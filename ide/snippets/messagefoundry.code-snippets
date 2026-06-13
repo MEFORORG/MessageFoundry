@@ -1,0 +1,37 @@
+{
+  "MEFOR inbound connection": {
+    "prefix": "meforinbound",
+    "body": [
+      "inbound(\"${1:name}\", MLLP(host=\"0.0.0.0\", port=${2:2575}), router=\"${3:router_name}\")"
+    ],
+    "description": "Declare an inbound MessageFoundry connection"
+  },
+  "MEFOR outbound connection": {
+    "prefix": "meforoutbound",
+    "body": [
+      "outbound(\"${1:name}\", File(directory=\"${2:./out}\", filename=\"{MSH-10}.hl7\"))"
+    ],
+    "description": "Declare an outbound MessageFoundry connection"
+  },
+  "MEFOR router": {
+    "prefix": "meforrouter",
+    "body": [
+      "@router(\"${1:router_name}\")",
+      "def ${2:route}(msg):",
+      "\tif msg[\"MSH-9.1\"] != \"${3:ADT}\":",
+      "\t\treturn []  # routed nowhere -> UNROUTED",
+      "\treturn [\"${4:handler_name}\"]"
+    ],
+    "description": "Define a MessageFoundry Router"
+  },
+  "MEFOR handler": {
+    "prefix": "meforhandler",
+    "body": [
+      "@handler(\"${1:handler_name}\")",
+      "def ${2:handle}(msg):",
+      "\t${3:# filter / transform}",
+      "\treturn Send(\"${4:outbound_name}\", msg)"
+    ],
+    "description": "Define a MessageFoundry Handler"
+  }
+}

@@ -1,0 +1,135 @@
+{
+  "name": "messagefoundry",
+  "displayName": "MessageFoundry",
+  "description": "Author, test, and monitor MessageFoundry HL7 v2 interfaces in VS Code.",
+  "version": "0.0.1",
+  "publisher": "messagefoundry",
+  "icon": "media/icon.png",
+  "license": "SEE LICENSE IN ../LICENSE",
+  "repository": { "type": "git", "url": "https://github.com/MEFORORG/MessageFoundry" },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["Programming Languages", "Testing", "Other"],
+  "activationEvents": ["onLanguage:python", "workspaceContains:**/*.py"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "messagefoundry.validate", "title": "MessageFoundry: Validate Config" },
+      { "command": "messagefoundry.openTestBench", "title": "MessageFoundry: Open Test Bench", "icon": "$(beaker)" },
+      { "command": "messagefoundry.refreshGraph", "title": "MessageFoundry: Refresh Connections", "icon": "$(refresh)" },
+      { "command": "messagefoundry.filterConnections", "title": "MessageFoundry: Filter Connections", "icon": "$(filter)" },
+      { "command": "messagefoundry.groupConnections", "title": "MessageFoundry: Group Connections", "icon": "$(list-tree)" },
+      { "command": "messagefoundry.openConnectionSettings", "title": "MessageFoundry: Open Connection Settings", "icon": "$(gear)" },
+      { "command": "messagefoundry.newConnection", "title": "MessageFoundry: New Connection" },
+      { "command": "messagefoundry.newRoute", "title": "MessageFoundry: New Route Wizard" },
+      { "command": "messagefoundry.newRouter", "title": "MessageFoundry: New Router" },
+      { "command": "messagefoundry.newHandler", "title": "MessageFoundry: New Handler" },
+      { "command": "messagefoundry.newAlert", "title": "MessageFoundry: New Alert" },
+      { "command": "messagefoundry.generateSamples", "title": "MessageFoundry: Generate Samples" },
+      {
+        "command": "messagefoundry.setupSourceControl",
+        "title": "MessageFoundry: Set Up Version Control & Checks"
+      },
+      { "command": "messagefoundry.promote", "title": "MessageFoundry: Stage → Promote" },
+      { "command": "messagefoundry.showAiPolicy", "title": "MessageFoundry: Show AI Policy" }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "messagefoundry", "title": "MessageFoundry", "icon": "media/icon.svg" }
+      ]
+    },
+    "views": {
+      "messagefoundry": [
+        { "id": "messagefoundry.home", "name": "Home", "type": "webview" },
+        { "id": "messagefoundry.graph", "name": "Connections" }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        { "command": "messagefoundry.filterConnections", "when": "view == messagefoundry.graph", "group": "navigation@1" },
+        { "command": "messagefoundry.groupConnections", "when": "view == messagefoundry.graph", "group": "navigation@2" },
+        { "command": "messagefoundry.openTestBench", "when": "view == messagefoundry.graph", "group": "navigation@3" },
+        { "command": "messagefoundry.refreshGraph", "when": "view == messagefoundry.graph", "group": "navigation@4" }
+      ],
+      "view/item/context": [
+        {
+          "command": "messagefoundry.openConnectionSettings",
+          "when": "view == messagefoundry.graph && viewItem == meforConnection",
+          "group": "inline"
+        }
+      ]
+    },
+    "snippets": [{ "language": "python", "path": "./snippets/messagefoundry.code-snippets" }],
+    "chatParticipants": [
+      {
+        "id": "messagefoundry.chat",
+        "name": "messagefoundry",
+        "fullName": "MessageFoundry",
+        "description": "Ask about Connections, Routers, and Handlers (PHI-safe — code & schema only).",
+        "isSticky": true,
+        "commands": [
+          { "name": "explain", "description": "Explain the selected HL7 path, Router, or Handler" },
+          { "name": "transform", "description": "Draft a Handler transform for what you describe" },
+          { "name": "review", "description": "Review the active Router/Handler for PHI leaks and bugs" }
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "MessageFoundry",
+      "properties": {
+        "messagefoundry.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "scope": "machine",
+          "description": "Python interpreter used to run the `messagefoundry` CLI. Machine-scoped: a checked-in workspace .vscode/settings.json cannot override it to a malicious interpreter that would run on the next CLI/debug launch."
+        },
+        "messagefoundry.configDir": {
+          "type": "string",
+          "default": "samples/config",
+          "description": "Config modules directory (relative to the workspace)."
+        },
+        "messagefoundry.engineUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8765",
+          "description": "Engine API URL used by Stage → Promote when no named environments are configured (see messagefoundry.environments)."
+        },
+        "messagefoundry.environments": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "Named promote targets for Stage → Promote (e.g. DEV/PROD). When set, promote asks which to target; when empty, it uses `messagefoundry.engineUrl`. Each engine resolves its own environment values, so the same config promotes to each.",
+          "items": {
+            "type": "object",
+            "required": ["name", "url"],
+            "properties": {
+              "name": { "type": "string", "description": "Display name, e.g. DEV or PROD." },
+              "url": { "type": "string", "description": "Engine API URL, e.g. https://prod-host:8765." }
+            }
+          }
+        },
+        "messagefoundry.messageSetsDir": {
+          "type": "string",
+          "default": "samples/messages",
+          "description": "Default folder the Test Bench's 'Load Message Set' dialog opens to."
+        },
+        "messagefoundry.sourceControl.autoPrompt": {
+          "type": "boolean",
+          "default": true,
+          "description": "Offer to set up version control + commit-time checks when a config project has no git repo yet."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.4.5"
+  }
+}

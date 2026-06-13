@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "messagefoundry"
+version = "0.0.1"
+description = "Lightweight open-source HL7 v2 integration engine"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
+dependencies = [
+    "hl7apy>=1.3",          # version-aware validation + profiles
+    "hl7>=0.4.5",           # python-hl7: fast, tolerant parsing for routing
+    "pydantic>=2.6",        # channel config models / validation
+    "aiosqlite>=0.20",      # async SQLite for the message store/queue
+    "fastapi>=0.110",       # localhost engine API
+    "uvicorn[standard]>=0.29",
+    "argon2-cffi>=23.1",    # argon2id password hashing (OWASP-recommended)
+    "cryptography>=42",     # AES-256-GCM PHI-at-rest encryption for the store
+    "ldap3>=2.9",           # Active Directory / LDAP authentication (pure-Python)
+    "pyspnego>=0.10",       # SPNEGO/Kerberos negotiate for Windows SSO
+]
+
+[project.optional-dependencies]
+console = [
+    "PySide6>=6.6",         # admin console (LGPL — OSS-distributable)
+    "keyring>=24.0",        # OS-keyring storage for the console's auth token
+]
+# EXPERIMENTAL SQL Server store backend. Also needs the Microsoft ODBC Driver 18 for SQL Server
+# installed at the OS level (not pip-installable). Lazy-imported, so SQLite-only installs skip it.
+sqlserver = ["aioodbc>=0.5"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "httpx>=0.27",          # ASGI test client for the localhost API
+]
+
+[project.scripts]
+messagefoundry = "messagefoundry.__main__:main"
+
+# Ship the offline common-password screening corpus (data, loaded via importlib.resources) in the
+# wheel — explicit so a future build-config change can't silently drop a security-relevant file.
+[tool.hatch.build.targets.wheel.force-include]
+"messagefoundry/auth/data" = "messagefoundry/auth/data"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+# Third-party libraries that ship no type stubs / py.typed marker.
+[[tool.mypy.overrides]]
+module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "ldap3.*"]
+ignore_missing_imports = true

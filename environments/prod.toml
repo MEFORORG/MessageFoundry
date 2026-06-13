@@ -1,0 +1,10 @@
+# PROD environment values — resolved by env("key") in the message graph (see docs/CONFIGURATION.md).
+# Same keys as dev.toml, different values: this is the ONLY thing that changes between environments;
+# the message graph (samples/config) is identical. Secrets come from MEFOR_VALUE_<KEY>, never here.
+#
+# Active environment is selected by [ai].environment / `serve --env prod`.
+
+# Downstream peer for OB_ACME_ADT: the real receiver in PROD (placeholder host — edit for a real
+# deployment). A referenced key missing here would make a promote to PROD fail loud, by design.
+acme_adt_host = "receiver-prod.example.org"
+acme_adt_port = 6661

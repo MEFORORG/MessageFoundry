@@ -1,0 +1,139 @@
+name: Security
+
+# Security gate: Python SAST (bandit), dependency audit (pip-audit), secret scan (gitleaks), and
+# project SAST rules (semgrep).
+#   All four are BLOCKING — their first CI run was clean (bandit: 0; gitleaks: 0; semgrep: 0 across
+#   5 rules; pip-audit: no known CVEs), so each now fails the build on a regression rather than
+#   merging unnoticed. To temporarily downgrade one, add `continue-on-error: true` back to its job.
+# CodeQL and native push-protection secret scanning need GitHub Advanced Security on this private
+# repo; gitleaks below is the no-GHAS secret scanner. See docs/SECURITY.md.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, so a freshly-disclosed CVE is caught even without a push
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    name: pip-audit (dependency vulnerabilities)
+    runs-on: ubuntu-latest
+    # BLOCKING: the lockfile audit is clean. A newly-disclosed CVE in a pinned dep will now turn CI
+    # red (the intended forcing function) — bump the lockfile, or `pip-audit --ignore-vuln <ID>` to
+    # accept a triaged advisory.
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+      - name: Check the lockfile is in sync with pyproject (DEP-1)
+        run: |
+          python -m pip install --upgrade pip uv
+          # Fails if pyproject changed without re-running `uv lock` (drift guard).
+          uv lock --check
+          # Re-export to the same path and fail if it differs from what's committed (keeps the
+          # hashed requirements.lock in sync with uv.lock; same -o name = deterministic header).
+          uv export --all-extras --no-emit-project --format requirements.txt -o requirements.lock
+          git diff --exit-code -- requirements.lock
+      - name: Install from the hashed lockfile (DEP-1)
+        run: |
+          # --require-hashes enforces a hash for every requirement (the lockfile carries them): a
+          # reproducible, tamper-evident install. Exercises the lockfile as an actual install path
+          # instead of only auditing it, so a lockfile that doesn't resolve/install is caught (low-26).
+          python -m venv /tmp/lockcheck
+          /tmp/lockcheck/bin/pip install --upgrade pip
+          /tmp/lockcheck/bin/pip install --require-hashes -r requirements.lock
+      - name: Audit the locked dependencies (DEP-1)
+        run: |
+          pip install pip-audit
+          # Audit the committed, pinned set — reproducible (vs auditing a fresh latest-resolve).
+          pip-audit -r requirements.lock --desc
+
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    # Advisory (non-blocking): generate a machine-readable CycloneDX SBOM from the committed, pinned
+    # lockfile and retain it as a build artifact, so "are we exposed to CVE-X?" is answerable from a
+    # recorded bill of materials rather than a fresh resolve (ASVS 15.1.2). The step still fails if
+    # the SBOM can't be produced, so a lockfile that won't render is caught.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+      - name: Generate a CycloneDX SBOM from the lockfile
+        run: |
+          python -m pip install --upgrade pip "cyclonedx-bom~=4.6"
+          cyclonedx-py requirements requirements.lock --output-format JSON --outfile sbom.cdx.json
+      - name: Upload the SBOM artifact
+        # TODO(supply-chain): pin to a commit SHA like the other actions here before this gate is
+        # made blocking (kept on the @v4 tag for now to avoid a guessed SHA).
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+
+  bandit:
+    name: bandit (Python SAST)
+    runs-on: ubuntu-latest
+    # BLOCKING: the baseline is clean, so any NEW insecure pattern (that isn't a reviewed per-line
+    # `# nosec`) fails the build instead of merging unnoticed.
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+      - name: Scan source for insecure patterns
+        run: |
+          # Pin bandit: an unpinned upgrade once silently changed `# nosec` parsing (1.9.x requires
+          # space-separated test IDs) and broke a green branch. Bump deliberately, not implicitly.
+          python -m pip install --upgrade pip "bandit==1.9.4"
+          # Skips are reviewed-safe project idioms. The subprocess sites (B603/B607) are annotated
+          # per-line with `# nosec` at the call instead of a wholesale skip, so a NEW unreviewed
+          # subprocess call is still flagged (review low-27):
+          #   B101 assert        — type-narrowing invariants, not security checks
+          #   B404 import subprocess — the calls themselves are per-line nosec'd (icacls/sc/ruff/mypy)
+          #   B311 random        — synthetic-data generators only; tokens use `secrets`
+          #   B110 try/except/pass — best-effort resource cleanup
+          #   B608 hardcoded SQL — f-strings interpolate only literal column names; values are bound
+          #                        params (verified — see security review STORE-4)
+          bandit -r messagefoundry --skip B101,B110,B311,B404,B608
+
+  gitleaks:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    # BLOCKING: full-history scan came back clean; a newly-introduced secret now fails the build.
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0 # full history so the scan also covers earlier commits, not just the tip
+      - name: Install gitleaks (pinned)
+        run: |
+          # Pin the release; bump deliberately. Verify the tag exists if this step 404s.
+          VER=8.18.4
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" \
+            | tar -xz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Scan repository for secrets
+        run: gitleaks detect --config .gitleaks.toml --redact --verbose --no-banner
+
+  semgrep:
+    name: semgrep (project SAST rules)
+    runs-on: ubuntu-latest
+    # BLOCKING: the first run was 0 findings; a new match for any rule now fails the build.
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+      - name: Run the MessageFoundry rules
+        run: |
+          python -m pip install --upgrade pip "semgrep~=1.90"
+          # --error: any finding fails the step — and the job, now that this gate is blocking.
+          semgrep --config .semgrep --error --metrics off messagefoundry

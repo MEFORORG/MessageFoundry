@@ -1,0 +1,222 @@
+"""Console entrypoint:  python -m messagefoundry.console [--url URL]
+
+Connects to a running engine API (default http://127.0.0.1:8765 — start one with
+``python -m messagefoundry serve``), opens the admin window, and auto-refreshes channel and
+message state on a timer. The interval is user-selectable from the window (link → dialog) and
+remembered across runs (QSettings); ``--poll`` is just the default for a first run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+
+from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication, QDialog
+
+from messagefoundry.console.change_password import ChangePasswordDialog
+from messagefoundry.console.client import ApiError, EngineClient
+from messagefoundry.console.login import LoginDialog
+from messagefoundry.console.shell import AppWindow
+
+log = logging.getLogger(__name__)
+
+_SETTINGS_KEY = "autorefresh/seconds"
+_DEFAULT_SIZE = (2560, 1440)
+# The cached token is a PHI-scoped bearer credential (the user's full RBAC, incl. messages:view_raw)
+# valid for the server-side session lifetime. It lives in the OS keyring (Windows Credential
+# Manager) and is re-validated against /auth/me on startup, so a stale/revoked one is discarded.
+_KEYRING_SERVICE = "MessageFoundry"
+
+
+def _load_token(base_url: str) -> str | None:
+    try:
+        import keyring
+        from keyring.errors import KeyringError
+    except ImportError:
+        return None
+    try:
+        return keyring.get_password(_KEYRING_SERVICE, base_url)
+    except KeyringError as exc:  # keyring present but locked/unavailable — fall back to sign-in
+        log.warning("could not read stored credential: %s", exc)
+        return None
+
+
+def _save_token(base_url: str, token: str) -> None:
+    try:
+        import keyring
+        from keyring.errors import KeyringError
+    except ImportError:
+        return  # no keyring backend — the session simply isn't remembered across launches
+    try:
+        keyring.set_password(_KEYRING_SERVICE, base_url, token)
+    except KeyringError as exc:
+        log.warning("could not store credential (will re-prompt next launch): %s", exc)
+
+
+def _delete_token(base_url: str) -> bool:
+    """Clear the stored token. Returns False if it may still be present (CONSOLE-2)."""
+    try:
+        import keyring
+        from keyring.errors import KeyringError, PasswordDeleteError
+    except ImportError:
+        return True  # nothing was persisted to begin with
+    try:
+        keyring.delete_password(_KEYRING_SERVICE, base_url)
+        return True
+    except PasswordDeleteError:
+        return True  # no such entry — already absent, effectively cleared
+    except KeyringError as exc:
+        log.warning("could not clear stored credential — it may still be present: %s", exc)
+        return False
+
+
+def _authenticate(client: EngineClient) -> bool:
+    """Ensure the client is authenticated when the engine requires it.
+
+    Returns True to proceed (authenticated, or auth disabled, or unreachable so the window can show
+    the connection error), or False if the user cancelled the sign-in dialog.
+    """
+    try:
+        client.providers()  # 200 when auth is on; 503 when disabled
+    except ApiError as exc:
+        if exc.status == 503 or exc.status is None:
+            return True  # auth disabled, or unreachable (the window surfaces the error)
+    stored = _load_token(client.base_url)
+    if stored:
+        try:
+            client.set_token(stored)
+            return True
+        except ApiError:
+            client.clear_auth()
+            _delete_token(client.base_url)
+    while True:
+        login = LoginDialog(client)
+        if login.exec() != QDialog.DialogCode.Accepted:
+            return False
+        if not login.must_change_password:
+            break
+        # Forced change: the session is must-change-restricted (403 on protected routes). Let the
+        # user set a new password, prefilling the current one they just typed and the server
+        # accepted.
+        change = ChangePasswordDialog(client, current_password=login.entered_password)
+        login.entered_password = ""  # nosec B105 (clears the plaintext seam, not a credential; M4)
+        if change.exec() != QDialog.DialogCode.Accepted:
+            client.clear_auth()  # drop the restricted token; the user bailed out
+            continue  # back to sign-in (still blocked until they change it)
+        # change_password() already revoked + cleared the session server-side, so the loop falls
+        # through to a fresh sign-in with the new password rather than admitting the dead token.
+    if client.token is not None:
+        _save_token(client.base_url, client.token)
+    return True
+
+
+def _sign_out(client: EngineClient, app: QApplication) -> None:
+    base_url = client.base_url
+    try:
+        client.logout()  # revoke the session server-side
+    except ApiError as exc:
+        log.warning("server-side logout failed: %s", exc)
+    if not _delete_token(base_url):
+        log.warning("local credential may not have been cleared; remove it from the OS keyring")
+    app.quit()  # re-launch the console to sign in again
+
+
+def _password_changed(client: EngineClient, app: QApplication) -> None:
+    """Route back to sign-in after an in-app password change.
+
+    The dialog already called ``change_password`` (server revoked the session, client cleared its
+    token), so this only clears the cached keyring credential and quits — relaunch lands on the
+    sign-in dialog where the user authenticates with the new password.
+    """
+    if not _delete_token(client.base_url):
+        log.warning("local credential may not have been cleared; remove it from the OS keyring")
+    app.quit()  # re-launch the console to sign in with the new password
+
+
+def _session_expired(client: EngineClient, app: QApplication) -> None:
+    """The session expired/was revoked mid-session (a 401 on the health poll). The token is already
+    dead, so just clear the cached credential and quit — re-launch lands on the sign-in dialog (M-26)."""
+    if not _delete_token(client.base_url):
+        log.warning("local credential may not have been cleared; remove it from the OS keyring")
+    app.quit()
+
+
+def _open_window(window: AppWindow, app: QApplication) -> None:
+    """Open at the default size, or maximized if the screen can't fit it.
+
+    ``_DEFAULT_SIZE`` is in physical pixels (what the user sees on a monitor), but Qt's
+    geometry and ``resize()`` are in device-independent (logical) pixels. On a HiDPI display
+    (e.g. a 5K2K monitor at 200% scaling) the two differ by ``devicePixelRatio``, so we compare
+    against the *physical* work area and convert the target back to logical pixels for resize().
+    """
+    target_w, target_h = _DEFAULT_SIZE
+    screen = app.primaryScreen()
+    if screen is None:
+        window.resize(target_w, target_h)
+        window.show()
+        return
+    dpr = screen.devicePixelRatio() or 1.0
+    available = screen.availableGeometry()  # logical pixels
+    if available.width() * dpr < target_w or available.height() * dpr < target_h:
+        window.showMaximized()  # default size is too big for this display
+    else:
+        window.resize(round(target_w / dpr), round(target_h / dpr))
+        window.show()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="messagefoundry.console")
+    parser.add_argument("--url", default="http://127.0.0.1:8765", help="engine API base URL")
+    parser.add_argument("--poll", type=float, default=2.0, help="default auto-refresh seconds")
+    parser.add_argument(
+        "--service-name", default="MessageFoundry", help="Windows service name for the Status page"
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="allow plaintext http to a non-loopback engine (trusted-network dev only; no TLS yet)",
+    )
+    args = parser.parse_args(argv)
+
+    app = QApplication(sys.argv[:1])
+    app.setOrganizationName("MessageFoundry")
+    app.setApplicationName("Console")
+
+    try:
+        client = EngineClient(args.url, allow_insecure=args.insecure)
+    except ApiError as exc:
+        print(f"error: {exc}", file=sys.stderr)  # e.g. refusing plaintext http to a remote host
+        return 2
+
+    if not _authenticate(client):
+        client.close()
+        return 0
+
+    # Remembered interval wins; fall back to --poll on first run. QSettings returns the value
+    # as a str (registry) or float (in-memory), so normalise via str() before parsing.
+    settings = QSettings()
+    poll_seconds = float(str(settings.value(_SETTINGS_KEY, args.poll)))
+    window = AppWindow(client, poll_seconds=poll_seconds, service_name=args.service_name)
+    window.interval_changed.connect(lambda seconds: settings.setValue(_SETTINGS_KEY, seconds))
+    window.logout_requested.connect(lambda: _sign_out(client, app))
+    window.change_password_requested.connect(lambda: _password_changed(client, app))
+    window.session_expired.connect(lambda: _session_expired(client, app))
+
+    # Confirm the engine is reachable before showing a blank window.
+    try:
+        client.health()
+    except ApiError as exc:
+        window._show_error(f"Cannot reach engine: {exc}")  # noqa: SLF001 (entrypoint glue)
+
+    window.refresh_all()
+    _open_window(window, app)
+
+    exit_code = app.exec()
+    client.close()
+    return int(exit_code)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,362 @@
+"""File transport: directory destination + directory-polling source.
+
+**Destination** writes each payload to a file in a directory. The filename may contain
+``{HL7-path}`` placeholders (e.g. ``{MSH-10}.hl7``) resolved by peeking the payload, so
+archived files are named by control id / message type. Writes are atomic (write to a
+temp name, then ``rename``) so a reader watching the directory never sees a partial file.
+
+**Source** polls a directory for files, hands each to the pipeline handler, then moves the
+file into a ``.processed`` subdirectory (or ``.error`` if the handler raised). Files have
+no reply channel, so the handler's return value is ignored.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import tempfile
+import time
+from contextlib import suppress
+from pathlib import Path
+
+from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.parsing.peek import HL7PeekError, Peek
+from messagefoundry.transports.base import (
+    DeliveryError,
+    DestinationConnector,
+    InboundHandler,
+    SourceConnector,
+    register_destination,
+    register_source,
+)
+
+__all__ = ["FileDestination", "FileSource", "render_filename", "DEFAULT_MAX_FILE_BYTES"]
+
+logger = logging.getLogger(__name__)
+
+# Cap a single inbound file read so a multi-GB drop can't OOM the engine (DoS guard). A
+# falsy value (None/0) in settings disables the cap; see docs/CONNECTIONS.md.
+DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024  # 16 MiB — matches the MLLP frame cap
+
+_PLACEHOLDER = re.compile(r"\{([A-Z][A-Z0-9]{2}-\d+(?:\.\d+){0,2})\}")
+# Strip characters that are unsafe in filenames on Windows and POSIX alike (path separators
+# included, so a resolved value can never introduce a directory component).
+_UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# Windows reserved device names (case-insensitive, optionally with an extension) — never usable.
+_RESERVED = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def render_filename(template: str, payload: str, *, fallback: str) -> str:
+    """Resolve ``{HL7-path}`` placeholders in ``template`` against ``payload``, producing a single
+    safe filename (never a path).
+
+    Unresolvable placeholders (missing field, or an unparseable payload) fall back to ``fallback``
+    so a delivery never fails merely because a name couldn't be built. The result is constrained to
+    one path component: unsafe characters are stripped, leading dots removed, and ``.``/``..``/empty
+    or a reserved device name falls back — so an attacker-controlled field can't write outside the
+    target directory or shadow ``.processed``/``.error`` (FILE-1)."""
+    try:
+        peek: Peek | None = Peek.parse(payload)
+    except HL7PeekError:
+        peek = None
+
+    def repl(match: re.Match[str]) -> str:
+        value = peek.field(match.group(1)) if peek else None
+        return _sanitize(value) if value else fallback
+
+    name = _sanitize(_PLACEHOLDER.sub(repl, template))
+    stem = name.split(".", 1)[0].upper()
+    if not name or name in (".", "..") or stem in _RESERVED:
+        return fallback
+    return name
+
+
+def _sanitize(value: str) -> str:
+    """Reduce ``value`` to a safe single-component filename: drop unsafe chars and leading dots
+    (which would create hidden files or ``.``/``..`` traversal)."""
+    return _UNSAFE.sub("_", value).lstrip(".")
+
+
+class FileDestination(DestinationConnector):
+    def __init__(self, config: Destination) -> None:
+        s = config.settings
+        if "directory" not in s:
+            raise ValueError("file destination requires a 'directory' setting")
+        self.directory = Path(s["directory"])
+        self.filename_template: str = s.get("filename", "{MSH-10}.hl7")
+        # When two messages resolve to the same name, append a counter rather than clobber.
+        self._overwrite: bool = bool(s.get("overwrite", False))
+        self.encoding: str = s.get("encoding", "utf-8")
+
+    async def send(self, payload: str) -> None:
+        try:
+            await asyncio.to_thread(self._write, payload)
+        except OSError as exc:
+            raise DeliveryError(f"file write failed: {exc}") from exc
+
+    def _write(self, payload: str) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        name = render_filename(self.filename_template, payload, fallback="message.hl7")
+        target = self.directory / name
+        data = payload.encode(self.encoding)
+        # Write to a uniquely-named temp (mkstemp — no shared counter, no name race), then publish
+        # atomically. For no-overwrite, claim the final name by exclusive create so two concurrent
+        # deliveries can't clobber each other (FILE-5: replaces the TOCTOU exists()-then-rename).
+        fd, tmp_name = tempfile.mkstemp(dir=self.directory, suffix=".part")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            if self._overwrite:
+                os.replace(tmp, target)  # atomic overwrite; consumes tmp
+            else:
+                _claim_unique(tmp, target)  # hard-links tmp → a free name
+        finally:
+            # Remove the temp; after a successful os.replace it's already gone (suppressed).
+            with suppress(OSError):
+                os.unlink(tmp)
+
+
+class FileSource(SourceConnector):
+    """Poll a directory for files and feed each to the pipeline handler."""
+
+    def __init__(self, config: Source) -> None:
+        s = config.settings
+        if "directory" not in s:
+            raise ValueError("file source requires a 'directory' setting")
+        self.directory = Path(s["directory"])
+        self.pattern: str = s.get("pattern", "*")
+        self.poll_seconds: float = float(s.get("poll_seconds", 1.0))
+        self.min_age_seconds: float = float(s.get("min_age_seconds", 0.0))
+        self.after_read: str = s.get("after_read", "move")  # "move" | "delete"
+        self.sort: str = s.get("sort", "name")  # "name" | "mtime"
+        self.recursive: bool = bool(s.get("recursive", False))
+        mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
+        self.max_file_bytes: int | None = int(mfb) if mfb else None
+        self.processed_dir = self.directory / s.get("processed_subdir", ".processed")
+        self.error_dir = self.directory / s.get("error_subdir", ".error")
+        self._handler: InboundHandler | None = None
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self, handler: InboundHandler) -> None:
+        """Begin polling in the background. Returns once the source is set up so the
+        caller can rely on it being live (consistent with the TCP sources)."""
+        self._handler = handler
+        self._stop.clear()
+        self.processed_dir.mkdir(parents=True, exist_ok=True)
+        self.error_dir.mkdir(parents=True, exist_ok=True)
+        self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self._scan_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A scan error (watch dir vanished/unreadable, a bad glob, a move/read failure) must
+                # NOT kill the poller — that would silently stop the connection from receiving while
+                # it still reports running, and re-raise inside stop()/reload (review H-4). Log and
+                # retry on the next interval.
+                logger.exception(
+                    "file source scan failed for %s; retrying next poll", self.directory
+                )
+            try:
+                await asyncio.wait_for(self._stop.wait(), self.poll_seconds)
+            except asyncio.TimeoutError:
+                pass  # poll interval elapsed; scan again
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            # return_exceptions: a faulted poll task must not re-raise here — stop() runs during
+            # reload quiesce, outside its rollback (review H-4). _run already guards scans; this is
+            # the belt-and-suspenders.
+            await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
+
+    async def _scan_once(self) -> None:
+        assert self._handler is not None
+        for path in await asyncio.to_thread(self._candidates):
+            if await asyncio.to_thread(self._oversize, path):
+                # Transport-level reject *before* any message is read — parallels MLLP dropping an
+                # over-cap frame. It never became a "received message", so (like MLLP) there's no
+                # store disposition to record; preserve the file in .error for the operator and log it.
+                logger.warning(
+                    "file %s exceeds max_file_bytes (%s); routing to error dir",
+                    path.name,
+                    self.max_file_bytes,
+                )
+                await asyncio.to_thread(self._move, path, self.error_dir)
+                continue
+            try:
+                raw = await asyncio.to_thread(path.read_bytes)
+            except OSError as exc:
+                # Transient (file locked / vanished mid-scan): leave it in place to retry next scan
+                # rather than quarantining a healthy file. Logged, never silently swallowed.
+                logger.warning("could not read %s (will retry next scan): %s", path.name, exc)
+                continue
+            if not _looks_like_hl7(raw):
+                # Content doesn't match the declared .hl7 type (binary / non-HL7 text) — quarantine
+                # before its bytes reach the pipeline (ASVS 5.2.2). Like the oversize reject above, it
+                # never became a "received message", so there's no store disposition; preserve it in
+                # .error and log it (never a silent drop).
+                logger.warning(
+                    "file %s is not HL7 (no MSH/FHS/BHS header); routing to error dir", path.name
+                )
+                await asyncio.to_thread(self._move, path, self.error_dir)
+                continue
+            try:
+                await self._handler(raw)
+            except Exception as exc:
+                # The handler records every message-level outcome (parse/validation/routing → ERROR)
+                # itself and returns, so an exception escaping here is an infrastructure failure: the
+                # durable store write failed (DB locked, disk full). Leave the file in place so the
+                # next scan retries once the store recovers (at-least-once) — moving it to .error would
+                # drop a *received* message that was never recorded, an accept-and-drop (review M-15).
+                logger.warning("handler failed for %s (will retry next scan): %s", path.name, exc)
+                continue
+            await asyncio.to_thread(self._after_processing, path)
+
+    def _oversize(self, path: Path) -> bool:
+        """True if ``path`` is larger than the configured cap (checked before reading it)."""
+        if self.max_file_bytes is None:
+            return False
+        try:
+            return path.stat().st_size > self.max_file_bytes
+        except OSError:
+            return False  # vanished/locked — let the read path handle it
+
+    def _candidates(self) -> list[Path]:
+        """Files ready to process, honoring recursion, min-age, and sort order."""
+        globber = self.directory.rglob if self.recursive else self.directory.glob
+        try:
+            matched = list(globber(self.pattern))
+        except (OSError, ValueError) as exc:
+            # Watch dir vanished/unreadable, or an invalid glob pattern: treat as "nothing this
+            # scan" (logged) rather than letting it propagate and kill the poller (review H-4).
+            logger.warning(
+                "file source could not list %s (pattern %r): %s", self.directory, self.pattern, exc
+            )
+            return []
+        files = [
+            p
+            for p in matched
+            if p.is_file()
+            and self.processed_dir not in p.parents
+            and self.error_dir not in p.parents
+        ]
+        if self.min_age_seconds > 0:
+            cutoff = time.time() - self.min_age_seconds
+            files = [p for p in files if _mtime(p) <= cutoff]  # skip files still being written
+        if self.sort == "mtime":
+            files.sort(key=_mtime)
+        else:
+            files.sort(key=lambda p: p.name)
+        return files
+
+    def _after_processing(self, path: Path) -> None:
+        if self.after_read == "delete":
+            try:
+                path.unlink()
+            except OSError as exc:
+                # A processed file we can't delete will be re-read (duplicate); surface it (FILE-4).
+                logger.warning("could not delete processed file %s: %s", path.name, exc)
+        else:
+            self._move(path, self.processed_dir)
+
+    @staticmethod
+    def _move(path: Path, dest_dir: Path) -> None:
+        try:
+            path.replace(_unique(dest_dir / path.name))
+        except OSError as exc:
+            # A stuck file (locked / dest unwritable) stays and is re-read; log it (FILE-4).
+            logger.warning("could not move %s to %s: %s", path.name, dest_dir.name, exc)
+
+
+# --- helpers -----------------------------------------------------------------
+
+
+# Segment ids a valid HL7 v2 payload (single message or batch file) may start with.
+_HL7_LEADING_SEGMENTS = (b"MSH", b"FHS", b"BHS")
+
+
+def _looks_like_hl7(raw: bytes) -> bool:
+    """Cheap content sniff: does ``raw`` start with an HL7 v2 header segment (ASVS 5.2.2)?
+
+    Mirrors what the tolerant parser accepts at the very start — an optional UTF-8 BOM, an MLLP
+    start byte, and leading whitespace — then requires the first segment id to be MSH (message), FHS
+    (file) or BHS (batch). This rejects a binary or non-HL7 file that merely carries the ``.hl7``
+    extension before its bytes enter the pipeline, without rejecting a structurally-odd-but-textual
+    HL7 message (which still flows through and is recorded as ``ERROR`` by the parser)."""
+    head = raw.lstrip(b"\x0b\r\n \t")
+    if head.startswith(b"\xef\xbb\xbf"):  # UTF-8 BOM
+        head = head[3:].lstrip(b"\x0b\r\n \t")
+    return head[:3] in _HL7_LEADING_SEGMENTS
+
+
+def _claim_unique(tmp: Path, target: Path) -> Path:
+    """Claim ``target`` (or ``name-1.ext``, ``name-2.ext``, … if taken) for ``tmp``, atomically.
+
+    Prefers ``os.link`` (the target becomes a hard link to ``tmp``); ``FileExistsError`` means the
+    name is taken, so claiming a free name is a single atomic step — no check-then-act window where
+    a concurrent writer could clobber us. Where hard links aren't supported (FAT/exFAT, many SMB/NAS
+    mounts) ``os.link`` raises a different ``OSError``; fall back to an exclusive-create copy
+    (``O_CREAT | O_EXCL``), which is also atomic no-clobber but works cross-filesystem (review low-5)."""
+    stem, suffix = target.stem, target.suffix
+    candidate, n = target, 0
+    linkable = True
+    while True:
+        if linkable:
+            try:
+                os.link(tmp, candidate)
+                return candidate
+            except FileExistsError:
+                n += 1
+                candidate = target.with_name(f"{stem}-{n}{suffix}")
+                continue
+            except OSError:
+                linkable = False  # hard links unusable on this filesystem — copy instead
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            n += 1
+            candidate = target.with_name(f"{stem}-{n}{suffix}")
+            continue
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(tmp.read_bytes())
+        return candidate
+
+
+def _mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _unique(target: Path) -> Path:
+    """Return ``target`` or, if it exists, ``name-1.ext``, ``name-2.ext``, …"""
+    if not target.exists():
+        return target
+    stem, suffix = target.stem, target.suffix
+    n = 1
+    while True:
+        candidate = target.with_name(f"{stem}-{n}{suffix}")
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+register_destination(ConnectorType.FILE, FileDestination)
+register_source(ConnectorType.FILE, FileSource)

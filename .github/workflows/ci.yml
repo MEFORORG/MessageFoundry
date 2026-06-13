@@ -1,0 +1,253 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Lint + type-check + unit tests. The Python-version matrix runs on Linux
+  # (cheap); Windows Server 2022 + 2025 are added for OS coverage on the exact
+  # versions we deploy to (one Python each to keep Windows minutes down — they
+  # bill at 2x on a private repo).
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python-version: "3.11" }
+          - { os: ubuntu-latest, python-version: "3.13" }
+          - { os: windows-2022, python-version: "3.13" }
+          - { os: windows-2025, python-version: "3.13" }
+    defaults:
+      run:
+        shell: bash  # available on all runners (Git Bash on Windows) -> one set of commands
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # PySide6's offscreen platform plugin needs a few system libraries even
+      # headless. Linux-only; Windows runners need no equivalent.
+      - name: Install Qt offscreen system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+
+      - name: Install project (dev + console extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,console]"
+
+      - name: Lint (ruff)
+        run: ruff check messagefoundry tests
+
+      - name: Format check (ruff)
+        run: ruff format --check .
+
+      - name: Type-check (mypy, strict)
+        run: mypy messagefoundry
+
+      - name: Tests (pytest)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -q
+
+  # Build + type-check the VS Code extension. The Python jobs never touch ide/, so a dep bump or
+  # IDE code change that breaks the bundle or the types would otherwise pass CI unbuilt (this job
+  # exists because an esbuild bump merged "green" without anything having compiled it). Cheap,
+  # Linux-only, runs on PRs.
+  ide:
+    name: ide build (typecheck + bundle)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ide
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ide/package-lock.json
+
+      - name: Install (clean, from lockfile)
+        run: npm ci
+
+      - name: Type-check (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Bundle (esbuild)
+        run: npm run compile
+
+  # Experimental SQL Server store backend: run the gated store suite against a real SQL Server
+  # service container (Linux, so 1x minutes). Skipped on PRs (like the smoke job) to save spend;
+  # runs on push to main and on-demand (workflow_dispatch). This is what actually exercises the
+  # T-SQL that the SQLite tests can't.
+  sqlserver-store:
+    name: sql server store (experimental)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "Str0ng_P@ssw0rd!"
+        ports:
+          - 1433:1433
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Microsoft ODBC Driver 18 + sqlcmd
+        run: |
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
+          curl -fsSL "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release; echo "$VERSION_ID")/prod.list" \
+            | sudo tee /etc/apt/sources.list.d/mssql-release.list > /dev/null
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev
+
+      - name: Wait for SQL Server and create the database
+        run: |
+          sqlcmd=/opt/mssql-tools18/bin/sqlcmd
+          for i in $(seq 1 40); do
+            if "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1; then
+              echo "SQL Server is up"; break
+            fi
+            echo "waiting for SQL Server ($i)"; sleep 2
+          done
+          "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C \
+            -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry"
+
+      - name: Install project (dev + sqlserver extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,sqlserver]"
+
+      - name: Run the SQL Server store suite (against the real DB)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+        run: pytest tests/test_sqlserver_store.py -v
+
+  # End-to-end check of the real Windows service path on both target Server
+  # versions: install via NSSM -> start -> /health -> send an MLLP message ->
+  # confirm it was recorded -> stop -> uninstall. Skipped on PRs to save Windows
+  # minutes; runs on push to main and on-demand (workflow_dispatch).
+  windows-service-smoke:
+    name: windows service smoke (${{ matrix.os }})
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Install the engine
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      # Run the install/uninstall scripts under Windows PowerShell 5.1 (shell: powershell) to
+      # match what the console launches on an end-user machine — catches 5.1-only behaviour
+      # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). NSSM happens to
+      # be on the runner PATH, so the auto-download path is validated locally / on the user's box.
+      - name: Install the service
+        shell: powershell
+        run: |
+          $exe = (Get-Command messagefoundry).Source
+          .\scripts\service\install-service.ps1 -AppExe $exe -LogLevel DEBUG
+          # This smoke validates the Windows service + MLLP plumbing, not authentication (auth is
+          # covered by the pytest suite: test_api_auth / test_console_auth). Run the service with
+          # auth disabled so the /messages verification call below doesn't need a bearer token.
+          nssm set MessageFoundry AppEnvironmentExtra MEFOR_AUTH_ENABLED=false
+
+      - name: Start and verify /health
+        run: |
+          nssm start MessageFoundry
+          $ok = $null
+          foreach ($i in 1..30) {
+            try { $ok = Invoke-RestMethod http://127.0.0.1:8765/health -TimeoutSec 2; break }
+            catch { Start-Sleep -Milliseconds 500 }
+          }
+          if (-not $ok) { throw "engine /health never came up" }
+          "health: $($ok | ConvertTo-Json -Compress)"
+
+      - name: Send an MLLP message and confirm it was recorded
+        run: |
+          python samples\send_mllp.py samples\messages\adt_a01.hl7
+          $msgs = $null
+          foreach ($i in 1..20) {
+            $msgs = Invoke-RestMethod http://127.0.0.1:8765/messages
+            if ($msgs.total -ge 1) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          if ($msgs.total -lt 1) { throw "message was not recorded by the engine" }
+          "messages.total = $($msgs.total)"
+
+      - name: Stop the service (graceful)
+        run: nssm stop MessageFoundry
+
+      - name: Show service logs
+        if: always()
+        run: |
+          $dir = "C:\ProgramData\MessageFoundry\logs"
+          foreach ($f in "service.out.log", "service.err.log") {
+            $p = Join-Path $dir $f
+            "===== $f ====="
+            if (Test-Path $p) { Get-Content $p } else { "(none)" }
+          }
+
+      - name: Uninstall the service
+        if: always()
+        shell: powershell
+        run: .\scripts\service\uninstall-service.ps1
+
+      - name: Upload service logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: service-logs-${{ matrix.os }}
+          path: C:\ProgramData\MessageFoundry\logs\
+          if-no-files-found: ignore

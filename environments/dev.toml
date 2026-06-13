@@ -1,0 +1,9 @@
+# DEV environment values — resolved by env("key") in the message graph (see docs/CONFIGURATION.md).
+# Non-secret values only; versioned in the repo so they're diffable/reviewable. Secrets come from
+# MEFOR_VALUE_<KEY> environment variables, never this file. Keys are lower_snake_case.
+#
+# Active environment is selected by [ai].environment / `serve --env dev`.
+
+# Downstream peer for OB_ACME_ADT (samples/config/IB_ACME_ADT.py): a local test receiver in DEV.
+acme_adt_host = "127.0.0.1"
+acme_adt_port = 2601

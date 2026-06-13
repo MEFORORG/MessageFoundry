@@ -1,0 +1,37 @@
+# Pre-commit hooks — surface lint/format/secret/SAST issues locally before they reach a commit,
+# mirroring the CI gate (ruff, bandit, gitleaks). One-time setup per clone:
+#   pip install pre-commit  &&  pre-commit install
+# Run across the whole tree on demand:  pre-commit run --all-files
+# Keep hook versions roughly in step with CI (.github/workflows/security.yml) and pyproject.
+repos:
+  # Ruff lint + format from the project's own environment, so pre-commit can never disagree with the
+  # CI/dev ruff on a version (language: system uses the installed ruff from the active venv).
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format
+        entry: ruff format
+        language: system
+        types: [python]
+      - id: ruff-check
+        name: ruff check
+        entry: ruff check --fix
+        language: system
+        types: [python]
+
+  # Secret scanning — blocks a commit that would introduce a credential/token/key.
+  # (rev is verified by `pre-commit autoupdate` on first install; a wrong tag fails loudly there,
+  # never silently in CI.)
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+
+  # Python SAST — same test set + skips as the CI bandit job (security.yml). Engine code only;
+  # tests/harness/samples carry intentional non-production idioms (asserts, synthetic-data RNG).
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.9.4
+    hooks:
+      - id: bandit
+        args: ["--skip", "B101,B110,B311,B404,B608"]
+        exclude: ^(tests/|harness/|samples/)

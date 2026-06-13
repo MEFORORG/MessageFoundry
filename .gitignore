@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Engine runtime data (PHI may live here — never commit)
+*.db
+*.db-wal
+*.db-shm
+out/
+harness_io/
+*.log
+
+# One-time bootstrap admin credential written next to the store (consumed + deleted by the operator) — never commit
+bootstrap-admin.txt
+
+# Secrets / credentials — never commit (no such files exist today; these are foot-gun guards)
+.env
+.env.*
+*.key
+*.pem
+*.pfx
+secrets/
+
+# Generated, regenerable test corpus (build with: python -m messagefoundry.generators.adt)
+/samples/messages/adt/
+
+# Tooling
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.vscode/
+.idea/
+
+# Claude Code: settings.json is shared/tracked; settings.local.json is machine-local (never commit)
+.claude/settings.local.json
+
+# Local reference notes pointing at machine-specific Claude Code transcript paths — never commit
+TRANSCRIPTS.md

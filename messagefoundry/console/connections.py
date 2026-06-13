@@ -1,0 +1,259 @@
+"""Connections dashboard: one row per endpoint (each inbound + each outbound connection).
+
+A toolbar acts on the selected rows — Start/Stop/Restart operate on the selected **inbound**
+connections; Purge clears the queue of the selected **outbound** connections. The table is fed by
+the server-computed ``GET /connections`` rows, so the page stays thin. Clicking a row's *Logs*
+link asks the shell to open the Log Search page filtered to that connection.
+"""
+
+from __future__ import annotations
+
+from typing import Callable
+
+from PySide6.QtCore import QItemSelectionModel, Qt, Signal
+from PySide6.QtGui import QBrush, QColor
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QTableWidgetItem,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from messagefoundry.console.client import ApiError, EngineClient
+from messagefoundry.console.widgets import ConfigurableTable
+
+_COLUMNS = [
+    "Name",
+    "Status",
+    "Direction",
+    "Method",
+    "Logs",
+    "Queue Depth",
+    "Idle",
+    "Alerts",
+    "# Errored",
+    "# Read",
+    "# Written",
+    "Peer",
+    "Port",
+    "Backlog",
+    "Delivered Age",
+]
+_LOGS_COL = 4
+
+# (role, channel_id, destination) identifies a row across refreshes for selection + actions.
+_RowKey = tuple[str, str, str]
+
+
+def _fmt_int(n: int | None) -> str:
+    return "—" if n is None else str(n)
+
+
+def _fmt_secs(s: float | None) -> str:
+    if s is None:
+        return "—"
+    if s < 1:
+        return "0s"
+    if s < 60:
+        return f"{s:.0f}s"
+    if s < 3600:
+        return f"{s / 60:.0f}m"
+    return f"{s / 3600:.1f}h"
+
+
+def _style_link(item: QTableWidgetItem) -> None:
+    """Make a cell look like a clickable link (blue, underlined)."""
+    item.setForeground(QBrush(QColor("#1a73e8")))
+    font = item.font()
+    font.setUnderline(True)
+    item.setFont(font)
+
+
+class ConnectionsPage(QWidget):
+    """Endpoint table + action toolbar."""
+
+    error = Signal(str)
+    open_logs = Signal(str)  # channel_id — ask the shell to open Log Search filtered to it
+
+    def __init__(self, client: EngineClient) -> None:
+        super().__init__()
+        self._client = client
+
+        self._start = QPushButton("Start")
+        self._stop = QPushButton("Stop")
+        self._actions = QToolButton()
+        self._actions.setText("Actions ▾")
+        self._actions.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(self._actions)
+        act_restart = menu.addAction("Restart")
+        menu.addSeparator()
+        act_purge_top = menu.addAction("Purge Top Message")
+        act_purge_all = menu.addAction("Purge All Queued Messages")
+        self._actions.setMenu(menu)
+
+        self._start.clicked.connect(lambda: self._inbound_action(self._client.start_connection))
+        self._stop.clicked.connect(lambda: self._inbound_action(self._client.stop_connection))
+        act_restart.triggered.connect(lambda: self._inbound_action(self._client.restart_connection))
+        act_purge_top.triggered.connect(lambda: self._purge("top"))
+        act_purge_all.triggered.connect(lambda: self._purge("all"))
+
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("Connections"))
+        toolbar.addStretch(1)
+        toolbar.addWidget(self._start)
+        toolbar.addWidget(self._stop)
+        toolbar.addWidget(self._actions)
+
+        self._table = ConfigurableTable(
+            _COLUMNS, settings_key="connections/header_state", multi=True
+        )
+        self._table.itemSelectionChanged.connect(self._sync_toolbar)
+        self._table.cellClicked.connect(self._on_cell_clicked)
+        self._loaded = False  # autosize columns on the first (and user-initiated) loads
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(toolbar)
+        layout.addWidget(self._table)
+        self._sync_toolbar()
+
+    def refresh(self, *, autosize: bool = False) -> None:
+        try:
+            rows = self._client.connections()
+        except ApiError as exc:
+            self.error.emit(str(exc))
+            return
+        selected = self._selected_keys()
+        self._table.begin_populate()
+        self._table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            key: _RowKey = (row.role, row.channel_id, row.destination or "")
+            cells = [
+                row.name,
+                row.status,
+                row.direction,
+                row.method,
+                "Logs",  # clickable cell -> open_logs (see _on_cell_clicked)
+                _fmt_int(row.queue_depth),
+                _fmt_secs(row.idle_seconds),
+                _fmt_int(row.alerts_active),
+                _fmt_int(row.errored),
+                _fmt_int(row.read),
+                _fmt_int(row.written),
+                row.peer or "",
+                _fmt_int(row.port),
+                _fmt_secs(row.backlog_seconds),
+                _fmt_secs(row.delivered_age_seconds),
+            ]
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if c == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, key)
+                elif c == _LOGS_COL:
+                    _style_link(item)
+                self._table.setItem(r, c, item)
+        self._table.end_populate(autosize=autosize or not self._loaded)
+        self._loaded = True
+        self._reselect(selected)
+
+    def reload(self) -> None:
+        """User-initiated load (nav/open) — autosizes columns to contents."""
+        self.refresh(autosize=True)
+
+    # --- selection -----------------------------------------------------------
+
+    def _selected_keys(self) -> list[_RowKey]:
+        model = self._table.selectionModel()
+        if model is None:
+            return []
+        keys: list[_RowKey] = []
+        for index in model.selectedRows():
+            item = self._table.item(index.row(), 0)
+            data = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if data:
+                keys.append((data[0], data[1], data[2]))
+        return keys
+
+    def _reselect(self, keys: list[_RowKey]) -> None:
+        model = self._table.selectionModel()
+        if model is None or not keys:
+            self._sync_toolbar()
+            return
+        wanted = set(keys)
+        self._table.blockSignals(True)
+        model.clearSelection()
+        flags = QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        for r in range(self._table.rowCount()):
+            item = self._table.item(r, 0)
+            data = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if data and (data[0], data[1], data[2]) in wanted:
+                model.select(self._table.model().index(r, 0), flags)
+        self._table.blockSignals(False)
+        self._sync_toolbar()
+
+    def _sync_toolbar(self) -> None:
+        has = bool(self._selected_keys())
+        self._start.setEnabled(has)
+        self._stop.setEnabled(has)
+        self._actions.setEnabled(has)
+
+    # --- actions -------------------------------------------------------------
+
+    def _inbound_action(self, action: Callable[[str], None]) -> None:
+        """Start/Stop/Restart the inbound connection(s) in the selected source rows."""
+        names: list[str] = []
+        for role, channel_id, _dest in self._selected_keys():
+            if role == "source" and channel_id not in names:
+                names.append(channel_id)
+        if not names:
+            self.error.emit("Select one or more inbound (source) rows.")
+            return
+        try:
+            for name in names:
+                action(name)
+        except ApiError as exc:
+            self.error.emit(str(exc))
+            return
+        self.refresh()
+
+    def _purge(self, scope: str) -> None:
+        """Purge the queue of the outbound connection(s) in the selected destination rows."""
+        names: list[str] = []
+        for role, _channel_id, dest in self._selected_keys():
+            if role == "destination" and dest and dest not in names:
+                names.append(dest)
+        if not names:
+            self.error.emit("Select one or more outbound (destination) rows to purge.")
+            return
+        if scope == "all":
+            # Bulk + destructive: cancels every queued delivery (they won't retry). Confirm, default
+            # No, so an accidental click next to "Purge Top Message" can't wipe a queue (review M-28).
+            answer = QMessageBox.question(
+                self,
+                "Purge all queued messages",
+                f"Cancel ALL queued deliveries to {', '.join(names)}?\n\n"
+                "Queued messages won't be sent and won't retry. This can't be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            for name in names:
+                self._client.purge_connection(name, scope)
+        except ApiError as exc:
+            self.error.emit(str(exc))
+            return
+        self.refresh()
+
+    def _on_cell_clicked(self, row: int, col: int) -> None:
+        if col != _LOGS_COL:
+            return
+        item = self._table.item(row, 0)
+        key = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if key:
+            self.open_logs.emit(key[1])  # channel_id
