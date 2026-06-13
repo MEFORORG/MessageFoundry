@@ -179,6 +179,19 @@ def test_verify_tls_false_refused_without_escape(monkeypatch: pytest.MonkeyPatch
         _dest(verify_tls=False)
 
 
+def test_soap_credentials_over_cleartext_http_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SOAP reuses REST's cleartext-credential guard: bearer/basic over plain http is refused.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with pytest.raises(ValueError, match="cleartext http"):
+        build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.SOAP,
+                settings=Soap(url="http://api.example.com/svc", bearer_token="tok").settings,
+            )
+        )
+
+
 def test_egress_shares_allowed_http() -> None:
     bad = Destination(
         name="x",

@@ -19,6 +19,7 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.config.wiring import (
     Database,
+    DatabasePoll,
     File,
     MLLP,
     Rest,
@@ -42,6 +43,7 @@ __all__ = [
     "File",
     "Rest",
     "Database",
+    "DatabasePoll",
     "Soap",
     "env",
     "AckMode",

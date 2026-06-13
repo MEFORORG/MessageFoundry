@@ -154,6 +154,8 @@ modules loads via `load_config` into a `Registry` that the engine's `RegistryRun
 Messages contain PHI. Access control and the *data* protections are tracked separately — see
 [SECURITY.md](SECURITY.md) (identity, RBAC, action audit) and [PHI.md](PHI.md) (data-at-rest,
 transport, logging, retention, de-identification), which is the authoritative built-vs-planned map.
+The per-interface trust boundaries and STRIDE threats are in
+[security/THREAT-MODEL.md](security/THREAT-MODEL.md) (PW.1–2 / ASVS V15).
 
 **Built today:** authentication + RBAC (PHI views gated by `messages:view_raw` /
 `messages:view_summary`), a user-attributed append-only **audit log** (hash-chained) of who

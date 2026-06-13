@@ -25,21 +25,27 @@ docs/CONNECTIONS.md.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
+    InboundHandler,
     NegativeAckError,
+    SourceConnector,
     register_destination,
+    register_source,
 )
 
-__all__ = ["DatabaseDestination"]
+__all__ = ["DatabaseDestination", "DatabaseSource"]
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +165,44 @@ def _sqlstate(exc: BaseException) -> str | None:
     return None
 
 
+def _import_aioodbc() -> Any:
+    """Import the optional ``aioodbc`` driver, raising a clear install hint if the ``[sqlserver]`` extra
+    isn't present — so a SQLite-only install never touches it until a DATABASE connector is actually used."""
+    try:
+        import aioodbc
+    except ImportError as exc:  # pragma: no cover - exercised only without the extra
+        raise RuntimeError(
+            "DATABASE connector requires the 'sqlserver' extra: "
+            "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)"
+        ) from exc
+    return aioodbc
+
+
+async def _make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> Any:
+    """Create an aioodbc connection pool for ``dsn`` (lazy driver import). The destination wraps
+    execute+commit itself (``autocommit=False``); the source marks each row in its own auto-committed
+    statement (``autocommit=True``)."""
+    aioodbc = _import_aioodbc()
+    return await aioodbc.create_pool(
+        dsn=dsn, minsize=1, maxsize=max(1, pool_max), autocommit=autocommit
+    )
+
+
+def _json_default(value: Any) -> Any:
+    """JSON-serialize DB column types ``json.dumps`` can't handle natively (dates, ``Decimal``, bytes),
+    so a polled row becomes a JSON-object body. An unknown type raises ``TypeError`` (surfaced as a
+    poll error and logged) rather than silently dropping data."""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (bytes, bytearray)):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    raise TypeError(
+        f"DATABASE source cannot serialize a {type(value).__name__} column value to JSON"
+    )
+
+
 class DatabaseDestination(DestinationConnector):
     """Execute one parameterized statement per payload against a SQL database (SQL Server today)."""
 
@@ -178,16 +222,7 @@ class DatabaseDestination(DestinationConnector):
             return self._pool
         async with self._pool_lock:
             if self._pool is None:
-                try:
-                    import aioodbc
-                except ImportError as exc:  # pragma: no cover - exercised only without the extra
-                    raise RuntimeError(
-                        "DATABASE destination requires the 'sqlserver' extra: "
-                        "pip install 'messagefoundry[sqlserver]' (plus the Microsoft ODBC Driver 18)"
-                    ) from exc
-                self._pool = await aioodbc.create_pool(
-                    dsn=self._dsn, minsize=1, maxsize=max(1, self._pool_max), autocommit=False
-                )
+                self._pool = await _make_pool(self._dsn, self._pool_max, autocommit=False)
         return self._pool
 
     async def send(self, payload: str) -> None:
@@ -215,4 +250,174 @@ class DatabaseDestination(DestinationConnector):
             self._pool = None
 
 
+class DatabaseSource(SourceConnector):
+    """Poll a SQL table on an interval, hand each row to the pipeline handler, then mark it processed.
+
+    The File source's *process-then-mark-done* shape (at-least-once), with a query instead of a
+    directory: a cooperatively-cancellable background loop runs the operator-declared ``poll_statement``
+    (a ``SELECT`` of the next batch), hands each row to the handler as a body, and — **only after the
+    handler returns** — runs the optional ``mark_statement`` (an ``UPDATE``/``DELETE`` bound from that
+    row's columns) so the row isn't re-read. A crash before the mark re-emits the row next poll
+    (at-least-once); the downstream pipeline must tolerate duplicates. Poll errors are logged-not-fatal
+    (a bad poll never kills the poller, mirroring the File source).
+
+    **Body shape (payload-agnostic ingress, ADR 0004).** With ``body_column`` set, the body is that one
+    column's value verbatim (e.g. a queue column holding an HL7 message → pair with ``content_type``
+    ``hl7v2`` and it flows through the full HL7 path); unset, the body is the whole row as a JSON object
+    ``{column: value}`` (pair with ``content_type=json`` so the Handler can ``.json()`` it).
+    """
+
+    def __init__(self, config: Source) -> None:
+        s = config.settings
+        for req in ("server", "database", "poll_statement"):
+            if not s.get(req):
+                raise ValueError(f"DATABASE source requires a {req!r} setting")
+        self._dsn = _build_dsn(s)  # fail fast on a weakened-TLS / bad-auth config
+        self._poll_sql = str(s["poll_statement"])
+        mark = s.get("mark_statement")
+        # mark_statement is optional (a read-only/idempotent feed may omit it); its :name params bind
+        # from the polled row's columns, reusing the destination's named-parameter translation.
+        self._mark_sql: str | None
+        self._mark_sql, self._mark_names = _parse_named_params(str(mark)) if mark else (None, [])
+        self._body_column: str | None = s.get("body_column") or None
+        self._poll_seconds = float(s.get("poll_seconds", 5.0))
+        self._encoding: str = s.get("encoding", "utf-8")
+        self._pool_max = int(s.get("pool_max", 5))
+        self._pool: Any = None
+        self._pool_lock = asyncio.Lock()
+        self._handler: InboundHandler | None = None
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self, handler: InboundHandler) -> None:
+        self._handler = handler
+        self._stop.clear()
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task is not None:
+            # return_exceptions: a faulted poll task must not re-raise here — stop() runs during reload
+            # quiesce, outside its rollback (mirrors the File source's belt-and-suspenders).
+            await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
+        await self.aclose()
+
+    async def _get_pool(self) -> Any:
+        if self._pool is not None:
+            return self._pool
+        async with self._pool_lock:
+            if self._pool is None:
+                # autocommit: each mark is its own committed statement, giving per-row mark durability.
+                self._pool = await _make_pool(self._dsn, self._pool_max, autocommit=True)
+        return self._pool
+
+    async def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self._poll_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A poll error (connection drop, a bad poll_statement, an unserializable column) must
+                # NOT kill the poller — that would silently stop the connection from receiving while it
+                # still reports running. Log and retry on the next interval (mirrors the File source).
+                logger.exception("DATABASE source poll failed; retrying next interval")
+            try:
+                await asyncio.wait_for(self._stop.wait(), self._poll_seconds)
+            except asyncio.TimeoutError:
+                pass  # poll interval elapsed; poll again
+
+    async def _poll_once(self) -> None:
+        assert self._handler is not None
+        columns, rows = await self._select()
+        for row in rows:
+            if self._stop.is_set():
+                break  # shutting down — leave the rest unmarked for the next start (at-least-once)
+            record = dict(zip(columns, row))
+            try:
+                body = self._body(record)
+            except (ValueError, TypeError) as exc:
+                # A row we can't turn into a body (missing body_column, unserializable value) is a
+                # config/data error for that row — log and skip it rather than wedging the batch.
+                logger.error("DATABASE source: %s; skipping row", exc)
+                continue
+            try:
+                await self._handler(body.encode(self._encoding))
+            except Exception as exc:
+                # The handler records every message-level outcome itself (parse/route → ERROR) and
+                # returns, so an exception here is an infrastructure failure (the durable store write
+                # failed). Leave the row UNMARKED so the next poll re-emits it (at-least-once) — marking
+                # it now would drop a received-but-unrecorded message (mirrors the File source's M-15).
+                logger.warning(
+                    "DATABASE source handler failed (row left unmarked, will retry): %s", exc
+                )
+                continue
+            try:
+                await self._mark(record)
+            except Exception as exc:
+                # The handler already ingested the message; a mark failure means the row re-emits next
+                # poll (a duplicate — at-least-once). Log and move on rather than abort the batch tail.
+                logger.warning(
+                    "DATABASE source mark failed (row will re-emit, a duplicate): %s", exc
+                )
+
+    async def _select(self) -> tuple[list[str], list[Any]]:
+        """Run ``poll_statement`` and return ``(column_names, rows)``. The connection is released before
+        the rows are handed to the (possibly slow) handler, so a batch never holds a pool connection
+        hostage to downstream store I/O."""
+        pool = await self._get_pool()
+        conn = await pool.acquire()
+        try:
+            cur = await conn.cursor()
+            await cur.execute(self._poll_sql)
+            columns = [d[0] for d in cur.description]
+            rows = list(await cur.fetchall())
+        finally:
+            await pool.release(conn)
+        return columns, rows
+
+    def _body(self, record: dict[str, Any]) -> str:
+        """The body for one row: a single column verbatim (``body_column``) or the whole row as JSON."""
+        if self._body_column is not None:
+            try:
+                value = record[self._body_column]
+            except KeyError:
+                raise ValueError(
+                    f"body_column {self._body_column!r} is not in the poll_statement result columns"
+                ) from None
+            if isinstance(value, (bytes, bytearray)):
+                return bytes(value).decode(self._encoding)
+            return value if isinstance(value, str) else str(value)
+        return json.dumps(record, default=_json_default)
+
+    async def _mark(self, record: dict[str, Any]) -> None:
+        if self._mark_sql is None:
+            return
+        try:
+            params = tuple(record[n] for n in self._mark_names)
+        except KeyError as exc:
+            # mark_statement references a column the poll_statement didn't select — a static config
+            # error. Log loudly and leave the row unmarked (it re-emits) rather than crash the poller.
+            logger.error(
+                "DATABASE source mark_statement references unknown column %s; row left unmarked",
+                exc,
+            )
+            return
+        pool = await self._get_pool()
+        conn = await pool.acquire()
+        try:
+            cur = await conn.cursor()
+            await cur.execute(self._mark_sql, params)
+        finally:
+            await pool.release(conn)
+
+    async def aclose(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
+            await self._pool.wait_closed()
+            self._pool = None
+
+
 register_destination(ConnectorType.DATABASE, DatabaseDestination)
+register_source(ConnectorType.DATABASE, DatabaseSource)

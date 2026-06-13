@@ -19,6 +19,7 @@ from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.file import (
     DEFAULT_MAX_FILE_BYTES,
+    FileSource,
     _claim_unique,
     render_filename,
 )
@@ -442,6 +443,78 @@ async def test_file_source_recursive_descends_subdirs(tmp_path: Path) -> None:
         await src.stop()
         await task
     assert received == [ADT.encode("utf-8")]
+
+
+def test_file_source_within_root_rejects_escaping_path(tmp_path: Path) -> None:
+    # Path-confinement (3.2): a candidate that resolves outside the watch root is rejected, so a
+    # recursive scan can't be walked out of its directory via a symlink.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    inside = inbox / "ok.hl7"
+    inside.write_bytes(b"MSH|x\r")
+    secret = outside / "secret.hl7"
+    secret.write_bytes(b"MSH|x\r")
+    src = build_source(Source(type=ConnectorType.FILE, settings={"directory": str(inbox)}))
+    assert isinstance(src, FileSource)
+    assert src._within_root(inside) is True
+    assert src._within_root(secret) is False
+
+
+async def test_file_source_skips_symlink_escaping_watch_root(tmp_path: Path) -> None:
+    # End-to-end: a symlinked subdir pointing outside the root must never let the poller deliver a
+    # file from outside the configured directory (whether or not rglob follows the symlink).
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.hl7").write_bytes(ADT.encode("utf-8"))
+    try:
+        (inbox / "link").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported / not permitted on this platform")
+
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "pattern": "*.hl7",
+                "poll_seconds": 0.01,
+                "recursive": True,
+            },
+        )
+    )
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await asyncio.sleep(0.1)  # several poll intervals; the escaping file must never arrive
+    finally:
+        await src.stop()
+        await task
+    assert received == []
+
+
+async def test_file_destination_refuses_path_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Defence in depth (3.2): even if a filename slipped past sanitization with a path component,
+    # the destination refuses to write outside its configured directory.
+    out = tmp_path / "out"
+    dest = build_destination(
+        Destination(name="OB", type=ConnectorType.FILE, settings={"directory": str(out)})
+    )
+    monkeypatch.setattr(
+        "messagefoundry.transports.file.render_filename", lambda *a, **k: "../escape.hl7"
+    )
+    with pytest.raises(DeliveryError, match="outside the destination directory"):
+        await dest.send("MSH|x\r")
+    assert not (tmp_path / "escape.hl7").exists()
 
 
 async def test_file_source_sort_mtime_orders_by_time(tmp_path: Path) -> None:

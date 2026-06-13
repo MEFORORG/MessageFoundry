@@ -240,6 +240,29 @@ def test_serve_warns_in_prod_without_key(
     assert "UNENCRYPTED at rest" in capsys.readouterr().err
 
 
+def test_serve_warns_in_staging_without_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # staging may carry real PHI too, so the keyless at-rest warning fires there as well (3.1).
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]) == 0
+    err = capsys.readouterr().err
+    assert "UNENCRYPTED at rest" in err and "staging" in err
+
+
+def test_serve_quiet_in_dev_without_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # dev is synthetic-only by policy, so the keyless warning stays quiet to avoid alarm fatigue.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    assert "UNENCRYPTED at rest" not in capsys.readouterr().err
+
+
 # --- non-loopback API bind guard (--allow-insecure-bind) ---------------------
 
 

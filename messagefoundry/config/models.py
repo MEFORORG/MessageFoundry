@@ -26,7 +26,8 @@ class ConnectorType(str, Enum):
     REST = "rest"  # generic HTTP destination (ADR 0003)
     DATABASE = "database"  # SQL destination — SQL Server first (ADR 0003)
     SOAP = "soap"  # SOAP / web-service destination over HTTP (ADR 0003)
-    # Sources await payload-agnostic ingress. Future: TCP, FHIR
+    # DATABASE also has an inbound poll source (DatabasePoll, ADR 0003 §3 + 0004). REST/SOAP sources
+    # (HTTP listeners) and TCP/FHIR are future.
 
 
 class ContentType(str, Enum):

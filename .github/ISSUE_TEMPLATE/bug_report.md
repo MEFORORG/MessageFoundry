@@ -1,38 +1,41 @@
 ---
 name: Bug report
-about: Create a report to help us improve
+about: Report a problem with the MessageFoundry engine, console, or IDE tooling
 title: ''
-labels: ''
+labels: bug
 assignees: ''
-
 ---
+
+> ⚠️ **Never paste real PHI / patient data.** MessageFoundry processes HL7 in real
+> deployments — use **synthetic** messages only (`messagefoundry generate ...`) and redact
+> any IPs, hostnames, partner names, or message bodies before sharing. Security
+> vulnerabilities should be reported privately, not here — see
+> [SECURITY.md](../SECURITY.md).
 
 **Describe the bug**
 A clear and concise description of what the bug is.
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+**To reproduce**
+Steps to reproduce the behavior — include the relevant config (Connection/Router/Handler) and a
+**synthetic** sample message where applicable:
+1. Configure '...'
+2. Send / poll '...'
+3. Observe '...'
 
 **Expected behavior**
-A clear and concise description of what you expected to happen.
+What you expected to happen.
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
+**Actual behavior / logs**
+What happened instead. Include the relevant log lines or stack trace (redact PHI and any
+host/partner identifiers).
 
-**Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
-
-**Smartphone (please complete the following information):**
- - Device: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - Browser [e.g. stock browser, safari]
- - Version [e.g. 22]
+**Environment**
+- MessageFoundry version: <!-- `messagefoundry --version` -->
+- OS: <!-- e.g. Windows Server 2022 / Ubuntu 24.04 -->
+- Python version: <!-- `python --version` -->
+- Store backend: <!-- SQLite (default) / SQL Server (experimental) -->
+- Component: <!-- engine / console / IDE extension -->
+- Transport(s) involved: <!-- MLLP / file / database / REST / SOAP -->
 
 **Additional context**
-Add any other context about the problem here.
+Anything else that helps — message type/trigger, whether it's reproducible, recent changes, etc.

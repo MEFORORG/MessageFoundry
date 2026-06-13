@@ -231,12 +231,16 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if settings.ai.environment.value == "prod":
+        # Warn in any environment that may carry real PHI (staging + prod). dev is synthetic-only by
+        # policy (CLAUDE.md §9 / docs/PHI.md), so it stays quiet to avoid alarm fatigue.
+        if settings.ai.environment.value in ("prod", "staging"):
+            env_name = settings.ai.environment.value
             print(
-                "warning: no MEFOR_STORE_ENCRYPTION_KEY set in a 'prod' environment — PHI bodies and "
-                "the error/last_error/detail columns are stored UNENCRYPTED at rest (only volume "
-                "encryption protects them). Generate a key with `messagefoundry gen-key` (or protect "
-                "one to a file with `messagefoundry protect-key`), or set [store].require_encryption.",
+                f"warning: no MEFOR_STORE_ENCRYPTION_KEY set in a {env_name!r} environment — PHI "
+                "bodies and the error/last_error/detail columns are stored UNENCRYPTED at rest (only "
+                "volume encryption protects them). Generate a key with `messagefoundry gen-key` (or "
+                "protect one to a file with `messagefoundry protect-key`), or set "
+                "[store].require_encryption.",
                 file=sys.stderr,
             )
 

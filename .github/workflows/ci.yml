@@ -158,6 +158,10 @@ jobs:
           MEFOR_STORE_USERNAME: sa
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
           MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          # The service container uses a self-signed cert, so trust_server_certificate=true is
+          # required to connect. The store's TLS-hardening guard refuses that MITM-able combination
+          # unless this escape is set — exactly the trusted-network dev/test case it exists for.
+          MEFOR_ALLOW_INSECURE_TLS: "1"
         run: pytest tests/test_sqlserver_store.py -v
 
   # End-to-end check of the real Windows service path on both target Server

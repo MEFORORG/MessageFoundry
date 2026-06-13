@@ -57,6 +57,7 @@ __all__ = [
     "File",
     "Rest",
     "Database",
+    "DatabasePoll",
     "Soap",
     "Send",
     "EnvRef",
@@ -345,6 +346,64 @@ def Database(
             "app_name": app_name,
             "odbc_driver": odbc_driver,
             "pool_max": pool_max,
+        },
+    )
+
+
+def DatabasePoll(
+    *,
+    server: str | EnvRef,  # SQL Server host (may be env())
+    database: str | EnvRef,
+    poll_statement: str,  # SELECT of the next batch (e.g. WHERE status='NEW' ORDER BY id)
+    mark_statement: str
+    | None = None,  # UPDATE/DELETE run per row after the handler succeeds (:name)
+    body_column: str | None = None,  # None → whole row as JSON; set → that column's value verbatim
+    poll_seconds: float = 5.0,
+    auth: str = "sql",  # sql | integrated | entra
+    username: str | EnvRef | None = None,
+    password: str | EnvRef | None = None,  # secret — use env()
+    port: int | EnvRef = 1433,
+    encrypt: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    trust_server_certificate: bool = False,
+    connect_timeout: int = 15,
+    app_name: str = "messagefoundry",
+    odbc_driver: str = "ODBC Driver 18 for SQL Server",
+    pool_max: int = 5,
+    encoding: str = "utf-8",
+) -> ConnectionSpec:
+    """A SQL database polling **source** (inbound, ADR 0003 §3; SQL Server via the ``[sqlserver]`` extra +
+    ODBC Driver 18 — **experimental**). Every ``poll_seconds`` it runs ``poll_statement`` (a ``SELECT``),
+    hands each row to the bound router as a body, then runs ``mark_statement`` (bound from the row's
+    columns) so the row isn't re-read — the File source's *process-then-mark-done* shape. At-least-once:
+    a crash before the mark re-emits the row, so the downstream pipeline **must tolerate duplicates**.
+
+    Lead pattern is a status column: ``poll_statement='SELECT id, payload FROM mf_inbox WHERE status=\\'NEW\\''``
+    + ``mark_statement='UPDATE mf_inbox SET status=\\'DONE\\' WHERE id=:id'`` (a ``DELETE`` or a
+    high-water-mark ``UPDATE`` work through the same ``mark_statement``). ``body_column`` unset → the
+    whole row as a JSON object (pair with ``content_type=json``); set → that one column's value verbatim
+    (e.g. a column holding an HL7 message → ``content_type=hl7v2``). Put secrets (``password``) in
+    ``env()``; TLS is on by default (weakening needs ``MEFOR_ALLOW_INSECURE_TLS``); the polled ``server``
+    is gated by ``[egress].allowed_db``."""
+    return ConnectionSpec(
+        ConnectorType.DATABASE,
+        {
+            "server": server,
+            "database": database,
+            "poll_statement": poll_statement,
+            "mark_statement": mark_statement,
+            "body_column": body_column,
+            "poll_seconds": poll_seconds,
+            "auth": auth,
+            "username": username,
+            "password": password,
+            "port": port,
+            "encrypt": encrypt,
+            "trust_server_certificate": trust_server_certificate,
+            "connect_timeout": connect_timeout,
+            "app_name": app_name,
+            "odbc_driver": odbc_driver,
+            "pool_max": pool_max,
+            "encoding": encoding,
         },
     )
 

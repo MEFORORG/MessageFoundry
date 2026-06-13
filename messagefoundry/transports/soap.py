@@ -45,6 +45,7 @@ from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     _insecure_opener,
     _redact_url,
+    refuse_cleartext_credentials,
 )
 
 __all__ = ["SoapDestination"]
@@ -107,6 +108,7 @@ class SoapDestination(DestinationConnector):
                 f"SOAP destination soap_version must be 1.1 or 1.2, got {self.version!r}"
             )
         self._headers = self._build_headers(s)
+        refuse_cleartext_credentials(scheme, self._headers, self.url)
         if bool(s.get("verify_tls", True)):
             self._opener = _NO_REDIRECT_OPENER
         else:

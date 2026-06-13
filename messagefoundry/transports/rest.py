@@ -44,7 +44,7 @@ from messagefoundry.transports.base import (
     register_destination,
 )
 
-__all__ = ["RestDestination"]
+__all__ = ["RestDestination", "refuse_cleartext_credentials"]
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,25 @@ def _redact_url(url: str) -> str:
     return f"{p.scheme}://{p.hostname or ''}{port}{p.path}"
 
 
+def refuse_cleartext_credentials(scheme: str, headers: dict[str, str], url: str) -> None:
+    """Refuse to send credentials over a cleartext (``http``) channel.
+
+    Basic/bearer auth in an ``Authorization`` header over plain ``http`` puts the credential on the
+    wire (and the body is PHI). Mirrors the ``verify_tls=false`` posture: refused unless the explicit
+    dev/trusted-network escape ``MEFOR_ALLOW_INSECURE_TLS`` is set, and logged loudly when allowed.
+    Shared by the REST and SOAP destinations (SOAP reuses REST's HTTP plumbing)."""
+    if scheme != "http" or "Authorization" not in headers:
+        return
+    if not insecure_tls_allowed():
+        raise ValueError(
+            "destination sends credentials (Authorization header) over cleartext http; refused "
+            f"unless {INSECURE_TLS_ESCAPE_ENV} is set — use https"
+        )
+    logger.warning(
+        "destination %s sends credentials over CLEARTEXT http (no TLS)", _redact_url(url)
+    )
+
+
 class RestDestination(DestinationConnector):
     """Deliver each transformed payload to an HTTP(S) endpoint (outbound only today)."""
 
@@ -105,6 +124,7 @@ class RestDestination(DestinationConnector):
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.encoding: str = s.get("encoding", "utf-8")
         self._headers = self._build_headers(s)
+        refuse_cleartext_credentials(scheme, self._headers, self.url)
         if bool(s.get("verify_tls", True)):
             self._opener = _NO_REDIRECT_OPENER
         else:

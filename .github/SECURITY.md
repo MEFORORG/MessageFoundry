@@ -20,8 +20,25 @@ Please include: affected component (e.g. MLLP/file transport, store, API/auth, c
 a description and impact, and reproduction steps or a proof of concept. Do **not** include
 real PHI — use synthetic HL7 (the `messagefoundry generate` corpus is ideal).
 
-We aim to acknowledge within a few business days, agree on a disclosure timeline, and credit
-reporters who wish to be named once a fix is released.
+We aim to acknowledge within a few business days and credit reporters who wish to be named once a
+fix is released.
+
+## Response & remediation timeline
+
+After we acknowledge a report, we triage it by severity and target these remediation windows
+(measured from triage; fixes are verified before a report is closed):
+
+| Severity | Target to remediate |
+|---|---|
+| Critical | ≤ 7 days |
+| High | ≤ 30 days |
+| Medium | ≤ 90 days |
+| Low | Best-effort |
+
+**Coordinated disclosure.** We practice coordinated disclosure: we ask that you give us a reasonable
+window to ship a fix before any public detail, and we publish details (and credit, if wanted) **once
+a fix is available**. We'll keep you updated on progress and agree the disclosure timing with you.
+These windows trace to the project's Secure Development Standards (§4.4 RV.2, Appendix A.5).
 
 ## Scope notes
 

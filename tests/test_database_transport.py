@@ -7,18 +7,23 @@ CI-service-container-gated, like the SQL Server store backend).
 
 from __future__ import annotations
 
+import base64
+import json
+from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 import pytest
 
-from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.wiring import Database, WiringError
-from messagefoundry.pipeline.wiring_runner import check_egress_allowed
-from messagefoundry.transports import build_destination
+from messagefoundry.config.wiring import Database, DatabasePoll, WiringError
+from messagefoundry.pipeline.wiring_runner import check_egress_allowed, check_source_allowed
+from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.database import (
     DatabaseDestination,
+    DatabaseSource,
     _bind_params,
     _build_dsn,
     _classify_db_error,
@@ -248,3 +253,245 @@ def test_egress_host_port_match() -> None:
 
 def test_egress_unrestricted_when_empty() -> None:
     check_egress_allowed(_db_dest("anywhere.example"), EgressSettings())  # empty = unrestricted
+
+
+# === DATABASE source (poll) ==================================================
+# Like the destination tests, the driver is never imported — a fake pool/cursor stands in, so the
+# poll/mark/body logic is unit-tested without a real SQL Server.
+
+POLL = "SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id"
+MARK = "UPDATE mf_inbox SET status='DONE' WHERE id=:id"
+
+
+def _src(**over: Any) -> DatabaseSource:
+    base: dict[str, Any] = dict(
+        server="sql.example.com", database="MFDB", poll_statement=POLL, mark_statement=MARK
+    )
+    base.update(over)
+    s = build_source(Source(type=ConnectorType.DATABASE, settings=DatabasePoll(**base).settings))
+    assert isinstance(s, DatabaseSource)
+    return s
+
+
+class _RecordingHandler:
+    def __init__(self, exc: Exception | None = None) -> None:
+        self.bodies: list[bytes] = []
+        self._exc = exc
+
+    async def __call__(self, raw: bytes) -> str | None:
+        self.bodies.append(raw)
+        if self._exc is not None:
+            raise self._exc
+        return None
+
+
+class _SrcCursor:
+    def __init__(
+        self,
+        columns: list[str],
+        rows: list[tuple[Any, ...]],
+        *,
+        poll_exc: Exception | None = None,
+        mark_exc: Exception | None = None,
+    ) -> None:
+        self.description = [(c,) for c in columns]
+        self._rows = rows
+        self._poll_exc = poll_exc
+        self._mark_exc = mark_exc
+        self.marks: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
+        if params is None:  # the poll SELECT
+            if self._poll_exc is not None:
+                raise self._poll_exc
+        else:  # a per-row mark
+            self.marks.append((sql, params))
+            if self._mark_exc is not None:
+                raise self._mark_exc
+
+    async def fetchall(self) -> list[tuple[Any, ...]]:
+        return list(self._rows)
+
+
+class _SrcConn:
+    def __init__(self, cur: _SrcCursor) -> None:
+        self._cur = cur
+
+    async def cursor(self) -> _SrcCursor:
+        return self._cur
+
+
+class _SrcPool:
+    def __init__(self, conn: _SrcConn) -> None:
+        self._conn = conn
+        self.closed = False
+
+    async def acquire(self) -> _SrcConn:
+        return self._conn
+
+    async def release(self, conn: _SrcConn) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+async def _run_poll(
+    src: DatabaseSource,
+    columns: list[str],
+    rows: list[tuple[Any, ...]],
+    handler: _RecordingHandler,
+    **cur_kw: Any,
+) -> _SrcCursor:
+    cur = _SrcCursor(columns, rows, **cur_kw)
+    src._pool = _SrcPool(_SrcConn(cur))
+    src._handler = handler
+    await src._poll_once()
+    return cur
+
+
+async def test_source_polls_each_row_and_marks_processed() -> None:
+    src = _src(body_column="payload")
+    h = _RecordingHandler()
+    cur = await _run_poll(src, ["id", "payload"], [(1, "AAA"), (2, "BBB")], h)
+    assert h.bodies == [b"AAA", b"BBB"]  # one body per row, verbatim (body_column)
+    assert (
+        cur.marks
+        == [  # :id translated to ?, bound from each row — only AFTER the handler returned
+            ("UPDATE mf_inbox SET status='DONE' WHERE id=?", (1,)),
+            ("UPDATE mf_inbox SET status='DONE' WHERE id=?", (2,)),
+        ]
+    )
+
+
+async def test_source_json_body_is_whole_row() -> None:
+    src = _src(body_column=None, mark_statement=None)
+    h = _RecordingHandler()
+    await _run_poll(src, ["id", "val"], [(1, "x")], h)
+    assert json.loads(h.bodies[0]) == {"id": 1, "val": "x"}
+
+
+async def test_source_json_serializes_dates_decimal_bytes() -> None:
+    src = _src(body_column=None, mark_statement=None)
+    h = _RecordingHandler()
+    await _run_poll(
+        src, ["t", "amt", "blob"], [(datetime(2026, 6, 12, 8, 30), Decimal("1.50"), b"\x00\x01")], h
+    )
+    obj = json.loads(h.bodies[0])
+    assert obj["t"] == "2026-06-12T08:30:00"
+    assert obj["amt"] == "1.50"  # Decimal → str (no float rounding)
+    assert obj["blob"] == base64.b64encode(b"\x00\x01").decode("ascii")
+
+
+async def test_source_body_column_decodes_bytes_verbatim() -> None:
+    src = _src(body_column="payload", mark_statement=None)
+    h = _RecordingHandler()
+    hl7 = "MSH|^~\\&|A|B".encode()
+    await _run_poll(src, ["id", "payload"], [(1, hl7)], h)
+    assert h.bodies[0] == hl7  # a column holding an HL7 message round-trips byte-for-byte
+
+
+async def test_source_handler_failure_leaves_row_unmarked() -> None:
+    src = _src(body_column="payload")
+    h = _RecordingHandler(exc=RuntimeError("store write failed"))
+    cur = await _run_poll(src, ["id", "payload"], [(1, "AAA")], h)
+    assert h.bodies == [b"AAA"]  # handler was attempted
+    assert cur.marks == []  # but the row is NOT marked → it re-emits next poll (at-least-once)
+
+
+async def test_source_mark_failure_does_not_abort_batch_tail() -> None:
+    src = _src(body_column="payload")
+    h = _RecordingHandler()
+    cur = await _run_poll(
+        src, ["id", "payload"], [(1, "A"), (2, "B")], h, mark_exc=Exception("08S01", "deadlock")
+    )
+    assert h.bodies == [b"A", b"B"]  # both rows handled despite the first mark erroring
+    assert len(cur.marks) == 2  # both marks attempted (the error is logged, not fatal)
+
+
+async def test_source_without_mark_statement_does_not_mark() -> None:
+    src = _src(body_column="payload", mark_statement=None)
+    h = _RecordingHandler()
+    cur = await _run_poll(src, ["id", "payload"], [(1, "A")], h)
+    assert h.bodies == [b"A"]
+    assert cur.marks == []
+
+
+async def test_source_missing_body_column_skips_row() -> None:
+    src = _src(body_column="nope")
+    h = _RecordingHandler()
+    cur = await _run_poll(src, ["id", "payload"], [(1, "A")], h)
+    assert h.bodies == []  # no body could be built → row skipped, not delivered
+    assert cur.marks == []
+
+
+async def test_source_run_loop_survives_a_poll_error() -> None:
+    src = _src(body_column="payload")
+    calls: list[int] = []
+
+    async def boom() -> None:
+        calls.append(1)
+        src._stop.set()  # exit the loop after this one iteration
+        raise RuntimeError("poll blew up")
+
+    src._poll_once = boom  # type: ignore[method-assign]
+    src._poll_seconds = 0.0
+    await src._run()  # must NOT propagate — a bad poll never kills the poller
+    assert calls == [1]
+
+
+async def test_source_stop_closes_the_pool() -> None:
+    src = _src(body_column="payload")
+    pool = _SrcPool(_SrcConn(_SrcCursor(["id", "payload"], [])))
+    src._pool = pool
+
+    async def handler(raw: bytes) -> str | None:
+        return None
+
+    await src.start(handler)
+    await src.stop()
+    assert src._task is None
+    assert pool.closed  # aclose drained the pool
+
+
+@pytest.mark.parametrize("missing", ["server", "database", "poll_statement"])
+def test_source_requires_core_settings(missing: str) -> None:
+    base: dict[str, Any] = dict(server="s", database="d", poll_statement=POLL)
+    base[missing] = ""
+    with pytest.raises(ValueError):
+        build_source(Source(type=ConnectorType.DATABASE, settings=DatabasePoll(**base).settings))
+
+
+# --- source connect-allowlist ([egress].allowed_db) --------------------------
+
+
+def _src_cfg(server: str, port: int = 1433) -> Source:
+    return Source(
+        type=ConnectorType.DATABASE,
+        settings=DatabasePoll(server=server, database="d", poll_statement=POLL, port=port).settings,
+    )
+
+
+def test_source_connect_blocks_unlisted_server() -> None:
+    with pytest.raises(WiringError):
+        check_source_allowed(
+            _src_cfg("other.example.com"), "IB_DB", EgressSettings(allowed_db=["sql.example.com"])
+        )
+
+
+def test_source_connect_permits_listed_server() -> None:
+    check_source_allowed(
+        _src_cfg("sql.example.com"), "IB_DB", EgressSettings(allowed_db=["sql.example.com"])
+    )
+
+
+def test_source_connect_unrestricted_when_empty() -> None:
+    check_source_allowed(_src_cfg("anywhere.example"), "IB_DB", EgressSettings())
+
+
+def test_source_connect_ignores_non_database_source() -> None:
+    mllp = Source(type=ConnectorType.MLLP, settings={"port": 2575})
+    check_source_allowed(mllp, "IB_MLLP", EgressSettings(allowed_db=["sql.example.com"]))

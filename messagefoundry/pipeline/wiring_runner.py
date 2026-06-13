@@ -215,7 +215,9 @@ class RegistryRunner:
                 f"inbound connection {name!r}: ack_after='delivered' is not yet implemented "
                 "(Step A ships ACK-on-receipt only — use ack_after='ingest', the default)"
             )
-        source = build_source(_source_config(ic, self._inbound_bind_host, self._env_values))
+        source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
+        check_source_allowed(source_cfg, ic.name, self._egress)  # fail-closed connect allowlist
+        source = build_source(source_cfg)
         # Bind BEFORE registering: a failed bind (e.g. port in use) must not leave a dead source in
         # _sources, where inbound_running() would report True and a retry would no-op (review M-9).
         await source.start(self._make_handler(ic))
@@ -378,7 +380,9 @@ class RegistryRunner:
         Raises :class:`WiringError` so the API maps it to 422 like other invalid-config errors."""
         try:
             for ic in registry.inbound.values():
-                build_source(_source_config(ic, self._inbound_bind_host, self._env_values))
+                source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
+                check_source_allowed(source_cfg, ic.name, self._egress)
+                build_source(source_cfg)
             for oc in registry.outbound.values():
                 dest = _dest_config(oc, self._env_values)
                 check_egress_allowed(dest, self._egress)  # fail-closed egress allowlist (WP-11c)
@@ -979,6 +983,27 @@ def _dest_config(oc: OutboundConnection, env_values: Mapping[str, Any]) -> Desti
         settings=resolve_env_settings(oc.spec.settings, env_values),
         retry=oc.retry or RetryPolicy(),
     )
+
+
+def check_source_allowed(source: Source, name: str, egress: EgressSettings) -> None:
+    """Fail-closed connect-allowlist for an inbound connector that **dials out** to a server to receive
+    (today: the DATABASE source, which polls a SQL host). Reuses ``[egress].allowed_db``: although the
+    DB source pulls data *in* rather than exfiltrating it, it still opens an outbound connection to an
+    operator-named host, so the same allowlist guards against pointing the engine at an arbitrary
+    server. Opt-in (an empty list = unrestricted), matching destinations; checked at load/reload/start."""
+    if source.type is ConnectorType.DATABASE and egress.allowed_db:
+        host = str(source.settings.get("server", ""))
+        port = source.settings.get("port", 1433)
+        if not _mllp_egress_allowed(host, port, egress.allowed_db):  # same host[:port] matching
+            log.warning(
+                "connect denied: inbound %r DATABASE server %r not in [egress].allowed_db",
+                name,
+                host,
+            )
+            raise WiringError(
+                f"inbound {name!r}: DATABASE server {host!r} is not in the "
+                "[egress].allowed_db allowlist"
+            )
 
 
 def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:

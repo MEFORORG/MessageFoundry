@@ -134,6 +134,43 @@ def test_rest_verify_tls_false_allowed_with_escape(monkeypatch: pytest.MonkeyPat
     assert dest._opener is not None
 
 
+def test_rest_credentials_over_cleartext_http_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Basic/bearer over plain http leaks the credential — refused unless the explicit escape is set.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with pytest.raises(ValueError, match="cleartext http"):
+        build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.REST,
+                settings=Rest(url="http://api.example.com/x", bearer_token="tok").settings,
+            )
+        )
+
+
+def test_rest_credentials_over_cleartext_http_allowed_with_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    dest = build_destination(
+        Destination(
+            name="OB",
+            type=ConnectorType.REST,
+            settings=Rest(url="http://api.example.com/x", bearer_token="tok").settings,
+        )
+    )
+    assert isinstance(dest, RestDestination)  # built (warns), not refused
+
+
+def test_rest_cleartext_http_without_credentials_is_allowed() -> None:
+    # No Authorization header → nothing to leak → plain http is fine (e.g. a loopback sink).
+    dest = build_destination(
+        Destination(
+            name="OB", type=ConnectorType.REST, settings=Rest(url="http://localhost/x").settings
+        )
+    )
+    assert isinstance(dest, RestDestination)
+
+
 def test_rest_egress_allowlist_blocks_unlisted_host() -> None:
     dest = Destination(
         name="OB", type=ConnectorType.REST, settings=Rest(url="https://evil.example.net/x").settings

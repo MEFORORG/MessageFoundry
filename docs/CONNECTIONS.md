@@ -36,7 +36,7 @@ Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sa
 | `SOAP-OUT` | outbound | SOAP client | Web Service Sender | ✅ |
 | `REST-IN` | inbound | HTTP endpoint | HTTP Listener | ⏳ planned † |
 | `REST-OUT` | outbound | HTTP client | HTTP Sender | ✅ |
-| `DB-IN` | inbound | DB poll | Database Reader | ⏳ planned † |
+| `DB-IN` | inbound | DB poll | Database Reader | ✅ (SQL Server, exp.) |
 | `DB-OUT` | outbound | DB write | Database Writer | ✅ |
 | `FHIR-IN` / `FHIR-OUT` | in/out | FHIR endpoint/client | (FHIR connector) | ⏳ planned |
 | `DICOM-IN` / `DICOM-OUT` | in/out | DICOM listener/sender | DICOM Listener/Sender | ⏳ planned |
@@ -49,11 +49,11 @@ these, "waiting for connection" is the *normal, healthy* state (a low‑traffic 
 link that idles), so the Monitor shouldn't flag them. (The Monitor health rule that honors this is not
 yet implemented — the suffix documents intent today.)
 
-† **`REST-IN`**, **`DB-IN`**, and **`SOAP-IN`** (non-HL7 inbound *sources*). The **payload-agnostic
-ingress** contract is now **built** ([ADR 0004](adr/0004-payload-agnostic-ingress.md): an inbound's
-`content_type` selects the HL7 path vs. a `RawMessage` route), so what these rows await is a **source
-connector** (a DB poll, an HTTP listener) on top of it. The **`REST-OUT`**, **`DB-OUT`**, and
-**`SOAP-OUT`** destinations are built (below).
+† **`REST-IN`** and **`SOAP-IN`** (non-HL7 inbound *sources*). The **payload-agnostic ingress** contract
+is **built** ([ADR 0004](adr/0004-payload-agnostic-ingress.md): an inbound's `content_type` selects the
+HL7 path vs. a `RawMessage` route), so what these rows await is a **source connector** (an HTTP listener)
+on top of it. The first source on that contract — the **`DB-IN`** poll (`DatabasePoll(...)`, below) — is
+**built**; the **`REST-OUT`**, **`DB-OUT`**, and **`SOAP-OUT`** destinations are built (below).
 
 ## Authoring a connection
 
@@ -218,7 +218,7 @@ An **outbound** SQL connector ([ADR 0003](adr/0003-non-hl7-transports-database-r
 Server** today, via the `[sqlserver]` extra (`pip install 'messagefoundry[sqlserver]'`) + the Microsoft
 ODBC Driver 18, **lazily imported** (SQLite-only installs unaffected). **Status: experimental**, like
 the SQL Server *store* backend — the live round-trip is exercised only by the CI service-container job.
-There is **no DB source yet** (a DB poll awaits the payload-agnostic ingress of ADR 0003).
+The **inbound** direction is the DB poll source below (`DatabasePoll(...)`).
 
 The Handler produces a **JSON-object** body; the connector binds its keys to the `:name` parameters in
 `statement` (translated to positional ODBC `?` — always parameterized, never string-built) and runs it.
@@ -264,6 +264,62 @@ outbound(
         password=env("acme_sql_password"),
         statement="INSERT INTO obs (mrn, value) VALUES (:mrn, :value)",
     ),
+)
+```
+
+### Database source — `DatabasePoll(...)`
+
+The **inbound** DB poll ([ADR 0003](adr/0003-non-hl7-transports-database-rest-soap.md) §3 + the
+payload-agnostic ingress of [ADR 0004](adr/0004-payload-agnostic-ingress.md)). Same connection settings
+and `[sqlserver]`-extra / experimental status as the destination above; it is the File source's
+*process-then-mark-done* shape with a query instead of a directory. Every `poll_seconds` it runs
+`poll_statement` (a `SELECT`), hands each row to the bound Router as a body, then — **only after the
+handler returns** — runs `mark_statement` (bound from the row's columns) so the row isn't re-read.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `server` | — (required) | SQL Server host. Use `env()` for a DEV/PROD-specific host. |
+| `database` | — (required) | database name |
+| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id` |
+| `mark_statement` | — | run **per row after** the handler succeeds, with `:name` params bound from the row, e.g. `UPDATE mf_inbox SET status='DONE' WHERE id=:id`. Omit only for a genuinely read-only/idempotent feed. |
+| `body_column` | — | unset → the **whole row** as a JSON object `{column: value}` (pair with `content_type=json`); set → that **one column's value verbatim** (e.g. a column holding an HL7 message → `content_type=hl7v2`) |
+| `poll_seconds` | `5.0` | interval between polls |
+| `encoding` | `utf-8` | charset for the body bytes handed to the pipeline |
+| `auth` / `username` / `password` / `port` / `encrypt` / `trust_server_certificate` / `connect_timeout` / `app_name` / `odbc_driver` / `pool_max` | — | identical to the `Database(...)` destination above |
+
+**Mark mechanism — your choice via `mark_statement`.** A **status column** (lead pattern:
+`SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue** (`DELETE … WHERE
+id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor) all work — the connector
+just runs whatever statement you declare, bound from the row.
+
+**Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
+handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
+pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefly down) leaves the row
+**unmarked** so it retries — never marked-and-dropped. A poll error is **logged, not fatal** — a bad
+`poll_statement` or a dropped connection never kills the poller; it retries next interval.
+
+**Security.** TLS is **on by default** (weakening needs `MEFOR_ALLOW_INSECURE_TLS`); the connection
+string brace-quotes every value; secrets go through `env()`. The polled `server` is gated by the same
+fail-closed `[egress].allowed_db` allowlist as the destination — although the source pulls data *in*, it
+still dials out to a host, so the allowlist guards against polling an arbitrary server.
+
+```python
+from messagefoundry import inbound, DatabasePoll, env
+from messagefoundry.config.models import ContentType
+
+inbound(
+    "DB-IN_ACME_ORDERS",
+    DatabasePoll(
+        server=env("acme_sql_host"),
+        database="Orders",
+        username=env("acme_sql_user"),
+        password=env("acme_sql_password"),
+        poll_statement="SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id",
+        mark_statement="UPDATE mf_inbox SET status='DONE' WHERE id=:id",
+        body_column="payload",  # the column holds an HL7 message
+    ),
+    router="route_orders",
+    content_type=ContentType.HL7V2,  # or omit body_column + use ContentType.JSON for a whole-row body
 )
 ```
 
@@ -329,7 +385,7 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **S3 / cloud blob** | ✅ | ~ | ✅ | ❌ | File remote scheme, planned |
 | **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ~ | `REST-OUT` shipped; `REST-IN` planned |
 | **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped; `SOAP-IN` planned |
-| **Database** reader/writer (JDBC/ODBC) | ✅ | ✅ | ✅ | ~ | `DB-OUT` shipped (SQL Server, exp.); `DB-IN` planned |
+| **Database** reader/writer (JDBC/ODBC) | ✅ | ✅ | ✅ | ✅ | `DB-OUT` + `DB-IN` shipped (SQL Server, exp.) |
 | **SMTP** (email send) | ✅ | ✅ | ✅ | ❌ | `SMTP-OUT` planned |
 | **Email reader** (POP3/IMAP) | ~ | ~ | ✅ | ❌ | `MAIL-IN` planned |
 | **JMS** (Java messaging) | ✅ | ❌ | ✅ | ❌ | `JMS-IN/OUT` planned |

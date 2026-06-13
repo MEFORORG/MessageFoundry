@@ -107,6 +107,10 @@ class FileDestination(DestinationConnector):
         self.directory.mkdir(parents=True, exist_ok=True)
         name = render_filename(self.filename_template, payload, fallback="message.hl7")
         target = self.directory / name
+        # Defence in depth atop the filename sanitization (FILE-1): never write outside the
+        # configured directory even if a name somehow carried a path component.
+        if self.directory.resolve() not in target.resolve().parents:
+            raise DeliveryError(f"refusing to write outside the destination directory: {name!r}")
         data = payload.encode(self.encoding)
         # Write to a uniquely-named temp (mkstemp — no shared counter, no name race), then publish
         # atomically. For no-overwrite, claim the final name by exclusive create so two concurrent
@@ -134,6 +138,10 @@ class FileSource(SourceConnector):
         if "directory" not in s:
             raise ValueError("file source requires a 'directory' setting")
         self.directory = Path(s["directory"])
+        # Resolved watch root for path-confinement: a recursive scan must not be walked out of the
+        # configured directory via a symlinked file/subdir (see _within_root). resolve() is
+        # non-strict, so it's fine that the directory is created later in start().
+        self._root_real = self.directory.resolve()
         self.pattern: str = s.get("pattern", "*")
         self.poll_seconds: float = float(s.get("poll_seconds", 1.0))
         self.min_age_seconds: float = float(s.get("min_age_seconds", 0.0))
@@ -255,6 +263,7 @@ class FileSource(SourceConnector):
             if p.is_file()
             and self.processed_dir not in p.parents
             and self.error_dir not in p.parents
+            and self._within_root(p)
         ]
         if self.min_age_seconds > 0:
             cutoff = time.time() - self.min_age_seconds
@@ -264,6 +273,24 @@ class FileSource(SourceConnector):
         else:
             files.sort(key=lambda p: p.name)
         return files
+
+    def _within_root(self, path: Path) -> bool:
+        """True if ``path`` resolves inside the configured watch root.
+
+        A symlinked file or subdirectory that points outside the root (e.g. ``in/link -> /etc``)
+        resolves elsewhere and is skipped, so a recursive scan can't be walked out of its directory
+        to read arbitrary files (path-confinement / symlink-escape guard)."""
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        if resolved == self._root_real or self._root_real in resolved.parents:
+            return True
+        logger.warning(
+            "file source: skipping %s — it resolves outside the watch root (symlink escape?)",
+            path.name,
+        )
+        return False
 
     def _after_processing(self, path: Path) -> None:
         if self.after_read == "delete":
