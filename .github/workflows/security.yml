@@ -73,7 +73,7 @@ jobs:
       - name: Upload the SBOM artifact
         # TODO(supply-chain): pin to a commit SHA like the other actions here before this gate is
         # made blocking (kept on the @v4 tag for now to avoid a guessed SHA).
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-cyclonedx
           path: sbom.cdx.json
