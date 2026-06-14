@@ -1,6 +1,6 @@
 # MessageFoundry — Early-Adopter Installation & Rollout Guide
 
-This guide is for teams piloting **MessageFoundry (MEFOR)** — a code-first, Python HL7 v2.x
+This guide is for teams piloting **MessageFoundry (MEFOR)** — an open-source, Python healthcare
 integration engine — and taking it from a first install to full production use. It is an
 **orchestration** document: it ties the existing docs together and adds the install-to-production
 **rollout plan** that nothing else covers. Where a topic has a dedicated reference, this guide
@@ -38,8 +38,9 @@ links to it rather than repeating it.
 
 ## 1. What MessageFoundry is, and who should pilot it
 
-MessageFoundry routes, transforms, and validates HL7 v2.x messages between **Connections**, with
-routing and handling expressed as **code-first Python**. The runtime model is a graph wired by name:
+MessageFoundry routes, transforms, and validates messages between **Connections** — HL7 v2.x by
+default, with payload-agnostic support for other formats — and its routing and handling are written in
+**Python**. The runtime model is a graph wired by name:
 
 - **Connection** — an endpoint that receives (inbound) or sends (outbound) messages (MLLP, TCP,
   File today; REST/SOAP/Database destinations and a Database poll source also ship — see
@@ -53,7 +54,7 @@ The engine is a **headless asyncio service** (FastAPI/uvicorn) that owns a durab
 supervises one worker set per connection. A separate **PySide6 console** and a **VS Code extension**
 operate it over a localhost HTTP API. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full model.
 
-**Who should pilot it now.** Teams who want a code-first, Python-native alternative to Mirth/Corepoint,
+**Who should pilot it now.** Teams who want a Python-native, open-source alternative to Mirth/Corepoint,
 who run **a single engine node** (see §2/§14 on HA), who can keep the engine on a trusted network or
 behind their own TLS proxy, and who are comfortable validating a pre-1.0 tool against their own traffic
 before trusting it. If you need turnkey multi-node failover, transport TLS out of the box, or SQL Server
@@ -234,7 +235,7 @@ Full reference: **[CONFIGURATION.md](CONFIGURATION.md)** (service settings) and
 
 There are two distinct configuration surfaces:
 
-1. **The message graph (code-first Python)** in your `--config` directory. The minimum first flow is
+1. **The message graph (Python modules)** in your `--config` directory. The minimum first flow is
    one module: an `inbound()` with a transport spec and a `router=` binding, a `@router` that returns
    handler name(s), and a `@handler` that returns `Send(...)` to a declared `outbound()`. Start by
    copying `samples/config/IB_ACME_ADT.py`. The loader globs `*.py` (non-recursive; skips `_*`-prefixed
