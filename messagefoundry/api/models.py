@@ -198,6 +198,40 @@ class IntegrityResult(BaseModel):
     detail: str
 
 
+class ClusterStatus(BaseModel):
+    """This node's cluster posture (Track B Step 7), from the cheap in-memory coordinator gates — no DB
+    round-trip. ``clustered`` is False on a single node (NullCoordinator), where ``is_leader`` is always
+    True and ``config_version`` is 0."""
+
+    node_id: str
+    clustered: bool
+    is_leader: bool
+    config_version: int
+
+
+class ClusterNode(BaseModel):
+    """One node in the cluster (Track B Step 7). ``is_leader`` is the DERIVED live leader (the durable
+    ``nodes.is_leader`` heartbeat flag filtered for freshness, so a crashed ex-leader's stale flag is not
+    reported). ``started_at``/``last_seen`` are epoch seconds, ``None`` only for the single-node
+    synthetic self-entry."""
+
+    node_id: str
+    host: str | None
+    pid: int | None
+    status: str
+    started_at: float | None
+    last_seen: float | None
+    is_leader: bool
+
+
+class ClusterNodeList(BaseModel):
+    """Cluster membership (Track B Step 7). ``leader_node_id`` is the node_id of the single derived
+    leader, or ``None`` if no fresh node currently holds leadership."""
+
+    nodes: list[ClusterNode]
+    leader_node_id: str | None
+
+
 class AiPolicy(BaseModel):
     """The effective AI-assistance policy for the IDE gate. ``assist_permitted`` is the
     identity-dependent bit: ``True``/``False`` when the caller's RBAC can be evaluated, ``None`` when

@@ -5,6 +5,7 @@
     messagefoundry graph     --config ./samples/config --json                     # the wired graph
     messagefoundry dryrun    --config ./samples/config --messages ./msgs --json   # run, don't send
     messagefoundry check     --config ./samples/config --messages ./msgs          # commit/CI gate
+    messagefoundry connection upsert --config ./samples/config --data '{...}'      # edit connections.toml
     messagefoundry generate  --type ADT --count 5 --out ./out/adt                 # synthetic HL7
     messagefoundry hl7schema --json                                               # HL7 field schema
 
@@ -95,6 +96,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     check.add_argument("--no-lint", action="store_true", help="skip the advisory ruff/mypy checks")
     check.add_argument("--json", action="store_true", help="emit JSON")
+
+    connection = sub.add_parser(
+        "connection",
+        help="manage connections.toml — list / upsert / remove (ADR 0007; the VS Code editor shells this)",
+    )
+    connection.add_argument("action", choices=["list", "upsert", "remove"])
+    connection.add_argument("--config", default="samples/config", help="config modules directory")
+    connection.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML for [egress]/active-env validation (default: "
+        "./messagefoundry.toml if present)",
+    )
+    connection.add_argument("--name", default=None, help="connection name (for remove)")
+    connection.add_argument(
+        "--data", default=None, help="connection JSON for upsert (default: read from stdin)"
+    )
+    connection.add_argument("--json", action="store_true", help="emit JSON")
 
     generate = sub.add_parser(
         "generate", help="generate conformant synthetic HL7 messages (no real PHI)"
@@ -306,7 +325,9 @@ def _serve(args: argparse.Namespace) -> int:
         ai_settings=settings.ai,
         alerts_settings=settings.alerts,
         retention_settings=settings.retention,
+        reference_settings=settings.reference,
         egress_settings=settings.egress,
+        cluster_settings=settings.cluster,
         expose_docs=settings.api.expose_docs,
         ws_allowed_origins=settings.api.ws_allowed_origins,
     )
@@ -464,6 +485,16 @@ def _dryrun(args: argparse.Namespace) -> int:
                     "deliveries": [
                         {"to": d.to, "payload": d.payload if show_phi else _redact_body(d.payload)}
                         for d in result.deliveries
+                    ],
+                    # Declared state writes (ADR 0005). The value can be PHI (e.g. an MRN→anon
+                    # mapping), so gate it behind --show-phi exactly like a delivery payload.
+                    "state_ops": [
+                        {
+                            "namespace": s.namespace,
+                            "key": s.key if show_phi else _redact_body(str(s.key)),
+                            "value": s.value if show_phi else _redact_body(str(s.value)),
+                        }
+                        for s in result.state_ops
                     ],
                     "error": result.error,
                     "raw": result.raw if show_phi else _redact_body(result.raw),
@@ -764,6 +795,70 @@ def _check(args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
+def _connection(args: argparse.Namespace) -> int:
+    """Manage the data-authored ``connections.toml`` (ADR 0007): ``list`` to populate the VS Code
+    editor, ``upsert``/``remove`` to save (a developer can also hand-edit the file). ``upsert``/
+    ``remove`` validate the whole config dir (structure + connector/egress build-check) BEFORE
+    persisting and roll back on failure. Offline: touches no network, starts no server."""
+    import os
+    from pathlib import Path
+
+    from pydantic import ValidationError
+
+    from messagefoundry.config import connections_edit
+    from messagefoundry.config.environments import load_environment_values
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.wiring import WiringError, load_config
+    from messagefoundry.pipeline.wiring_runner import build_check_registry
+
+    if args.action == "list":
+        try:
+            entries = connections_edit.list_connections(args.config)
+        except (OSError, WiringError) as exc:
+            return _emit_error(str(exc), as_json=args.json)
+        _print_json(entries, compact=args.json)
+        return 0
+
+    # upsert / remove: validate the candidate dir against this instance's [egress] allowlist + active
+    # environment before persisting, so a GUI edit pointing at a non-allowlisted host fails at edit
+    # time exactly as it would at reload.
+    try:
+        settings = load_settings(config_path=args.service_config)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        return _emit_error(str(exc), as_json=args.json)
+    env_values = load_environment_values(
+        base_dir=Path.cwd(),
+        dir_name=settings.environments.dir,
+        environment=settings.ai.environment.value,
+        environ=os.environ,
+    )
+
+    def validate(config_dir: Path) -> None:
+        registry = load_config(config_dir)
+        build_check_registry(
+            registry,
+            inbound_bind_host=settings.inbound.bind_host,
+            env_values=env_values,
+            egress=settings.egress,
+        )
+
+    try:
+        if args.action == "upsert":
+            raw = args.data if args.data is not None else sys.stdin.read()
+            obj = json.loads(raw)
+            result = connections_edit.upsert_connection(args.config, obj, validate=validate)
+        else:  # remove
+            if not args.name:
+                return _emit_error("--name is required for `connection remove`", as_json=args.json)
+            result = connections_edit.remove_connection(args.config, args.name, validate=validate)
+    except json.JSONDecodeError as exc:
+        return _emit_error(f"invalid connection JSON: {exc}", as_json=args.json)
+    except (WiringError, OSError) as exc:
+        return _emit_error(str(exc), as_json=args.json)
+    _print_json(result, compact=args.json)
+    return 0
+
+
 def _print_json(data: object, *, compact: bool) -> None:
     print(json.dumps(data) if compact else json.dumps(data, indent=2))
 
@@ -782,6 +877,7 @@ _DISPATCH = {
     "graph": _graph,
     "dryrun": _dryrun,
     "check": _check,
+    "connection": _connection,
     "generate": _generate,
     "hl7schema": _hl7schema,
     "gen-key": _gen_key,

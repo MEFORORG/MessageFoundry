@@ -22,6 +22,7 @@
       { "command": "messagefoundry.groupConnections", "title": "MessageFoundry: Group Connections", "icon": "$(list-tree)" },
       { "command": "messagefoundry.openConnectionSettings", "title": "MessageFoundry: Open Connection Settings", "icon": "$(gear)" },
       { "command": "messagefoundry.newConnection", "title": "MessageFoundry: New Connection" },
+      { "command": "messagefoundry.editConnection", "title": "MessageFoundry: Edit Connection" },
       { "command": "messagefoundry.newRoute", "title": "MessageFoundry: New Route Wizard" },
       { "command": "messagefoundry.newRouter", "title": "MessageFoundry: New Router" },
       { "command": "messagefoundry.newHandler", "title": "MessageFoundry: New Handler" },
@@ -57,7 +58,15 @@
           "command": "messagefoundry.openConnectionSettings",
           "when": "view == messagefoundry.graph && viewItem == meforConnection",
           "group": "inline"
+        },
+        {
+          "command": "messagefoundry.editConnection",
+          "when": "view == messagefoundry.graph && viewItem == meforConnection",
+          "group": "1_edit"
         }
+      ],
+      "commandPalette": [
+        { "command": "messagefoundry.editConnection", "when": "false" }
       ]
     },
     "snippets": [{ "language": "python", "path": "./snippets/messagefoundry.code-snippets" }],

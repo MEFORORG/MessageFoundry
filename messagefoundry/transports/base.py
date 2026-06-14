@@ -13,7 +13,7 @@ register a builder here (or, later, from a plugin).
 from __future__ import annotations
 
 import abc
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, ClassVar
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 
@@ -68,10 +68,32 @@ class SourceConnector(abc.ABC):
     """Inbound connector. ``start`` sets the source up, begins delivering received
     messages to ``handler`` in the background, and **returns once the source is live**
     (bound/listening or polling) — so a caller can rely on it being ready. ``stop`` shuts
-    it down and awaits any background task it owns."""
+    it down and awaits any background task it owns.
+
+    :attr:`polls_shared_resource` documents whether the source **polls a shared external
+    resource** (a directory, a DB table, a remote dir) — intake that must be **single-node** in a
+    cluster, since two nodes polling it would ingest the same file/row twice. It is ``False`` by
+    default (a **listen** source like MLLP/TCP, which has its own per-node endpoint and no
+    double-read problem) and set ``True`` on the poll sources. It is documentation + lets a caller
+    log/identify poll sources; the actual single-node gating is done by ``leader_gate`` below."""
+
+    # Documentation flag (see the class docstring): True on poll sources, False on listen sources.
+    polls_shared_resource: ClassVar[bool] = False
 
     @abc.abstractmethod
-    async def start(self, handler: InboundHandler) -> None: ...
+    async def start(
+        self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
+    ) -> None:
+        """Begin delivering received messages to ``handler``; return once live.
+
+        ``leader_gate`` is an **optional** predicate returning ``True`` when THIS node may poll a
+        **shared external resource** (Track B Step 4b leader-gating). ``None`` (the default) means
+        *always poll* — the single-node / direct-caller / test path, byte-identical to before the
+        gate existed. A **poll** source (:attr:`polls_shared_resource` True) must SKIP its
+        scan/select-and-process for a tick whenever the gate returns ``False`` (so only the leader
+        reads the shared resource); the loop keeps ticking, so when this node later becomes leader
+        the next tick scans. A **listen** source (MLLP/TCP) ignores it: it runs on every node."""
+        ...
 
     @abc.abstractmethod
     async def stop(self) -> None: ...

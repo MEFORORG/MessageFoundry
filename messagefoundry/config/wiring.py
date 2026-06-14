@@ -38,6 +38,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from messagefoundry.config.code_sets import (
+    CODESETS_DIR_NAME,
+    CodeSet,
+    CodeSetError,
+    activated as _code_sets_activated,
+    code_set as _resolve_code_set,
+    load_code_sets,
+)
 from messagefoundry.config.models import (
     AckAfter,
     AckMode,
@@ -54,14 +62,25 @@ from messagefoundry.parsing.message import Message, RawMessage
 __all__ = [
     "ConnectionSpec",
     "MLLP",
+    "Tcp",
     "File",
     "Rest",
     "Database",
     "DatabasePoll",
     "Soap",
+    "Sftp",
+    "Ftp",
     "Send",
+    "SetState",
     "EnvRef",
     "env",
+    "CodeSet",
+    "code_set",
+    "Reference",
+    "FileRef",
+    "DatabaseRef",
+    "ReferenceSpec",
+    "ReferenceSourceSpec",
     "resolve_env_settings",
     "referenced_env_keys",
     "display_settings",
@@ -72,6 +91,9 @@ __all__ = [
     "Diagnostic",
     "inbound",
     "outbound",
+    "build_inbound_connection",
+    "build_outbound_connection",
+    "parse_env_setting",
     "router",
     "handler",
     "load_config",
@@ -136,6 +158,189 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     The key is matched case-insensitively (lower-cased here, as it is on the value side), so
     ``env("EPIC_HOST")``, the file key ``epic_host``, and ``MEFOR_VALUE_EPIC_HOST`` all line up."""
     return EnvRef(key=key.lower(), default=default, cast=cast)
+
+
+#: Named casts a ``connections.toml`` env-ref may request (ADR 0007). A data file/GUI can't author an
+#: arbitrary Python callable the way :func:`env` can, so the file form is restricted to these — and
+#: ``int`` is the only cast used across the migration estate today.
+_NAMED_CASTS: dict[str, Callable[[Any], Any]] = {
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "str": str,
+}
+
+#: The only keys an env-ref inline table may carry (the inverse of :func:`display_settings`).
+_ENVREF_KEYS = frozenset({"env", "default", "cast"})
+
+
+def parse_env_setting(value: Any) -> Any:
+    """Decode one ``connections.toml`` settings value into a literal or an :class:`EnvRef` (ADR 0007).
+
+    An inline table carrying the reserved key ``env`` (and only ``env``/``default``/``cast``) becomes an
+    :class:`EnvRef` — the inverse of :func:`display_settings`'s ``{"env": key[, "default"]}`` encoding;
+    ``cast`` is a **named** cast (``"int"``/``"float"``/``"bool"``/``"str"``) since a file can't carry a
+    Python callable. Any other value (a scalar, list, or a plain dict like a REST ``headers`` map) is
+    returned verbatim. Raises :class:`WiringError` on a malformed env marker or an unknown cast name."""
+    if not (isinstance(value, dict) and "env" in value and set(value) <= _ENVREF_KEYS):
+        return value
+    key = value["env"]
+    if not isinstance(key, str) or not key:
+        raise WiringError(f"env reference must name a non-empty string key, got {key!r}")
+    cast_name = value.get("cast")
+    if cast_name is not None and cast_name not in _NAMED_CASTS:
+        raise WiringError(
+            f"env reference {key!r}: unknown cast {cast_name!r} "
+            f"(use one of {', '.join(sorted(_NAMED_CASTS))})"
+        )
+    cast = _NAMED_CASTS[cast_name] if cast_name is not None else None
+    default = value["default"] if "default" in value else _UNSET
+    return EnvRef(key=key.lower(), default=default, cast=cast)
+
+
+# --- code sets (reference lookup tables) -------------------------------------
+
+
+def code_set(name: str) -> CodeSet:
+    """Reference a managed reference table from ``codesets/<name>.{csv,toml}`` (next to ``--config``).
+
+    The code-first alternative to a hand-maintained dict: capture it once at a module's top level
+    (``DIET = code_set("epic_diets")``) or look it up at call time inside a handler
+    (``code_set("epic_diets").get(x)``) — both resolve against the active set the loader/runner has
+    published. Returns a frozen, read-only :class:`CodeSet` (a mapping: ``cs[k]`` / ``cs.get(k, d)`` /
+    ``k in cs`` / ``len(cs)`` / iteration); it is shared across transforms, so it must not be mutated.
+
+    A missing or malformed code set fails **loud** as a :class:`WiringError`, surfaced by ``validate`` /
+    ``check`` / reload exactly like a missing ``env()`` value — never a silent empty table. The
+    reference data is read-only, so the lookup stays pure (re-run-safe); see
+    :mod:`messagefoundry.config.code_sets` for the one reload-vs-re-run caveat."""
+    try:
+        return _resolve_code_set(name)
+    except CodeSetError as exc:
+        raise WiringError(str(exc)) from exc
+
+
+# --- reference sets (external-data enrichment, ADR 0006 Tier 1) ---------------
+# A reference set is declared in a wiring module with Reference(name, source=…); the engine's
+# ReferenceSyncRunner materializes the source OFF the message path into a versioned, encrypted store
+# snapshot, and a Handler reads it PURELY at run time via reference("name").get(key) (the read accessor
+# lives in messagefoundry.config.reference). The DECLARATION here is the source + cadence only.
+
+
+@dataclass(frozen=True)
+class ReferenceSourceSpec:
+    """Where a reference set's data is materialized from (the analog of :class:`ConnectionSpec`).
+
+    ``kind`` selects the source connector (``"file"`` today; ``"database"`` is ADR-0006 increment 2);
+    ``settings`` carries its options (may hold :class:`EnvRef` values, resolved per environment)."""
+
+    kind: str
+    settings: dict[str, Any]
+
+
+def FileRef(
+    *,
+    path: str | EnvRef,
+    encoding: str = "utf-8",
+) -> ReferenceSourceSpec:
+    """A reference **source** backed by a local CSV/TOML file (ADR 0006 Tier 1).
+
+    The file has the same shape as a code set (``code_set`` format: header row, first column the key;
+    one value column → scalar, several → ``{header: cell}``; or a flat/nested TOML). It is the path for
+    an externally-produced export (e.g. a nightly job dumps a provider directory to a share): the engine
+    re-reads it on the set's refresh cadence and materializes it into a versioned, encrypted snapshot,
+    so an updated export is picked up without a config reload. ``path`` may be an :func:`env` ref."""
+    return ReferenceSourceSpec("file", {"path": path, "encoding": encoding})
+
+
+def DatabaseRef(
+    *,
+    server: str | EnvRef,
+    database: str | EnvRef,
+    statement: str,
+    key_column: str,
+    value_column: str | None = None,
+    auth: str = "sql",
+    username: str | EnvRef | None = None,
+    password: str | EnvRef | None = None,
+    port: int | EnvRef = 1433,
+    encrypt: bool = True,
+    trust_server_certificate: bool = False,
+    connect_timeout: int = 15,
+    app_name: str = "messagefoundry",
+    odbc_driver: str = "ODBC Driver 18 for SQL Server",
+    pool_max: int = 5,
+) -> ReferenceSourceSpec:
+    """A reference **source** backed by a SQL query (ADR 0006 increment 2; SQL Server via the
+    ``[sqlserver]`` extra + ODBC Driver 18 — **experimental**, like the DATABASE connector).
+
+    The engine runs ``statement`` (a read-only ``SELECT``/proc) on the set's refresh cadence and builds
+    the snapshot from the rows: ``key_column`` is the lookup key; ``value_column`` (if given) is that
+    column's value, else the value is a dict of the remaining columns (the multi-column ``code_set``
+    shape). Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
+    ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
+    allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts."""
+    return ReferenceSourceSpec(
+        "database",
+        {
+            "server": server,
+            "database": database,
+            "statement": statement,
+            "key_column": key_column,
+            "value_column": value_column,
+            "auth": auth,
+            "username": username,
+            "password": password,
+            "port": port,
+            "encrypt": encrypt,
+            "trust_server_certificate": trust_server_certificate,
+            "connect_timeout": connect_timeout,
+            "app_name": app_name,
+            "odbc_driver": odbc_driver,
+            "pool_max": pool_max,
+        },
+    )
+
+
+@dataclass(frozen=True)
+class ReferenceSpec:
+    """A declared reference set: ``name`` + its :class:`ReferenceSourceSpec` + sync cadence.
+
+    Held in :class:`Registry` and consumed by the engine's ``ReferenceSyncRunner``; the data lives in
+    the store, read via ``reference(name)``. ``refresh_seconds`` is the materialization cadence (the
+    runner also syncs once on startup); ``max_staleness_seconds`` (0 = off) is a reserved freshness
+    knob for a follow-up."""
+
+    name: str
+    source: ReferenceSourceSpec
+    refresh_seconds: float = 3600.0
+    max_staleness_seconds: float = 0.0
+
+
+def Reference(
+    name: str,
+    *,
+    source: ReferenceSourceSpec,
+    refresh_seconds: float = 3600.0,
+    max_staleness_seconds: float = 0.0,
+) -> None:
+    """Declare a reference set into the graph being loaded (side-effecting, like :func:`inbound`).
+
+    The engine materializes ``source`` into a versioned snapshot every ``refresh_seconds`` (and once at
+    startup); a Handler reads it purely with ``reference(name).get(key)``. Example::
+
+        Reference("provider_npi", source=FileRef(path=env("provider_npi_csv")), refresh_seconds=3600)
+    """
+    if refresh_seconds < 0:
+        raise WiringError(f"Reference({name!r}): refresh_seconds must be >= 0")
+    _active_registry().add_reference(
+        ReferenceSpec(
+            name=name,
+            source=source,
+            refresh_seconds=refresh_seconds,
+            max_staleness_seconds=max_staleness_seconds,
+        )
+    )
 
 
 def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:
@@ -227,6 +432,56 @@ def MLLP(
             "max_frame_bytes": max_frame_bytes,
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
+        },
+    )
+
+
+def Tcp(
+    *,
+    host: str | EnvRef | None = None,  # OUTBOUND: the downstream peer (required; may be env()).
+    # INBOUND: omit — the bind interface is a service setting ([inbound].bind_host), not authored.
+    port: int | EnvRef,
+    # Framing: a preset name ("stx_etx" | "vt_fs" | "mllp") OR explicit start/end[/trailer] byte ints.
+    framing: str | None = "stx_etx",
+    start: int | None = None,  # explicit start delimiter byte (use instead of `framing`)
+    end: int | None = None,  # explicit end delimiter byte
+    trailer: int | None = None,  # explicit optional trailer byte
+    encoding: str = "utf-8",
+    # Inbound DoS guards (defaults mirror MLLP; pass None/0 to disable):
+    max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
+    receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
+    max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
+    connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
+    timeout_seconds: float = 30.0,  # outbound: send/await-reply timeout
+    expect_reply: bool = False,  # outbound: read one framed reply and treat it as confirmation
+) -> ConnectionSpec:
+    """A raw-TCP endpoint with **configurable delimiter framing**, relaying the payload **opaquely**
+    (no structured parse) — built for X12-over-TCP feeds. Set ``framing`` to a preset
+    (``"stx_etx"`` = ``0x02``/``0x03``, the default; ``"vt_fs"``/``"mllp"`` = ``0x0B``/``0x1C``/``0x0D``)
+    **or** give explicit ``start``/``end`` (with optional ``trailer``) delimiter byte ints — not both.
+
+    Inbound takes no ``host`` (the bind interface is ``[inbound].bind_host``); pair it with
+    ``content_type="x12"`` on ``inbound(...)`` so the body routes as a ``RawMessage`` (ADR 0004).
+    There is **no HL7 ACK** — a Handler may still return a payload, which is framed back to the
+    sender. Outbound dials ``host``/``port``, frames + sends; with ``expect_reply`` it waits for one
+    framed reply and treats receiving it as confirmation (the reply is **not** parsed — X12 997/TA1
+    acks are a deferred follow-up). Delivery is at-least-once → the receiver **must be idempotent**."""
+    return ConnectionSpec(
+        ConnectorType.TCP,
+        {
+            "host": host,
+            "port": port,
+            "framing": framing,
+            "start": start,
+            "end": end,
+            "trailer": trailer,
+            "encoding": encoding,
+            "max_connections": max_connections,
+            "receive_timeout": receive_timeout,
+            "max_frame_bytes": max_frame_bytes,
+            "connect_timeout": connect_timeout,
+            "timeout_seconds": timeout_seconds,
+            "expect_reply": expect_reply,
         },
     )
 
@@ -443,6 +698,113 @@ def Soap(
     )
 
 
+def Sftp(
+    *,
+    host: str | EnvRef,  # the SFTP/SSH server (may be env())
+    port: int | EnvRef = 22,
+    username: str | EnvRef | None = None,
+    password: str | EnvRef | None = None,  # secret — use env()
+    private_key: str | EnvRef | None = None,  # PEM private key text/path — secret, use env()
+    key_password: str | EnvRef | None = None,  # passphrase for an encrypted key — secret, use env()
+    known_hosts: str | EnvRef | None = None,  # extra known_hosts file (system hosts always loaded)
+    remote_dir: str | EnvRef,
+    filename: str | EnvRef = "{MSH-10}.hl7",  # outbound: upload name (may template HL7 fields)
+    pattern: str = "*.hl7",  # inbound: glob of files to poll
+    poll_seconds: float = 5.0,  # inbound: poll interval
+    after_read: str = "move",  # inbound: "move" (to processed_subdir) | "delete"
+    min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
+    max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
+    overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
+    processed_subdir: str = ".processed",
+    error_subdir: str = ".error",
+    encoding: str = "utf-8",
+) -> ConnectionSpec:
+    """An **SFTP** (SSH file transfer) endpoint — source **and** destination (ADR 0003 follow-on).
+
+    Inbound polls ``remote_dir`` for ``pattern`` (process-then-move/delete, at-least-once); outbound
+    uploads to ``remote_dir``/``filename`` (write to a temp name then rename, so a poller never sees a
+    partial). Needs the ``[sftp]`` extra (``pip install 'messagefoundry[sftp]'``; paramiko is lazily
+    imported). **Host-key verification is ON by default** (system + ``known_hosts``; an unknown key is
+    refused) — accepting an unknown key needs ``MEFOR_ALLOW_INSECURE_TLS``. Put secrets (``password``/
+    ``private_key``/``key_password``) in ``env()``. The host is gated by ``[egress].allowed_remote``
+    (both directions). At-least-once: an upload may re-send and a poll may re-emit, so downstreams
+    **must be idempotent**."""
+    return ConnectionSpec(
+        ConnectorType.REMOTEFILE,
+        {
+            "protocol": "sftp",
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "private_key": private_key,
+            "key_password": key_password,
+            "known_hosts": known_hosts,
+            "remote_dir": remote_dir,
+            "filename": filename,
+            "pattern": pattern,
+            "poll_seconds": poll_seconds,
+            "after_read": after_read,
+            "min_age_seconds": min_age_seconds,
+            "max_file_bytes": max_file_bytes,
+            "overwrite": overwrite,
+            "processed_subdir": processed_subdir,
+            "error_subdir": error_subdir,
+            "encoding": encoding,
+        },
+    )
+
+
+def Ftp(
+    *,
+    host: str | EnvRef,  # the FTP server (may be env())
+    port: int | EnvRef = 21,
+    tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
+    username: str | EnvRef | None = None,
+    password: str | EnvRef | None = None,  # secret — use env()
+    remote_dir: str | EnvRef,
+    filename: str | EnvRef = "{MSH-10}.hl7",  # outbound: upload name (may template HL7 fields)
+    pattern: str = "*.hl7",  # inbound: glob of files to poll
+    poll_seconds: float = 5.0,  # inbound: poll interval
+    after_read: str = "move",  # inbound: "move" (to processed_subdir) | "delete"
+    min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
+    max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
+    overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
+    processed_subdir: str = ".processed",
+    error_subdir: str = ".error",
+    encoding: str = "utf-8",
+) -> ConnectionSpec:
+    """An **FTP** (``tls=False``) or **FTPS** (``tls=True`` — explicit TLS) endpoint, source **and**
+    destination (stdlib ``ftplib`` — no extra). Same poll/upload shape as :func:`Sftp`.
+
+    Plain ``ftp`` transmits credentials in **cleartext**: supplying a ``username``/``password`` over
+    plain ``ftp`` is **refused** unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (use ``tls=True`` for FTPS,
+    or :func:`Sftp`). FTPS encrypts the control + data channels, so credentials are fine there. Put
+    secrets (``password``) in ``env()``. The host is gated by ``[egress].allowed_remote`` (both
+    directions). At-least-once → downstreams **must be idempotent**."""
+    return ConnectionSpec(
+        ConnectorType.REMOTEFILE,
+        {
+            "protocol": "ftps" if tls else "ftp",
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "remote_dir": remote_dir,
+            "filename": filename,
+            "pattern": pattern,
+            "poll_seconds": poll_seconds,
+            "after_read": after_read,
+            "min_age_seconds": min_age_seconds,
+            "max_file_bytes": max_file_bytes,
+            "overwrite": overwrite,
+            "processed_subdir": processed_subdir,
+            "error_subdir": error_subdir,
+            "encoding": encoding,
+        },
+    )
+
+
 @dataclass(frozen=True)
 class Send:
     """A Handler's instruction to deliver ``message`` to a named outbound connection."""
@@ -451,11 +813,53 @@ class Send:
     message: Message | RawMessage | str
 
 
+#: JSON-serializable scalar/container types a :class:`SetState` value may carry. Validated at
+#: construction (fail loud in the author's code, not deep in a store INSERT), and what
+#: :func:`messagefoundry.config.state.state_get` returns on a hit.
+StateValue = str | int | float | bool | None | list[Any] | dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SetState:
+    """A Handler's instruction to **declare** a state write (cross-message correlation, ADR 0005).
+
+    A Handler does not mutate state imperatively; it returns ``SetState(namespace, key, value)``
+    alongside its :class:`Send`\\ s, and the engine applies the upsert **inside the routed→outbound
+    handoff transaction** — so a crash before commit leaves no state and a re-run applies it exactly
+    once (preserving the staged pipeline's pure-re-run invariant). ``value`` must be JSON-serializable
+    (validated here); read it back synchronously with
+    :func:`messagefoundry.config.state.state_get`."""
+
+    namespace: str
+    key: str
+    value: StateValue
+
+    def __post_init__(self) -> None:
+        # Validate at construction so a non-serializable value fails in the author's handler (with a
+        # clear message) rather than deep inside the store's INSERT during a handoff. namespace/key
+        # are the composite PK and must be non-empty strings.
+        if not isinstance(self.namespace, str) or not self.namespace:
+            raise WiringError("SetState namespace must be a non-empty string")
+        if not isinstance(self.key, str) or not self.key:
+            raise WiringError("SetState key must be a non-empty string")
+        try:
+            import json
+
+            json.dumps(self.value)
+        except (TypeError, ValueError) as exc:
+            raise WiringError(
+                f"SetState({self.namespace!r}, {self.key!r}, ...): value must be JSON-serializable "
+                f"(str/int/float/bool/None/list/dict) — {exc}"
+            ) from exc
+
+
 #: What a Router/Handler receives: a mutable HL7 :class:`Message`, or a :class:`RawMessage` for a
 #: non-HL7 inbound (ADR 0004). The author knows which — a Router/Handler is bound to one inbound.
 Payload = Message | RawMessage
 RouterFn = Callable[[Payload], "list[str] | str | None"]
-HandlerFn = Callable[[Payload], "Send | list[Send] | None"]
+#: A Handler returns deliveries and/or state writes (ADR 0005): a single :class:`Send`/:class:`SetState`,
+#: a mixed list, or ``None`` (filtered). ``Send``-only returns are unchanged — backward compatible.
+HandlerFn = Callable[[Payload], "Send | SetState | list[Send | SetState] | None"]
 
 
 @dataclass(frozen=True)
@@ -495,6 +899,13 @@ class Registry:
     outbound: dict[str, OutboundConnection] = field(default_factory=dict)
     routers: dict[str, RouterFn] = field(default_factory=dict)
     handlers: dict[str, HandlerFn] = field(default_factory=dict)
+    # Reference lookup tables loaded from <config_dir>/codesets/ — attached so a runner can re-publish
+    # this graph's code sets as the active set while its routers/handlers run (call-time resolution).
+    code_sets: dict[str, CodeSet] = field(default_factory=dict)
+    # Reference-set declarations (ADR 0006): name -> source + cadence. The engine's ReferenceSyncRunner
+    # materializes each into a store snapshot; reference(name) reads the snapshot (data lives in the
+    # store, not here). Carried with the graph so a reload re-arms the sync set atomically.
+    references: dict[str, ReferenceSpec] = field(default_factory=dict)
 
     def add_inbound(self, conn: InboundConnection) -> None:
         self._add(self.inbound, conn.name, conn, "inbound connection")
@@ -507,6 +918,9 @@ class Registry:
 
     def add_handler(self, name: str, fn: HandlerFn) -> None:
         self._add(self.handlers, name, fn, "handler")
+
+    def add_reference(self, spec: ReferenceSpec) -> None:
+        self._add(self.references, spec.name, spec, "reference set")
 
     @staticmethod
     def _add(table: dict[str, Any], name: str, value: Any, kind: str) -> None:
@@ -564,6 +978,68 @@ def _call_site() -> tuple[str | None, int | None]:
     return caller.f_code.co_filename, caller.f_lineno
 
 
+def build_inbound_connection(
+    name: str,
+    spec: ConnectionSpec,
+    *,
+    router: str,
+    ack_mode: AckMode = AckMode.ORIGINAL,
+    ack_after: AckAfter | None = None,
+    strict: bool = False,
+    hl7_version: str | None = None,
+    content_type: ContentType = ContentType.HL7V2,
+    source_file: str | None = None,
+    source_line: int | None = None,
+) -> InboundConnection:
+    """Validate the inbound-connection invariants and build an :class:`InboundConnection`.
+
+    The shared core of code-first :func:`inbound` **and** the ``connections.toml`` loader (ADR 0007),
+    so both authoring surfaces enforce identical guards. Pure — it does not touch the active registry;
+    the caller is responsible for ``add_inbound``."""
+    if (
+        spec.type in (ConnectorType.MLLP, ConnectorType.TCP)
+        and spec.settings.get("host") is not None
+    ):
+        # The bind interface is an environment/service decision (which NIC this instance exposes),
+        # not a per-connection one — and exposing an unauthenticated raw listener on 0.0.0.0 must be
+        # an admin choice, not a developer default. Set it service-side via [inbound].bind_host.
+        kind = spec.type.value.upper()
+        raise WiringError(
+            f"inbound connection {name!r}: {kind} inbound takes no host; the bind interface is a "
+            f"service setting ([inbound].bind_host). Declare it as {kind.title()}(port=...)."
+        )
+    if ack_after == AckAfter.DELIVERED:
+        # Deferred-until-delivered ACK needs the listener to hold/replay the ACK from the delivery
+        # worker (sender socket details, held connection) — not built in Step A. Fail loud at wiring
+        # so a config asking for it is caught in dry-run / `messagefoundry check`, not silently
+        # downgraded. (This also rules out the incoherent DELIVERED + ack_mode=NONE combination.)
+        # Compared by VALUE not identity: AckAfter is a str-Enum, so a raw-string ack_after='delivered'
+        # (== the member but not `is` it) must still be caught rather than slipping through as INGEST.
+        raise WiringError(
+            f"inbound connection {name!r}: ack_after='delivered' is not yet implemented "
+            "(Step A ships ACK-on-receipt only — use ack_after='ingest', the default)"
+        )
+    if content_type is not ContentType.HL7V2 and strict:
+        # Strict validation is hl7apy structure/cardinality validation — meaningless for a JSON/XML/text
+        # body. Fail loud at wiring (caught in dry-run / `messagefoundry check`) rather than silently
+        # ignoring it; non-HL7 payloads are validated in the Handler instead (ADR 0004).
+        raise WiringError(
+            f"inbound connection {name!r}: validation.strict is HL7-specific and can't apply to a "
+            f"{content_type.value!r} content_type — validate non-HL7 payloads in the Handler instead"
+        )
+    return InboundConnection(
+        name=name,
+        spec=spec,
+        router=router,
+        ack_mode=ack_mode,
+        ack_after=ack_after,
+        validation=Validation(strict=strict, hl7_version=hl7_version),
+        content_type=content_type,
+        source_file=source_file,
+        source_line=source_line,
+    )
+
+
 def inbound(
     name: str,
     spec: ConnectionSpec,
@@ -586,46 +1062,55 @@ def inbound(
     peek/validate/ACK path and the Router/Handler receive a :class:`Message`; any other value skips HL7
     parsing and they receive a :class:`RawMessage` (``.raw``/``.text``/``.json()``). ``strict``
     validation is HL7-only, so it cannot combine with a non-HL7 ``content_type``."""
-    if spec.type is ConnectorType.MLLP and spec.settings.get("host") is not None:
-        # The bind interface is an environment/service decision (which NIC this instance exposes),
-        # not a per-connection one — and exposing unauthenticated MLLP on 0.0.0.0 must be an admin
-        # choice, not a developer default. Set it service-side via [inbound].bind_host.
-        raise WiringError(
-            f"inbound connection {name!r}: MLLP inbound takes no host; the bind interface is a "
-            "service setting ([inbound].bind_host). Declare it as MLLP(port=...)."
-        )
-    if ack_after == AckAfter.DELIVERED:
-        # Deferred-until-delivered ACK needs the listener to hold/replay the ACK from the delivery
-        # worker (sender socket details, held connection) — not built in Step A. Fail loud at wiring
-        # so a config asking for it is caught in dry-run / `messagefoundry check`, not silently
-        # downgraded. (This also rules out the incoherent DELIVERED + ack_mode=NONE combination.)
-        # Compared by VALUE not identity: AckAfter is a str-Enum, so a raw-string ack_after='delivered'
-        # (== the member but not `is` it) must still be caught rather than slipping through as INGEST.
-        raise WiringError(
-            f"inbound connection {name!r}: ack_after='delivered' is not yet implemented "
-            "(Step A ships ACK-on-receipt only — use ack_after='ingest', the default)"
-        )
-    if content_type is not ContentType.HL7V2 and strict:
-        # Strict validation is hl7apy structure/cardinality validation — meaningless for a JSON/XML/text
-        # body. Fail loud at wiring (caught in dry-run / `messagefoundry check`) rather than silently
-        # ignoring it; non-HL7 payloads are validated in the Handler instead (ADR 0004).
-        raise WiringError(
-            f"inbound connection {name!r}: validation.strict is HL7-specific and can't apply to a "
-            f"{content_type.value!r} content_type — validate non-HL7 payloads in the Handler instead"
-        )
     file, line = _call_site()
     _active_registry().add_inbound(
-        InboundConnection(
-            name=name,
-            spec=spec,
+        build_inbound_connection(
+            name,
+            spec,
             router=router,
             ack_mode=ack_mode,
             ack_after=ack_after,
-            validation=Validation(strict=strict, hl7_version=hl7_version),
+            strict=strict,
+            hl7_version=hl7_version,
             content_type=content_type,
             source_file=file,
             source_line=line,
         )
+    )
+
+
+def build_outbound_connection(
+    name: str,
+    spec: ConnectionSpec,
+    *,
+    retry: RetryPolicy | None = None,
+    ordering: OrderingMode | None = None,
+    internal_error: InternalErrorPolicy | None = None,
+    buildup: BuildupThreshold | None = None,
+    source_file: str | None = None,
+    source_line: int | None = None,
+) -> OutboundConnection:
+    """Validate the outbound-connection invariants and build an :class:`OutboundConnection`.
+
+    The shared core of code-first :func:`outbound` **and** the ``connections.toml`` loader (ADR 0007).
+    Pure — it does not touch the active registry; the caller is responsible for ``add_outbound``."""
+    if spec.type in (ConnectorType.MLLP, ConnectorType.TCP) and spec.settings.get("host") is None:
+        # Outbound MLLP/TCP dials a downstream peer, so a host is mandatory. (It's the value that
+        # legitimately differs per environment — see env() for DEV/PROD-specific peers.)
+        kind = spec.type.value.upper()
+        raise WiringError(
+            f"outbound connection {name!r}: {kind} outbound requires a host (the downstream peer), "
+            f"e.g. {kind.title()}(host=..., port=...)."
+        )
+    return OutboundConnection(
+        name=name,
+        spec=spec,
+        retry=retry,
+        ordering=ordering,
+        internal_error=internal_error,
+        buildup=buildup,
+        source_file=source_file,
+        source_line=source_line,
     )
 
 
@@ -644,18 +1129,11 @@ def outbound(
     for this connection only (omit to inherit). ``ordering`` defaults to FIFO — strict in-order
     delivery per connection; ``internal_error`` defaults to continue (dead-letter a code-error row and
     advance); ``buildup`` sets the ``queue_buildup`` alert thresholds for this lane."""
-    if spec.type is ConnectorType.MLLP and spec.settings.get("host") is None:
-        # Outbound MLLP dials a downstream peer, so a host is mandatory. (It's the value that
-        # legitimately differs per environment — see env() for DEV/PROD-specific peers.)
-        raise WiringError(
-            f"outbound connection {name!r}: MLLP outbound requires a host (the downstream peer), "
-            "e.g. MLLP(host=..., port=...)."
-        )
     file, line = _call_site()
     _active_registry().add_outbound(
-        OutboundConnection(
-            name=name,
-            spec=spec,
+        build_outbound_connection(
+            name,
+            spec,
             retry=retry,
             ordering=ordering,
             internal_error=internal_error,
@@ -677,7 +1155,9 @@ def router(name: str) -> Callable[[RouterFn], RouterFn]:
 
 
 def handler(name: str) -> Callable[[HandlerFn], HandlerFn]:
-    """Register a Handler: ``def handle(msg) -> Send | list[Send] | None`` (None => filtered)."""
+    """Register a Handler: ``def handle(msg) -> Send | SetState | list[Send | SetState] | None``
+    (``None`` => filtered; :class:`SetState` declares a state write applied exactly-once in the
+    handoff, ADR 0005)."""
 
     def decorate(fn: HandlerFn) -> HandlerFn:
         _active_registry().add_handler(name, fn)
@@ -720,7 +1200,8 @@ _load_lock = threading.Lock()
 
 @contextmanager
 def _loading(directory: Path, registry: Registry) -> Iterator[None]:
-    """Hold the load lock, publish ``registry`` as the active declaration target, and install the
+    """Hold the load lock, publish ``registry`` as the active declaration target **and its code sets
+    as the active set** (so a module-top-level ``code_set(...)`` resolves), and install the
     sibling-helper import finder for ``directory`` — tearing all of it down (including any helper
     modules registered under their plain name) on exit."""
     global _active
@@ -729,8 +1210,11 @@ def _loading(directory: Path, registry: Registry) -> Iterator[None]:
     with _load_lock:
         _active = registry
         sys.meta_path.insert(0, finder)
+        # Code sets are published BEFORE the modules run so a top-level capture resolves; the registry
+        # already holds them (loaded in load_config/validate_config), and activated() restores cleanly.
         try:
-            yield
+            with _code_sets_activated(registry.code_sets):
+                yield
         finally:
             _active = None
             with suppress(ValueError):
@@ -753,9 +1237,28 @@ def load_config(directory: str | Path) -> Registry:
         raise FileNotFoundError(f"config directory not found: {directory}")
     _assert_safe_config_source(directory)
     registry = Registry()
+    # Load the bundle's reference tables (codesets/ relative to the config dir) BEFORE importing the
+    # config modules, so a module-top-level code_set(...) capture resolves. A bad/duplicate table is a
+    # WiringError here (fail loud), like a bad env value; a missing codesets/ dir is fine (no tables).
+    try:
+        registry.code_sets = load_code_sets(directory / CODESETS_DIR_NAME)
+    except CodeSetError as exc:
+        raise WiringError(str(exc)) from exc
     with _loading(directory, registry):
         for path in sorted(p for p in directory.glob("*.py") if not p.name.startswith("_")):
             _exec_module(path)
+    # Connections may also be authored as data (ADR 0007): merge connections.toml into the SAME
+    # registry the code-first inbound()/outbound() calls populated, before validating the whole graph.
+    # Imported lazily to avoid a wiring<->connections_file import cycle. A name in both surfaces is a
+    # duplicate WiringError via add_inbound/add_outbound (no silent precedence).
+    from messagefoundry.config.connections_file import (
+        CONNECTIONS_FILE_NAME,
+        load_connections_file,
+    )
+
+    conn_file = directory / CONNECTIONS_FILE_NAME
+    if conn_file.is_file():
+        load_connections_file(conn_file, registry)
     registry.validate()
     return registry
 
@@ -839,12 +1342,32 @@ def validate_config(directory: str | Path) -> list[Diagnostic]:
         return [Diagnostic(message=str(exc), file=str(directory))]
     registry = Registry()
     diagnostics: list[Diagnostic] = []
+    # Load reference tables first (so a module-top-level code_set(...) resolves during import). A
+    # bad/duplicate table is recorded as a diagnostic, not raised, so the editor sees every problem.
+    codesets_dir = directory / CODESETS_DIR_NAME
+    try:
+        registry.code_sets = load_code_sets(codesets_dir)
+    except CodeSetError as exc:
+        diagnostics.append(Diagnostic(message=str(exc), file=str(codesets_dir)))
     with _loading(directory, registry):
         for path in sorted(p for p in directory.glob("*.py") if not p.name.startswith("_")):
             try:
                 _exec_module(path)
             except WiringError as exc:
                 diagnostics.append(Diagnostic(message=str(exc), file=str(path)))
+    # Merge connections.toml best-effort too (ADR 0007), so the editor sees TOML problems alongside the
+    # *.py ones and the router/port checks below cover TOML-authored connections. Lazy import (cycle).
+    from messagefoundry.config.connections_file import (
+        CONNECTIONS_FILE_NAME,
+        load_connections_file,
+    )
+
+    conn_file = directory / CONNECTIONS_FILE_NAME
+    if conn_file.is_file():
+        try:
+            load_connections_file(conn_file, registry)
+        except WiringError as exc:
+            diagnostics.append(Diagnostic(message=str(exc), file=str(conn_file)))
     for conn in registry.inbound.values():
         if conn.router not in registry.routers:
             diagnostics.append(

@@ -175,7 +175,9 @@ async def test_inbound_unknown_handler_dead_letters_at_ingress(
 class _BoomSource:
     """A source whose start() always fails (simulates a port-in-use bind error)."""
 
-    async def start(self, handler: object) -> None:
+    polls_shared_resource = False
+
+    async def start(self, handler: object, *, leader_gate: object = None) -> None:
         raise OSError("address already in use")
 
     async def stop(self) -> None:

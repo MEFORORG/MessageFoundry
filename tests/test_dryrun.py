@@ -144,14 +144,15 @@ def test_transform_one_returns_deliveries() -> None:
         return Send("out", msg)
 
     reg = _registry(lambda m: ["h"], {"h": handle})
-    deliveries = transform_one(reg, "h", ADT_A01)
+    deliveries, state_ops = transform_one(reg, "h", ADT_A01)
     assert [d.to for d in deliveries] == ["out"]
     assert isinstance(deliveries[0], DeliveryPreview) and "FOUNDRY" in deliveries[0].payload
+    assert state_ops == []  # no SetState declared (ADR 0005)
 
 
 def test_transform_one_filtering_handler_returns_no_deliveries() -> None:
     reg = _registry(lambda m: ["h"], {"h": lambda m: None})
-    assert transform_one(reg, "h", ADT_A01) == []
+    assert transform_one(reg, "h", ADT_A01) == ([], [])
 
 
 def test_transform_one_unknown_outbound_raises() -> None:
@@ -194,7 +195,7 @@ def test_route_message_recomposes_identically() -> None:
     ic = reg.inbound["in"]
     combined = route_message(reg, ic, ADT_A01)
     names = route_only(reg, ic, ADT_A01)
-    manual_deliveries = [d for hname in names for d in transform_one(reg, hname, ADT_A01)]
+    manual_deliveries = [d for hname in names for d in transform_one(reg, hname, ADT_A01)[0]]
     assert combined.handlers == names
     assert [(d.to, d.payload) for d in combined.deliveries] == [
         (d.to, d.payload) for d in manual_deliveries

@@ -46,6 +46,7 @@ __all__ = [
     "DeliverySettings",
     "EnvironmentsSettings",
     "LoggingSettings",
+    "ReferenceSettings",
     "RetentionSettings",
     "AuthSettings",
     "AiSettings",
@@ -54,6 +55,7 @@ __all__ = [
     "AiEnvironment",
     "EgressSettings",
     "AlertsSettings",
+    "ClusterSettings",
     "ServiceSettings",
     "load_settings",
 ]
@@ -66,11 +68,13 @@ _SECTIONS = (
     "delivery",
     "environments",
     "logging",
+    "reference",
     "retention",
     "auth",
     "ai",
     "egress",
     "alerts",
+    "cluster",
 )
 _ENV_PREFIX = "MEFOR_"
 _DEFAULT_FILE = "messagefoundry.toml"
@@ -91,6 +95,9 @@ class StoreBackend(str, Enum):
     SQLITE = "sqlite"
     SQLSERVER = (
         "sqlserver"  # implemented but EXPERIMENTAL / not production-ready (see store/sqlserver.py)
+    )
+    POSTGRES = (
+        "postgres"  # production server-DB backend with single-node parity (see store/postgres.py)
     )
 
 
@@ -150,8 +157,14 @@ class StoreSettings(_Section):
     # the env key takes precedence. Empty = use `encryption_key` (the cross-platform default).
     encryption_key_file: str | None = None
 
-    # --- SQL Server (backend = "sqlserver") ---------------------------------
+    # --- Server-DB backends (backend = "sqlserver" | "postgres") ------------
+    # These connection fields are shared by every server-database backend. SQL Server consumes them
+    # via an ODBC DSN (store/sqlserver.py); Postgres maps them onto asyncpg connection params
+    # (store/postgres.py). trust_server_certificate/encrypt drive the TLS posture identically.
     server: str | None = None
+    # Default is SQL Server's port (1433); for the Postgres backend a left-at-default 1433 is treated
+    # as "use Postgres's conventional 5432" by the model_validator below, so a Postgres deployment that
+    # omits `port` still connects (set MEFOR_STORE_PORT explicitly to override either default).
     port: int = 1433
     database: str | None = None
     auth: SqlAuth = SqlAuth.SQL
@@ -166,6 +179,21 @@ class StoreSettings(_Section):
         None  # 'db_schema' avoids shadowing BaseModel.schema; env: MEFOR_STORE_DB_SCHEMA
     )
     application_name: str = "messagefoundry"
+    # Inflight-row lease TTL (seconds) for the multi-node server-DB backends (Track B Step 2). When a
+    # worker claims a row it stamps owner + a lease_expires_at = now + this; a renew timer extends it
+    # while processing, and a leader sweep reclaims only rows whose lease has expired (so a crashed
+    # node's work is recovered without stealing a live sibling's in-flight rows). A shared server-DB
+    # field — harmless to SQL Server / SQLite, which don't lease and ignore it. The lease is wall-clock
+    # across nodes, so the no-theft guarantee assumes clocks are NTP-synced to well within this TTL;
+    # set it comfortably larger than expected clock skew + the renew interval.
+    lease_ttl_seconds: float = 60.0
+
+    @field_validator("lease_ttl_seconds")
+    @classmethod
+    def _positive_lease_ttl(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("lease_ttl_seconds must be > 0")
+        return value
 
     @field_validator("server", "database", "username", "application_name")
     @classmethod
@@ -182,14 +210,29 @@ class StoreSettings(_Section):
         return value
 
     @model_validator(mode="after")
-    def _require_sqlserver_fields(self) -> "StoreSettings":
-        """When the SQL Server backend is selected, its connection essentials must be present."""
-        if self.backend is StoreBackend.SQLSERVER:
+    def _require_server_db_fields(self) -> "StoreSettings":
+        """When a server-database backend (SQL Server or Postgres) is selected, its connection
+        essentials must be present. Both backends share the ``server``/``database`` (+ ``username``
+        for SQL auth) connection fields; Postgres additionally only supports SQL (username/password)
+        auth in this phase — INTEGRATED/ENTRA are SQL-Server-only until a Postgres equivalent
+        (Kerberos/IAM) is built."""
+        if self.backend in (StoreBackend.SQLSERVER, StoreBackend.POSTGRES):
+            label = self.backend.value
+            if self.backend is StoreBackend.POSTGRES:
+                if self.auth is not SqlAuth.SQL:
+                    raise ValueError(
+                        "postgres backend supports only auth='sql' (username + MEFOR_STORE_PASSWORD) "
+                        f"in this phase, not auth={self.auth.value!r}"
+                    )
+                if self.port == 1433:
+                    # Left at the SQL-Server default → fall back to Postgres's conventional port so a
+                    # Postgres deployment that omits `port` doesn't silently dial 1433 and fail.
+                    self.port = 5432
             missing = [name for name in ("server", "database") if getattr(self, name) is None]
             if self.auth is SqlAuth.SQL and self.username is None:
                 missing.append("username")  # SQL login needs a user (+ MEFOR_STORE_PASSWORD)
             if missing:
-                raise ValueError("sqlserver backend requires: " + ", ".join(missing))
+                raise ValueError(f"{label} backend requires: " + ", ".join(missing))
         return self
 
 
@@ -300,6 +343,39 @@ class LoggingSettings(_Section):
         return upper
 
 
+class ReferenceSettings(_Section):
+    """``[reference]`` — managed, versioned, read-only lookup snapshots (ADR 0006 Tier 1).
+
+    Enforced by the engine's :class:`~messagefoundry.pipeline.reference_sync.ReferenceSyncRunner`.
+    Reference sets are declared in wiring modules with ``Reference(name, source=…)`` and materialized
+    OFF the message path; a transform reads them purely via ``reference("name").get(key)``. The runner
+    is a no-op when no sets are declared, so these defaults are safe for an existing deployment."""
+
+    # Base cadence (seconds) the sync loop ticks at; each set re-materializes when its own
+    # refresh_seconds is due. Must be > 0.
+    refresh_interval_seconds: float = 3600.0
+    # Sync every declared set once at startup, before inbound listeners begin serving, so a transform's
+    # reference(...) resolves on the very first message. Strongly recommended on.
+    sync_on_startup: bool = True
+    # Reserved freshness guard (seconds; 0 = off): alert/refuse when the active snapshot is older than
+    # this. Not enforced in Tier 1 — accepted so a forward-looking file still loads.
+    max_staleness_seconds: float = 0.0
+
+    @field_validator("refresh_interval_seconds")
+    @classmethod
+    def _positive_interval(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("refresh_interval_seconds must be > 0")
+        return value
+
+    @field_validator("max_staleness_seconds")
+    @classmethod
+    def _non_negative_staleness(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("max_staleness_seconds must be >= 0 (0 = off)")
+        return value
+
+
 class RetentionSettings(_Section):
     """``[retention]`` — data-retention + SQLite maintenance (PHI.md §8, ASVS 14.2.x).
 
@@ -316,6 +392,10 @@ class RetentionSettings(_Section):
     # Past N days, null the bodies of DEAD (dead-lettered) outbound rows — their own window because a
     # dead row stays replayable until its body is purged. 0 = keep forever.
     dead_letter_days: int = 0
+    # Past N days, DELETE transform-state entries (ADR 0005) last written before the cutoff — keeps the
+    # in-memory state cache + table bounded. A simple global age purge; per-namespace policy is a
+    # follow-up. 0 = keep forever (the default — state correlation data is opt-in to purge).
+    state_max_age_days: int = 0
     # Audit-log retention. RESERVED / not enforced: the audit_log is a tamper-evident hash chain and
     # HIPAA expects ~6-year retention, so audit is keep-forever by design here; archive-first pruning
     # is a tracked follow-up. Accepted (not rejected) so a forward-looking file still loads.
@@ -334,7 +414,9 @@ class RetentionSettings(_Section):
     # a write lock on the whole DB while it runs, so it is off by default and meant for a quiet window.
     vacuum_at: str = ""
 
-    @field_validator("messages_days", "dead_letter_days", "audit_days", "max_db_mb")
+    @field_validator(
+        "messages_days", "dead_letter_days", "audit_days", "max_db_mb", "state_max_age_days"
+    )
     @classmethod
     def _non_negative_days(cls, value: int) -> int:
         if value < 0:
@@ -426,6 +508,7 @@ class AuthSettings(_Section):
     ad_allow_insecure_ldap: bool = False  # explicit opt-in to a non-ldaps:// bind (trusted-net dev)
 
     # Windows SSO (Kerberos/SPNEGO) — passwordless login from a domain-joined client.
+    # Experimental; off by default. Not a supported v0.1 feature — hardening targeted for 0.2.
     kerberos_enabled: bool = False
     kerberos_spn: str | None = None  # e.g. HTTP/host.example.com
 
@@ -503,15 +586,26 @@ class EgressSettings(_Section):
 
     # Allowed MLLP outbound destinations: each entry is "host" (any port) or "host:port".
     allowed_mllp: list[str] = []
+    # Allowed raw-TCP outbound destinations: each entry is "host" (any port) or "host:port".
+    allowed_tcp: list[str] = []
     # Allowed File outbound directories: a destination's directory must resolve at/under one of these.
     allowed_file_dirs: list[str] = []
     # Allowed REST/SOAP (HTTP) outbound hosts: each entry is "host" (any port) or "host:port".
     allowed_http: list[str] = []
     # Allowed DATABASE outbound servers: each entry is "host" (any port) or "host:port".
     allowed_db: list[str] = []
+    # Allowed REMOTEFILE (SFTP/FTP/FTPS) hosts — gates the connector in BOTH directions (the source
+    # dials out to poll, the destination dials out to upload). Each entry is "host" or "host:port".
+    allowed_remote: list[str] = []
 
     @field_validator(
-        "allowed_mllp", "allowed_file_dirs", "allowed_http", "allowed_db", mode="before"
+        "allowed_mllp",
+        "allowed_tcp",
+        "allowed_file_dirs",
+        "allowed_http",
+        "allowed_db",
+        "allowed_remote",
+        mode="before",
     )
     @classmethod
     def _split_list(cls, v: object) -> object:
@@ -566,6 +660,63 @@ class AlertsSettings(_Section):
         return v
 
 
+class ClusterSettings(_Section):
+    """``[cluster]`` — horizontal scale-out coordination (Track B Steps 3-7).
+
+    The multi-node coordination seam (a ``nodes`` table + per-node heartbeat + leader election) without
+    changing single-node behavior: with ``enabled = false`` (the default) the engine uses the no-op
+    :class:`~messagefoundry.pipeline.cluster.NullCoordinator` and runs byte-identically to before.
+    With ``enabled = true`` on Postgres, the scale-out feature set is COMPLETE: leader election (Step 4),
+    leader-gated poll-source intake (Step 4b), per-lane FIFO ownership (Step 5), cross-node reference +
+    config-reload + transform-state convergence (Steps 6/6b), and the read-only observability API
+    (Step 7 — ``/cluster/status`` + ``/cluster/nodes``). Exactly one node runs the leader-only WRITE
+    singletons (retention, the lease-reclaim sweep) and re-reads each reference source while followers
+    read-through the shared snapshot; an operator config reload propagates cluster-wide via a version
+    token; and operators can see membership + leadership over the API. Operators must keep node clocks
+    synced (NTP — leases are wall-clock), run identical config dirs on every node, and apply config
+    changes via a coordinated (not rolling) restart — see ``docs/CLUSTERING.md``. The cross-section
+    validator below requires ``[store].backend = postgres`` and ``[store].pool_size >= 2`` when this is
+    enabled (the leader holds one dedicated pooled connection for its leadership advisory lock)."""
+
+    enabled: bool = False
+    # Override the auto-generated node id (host:pid:hex). Pin it for a stable identity across restarts
+    # or in tests; left unset, the factory reuses the store's lease owner-id so node-id == owner-id.
+    node_id: str | None = None
+    # How often a node refreshes its `last_seen` heartbeat. The same cadence drives leader-lock
+    # maintenance (Track B Step 4) — no separate leader-check knob. Must be > 0.
+    heartbeat_seconds: float = 10.0
+    # A node is considered dead when its last_seen is older than this. Consulted by DbCoordinator's
+    # cluster_members() (Step 7) as the freshness filter for the /cluster/nodes observability endpoint —
+    # it discards a crashed ex-leader's stale is_leader flag and bounds the failover window in which a
+    # just-beaten node still counts toward the derived leader. It is NOT what transfers leadership: the
+    # session-level leader advisory lock is (a crashed leader's lock auto-releases server-side). Must be > 0.
+    node_timeout_seconds: float = 30.0
+    # How often the LEADER runs the lease-reclaim sweep (reclaim_expired_leases) that recovers crashed
+    # nodes' in-flight rows (Track B Step 4). Only the current leader acts; followers no-op. Must be > 0.
+    reclaim_interval_seconds: float = 30.0
+
+    @field_validator("heartbeat_seconds", "node_timeout_seconds", "reclaim_interval_seconds")
+    @classmethod
+    def _positive(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("must be > 0")
+        return value
+
+    @model_validator(mode="after")
+    def _timeout_exceeds_heartbeat(self) -> "ClusterSettings":
+        """A node must beat at least once within its dead-timeout, or Step-4 election would mark a
+        live node dead between beats. node_timeout_seconds is reserved for that election, but lock the
+        invariant in now so a misconfiguration is caught at config load, not at election bring-up."""
+        if self.node_timeout_seconds <= self.heartbeat_seconds:
+            raise ValueError(
+                "node_timeout_seconds must be > heartbeat_seconds "
+                f"(got node_timeout_seconds={self.node_timeout_seconds}, "
+                f"heartbeat_seconds={self.heartbeat_seconds}) — a node must beat at least once before "
+                "it is considered dead"
+            )
+        return self
+
+
 class ServiceSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")  # tolerate forward-looking/unknown sections
 
@@ -575,11 +726,39 @@ class ServiceSettings(BaseModel):
     delivery: DeliverySettings = Field(default_factory=DeliverySettings)
     environments: EnvironmentsSettings = Field(default_factory=EnvironmentsSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    reference: ReferenceSettings = Field(default_factory=ReferenceSettings)
     retention: RetentionSettings = Field(default_factory=RetentionSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
     ai: AiSettings = Field(default_factory=AiSettings)
     egress: EgressSettings = Field(default_factory=EgressSettings)
     alerts: AlertsSettings = Field(default_factory=AlertsSettings)
+    cluster: ClusterSettings = Field(default_factory=ClusterSettings)
+
+    @model_validator(mode="after")
+    def _cluster_requires_postgres(self) -> "ServiceSettings":
+        """Cluster coordination needs a shared multi-node store. SQLite is single-file/single-node and
+        SQL Server is experimental (no leases), so only the Postgres backend can back the ``nodes``
+        table + row leases the coordinator depends on. This spans two sections, so it lives here (not
+        on :class:`ClusterSettings`, which can't see ``[store]``)."""
+        if self.cluster.enabled:
+            if self.store.backend is not StoreBackend.POSTGRES:
+                raise ValueError(
+                    "[cluster].enabled requires [store].backend = 'postgres' "
+                    f"(got {self.store.backend.value!r}); SQLite is single-node and SQL Server is "
+                    "experimental — cluster coordination is Postgres-only"
+                )
+            if self.store.pool_size < 2:
+                # Leader election holds ONE pooled connection for the lifetime of its session-level
+                # advisory lock (Track B Step 4). With pool_size=1 that lone connection would be the
+                # store's only connection, starving every query, so require headroom.
+                raise ValueError(
+                    "[cluster].enabled requires [store].pool_size >= 2 "
+                    f"(got {self.store.pool_size}); the leader holds one dedicated pooled connection "
+                    "for its leadership advisory lock, so a pool of 1 would starve the store. Note the "
+                    "floor of 2 leaves only ONE working connection while a node holds the leader "
+                    "connection under contention — prefer pool_size >= 3 for clustered Postgres"
+                )
+        return self
 
 
 def _merge(dst: dict[str, dict[str, Any]], src: Mapping[str, Any]) -> None:

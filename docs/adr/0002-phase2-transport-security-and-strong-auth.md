@@ -1,11 +1,17 @@
 # ADR 0002 — Phase 2: transport security & strong authentication (off-loopback exposure)
 
-- **Status:** Proposed (2026-06-12) — **design only; build deferred** until off-loopback exposure is
-  actually scheduled (the standing "design now, build then" decision). This ADR is written *before* a
-  network deployment is on the calendar so the flip from "deferred" to "mandatory" is mechanical, not a
-  scramble. It records the design; it does **not** authorize the build.
+- **Status:** **Accepted (2026-06-14) — build authorized for the v0.1 transport-TLS subset.** The
+  off-loopback trigger has fired: the [v0.1 Release Plan](../releases/v0.1-PLAN.md) makes **native
+  off-loopback TLS a hard release gate (Gate #4)**, so **WP-13a (API/WSS TLS), WP-13b (MLLP-over-TLS),
+  and WP-15 (reverse-proxy / forwarded headers) are authorized for v0.1**. **WP-14 (TOTP MFA) stays
+  deferred to 0.2** (owner decision 2026-06-14: off-loopback v0.1 relies on AD/Entra IdP-MFA or an
+  MFA-terminating proxy; local-password admins stay loopback). **Federated SSO (OAuth 2.0 / OIDC /
+  SAML via Entra) and SMART on FHIR are *out of this ADR's scope*** — they get a dedicated
+  federated-SSO ADR when 0.2 design begins. *(Originally Proposed 2026-06-12 as design-only under the
+  "design now, build then" rule; this acceptance supersedes that deferral.)*
 - **Built:** Nothing in this ADR is built yet — it designs **WP-13a** (API/WebSocket TLS), **WP-13b**
-  (MLLP-over-TLS), **WP-14** (MFA), and **WP-15** (reverse-proxy / forwarded-header hardening). The
+  (MLLP-over-TLS, v0.1), **WP-14** (MFA, **deferred to 0.2**), and **WP-15** (reverse-proxy /
+  forwarded-header hardening). The
   Phase-0/1 groundwork it *builds on* is already shipped and must **not** be redesigned:
   the HSTS response header that fires on `https` ([api/app.py](../../messagefoundry/api/app.py)
   `_security_headers`), the transport-agnostic WebSocket `Origin` check
@@ -214,8 +220,8 @@ enterprise healthcare — the engine stays `http` on a restricted interface **be
 
 ---
 
-*On acceptance: this stays Proposed until an off-loopback deployment is scheduled; then build in the
-order above, one WP per branch/PR with the standard quartet gate, flipping the relevant
-[ASVS-L2-ASSESSMENT.md](../security/ASVS-L2-ASSESSMENT.md) rows and updating
+*Accepted for v0.1 (Gate #4): build the transport-TLS subset in the order **WP-13a → WP-15 → WP-13b**,
+one WP per branch/PR with the standard quartet gate; **WP-14 (MFA) lands in 0.2**, not this release.
+Flip the relevant [ASVS-L2-ASSESSMENT.md](../security/ASVS-L2-ASSESSMENT.md) rows and update
 [PHI.md](../PHI.md) §4/§11 + [CONFIGURATION.md](../CONFIGURATION.md) + [SECURITY.md](../SECURITY.md) as
 each lands. Update CLAUDE.md / ARCHITECTURE.md only when code ships, not now.*

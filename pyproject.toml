@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "messagefoundry"
 version = "0.0.1"
-description = "Lightweight open-source HL7 v2 integration engine"
+description = "Open-source healthcare integration engine — route, transform, and validate messages across many formats and connection types"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "AGPL-3.0-or-later"
@@ -20,6 +20,7 @@ dependencies = [
     "cryptography>=42",     # AES-256-GCM PHI-at-rest encryption for the store
     "ldap3>=2.9",           # Active Directory / LDAP authentication (pure-Python)
     "pyspnego>=0.10",       # SPNEGO/Kerberos negotiate for Windows SSO
+    "tomlkit>=0.12",        # comment/format-preserving TOML writer for connections.toml (ADR 0007)
 ]
 
 [project.optional-dependencies]
@@ -30,6 +31,12 @@ console = [
 # EXPERIMENTAL SQL Server store backend. Also needs the Microsoft ODBC Driver 18 for SQL Server
 # installed at the OS level (not pip-installable). Lazy-imported, so SQLite-only installs skip it.
 sqlserver = ["aioodbc>=0.5"]
+# PostgreSQL store backend (production server-DB with single-node parity). Pure-Python driver, no
+# OS-level dependency. Lazy-imported, so SQLite-only installs skip it.
+postgres = ["asyncpg>=0.29"]
+# SFTP (SSH) transport for the REMOTEFILE connector. FTP/FTPS use the stdlib (ftplib), no dep.
+# Lazy-imported, so installs that never use SFTP skip paramiko.
+sftp = ["paramiko>=3.4"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -60,5 +67,5 @@ strict = true
 
 # Third-party libraries that ship no type stubs / py.typed marker.
 [[tool.mypy.overrides]]
-module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "ldap3.*"]
+module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*"]
 ignore_missing_imports = true

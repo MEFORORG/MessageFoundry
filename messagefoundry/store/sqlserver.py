@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
@@ -74,6 +75,15 @@ _SCHEMA: list[str] = [
         event NVARCHAR(64) NOT NULL, destination NVARCHAR(256) NULL, detail NVARCHAR(MAX) NULL)""",
     """IF INDEXPROPERTY(OBJECT_ID('message_events'),'ix_events_message','IndexID') IS NULL
         CREATE INDEX ix_events_message ON message_events(message_id, ts)""",
+    # Transform-accessible state (ADR 0005) — parity table. INERT on this backend: writes ride the
+    # staged transform_handoff, which is NotImplementedError here (BACKLOG #1), so nothing populates it
+    # until the SQL Server staged pipeline lands. Present so the schema matches SQLite.
+    """IF OBJECT_ID('state','U') IS NULL CREATE TABLE state (
+        namespace NVARCHAR(256) NOT NULL, [key] NVARCHAR(256) NOT NULL, value NVARCHAR(MAX) NOT NULL,
+        set_at FLOAT NOT NULL, message_id NVARCHAR(64) NULL,
+        CONSTRAINT pk_state PRIMARY KEY (namespace, [key]))""",
+    """IF INDEXPROPERTY(OBJECT_ID('state'),'ix_state_set_at','IndexID') IS NULL
+        CREATE INDEX ix_state_set_at ON state(set_at)""",
     """IF OBJECT_ID('audit_log','U') IS NULL CREATE TABLE audit_log (
         id INT IDENTITY(1,1) PRIMARY KEY, ts FLOAT NOT NULL, actor NVARCHAR(256) NULL,
         action NVARCHAR(128) NOT NULL, channel_id NVARCHAR(256) NULL, detail NVARCHAR(MAX) NULL,
@@ -491,13 +501,58 @@ class SqlServerStore:
         message_id: str,
         channel_id: str,
         deliveries: Sequence[tuple[str, str]],
+        state_ops: Sequence[tuple[str, str, Any]] = (),
         now: float | None = None,
     ) -> bool:
-        """Not implemented on the SQL Server backend — see :meth:`route_handoff` (BACKLOG #1)."""
+        """Not implemented on the SQL Server backend — see :meth:`route_handoff` (BACKLOG #1). The
+        ``state_ops`` param (ADR 0005) is accepted for ``Store`` protocol parity but inert here: state
+        writes ride this handoff, which doesn't run on SQL Server until its staged pipeline lands."""
         raise NotImplementedError(
             "staged transform_handoff is not supported on the SQL Server backend yet (BACKLOG #1); "
             "use the SQLite backend"
         )
+
+    def state_view(self) -> Mapping[tuple[str, str], Any]:
+        """Empty transform-state view on the SQL Server backend (ADR 0005). The staged transform path
+        that populates state is SQLite-only (BACKLOG #1); returning an empty read-only mapping keeps a
+        Handler's ``state_get(...)`` resolvable (every key misses → its default) rather than raising."""
+        return MappingProxyType({})
+
+    def reference_view(self) -> Mapping[str, Mapping[str, Any]]:
+        """Empty reference view on the SQL Server backend (ADR 0006). Reference snapshots live in the
+        SQLite store; returning an empty read-only mapping keeps a Handler's ``reference("name")``
+        call shaped correctly — though it will raise ``ReferenceError`` for any name (no set synced),
+        which is the honest state on this backend (the staged runner doesn't start here anyway)."""
+        return MappingProxyType({})
+
+    async def write_reference_snapshot(
+        self, *, name: str, version: str, rows: Mapping[str, Any]
+    ) -> None:
+        """Not supported on the SQL Server backend — reference snapshots are SQLite-only (ADR 0006),
+        and the staged runner never starts here (``supports_ingest_stage = False``). Present for
+        ``Store`` protocol completeness."""
+        raise NotImplementedError(
+            "write_reference_snapshot is not supported on the SQL Server backend (ADR 0006 is "
+            "SQLite-only); use the SQLite backend"
+        )
+
+    async def converge_reference_cache(self) -> list[str]:
+        """No-op on the SQL Server backend (Track B Step 6). Reference snapshots are SQLite-only here
+        (write_reference_snapshot raises) and the staged runner never starts on this backend, so there
+        is no shared snapshot to read through. Present for ``Store`` protocol completeness; returns
+        ``[]``."""
+        return []
+
+    async def converge_state_cache(self) -> list[str]:
+        """No-op on the SQL Server backend (Track B Step 6b). The staged pipeline (transform_handoff /
+        transform state) never runs on this backend, so there is no shared state to read through. Present
+        for ``Store`` protocol completeness; returns ``[]`` (same reasoning as converge_reference_cache)."""
+        return []
+
+    def enable_state_convergence(self) -> None:
+        """No-op on the SQL Server backend (Track B Step 6b): there is no cross-node convergence here, so
+        there is no per-namespace version to bump. Present for ``Store`` protocol completeness."""
+        return None
 
     async def dead_letter_missing_handlers(
         self, valid_names: set[str], now: float | None = None
@@ -530,6 +585,13 @@ class SqlServerStore:
         raise NotImplementedError(
             "purge_message_bodies is not supported on the SQL Server backend (retention is "
             "SQLite-only; use a TDE + SQL Agent purge job on SQL Server)"
+        )
+
+    async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
+        """Not supported on the SQL Server backend — retention is SQLite-only (see class note). The
+        ``state`` table here is inert (no staged transform path populates it, BACKLOG #1)."""
+        raise NotImplementedError(
+            "purge_state is not supported on the SQL Server backend (retention is SQLite-only)"
         )
 
     async def purge_dead_letters(self, *, older_than: float, now: float | None = None) -> int:
@@ -661,10 +723,18 @@ class SqlServerStore:
         return items
 
     async def claim_next_fifo(
-        self, name: str, now: float | None = None, *, stage: str = Stage.OUTBOUND.value
+        self,
+        name: str,
+        now: float | None = None,
+        *,
+        stage: str = Stage.OUTBOUND.value,
+        owner: str | None = None,
     ) -> OutboxItem | None:
         # SQL Server holds only outbound rows (see claim_ready); `name` is the destination lane and
         # `stage` is accepted for protocol compatibility. Ingress staging is gated on BACKLOG #1.
+        # `owner` (Track B Step 5 lane ownership) is accepted for protocol uniformity and IGNORED: this
+        # experimental backend is single-node, so there are no lane leases and the runner never passes
+        # a non-None owner here.
         destination_name = name
         now = time.time() if now is None else now
         # FIFO: lock + claim the single oldest pending row for this destination, but only if it is

@@ -7,6 +7,7 @@ CI-service-container-gated, like the SQL Server store backend).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from datetime import datetime
@@ -441,6 +442,84 @@ async def test_source_run_loop_survives_a_poll_error() -> None:
     src._poll_seconds = 0.0
     await src._run()  # must NOT propagate — a bad poll never kills the poller
     assert calls == [1]
+
+
+# --- source: leader-gating (Track B Step 4b) --------------------------------
+
+
+def test_source_declares_polls_shared_resource() -> None:
+    # A polled DB table is a shared external resource — the runner reads this flag to leader-gate it.
+    assert DatabaseSource.polls_shared_resource is True
+
+
+async def test_source_run_loop_skips_poll_when_gate_false() -> None:
+    # A follower (leader_gate() -> False) must NOT execute poll_statement nor mark any rows: the loop
+    # ticks but _poll_once is never reached, so the shared table is untouched (no duplicate intake).
+    src = _src(body_column="payload")
+    src._leader_gate = lambda: False
+    src._poll_seconds = 0.0
+    polled = {"n": 0}
+
+    async def spy() -> None:  # would run poll_statement + marks if reached
+        polled["n"] += 1
+        src._stop.set()
+        raise AssertionError("a follower must not poll")
+
+    src._poll_once = spy  # type: ignore[method-assign]
+    # Let the loop spin a few ticks, then stop it (a follower never sets _stop itself via the spy).
+    runner = asyncio.create_task(src._run())
+    await asyncio.sleep(0.02)
+    src._stop.set()
+    await runner
+    assert polled["n"] == 0  # poll_once was gated out every tick
+
+
+async def test_source_follower_real_poll_issues_no_sql() -> None:
+    # Higher-fidelity follower test (matches the FILE source's end-to-end check): let the REAL
+    # _poll_once run under a False gate against a pool that raises if touched. The gate must short-
+    # circuit before any acquire/SELECT/mark — so a regression where _may_poll returns True but
+    # _poll_once is reached would surface as the pool being acquired (not just a spy never called).
+    class _PoisonPool:
+        async def acquire(self) -> object:
+            raise AssertionError("a follower must not acquire a connection / issue any SQL")
+
+    src = _src(body_column="payload")
+    src._pool = _PoisonPool()  # already-built pool → _get_pool returns it without reconnecting
+    src._handler = _RecordingHandler()
+    src._leader_gate = lambda: False
+    src._poll_seconds = 0.0
+    runner = asyncio.create_task(src._run())
+    await asyncio.sleep(0.02)  # several ticks — each must skip the poison pool
+    src._stop.set()
+    await runner  # must not raise: the gate kept the real _poll_once away from the pool
+
+
+async def test_source_run_loop_polls_when_gate_true() -> None:
+    # A leader (leader_gate() -> True) polls exactly as the un-gated default does.
+    src = _src(body_column="payload")
+    src._leader_gate = lambda: True
+    src._poll_seconds = 0.0
+    calls: list[int] = []
+
+    async def spy() -> None:
+        calls.append(1)
+        src._stop.set()  # one iteration then exit
+
+    src._poll_once = spy  # type: ignore[method-assign]
+    await src._run()
+    assert calls == [1]  # the gate was True → poll_once ran
+
+
+async def test_source_may_poll_logs_transition_once_then_resumes() -> None:
+    # _may_poll is the gate check: False while a follower, True once leader, and it flips its
+    # transition flag so it logs once per transition rather than every skipped tick.
+    src = _src(body_column="payload")
+    leader = {"on": False}
+    src._leader_gate = lambda: leader["on"]
+    assert src._may_poll() is False and src._skipping is True
+    assert src._may_poll() is False and src._skipping is True  # still a follower (no re-flip)
+    leader["on"] = True
+    assert src._may_poll() is True and src._skipping is False  # became leader → resume
 
 
 async def test_source_stop_closes_the_pool() -> None:

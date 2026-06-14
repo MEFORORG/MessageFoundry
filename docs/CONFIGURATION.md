@@ -102,6 +102,160 @@ section only locates the value files.
 - A referenced key that is **undefined for the target environment** makes the engine refuse to load
   or promote that graph (fail loud) — never a silent blank host. See the env files under
   [`environments/`](../environments/) and `samples/config/IB_ACME_ADT.py` for a worked example.
+- **Per-face logic inside a transform:** `env()` is a *deferred reference* resolved only when a
+  **connection** spec is built — using it in a handler is an always-truthy object (a bug). To branch a
+  Router/Handler on the deployment, read the active environment **name** with
+  [`current_environment()`](../messagefoundry/config/active_environment.py) (`"dev"`/`"staging"`/
+  `"prod"`, or `None` in a dry-run):
+  ```python
+  from messagefoundry import current_environment
+  # Corepoint: If ActiveFace="Test" Then MSH-11.1 = "T"
+  if current_environment() in ("staging", "dev"):
+      msg.set("MSH-11.1", "T")
+  ```
+  The active environment is a deployment constant, so the read is pure + re-run-safe.
+
+### Code sets — reference lookup tables (`codesets/`)
+A code-first Router/Handler often needs a **reference table** — an Epic diet code → a food-service
+system value, a facility code → a downstream mnemonic. Rather than a hand-maintained Python dict, drop the table in a
+**code set** and look it up with [`code_set("name")`](../messagefoundry/config/code_sets.py).
+
+- **Where.** Files live in `codesets/` **relative to the `--config` dir** — a config bundle carries
+  its own reference tables and they **reload with the graph** (POST `/config/reload`). This is distinct
+  from `environments/` (cwd-level endpoint values for `env()`). A missing `codesets/` dir is fine
+  (no code sets). The code-set **name** is the file's stem (`codesets/epic_diets.csv` → `"epic_diets"`).
+- **CSV** (`<name>.csv`) — a header row; the **first column is the lookup key**. One other column →
+  the value is that scalar (`str`); several other columns → the value is a `dict` `{header: cell}`. A
+  duplicate key is a **load error** (fail loud).
+- **TOML** (`<name>.toml`) — a flat table `key = value` → `{key: scalar}`; a nested `[key]` table →
+  `{key: {…}}` (mirrors the `environments/<env>.toml` shape).
+- **Usage.** Capture once at a module's top level (preferred) or look it up at call time inside a
+  handler — both resolve:
+  ```python
+  from messagefoundry import code_set, handler, Send
+
+  DIET = code_set("epic_diets")          # frozen, read-only mapping; captured at import
+
+  @handler("to_cbord")
+  def handle(msg):
+      msg["ODS-3"] = DIET.get(msg["ODS-3"], "")     # .get(key, default) — blank on a miss
+      fac = code_set("facility_mnemonics").get(msg["MSH-4"])  # call-time lookup also works
+      ...
+      return Send("OB_CBORD_DIET", msg)
+  ```
+  A `CodeSet` is a read-only `Mapping`: `cs[key]` (raises `KeyError` naming the set on a miss),
+  `cs.get(key, default)`, `key in cs`, `len(cs)`, iteration. It is **frozen** — one instance is shared
+  across transforms, so a handler must never mutate the reference data.
+- **Fail loud.** `code_set("missing")` (no such file) or a malformed/duplicate-key CSV/TOML raises a
+  `WiringError`, surfaced by `validate` / `messagefoundry check` / reload exactly like a missing
+  `env()` value — never a silent empty table.
+- **Purity caveat.** The lookup is pure (key in → value out), so it's compatible with the staged
+  pipeline's **pure-re-run** invariant ([ADR 0001](adr/0001-staged-pipeline-architecture.md) /
+  CLAUDE.md §2). The one caveat: a hot-reload that **changes** a table between a run and a
+  crash-re-run can make the re-run derive a different output. That's acceptable for reference data (a
+  code set is deliberately operator-editable, and a reload is an explicit, audited act), but it is the
+  one way a transform's re-run can legitimately differ — note it where you document the transform.
+
+### Transform state — cross-message correlation ([ADR 0005](adr/0005-transform-accessible-state.md))
+
+Where code sets are **read-only** reference data, **transform state** is **read/write** correlation
+data a Handler accumulates across messages: an anonymous-patient mapping (persist a real MRN → a stable
+anonymized id and reuse it on later messages), order↔result correlation, running aggregates. It is
+authored against two surfaces from `messagefoundry`:
+
+```python
+from messagefoundry import handler, Send, SetState, state_get
+
+@handler("anonymize")
+def anonymize(msg):
+    mrn = msg["PID-3.1"]
+    anon = state_get("patient_anon", mrn)          # synchronous read; None on a miss
+    ops = []
+    if anon is None:
+        anon = derive_anon_id(mrn)                  # deterministic derivation preferred (see below)
+        ops.append(SetState("patient_anon", mrn, anon))
+    msg["PID-3.1"] = anon
+    return [Send("OB_DOWNSTREAM", msg), *ops]       # Sends and SetStates, mixed in one list
+```
+
+- **Write contract — declared, never imperative.** A Handler returns
+  `Send | SetState | list[Send | SetState] | None`; it does **not** mutate state directly. Each
+  `SetState(namespace, key, value)` (the `value` must be JSON-serializable — validated at construction)
+  is an **upsert by `(namespace, key)`** the engine applies **inside the routed→outbound handoff
+  transaction**. `Send`-only Handlers are unchanged — fully **backward compatible**.
+- **Exactly-once / re-run safety.** Because the write commits in the **same transaction** as the
+  outbound rows, a crash before commit leaves **no** state (atomic with the handoff) and the attempt
+  that commits applies the write **exactly once per message** — this preserves the staged pipeline's
+  **pure-re-run** invariant ([ADR 0001](adr/0001-staged-pipeline-architecture.md) / CLAUDE.md §2). A
+  non-deterministic value (a random anon id) is still safe because only the committed attempt persists,
+  but **prefer a deterministic derivation** where cross-run identity matters.
+- **Read — synchronous, read-through cache.** Handlers are pure synchronous functions and a DB read is
+  async, so `state_get(namespace, key, default=None)` reads an in-memory **read-through cache** the
+  engine maintains (loaded at startup, updated as writes commit) and publishes around each
+  router/transform run — exactly how `code_set()` resolves against an active set. A missing key returns
+  `default` (state is sparse, not a referenced table). **Non-linearization caveat:** a read reflects
+  committed state as of its invocation, but is **not** linearized with a concurrent sibling handler's
+  write — fine for read-mostly correlation; a race-sensitive read-modify-write within one namespace
+  needs author care.
+- **Encryption at rest.** State values may carry PHI (MRN↔id), so they are AES-256-GCM-encrypted with
+  the store cipher just like `messages.raw`, and covered by key rotation (`messagefoundry rotate-key`).
+- **Retention (TTL).** Set `[retention].state_max_age_days` to age out stale entries (a global age
+  purge; per-namespace policy is a follow-up). Off by default = keep forever. The whole-table cache
+  assumes **bounded** state — unbounded estates (every MRN ever seen) are a documented follow-up
+  ([ADR 0005](adr/0005-transform-accessible-state.md)).
+- **SQL Server.** State writes ride the staged `transform_handoff`, which is SQLite-only today, so the
+  `state` table on the experimental SQL Server backend is **inert** (parity schema only) until its
+  staged pipeline lands.
+
+`state_get` also resolves in **dry-run** / the IDE Test Bench / `messagefoundry check`: each simulated
+message gets a fresh in-memory view that accumulates that run's own declared writes (so a later handler
+sees an earlier one's `SetState`), and `dryrun` output lists the declared state ops — **PHI-gated**
+behind `--show-phi` like a message body.
+
+### Reference sets — external-data enrichment ([ADR 0006](adr/0006-external-data-lookups.md))
+
+Where a **code set** is a static lookup table shipped in the bundle and **transform state** is
+read/write correlation, a **reference set** is **external data materialized off the message path**: a
+provider directory, a DB-backed translation table (the Corepoint Data Point / DB Association pattern).
+The engine syncs the source into a **versioned, encrypted store snapshot** on a cadence; a Handler
+reads it **purely** at run time. Because the read carries no external call, the staged pipeline's
+pure-re-run invariant holds (the only non-determinism is a snapshot flip landing between a run and a
+crash-re-run — the same accepted caveat as a code-set hot-reload).
+
+- **Declare** a set in a wiring module (registers it into the graph, like `inbound`):
+  ```python
+  from messagefoundry import Reference, FileRef, env, handler, Send, reference
+
+  Reference("provider_npi", source=FileRef(path=env("provider_npi_csv")), refresh_seconds=3600)
+
+  @handler("enrich")
+  def enrich(msg):
+      npi = reference("provider_npi").get(msg["PV1-7.1"])   # pure dict lookup, no I/O
+      if npi:
+          msg.set("PV1-7.13", npi)
+      return Send("OB_DOWNSTREAM", msg)
+  ```
+- **`reference(name)`** returns a frozen, read-only `ReferenceSet` (`rs[k]` / `rs.get(k, d)` / `k in rs`).
+  A missing **key** returns the default (external data is sparse); a missing/unsynced **set** raises
+  (fail loud) at run time → that message's `ERROR` disposition. Call it **inside a Handler/Router**, not
+  at module top level (the snapshot exists only once the store is open + synced — unlike `code_set`).
+- **Sources:** `FileRef(path=…, encoding=…)` — a local CSV/TOML in the **code-set format**, re-read on
+  the refresh cadence (the path for an externally-produced export; `path` may be `env()`).
+  `DatabaseRef(server=…, database=…, statement=…, key_column=…, value_column=…)` — the engine runs a
+  read-only SQL query on the cadence (SQL Server via the `[sqlserver]` extra, **experimental**; secrets
+  via `env()`; the dial-out is gated by the fail-closed `[egress].allowed_db` allowlist). `key_column`
+  is the lookup key; `value_column` (if set) is the value, else the value is a dict of the other columns.
+- **Sync.** The engine's `ReferenceSyncRunner` materializes each set once at startup (before listeners
+  serve, so `reference(...)` resolves on the first message) and every `refresh_seconds`. A source
+  failure is **isolated**: it's logged + alerted and the **last-good snapshot is kept** (the write
+  isn't attempted), so one bad source never blocks the others or the message path.
+- **At rest:** snapshot values are AES-GCM-encrypted (they may carry PHI) and covered by key rotation,
+  exactly like `state`/message bodies; the `[egress].allowed_db` gate will govern the (increment-2) DB
+  source. **SQLite-only** (the SQL Server store has an inert stub).
+- **`[reference]` settings:** `refresh_interval_seconds` (loop tick, default 3600), `sync_on_startup`
+  (default true), `max_staleness_seconds` (reserved, 0 = off).
+- **Dry-run / `check`** resolve file-backed sets best-effort (literal paths) so a reference-using
+  transform validates; DB-backed or `env()`-path sets are absent in a pure dry-run.
 
 ### `[auth]` — authentication & RBAC
 Implemented (see [SECURITY.md](SECURITY.md)). Authentication is **required** by default; the AD bind
@@ -138,7 +292,7 @@ password is a **secret** supplied via env (`MEFOR_AUTH_AD_BIND_PASSWORD`), never
 | `ad_tls_verify` | bool | `true` | validate the LDAPS certificate |
 | `ad_tls_ca_cert_file` | str | — | trust an internal CA for LDAPS without disabling verification |
 | `ad_allow_insecure_ldap` | bool | `false` | explicit opt-in to a non-`ldaps://` bind (trusted-network dev only) |
-| `kerberos_enabled` | bool | `false` | Windows SSO (experimental; needs `ad_enabled`) |
+| `kerberos_enabled` | bool | `false` | Windows SSO (experimental, **0.2 target — not supported in v0.1**; needs `ad_enabled`) |
 | `kerberos_spn` | str | — | service principal, e.g. `HTTP/host.example.com` |
 
 > AD-group→role mappings live in the DB and are managed by an admin (`PUT /ad-group-map` or the
@@ -182,6 +336,7 @@ so retention is opt-in.
 |---|---|---|---|
 | `messages_days` | int | `0` | past N days, null inbound bodies (`raw`/`summary`/`error`) of **fully-resolved** messages (no `pending`/`inflight` delivery), keeping metadata. `0` = keep |
 | `dead_letter_days` | int | `0` | past N days, null the bodies of **dead-lettered** outbound rows (their own window — a dead row stays replayable until purged). `0` = keep |
+| `state_max_age_days` | int | `0` | past N days, **delete** transform-state entries (ADR 0005) last written before the cutoff — keeps the in-memory state cache + table bounded. A simple global age purge (by `set_at`); per-namespace policy is a follow-up. `0` = keep |
 | `audit_days` | int | `0` | **reserved / not enforced.** The `audit_log` is a tamper-evident hash chain and HIPAA expects ~6-year retention, so audit is **keep-forever by design**; archive-first pruning is a tracked follow-up. Accepted so a forward-looking file still loads |
 | `max_db_mb` | int | `0` | advisory only: warn (WARNING log + an `AlertSink` `storage_threshold` event) when the DB (+ `-wal`/`-shm`) exceeds this. Never auto-deletes. `0` = off |
 | `purge_interval_seconds` | float | `3600` | how often the purge/maintenance loop runs a pass |
@@ -215,6 +370,7 @@ checked against the resolved (`env()`-substituted) destination.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `allowed_mllp` | list | `[]` | allowed MLLP destinations; each entry is `host` (any port) or `host:port`. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_MLLP` |
+| `allowed_tcp` | list | `[]` | allowed raw-TCP (`Tcp(...)`) destinations; each entry is `host` (any port) or `host:port`. An inbound `Tcp(...)` is a local listener and is not gated. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_TCP` |
 | `allowed_file_dirs` | list | `[]` | allowed File output directories; a destination's directory must resolve at/under one of these |
 | `allowed_http` | list | `[]` | allowed REST/SOAP (HTTP) destination hosts; each entry is `host` (any port) or `host:port` (ADR 0003). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_HTTP` |
 | `allowed_db` | list | `[]` | allowed DATABASE destination servers; each entry is `host` (any port) or `host:port` (ADR 0003). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DB` |
@@ -247,6 +403,104 @@ best-effort and runs on a background task, so it never blocks or hangs a deliver
 
 > Routing these events to a richer destination, templating, and send-retry are future work; this is
 > the first real notifier behind the `AlertSink` seam.
+
+### `[cluster]` — horizontal scale-out coordination (Track B)
+**Experimental / Postgres-only.** Introduces the multi-node coordination seam — a `nodes` table, a
+per-node heartbeat, (Track B Step 4) **leader election**, (Step 5) **per-lane FIFO ownership**, and
+(Step 6) **cross-node reference + config-reload convergence** — *without changing single-node behavior*.
+With `enabled = false` (the default) the engine uses a no-op coordinator and runs **byte-identically**
+to before. Enabling it requires `[store].backend = "postgres"` (SQLite is single-node; SQL Server is
+experimental) **and** `[store].pool_size >= 2` — the leader holds **one dedicated pooled connection**
+for the lifetime of its leadership advisory lock, so a pool of 1 would starve the store. A
+cross-section validator refuses either violation at config load.
+
+With `[cluster].enabled` on Postgres, **leader election is built**: exactly one node across the cluster
+holds a session-level Postgres advisory lock and is the **leader**. The leader-only **WRITE singletons**
+run on that one node while followers **no-op** them (reactive-by-polling, so failover is automatic on
+the next tick):
+- **`[retention]` purge/VACUUM/audit** — runs on the leader only.
+- **the lease-reclaim sweep** — the leader periodically calls `reclaim_expired_leases` (cadence
+  `reclaim_interval_seconds`) to recover **crashed** nodes' in-flight rows (only rows whose lease has
+  *expired*, never a live sibling's). In clustered mode the engine therefore **skips** the
+  single-node unconditional `reset_stale_inflight` startup recovery, which would steal a live
+  sibling's in-flight rows.
+
+**Poll-source intake is leader-gated (Track B Step 4b).** A **poll** source — `file` (a watched
+directory), `database` (a polled table), `remote-file` (an SFTP/FTP directory) — reads a **shared
+external resource**: if more than one node polled it, the same file/row would be ingested twice. So
+only the **leader** polls a poll source; a follower's poll loop keeps ticking but **skips** the
+scan/select (it neither reads nor moves files / marks rows), and resumes on the tick after it becomes
+leader (reactive-by-polling, no restart). **Listen** sources — `mllp`, `tcp` — are **not** gated: each
+node binds its own endpoint (distribute inbound connections with a load balancer or per-node ports),
+so they run on every node, as do all the **staged-queue workers** (router / transform / delivery),
+which share the queue via `FOR UPDATE SKIP LOCKED` + row leases. The brief overlap during a leadership
+transition (the old leader's last in-flight poll vs. the new leader's first) is bounded by the same
+at-least-once guarantees that cover a crash mid-poll — the file-rename / row-claim atomicity and the
+downstream queue's idempotent handoff make a re-read a tolerated duplicate, never data loss. The
+worst-case transition window scales with `heartbeat_seconds`: a leader whose lock connection silently
+drops keeps polling until its next maintenance tick detects the drop and demotes (up to one
+`heartbeat_seconds`), so keep `heartbeat_seconds` modest if duplicate-intake cost is high. For a
+`database` source the row-claim atomicity is the operator's `poll_statement`/`mark_statement` (claim
+with a status flag or `UPDATE ... RETURNING`); the engine owns the atomic rename only for file sources.
+
+If the leader stops or its connection drops, its advisory lock is released and a follower acquires
+leadership on its next heartbeat tick. **Single-node operation is unchanged** (the no-op coordinator
+is always leader, so every poll source always scans, runs the unconditional startup reset, and spawns
+no leader sweep).
+
+**Per-lane FIFO ownership preserves order across nodes (Track B Step 5).** The staged-queue workers
+(router / transform / delivery) run on **every** node, so without coordination two nodes draining the
+**same** FIFO lane would interleave it: node A's `FOR UPDATE SKIP LOCKED` locks the head (row 1) and
+node B's `SKIP LOCKED` skips the locked head and claims row 2 — so row 2 could deliver before row 1.
+To prevent that, a FIFO lane is **owned by exactly one node at a time** via a `lane_leases` table, and
+ownership is enforced **atomically at claim time**: each FIFO claim, in one transaction, first
+acquires-or-renews the lane lease (`INSERT ... ON CONFLICT ... WHERE owner = me OR lease expired`) and
+only then claims the head — so only the lane's owner ever claims its rows, head-of-line blocking is
+restored, and strict per-lane FIFO holds across nodes with a **zero reorder window** (the claim itself
+is the authority, not a cached gate). An idle lane's lease simply expires and the next node with work
+for it re-acquires it (one node at a time). **Crash mid-delivery stays ordered, too**: a node that dies
+holding the head leaves it `inflight` under an expired row lease, so the next node taking over the lane
+reclaims that lane's expired-lease inflight rows back to pending **in the same claim transaction, before
+the head select** — the stranded head is recovered and blocks the lane rather than being skipped, so a
+later row can never deliver ahead of it (the recovery does not wait on the leader's periodic sweep). The
+wall-clock lease shares the row-lease NTP assumption:
+keep `[store].lease_ttl_seconds` comfortably above clock skew + the claim cadence. **UNORDERED**
+lanes are intentionally **not** lane-owned — concurrent draining across nodes is fine there.
+**Single-node is byte-identical**: the no-op coordinator's lane owner is `None`, so the claim takes its
+unchanged no-owner path (no `lane_leases` touch). SQLite and SQL Server (single-node) accept and ignore
+the owner.
+
+**Cross-node convergence is built (Track B Step 6).** Two shared-state concerns now converge across
+nodes automatically:
+- **Reference sets** — materialize-from-source is **leader-gated** (only the leader re-reads the
+  external file/DB source and writes the shared, versioned snapshot), and **every** node then
+  **read-throughs** that snapshot into its own in-process read cache via the store's
+  `converge_reference_cache` (matching on the per-set version). So the external source is read **once**
+  per cluster and no follower is left on a stale cache — replacing the prior "every node re-syncs" model.
+  Single-node is byte-identical: the no-op coordinator is always leader (materializes every pass) and
+  the convergence call is a no-op on SQLite (the sole writer's cache is always current).
+- **Config reload** — an operator `POST /config/reload` on **one** node bumps a single-row
+  `cluster_config` **version token**; every **other** node's config-convergence loop observes the higher
+  version and reloads **its own** (identically-deployed) config dir to converge. The initiating node
+  advances its applied version when it bumps, so it does **not** re-reload (no feedback loop). A
+  `dry_run` never bumps; single-node never spawns the loop. This assumes **homogeneous config** across
+  nodes (the token coordinates *when* to reload; each node reloads its own dir) — the same assumption as
+  the dead-letter-missing-destinations/handlers startup sweeps.
+
+> Still **experimental**: the remaining gap is **transform-STATE cross-node read-through (Step 6b)** — a
+> transform's write-state is still per-node — and the absence of a **cluster ops API (Step 7)**. Leader
+> election, leader-gated singletons + poll-source intake, per-lane FIFO order across nodes, and
+> cross-node reference + config convergence are all built (a one-time startup `WARNING` summarizes the
+> state), so order- and shared-state-sensitive flows are now safe under multi-node — but treat
+> `[cluster].enabled` as experimental until transform-state convergence and the ops API land.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | turn on the coordination seam; requires `[store].backend = "postgres"` and `[store].pool_size >= 2` |
+| `node_id` | str | _unset_ | override the auto id (`host:pid:hex`); pin for a stable identity / tests. Unset → reuses the store's lease owner-id, so node-id == owner-id |
+| `heartbeat_seconds` | num | 10 | how often a node refreshes its `last_seen` heartbeat **and** maintains its leader lock (no separate leader-check knob). Must be > 0 |
+| `node_timeout_seconds` | num | 30 | a node is considered dead when its `last_seen` is older than this (election diagnostics / future stale-member sweep). The advisory lock — not this timeout — is what transfers leadership today. Must be > 0, and must exceed `heartbeat_seconds` |
+| `reclaim_interval_seconds` | num | 30 | how often the **leader** runs the lease-reclaim sweep that recovers crashed nodes' in-flight rows (followers no-op). Must be > 0 |
 
 ### `[engine]`
 | Key | Type | Default | Notes |

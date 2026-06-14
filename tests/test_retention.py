@@ -226,6 +226,72 @@ async def test_run_once_purges_and_writes_one_audit_entry(store: MessageStore) -
     assert "raw" not in audit[0]["detail"] and "DOE" not in audit[0]["detail"]
 
 
+class _FollowerCoordinator:
+    """A coordinator whose is_leader() is False — used to prove RetentionRunner no-ops on a follower."""
+
+    node_id = "follower"
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    def is_leader(self) -> bool:
+        return False
+
+    def owns_lane(self, lane_key: str) -> bool:
+        return True
+
+    def lane_owner(self) -> str | None:
+        return self.node_id
+
+    def reclaims_inflight(self) -> bool:
+        return True
+
+    def is_clustered(self) -> bool:
+        return True
+
+    async def config_version(self) -> int:
+        return 0
+
+    def config_version_cached(self) -> int:
+        return 0
+
+    async def bump_config_version(self) -> int:
+        return 0
+
+
+async def test_run_once_no_ops_on_follower(store: MessageStore) -> None:
+    """Track B Step 4: retention is a leader-only WRITE singleton. On a follower (is_leader False)
+    run_once returns an all-zero did-nothing pass and performs NO purge — so a delivered message that
+    is past the window stays intact, and no audit row is written."""
+    mid, outbox_id = await _delivered(store, now=0.0)
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(messages_days=1, dead_letter_days=1),
+        clock=lambda: 10 * DAY,
+        coordinator=_FollowerCoordinator(),
+    )
+
+    result = await runner.run_once()
+
+    assert result.messages_purged == 0 and result.dead_purged == 0
+    assert not result.did_work
+    # Nothing purged: the raw body is still present, and no audit row was written.
+    assert (await store.get_message(mid))["raw"] is not None
+    assert [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"] == []
+
+
+async def test_run_once_acts_as_leader_with_default_coordinator(store: MessageStore) -> None:
+    """The default (no coordinator) is the NullCoordinator → always leader → purges exactly as before
+    this gate existed (byte-identical to test_run_once_purges_and_writes_one_audit_entry)."""
+    await _delivered(store, now=0.0)
+    runner = RetentionRunner(store, RetentionSettings(messages_days=1), clock=lambda: 10 * DAY)
+    result = await runner.run_once()
+    assert result.messages_purged == 1
+
+
 async def test_run_once_no_work_writes_no_audit(store: MessageStore) -> None:
     await _delivered(store, now=0.0)
     # Everything off → a pass does nothing and must not spam the audit log.

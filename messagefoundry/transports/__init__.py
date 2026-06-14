@@ -15,8 +15,10 @@ from messagefoundry.transports import (  # noqa: F401  (import = registration)
     database,
     file,
     mllp,
+    remotefile,
     rest,
     soap,
+    tcp,
 )
 from messagefoundry.transports.base import (
     DeliveryError,

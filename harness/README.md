@@ -8,6 +8,8 @@ faults, and watch what a running engine actually did with each message.
 python -m harness                      # launch the GUI
 python -m harness --list-scenarios     # list headless scenarios
 python -m harness --scenario processed # run one scenario in CI (exit 0 pass / 1 fail)
+python -m harness --list-profiles      # list headless load profiles
+python -m harness --load smoke         # run a load profile (exit 0 SLOs met / 1 violation / 2 setup)
 ```
 
 It reuses the engine's own MLLP framing + ACK builder (`messagefoundry.transports.mllp`), message
@@ -76,3 +78,24 @@ python -m harness --scenario dead_letter   # ADT^A01 echo with nothing on 2576
 ```
 
 Pass `--engine <url>` for a non-default API address and `--token <t>` for an auth-enabled engine.
+
+## Load testing (headless)
+
+A separate, **Qt-free** asyncio load engine (`harness/load/`) drives the engine under heavy MLLP
+traffic and measures it — the GUI's single-thread sender can't saturate it. A pool of **persistent,
+pipelined** connections offers a data-driven [load profile](load/profiles/) (warmup → ramp →
+sustained → spike → soak); a fast **correlation sink** absorbs the engine's outbound fan-out and
+times every message end-to-end; an engine poller samples the API for throughput, backlog, DB growth,
+and post-load drain. The run ends in an SLO verdict + a no-loss reconciliation and a JSON/CSV report.
+
+Serve the synthetic high-fan-out [system-under-test](config/load/) (separate from `harness/config`),
+then run a profile:
+
+```powershell
+$env:MEFOR_LOAD_FANOUT=20; $env:MEFOR_LOAD_TRANSFORM="edit"; $env:MEFOR_LOAD_SINK_PORT=2700
+python -m messagefoundry serve --config harness/config/load --db ./load.db   # swap --db for backends
+python -m harness --load fanout-baseline --engine URL --token T --report-json out/load/run.json
+```
+
+Full guide — profile schema, the env knobs, reading the report/SLOs, exit codes, baseline
+comparison, and the backend-comparison recipe — is in [docs/LOAD-TESTING.md](../docs/LOAD-TESTING.md).

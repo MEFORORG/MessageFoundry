@@ -85,6 +85,31 @@ async def test_login_then_permission_enforced(engine: Engine) -> None:
         assert (await c.get("/stats", headers=_auth(token))).status_code == 401
 
 
+async def test_cluster_endpoints_gated_by_monitoring_read(engine: Engine) -> None:
+    # Track B Step 7: /cluster/status + /cluster/nodes are gated by Permission.MONITORING_READ. A VIEWER
+    # holds it (200 on both); a user with NO roles lacks it (403); fail-closed for no/invalid token (401).
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)
+    await _add(service, "norole")  # created with an empty roles list → no permissions
+    async with _client(engine, service) as c:
+        # No token under enabled auth → fail closed (401), not an open read.
+        assert (await c.get("/cluster/status")).status_code == 401
+        assert (await c.get("/cluster/nodes")).status_code == 401
+        # An invalid token is equally rejected.
+        bad = _auth("not-a-real-token")
+        assert (await c.get("/cluster/status", headers=bad)).status_code == 401
+        assert (await c.get("/cluster/nodes", headers=bad)).status_code == 401
+        # VIEWER (has monitoring:read) → 200 on both.
+        vw = _auth((await _login(c, "vw")).json()["token"])
+        assert (await c.get("/cluster/status", headers=vw)).status_code == 200
+        nodes = await c.get("/cluster/nodes", headers=vw)
+        assert nodes.status_code == 200 and len(nodes.json()["nodes"]) == 1
+        # A role-less user lacks monitoring:read → 403 on both.
+        nr = _auth((await _login(c, "norole")).json()["token"])
+        assert (await c.get("/cluster/status", headers=nr)).status_code == 403
+        assert (await c.get("/cluster/nodes", headers=nr)).status_code == 403
+
+
 async def test_phi_raw_view_requires_operator(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)

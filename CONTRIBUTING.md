@@ -4,6 +4,11 @@ Thanks for your interest in contributing! MessageFoundry is a code-first HL7 v2.
 engine. This guide covers the license, the Contributor License Agreement, and the local checks a
 change must pass.
 
+By participating you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md). How the project is
+governed, what we welcome, and what to **discuss first** before writing code are described in
+[GOVERNANCE.md](GOVERNANCE.md) — please skim it before a non-trivial change so effort lands where it
+can be merged.
+
 ## License
 
 MessageFoundry is licensed under the **GNU Affero General Public License v3.0 or later**
@@ -49,6 +54,19 @@ maintainer.)
    $env:QT_QPA_PLATFORM = "offscreen"; pytest -q
    ```
    You can also run the project's own commit/CI gate: `python -m messagefoundry check`.
+
+## Finding something to work on
+
+Browse issues labeled **`good first issue`** (small, self-contained) and **`help wanted`**. For
+anything larger or architectural, open an issue first — see the "discuss first" list in
+[GOVERNANCE.md](GOVERNANCE.md). Questions and design discussion go in **GitHub Discussions**; bugs and
+concrete features go in **Issues**; security vulnerabilities go through a
+[private advisory](.github/SECURITY.md), never a public issue.
+
+### Working on two things at once
+
+Building two changes in parallel? Don't share one checkout — give each its own **git worktree**
+(`scripts\worktree\new.ps1 -Name <x>`). See [docs/WORKTREES.md](docs/WORKTREES.md).
 
 ## PHI / safety
 

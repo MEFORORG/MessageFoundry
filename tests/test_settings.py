@@ -305,3 +305,150 @@ def test_auth_kerberos_requires_ad(tmp_path: Path) -> None:
     cfg = _write(tmp_path / "messagefoundry.toml", "[auth]\nkerberos_enabled = true\n")
     with pytest.raises(ValidationError):
         load_settings(config_path=cfg, environ={})
+
+
+# --- [cluster] settings (Track B Step 3) ------------------------------------
+
+
+def test_cluster_defaults_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    s = load_settings(environ={})
+    # Off by default → single-node, byte-identical to before the seam existed.
+    assert s.cluster.enabled is False
+    assert s.cluster.node_id is None
+    assert s.cluster.heartbeat_seconds == 10.0
+    assert s.cluster.node_timeout_seconds == 30.0
+    assert s.cluster.reclaim_interval_seconds == 30.0
+
+
+def test_cluster_parses_from_file_and_env(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        '[cluster]\nenabled = true\nnode_id = "node-A"\nheartbeat_seconds = 2.5\n',
+    )
+    s = load_settings(config_path=cfg, environ={"MEFOR_CLUSTER_NODE_TIMEOUT_SECONDS": "7.5"})
+    assert s.cluster.enabled is True
+    assert s.cluster.node_id == "node-A"
+    assert s.cluster.heartbeat_seconds == 2.5
+    assert s.cluster.node_timeout_seconds == 7.5  # str env value coerced to float
+
+
+def test_cluster_enabled_requires_postgres_backend(tmp_path: Path) -> None:
+    # SQLite is single-node, so enabling cluster coordination on it is refused (cross-section
+    # validator on ServiceSettings).
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "sqlite"\n[cluster]\nenabled = true\n',
+    )
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_cluster_enabled_on_postgres_is_ok(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[cluster]\nenabled = true\n",
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert s.cluster.enabled is True and s.store.backend is StoreBackend.POSTGRES
+
+
+def test_cluster_disabled_on_sqlite_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The constraint is only on enabled=true; the default SQLite + disabled cluster must load fine.
+    monkeypatch.chdir(tmp_path)
+    cfg = _write(tmp_path / "messagefoundry.toml", "[cluster]\nenabled = false\n")
+    s = load_settings(config_path=cfg, environ={})
+    assert s.cluster.enabled is False and s.store.backend is StoreBackend.SQLITE
+
+
+def test_cluster_heartbeat_must_be_positive(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[cluster]\nenabled = true\nheartbeat_seconds = 0\n",
+    )
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_cluster_node_timeout_must_be_positive(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[cluster]\nenabled = true\nnode_timeout_seconds = -1\n",
+    )
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_cluster_node_timeout_must_exceed_heartbeat(tmp_path: Path) -> None:
+    # A node must beat at least once before it is considered dead; a timeout <= the heartbeat would
+    # let Step-4 election mark a live node dead between beats. Refused at config load.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[cluster]\nenabled = true\nheartbeat_seconds = 10\nnode_timeout_seconds = 10\n",
+    )
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+# --- [cluster] leader election + reclaim (Track B Step 4) -------------------
+
+
+def test_cluster_reclaim_interval_must_be_positive(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[cluster]\nenabled = true\nreclaim_interval_seconds = 0\n",
+    )
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_cluster_reclaim_interval_parses(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[cluster]\nenabled = true\nreclaim_interval_seconds = 12.5\n",
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert s.cluster.reclaim_interval_seconds == 12.5
+
+
+def test_cluster_enabled_requires_pool_size_at_least_two(tmp_path: Path) -> None:
+    # The leader holds one dedicated pooled connection for its advisory lock, so a pool of 1 would
+    # starve the store — refused at config load (Track B Step 4).
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\npool_size = 1\n'
+        "[cluster]\nenabled = true\n",
+    )
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_cluster_enabled_pool_size_two_is_ok(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\npool_size = 2\n'
+        "[cluster]\nenabled = true\n",
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert s.cluster.enabled is True and s.store.pool_size == 2
+
+
+def test_cluster_disabled_pool_size_one_is_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The pool_size>=2 constraint only applies when cluster is enabled; a single-node SQLite deployment
+    # with pool_size=1 (the constraint is moot for SQLite anyway) must still load.
+    monkeypatch.chdir(tmp_path)
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        "[store]\npool_size = 1\n[cluster]\nenabled = false\n",
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert s.cluster.enabled is False and s.store.pool_size == 1

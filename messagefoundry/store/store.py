@@ -33,6 +33,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Sequence
 from uuid import uuid4
 
@@ -385,6 +386,46 @@ CREATE TABLE IF NOT EXISTS message_events (
 );
 CREATE INDEX IF NOT EXISTS ix_events_message ON message_events(message_id, ts);
 
+-- Transform-accessible state (ADR 0005): cross-message correlation values a Handler declares via
+-- SetState and reads back via state_get. Upserted by (namespace,key) INSIDE the routed->outbound
+-- handoff transaction, so a write is exactly-once with the message's processing (no double-apply on a
+-- crash-re-run). `value` is JSON-encoded then cipher-encrypted at rest (it may carry PHI, e.g. an
+-- MRN->anon mapping). `message_id` records which message last wrote it (audit/traceability); not an FK
+-- (a state row outlives its writer's body purge). `set_at` drives the age-based retention purge.
+CREATE TABLE IF NOT EXISTS state (
+    namespace  TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,        -- json.dumps(value), encrypted at rest
+    set_at     REAL NOT NULL,
+    message_id TEXT,                 -- the message that last wrote this entry (audit; not an FK)
+    PRIMARY KEY (namespace, key)
+);
+CREATE INDEX IF NOT EXISTS ix_state_set_at ON state(set_at);
+
+-- Reference sets (ADR 0006 Tier 1): managed, versioned, read-only lookup snapshots materialized OFF
+-- the message path (a provider directory, a DB-backed translation table) and read PURELY by a transform
+-- via reference("name").get(key). Each sync writes a whole new (name, version) snapshot and atomically
+-- flips it active, replacing the prior version — build-new-then-flip, so a reader sees the old or new
+-- snapshot whole, never torn, and a failed sync leaves the last-good active. `value` is JSON-encoded
+-- then cipher-encrypted at rest (it may carry PHI). reference_version records the active version per
+-- name (synced_at drives the staleness guard; row_count is audit metadata).
+CREATE TABLE IF NOT EXISTS reference (
+    name       TEXT NOT NULL,
+    version    TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,           -- json.dumps(value), encrypted at rest
+    PRIMARY KEY (name, version, key)
+);
+CREATE INDEX IF NOT EXISTS ix_reference_name ON reference(name);
+
+CREATE TABLE IF NOT EXISTS reference_version (
+    name       TEXT NOT NULL,
+    version    TEXT NOT NULL,
+    synced_at  REAL NOT NULL,
+    row_count  INTEGER NOT NULL,
+    PRIMARY KEY (name)                  -- one row per set: the ACTIVE version
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          REAL NOT NULL,
@@ -478,6 +519,17 @@ class MessageStore:
         # Serialise multi-statement transactions: aiosqlite serialises single
         # executes, but a txn spanning awaits could otherwise interleave.
         self._lock = asyncio.Lock()
+        # Transform-accessible state (ADR 0005): an in-memory read-through mirror of the `state` table,
+        # {(namespace, key): decoded_value}. The table is the source of truth; this is the synchronous
+        # read path state_get() resolves against (loaded at open, updated by transform_handoff ONLY
+        # after the handoff transaction commits — a rolled-back op must never leak into the cache).
+        self._state_cache: dict[tuple[str, str], Any] = {}
+        # Reference sets (ADR 0006 Tier 1): an in-memory read-through mirror of the ACTIVE snapshot per
+        # set, {name: {key: decoded_value}}. Loaded at open; write_reference_snapshot swaps a set's
+        # entry wholesale ONLY after its build-new-then-flip transaction commits (a rolled-back sync
+        # never leaks into reference_view, so the last-good snapshot stays live). The synchronous read
+        # path reference("name").get(key) resolves against this via reference_view().
+        self._reference_cache: dict[str, dict[str, Any]] = {}
 
     # --- PHI-at-rest cipher seam for nullable text columns (WP-5) -------------
     # error / last_error / detail can embed raw HL7 fragments from exceptions, so they go through the
@@ -534,7 +586,44 @@ class MessageStore:
         store = cls(db, path=path, cipher=cipher)
         await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
         await store._backfill_audit_chain()  # chain any pre-existing (unhashed) audit rows
+        await (
+            store._load_state_cache()
+        )  # populate the in-memory state read-through cache (ADR 0005)
+        await store._load_reference_cache()  # populate the reference-snapshot read cache (ADR 0006)
         return store
+
+    async def _load_state_cache(self) -> None:
+        """Populate the in-memory transform-state cache from the ``state`` table (ADR 0005).
+
+        Runs at open (and after the on-open encrypt migration, so values are decryptable under the
+        current keyring). Each ``value`` is decrypted then JSON-decoded into its native Python value —
+        the form :func:`messagefoundry.config.state.state_get` returns. Bounded by the table size (the
+        ADR's documented v1 assumption; TTL/retention keeps it bounded)."""
+        cur = await self._db.execute("SELECT namespace, key, value FROM state")
+        cache: dict[tuple[str, Any], Any] = {}
+        for r in await cur.fetchall():
+            cache[(r["namespace"], r["key"])] = json.loads(self._cipher.decrypt(r["value"]))
+        self._state_cache = cache
+
+    async def _load_reference_cache(self) -> None:
+        """Populate the in-memory reference cache from the ACTIVE snapshot of each set (ADR 0006).
+
+        Runs at open (after the encrypt migration). ``reference_version`` holds one row per set naming
+        its active ``version``; this joins to ``reference`` and loads only that version's rows,
+        decrypting + JSON-decoding each value into the native form ``reference(name).get(key)``
+        returns. Bounded by the active snapshots' size (the ADR's v1 in-memory assumption)."""
+        # Drive from reference_version (the authoritative active-version list) with a LEFT JOIN, so a
+        # set that synced to ZERO rows still loads as an empty {} (present, not absent) after a reopen.
+        cur = await self._db.execute(
+            "SELECT v.name AS name, r.key AS key, r.value AS value FROM reference_version v "
+            "LEFT JOIN reference r ON r.name = v.name AND r.version = v.version"
+        )
+        cache: dict[str, dict[str, Any]] = {}
+        for r in await cur.fetchall():
+            entry = cache.setdefault(r["name"], {})
+            if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
+                entry[r["key"]] = json.loads(self._cipher.decrypt(r["value"]))
+        self._reference_cache = cache
 
     async def _backfill_audit_chain(self) -> None:
         """Fill ``row_hash`` for audit rows written before hash-chaining (idempotent).
@@ -604,6 +693,43 @@ class MessageStore:
                     )
                     await self._db.commit()
                     total += len(rows)
+            # The `state` table (composite PK, ADR 0005) can't use the id-keyed loop — migrate it
+            # separately so a key enabled on an existing DB encrypts any legacy plaintext state values.
+            while True:
+                cur = await self._db.execute(
+                    "SELECT namespace, key, value FROM state"
+                    " WHERE value NOT LIKE ? AND value <> '' LIMIT 500",
+                    (like,),
+                )
+                rows = list(await cur.fetchall())
+                if not rows:
+                    break
+                await self._db.executemany(
+                    "UPDATE state SET value=? WHERE namespace=? AND key=?",
+                    [(self._cipher.encrypt(r["value"]), r["namespace"], r["key"]) for r in rows],
+                )
+                await self._db.commit()
+                total += len(rows)
+            # The `reference` table (composite PK name,version,key — ADR 0006) likewise can't use the
+            # id-keyed loop; migrate any legacy plaintext snapshot values separately.
+            while True:
+                cur = await self._db.execute(
+                    "SELECT name, version, key, value FROM reference"
+                    " WHERE value NOT LIKE ? AND value <> '' LIMIT 500",
+                    (like,),
+                )
+                rows = list(await cur.fetchall())
+                if not rows:
+                    break
+                await self._db.executemany(
+                    "UPDATE reference SET value=? WHERE name=? AND version=? AND key=?",
+                    [
+                        (self._cipher.encrypt(r["value"]), r["name"], r["version"], r["key"])
+                        for r in rows
+                    ],
+                )
+                await self._db.commit()
+                total += len(rows)
         if total:
             log.info("encrypted %d existing value(s) at rest", total)
 
@@ -639,9 +765,70 @@ class MessageStore:
                     await self._db.executemany(f"UPDATE {table} SET {column}=? WHERE id=?", updates)
                     await self._db.commit()
                     total += len(rows)
+            # The `state` table has a composite PK (namespace,key), not an `id`, so it can't ride the
+            # generic id-keyed loop above — rotate it with its own pass (ADR 0005).
+            total += await self._reencrypt_state_to_active(cipher, active_like, batch)
+            # The `reference` table (composite PK name,version,key — ADR 0006) likewise rotates on its
+            # own pass.
+            total += await self._reencrypt_reference_to_active(cipher, active_like, batch)
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         return total
+
+    async def _reencrypt_state_to_active(
+        self, cipher: AesGcmCipher, active_like: str, batch: int
+    ) -> int:
+        """Re-encrypt the ``state`` table's values under the active key (caller holds ``self._lock``).
+
+        Mirrors the id-keyed loop in :meth:`reencrypt_to_active` but keys on the composite PK. Decrypt
+        (via the keyring) → encrypt (active); a value no configured key can decrypt raises before any
+        UPDATE (PHI is never dropped). Skips values already under the active key (idempotent)."""
+        rotated = 0
+        while True:
+            cur = await self._db.execute(
+                "SELECT namespace, key, value FROM state"
+                " WHERE value NOT LIKE ? AND value <> '' LIMIT ?",
+                (active_like, batch),
+            )
+            rows = list(await cur.fetchall())
+            if not rows:
+                break
+            updates = [
+                (cipher.encrypt(cipher.decrypt(r["value"])), r["namespace"], r["key"]) for r in rows
+            ]
+            await self._db.executemany(
+                "UPDATE state SET value=? WHERE namespace=? AND key=?", updates
+            )
+            await self._db.commit()
+            rotated += len(rows)
+        return rotated
+
+    async def _reencrypt_reference_to_active(
+        self, cipher: AesGcmCipher, active_like: str, batch: int
+    ) -> int:
+        """Re-encrypt the ``reference`` table's values under the active key (caller holds ``self._lock``).
+
+        Mirrors :meth:`_reencrypt_state_to_active` but keys on the composite PK (name,version,key)."""
+        rotated = 0
+        while True:
+            cur = await self._db.execute(
+                "SELECT name, version, key, value FROM reference"
+                " WHERE value NOT LIKE ? AND value <> '' LIMIT ?",
+                (active_like, batch),
+            )
+            rows = list(await cur.fetchall())
+            if not rows:
+                break
+            updates = [
+                (cipher.encrypt(cipher.decrypt(r["value"])), r["name"], r["version"], r["key"])
+                for r in rows
+            ]
+            await self._db.executemany(
+                "UPDATE reference SET value=? WHERE name=? AND version=? AND key=?", updates
+            )
+            await self._db.commit()
+            rotated += len(rows)
+        return rotated
 
     @staticmethod
     async def _migrate(db: aiosqlite.Connection) -> None:
@@ -1030,6 +1217,104 @@ class MessageStore:
                 raise
         return True
 
+    def state_view(self) -> Mapping[tuple[str, str], Any]:
+        """A read-only view of the transform-state read-through cache (ADR 0005).
+
+        ``{(namespace, key): decoded_value}`` — the synchronous read surface the runner publishes (via
+        :func:`messagefoundry.config.state.activated`) around each router/transform run so a Handler's
+        ``state_get(...)`` resolves. Returned as a ``MappingProxyType`` (a live, read-only window onto
+        the cache): it reflects writes as they commit and can't be mutated through this handle."""
+        return MappingProxyType(self._state_cache)
+
+    def reference_view(self) -> Mapping[str, Mapping[str, Any]]:
+        """A read-only view of the active reference snapshots (ADR 0006).
+
+        ``{name: {key: decoded_value}}`` — the synchronous read surface the runner publishes (via
+        :func:`messagefoundry.config.reference.activated`) around each router/transform run so a
+        Handler's ``reference("name").get(key)`` resolves. Returned as a ``MappingProxyType`` (a live,
+        read-only window onto the cache): it swaps in a new snapshot only after a sync commits and can't
+        be mutated through this handle."""
+        return MappingProxyType(self._reference_cache)
+
+    async def write_reference_snapshot(
+        self, *, name: str, version: str, rows: Mapping[str, Any]
+    ) -> None:
+        """Materialize a new reference snapshot and atomically make it the active one (ADR 0006 Tier 1).
+
+        In ONE transaction: drop the set's prior rows, insert every ``(name, version, key, value)`` of
+        the new snapshot (each ``value`` JSON-encoded then cipher-encrypted — it may carry PHI), and
+        upsert the ``reference_version`` pointer to ``version``. Readers keep seeing the prior snapshot
+        (served from the in-memory cache) until this commits; a **failed** sync rolls back wholesale, so
+        the last-good snapshot stays active (graceful degradation). The cache is swapped **only after**
+        commit — a rolled-back write never leaks into :meth:`reference_view`. Replaces the whole set
+        (build-new-then-flip), so it is idempotent on a re-run with the same rows."""
+        encrypted = [
+            (name, version, k, self._cipher.encrypt(json.dumps(v))) for k, v in rows.items()
+        ]
+        async with self._lock:
+            try:
+                await self._db.execute("BEGIN")
+                # Drop the set's prior version(s) — we keep only the active snapshot per name.
+                await self._db.execute("DELETE FROM reference WHERE name=?", (name,))
+                if encrypted:
+                    await self._db.executemany(
+                        "INSERT INTO reference (name, version, key, value) VALUES (?,?,?,?)",
+                        encrypted,
+                    )
+                await self._db.execute(
+                    "INSERT OR REPLACE INTO reference_version (name, version, synced_at, row_count)"
+                    " VALUES (?,?,?,?)",
+                    (name, version, time.time(), len(encrypted)),
+                )
+                await self._db.commit()
+            except Exception:
+                await self._db.rollback()
+                raise
+        # Commit succeeded → swap the active snapshot in the read cache (plaintext, decoded form).
+        self._reference_cache[name] = dict(rows)
+
+    async def converge_reference_cache(self) -> list[str]:
+        """No-op on SQLite (Track B Step 6). SQLite is single-node: this handle is the SOLE writer of
+        its reference snapshots, so :meth:`write_reference_snapshot` already keeps the in-process cache
+        current. There is no other node whose newer snapshot we'd need to read through, so there is
+        never anything to converge. Returns ``[]`` so the runner's always-converge pass is a free
+        no-op, keeping single-node behaviour byte-identical."""
+        return []
+
+    async def converge_state_cache(self) -> list[str]:
+        """No-op on SQLite (Track B Step 6b). SQLite is single-node: this handle is the SOLE writer of
+        its transform state, so :meth:`transform_handoff` already keeps the in-process cache current.
+        There is no other node whose newer write we'd need to read through, so there is never anything to
+        converge. Returns ``[]`` so the runner's always-converge pass is a free no-op, keeping single-node
+        behaviour byte-identical (same reasoning as :meth:`converge_reference_cache`)."""
+        return []
+
+    def enable_state_convergence(self) -> None:
+        """No-op on SQLite (Track B Step 6b): there is no cross-node convergence on this backend, so there
+        is no per-namespace version to bump. Present for ``Store`` protocol completeness."""
+        return None
+
+    async def _apply_state_op(
+        self,
+        namespace: str,
+        key: str,
+        value_json: str,
+        message_id: str,
+        now: float,
+    ) -> None:
+        """Upsert one state entry within the current transaction (caller holds the lock + an open txn).
+
+        ``value_json`` is the already-JSON-encoded value; it is cipher-encrypted here so PHI never hits
+        disk in the clear (mirrors ``messages.raw``). ``INSERT OR REPLACE`` makes the write idempotent
+        by ``(namespace, key)`` — a re-run after a crash overwrites with the same value, never double-
+        applies. The in-memory cache is **not** touched here (only after the txn commits — see
+        :meth:`transform_handoff`), so a rolled-back op can't leak into the synchronous read path."""
+        await self._db.execute(
+            "INSERT OR REPLACE INTO state (namespace, key, value, set_at, message_id)"
+            " VALUES (?,?,?,?,?)",
+            (namespace, key, self._cipher.encrypt(value_json), now, message_id),
+        )
+
     async def transform_handoff(
         self,
         *,
@@ -1037,21 +1322,29 @@ class MessageStore:
         message_id: str,
         channel_id: str,
         deliveries: Sequence[tuple[str, str]],  # (destination_name, transformed_payload)
+        state_ops: Sequence[tuple[str, str, Any]] = (),  # (namespace, key, value) — ADR 0005
         now: float | None = None,
     ) -> bool:
         """Advance one handler assignment from the **routed** stage to outbound — the transform half of
         the split pipeline (ADR 0001 Step B): claim→produce-next→complete in one transaction.
 
         Consume the in-flight routed row (DELETE — its raw body is canonical in ``messages.raw``),
-        insert one ``stage='outbound'`` row per delivery this handler produced, log the ``transformed``
-        event, then call :meth:`_maybe_finalize_message`. It does **not** write ``messages.status``
-        itself: the finalizer is the single disposition authority (it alone has the whole multi-stage
-        row picture — a sibling handler's routed/outbound rows may still be in flight, so per-handoff
-        disposition math would be order-dependent and wrong). INFLIGHT-guarded and single-transaction
-        like :meth:`handoff`: a crash before commit rolls back (the routed row recovers and the
-        transform re-runs, re-deriving identical outbound rows — transforms are pure), and a committed
-        run is an idempotent no-op on re-invocation (routed row gone → ``False``). Returns ``True`` if
-        this call performed the handoff, ``False`` if it was a no-op."""
+        insert one ``stage='outbound'`` row per delivery this handler produced, **apply each declared
+        state write** (ADR 0005), log the ``transformed`` event, then call
+        :meth:`_maybe_finalize_message`. It does **not** write ``messages.status`` itself: the finalizer
+        is the single disposition authority (it alone has the whole multi-stage row picture — a sibling
+        handler's routed/outbound rows may still be in flight, so per-handoff disposition math would be
+        order-dependent and wrong). INFLIGHT-guarded and single-transaction like :meth:`handoff`: a
+        crash before commit rolls back (the routed row recovers and the transform re-runs, re-deriving
+        identical outbound rows **and** state writes — transforms are pure), and a committed run is an
+        idempotent no-op on re-invocation (routed row gone → ``False``). Returns ``True`` if this call
+        performed the handoff, ``False`` if it was a no-op.
+
+        **State exactly-once (ADR 0005):** each ``state_ops`` entry is upserted by ``(namespace, key)``
+        **inside this same transaction** as the outbound rows, so it commits or rolls back atomically
+        with them — a crash before commit leaves NO state row, and the committing attempt's value is the
+        one that persists (exactly-once *per message*). The in-memory read cache is updated **only after
+        ``commit()`` succeeds**, so a rolled-back op never leaks into a synchronous ``state_get``."""
         now = time.time() if now is None else now
         async with self._lock:
             try:
@@ -1066,6 +1359,15 @@ class MessageStore:
                     return False
                 for dest_name, payload in deliveries:
                     await self._insert_outbound_row(message_id, channel_id, dest_name, payload, now)
+                # JSON-encode + apply each declared state write in the SAME transaction as the outbound
+                # rows. Encoding is done up front so a (shouldn't-happen) serialization error aborts the
+                # whole handoff cleanly rather than after some rows were inserted. SetState validated
+                # JSON-serializability at construction, so this is belt-and-suspenders.
+                applied: list[tuple[tuple[str, str], Any]] = []
+                for namespace, key, value in state_ops:
+                    value_json = json.dumps(value)
+                    await self._apply_state_op(namespace, key, value_json, message_id, now)
+                    applied.append(((namespace, key), value))
                 await self._event(
                     message_id, "transformed", None, f"{len(deliveries)} destination(s)", now
                 )
@@ -1076,6 +1378,10 @@ class MessageStore:
             except Exception:
                 await self._db.rollback()
                 raise
+        # Commit succeeded → publish the committed writes to the read-through cache (never before: a
+        # rolled-back op above would have raised and skipped this, leaving the cache untouched).
+        for ck, cv in applied:
+            self._state_cache[ck] = cv
         return True
 
     async def _insert_message(
@@ -1218,10 +1524,19 @@ class MessageStore:
         return items
 
     async def claim_next_fifo(
-        self, name: str, now: float | None = None, *, stage: str = Stage.OUTBOUND.value
+        self,
+        name: str,
+        now: float | None = None,
+        *,
+        stage: str = Stage.OUTBOUND.value,
+        owner: str | None = None,
     ) -> OutboxItem | None:
         """Claim the **single oldest** pending row for one lane at ``stage`` — strict FIFO by enqueue
         time — but only if it is **due**.
+
+        ``owner`` (Track B Step 5 lane ownership) is accepted for protocol uniformity and IGNORED:
+        SQLite is single-node so there are no lane leases — it always runs the single-node claim, and
+        the runner only passes a non-``None`` owner on a clustered Postgres store.
 
         The lane key is **stage-aware**: outbound lanes are keyed by ``destination_name`` (per-outbound
         FIFO across all inbounds); ingress **and routed** lanes by ``channel_id`` (per-inbound FIFO —
@@ -2251,19 +2566,25 @@ class MessageStore:
             return cur.rowcount if cur.rowcount is not None else 0
 
     async def db_status(self) -> DbStatus:
-        """Database health snapshot (size, free space, journal mode, row counts)."""
-        cur = await self._db.execute("PRAGMA journal_mode")
-        row = await cur.fetchone()
-        journal = str(row[0]) if row else ""
-        return DbStatus(
-            path=self.path,
-            size_bytes=self._db_size_bytes(),
-            disk_free_bytes=self._disk_free_bytes(),
-            journal_mode=journal,
-            messages=await self._count("messages"),
-            events=await self._count("message_events"),
-            audit=await self._count("audit_log"),
-        )
+        """Database health snapshot (size, free space, journal mode, row counts).
+
+        Holds ``self._lock`` like the write paths: every method shares one aiosqlite connection, so a
+        lock-free read can interleave between a write's ``BEGIN`` and ``commit`` and corrupt the
+        connection's transaction state (``cannot commit - SQL statements in progress``) under
+        concurrent load — found by the load harness polling ``/status`` during heavy delivery."""
+        async with self._lock:
+            cur = await self._db.execute("PRAGMA journal_mode")
+            row = await cur.fetchone()
+            journal = str(row[0]) if row else ""
+            return DbStatus(
+                path=self.path,
+                size_bytes=self._db_size_bytes(),
+                disk_free_bytes=self._disk_free_bytes(),
+                journal_mode=journal,
+                messages=await self._count("messages"),
+                events=await self._count("message_events"),
+                audit=await self._count("audit_log"),
+            )
 
     async def integrity_check(self) -> tuple[bool, str]:
         """Run ``PRAGMA quick_check`` (can be slow on a large DB — call on demand only)."""
@@ -2365,6 +2686,30 @@ class MessageStore:
             await self._db.commit()
             return int(cur.rowcount)
 
+    async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
+        """Delete transform-state entries last written before ``older_than`` (ADR 0005 retention).
+
+        Unlike the body purges, this **removes the row** (state is correlation data, not a logged
+        message with counts/disposition to preserve) and drops it from the in-memory read cache after
+        the commit succeeds, so a later ``state_get`` reflects the purge. A simple global age purge (by
+        ``set_at``); per-namespace policy is a documented follow-up. Returns the number of entries
+        purged. Off by default — the RetentionRunner calls it only when ``state_max_age_days`` is set."""
+        now = time.time() if now is None else now
+        async with self._lock:
+            cur = await self._db.execute(
+                "SELECT namespace, key FROM state WHERE set_at < ?", (older_than,)
+            )
+            purged_keys = [(r["namespace"], r["key"]) for r in await cur.fetchall()]
+            if not purged_keys:
+                return 0
+            await self._db.execute("DELETE FROM state WHERE set_at < ?", (older_than,))
+            await self._db.commit()
+        # Commit succeeded → evict the purged keys from the read-through cache (after commit, mirroring
+        # the write path: the table is the source of truth, the cache follows it only once durable).
+        for ck in purged_keys:
+            self._state_cache.pop(ck, None)
+        return len(purged_keys)
+
     async def wal_checkpoint(self) -> None:
         """Force a full WAL checkpoint + truncate (``PRAGMA wal_checkpoint(TRUNCATE)``) so the ``-wal``
         sidecar — which holds recently-written PHI outside any app-level cipher — doesn't grow
@@ -2384,12 +2729,14 @@ class MessageStore:
 
     async def stats(self) -> dict[str, int]:
         """Outbound-queue depth by status — feeds the monitoring/queue-depth view. Scoped to outbound
-        rows so the numbers match the pre-staged-pipeline meaning (delivery backlog)."""
-        cur = await self._db.execute(
-            "SELECT status, COUNT(*) AS n FROM queue WHERE stage=? GROUP BY status",
-            (Stage.OUTBOUND.value,),
-        )
-        return {r["status"]: r["n"] for r in await cur.fetchall()}
+        rows so the numbers match the pre-staged-pipeline meaning (delivery backlog). Holds
+        ``self._lock`` (see :meth:`db_status`) — the shared connection can't read mid-write-transaction."""
+        async with self._lock:
+            cur = await self._db.execute(
+                "SELECT status, COUNT(*) AS n FROM queue WHERE stage=? GROUP BY status",
+                (Stage.OUTBOUND.value,),
+            )
+            return {r["status"]: r["n"] for r in await cur.fetchall()}
 
     async def connection_metrics(
         self, *, since: float, now: float | None = None, rate_window: float = 60.0
@@ -2397,7 +2744,16 @@ class MessageStore:
         """Aggregate per-channel inbound and per-destination outbound metrics for the
         connections dashboard. Counts (read/errored/written/dead) cover activity at or after
         ``since`` (engine start); queue depth and ages reflect current state; ``recent_done``
-        is completions within the last ``rate_window`` seconds (for backlog ETA)."""
+        is completions within the last ``rate_window`` seconds (for backlog ETA). Holds
+        ``self._lock`` (see :meth:`db_status`) — the shared connection can't read mid-write."""
+        async with self._lock:
+            return await self._connection_metrics_locked(
+                since=since, now=now, rate_window=rate_window
+            )
+
+    async def _connection_metrics_locked(
+        self, *, since: float, now: float | None = None, rate_window: float = 60.0
+    ) -> ConnectionMetrics:
         now = time.time() if now is None else now
         rate_since = now - rate_window
 

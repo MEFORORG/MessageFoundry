@@ -5,22 +5,24 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 
-A lightweight, open-source **HL7 v2 integration engine** for healthcare IT — message
-validation, parsing, transformation, and routing — with a desktop admin console.
+MessageFoundry is an **open-source integration engine for healthcare**. It connects clinical and
+business systems — routing, transforming, and validating messages across many formats (HL7 v2, JSON,
+XML/SOAP, X12, database records) and connection types (MLLP, TCP, HTTP/REST, SOAP, database, files,
+SFTP/FTP). Configure it with guided tooling or extend it in Python; it runs on SQLite or PostgreSQL
+with authentication, RBAC, audit, and encryption-at-rest built in.
 
-> Built with **hl7apy** + **python-hl7** (parsing/validation) and **PySide6**
-> (admin console). Python import package: `messagefoundry`.
+> Python import package: `messagefoundry`. Built with **hl7apy** + **python-hl7** (HL7 parsing/
+> validation), **FastAPI** (engine API), and **PySide6** (admin console).
 
 ## What it is
 
-A focused, reliable alternative to heavyweight engines for simple point-to-point
-interfaces (ADT, ORU, SIU, DFT). Message flow is a **graph wired by name, authored as
-Python**: an inbound **Connection** names a **Router**, which forwards to one or more
-**Handlers** (filter → transform), which send to outbound Connections — all backed by
-durable queuing, retries, and replay. There's no monolithic "channel" object bundling
-the graph; the configuration *is* the graph, version-controlled as plain Python modules.
+A modern alternative to engines like Mirth and Corepoint. Messages flow through a graph you
+wire by name: an inbound **Connection** hands off to a **Router**, which forwards to one or more
+**Handlers** (filter → transform), which deliver to outbound Connections — all backed by durable
+queuing, automatic retries, and replay. Build that graph with guided wizards, or in Python for full
+control; either way the configuration is version-controlled and yours.
 
-## Architecture (Phase 1)
+## Architecture
 
 **Engine-as-library + localhost API.** The engine is an importable Python package.
 The PySide6 console talks to it over a localhost HTTP + WebSocket API — the same way
@@ -38,14 +40,14 @@ No hand-rolled IPC; the deployment split is a config choice, not an architectura
 ```
 
 ### Key decisions
-- **The message store *is* the queue.** Transactional inbox/outbox → at-least-once
-  delivery, retries, and replay come for free. This is the reliability backbone.
+- **Reliable by default.** A durable, transactional pipeline gives at-least-once delivery,
+  automatic retries, replay, and dead-lettering — no separate message broker to run.
 - **Async core.** asyncio with per-connection workers for listeners, pollers, retries.
 - **Tolerant parsing first.** `python-hl7` for fast routing/peek; `hl7apy` for deep,
   version-aware validation and profiles on demand (real-world HL7 is often non-conformant).
-- **Config is code** — named **Connections** wired by **Router**/**Handler** Python scripts
-  (`inbound`/`outbound`/`@router`/`@handler`), version-controlled. The DB holds runtime state
-  and messages only — never config.
+- **Configure visually or in code.** Author connections and routes with guided wizards, or in
+  Python (`inbound`/`outbound`/`@router`/`@handler`) for full control — always version-controlled.
+  The database holds runtime state and messages only, never configuration.
 - **PHI is first-class.** Authentication, RBAC, a user-attributed audit log of message
   views/replays, and **encryption-at-rest** for message bodies (AES-256-GCM) are **built**; log
   redaction and MLLPS/TLS are on the roadmap. See [docs/PHI.md](docs/PHI.md) for the built-vs-planned
@@ -54,7 +56,7 @@ No hand-rolled IPC; the deployment split is a config choice, not an architectura
 ## Roadmap
 
 **Phase 1 — minimum reliable engine**
-- [x] Code-first Connection/Router/Handler model + config-module loader
+- [x] Connection/Router/Handler model + config-module loader
 - [x] Durable message store / queue (SQLite WAL, outbox pattern)
 - [x] Parse / validate (tolerant peek + opt-in strict validation)
 - [x] MLLP source + destination (correct `0x0B … 0x1C 0x0D` framing, ACK/NACK)
@@ -66,10 +68,30 @@ No hand-rolled IPC; the deployment split is a config choice, not an architectura
 - [x] PySide6 console: connection dashboard, message browser, HL7 parse-tree viewer,
       delivery/audit trail, replay (`python -m messagefoundry.console`)
 
-**Phase 1 complete.** Next: see "Later" below.
+**Phase 1 complete.**
 
-**Later** — plugin layer, PostgreSQL, REST/FHIR destinations, DB poller, transformer
-code steps (sandboxed), enrichment/lookup tables, alerting.
+**Since Phase 1 — now built**
+- [x] Staged pipeline (ingress → routed → outbound): at-least-once handoff, dead-letter, replay
+- [x] Authentication, RBAC, user-attributed audit log, at-rest body encryption (AES-256-GCM)
+- [x] **PostgreSQL** store backend (production, single-node)
+- [x] REST, SOAP, and Database destinations
+- [x] Database poll source *(experimental)*
+- [x] Reference / lookup tables (`code_set`) for enrichment
+- [x] Alerting — logging sink + webhook/email notifier
+- [x] Connections-as-data (`connections.toml`) editable by hand or a VS Code GUI
+
+**Later / in progress** — engine-native high availability (active-passive failover) and the
+experimental multi-node cluster path; native transport TLS (API + MLLP); a read-only component
+SDK (fork-to-customize); a de-identification framework; SQL Server store promotion. See
+[docs/EARLY-ADOPTER-GUIDE.md](docs/EARLY-ADOPTER-GUIDE.md) §2 for the current built-vs-experimental map.
+
+## Installing & rolling out
+
+Piloting MessageFoundry? The **[Early-Adopter Installation & Rollout Guide](docs/EARLY-ADOPTER-GUIDE.md)**
+takes you from first install through a staged, go/no-go-gated path to full production
+(Lab → Shadow/Parallel → Limited → Full). It leads with an honest built-vs-experimental
+maturity map and covers prerequisites, install, security/PHI hardening, reliability
+configuration, validation, load testing, backup/DR, day-2 operations, and upgrade/rollback.
 
 ## Development
 
@@ -110,5 +132,6 @@ available from the maintainer.
 
 ## Contributing
 
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). A signed
-[Contributor License Agreement](CLA.md) is required before a pull request can be merged.
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md), our
+[Code of Conduct](CODE_OF_CONDUCT.md), and how the project is governed in [GOVERNANCE.md](GOVERNANCE.md).
+A signed [Contributor License Agreement](CLA.md) is required before a pull request can be merged.

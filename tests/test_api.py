@@ -461,6 +461,32 @@ async def test_integrity_check_endpoint(engine: Engine, client: httpx.AsyncClien
     assert r.json()["ok"] is True
 
 
+async def test_cluster_status_single_node(client: httpx.AsyncClient) -> None:
+    # Track B Step 7: a default Engine.create → NullCoordinator → single-node posture.
+    r = await client.get("/cluster/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["clustered"] is False
+    assert body["is_leader"] is True
+    assert body["node_id"]  # non-empty stable identity
+    assert body["config_version"] == 0
+
+
+async def test_cluster_nodes_single_node(client: httpx.AsyncClient) -> None:
+    # Single-node /cluster/nodes synthesizes exactly one self-member, leader, with the matching
+    # leader_node_id.
+    r = await client.get("/cluster/nodes")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["nodes"]) == 1
+    node = body["nodes"][0]
+    assert node["is_leader"] is True
+    assert node["status"] == "active"
+    assert body["leader_node_id"] == node["node_id"]
+    # The single-node synthetic entry has no heartbeat history.
+    assert node["started_at"] is None and node["last_seen"] is None
+
+
 async def test_connections_includes_registry_connections(
     engine: Engine, client: httpx.AsyncClient
 ) -> None:

@@ -6,6 +6,13 @@ subcomponents are rebuilt at the *string* level (split on the message's own sepa
 re-join, assign the whole field) — which avoids a python-hl7 quirk where assigning to a component
 of a not-yet-componentized field raises.
 
+By default a read/write addresses the **first** segment of an id and (for a component) the **first**
+repetition of a field — the common case. Real-world feeds also need to **iterate field repetitions** (PID-3 identifier lists, repeating OBX/IN1) and
+to **address, add, and remove whole segments** (e.g. rebuilding a repeating ODS/OBX block). Those are
+the ``occurrence=``/``repetition=`` keywords on :meth:`field`/:meth:`set`, plus :meth:`repetitions`,
+:meth:`add_repetition`, :meth:`count_segments`, :meth:`add_segment`, and :meth:`delete_segments`.
+Every one of them reads the message's own separators (MSH-1/MSH-2), never hardcoded defaults.
+
 This is the read/mutate primitive that code-first **Routers** and **Handlers** work against (and
 that the declarative transforms now reuse). Never string-slice raw HL7 — go through here and
 re-encode.
@@ -14,11 +21,16 @@ re-encode.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import hl7
 
 from messagefoundry.parsing.peek import normalize, parse_path
+
+# A segment id is exactly three chars: an upper-case letter then two alphanumerics (HL7 §2.5),
+# e.g. ``MSH``/``PID``/``ZAL``. Used to validate :meth:`Message.add_segment` input.
+_SEG_ID_RE = re.compile(r"^[A-Z][A-Z0-9]{2}$")
 
 
 class Message:
@@ -38,32 +50,67 @@ class Message:
 
     # --- read ----------------------------------------------------------------
 
-    def field(self, path: str) -> str | None:
+    def field(self, path: str, *, occurrence: int = 1, repetition: int | None = None) -> str | None:
         """Value at ``path`` (``"MSH-9"``, ``"MSH-9.1"``, ``"PID-3.1.1"``), or None if absent/empty.
 
-        A whole-field read returns the raw (structural) text, including any repetitions. A
+        A whole-field read returns the raw (structural) text, **including** any repetitions. A
         component/subcomponent read is taken from the **first repetition** (matching
         :class:`~messagefoundry.parsing.peek.Peek`) and is **unescaped** so HL7 escape sequences
         (e.g. ``\\S\\``) round-trip back to their literal value (the inverse of :meth:`set`'s
-        escaping)."""
+        escaping).
+
+        ``occurrence`` (1-based) selects which segment of that id to read — ``occurrence=2`` reads
+        the **second** ``OBX``, etc. ``repetition`` (1-based) scopes the read to one field
+        repetition: when given, a whole-field read returns just that repetition's text and a
+        component read takes that repetition's component (default ``None`` keeps the behavior above —
+        all reps for a whole field, first rep for a component). Returns None if the occurrence or
+        repetition is absent."""
+        if occurrence < 1:
+            raise ValueError("occurrence is 1-based (>= 1)")
+        if repetition is not None and repetition < 1:
+            raise ValueError("repetition is 1-based (>= 1)")
         seg, fld, comp, sub = parse_path(path)
-        text = self._raw_field(seg, fld)
-        if comp is None:
-            return text or None
+        text = self._raw_field(seg, fld, occurrence)
         _field_sep, comp_sep, rep_sep, _esc, sub_sep = self._encoding_chars()
-        # First repetition only, so a component read of a repeating field (e.g. PID-3
-        # "111^^^A~222^^^B") returns rep 1's component, not cross-repetition text (review H-9).
-        comps = text.split(rep_sep)[0].split(comp_sep)
-        if comp > len(comps):
+        if comp is None:
+            if repetition is None:
+                return text or None  # whole field: every repetition (review H-9)
+            reps = text.split(rep_sep)
+            return (reps[repetition - 1] or None) if repetition <= len(reps) else None
+        # Component/subcomponent: one repetition (the first unless asked otherwise), so a read of a
+        # repeating field (e.g. PID-3 "111^^^A~222^^^B") returns a single rep's component, not
+        # cross-repetition text (review H-9).
+        reps = text.split(rep_sep)
+        rep_index = 1 if repetition is None else repetition
+        if rep_index > len(reps):
             return None
-        value = comps[comp - 1]
-        if sub is None:
-            return self._m.unescape(value) or None
-        subs = value.split(sub_sep)
-        return (self._m.unescape(subs[sub - 1]) or None) if sub <= len(subs) else None
+        return self._extract(reps[rep_index - 1], comp, sub, comp_sep, sub_sep)
 
     def __getitem__(self, path: str) -> str | None:
         return self.field(path)
+
+    def repetitions(self, path: str, *, occurrence: int = 1) -> list[str | None]:
+        """Every repetition of the field at ``path``, in order (``[]`` if the field is absent/empty).
+
+        For a whole-field path each element is that repetition's full text; for a component/
+        subcomponent path each element is that part **within** each repetition (unescaped), with
+        None where a repetition lacks it. This is the iterate-the-``~``-list primitive — e.g.
+        ``msg.repetitions("PID-3.1")`` → every identifier's first component. ``occurrence`` selects
+        the segment as in :meth:`field`."""
+        if occurrence < 1:
+            raise ValueError("occurrence is 1-based (>= 1)")
+        seg, fld, comp, sub = parse_path(path)
+        text = self._raw_field(seg, fld, occurrence)
+        if not text:
+            return []
+        _field_sep, comp_sep, rep_sep, _esc, sub_sep = self._encoding_chars()
+        if comp is None:
+            return [rep or None for rep in text.split(rep_sep)]
+        return [self._extract(rep, comp, sub, comp_sep, sub_sep) for rep in text.split(rep_sep)]
+
+    def count_segments(self, segment_id: str) -> int:
+        """How many segments of ``segment_id`` the message has (0 if none)."""
+        return sum(1 for seg in self._m if str(seg[0]) == segment_id)
 
     @property
     def message_code(self) -> str | None:
@@ -87,7 +134,9 @@ class Message:
 
     # --- mutate --------------------------------------------------------------
 
-    def set(self, path: str, value: str) -> None:
+    def set(
+        self, path: str, value: str, *, occurrence: int = 1, repetition: int | None = None
+    ) -> None:
         """Write ``value`` at ``path``, extending the field/components as needed.
 
         ``value`` may never contain a **segment separator** (CR/LF) — that would inject a new segment
@@ -95,17 +144,26 @@ class Message:
         split into extra fields); both raise ``ValueError`` (XFORM-1, review M-12). A component/
         subcomponent write **escapes** the value's structural delimiters (``| ^ ~ & \\``) so they are
         carried as data, not new structure (e.g. ``PID-5.1 = "O^Brien"`` stays one component), while
-        non-delimiter characters — incl. CJK/accented names — pass through intact (review M-13). A
-        write to a repeating field edits only the **first repetition**, preserving the rest (review
-        H-9). A whole-field write assigns the caller's text verbatim (their structure). Raises
-        ``KeyError`` if the target segment isn't present."""
+        non-delimiter characters — incl. CJK/accented names — pass through intact (review M-13).
+
+        ``occurrence`` (1-based) selects which segment of that id to write — ``occurrence=2`` edits
+        the **second** ``OBX``. ``repetition`` (1-based) scopes the write to one field repetition: a
+        component write edits that repetition (padding earlier reps if needed) and preserves the
+        others (default — and ``repetition=1`` — edit the first, preserve the rest; review H-9); a
+        whole-field write with ``repetition`` replaces just that repetition's text (and the value may
+        then not contain the repetition separator). Without ``repetition``, a whole-field write
+        assigns the caller's text verbatim (their structure, repetitions and all). Raises
+        ``KeyError`` if the target segment (occurrence) isn't present."""
         if "\r" in value or "\n" in value:
             raise ValueError("HL7 field value may not contain a segment separator (CR/LF)")
+        if occurrence < 1:
+            raise ValueError("occurrence is 1-based (>= 1)")
+        if repetition is not None and repetition < 1:
+            raise ValueError("repetition is 1-based (>= 1)")
         seg, fld, comp, sub = parse_path(path)
-        try:
-            self._m.segment(seg)
-        except KeyError:
-            raise KeyError(f"cannot set absent segment {seg!r}") from None
+        if self._segment_obj(seg, occurrence) is None:
+            where = f"{seg!r}" + (f" occurrence {occurrence}" if occurrence > 1 else "")
+            raise KeyError(f"cannot set absent segment {where}")
 
         field_sep, comp_sep, rep_sep, esc, sub_sep = self._encoding_chars()
 
@@ -118,14 +176,32 @@ class Message:
                     f"HL7 field value may not contain the field separator {field_sep!r}; "
                     "write structured values via a component/subcomponent path"
                 )
-            self._m[f"{seg}.F{fld}"] = value
+            if repetition is None:
+                self._assign_field(seg, fld, occurrence, value)
+                return
+            # Repetition-scoped whole-field write: replace just that rep, keep the others. The value
+            # targets one repetition, so it may not itself carry the repetition separator.
+            if rep_sep in value:
+                raise ValueError(
+                    f"a repetition-scoped value may not contain the repetition separator {rep_sep!r}"
+                )
+            current = self._raw_field(seg, fld, occurrence)
+            reps = current.split(rep_sep) if current else [""]
+            while len(reps) < repetition:
+                reps.append("")
+            reps[repetition - 1] = value
+            self._assign_field(seg, fld, occurrence, rep_sep.join(reps))
             return
 
         escaped = self._escape_leaf(value, field_sep, comp_sep, rep_sep, esc, sub_sep)
-        current = self._raw_field(seg, fld)
-        # Edit the FIRST repetition only (matching the read side); preserve any further reps (H-9).
+        current = self._raw_field(seg, fld, occurrence)
+        # Edit one repetition (the first unless asked otherwise), matching the read side; preserve
+        # any further reps (H-9).
+        rep_index = 1 if repetition is None else repetition
         reps = current.split(rep_sep) if current else [""]
-        comps = reps[0].split(comp_sep) if reps[0] else []
+        while len(reps) < rep_index:
+            reps.append("")
+        comps = reps[rep_index - 1].split(comp_sep) if reps[rep_index - 1] else []
         while len(comps) < comp:
             comps.append("")
         if sub is None:
@@ -136,11 +212,88 @@ class Message:
                 subs.append("")
             subs[sub - 1] = escaped
             comps[comp - 1] = sub_sep.join(subs)
-        reps[0] = comp_sep.join(comps)
-        self._m[f"{seg}.F{fld}"] = rep_sep.join(reps)
+        reps[rep_index - 1] = comp_sep.join(comps)
+        self._assign_field(seg, fld, occurrence, rep_sep.join(reps))
 
     def __setitem__(self, path: str, value: str) -> None:
         self.set(path, value)
+
+    def add_repetition(self, path: str, value: str, *, occurrence: int = 1) -> None:
+        """Append a new ``~`` repetition carrying ``value`` to the field at ``path``.
+
+        ``path`` must be a **whole-field** path (no component) — a repetition is a field-level unit;
+        ``value`` is the new repetition's structure (components with ``^`` are kept as the caller's
+        intent), so it may not contain the field or repetition separator or a CR/LF. If the field is
+        currently empty the value becomes its first repetition. ``occurrence`` selects the segment.
+        Raises ``KeyError`` if the segment (occurrence) is absent, ``ValueError`` on a component path
+        or an illegal separator in ``value``."""
+        if "\r" in value or "\n" in value:
+            raise ValueError("HL7 field value may not contain a segment separator (CR/LF)")
+        if occurrence < 1:
+            raise ValueError("occurrence is 1-based (>= 1)")
+        seg, fld, comp, _sub = parse_path(path)
+        if comp is not None:
+            raise ValueError("add_repetition takes a whole-field path (no component)")
+        if self._segment_obj(seg, occurrence) is None:
+            where = f"{seg!r}" + (f" occurrence {occurrence}" if occurrence > 1 else "")
+            raise KeyError(f"cannot add a repetition to absent segment {where}")
+        field_sep, _comp_sep, rep_sep, _esc, _sub_sep = self._encoding_chars()
+        if field_sep in value:
+            raise ValueError(
+                f"a repetition value may not contain the field separator {field_sep!r}"
+            )
+        if rep_sep in value:
+            raise ValueError(
+                f"a repetition value may not contain the repetition separator {rep_sep!r}; "
+                "call add_repetition once per repetition"
+            )
+        current = self._raw_field(seg, fld, occurrence)
+        self._assign_field(seg, fld, occurrence, f"{current}{rep_sep}{value}" if current else value)
+
+    def add_segment(self, line: str, *, index: int | None = None) -> None:
+        """Add a whole segment from a raw ``line`` like ``"ODS|R|^ODS123|GEN^Regular^Diet"``.
+
+        The line is split on the message's **own** field separator and grafted in so it re-encodes
+        byte-for-byte and re-parses into real components. It must be a **single** segment (no CR/LF)
+        beginning with a 3-char segment id. By default the segment is appended at the end; pass
+        ``index`` (1-based position among segments, ``1`` = just after MSH) to insert it earlier.
+        Adding an ``MSH`` is refused (there is exactly one). Raises ``ValueError`` on a malformed
+        line or out-of-range ``index``."""
+        if "\r" in line or "\n" in line:
+            raise ValueError(
+                "add_segment takes one segment line (no CR/LF); call it once per segment"
+            )
+        field_sep, *_ = self._encoding_chars()
+        tokens = line.split(field_sep)
+        segment_id = tokens[0]
+        if not _SEG_ID_RE.match(segment_id):
+            raise ValueError(f"segment must begin with a 3-char segment id, got {segment_id!r}")
+        if segment_id == "MSH":
+            raise ValueError("refusing to add a second MSH segment")
+        new_segment = self._m.create_segment([self._m.create_field([tok]) for tok in tokens])
+        if index is None:
+            self._m.append(new_segment)
+            return
+        if index < 1 or index > len(self._m):
+            raise ValueError(
+                f"index {index} out of range (1..{len(self._m)}); index 1 is after MSH"
+            )
+        self._m.insert(index, new_segment)
+
+    def delete_segments(self, segment_id: str) -> int:
+        """Remove every segment with ``segment_id`` and return how many were removed.
+
+        Deleting ``MSH`` is refused — the message must keep its header. Common for clearing a
+        repeating block (e.g. ``delete_segments("ODS")``) before rebuilding it with
+        :meth:`add_segment`."""
+        if segment_id == "MSH":
+            raise ValueError("refusing to delete the MSH segment")
+        removed = 0
+        for i in range(len(self._m) - 1, -1, -1):  # back-to-front keeps indices valid
+            if str(self._m[i][0]) == segment_id:
+                del self._m[i]
+                removed += 1
+        return removed
 
     # --- encode --------------------------------------------------------------
 
@@ -153,12 +306,57 @@ class Message:
 
     # --- internals -----------------------------------------------------------
 
-    def _raw_field(self, seg: str, fld: int) -> str:
-        """Raw field text (``""`` if the segment/field is absent) — for component rebuilds."""
+    def _raw_field(self, seg: str, fld: int, occurrence: int = 1) -> str:
+        """Raw field text (``""`` if the segment/field/occurrence is absent) — for component
+        rebuilds. ``occurrence`` (1-based) picks which segment of that id."""
+        segment = self._segment_obj(seg, occurrence)
+        if segment is None:
+            return ""
         try:
-            return str(self._m.segment(seg)[fld])
+            return str(segment[fld])
         except (KeyError, IndexError):
             return ""
+
+    def _segment_obj(self, segment_id: str, occurrence: int = 1) -> Any:
+        """The ``occurrence``-th (1-based) segment object with ``segment_id``, or None if absent."""
+        seen = 0
+        for segment in self._m:
+            if str(segment[0]) == segment_id:
+                seen += 1
+                if seen == occurrence:
+                    return segment
+        return None
+
+    def _assign_field(self, seg: str, fld: int, occurrence: int, raw_value: str) -> None:
+        """Write the whole raw field text at ``seg``/``fld`` for the given segment ``occurrence``.
+
+        Occurrence 1 uses python-hl7's accessor, which auto-extends the field list; a later
+        occurrence is written on its segment object directly, padding empty fields up to ``fld``
+        first (a bare index assignment past the end raises). The string content (components,
+        repetitions) round-trips verbatim and re-parses into structure either way."""
+        if occurrence == 1:
+            self._m[f"{seg}.F{fld}"] = raw_value
+            return
+        segment = self._segment_obj(seg, occurrence)
+        if segment is None:  # pragma: no cover - callers check first
+            raise KeyError(f"cannot set absent segment {seg!r} occurrence {occurrence}")
+        while len(segment) <= fld:
+            segment.append(self._m.create_field([""]))
+        segment[fld] = self._m.create_field([raw_value])
+
+    def _extract(
+        self, rep_text: str, comp: int, sub: int | None, comp_sep: str, sub_sep: str
+    ) -> str | None:
+        """The component/subcomponent value within a single repetition's text, unescaped, or None
+        if that part is absent."""
+        comps = rep_text.split(comp_sep)
+        if comp > len(comps):
+            return None
+        value = comps[comp - 1]
+        if sub is None:
+            return self._m.unescape(value) or None
+        subs = value.split(sub_sep)
+        return (self._m.unescape(subs[sub - 1]) or None) if sub <= len(subs) else None
 
     def _encoding_chars(self) -> tuple[str, str, str, str, str]:
         """The message's ``(field, component, repetition, escape, subcomponent)`` delimiters, read

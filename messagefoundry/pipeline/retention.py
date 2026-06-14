@@ -29,6 +29,7 @@ from dataclasses import dataclass
 
 from messagefoundry.config.settings import RetentionSettings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store
 
 __all__ = ["RetentionRunner", "RetentionPass"]
@@ -45,6 +46,7 @@ class RetentionPass:
 
     messages_purged: int
     dead_purged: int
+    state_purged: int
     wal_checkpointed: bool
     vacuumed: bool
     size_bytes: int
@@ -54,7 +56,13 @@ class RetentionPass:
     def did_work(self) -> bool:
         """Whether the pass changed anything worth an audit row (a routine WAL checkpoint alone
         isn't — it leaves no data trace and would otherwise spam the audit log every pass)."""
-        return self.messages_purged > 0 or self.dead_purged > 0 or self.vacuumed or self.over_limit
+        return (
+            self.messages_purged > 0
+            or self.dead_purged > 0
+            or self.state_purged > 0
+            or self.vacuumed
+            or self.over_limit
+        )
 
 
 class RetentionRunner:
@@ -69,12 +77,17 @@ class RetentionRunner:
         *,
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
+        coordinator: ClusterCoordinator | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
         # Default to the logging sink so an over-limit store is at least visible without a notifier.
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._clock = clock
+        # Retention is a leader-only WRITE singleton (it purges PHI bodies + writes audit rows), so in
+        # a cluster it must run on exactly one node. Default NullCoordinator → always leader → always
+        # runs, so an existing caller/test that passes no coordinator is byte-identical (Track B Step 4).
+        self._coordinator: ClusterCoordinator = coordinator or NullCoordinator()
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         # Maintenance cadence state (loop-driven; only read/written on the single task).
@@ -89,6 +102,7 @@ class RetentionRunner:
         return bool(
             s.messages_days
             or s.dead_letter_days
+            or s.state_max_age_days
             or s.max_db_mb
             or s.wal_checkpoint_seconds
             or s.vacuum_time() is not None
@@ -152,7 +166,25 @@ class RetentionRunner:
     async def run_once(self, now: float | None = None) -> RetentionPass:
         """Run a full retention pass for ``now`` (default: the injected clock): purge bodies past the
         configured windows, checkpoint the WAL / VACUUM if due, check the size threshold, and write a
-        single ``audit_log`` entry when the pass did real work. Returns a :class:`RetentionPass`."""
+        single ``audit_log`` entry when the pass did real work. Returns a :class:`RetentionPass`.
+
+        Leader-gated (Track B Step 4): a non-leader node returns a did-nothing pass without touching the
+        store, so in a cluster exactly one node purges. The loop keeps ticking on followers
+        (reactive-by-polling), so when a follower becomes leader the very next pass acts. A follower
+        never advances its WAL/VACUUM cadence state (the gate returns before those timers update), so a
+        newly-promoted leader runs any due WAL checkpoint / daily VACUUM on its first acting pass — which
+        is the correct behavior (the new leader picks up the maintenance the cluster owes). Single-node
+        (the NullCoordinator default) is always leader, so this is byte-identical there."""
+        if not self._coordinator.is_leader():
+            return RetentionPass(
+                messages_purged=0,
+                dead_purged=0,
+                state_purged=0,
+                wal_checkpointed=False,
+                vacuumed=False,
+                size_bytes=0,
+                over_limit=False,
+            )
         now = self._clock() if now is None else now
         s = self._settings
 
@@ -165,6 +197,11 @@ class RetentionRunner:
         if s.dead_letter_days > 0:
             dead_purged = await self._store.purge_dead_letters(
                 older_than=now - s.dead_letter_days * _SECONDS_PER_DAY, now=now
+            )
+        state_purged = 0
+        if s.state_max_age_days > 0:
+            state_purged = await self._store.purge_state(
+                older_than=now - s.state_max_age_days * _SECONDS_PER_DAY, now=now
             )
 
         wal_checkpointed = False
@@ -184,6 +221,7 @@ class RetentionRunner:
         result = RetentionPass(
             messages_purged=messages_purged,
             dead_purged=dead_purged,
+            state_purged=state_purged,
             wal_checkpointed=wal_checkpointed,
             vacuumed=vacuumed,
             size_bytes=size_bytes,
@@ -220,6 +258,8 @@ class RetentionRunner:
                 "messages_purged": result.messages_purged,
                 "dead_letter_days": self._settings.dead_letter_days,
                 "dead_purged": result.dead_purged,
+                "state_max_age_days": self._settings.state_max_age_days,
+                "state_purged": result.state_purged,
                 "vacuumed": result.vacuumed,
                 "db_size_bytes": result.size_bytes,
                 "max_db_mb": self._settings.max_db_mb,

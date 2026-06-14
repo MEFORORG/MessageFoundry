@@ -11,9 +11,9 @@ import { workspaceDir } from "./cli";
 import { registerCompletion } from "./completion";
 import { registerChat } from "./chat";
 import { generateSamples } from "./generate";
+import { openConnectionEditor } from "./connectionEditor";
 import { GraphProvider } from "./graphTree";
 import { HomeView } from "./home";
-import { openNewConnection } from "./newConnection";
 import { openNewRoute } from "./newRoute";
 import { promote } from "./promote";
 import { maybeSuggestSourceControl, setupSourceControl } from "./sourceControl";
@@ -42,6 +42,8 @@ async function insertSnippet(key: keyof typeof SNIPPETS): Promise<void> {
 
 export function activate(context: vscode.ExtensionContext): void {
   const graph = new GraphProvider();
+  // Router names from the live graph, for the connection editor's router-binding dropdown.
+  const routerNames = (): string[] => graph.getGraph()?.routers.map((r) => r.name) ?? [];
   const graphView = vscode.window.createTreeView("messagefoundry.graph", { treeDataProvider: graph });
   context.subscriptions.push(graphView);
   context.subscriptions.push(
@@ -92,16 +94,25 @@ export function activate(context: vscode.ExtensionContext): void {
         await vscode.window.showTextDocument(doc, { selection: new vscode.Range(pos, pos) });
       },
     ),
-    // Gear action on a connection row → jump to its MLLP()/File() settings in code (the node's own
-    // definition line). Reuses the node's openSource command args.
+    // Gear action on a connection row. A connections.toml (data-authored) connection opens the
+    // editor; a code-authored one jumps to its .py definition (it isn't GUI-editable — ADR 0007).
     vscode.commands.registerCommand("messagefoundry.openConnectionSettings", (node?: vscode.TreeItem) => {
       const args = node?.command?.arguments;
-      if (args && args.length >= 1 && typeof args[0] === "string") {
-        void vscode.commands.executeCommand("messagefoundry.openSource", args[0], args[1] ?? 1);
+      const file = args && typeof args[0] === "string" ? args[0] : undefined;
+      const name = typeof node?.label === "string" ? node.label : undefined;
+      if (file && file.endsWith("connections.toml") && name) {
+        void openConnectionEditor(context, { routers: routerNames(), editName: name, onSaved: () => graph.refresh() });
+      } else if (file) {
+        void vscode.commands.executeCommand("messagefoundry.openSource", file, args?.[1] ?? 1);
       }
     }),
+    // Edit a data-authored connection from its context menu (informs if it's code-authored).
+    vscode.commands.registerCommand("messagefoundry.editConnection", (node?: vscode.TreeItem) => {
+      const name = typeof node?.label === "string" ? node.label : undefined;
+      void openConnectionEditor(context, { routers: routerNames(), editName: name, onSaved: () => graph.refresh() });
+    }),
     vscode.commands.registerCommand("messagefoundry.newConnection", () =>
-      openNewConnection(context, () => graph.refresh()),
+      openConnectionEditor(context, { routers: routerNames(), onSaved: () => graph.refresh() }),
     ),
     vscode.commands.registerCommand("messagefoundry.newRoute", () =>
       openNewRoute(context, () => graph.refresh()),

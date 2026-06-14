@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import datetime
-from typing import Iterator
 
 from messagefoundry.config.models import AckMode, ConnectorType, Destination, Source
 from messagefoundry.parsing.peek import HL7PeekError, Peek
+from messagefoundry.transports.framing import MLLP_CODEC, FrameDecoder, FrameError
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
@@ -51,6 +52,8 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+# MLLP framing is the VT/FS+CR preset of the shared, configurable codec (transports.framing); these
+# names + frame()/MLLPDecoder are kept as the MLLP-specific surface so existing imports + tests hold.
 SB = 0x0B  # start block  (VT)
 EB = 0x1C  # end block    (FS)
 CR = 0x0D  # carriage return
@@ -66,7 +69,9 @@ DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this lo
 _CLIENT_SHUTDOWN_GRACE = 5.0
 
 
-class MLLPFrameError(ValueError):
+# MLLP's frame-too-large error is the shared codec error under its historical name (subclassing keeps
+# `except MLLPFrameError` working while the codec raises the generic FrameError internally).
+class MLLPFrameError(FrameError):
     """Raised when an MLLP frame exceeds its configured byte cap before end-of-block.
 
     Signals the caller to drop the connection rather than buffer an unbounded frame.
@@ -74,48 +79,24 @@ class MLLPFrameError(ValueError):
 
 
 def frame(payload: str | bytes, encoding: str = "utf-8") -> bytes:
-    """Wrap a message in an MLLP block: ``SB payload EB CR``."""
-    body = payload.encode(encoding) if isinstance(payload, str) else bytes(payload)
-    return bytes([SB]) + body + bytes([EB, CR])
+    """Wrap a message in an MLLP block: ``SB payload EB CR`` (the VT/FS+CR codec preset)."""
+    return MLLP_CODEC.frame(payload, encoding)
 
 
-class MLLPDecoder:
-    """Stateful MLLP frame reassembler.
+class MLLPDecoder(FrameDecoder):
+    """Stateful MLLP frame reassembler — the :class:`~messagefoundry.transports.framing.FrameDecoder`
+    bound to the MLLP (VT/FS+CR) codec.
 
     Feed it whatever bytes arrive; it yields complete message payloads (framing bytes
     stripped) as they complete. Bytes outside a frame — including a stray CR after EB or
-    junk before the next SB — are discarded, matching tolerant real-world receivers.
+    junk before the next SB — are discarded, matching tolerant real-world receivers. A frame
+    over ``max_frame_bytes`` raises :class:`MLLPFrameError`.
     """
 
-    def __init__(self, max_frame_bytes: int | None = None) -> None:
-        self._buf = bytearray()
-        self._in_block = False
-        self.max_frame_bytes = max_frame_bytes
+    error_class = MLLPFrameError
 
-    def feed(self, data: bytes) -> Iterator[bytes]:
-        for byte in data:
-            if not self._in_block:
-                if byte == SB:
-                    self._in_block = True
-                    self._buf.clear()
-                # else: discard inter-frame noise (CR after EB, keep-alives, etc.)
-                continue
-            if byte == EB:
-                # End of block. The next byte should be CR; we don't require it, and
-                # we leave _in_block False so a lone trailing CR is simply ignored.
-                self._in_block = False
-                yield bytes(self._buf)
-                self._buf.clear()
-            else:
-                if self.max_frame_bytes is not None and len(self._buf) >= self.max_frame_bytes:
-                    # Oversized open frame: a peer that never sends EB would grow the buffer
-                    # without bound. Reset state and signal the caller to drop the connection.
-                    self._buf.clear()
-                    self._in_block = False
-                    raise MLLPFrameError(
-                        f"MLLP frame exceeded {self.max_frame_bytes} bytes before end-of-block"
-                    )
-                self._buf.append(byte)
+    def __init__(self, max_frame_bytes: int | None = None) -> None:
+        super().__init__(MLLP_CODEC, max_frame_bytes=max_frame_bytes)
 
 
 # --- ACK building ------------------------------------------------------------
@@ -322,7 +303,12 @@ class MLLPSource(SourceConnector):
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
 
-    async def start(self, handler: InboundHandler) -> None:
+    async def start(
+        self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
+    ) -> None:
+        # leader_gate is ignored: a listen source runs on every node (each binds its own endpoint;
+        # a load balancer / per-node ports distribute inbound connections), so there is no
+        # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
         self._server = await asyncio.start_server(self._on_client, self.host, self.port)
 

@@ -773,7 +773,133 @@ async def test_file_source_leaves_file_in_place_on_handler_failure(tmp_path: Pat
     assert not (inbox / ".error" / "msg.hl7").exists()  # never quarantined
 
 
+# --- file source: leader-gating (Track B Step 4b) ----------------------------
+
+
+def test_file_source_declares_polls_shared_resource() -> None:
+    # A directory is a shared external resource — the runner reads this flag to know the intake is
+    # leader-gated (only the cluster leader polls it).
+    assert FileSource.polls_shared_resource is True
+
+
+async def test_file_source_skips_scan_when_gate_false(tmp_path: Path) -> None:
+    # A follower (leader_gate() -> False) must NOT read or move a dropped file across a poll tick:
+    # the directory is shared, so a non-leader ingesting it would duplicate intake.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "msg1.hl7").write_bytes(ADT.encode("utf-8"))
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
+        )
+    )
+    task = asyncio.create_task(src.start(handler, leader_gate=lambda: False))
+    try:
+        # Give the loop several poll intervals; a follower must scan none of them.
+        await asyncio.sleep(0.1)
+    finally:
+        await src.stop()
+        await task
+    assert received == []  # never delivered
+    assert (inbox / "msg1.hl7").exists()  # file untouched (not read, not moved)
+    assert not (inbox / ".processed" / "msg1.hl7").exists()
+
+
+async def test_file_source_processes_when_gate_true(tmp_path: Path) -> None:
+    # A leader (leader_gate() -> True) processes exactly as the un-gated default does.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "msg1.hl7").write_bytes(ADT.encode("utf-8"))
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
+        )
+    )
+    task = asyncio.create_task(src.start(handler, leader_gate=lambda: True))
+    try:
+        await _until(lambda: bool(received))
+    finally:
+        await src.stop()
+        await task
+    assert received == [ADT.encode("utf-8")]
+    assert (inbox / ".processed" / "msg1.hl7").exists()
+
+
+async def test_file_source_resumes_when_gate_flips_to_true(tmp_path: Path) -> None:
+    # Reactive-by-polling: with the gate initially False the file is left untouched; once the gate
+    # flips True (this node became leader) the very next tick scans it — no restart needed.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "msg1.hl7").write_bytes(ADT.encode("utf-8"))
+    received: list[bytes] = []
+    leader = {"on": False}
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
+        )
+    )
+    task = asyncio.create_task(src.start(handler, leader_gate=lambda: leader["on"]))
+    try:
+        await asyncio.sleep(0.05)
+        assert received == []  # still a follower — nothing ingested
+        leader["on"] = True  # this node wins leadership
+        await _until(lambda: bool(received))  # the next tick scans it
+    finally:
+        await src.stop()
+        await task
+    assert received == [ADT.encode("utf-8")]
+    assert (inbox / ".processed" / "msg1.hl7").exists()
+
+
+# --- listen sources accept (and ignore) the leader_gate ----------------------
+
+
+async def test_mllp_source_accepts_and_ignores_leader_gate() -> None:
+    # A listen source runs on every node; passing leader_gate must be accepted without error and have
+    # no effect (it still binds + serves). Even a False gate does not stop it listening.
+    src = MLLPSource(Source(type=ConnectorType.MLLP, settings={"port": 0}))
+    await src.start(_noop_handler, leader_gate=lambda: False)
+    try:
+        assert src.sockport > 0  # bound + listening despite a False gate
+        assert MLLPSource.polls_shared_resource is False  # a listen source is not a poll source
+    finally:
+        await src.stop()
+
+
+async def test_tcp_source_accepts_and_ignores_leader_gate() -> None:
+    from messagefoundry.transports.tcp import TcpSource
+
+    src = TcpSource(Source(type=ConnectorType.TCP, settings={"port": 0, "framing": "stx_etx"}))
+    await src.start(_noop_handler, leader_gate=lambda: False)
+    try:
+        assert src.sockport > 0  # bound + listening despite a False gate
+        assert TcpSource.polls_shared_resource is False
+    finally:
+        await src.stop()
+
+
 # --- helpers -----------------------------------------------------------------
+
+
+async def _noop_handler(raw: bytes) -> str | None:
+    return None
 
 
 async def _until(cond, timeout: float = 2.0) -> None:

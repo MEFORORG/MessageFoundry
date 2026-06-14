@@ -41,6 +41,10 @@ from messagefoundry.config.models import (
     RetryPolicy,
     Source,
 )
+from messagefoundry.config.active_environment import activated as environment_activated
+from messagefoundry.config.code_sets import activated as code_sets_activated
+from messagefoundry.config.reference import activated as reference_activated
+from messagefoundry.config.state import activated as state_activated
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     InboundConnection,
@@ -51,6 +55,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.parsing import HL7PeekError, Peek, normalize, summarize, validate
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import safe_exc
 from messagefoundry.pipeline.dryrun import route_only, transform_one
 from messagefoundry.store import MessageStatus, QueueStore, Stage
@@ -101,9 +106,20 @@ class RegistryRunner:
         alert_sink: AlertSink | None = None,
         egress: EgressSettings | None = None,
         env_values: Mapping[str, Any] | None = None,
+        active_environment: str | None = None,
+        coordinator: ClusterCoordinator | None = None,
     ) -> None:
         self.registry = registry
         self.store = store
+        # Cluster coordination seam (Track B Step 3). Threaded in + held so Steps 4/5 can consult the
+        # cheap, synchronous gates (is_leader / owns_lane) on the hot path — this step adds NO call
+        # sites; the object is only stored + exposed. None → the no-op NullCoordinator (every gate
+        # True), so single-node operation is byte-identical to before this seam existed.
+        self._coordinator: ClusterCoordinator = coordinator or NullCoordinator()
+        # The active environment name ([ai].environment / serve --env), published around each
+        # router/transform run so a Handler's current_environment() resolves (ADR 0006-style per-face
+        # logic). A deployment constant, so the read is pure/re-run-safe.
+        self._active_environment = active_environment
         self.poll_interval = poll_interval
         self.claim_limit = claim_limit
         # Global outbound defaults (from [delivery]); a connection's own settings override them.
@@ -163,6 +179,12 @@ class RegistryRunner:
     def running(self) -> bool:
         return self._running
 
+    @property
+    def coordinator(self) -> ClusterCoordinator:
+        """The cluster coordinator threaded in by the engine (Track B Step 3). Steps 4/5 consume its
+        cheap, synchronous gates (``is_leader`` / ``owns_lane``); this step only exposes the object."""
+        return self._coordinator
+
     def notify_work(self) -> None:
         """Wake every stage worker now (e.g. after a replay re-queues rows at an unknown stage)."""
         self._ingress_work.set()
@@ -218,10 +240,24 @@ class RegistryRunner:
         source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
         check_source_allowed(source_cfg, ic.name, self._egress)  # fail-closed connect allowlist
         source = build_source(source_cfg)
+        # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
+        # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/
+        # free of any pipeline/cluster import. Only POLL sources act on it — they skip a scan when it
+        # returns False so exactly one node ingests a shared external resource (a dir / DB table /
+        # remote dir); LISTEN sources (MLLP/TCP) accept-and-ignore it (each binds its own endpoint). For
+        # single-node (NullCoordinator) is_leader is always True, so every poll source scans as before.
         # Bind BEFORE registering: a failed bind (e.g. port in use) must not leave a dead source in
         # _sources, where inbound_running() would report True and a retry would no-op (review M-9).
-        await source.start(self._make_handler(ic))
+        await source.start(self._make_handler(ic), leader_gate=self._coordinator.is_leader)
         self._sources[name] = source
+        # Once the source is live, note (start-time only, never per-tick) that a poll source's intake
+        # is leader-gated, so an operator reading the log knows only the leader polls this resource.
+        if getattr(source, "polls_shared_resource", False):
+            log.info(
+                "inbound %r polls a shared external resource; intake is leader-gated (only the "
+                "cluster leader polls it — single-node always does)",
+                name,
+            )
         # Ensure this inbound's router + transform workers are running. They are registry-tied, not
         # source-tied — so a per-connection start/restart, or a reload, re-arms a worker that exited
         # (e.g. halted by the STOP internal-error policy), otherwise the restarted source would resume
@@ -378,19 +414,12 @@ class RegistryRunner:
         BEFORE a reload quiesces anything — i.e. the running graph is left untouched. Construction
         is side-effect-free (no socket bind / file I/O — binding happens later in ``start_inbound``).
         Raises :class:`WiringError` so the API maps it to 422 like other invalid-config errors."""
-        try:
-            for ic in registry.inbound.values():
-                source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
-                check_source_allowed(source_cfg, ic.name, self._egress)
-                build_source(source_cfg)
-            for oc in registry.outbound.values():
-                dest = _dest_config(oc, self._env_values)
-                check_egress_allowed(dest, self._egress)  # fail-closed egress allowlist (WP-11c)
-                build_destination(dest)
-        except WiringError:
-            raise
-        except Exception as exc:
-            raise WiringError(f"connector build failed: {exc}") from exc
+        build_check_registry(
+            registry,
+            inbound_bind_host=self._inbound_bind_host,
+            env_values=self._env_values,
+            egress=self._egress,
+        )
 
     async def _reconcile_outbounds(self, old: Registry, new: Registry) -> None:
         """Bring the outbound connectors/workers in line with ``new`` without tearing down a live
@@ -622,9 +651,15 @@ class RegistryRunner:
                 # (head-of-line), so order is preserved. UNORDERED: claim a batch and rotate past a
                 # backing-off row to drain others. Resolved live so a reload can retune it.
                 if self._ordering.get(name, self._ordering_default) is OrderingMode.FIFO:
-                    head = await self.store.claim_next_fifo(name)
+                    # lane_owner() gates the claim to a single owner per lane (Track B Step 5) so strict
+                    # FIFO holds ACROSS nodes; it's None single-node (byte-identical no-owner claim).
+                    head = await self.store.claim_next_fifo(
+                        name, owner=self._coordinator.lane_owner()
+                    )
                     items = [head] if head is not None else []
                 else:
+                    # UNORDERED lanes are intentionally NOT lane-owned — concurrent draining across
+                    # nodes is fine, so claim_ready stays unchanged.
                     items = await self.store.claim_ready(
                         limit=self.claim_limit, destination_name=name
                     )
@@ -727,8 +762,12 @@ class RegistryRunner:
         while not self._stop.is_set():
             try:
                 # FIFO per inbound: claim only the due head (ingress rows never back off, so this is
-                # effectively the oldest pending row for this inbound).
-                item = await self.store.claim_next_fifo(name, stage=Stage.INGRESS.value)
+                # effectively the oldest pending row for this inbound). lane_owner() gates the claim to a
+                # single owner per lane (Track B Step 5) so strict FIFO holds across nodes; None
+                # single-node (byte-identical).
+                item = await self.store.claim_next_fifo(
+                    name, stage=Stage.INGRESS.value, owner=self._coordinator.lane_owner()
+                )
                 if item is None:
                     await self._wait_for_work(self._ingress_work)
                     continue
@@ -743,7 +782,16 @@ class RegistryRunner:
                     await self.store.mark_failed(item.id, "inbound not in registry", RetryPolicy())
                     return
                 try:
-                    names = route_only(self.registry, ic, item.payload)
+                    # Publish the live graph's code sets so a call-time code_set(...) inside the
+                    # Router resolves (the loader only had them active during import). The active set
+                    # is read from self.registry live, so a reload's swapped tables apply to the next
+                    # routed row; activated() restores cleanly after each run (no leak across rows).
+                    with (
+                        code_sets_activated(self.registry.code_sets),
+                        reference_activated(self.store.reference_view()),
+                        environment_activated(self._active_environment),
+                    ):
+                        names = route_only(self.registry, ic, item.payload)
                 except Exception as exc:
                     # Router code error (incl. an unknown handler name). Post-ACK, so no NAK — the
                     # global internal_error policy decides. Log the exception TYPE only; full detail
@@ -817,7 +865,11 @@ class RegistryRunner:
         last_buildup_check = 0.0
         while not self._stop.is_set():
             try:
-                item = await self.store.claim_next_fifo(name, stage=Stage.ROUTED.value)
+                # lane_owner() gates the claim to a single owner per lane (Track B Step 5) so strict
+                # FIFO holds across nodes; None single-node (byte-identical no-owner claim).
+                item = await self.store.claim_next_fifo(
+                    name, stage=Stage.ROUTED.value, owner=self._coordinator.lane_owner()
+                )
                 if item is None:
                     await self._wait_for_work(self._routed_work)
                     continue
@@ -845,12 +897,22 @@ class RegistryRunner:
                     )
                     continue
                 try:
-                    preview = transform_one(
-                        self.registry,
-                        hname,
-                        item.payload,
-                        self.registry.inbound[name].content_type.value,
-                    )
+                    # Same as the router worker: make the live graph's code sets active so a call-time
+                    # code_set(...) inside the Handler resolves; restored cleanly after the run. Also
+                    # publish the store's transform-state read-through cache view (ADR 0005) so a
+                    # call-time state_get(...) inside the Handler resolves against committed writes.
+                    with (
+                        code_sets_activated(self.registry.code_sets),
+                        reference_activated(self.store.reference_view()),
+                        state_activated(self.store.state_view()),
+                        environment_activated(self._active_environment),
+                    ):
+                        deliveries_preview, state_preview = transform_one(
+                            self.registry,
+                            hname,
+                            item.payload,
+                            self.registry.inbound[name].content_type.value,
+                        )
                 except Exception as exc:
                     # Handler/transform code error (incl. an unknown outbound name). Post-ACK, so no
                     # NAK — the global internal_error policy decides. Log the exception TYPE only (PHI).
@@ -879,12 +941,14 @@ class RegistryRunner:
                     )
                     await self.store.dead_letter_now(item.id, f"handler error: {safe_exc(exc)}")
                     continue
-                deliveries = [(d.to, d.payload) for d in preview]
+                deliveries = [(d.to, d.payload) for d in deliveries_preview]
+                state_ops = [(s.namespace, s.key, s.value) for s in state_preview]
                 await self.store.transform_handoff(
                     routed_id=item.id,
                     message_id=item.message_id,
                     channel_id=name,
                     deliveries=deliveries,
+                    state_ops=state_ops,
                 )
                 if deliveries:
                     self._work.set()  # wake the outbound delivery workers for the freshly-queued rows
@@ -969,9 +1033,9 @@ class RegistryRunner:
 def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[str, Any]) -> Source:
     # Resolve any env() references first (a missing value raises WiringError here, before bind).
     settings = resolve_env_settings(ic.spec.settings, env_values)
-    # Inbound MLLP listeners never carry an author-supplied host (wiring rejects one) — they bind to
-    # the service-level interface. File and other inbounds have no host and ignore this.
-    if ic.spec.type is ConnectorType.MLLP:
+    # Inbound MLLP/TCP listeners never carry an author-supplied host (wiring rejects one) — they bind
+    # to the service-level interface. File and other inbounds have no host and ignore this.
+    if ic.spec.type in (ConnectorType.MLLP, ConnectorType.TCP):
         settings["host"] = bind_host
     return Source(type=ic.spec.type, settings=settings, ack_mode=ic.ack_mode)
 
@@ -985,12 +1049,43 @@ def _dest_config(oc: OutboundConnection, env_values: Mapping[str, Any]) -> Desti
     )
 
 
+def build_check_registry(
+    registry: Registry,
+    *,
+    inbound_bind_host: str,
+    env_values: Mapping[str, Any],
+    egress: EgressSettings,
+) -> None:
+    """Construct (and discard) every connector in ``registry`` + run the fail-closed connect/egress
+    allowlists, so a bad connector spec or a non-allowlisted host fails as a :class:`WiringError`
+    BEFORE anything is applied. The standalone core of :meth:`RegistryRunner.build_check`, callable
+    offline — e.g. the ``connection`` CLI validating an edit before it persists (ADR 0007). Builds
+    nothing live (no socket bind / file I/O — binding happens later in ``start_inbound``)."""
+    try:
+        for ic in registry.inbound.values():
+            source_cfg = _source_config(ic, inbound_bind_host, env_values)
+            check_source_allowed(source_cfg, ic.name, egress)
+            build_source(source_cfg)
+        for oc in registry.outbound.values():
+            dest = _dest_config(oc, env_values)
+            check_egress_allowed(dest, egress)  # fail-closed egress allowlist (WP-11c)
+            build_destination(dest)
+    except WiringError:
+        raise
+    except Exception as exc:
+        raise WiringError(f"connector build failed: {exc}") from exc
+
+
 def check_source_allowed(source: Source, name: str, egress: EgressSettings) -> None:
     """Fail-closed connect-allowlist for an inbound connector that **dials out** to a server to receive
     (today: the DATABASE source, which polls a SQL host). Reuses ``[egress].allowed_db``: although the
     DB source pulls data *in* rather than exfiltrating it, it still opens an outbound connection to an
     operator-named host, so the same allowlist guards against pointing the engine at an arbitrary
-    server. Opt-in (an empty list = unrestricted), matching destinations; checked at load/reload/start."""
+    server. Opt-in (an empty list = unrestricted), matching destinations; checked at load/reload/start.
+
+    A TCP/MLLP/File *source* is a local **listener** (it binds ``[inbound].bind_host`` and waits for
+    peers, never dialing out), so there is nothing to connect-gate here — ``[egress].allowed_tcp``
+    governs only the TCP *destination* (see :func:`check_egress_allowed`)."""
     if source.type is ConnectorType.DATABASE and egress.allowed_db:
         host = str(source.settings.get("server", ""))
         port = source.settings.get("port", 1433)
@@ -1003,6 +1098,19 @@ def check_source_allowed(source: Source, name: str, egress: EgressSettings) -> N
             raise WiringError(
                 f"inbound {name!r}: DATABASE server {host!r} is not in the "
                 "[egress].allowed_db allowlist"
+            )
+    elif source.type is ConnectorType.REMOTEFILE and egress.allowed_remote:
+        host = str(source.settings.get("host", ""))
+        port = source.settings.get("port")
+        if not _mllp_egress_allowed(host, port, egress.allowed_remote):  # same host[:port] matching
+            log.warning(
+                "connect denied: inbound %r REMOTEFILE host %r not in [egress].allowed_remote",
+                name,
+                host,
+            )
+            raise WiringError(
+                f"inbound {name!r}: REMOTEFILE host {host!r} is not in the "
+                "[egress].allowed_remote allowlist"
             )
 
 
@@ -1025,6 +1133,20 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
             raise WiringError(
                 f"outbound {dest.name!r}: MLLP destination {host}:{port} is not in the "
                 "[egress].allowed_mllp allowlist"
+            )
+    elif dest.type is ConnectorType.TCP and egress.allowed_tcp:
+        host = str(dest.settings.get("host", "127.0.0.1"))
+        port = dest.settings.get("port")
+        if not _mllp_egress_allowed(host, port, egress.allowed_tcp):  # same host[:port] matching
+            log.warning(
+                "egress denied: outbound %r TCP %s:%s not in [egress].allowed_tcp",
+                dest.name,
+                host,
+                port,
+            )
+            raise WiringError(
+                f"outbound {dest.name!r}: TCP destination {host}:{port} is not in the "
+                "[egress].allowed_tcp allowlist"
             )
     elif dest.type is ConnectorType.FILE and egress.allowed_file_dirs:
         directory = dest.settings.get("directory")
@@ -1064,6 +1186,19 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
             raise WiringError(
                 f"outbound {dest.name!r}: DATABASE server {host!r} is not in the "
                 "[egress].allowed_db allowlist"
+            )
+    elif dest.type is ConnectorType.REMOTEFILE and egress.allowed_remote:
+        host = str(dest.settings.get("host", ""))
+        port = dest.settings.get("port")
+        if not _mllp_egress_allowed(host, port, egress.allowed_remote):  # same host[:port] matching
+            log.warning(
+                "egress denied: outbound %r REMOTEFILE host %r not in [egress].allowed_remote",
+                dest.name,
+                host,
+            )
+            raise WiringError(
+                f"outbound {dest.name!r}: REMOTEFILE host {host!r} is not in the "
+                "[egress].allowed_remote allowlist"
             )
 
 

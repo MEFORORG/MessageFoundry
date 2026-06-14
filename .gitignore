@@ -29,6 +29,11 @@ secrets/
 # Generated, regenerable test corpus (build with: python -m messagefoundry.generators.adt)
 /samples/messages/adt/
 
+# Workflow agent self-verification temp dirs (an isolated copy of a ported migration module + codesets
+/_verify_*/
+# construction; this is the local-only working area.
+/migration-local/
+
 # Tooling
 .mypy_cache/
 .ruff_cache/
@@ -41,3 +46,8 @@ secrets/
 
 # Local reference notes pointing at machine-specific Claude Code transcript paths — never commit
 TRANSCRIPTS.md
+
+# Local planning/marketing/security working docs — keep out of the repo
+/docs/DUAL_LICENSING_PLAN.md
+/docs/marketing/
+/docs/security/CISO-REVIEW.md

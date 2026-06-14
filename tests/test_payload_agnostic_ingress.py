@@ -78,9 +78,10 @@ def test_router_and_handler_receive_rawmessage() -> None:
     raw = '{"mrn": "100", "type": "obs"}'
     assert route_only(reg, ic, raw) == ["h"]
     assert seen == [RawMessage]  # the Router got a RawMessage, not an HL7 Message
-    previews = transform_one(reg, "h", raw, "json")
+    previews, state_ops = transform_one(reg, "h", raw, "json")
     assert len(previews) == 1 and previews[0].to == "OUT"
     assert _json.loads(previews[0].payload) == {"mrn": "100"}  # Handler returned a Send(str)
+    assert state_ops == []
 
 
 def test_route_message_non_hl7_filtered() -> None:

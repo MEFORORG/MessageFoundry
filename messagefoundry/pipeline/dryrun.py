@@ -11,11 +11,24 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
+from messagefoundry.config.code_sets import CodeSetError, load_code_set
+from messagefoundry.config.code_sets import activated as code_sets_activated
 from messagefoundry.config.models import ContentType
-from messagefoundry.config.wiring import HandlerFn, InboundConnection, Registry, Send
+from messagefoundry.config.reference import activated as reference_activated
+from messagefoundry.config.state import activated as state_activated
+from messagefoundry.config.wiring import (
+    HandlerFn,
+    InboundConnection,
+    Registry,
+    Send,
+    SetState,
+    StateValue,
+)
 from messagefoundry.parsing import (
     HL7PeekError,
     Message,
@@ -29,6 +42,7 @@ from messagefoundry.store import MessageStatus
 
 __all__ = [
     "DeliveryPreview",
+    "StateOpPreview",
     "RouteOutcome",
     "DryRunResult",
     "route_message",
@@ -50,10 +64,19 @@ def _handler_names(result: list[str] | str | None) -> list[str]:
     return [result] if isinstance(result, str) else list(result)
 
 
-def _sends(result: Send | list[Send] | None) -> list[Send]:
+def _partition(
+    result: Send | SetState | list[Send | SetState] | None,
+) -> tuple[list[Send], list[SetState]]:
+    """Split a Handler's return into its (deliveries, state writes) — ADR 0005.
+
+    A Handler may now return :class:`Send`\\ s and/or :class:`SetState`\\ s (a single value, a mixed
+    list, or ``None``). ``Send``-only returns yield ``([...], [])`` — backward compatible."""
     if result is None:
-        return []
-    return [result] if isinstance(result, Send) else list(result)
+        return [], []
+    items = result if isinstance(result, list) else [result]
+    sends = [it for it in items if isinstance(it, Send)]
+    state_ops = [it for it in items if isinstance(it, SetState)]
+    return sends, state_ops
 
 
 def _payload(raw: str | bytes, content_type: str) -> Message | RawMessage:
@@ -73,11 +96,24 @@ class DeliveryPreview:
 
 
 @dataclass(frozen=True)
+class StateOpPreview:
+    """A state write a Handler would declare (ADR 0005) — captured for the dry-run, applied nowhere.
+
+    ``value`` is the would-be-stored value; it may carry PHI (e.g. an MRN→anon mapping), so the CLI
+    gates it behind ``--show-phi`` exactly like a delivery payload."""
+
+    namespace: str
+    key: str
+    value: Any
+
+
+@dataclass(frozen=True)
 class RouteOutcome:
     """The result of running a Router + its Handlers (without validation/disposition)."""
 
     handlers: list[str]  # handler names the Router selected ([] = routed nowhere)
     deliveries: list[DeliveryPreview]
+    state_ops: list[StateOpPreview] = field(default_factory=list)  # declared writes (ADR 0005)
 
     @property
     def routed(self) -> bool:
@@ -104,25 +140,49 @@ def route_only(registry: Registry, ic: InboundConnection, raw: str | bytes) -> l
 
 def transform_one(
     registry: Registry, hname: str, raw: str | bytes, content_type: str = ContentType.HL7V2.value
-) -> list[DeliveryPreview]:
-    """Run **one** Handler on its own freshly-built payload and return what it would send.
+) -> tuple[list[DeliveryPreview], list[StateOpPreview]]:
+    """Run **one** Handler on its own freshly-built payload; return ``(deliveries, state_ops)``.
 
     The **transform half** of the split routing core (ADR 0001 Step B): a single handler, its own
     payload (a :class:`Message`, or a :class:`RawMessage` when ``content_type`` is non-HL7 — so one
     handler's transforms can't leak into another's), with every ``Send`` target validated against the
     outbound registry. An unknown outbound fails closed **here** (``ValueError``): an undeliverable
-    target would otherwise enqueue an outbound row no worker drains (silent accept-and-strand). The
-    caller guarantees ``hname`` is registered (:func:`route_only` validated it); the live engine's
-    transform worker calls this per routed-stage row.
+    target would otherwise enqueue an outbound row no worker drains (silent accept-and-strand).
+
+    A Handler may also return :class:`~messagefoundry.config.wiring.SetState` ops (ADR 0005); they are
+    split out (``state_ops``) and applied exactly-once by the store inside the transform handoff (the
+    live transform worker passes them to ``transform_handoff(state_ops=...)``). The caller guarantees
+    ``hname`` is registered (:func:`route_only` validated it); the live engine's transform worker calls
+    this per routed-stage row.
     """
     handle: HandlerFn = registry.handlers[hname]
+    sends, ops = _partition(handle(_payload(raw, content_type)))
     deliveries: list[DeliveryPreview] = []
-    for send in _sends(handle(_payload(raw, content_type))):
+    for send in sends:
         if send.to not in registry.outbound:
             raise ValueError(f"handler {hname!r} sent to unknown outbound connection {send.to!r}")
         payload = send.message if isinstance(send.message, str) else send.message.encode()
         deliveries.append(DeliveryPreview(to=send.to, payload=payload))
-    return deliveries
+    state_ops = [StateOpPreview(namespace=op.namespace, key=op.key, value=op.value) for op in ops]
+    return deliveries, state_ops
+
+
+def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
+    """Best-effort preview of reference snapshots for a dry-run (ADR 0006): load each FILE-backed
+    declaration with a literal path. DB-backed or ``env()``-path sets can't be materialized without a
+    store/environment, so they're omitted (a read of one then raises, as a preview error)."""
+    view: dict[str, Mapping[str, Any]] = {}
+    for spec in registry.references.values():
+        if spec.source.kind != "file":
+            continue
+        path = spec.source.settings.get("path")
+        if not isinstance(path, str):  # an env() ref — unresolved in a pure dry-run
+            continue
+        try:
+            view[spec.name] = dict(load_code_set(path))
+        except CodeSetError:
+            continue
+    return view
 
 
 def route_message(registry: Registry, ic: InboundConnection, raw: str | bytes) -> RouteOutcome:
@@ -134,10 +194,36 @@ def route_message(registry: Registry, ic: InboundConnection, raw: str | bytes) -
     dry-run path route identically. Each handler still gets its own :class:`Message` (via
     :func:`transform_one`). Router/Handler exceptions propagate to the caller.
     """
-    names = route_only(registry, ic, raw)
-    ct = ic.content_type.value
-    deliveries = [d for hname in names for d in transform_one(registry, hname, raw, ct)]
-    return RouteOutcome(handlers=names, deliveries=deliveries)
+    # Publish the graph's code sets so a call-time code_set(...) inside a Router/Handler resolves
+    # during a dry-run / Test Bench / `messagefoundry check` preview (the loader only had them active
+    # at import time). The live staged engine activates them in its workers; this mirrors it.
+    #
+    # State (ADR 0005): there is no store/cache in a dry-run, so publish an in-memory view that
+    # *accumulates this run's own declared writes* — so a later handler's state_get(...) sees what an
+    # earlier handler in the same simulated message declared (a self-consistent preview), mirroring how
+    # the live cache would reflect committed writes. It is local to this call (no global side effect).
+    sim_state: dict[tuple[str, str], StateValue] = {}
+    # Reference sets (ADR 0006): there is no store/sync in a dry-run, so build a best-effort preview
+    # view from the graph's FILE-backed declarations (literal paths) so a reference(...) read resolves
+    # during `check`/Test Bench. DB-backed or env()-path sets can't be reached in a pure dry-run and are
+    # simply absent (a read of one then raises, surfaced as that message's preview error).
+    sim_reference = _dry_run_reference_view(registry)
+    deliveries: list[DeliveryPreview] = []
+    state_ops: list[StateOpPreview] = []
+    with (
+        code_sets_activated(registry.code_sets),
+        reference_activated(sim_reference),
+        state_activated(sim_state),
+    ):
+        names = route_only(registry, ic, raw)
+        ct = ic.content_type.value
+        for hname in names:
+            ds, ops = transform_one(registry, hname, raw, ct)
+            deliveries.extend(ds)
+            for op in ops:
+                sim_state[(op.namespace, op.key)] = op.value  # visible to subsequent handlers
+            state_ops.extend(ops)
+    return RouteOutcome(handlers=names, deliveries=deliveries, state_ops=state_ops)
 
 
 def disposition_for(outcome: RouteOutcome) -> MessageStatus:
@@ -166,6 +252,7 @@ class DryRunResult:
     summary: str | None = None
     handlers: list[str] = field(default_factory=list)
     deliveries: list[DeliveryPreview] = field(default_factory=list)
+    state_ops: list[StateOpPreview] = field(default_factory=list)  # declared writes (ADR 0005)
     error: str | None = None
 
 
@@ -204,6 +291,7 @@ def _dry_run_raw(registry: Registry, ic: InboundConnection, raw: str | bytes) ->
         message_type=ic.content_type.value,
         handlers=outcome.handlers,
         deliveries=outcome.deliveries,
+        state_ops=outcome.state_ops,
     )
 
 
@@ -261,6 +349,7 @@ def dry_run(registry: Registry, raw: str | bytes, *, inbound: str | None = None)
         summary=summ,
         handlers=outcome.handlers,
         deliveries=outcome.deliveries,
+        state_ops=outcome.state_ops,
     )
 
 

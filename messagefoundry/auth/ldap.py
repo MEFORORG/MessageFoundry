@@ -239,8 +239,11 @@ class LdapAuthenticator:
 def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     """Complete one SPNEGO server step and return the authenticated sAMAccountName, or ``None``.
 
-    Experimental: the server must have a usable keytab/credential for ``kerberos_spn`` in its
-    environment. The realm suffix (``user@REALM``) is stripped to yield the account name.
+    Experimental — **not a supported v0.1 feature**: off by default (``kerberos_enabled=False``),
+    production hardening (CI coverage, keytab/SPN preflight) targeted for 0.2. Single-leg only: no
+    NTLM fallback, no mutual-auth response token, no multi-leg challenge handshake. The server must
+    have a usable keytab/credential for ``kerberos_spn`` in its environment; the realm suffix
+    (``user@REALM``) is stripped to yield the account name.
     """
     import spnego
 

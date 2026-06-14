@@ -18,6 +18,7 @@ import os
 import re
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 
@@ -133,6 +134,8 @@ class FileDestination(DestinationConnector):
 class FileSource(SourceConnector):
     """Poll a directory for files and feed each to the pipeline handler."""
 
+    polls_shared_resource = True  # a directory is a shared external resource — leader-gate it
+
     def __init__(self, config: Source) -> None:
         s = config.settings
         if "directory" not in s:
@@ -153,13 +156,21 @@ class FileSource(SourceConnector):
         self.processed_dir = self.directory / s.get("processed_subdir", ".processed")
         self.error_dir = self.directory / s.get("error_subdir", ".error")
         self._handler: InboundHandler | None = None
+        # Leader-gate (Track B Step 4b): when set, this directory (a shared external resource) is
+        # polled only while the gate returns True, so in a cluster exactly one node ingests its
+        # files. None = always poll (single-node / direct callers / tests) — byte-identical.
+        self._leader_gate: Callable[[], bool] | None = None
+        self._skipping = False  # whether the last tick was gated out (for a single transition log)
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
-    async def start(self, handler: InboundHandler) -> None:
+    async def start(
+        self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
+    ) -> None:
         """Begin polling in the background. Returns once the source is set up so the
         caller can rely on it being live (consistent with the TCP sources)."""
         self._handler = handler
+        self._leader_gate = leader_gate
         self._stop.clear()
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         self.error_dir.mkdir(parents=True, exist_ok=True)
@@ -168,7 +179,8 @@ class FileSource(SourceConnector):
     async def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                await self._scan_once()
+                if self._may_poll():
+                    await self._scan_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -183,6 +195,26 @@ class FileSource(SourceConnector):
                 await asyncio.wait_for(self._stop.wait(), self.poll_seconds)
             except asyncio.TimeoutError:
                 pass  # poll interval elapsed; scan again
+
+    def _may_poll(self) -> bool:
+        """Whether this tick may scan the directory. False on a follower (leader-gated, Step 4b):
+        a non-leader must NOT read or move/delete files, since the directory is shared and two
+        nodes ingesting it would duplicate intake. The loop still ticks, so a node that becomes
+        leader scans on its next tick (reactive-by-polling, no restart). When the gate is None or
+        True, behaves exactly as before. Logged once on each transition (never per skipped tick —
+        that would spam a follower's log every poll interval)."""
+        if self._leader_gate is None or self._leader_gate():
+            if self._skipping:
+                self._skipping = False
+                logger.debug("file source resuming polling of %s (now leader)", self.directory)
+            return True
+        if not self._skipping:
+            self._skipping = True
+            logger.debug(
+                "file source skipping polling of %s (not leader; another node ingests it)",
+                self.directory,
+            )
+        return False
 
     async def stop(self) -> None:
         self._stop.set()

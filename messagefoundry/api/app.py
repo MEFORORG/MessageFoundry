@@ -36,6 +36,9 @@ from messagefoundry import __version__
 from messagefoundry.api.models import (
     AiPolicy,
     ChannelInfo,
+    ClusterNode,
+    ClusterNodeList,
+    ClusterStatus,
     ConnectionRow,
     DbInfo,
     DeadLetterList,
@@ -80,13 +83,16 @@ from messagefoundry.config.settings import (
     AiSettings,
     AlertsSettings,
     AuthSettings,
+    ClusterSettings,
     EgressSettings,
+    ReferenceSettings,
     RetentionSettings,
     StoreSettings,
 )
 from messagefoundry.config.wiring import EnvRef, WiringError, load_config
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
 from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+from messagefoundry.pipeline.cluster import build_coordinator
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import Store
@@ -645,7 +651,12 @@ def create_app(
         Error responses are intentionally generic (the detail is logged server-side, not returned)
         so a config:deploy holder can't probe the filesystem via reload error text."""
         try:
-            registry = await engine.reload(req.config_dir, dry_run=req.dry_run)
+            # propagate=True on the real apply so an operator reload on one node bumps the cluster-wide
+            # config version and every other node converges (Track B Step 6); a dry_run never propagates
+            # (it doesn't apply anything) and single-node ignores it (is_clustered() False).
+            registry = await engine.reload(
+                req.config_dir, dry_run=req.dry_run, propagate=not req.dry_run
+            )
         except ConfigReloadDenied as exc:
             await engine.store.record_audit(
                 "config_reload_denied",
@@ -865,6 +876,48 @@ def create_app(
             ),
         )
 
+    # --- cluster observability (Track B Step 7) ------------------------------
+
+    @app.get("/cluster/status", response_model=ClusterStatus)
+    async def cluster_status(
+        engine: Engine = Depends(_get_engine),
+        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+    ) -> ClusterStatus:
+        """This node's cluster posture: id, whether it's clustered, whether it's the leader, and the
+        cached config version. All cheap in-memory coordinator gates — no DB round-trip. Single-node
+        (NullCoordinator) reports clustered=false, is_leader=true, config_version=0."""
+        c = engine.coordinator
+        return ClusterStatus(
+            node_id=c.node_id,
+            clustered=c.is_clustered(),
+            is_leader=c.is_leader(),
+            config_version=c.config_version_cached(),
+        )
+
+    @app.get("/cluster/nodes", response_model=ClusterNodeList)
+    async def cluster_nodes(
+        engine: Engine = Depends(_get_engine),
+        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+    ) -> ClusterNodeList:
+        """Cluster membership: one row per known node with liveness + derived leadership, plus the single
+        leader's node_id. One DB read on a real cluster (the shared ``nodes`` table); single-node
+        synthesizes one self-entry with no DB."""
+        members = await engine.coordinator.cluster_members()
+        nodes = [
+            ClusterNode(
+                node_id=m.node_id,
+                host=m.host,
+                pid=m.pid,
+                status=m.status,
+                started_at=m.started_at,
+                last_seen=m.last_seen,
+                is_leader=m.is_leader,
+            )
+            for m in members
+        ]
+        leader = next((n.node_id for n in nodes if n.is_leader), None)
+        return ClusterNodeList(nodes=nodes, leader_node_id=leader)
+
     @app.post("/status/integrity-check", response_model=IntegrityResult)
     async def integrity_check(
         engine: Engine = Depends(_get_engine),
@@ -978,7 +1031,9 @@ def create_managed_app(
     ai_settings: AiSettings | None = None,
     alerts_settings: AlertsSettings | None = None,
     retention_settings: RetentionSettings | None = None,
+    reference_settings: ReferenceSettings | None = None,
     egress_settings: EgressSettings | None = None,
+    cluster_settings: ClusterSettings | None = None,
     expose_docs: bool = False,
     ws_allowed_origins: Sequence[str] = (),
 ) -> FastAPI:
@@ -1005,6 +1060,11 @@ def create_managed_app(
         notifier = notifier_from_settings(alerts_settings) if alerts_settings is not None else None
         if notifier is not None:
             notifier.start()
+        # Cluster coordinator (Track B Step 3) — built from the opened store so a Postgres-backed
+        # store can reach its pool. Returns the no-op NullCoordinator unless [cluster].enabled on a
+        # Postgres store, so single-node is byte-identical. The Engine owns its lifecycle (start/stop
+        # in engine.start()/stop()), so the lifespan only constructs + passes it here.
+        coordinator = build_coordinator(store, cluster_settings)
         engine = Engine(
             store,
             poll_interval=poll_interval,
@@ -1018,9 +1078,13 @@ def create_managed_app(
             ack_after_default=ack_after_default,
             alert_sink=notifier,
             retention_settings=retention_settings,
+            reference_settings=reference_settings,
             egress_settings=egress_settings,
+            active_environment=ai_settings.environment.value if ai_settings else None,
             env_values=env_values,
             env_values_provider=env_values_provider,
+            coordinator=coordinator,
+            cluster_settings=cluster_settings,
         )
         if config_dir is not None:
             engine.add_registry(load_config(config_dir))

@@ -1,0 +1,4 @@
+# A flat TOML code set: sending-facility code (MSH-4) -> the downstream mnemonic to stamp.
+# Edit + reload (POST /config/reload) to update the mapping without a code change.
+ACME = "ACMEHOSP"
+ZGEN = "GENERAL"

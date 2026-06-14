@@ -21,7 +21,7 @@ the callers caring.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -169,13 +169,67 @@ class QueueStore(StoreLifecycle, Protocol):
         message_id: str,
         channel_id: str,
         deliveries: Sequence[tuple[str, str]],
+        state_ops: Sequence[tuple[str, str, Any]] = (),
         now: float | None = None,
     ) -> bool:
         """Advance one handler assignment from the **routed** stage to outbound in one transaction (the
         transform half of the split pipeline, ADR 0001 Step B): consume the in-flight routed row,
-        insert one outbound row per delivery, and let the finalizer recompute the terminal disposition
-        (this method never writes ``messages.status`` directly). Idempotent against worker restart —
+        insert one outbound row per delivery, **apply each declared state write** (``state_ops``:
+        ``(namespace, key, value)`` upserts, ADR 0005), and let the finalizer recompute the terminal
+        disposition (this method never writes ``messages.status`` directly). The state writes commit
+        atomically with the outbound rows, so a crash before commit leaves no state and a re-run applies
+        them exactly-once (preserving the pure-re-run invariant). Idempotent against worker restart —
         ``False`` if the routed row was already consumed."""
+        ...
+
+    def state_view(self) -> Mapping[tuple[str, str], Any]:
+        """A read-only view of the engine-maintained transform-state read-through cache (ADR 0005):
+        ``{(namespace, key): decoded_value}``. The runner publishes it around each router/transform run
+        so a Handler's synchronous ``state_get(...)`` resolves. Reflects writes as they commit."""
+        ...
+
+    # --- reference sets (ADR 0006 Tier 1) ------------------------------------
+    def reference_view(self) -> Mapping[str, Mapping[str, Any]]:
+        """A read-only view of the active reference snapshots (ADR 0006): ``{name: {key: value}}``. The
+        runner publishes it around each router/transform run so ``reference("name").get(key)`` resolves.
+        Swaps in a new snapshot only after a sync commits."""
+        ...
+
+    async def write_reference_snapshot(
+        self, *, name: str, version: str, rows: Mapping[str, Any]
+    ) -> None:
+        """Materialize a new reference snapshot for ``name`` and atomically make it active (ADR 0006):
+        one transaction replaces the set's rows and flips the active version; the read cache swaps only
+        after commit, so a failed sync leaves the last-good snapshot live."""
+        ...
+
+    async def converge_reference_cache(self) -> list[str]:
+        """Refresh this node's in-process reference read cache from the shared store (Track B Step 6).
+
+        The follower read-through: re-loads any set whose authoritative active version (in the shared
+        store) is newer than the version currently reflected in this handle's cache, **without**
+        re-reading the external source. Returns the names of the sets actually refreshed (``[]`` when
+        nothing changed). Multi-node Postgres implements it for real; single-node backends (SQLite,
+        SQL Server) return ``[]`` (a single node is the sole writer, so its cache is always current)."""
+        ...
+
+    async def converge_state_cache(self) -> list[str]:
+        """Refresh this node's in-process transform-STATE read cache from the shared store (Track B
+        Step 6b).
+
+        The follower read-through for ADR 0005 state: re-reads any namespace whose per-namespace version
+        (in the shared store) is newer than the version currently reflected in this handle's cache, so a
+        sibling node's state write reaches every node. Returns the namespace names actually refreshed
+        (``[]`` when nothing changed). Multi-node Postgres implements it for real; single-node backends
+        (SQLite, SQL Server) return ``[]`` (a single node is the sole writer, so its cache is always
+        current)."""
+        ...
+
+    def enable_state_convergence(self) -> None:
+        """Turn on per-namespace state-version bumping for cross-node convergence (Track B Step 6b). The
+        engine calls this only in a cluster (``coordinator.is_clustered()``) BEFORE workers start, so a
+        sibling's :meth:`converge_state_cache` sees every write. Single-node never calls it → no version
+        writes → byte-identical. A no-op on backends without cross-node convergence (SQLite, SQL Server)."""
         ...
 
     # --- delivery worker path ------------------------------------------------
@@ -190,11 +244,21 @@ class QueueStore(StoreLifecycle, Protocol):
     ) -> list[OutboxItem]: ...
 
     async def claim_next_fifo(
-        self, name: str, now: float | None = None, *, stage: str = Stage.OUTBOUND.value
+        self,
+        name: str,
+        now: float | None = None,
+        *,
+        stage: str = Stage.OUTBOUND.value,
+        owner: str | None = None,
     ) -> OutboxItem | None:
         """Claim the single oldest *due* pending row for one lane at ``stage`` (strict FIFO; the head
         blocks the lane while it backs off). The lane key is stage-aware: ``destination_name`` for
-        outbound, ``channel_id`` for ingress. ``None`` when nothing is pending or the head isn't due."""
+        outbound, ``channel_id`` for ingress. ``None`` when nothing is pending or the head isn't due.
+
+        ``owner`` is this node's cluster identity (Track B Step 5 lane ownership): ``None`` single-node
+        (the byte-identical path; SQLite/SQL Server always ignore it), or the coordinator's node_id
+        when clustered, gating the claim by an atomic per-lane lease so a FIFO lane is processed by
+        exactly one node at a time and strict per-lane FIFO holds across nodes."""
         ...
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None: ...
@@ -318,6 +382,11 @@ class QueueStore(StoreLifecycle, Protocol):
     async def purge_message_bodies(self, *, older_than: float, now: float | None = None) -> int: ...
 
     async def purge_dead_letters(self, *, older_than: float, now: float | None = None) -> int: ...
+
+    async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
+        """Delete transform-state entries (ADR 0005) last written before ``older_than`` (age-based
+        retention). Returns the number purged. Off unless ``[retention].state_max_age_days`` is set."""
+        ...
 
     async def wal_checkpoint(self) -> None: ...
 
@@ -529,8 +598,9 @@ def resolve_active_key(settings: StoreSettings) -> str | None:
 async def open_store(settings: StoreSettings) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
 
-    ``sqlite`` is the default; ``sqlserver`` is **experimental** and lazy-imported (needs the
-    ``sqlserver`` extra). Unknown backends raise ``NotImplementedError``.
+    ``sqlite`` is the default; ``postgres`` is a production server-DB backend with single-node parity
+    (lazy-imported, needs the ``postgres`` extra); ``sqlserver`` is **experimental** and lazy-imported
+    (needs the ``sqlserver`` extra). Unknown backends raise ``NotImplementedError``.
     """
     # AES-256-GCM keyring at rest when a key is set (STORE-1): active key (env or DPAPI key file) +
     # any retired decrypt-only keys for an in-progress rotation (WP-5). No key → identity cipher.
@@ -544,6 +614,10 @@ async def open_store(settings: StoreSettings) -> Store:
         from messagefoundry.store.sqlserver import SqlServerStore  # lazy: optional aioodbc dep
 
         return await SqlServerStore.open(settings, cipher=cipher)
+    if settings.backend is StoreBackend.POSTGRES:
+        from messagefoundry.store.postgres import PostgresStore  # lazy: optional asyncpg dep
+
+        return await PostgresStore.open(settings, cipher=cipher)
     raise NotImplementedError(f"store backend {settings.backend.value!r} is not implemented yet")
 
 

@@ -28,8 +28,8 @@ Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sa
 | `OBC` | outbound | MLLP sender (persistent link) | — | ✅ * |
 | `FILE-IN` | inbound | folder poll | File Reader | ✅ |
 | `FILE-OUT` | outbound | folder write | File Writer | ✅ |
-| `TCP-IN` | inbound | raw TCP listener (non-MLLP framing) | TCP Listener | ⏳ planned |
-| `TCP-OUT` | outbound | raw TCP sender (non-MLLP framing) | TCP Sender | ⏳ planned |
+| `TCP-IN` | inbound | raw TCP listener (configurable framing) | TCP Listener | ✅ |
+| `TCP-OUT` | outbound | raw TCP sender (configurable framing) | TCP Sender | ✅ |
 | `SFTP-IN` | inbound | SFTP poll | File Reader (SFTP scheme) | ⏳ planned |
 | `SFTP-OUT` | outbound | SFTP write | File Writer (SFTP scheme) | ⏳ planned |
 | `SOAP-IN` | inbound | SOAP endpoint | Web Service Listener | ⏳ planned † |
@@ -79,6 +79,58 @@ def handle(msg):
 > Connection names are plain strings, so hyphens and mixed case (e.g. `FILE-OUT_Test_ADT`) are fine.
 > Router/Handler **names** are not connections and don't follow the formula.
 
+### Connections as data — `connections.toml` (ADR 0007)
+
+A connection's **transport config** (type + settings + the inbound's `router` binding + delivery
+knobs) may instead live as **data** in an optional `connections.toml` next to the `*.py` modules — so
+it can be edited by hand *and* from the VS Code connection editor. **Routing/transform *logic* stays
+code-first** (`@router`/`@handler` in `.py`). The loader merges TOML connections into the **same**
+registry the factories produce, so the runtime, validation, and egress gating are identical:
+
+```toml
+# connections.toml — transport config as data; logic stays in .py.
+# Secrets/peers use an env() reference ({ env = "key" }), never inline.
+[[inbound]]
+name      = "IB_ACME_ADT"
+transport = "mllp"
+router    = "acme_adt_router"   # binds a router declared in a .py module
+  [inbound.settings]
+  port = 2576
+
+[[outbound]]
+name      = "OB_EPIC_ADT"
+transport = "mllp"
+  [outbound.settings]
+  host = { env = "epic_host" }            # resolved per environment (environments/<env>.toml)
+  port = { env = "epic_port", cast = "int" }
+```
+
+- The `transport` maps to the same factory (`MLLP`/`Tcp`/`File`/`Rest`/`Database`/`DatabasePoll`/
+  `Soap`/`Sftp`/`Ftp`) — **the factory is the schema**; an unknown transport/key/router fails loud at
+  load (`messagefoundry check`), exactly like a bad `inbound()` call. A name declared in **both** a
+  `.py` module and `connections.toml` is a hard error (no silent shadowing).
+- **Edit it two ways, same file:** by hand, or via `messagefoundry connection list|upsert|remove`
+  (comment/format-preserving, validate-before-persist with rollback) — which is what the **VS Code
+  connection editor** shells (the gear on a data-authored connection opens the form; a code-authored
+  one opens its `.py`). `env()` secrets are never written inline.
+
+### Decomposing by role (connections / routers / transformers)
+
+Because names resolve **globally** across the config dir, the three concerns can live in separate
+flat files (`load_config` globs `*.py` non-recursively, so use prefixed flat files, not subdirs):
+
+```
+connections.toml        all connections (data)
+routers_<area>.py       @router functions (Corepoint "E Process") — each lists its handler(s)
+handlers_<partner>.py   @handler functions (Corepoint "E Child") — a shared handler defined once,
+                        named by multiple routers
+```
+
+A **router fans out** by returning multiple handler names (`return ["to_a", "to_b"]`); a **single
+handler fans out** by returning multiple `Send`s (`return [Send("OB_A", msg), Send("OB_B", msg)]`).
+Namespace router/handler names uniquely (e.g. by site/partner) — `messagefoundry check` flags a
+collision.
+
 > **Transforms & HL7 escaping.** Writing a **component/subcomponent** (`msg["PID-5.1"] = value`)
 > stores `value` as a literal: HL7 delimiters in it (`^ ~ & |`) are **escaped** so they stay data
 > (`"O^Brien"` remains one component, not two). To build *multiple* components, write the whole
@@ -119,6 +171,54 @@ Plus on `inbound(...)`: `ack_mode` (`original`/`enhanced`/`none`), `strict`, `hl
 > **Message size caps:** beyond the MLLP frame cap, every inbound message is also rejected
 > before parsing if it exceeds **16 MiB** or **10,000 segments** (`ERROR` disposition + AR NAK),
 > bounding both the tolerant peek and the strict (hl7apy) validation paths.
+
+### Raw TCP — `Tcp(...)`
+
+A raw-TCP transport (source **and** destination) with **configurable delimiter framing**, built to
+relay **X12 (and other non-HL7) feeds over custom-framed TCP** — the payload is carried **opaquely**
+(no structured parse). It is the generalization of MLLP's framing: MLLP is the `vt_fs`/`mllp` preset
+of the same codec. Pair an inbound `Tcp(...)` with `content_type="x12"` so the body routes as a
+`RawMessage` ([ADR 0004](adr/0004-payload-agnostic-ingress.md)); the connector itself never inspects
+the bytes.
+
+| Setting | Dir | Default | Meaning |
+|---------|-----|---------|---------|
+| `host` | out | — (required) | the downstream peer to dial. **Inbound takes no host** (wiring error) — listeners bind the service-level `[inbound].bind_host`. |
+| `port` | both | — (required) | bind/connect port |
+| `framing` | both | `"stx_etx"` | framing **preset**: `"stx_etx"` (`0x02`/`0x03`, no trailer) or `"vt_fs"`/`"mllp"` (`0x0B`/`0x1C`/`0x0D`). Pass `framing=None` to use explicit bytes instead. |
+| `start` / `end` / `trailer` | both | — | explicit delimiter **byte ints** (use with `framing=None`; `trailer` optional). Specifying these *and* a preset is a config error. |
+| `encoding` | both | `utf-8` | charset used to encode/decode the framed payload |
+| `max_connections` | in | `256` | cap on concurrent client connections (flood guard). `None`/`0` = unlimited. |
+| `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris). `None`/`0` = no timeout. |
+| `max_frame_bytes` | both | `16 MiB` | reject a single frame larger than this before buffering it whole (OOM guard); applies to inbound frames and any framed reply. `None`/`0` = unlimited. |
+| `connect_timeout` | out | `10.0` | TCP connect timeout (s) |
+| `timeout_seconds` | out | `30.0` | send / await-reply timeout (s) |
+| `expect_reply` | out | `false` | read one framed reply and treat receiving it as confirmation (the reply is **not** parsed). `false` = fire-and-forget after the write. |
+
+```python
+from messagefoundry import Tcp, inbound, outbound
+
+# Receive an X12 feed framed with STX/ETX; route it opaquely as a RawMessage.
+inbound("TCP-IN_PARTNER_X12", Tcp(port=9100, framing="stx_etx"), router="x12_router",
+        content_type="x12")
+# Relay it back out over VT/FS framing to a downstream peer.
+outbound("TCP-OUT_DOWNSTREAM_X12", Tcp(host="downstream", port=9200, framing="vt_fs"))
+```
+
+- **No HL7 ACK.** A `Tcp(...)` source does **not** generate an HL7 acknowledgement. If a Handler
+  returns a payload it is framed back to the sender on the same connection (so a framed
+  application-level reply is possible); returning `None` sends nothing.
+- **Opaque relay.** Bytes in = bytes out (delimiters stripped/added) — no transformation,
+  validation, or content sniffing in the connector.
+- **At-least-once / duplicates.** An outbound send (and its framed reply, when expected) may be
+  retried, so the receiver may see a duplicate — **the receiver must be idempotent.**
+- **Egress allowlist.** A `Tcp(...)` destination is gated by `[egress].allowed_tcp` (host or
+  host:port); an inbound `Tcp(...)` is a local listener and is not connect-gated. See
+  [docs/CONFIGURATION.md](CONFIGURATION.md).
+- **Deferred follow-ups:** structured X12 parsing (ISA/GS/ST) and X12 acknowledgements (997/TA1)
+  are intentionally **not** built — this round is framing + opaque relay only. **Length-prefix
+  framing** (a leading byte count instead of an end delimiter) is also a follow-up; only
+  delimiter framing is supported today.
 
 ### File — `File(...)`
 
@@ -377,7 +477,7 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | Method | Mirth | Corepoint | Rhapsody | MF today | MF code / status |
 |--------|:-----:|:---------:|:--------:|:--------:|------------------|
 | **MLLP / LLP** (HL7 lower‑layer over TCP) | ✅ | ✅ | ✅ | ✅ | `IB`/`OB` shipped |
-| **Raw TCP** client/server (non‑MLLP framing) | ✅ | ✅ | ✅ | ❌ | `TCP-IN/OUT` planned |
+| **Raw TCP** client/server (configurable framing) | ✅ | ✅ | ✅ | ✅ | `TCP-IN/OUT` shipped |
 | **File / Directory** (local) | ✅ | ✅ | ✅ | ✅ | `FILE-IN/OUT` shipped |
 | **FTP / FTPS** | ✅ | ✅ | ✅ | ❌ | File remote scheme, planned |
 | **SFTP** | ✅ | ✅ | ✅ | ❌ | `SFTP-IN/OUT` planned |

@@ -22,12 +22,14 @@ class ConnectorType(str, Enum):
     """Built-in transport connectors. Plugins may register additional values."""
 
     MLLP = "mllp"
+    TCP = "tcp"  # raw TCP with configurable delimiter framing (X12 over TCP, ADR 0003)
     FILE = "file"
     REST = "rest"  # generic HTTP destination (ADR 0003)
     DATABASE = "database"  # SQL destination — SQL Server first (ADR 0003)
     SOAP = "soap"  # SOAP / web-service destination over HTTP (ADR 0003)
-    # DATABASE also has an inbound poll source (DatabasePoll, ADR 0003 §3 + 0004). REST/SOAP sources
-    # (HTTP listeners) and TCP/FHIR are future.
+    REMOTEFILE = "remotefile"  # remote-file transport — SFTP / FTP / FTPS (source + destination)
+    # DATABASE also has an inbound poll source (DatabasePoll, ADR 0003 §3 + 0004); REMOTEFILE is both
+    # source and destination. REST/SOAP sources (HTTP listeners) and TCP/FHIR are future.
 
 
 class ContentType(str, Enum):
@@ -43,6 +45,7 @@ class ContentType(str, Enum):
     JSON = "json"
     XML = "xml"
     TEXT = "text"
+    X12 = "x12"  # ASC X12 EDI, relayed opaquely (no structured parse) — routes as RawMessage
 
 
 class AckMode(str, Enum):

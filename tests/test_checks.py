@@ -12,6 +12,7 @@ from messagefoundry.__main__ import main
 from messagefoundry.checks import run_checks
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
+RESULTS_RELAY = Path(__file__).resolve().parents[1] / "samples" / "results_relay"
 ADT_A01 = (
     "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
     "EVN|A01|20260101\r"
@@ -138,6 +139,38 @@ def test_run_checks_no_lint_excludes_tools() -> None:
     names = {r.name for r in report.results}
     assert "ruff" not in names and "mypy" not in names
     assert "validate" in names and "dryrun" in names
+
+
+def test_results_relay_template_passes_check() -> None:
+    # The committed Wave-1 porting template must stay validate + dryrun green on every CI run.
+    report = run_checks(RESULTS_RELAY, messages_dir=RESULTS_RELAY / "messages", run_lint=False)
+    assert report.ok is True
+    by_name = {r.name: r for r in report.results}
+    assert by_name["validate"].ok and by_name["validate"].required
+    dr = by_name["dryrun"]
+    assert dr.required and dr.ok and not dr.skipped
+
+
+def test_results_relay_template_transform_output() -> None:
+    # Gate the authoring pattern itself (not just "it loads"): the transform must drop the cancelled
+    # result, remap test codes, renumber OBX, fan out to both destinations, and collapse PID-3.
+    from messagefoundry.config.wiring import load_config
+    from messagefoundry.pipeline.dryrun import dry_run
+
+    registry = load_config(RESULTS_RELAY)
+    raw = (RESULTS_RELAY / "messages" / "oru_results.hl7").read_text(encoding="utf-8")
+    result = dry_run(registry, raw)
+
+    assert [d.to for d in result.deliveries] == ["OB_EHR_ORU", "FILE-OUT_LABCO_ORU"]
+    out = result.deliveries[0].payload
+    assert out.count("OBX|") == 3  # cancelled Potassium dropped; 3 results renumbered
+    assert "GLUC^Glucose" in out and "SOD^Sodium" in out and "CHLOR^Chloride" in out
+    assert "Potassium" not in out  # the OBX-11=X result is gone
+    assert "MRN001^^^HOSP^MR" in out and "ACC555" not in out  # PID-3 collapsed to the MR id
+
+    # the all-cancelled message relays nothing (FILTERED)
+    cancelled = (RESULTS_RELAY / "messages" / "oru_all_cancelled.hl7").read_text(encoding="utf-8")
+    assert dry_run(registry, cancelled).deliveries == []
 
 
 def test_check_json_shape(capsys: pytest.CaptureFixture[str]) -> None:
