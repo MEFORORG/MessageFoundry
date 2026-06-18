@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """REMOTEFILE transport connector (SFTP / FTP / FTPS): upload, poll, error mapping, security, egress.
 
 The remote client is faked (``_make_client`` is monkeypatched, or the ``_SftpClient`` host-key policy
@@ -594,3 +596,58 @@ def test_requires_core_settings(missing: str) -> None:
         build_destination(
             Destination(name="OB", type=ConnectorType.REMOTEFILE, settings=Sftp(**base).settings)
         )
+
+
+# === test_connection() reachability probe ====================================
+
+
+async def test_dest_probe_ensures_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient()
+    dest = _dest(monkeypatch, client)
+    await dest.test_connection()  # connect + ensure the upload dir; no file written
+    assert "/in" in client.dirs
+    assert not client.files
+
+
+async def test_dest_probe_permanent_error_is_negative_ack(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient()
+
+    def _boom(remote_dir: str) -> None:
+        raise _RemoteError("auth failed", permanent=True)
+
+    client.ensure_dir = _boom  # type: ignore[method-assign]
+    dest = _dest(monkeypatch, client)
+    with pytest.raises(NegativeAckError):
+        await dest.test_connection()
+
+
+async def test_src_probe_lists_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient(files={"/in/a.hl7": b"AAA"})
+    src = _src(monkeypatch, client)
+    await src.test_connection()  # read-only list of the poll dir; nothing moved/removed
+    assert not client.ops
+
+
+async def test_src_probe_transient_error_is_delivery_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient()
+
+    def _boom(remote_dir: str) -> list[tuple[str, int]]:
+        raise _RemoteError("connection reset", permanent=False)
+
+    client.list_dir = _boom  # type: ignore[method-assign]
+    src = _src(monkeypatch, client)
+    with pytest.raises(DeliveryError) as ei:
+        await src.test_connection()
+    assert not isinstance(ei.value, NegativeAckError)
+
+
+def test_sftp_ftp_exported_from_top_level_package() -> None:
+    # Sftp/Ftp must be on the public `messagefoundry` surface like the other connectors
+    # (Tcp/Soap/Rest/File/Database*), so feeds import them the same way — not from
+    # messagefoundry.config.wiring. (Surfaced by the 540300 SFTP migration rework.)
+    import messagefoundry
+    from messagefoundry import Ftp as PublicFtp
+    from messagefoundry import Sftp as PublicSftp
+
+    assert PublicSftp is Sftp and PublicFtp is Ftp
+    assert "Sftp" in messagefoundry.__all__ and "Ftp" in messagefoundry.__all__

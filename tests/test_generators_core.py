@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The shared generator registry/core (``messagefoundry/generators/_core.py``)."""
 
 from __future__ import annotations

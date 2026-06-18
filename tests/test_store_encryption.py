@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Phase-8 STORE-1: PHI-at-rest encryption — the cipher + the store seam + migration."""
 
 from __future__ import annotations
@@ -183,7 +185,12 @@ async def test_migration_encrypts_existing_rows(tmp_path: Path) -> None:
 
 # --- WP-5: cipher coverage of error / last_error / detail --------------------
 
-PHI_ERR = "parse failed at PID|1||999^^^H^MR||SECRET^PATIENT"
+# A NON-HL7-shaped secret: HL7-delimited content is now scrubbed at the write chokepoint (#120) before
+# it ever reaches these columns, so the at-rest cipher's remaining job is to protect the *residual*
+# free-text PHI a script can invent (a bare name/identifier with no HL7 delimiters, which the scrub
+# deliberately can't detect). This value passes through safe_text unchanged, so it exercises encryption
+# round-trip identity — the scrub's own behavior is covered in test_store/test_redaction.
+PHI_ERR = "parse failed for patient SECRETNAME mrn 999 not found"
 
 
 async def test_error_and_event_detail_encrypted_at_rest_and_decrypt(tmp_path: Path) -> None:

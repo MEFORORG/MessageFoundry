@@ -1,8 +1,10 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """DATABASE destination connector (ADR 0003): param binding, error classification, DSN/TLS, egress.
 
 The aioodbc/pyodbc driver is never imported — the pool is faked, and error classification is duck-typed
-on the SQLSTATE, so the full logic is unit-tested without a real SQL Server (the live round-trip is
-CI-service-container-gated, like the SQL Server store backend).
+on the SQLSTATE, so the full logic is unit-tested without a real SQL Server. The live aioodbc round-trip
+is exercised separately by the gated integration suite (test_database_connector_integration.py).
 """
 
 from __future__ import annotations
@@ -96,7 +98,11 @@ def test_build_dsn_secure_defaults() -> None:
     dsn = _build_dsn(
         {"server": "sql.example.com", "database": "MFDB", "username": "u", "password": "p"}
     )
-    assert "SERVER={sql.example.com},1433" in dsn
+    # SERVER is emitted UNBRACED (validated, not brace-quoted) so the driver parses the ",port" suffix
+    # and the TLS handshake resolves the host — a brace-quoted "SERVER={host},port" is malformed ODBC
+    # and breaks certificate handling against a real SQL Server (mirrors the store's connection_string).
+    assert "SERVER=sql.example.com,1433" in dsn
+    assert "SERVER={" not in dsn  # never brace the host
     assert "DATABASE={MFDB}" in dsn
     assert "UID={u}" in dsn and "PWD={p}" in dsn
     assert dsn.rstrip(";").endswith("Encrypt=yes;TrustServerCertificate=no")  # security flags last
@@ -105,6 +111,14 @@ def test_build_dsn_secure_defaults() -> None:
 def test_build_dsn_braces_neutralize_injection() -> None:
     dsn = _build_dsn({"server": "s", "database": "MFDB", "password": "p};DROP", "username": "u"})
     assert "PWD={p}};DROP}" in dsn  # the inner } is doubled, so it can't close the brace early
+
+
+@pytest.mark.parametrize("bad", ["host;DROP", "host}xx", "host{xx", "a=b", "host\nx"])
+def test_build_dsn_rejects_server_injection(bad: str) -> None:
+    # The SERVER value is unbraced, so it is *validated* (not brace-quoted) to carry no ODBC
+    # connection-string metacharacters — an attacker-influenced host can't inject extra keywords.
+    with pytest.raises(ValueError, match="server must not contain"):
+        _build_dsn({"server": bad, "database": "d", "username": "u", "password": "p"})
 
 
 def test_build_dsn_weak_tls_refused_without_escape(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -141,7 +155,7 @@ class _FakeCursor:
         self.executed: list[tuple[str, tuple[Any, ...]]] = []
         self._exc = exc
 
-    async def execute(self, sql: str, params: tuple[Any, ...]) -> None:
+    async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         self.executed.append((sql, params))
         if self._exc is not None:
             raise self._exc
@@ -212,6 +226,62 @@ async def test_send_non_db_error_propagates() -> None:
     with pytest.raises(ValueError):
         await dest.send('{"mrn": "1", "val": "x"}')
     assert conn.rolledback
+
+
+class _HangingPool:
+    """A pool whose acquire never returns — stands in for an exhausted pool / unresponsive DB."""
+
+    async def acquire(self) -> object:
+        await asyncio.Event().wait()
+
+
+async def test_send_pool_acquire_timeout_is_transient() -> None:
+    # WP-L3-07 (ASVS 13.1.2/13.2.6): a borrow that can't be satisfied within acquire_timeout fails as a
+    # transient DeliveryError (retry) instead of blocking the delivery worker forever.
+    dest = _dest(acquire_timeout=0.05)
+    dest._pool = _HangingPool()
+    with pytest.raises(DeliveryError, match="pool acquire timed out"):
+        await dest.send('{"mrn": "1", "val": "x"}')
+
+
+async def test_lookup_pool_acquire_timeout_is_db_lookup_error() -> None:
+    # The handler-callable lookup maps the same timeout onto its PHI-free DbLookupError type.
+    from messagefoundry.transports.database import DatabaseLookupExecutor, DbLookupError
+
+    ex = DatabaseLookupExecutor(
+        {"clarity": {"server": "s", "database": "d", "acquire_timeout": 0.05}}
+    )
+    ex._pools["clarity"] = _HangingPool()
+    with pytest.raises(DbLookupError, match="pool acquire timed out"):
+        await ex.query("clarity", "SELECT 1", None)
+
+
+# --- test_connection() reachability probe (SELECT 1) -------------------------
+
+
+async def test_probe_runs_select_1() -> None:
+    cur = _FakeCursor()
+    pool = _FakePool(_FakeConn(cur))
+    dest = _dest()
+    dest._pool = pool
+    await dest.test_connection()  # no raise = reachable
+    assert ("SELECT 1", ()) in cur.executed  # a no-param read, never a write
+    assert pool.released  # the connection was returned to the pool
+
+
+async def test_probe_transient_error_is_delivery_error() -> None:
+    dest = _dest()
+    dest._pool = _FakePool(_FakeConn(_FakeCursor(Exception("08S01", "connection lost"))))
+    with pytest.raises(DeliveryError) as ei:
+        await dest.test_connection()
+    assert not isinstance(ei.value, NegativeAckError)  # transient → reachability fail
+
+
+async def test_probe_auth_error_is_permanent() -> None:
+    dest = _dest()
+    dest._pool = _FakePool(_FakeConn(_FakeCursor(Exception("28000", "login failed"))))
+    with pytest.raises(NegativeAckError):  # bad credentials → permanent (still a test failure)
+        await dest.test_connection()
 
 
 async def test_send_bad_payload_is_permanent_before_any_connection() -> None:

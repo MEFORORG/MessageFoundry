@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Write ``connections.toml`` — the comment/format-preserving editor behind the ``connection`` CLI
 (ADR 0007).
 
@@ -36,6 +38,7 @@ _SCALAR_FIELDS = (
     "hl7_version",
     "ordering",
     "internal_error",
+    "simulate",
 )
 _SUB_TABLES = ("settings", "retry", "buildup")
 

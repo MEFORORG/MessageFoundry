@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Load profiles — a run shape authored as **data** (TOML), parsed into frozen dataclasses.
 
 A profile names the targets to drive, the message-type mix, a sequence of phases (warmup → ramp →
@@ -40,6 +42,7 @@ _LOAD_KEYS = frozenset(
         "mix",
         "slo",
         "phase",
+        "failover",
     }
 )
 _TARGET_KEYS = frozenset({"name", "host", "port", "types", "weight", "expect_ack", "ack_timeout_s"})
@@ -57,6 +60,17 @@ _SLO_KEYS = frozenset(
         "max_dead_letters",
         "max_drain_seconds",
         "zero_loss",
+    }
+)
+_FAILOVER_KEYS = frozenset(
+    {
+        "kill_at_fraction",
+        "heartbeat_seconds",
+        "leader_fence_timeout_seconds",
+        "leader_lease_ttl_seconds",
+        "recovery_ttl_multiple",
+        "max_promotion_seconds",
+        "max_dup_rate",
     }
 )
 
@@ -95,6 +109,27 @@ class Slo:
     max_dead_letters: int | None = None
     max_drain_seconds: float | None = None
     zero_loss: bool = False
+
+
+@dataclass(frozen=True)
+class Failover:
+    """``[load.failover]`` — the two-node primary-kill scenario knobs (only used by ``--failover``).
+
+    The orchestrator runs **two** engine nodes against one shared server DB, drives the profile, and
+    SIGKILLs the current primary partway through the measured phase. The lease timings are passed to
+    BOTH nodes (tuned short so a CI run completes in seconds, while keeping ``heartbeat < fence < ttl``
+    so the self-fence invariant still holds); the recovery SLO is expressed **relative to the TTL** so it
+    stays valid whatever timings a profile sets (functional recovery ≤ ``recovery_ttl_multiple`` × TTL)."""
+
+    kill_at_fraction: float = 0.5  # fraction into the measured phase to kill the primary
+    heartbeat_seconds: float = 2.0
+    leader_fence_timeout_seconds: float = 4.0
+    leader_lease_ttl_seconds: float = 6.0
+    recovery_ttl_multiple: float = 2.0  # functional recovery must be ≤ this × the lease TTL
+    max_promotion_seconds: float | None = (
+        None  # optional absolute cap on promotion (None = unchecked)
+    )
+    max_dup_rate: float = 0.05  # tolerated at-least-once redelivery rate across the failover
 
 
 @dataclass(frozen=True)
@@ -156,6 +191,9 @@ class LoadProfile:
     drain_timeout_s: float = 120.0
     seed: str = "messagefoundry-load"
     correlator_capacity: int = 1_000_000
+    failover: Failover | None = (
+        None  # set only by a [load.failover] table (the --failover scenario)
+    )
 
     def mix_for(self, phase: Phase) -> TypeMix:
         return phase.mix if phase.mix is not None else self.default_mix
@@ -255,9 +293,51 @@ def _profile_from_data(data: dict[str, Any], *, where: str) -> LoadProfile:
         correlator_capacity=_opt_int(
             load, "correlator_capacity", f"{where} [load]", default=1_000_000, minimum=1
         ),
+        failover=_failover_from(load.get("failover"), f"{where} [load.failover]"),
     )
     _validate_cross_refs(profile, where)
     return profile
+
+
+def _failover_from(raw: Any, where: str) -> Failover | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise LoadProfileError(f"{where}: must be a table")
+    _reject_unknown(raw, _FAILOVER_KEYS, where)
+    fo = Failover(
+        kill_at_fraction=_opt_float(
+            raw, "kill_at_fraction", where, default=0.5, minimum=0.0, maximum=1.0
+        ),
+        heartbeat_seconds=_opt_float(raw, "heartbeat_seconds", where, default=2.0, minimum=0.05),
+        leader_fence_timeout_seconds=_opt_float(
+            raw, "leader_fence_timeout_seconds", where, default=4.0, minimum=0.05
+        ),
+        leader_lease_ttl_seconds=_opt_float(
+            raw, "leader_lease_ttl_seconds", where, default=6.0, minimum=0.05
+        ),
+        recovery_ttl_multiple=_opt_float(
+            raw, "recovery_ttl_multiple", where, default=2.0, minimum=0.0, maximum=100.0
+        ),
+        max_promotion_seconds=_opt_float_or_none(raw, "max_promotion_seconds", where, minimum=0.0),
+        max_dup_rate=_opt_float(raw, "max_dup_rate", where, default=0.05, minimum=0.0, maximum=1.0),
+    )
+    # The lease-timing ordering the engine itself enforces (heartbeat < fence < ttl): the leader must
+    # renew within the fence (self-fencing before the TTL) so a standby never acquires while the old
+    # leader is still processing. Reject a profile that would be refused at engine startup anyway.
+    if not (fo.heartbeat_seconds < fo.leader_fence_timeout_seconds < fo.leader_lease_ttl_seconds):
+        raise LoadProfileError(
+            f"{where}: lease timing must satisfy heartbeat_seconds < leader_fence_timeout_seconds < "
+            f"leader_lease_ttl_seconds (got heartbeat={fo.heartbeat_seconds}, "
+            f"fence={fo.leader_fence_timeout_seconds}, ttl={fo.leader_lease_ttl_seconds})"
+        )
+    # kill_at_fraction must leave room both before (steady state to fill the pipeline) and after (to
+    # observe recovery within the same phase). Exact 0/1 would kill before any load or after the phase.
+    if not (0.0 < fo.kill_at_fraction < 1.0):
+        raise LoadProfileError(
+            f"{where}: kill_at_fraction must be strictly between 0 and 1 (got {fo.kill_at_fraction})"
+        )
+    return fo
 
 
 def _targets_from(raw: Any, where: str) -> tuple[Target, ...]:

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """REST transport: an HTTP destination that delivers each transformed payload to a URL.
 
 The **destination** sends one payload (the request body, already produced by the Handler) to a
@@ -39,14 +41,27 @@ from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
 from messagefoundry.transports.base import (
     DeliveryError,
+    DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
     register_destination,
 )
 
-__all__ = ["RestDestination", "refuse_cleartext_credentials"]
+__all__ = [
+    "RestDestination",
+    "enforce_outbound_length_limits",
+    "refuse_cleartext_credentials",
+]
 
 logger = logging.getLogger(__name__)
+
+# WP-L3-09 (ASVS 4.2.5): bound the resolved outbound URL and each built header value at connector
+# construction. Every value is operator-supplied today (config + env()), so this is defense-in-depth
+# that also surfaces a misconfiguration early — e.g. an env() secret that resolved to an unexpected
+# blob, or a runaway concatenated header — as a clear config error instead of a wire-level surprise on
+# the first delivery. 8 KiB comfortably exceeds any legitimate endpoint URL or Basic/Bearer credential.
+MAX_OUTBOUND_URL_LEN = 8192
+MAX_OUTBOUND_HEADER_VALUE_LEN = 8192
 
 # 4xx statuses worth retrying anyway: the server is up but momentarily unwilling, not a hard reject.
 _RETRYABLE_4XX = frozenset({408, 429})
@@ -108,6 +123,25 @@ def refuse_cleartext_credentials(scheme: str, headers: dict[str, str], url: str)
     )
 
 
+def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
+    """Reject an over-length outbound URL or request-header value at connector construction (ASVS
+    4.2.5). Shared by the REST and SOAP destinations (SOAP reuses REST's HTTP plumbing). Raises
+    :class:`ValueError` with a PHI-free message naming only the limit and the offending header name —
+    never the value (a header may carry a credential)."""
+    if len(url) > MAX_OUTBOUND_URL_LEN:
+        raise ValueError(
+            f"outbound URL is {len(url)} chars, over the {MAX_OUTBOUND_URL_LEN}-char limit; "
+            "check the configured 'url' / its env() value"
+        )
+    for name, value in headers.items():
+        if len(value) > MAX_OUTBOUND_HEADER_VALUE_LEN:
+            raise ValueError(
+                f"outbound header {name!r} is {len(value)} chars, over the "
+                f"{MAX_OUTBOUND_HEADER_VALUE_LEN}-char limit; check the configured header / "
+                "credential value"
+            )
+
+
 class RestDestination(DestinationConnector):
     """Deliver each transformed payload to an HTTP(S) endpoint (outbound only today)."""
 
@@ -123,7 +157,12 @@ class RestDestination(DestinationConnector):
         self.method: str = str(s.get("method", "POST")).upper()
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.encoding: str = s.get("encoding", "utf-8")
+        # ADR 0013: capture the HTTP response body. Default False → returns None, byte-identical. A 2xx
+        # with a body → outcome='accepted'; a 2xx with an empty body → outcome='no_reply' (a successful
+        # round-trip, not an error). Non-2xx keeps today's DeliveryError/NegativeAckError classification.
+        self.capture_response: bool = bool(s.get("capture_response", False))
         self._headers = self._build_headers(s)
+        enforce_outbound_length_limits(self.url, self._headers)
         refuse_cleartext_credentials(scheme, self._headers, self.url)
         if bool(s.get("verify_tls", True)):
             self._opener = _NO_REDIRECT_OPENER
@@ -159,11 +198,43 @@ class RestDestination(DestinationConnector):
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
         return headers
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str) -> DeliveryResponse | None:
         # urllib is blocking — keep it off the event loop (the delivery worker awaits this).
-        await asyncio.to_thread(self._post, payload)
+        body, status = await asyncio.to_thread(self._post, payload)
+        if not self.capture_response:
+            return None
+        if body == "":
+            # A successful round-trip with no payload — captured as a deliberate empty reply, NOT an
+            # error (the request succeeded). Distinct from a read failure, which raised above.
+            return DeliveryResponse(body="", outcome="no_reply", detail=f"HTTP {status}")
+        return DeliveryResponse(body=body, outcome="accepted", detail=f"HTTP {status}")
 
-    def _post(self, payload: str) -> None:
+    async def test_connection(self) -> None:
+        await asyncio.to_thread(self._probe)
+
+    def _probe(self) -> None:
+        # Reachability only: a HEAD reaches the endpoint without POSTing a body. An HTTP response means
+        # the host answered, so a 405 (HEAD not allowed on a POST endpoint) is still a pass — but a 401/
+        # 403 means the configured credentials would be rejected, which a real delivery dead-letters, so
+        # surface it as a failure. Connection/DNS/TLS/timeout is always a fail.
+        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
+            self.url, headers=self._headers, method="HEAD"
+        )
+        try:
+            with self._opener.open(req, timeout=self.timeout) as resp:
+                resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise DeliveryError(
+                    f"REST {_redact_url(self.url)} returned HTTP {exc.code} (check credentials)"
+                ) from exc
+            return  # any other status (the host answered) → reachable
+        except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
+            raise DeliveryError(f"REST {_redact_url(self.url)} unreachable: {exc.reason}") from exc
+        except (TimeoutError, OSError) as exc:
+            raise DeliveryError(f"REST {_redact_url(self.url)} failed: {exc}") from exc
+
+    def _post(self, payload: str) -> tuple[str, int]:
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self.url,
             data=payload.encode(self.encoding),
@@ -172,7 +243,12 @@ class RestDestination(DestinationConnector):
         )
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                resp.read()  # drain the body so the connection closes cleanly; 2xx ⇒ delivered
+                # Read the body (drains the connection for clean close; returned for capture). 2xx ⇒
+                # delivered. Decoding a drained body is cheap, so this stays byte-identical when capture
+                # is off (the worker just ignores the return).
+                body = resp.read().decode(self.encoding, errors="replace")
+                status = int(getattr(resp, "status", 200))
+                return body, status
         except urllib.error.HTTPError as exc:
             status = exc.code
             if status in _RETRYABLE_4XX or 500 <= status < 600:

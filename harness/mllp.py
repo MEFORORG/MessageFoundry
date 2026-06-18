@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """MLLP transport for the test harness.
 
 Sending runs in a worker thread (blocking sockets) so a burst of N messages never freezes the

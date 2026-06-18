@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The correlation sink — a headless, high-throughput MLLP listener that *is* the engine's outbound
 destination.
 
@@ -27,6 +29,7 @@ from messagefoundry.parsing.peek import HL7PeekError
 from messagefoundry.transports.mllp import MLLPDecoder, build_ack, frame
 
 from harness.load.correlator import Correlator
+from harness.load.failover_track import FailoverTracker
 from harness.load.ids import ControlIds
 from harness.load.metrics import LiveMetrics
 
@@ -45,6 +48,7 @@ class CorrelationSink:
         host: str = "127.0.0.1",
         ports: Sequence[int] = (2700,),
         ack_mode: AckMode = AckMode.ORIGINAL,
+        tracker: FailoverTracker | None = None,
     ) -> None:
         if not ports:
             raise ValueError("the sink needs at least one port")
@@ -54,6 +58,10 @@ class CorrelationSink:
         self._host = host
         self._ports = tuple(ports)
         self._ack_mode = ack_mode
+        # Failover-only: per-destination delivery/order bookkeeping. The FIFO lane is the engine OUTBOUND
+        # DESTINATION (recovered from MSH-6, since the MLLP connector opens a fresh connection per
+        # delivery), NOT this TCP connection. None on a steady-state run, so the hot path below is unchanged.
+        self._tracker = tracker
         self._servers: list[asyncio.Server] = []
         self._writers: set[asyncio.StreamWriter] = set()
 
@@ -117,6 +125,10 @@ class CorrelationSink:
         seq = self._ids.parse(peek.control_id)
         if seq is not None:
             self._correlator.on_recv(seq, recv_ns)  # increments sink_received; matches/dups/misses
+            if self._tracker is not None:
+                # The FIFO lane is the engine outbound DESTINATION (MSH-6 = SINK_{lane}_{index}, stamped
+                # by the load graph's `edit` transform), not this fresh-per-delivery TCP connection.
+                self._tracker.on_delivery(peek.receiving_facility or "", seq)
         else:
             # A delivery whose control id isn't one of this run's (foreign traffic on the sink port).
             self._m.counters.sink_received += 1

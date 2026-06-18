@@ -19,9 +19,10 @@ talks to the engine.
 
 ---
 
-## The policy model — two axes under an environment ceiling
+## The policy model — two axes under a production-posture ceiling
 
-The policy is two independent axes, then **clamped** by the deployment environment:
+The policy is two independent axes, then **clamped** by the instance's **production posture**
+(decoupled from the environment *name*, ADR 0017):
 
 - **`mode`** — *what kind of AI*, on an OFF→PHI-safe spectrum:
 
@@ -41,24 +42,26 @@ The policy is two independent axes, then **clamped** by the deployment environme
   | `deidentified` | 2 | De-identified message data. **Requires the (unbuilt) de-id framework** — never reached today. |
   | `phi` | 3 | Real message bodies / PHI. Reachable **only** under `managed_claude_baa`. |
 
-- **`environment`** — `dev` · `staging` · `prod`. Sets a **ceiling** on `data_scope` (never on `mode`):
+- **`production`** — the instance's posture flag (a `bool`, **decoupled from the environment name**).
+  Sets a **ceiling** on `data_scope` (never on `mode`):
 
-  | `environment` | `data_scope` ceiling |
+  | `production` | `data_scope` ceiling |
   |---|---|
-  | `dev` | `synthetic` |
-  | `staging` | `synthetic` |
-  | `prod` | `phi` **if** `mode == managed_claude_baa`, else `code_only` |
+  | `false` (non-production) | `synthetic` |
+  | `true` (production) | `phi` **if** `mode == managed_claude_baa`, else `code_only` |
 
-`environment` defaults to the **safest** interpretation when unset (it resolves to the tightest
-ceiling), so an un-tuned install never accidentally widens scope.
+  Posture is derived from the built-in environment names when unset (`dev`/`staging` → non-production,
+  `prod` → production); a custom env name (e.g. `test`, `poc`) sets `[ai].production` (and
+  `[ai].data_class`) explicitly. When the posture can't be resolved, the policy clamps to the
+  **strictest** ceiling, so an un-tuned install never accidentally widens scope.
 
 ### Resolution (clamping)
 
-`resolve_effective_policy(mode, data_scope, environment)`
+`resolve_effective_policy(mode, data_scope, production)`
 ([config/ai_policy.py](../messagefoundry/config/ai_policy.py)) is a **pure** function that returns the
 *effective* policy after applying, in order:
 
-1. **Environment ceiling** — `data_scope` is lowered to the environment's ceiling (above) if the
+1. **Posture ceiling** — `data_scope` is lowered to the production-posture ceiling (above) if the
    request exceeds it.
 2. **`phi` hard rule** — `phi` survives only under `managed_claude_baa`; otherwise it falls back to
    `code_only`.
@@ -66,20 +69,20 @@ ceiling), so an un-tuned install never accidentally widens scope.
    de-identification framework is **not built** (roadmap only — see [PHI.md §9](PHI.md#9-de-identification)).
 4. **`off` normalization** — when `mode == off`, `data_scope` is irrelevant and resolves to `code_only`.
 
-**`mode` is never clamped by environment** — only `data_scope` is. Every clamp is recorded in a
+**`mode` is never clamped by posture** — only `data_scope` is. Every clamp is recorded in a
 human-readable `reason` so an operator can see *why* the effective policy differs from what was
 configured. Representative results:
 
-| Configured (`mode`, `data_scope`, `environment`) | Effective `data_scope` | Why |
+| Configured (`mode`, `data_scope`, `production`) | Effective `data_scope` | Why |
 |---|---|---|
-| `byo`, `code_only`, `prod` | `code_only` | no clamp (this is the default) |
-| `byo`, `phi`, `prod` | `code_only` | prod ceiling for non-BAA mode |
-| `managed_claude_baa`, `phi`, `prod` | `phi` | the full PHI-safe end — no clamp |
-| `managed_claude_baa`, `deidentified`, `prod` | `code_only` | de-id framework unbuilt |
-| `managed_claude_baa`, `synthetic`, `prod` | `synthetic` | under both ceiling and the phi rule |
-| `byo`, `phi`, `dev` | `synthetic` | dev ceiling |
-| `byo`, `deidentified`, `dev` | `synthetic` | ceiling reached before the de-id rule |
-| `off`, `phi`, `prod` | `code_only` | AI off → scope irrelevant |
+| `byo`, `code_only`, `true` | `code_only` | no clamp (this is the default) |
+| `byo`, `phi`, `true` | `code_only` | production ceiling for non-BAA mode |
+| `managed_claude_baa`, `phi`, `true` | `phi` | the full PHI-safe end — no clamp |
+| `managed_claude_baa`, `deidentified`, `true` | `code_only` | de-id framework unbuilt |
+| `managed_claude_baa`, `synthetic`, `true` | `synthetic` | under both ceiling and the phi rule |
+| `byo`, `phi`, `false` | `synthetic` | non-production ceiling |
+| `byo`, `deidentified`, `false` | `synthetic` | ceiling reached before the de-id rule |
+| `off`, `phi`, `true` | `code_only` | AI off → scope irrelevant |
 
 ---
 
@@ -92,7 +95,9 @@ Set in `messagefoundry.toml`, with the usual `MEFOR_AI_*` env overrides
 |---|---|---|---|
 | `mode` | enum | `byo` | `off` · `byo` · `managed_claude` · `managed_claude_baa` |
 | `data_scope` | enum | `code_only` | `code_only` · `synthetic` · `deidentified` · `phi` |
-| `environment` | enum | `prod` | `dev` · `staging` · `prod`; unset resolves to the safest ceiling |
+| `environment` | str | — | free-form active-environment **name** (ADR 0017); selects `environments/<name>.toml` + `current_environment()`. **Required** for `serve` (no default). |
+| `data_class` | enum | derived | `synthetic` · `phi` — does this instance carry real PHI (drives the at-rest/egress advisories). Derived from a built-in name (`dev`→synthetic, `staging`/`prod`→phi) when unset; **required** for a custom name. |
+| `production` | bool | derived | production-tier posture (drives the AI ceiling + prod DEBUG refusal), decoupled from the name. Derived (`dev`/`staging`→false, `prod`→true) when unset; **required** for a custom name. |
 | `provider` | str | `claude` | **forward-compat, unused in MVP** (P1 broker) |
 | `model` | str | `claude-opus-4-8` | **forward-compat, unused in MVP** |
 | `baa_attested` | bool | `false` | **forward-compat, unused in MVP** |

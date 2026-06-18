@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Send an HL7 file to a running MLLP listener and print the ACK it returns.
 
 A tiny manual-testing helper for a running engine. With the sample channel

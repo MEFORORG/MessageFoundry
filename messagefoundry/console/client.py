@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Synchronous API client for the console.
 
 A small typed wrapper over the localhost REST API. It is deliberately **synchronous** —
@@ -12,6 +14,7 @@ Kept free of any Qt import so it can be unit-tested on its own against a real se
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from json import JSONDecodeError
 from types import TracebackType
 from typing import TypeVar
@@ -27,6 +30,9 @@ from messagefoundry.api.auth_models import (
     ChannelScope,
     CurrentUser,
     LoginResponse,
+    MfaConfirmResponse,
+    MfaEnrollResponse,
+    MfaStatusResponse,
     ProvidersInfo,
     RoleInfo,
     SessionInfo,
@@ -36,6 +42,8 @@ from messagefoundry.api.auth_models import (
 )
 from messagefoundry.api.models import (
     ChannelInfo,
+    ClusterNodeList,
+    ClusterStatus,
     ConnectionRow,
     DeadLetterList,
     DeadLetterReplayResult,
@@ -125,10 +133,18 @@ class EngineClient:
         allow_insecure: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self._timeout = timeout
+        self._allow_insecure = allow_insecure
         _assert_safe_transport(self.base_url, allow_insecure=allow_insecure)
         self._http = httpx.Client(base_url=self.base_url, timeout=timeout)
         self._token: str | None = None
         self._user: CurrentUser | None = None
+        #: Invoked when the engine demands step-up re-verification (403 + X-Step-Up-Required); the GUI
+        #: prompts, calls reauth(), and returns True iff re-verified — then the request is retried.
+        self._step_up_handler: Callable[[], bool] | None = None
+        #: Invoked when the engine demands a second factor (403 + X-MFA-Required, WP-14); the GUI
+        #: prompts for a TOTP / recovery code, calls verify_mfa(), and returns True iff verified.
+        self._mfa_handler: Callable[[], bool] | None = None
 
     def __enter__(self) -> "EngineClient":
         return self
@@ -144,20 +160,127 @@ class EngineClient:
     def close(self) -> None:
         self._http.close()
 
+    def for_polling(self) -> "EngineClient":
+        """A second client dedicated to **background (off-thread) reads** — the nav health poll, the
+        Engine Status refresh, and the per-page auto-refresh.
+
+        It shares this client's bearer token but has its **own** ``httpx.Client`` connection pool and
+        **no step-up/MFA handlers**, so background reader threads never contend on the main-thread
+        client's pool or its mutable auth state. That separation is what makes the console
+        concurrency-safe: the handler-bearing, token-mutating primary client stays **main-thread
+        only** (it serves the modal sign-in/step-up/MFA flows and user actions), while this read-only
+        client is the only one shared across worker threads — and sharing *it* is safe because its
+        token is never mutated, its 403→prompt retry branches are inert (no handlers), and
+        ``httpx.Client`` is itself thread-safe for concurrent requests.
+
+        The token is copied at creation. A mid-session credential change relaunches the console
+        (sign-out/expiry quits the app), so this snapshot can't drift out from under a live window.
+        """
+        poll = EngineClient(
+            self.base_url, timeout=self._timeout, allow_insecure=self._allow_insecure
+        )
+        poll._token = self._token
+        poll._user = self._user
+        return poll
+
     # --- requests ------------------------------------------------------------
 
     def _get(self, path: str, **params: object) -> httpx.Response:
         return self._request("GET", path, params={k: v for k, v in params.items() if v is not None})
 
-    def _request(self, method: str, path: str, **kw: object) -> httpx.Response:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        _allow_step_up: bool = True,
+        _allow_mfa: bool = True,
+        **kw: object,
+    ) -> httpx.Response:
         headers = {"Authorization": f"Bearer {self._token}"} if self._token else None
         try:
             response = self._http.request(method, path, headers=headers, **kw)  # type: ignore[arg-type]
         except httpx.HTTPError as exc:
             raise ApiError(f"could not reach engine at {self.base_url}: {exc}") from exc
+        # Second factor (WP-14, ASVS 6.3.3): the engine refuses a sensitive op with 403 +
+        # X-MFA-Required when this session hasn't satisfied MFA. Prompt for a code (the handler calls
+        # verify_mfa()) and retry once — transparently, like step-up. Checked first because the engine
+        # gates MFA before step-up.
+        if (
+            _allow_mfa
+            and response.status_code == 403
+            and response.headers.get("X-MFA-Required")
+            and self._mfa_handler is not None
+            and self._mfa_handler()
+        ):
+            return self._request(
+                method, path, _allow_step_up=_allow_step_up, _allow_mfa=False, **kw
+            )
+        # Step-up re-verification (ASVS 7.5.3): the engine refuses a sensitive op with 403 +
+        # X-Step-Up-Required when this session hasn't re-proved its credential recently. Prompt the
+        # user (the handler re-authenticates via reauth()) and retry once, so the action goes through
+        # transparently instead of surfacing a raw 403.
+        if (
+            _allow_step_up
+            and response.status_code == 403
+            and response.headers.get("X-Step-Up-Required")
+            and self._step_up_handler is not None
+            and self._step_up_handler()
+        ):
+            return self._request(method, path, _allow_step_up=False, _allow_mfa=_allow_mfa, **kw)
         if response.status_code >= 400:
             raise ApiError(_error_detail(response), status=response.status_code)
         return response
+
+    def set_step_up_handler(self, handler: Callable[[], bool] | None) -> None:
+        """Register the callback invoked when the engine demands step-up re-verification (403 +
+        ``X-Step-Up-Required``). It must prompt the user, call :meth:`reauth`, and return ``True`` iff
+        re-verified — the original request is then retried once. Runs on the calling thread (the
+        console's sensitive actions run on the Qt main thread, so a modal dialog is safe)."""
+        self._step_up_handler = handler
+
+    def reauth(self, password: str) -> None:
+        """Step-up re-verification (ASVS 7.5.3): re-prove the current credential to refresh this
+        session's step-up window. Raises :class:`ApiError` (status 403) on a wrong password. Does not
+        itself trigger the step-up handler (``/me/reauth`` is not a step-up-gated route)."""
+        self._request("POST", "/me/reauth", json={"password": password}, _allow_step_up=False)
+
+    def set_mfa_handler(self, handler: Callable[[], bool] | None) -> None:
+        """Register the callback invoked when the engine demands a second factor (403 +
+        ``X-MFA-Required``, WP-14). It must prompt for a TOTP / recovery code, call :meth:`verify_mfa`,
+        and return ``True`` iff verified — the original request is then retried once."""
+        self._mfa_handler = handler
+
+    # --- MFA (WP-14, ASVS 6.3.3) ---------------------------------------------
+
+    def mfa_status(self) -> MfaStatusResponse:
+        """The signed-in user's MFA posture (enabled, enrolled-at, recovery codes left, required)."""
+        return _decode(self._get("/me/mfa"), MfaStatusResponse)
+
+    def enroll_mfa(self) -> MfaEnrollResponse:
+        """Begin TOTP enrollment: stage a secret and return it + the ``otpauth://`` URI. Step-up gated,
+        so the step-up handler may prompt for the password before this returns."""
+        return _decode(self._request("POST", "/me/mfa/enroll"), MfaEnrollResponse)
+
+    def confirm_mfa(self, code: str) -> list[str]:
+        """Confirm enrollment with a live TOTP code; activates MFA and returns the one-time recovery
+        codes (shown **once**). Raises :class:`ApiError` (400) on a wrong code."""
+        return _decode(
+            self._request("POST", "/me/mfa/confirm", json={"code": code}), MfaConfirmResponse
+        ).recovery_codes
+
+    def verify_mfa(self, code: str) -> None:
+        """Satisfy the current session's second factor with a TOTP or single-use recovery code. Raises
+        :class:`ApiError` (401) on a wrong code. Does not itself trigger the MFA handler."""
+        self._request("POST", "/auth/mfa-verify", json={"code": code}, _allow_mfa=False)
+
+    def disable_mfa(self) -> None:
+        """Turn off the signed-in user's TOTP MFA (step-up gated)."""
+        self._request("DELETE", "/me/mfa")
+
+    def reset_user_mfa(self, user_id: str) -> None:
+        """Admin: clear a user's MFA enrollment and revoke their sessions (step-up gated)."""
+        self._request("POST", f"/users/{user_id}/reset-mfa")
 
     # --- endpoints -----------------------------------------------------------
 
@@ -265,6 +388,14 @@ class EngineClient:
 
     def status(self) -> SystemStatus:
         return _decode(self._get("/status"), SystemStatus)
+
+    def cluster_status(self) -> ClusterStatus:
+        """This node's active-passive role / leadership (cheap in-memory read; MONITORING_READ)."""
+        return _decode(self._get("/cluster/status"), ClusterStatus)
+
+    def cluster_nodes(self) -> ClusterNodeList:
+        """Cluster membership + the derived live leader + lease state (MONITORING_READ)."""
+        return _decode(self._get("/cluster/nodes"), ClusterNodeList)
 
     def integrity_check(self) -> IntegrityResult:
         # The DB integrity scan (PRAGMA quick_check) is exactly the call that runs long on a large

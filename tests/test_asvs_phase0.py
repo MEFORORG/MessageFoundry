@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """ASVS 5.0 L2 Phase-0 hardening — tests for the quick-win work packages.
 
 Covers WP-1 (security headers, header-only WS token), WP-2 (WS Origin check), WP-4 (pinned argon2

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Operational alert emit-points for the delivery pipeline.
 
 The conservative ordering defaults (FIFO head-of-line blocking, retry-forever, stop-connection on
@@ -46,6 +48,13 @@ class AlertSink(Protocol):
         over the limit; ``path`` identifies the DB, never any message content (no PHI)."""
         ...
 
+    def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+        """A served TLS certificate is expired or within the configured warn window. ``name`` labels
+        which cert (``"api"`` or the connection name); ``path`` is the PEM file; ``not_after`` is the
+        ISO expiry; ``days_remaining`` is negative once expired. No key material is read or logged.
+        Emitted by the :class:`~messagefoundry.pipeline.cert_expiry.CertExpiryRunner`."""
+        ...
+
 
 class LoggingAlertSink:
     """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
@@ -71,3 +80,21 @@ class LoggingAlertSink:
             size_bytes / 1_000_000,
             limit_bytes / 1_000_000,
         )
+
+    def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+        if days_remaining < 0:
+            log.warning(
+                "ALERT cert_expiry: %r certificate (%s) EXPIRED %d day(s) ago (not_after=%s)",
+                name,
+                path,
+                -days_remaining,
+                not_after,
+            )
+        else:
+            log.warning(
+                "ALERT cert_expiry: %r certificate (%s) expires in %d day(s) (not_after=%s)",
+                name,
+                path,
+                days_remaining,
+                not_after,
+            )

@@ -1,0 +1,12 @@
+{
+  // Compile the integration-test sources to out/ for the @vscode/test-electron runner. The base
+  // tsconfig is type-check-only (noEmit) and bundled via esbuild; the tests instead need real .js on
+  // disk for the Extension Host to load, so this profile emits them (out/ is git-ignored).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "out",
+    "rootDir": "src"
+  },
+  "include": ["src/test"]
+}

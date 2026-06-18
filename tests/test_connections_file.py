@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """connections.toml read path (ADR 0007) — data-authored connections merge into the registry the
 code-first inbound()/outbound() populate, sharing every factory + guard."""
 
@@ -8,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.models import AckMode, ConnectorType, OrderingMode
+from messagefoundry.config.models import AckMode, ConnectorType, ContentType, OrderingMode
 from messagefoundry.config.wiring import (
     EnvRef,
     WiringError,
@@ -73,6 +75,38 @@ def test_inbound_and_outbound_round_trip(tmp_path: Path) -> None:
     assert ob.spec.settings["host"] == "epic.example"
     assert ob.ordering is OrderingMode.FIFO
     assert ob.retry is not None and ob.retry.max_attempts == 5
+
+
+def test_timer_inbound_from_toml(tmp_path: Path) -> None:
+    # A timer source (ADR 0011) is connection transport config, so it is declarable as data too —
+    # transport = "timer" desugars through the same Timer() factory as code-first inbound(..., Timer()).
+    reg = load_config(
+        _config(
+            tmp_path,
+            """
+            [[inbound]]
+            name = "IB_TIMER"
+            transport = "timer"
+            router = "r"
+            content_type = "text"
+              [inbound.settings]
+              body = "ping"
+              interval_seconds = 30.0
+
+            [[outbound]]
+            name = "OB"
+            transport = "mllp"
+              [outbound.settings]
+              host = "epic.example"
+              port = 2700
+            """,
+        )
+    )
+    ib = reg.inbound["IB_TIMER"]
+    assert ib.spec.type is ConnectorType.TIMER
+    assert ib.spec.settings["body"] == "ping"
+    assert ib.spec.settings["interval_seconds"] == 30.0
+    assert ib.content_type is ContentType.TEXT
 
 
 def test_env_ref_decode_with_named_cast(tmp_path: Path) -> None:

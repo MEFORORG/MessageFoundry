@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """API authentication + RBAC enforcement: login, deny-by-default, PHI gating, user admin, audit."""
 
 from __future__ import annotations
@@ -9,9 +11,10 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.auth import Role
+from messagefoundry.auth import Role, totp
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 
@@ -38,13 +41,24 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    await service.create_local_user(
+    user_id = await service.create_local_user(
         username=username,
         password=PW,
         display_name=None,
         email=None,
         roles=[r.value for r in roles],
         actor="test",
+    )
+    await _clear_must_change(service, user_id)
+
+
+async def _clear_must_change(service: AuthService, user_id: str) -> None:
+    # Admin-created accounts force first-login rotation (WP-L3-12). These helper fixtures stand in for
+    # already-onboarded users, so clear the flag (keeping the same hash) to keep their logins usable.
+    user = await service.store.get_user(user_id)
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        user_id, password_hash=user.password_hash, must_change_password=False
     )
 
 
@@ -66,6 +80,162 @@ async def test_unauthenticated_is_rejected_but_health_is_open(engine: Engine) ->
         assert (await c.get("/health")).status_code == 200
         assert (await c.get("/stats")).status_code == 401
         assert (await c.get("/connections")).status_code == 401
+
+
+async def test_security_events_feed_lists_callers_auth_events(engine: Engine) -> None:
+    # WP-L3-05 (ASVS 6.3.5/6.3.7): /me/security-events surfaces the caller's own audited auth.* events.
+    service = await _service(engine)
+    await _add(service, "viewer", Role.VIEWER)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "viewer")).json()["token"]  # audits auth.login_success
+        await _login(c, "viewer", "wrong")  # audits auth.login_failed (same actor)
+        r = await c.get("/me/security-events", headers=_auth(token))
+        assert r.status_code == 200
+        actions = [e["action"] for e in r.json()["events"]]
+        assert "auth.login_success" in actions
+        assert "auth.login_failed" in actions
+    # unauthenticated callers can't read it
+    async with _client(engine, service) as c:
+        assert (await c.get("/me/security-events")).status_code == 401
+
+
+async def test_security_events_feed_is_scoped_to_caller(engine: Engine) -> None:
+    # WP-L3-05 follow-up: the feed is horizontally isolated (no IDOR) — a caller sees ONLY their own
+    # audited auth.* events, never another user's. alice never fails a login, so bob's failed attempt
+    # leaking into her feed (a broken actor= filter) is caught precisely.
+    service = await _service(engine)
+    await _add(service, "alice", Role.VIEWER)
+    await _add(service, "bob", Role.VIEWER)
+    async with _client(engine, service) as c:
+        alice_token = (await _login(c, "alice")).json()["token"]  # alice: success only
+        await _login(c, "bob", "wrong")  # bob: a failed attempt (actor=bob)
+        bob_token = (await _login(c, "bob")).json()["token"]
+        alice_actions = [
+            e["action"]
+            for e in (await c.get("/me/security-events", headers=_auth(alice_token))).json()[
+                "events"
+            ]
+        ]
+        bob_actions = [
+            e["action"]
+            for e in (await c.get("/me/security-events", headers=_auth(bob_token))).json()["events"]
+        ]
+    assert "auth.login_success" in alice_actions
+    assert "auth.login_failed" not in alice_actions  # bob's failure must NOT appear in alice's feed
+    assert "auth.login_failed" in bob_actions  # bob sees his own failure
+
+
+async def test_mfa_enroll_confirm_and_step_up_gate(engine: Engine) -> None:
+    # WP-14 / ASVS 6.3.3: the full TOTP lifecycle over the API + the step-up MFA gate. An MFA-required
+    # session 403s on a require_step_up route with X-MFA-Required until POST /auth/mfa-verify.
+    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+
+        # Enrollment is step-up gated; the login itself counts as the first credential verification
+        # (sudo-timestamp model), so a just-logged-in session can enroll within the step-up window.
+        r = await c.post("/me/mfa/enroll", headers=_auth(tok))
+        assert r.status_code == 200
+        secret = r.json()["secret"]
+
+        # Confirm with a live code → activates MFA + returns the one-time recovery codes.
+        r = await c.post("/me/mfa/confirm", json={"code": totp.totp(secret)}, headers=_auth(tok))
+        assert r.status_code == 200 and len(r.json()["recovery_codes"]) == 10
+        st = (await c.get("/me/mfa", headers=_auth(tok))).json()
+        assert st["enabled"] is True and st["required"] is True
+
+        # A fresh login now flags mfa_required and the new session is un-MFA'd.
+        lr = (await _login(c, "adm")).json()
+        assert lr["mfa_required"] is True
+        tok2 = lr["token"]
+
+        # A require_step_up route is blocked with X-MFA-Required until the 2nd factor is verified.
+        r = await c.put("/ad-group-map", json={"entries": []}, headers=_auth(tok2))
+        assert r.status_code == 403 and r.headers.get("X-MFA-Required") == "1"
+        r = await c.post("/auth/mfa-verify", json={"code": totp.totp(secret)}, headers=_auth(tok2))
+        assert r.status_code == 200
+        # Now it passes (password step-up satisfied at login; MFA now satisfied).
+        r = await c.put("/ad-group-map", json={"entries": []}, headers=_auth(tok2))
+        assert r.status_code == 200
+
+
+async def test_mfa_verify_accepts_recovery_code_once(engine: Engine) -> None:
+    service = await _service(
+        engine, AuthSettings(login_rate_limit_enabled=False, mfa_recovery_code_count=3)
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
+        confirm = await c.post(
+            "/me/mfa/confirm", json={"code": totp.totp(secret)}, headers=_auth(tok)
+        )
+        recovery = confirm.json()["recovery_codes"]
+
+        # Fresh login → satisfy the 2nd factor with a recovery code.
+        tok2 = (await _login(c, "adm")).json()["token"]
+        r = await c.post("/auth/mfa-verify", json={"code": recovery[0]}, headers=_auth(tok2))
+        assert r.status_code == 200
+
+        # The same recovery code can't be reused; a fresh one still works.
+        tok3 = (await _login(c, "adm")).json()["token"]
+        r = await c.post("/auth/mfa-verify", json={"code": recovery[0]}, headers=_auth(tok3))
+        assert r.status_code == 401
+        r = await c.post("/auth/mfa-verify", json={"code": recovery[1]}, headers=_auth(tok3))
+        assert r.status_code == 200
+
+
+async def test_mfa_enrollment_requires_explicit_reauth_for_require_mfa_admin(
+    engine: Engine,
+) -> None:
+    # Security review (bootstrap bypass): a require_mfa Administrator's fresh, not-yet-enrolled session
+    # is MFA-pending, so it is NOT step-up-fresh — enrollment is refused until an explicit password
+    # re-verify. This stops a stolen pre-MFA token from binding an attacker-controlled authenticator.
+    service = await _service(engine, AuthSettings(require_mfa=True, login_rate_limit_enabled=False))
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        lr = (await _login(c, "adm")).json()
+        assert lr["mfa_required"] is True
+        tok = lr["token"]
+        # No explicit reauth yet → enroll is step-up-refused (the login no longer seeds step-up here).
+        r = await c.post("/me/mfa/enroll", headers=_auth(tok))
+        assert r.status_code == 403 and r.headers.get("X-Step-Up-Required") == "1"
+        # Re-prove the password, then enrollment proceeds.
+        r = await c.post("/me/reauth", json={"password": PW}, headers=_auth(tok))
+        assert r.status_code == 200
+        r = await c.post("/me/mfa/enroll", headers=_auth(tok))
+        assert r.status_code == 200
+
+
+async def test_security_events_feed_payload_is_phi_free(engine: Engine) -> None:
+    # The feed carries only non-PHI audit metadata (ts/action/detail) — never message bodies or
+    # credential material. Mirrors the PHI-free assertion already made on the email-notification body.
+    service = await _service(engine)
+    await _add(service, "viewer", Role.VIEWER)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "viewer")).json()["token"]
+        await _login(c, "viewer", "wrong")
+        r = await c.get("/me/security-events", headers=_auth(token))
+        assert r.status_code == 200
+        body = r.text
+    assert "MSH|" not in body and "PID|" not in body  # no HL7/PHI markers
+    assert PW not in body  # the caller's password is never echoed back into the feed
+
+
+async def test_health_version_disclosed_only_when_authenticated(engine: Engine) -> None:
+    # WP-L3-07 (ASVS 13.4.6): liveness is open, but the build version (a fingerprinting detail) is
+    # withheld from a tokenless caller and disclosed only to an authenticated one.
+    service = await _service(engine)
+    await _add(service, "viewer", Role.VIEWER)
+    async with _client(engine, service) as c:
+        anon = (await c.get("/health")).json()
+        assert anon["status"] == "ok"
+        assert anon["version"] is None  # no fingerprint for a tokenless probe
+
+        token = (await _login(c, "viewer")).json()["token"]
+        authed = (await c.get("/health", headers=_auth(token))).json()
+        assert authed["version"]  # authenticated → version disclosed
 
 
 async def test_login_then_permission_enforced(engine: Engine) -> None:
@@ -123,6 +293,48 @@ async def test_phi_raw_view_requires_operator(engine: Engine) -> None:
             await c.get(f"/messages/{mid}", headers=_auth(vw))
         ).status_code == 403  # no view_raw
         assert (await c.get("/messages", headers=_auth(vw))).status_code == 200  # messages:read ok
+
+
+async def test_outbound_payloads_require_view_raw(engine: Engine) -> None:
+    # #14: the transformed outbound payload is PHI body — same gate as the raw view. A VIEWER (no
+    # view_raw) is refused; an OPERATOR sees the decrypted transformed payload.
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await _add(service, "vw", Role.VIEWER)
+    mid = await engine.store.enqueue_message(
+        channel_id="ch1", raw=ADT, deliveries=[("archive", "MSH|transformed")]
+    )
+    async with _client(engine, service) as c:
+        op = (await _login(c, "op")).json()["token"]
+        vw = (await _login(c, "vw")).json()["token"]
+        ok = await c.get(f"/messages/{mid}/outbound", headers=_auth(op))
+        assert ok.status_code == 200
+        assert ok.json()["payloads"][0]["payload"] == "MSH|transformed"
+        assert (
+            await c.get(f"/messages/{mid}/outbound", headers=_auth(vw))
+        ).status_code == 403  # no view_raw
+
+
+async def test_detail_disposition_text_visible_to_operator_and_audited(engine: Engine) -> None:
+    # #120: get_message gates error/last_error/event-detail on view_summary and audits the view, but an
+    # Operator (holds view_summary + view_raw) must still SEE them — the redaction must not strip an
+    # authorized caller's disposition text. The null path (view_raw without view_summary) is unit-tested
+    # in test_field_authz; no built-in role holds that combo, so it isn't reachable end-to-end.
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    retry = RetryPolicy(max_attempts=1, backoff_seconds=1, backoff_multiplier=1)
+    mid = await engine.store.enqueue_message(
+        channel_id="ch1", raw=ADT, deliveries=[("OB", "p")], now=0.0
+    )
+    item = (await engine.store.claim_ready(now=0.0))[0]
+    await engine.store.mark_failed(item.id, "delivery rejected by partner", retry, now=0.0)
+    async with _client(engine, service) as c:
+        op = _auth((await _login(c, "op")).json()["token"])
+        r = await c.get(f"/messages/{mid}", headers=op)
+        assert r.status_code == 200
+        assert r.json()["outbox"][0]["last_error"] == "delivery rejected by partner"
+    actions = [dict(a)["action"] for a in await engine.store.list_audit(limit=50)]
+    assert "message_view" in actions  # opening the detail (raw) view is audited
 
 
 async def test_admin_user_crud_and_audit(engine: Engine) -> None:
@@ -385,3 +597,64 @@ async def test_patch_user_preserves_omitted_fields(engine: Engine) -> None:
     assert user is not None
     assert user.disabled and user.display_name == "Jane Doe"  # omitted fields preserved
     assert user.email == "jane@example.org"
+
+
+async def test_admin_created_account_forces_first_login_rotation(engine: Engine) -> None:
+    # WP-L3-12 (ASVS 6.4.6): a user created via the admin API must rotate the admin-set password on
+    # first login before reaching any protected route.
+    service = await _service(engine)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        admin = _auth((await _login(c, "root")).json()["token"])
+        created = await c.post(
+            "/users", headers=admin, json={"username": "carol", "password": PW, "roles": ["viewer"]}
+        )
+        assert created.status_code == 201
+        first = await _login(c, "carol")
+        assert first.status_code == 200 and first.json()["must_change_password"] is True
+        # the rotation gate blocks protected routes until carol changes the admin-set password
+        blocked = _auth(first.json()["token"])
+        assert (await c.get("/stats", headers=blocked)).status_code == 403
+
+
+async def test_admin_reset_password_endpoint(engine: Engine) -> None:
+    # WP-L3-12 (ASVS 6.4.6): admin reset returns a one-time temp once; it's permission-gated; the temp
+    # forces rotation; self/unknown/AD targets are refused appropriately.
+    service = await _service(engine)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    await _add(service, "vw", Role.VIEWER)
+    carol_id = await service.create_local_user(
+        username="carol",
+        password=PW,
+        display_name=None,
+        email="carol@example.org",
+        roles=["viewer"],
+        actor="root",
+    )
+    await engine.store.create_user(user_id="ad9", username="ad9", auth_provider="ad")
+    async with _client(engine, service) as c:
+        admin = _auth((await _login(c, "root")).json()["token"])
+        viewer = _auth((await _login(c, "vw")).json()["token"])
+        # deny-by-default: a viewer lacks users:manage
+        assert (
+            await c.post(f"/users/{carol_id}/reset-password", headers=viewer)
+        ).status_code == 403
+        # admin reset → a one-time temp returned once
+        reset = await c.post(f"/users/{carol_id}/reset-password", headers=admin)
+        assert reset.status_code == 200
+        temp = reset.json()["temp_password"]
+        assert temp and reset.json()["must_change_password"] is True
+        # the temp logs carol in (rotation required); rotating it clears the gate
+        relog = await _login(c, "carol", temp)
+        assert relog.status_code == 200 and relog.json()["must_change_password"] is True
+        rotated = await c.post(
+            "/me/password",
+            headers=_auth(relog.json()["token"]),
+            json={"current_password": temp, "new_password": "rotated-strong-passphrase-7"},
+        )
+        assert rotated.status_code == 200
+        # unknown → 404; AD user → 400; your own account → 400 (use change-password)
+        assert (await c.post("/users/nope/reset-password", headers=admin)).status_code == 404
+        assert (await c.post("/users/ad9/reset-password", headers=admin)).status_code == 400
+        me_id = (await c.get("/auth/me", headers=admin)).json()["user_id"]
+        assert (await c.post(f"/users/{me_id}/reset-password", headers=admin)).status_code == 400

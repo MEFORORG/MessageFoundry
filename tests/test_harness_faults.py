@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The harness Receive tab's fault-injection reply modes + at-least-once duplicate counting.
 
 Each test drives the QTcpServer-backed receiver with a raw client socket, spinning the Qt event

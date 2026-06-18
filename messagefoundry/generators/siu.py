@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Generate conformant HL7 v2.5.1 **SIU** (scheduling) messages.
 
 Every SIU_Sxx structure in the reference is covered. Required SCH + RESOURCES(→RGS) plus the

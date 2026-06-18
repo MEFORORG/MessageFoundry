@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """`messagefoundry connection list|upsert|remove` — the comment-preserving connections.toml editor
 the VS Code GUI shells (ADR 0007). Validates-before-persist and rolls back on failure."""
 

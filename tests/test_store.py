@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Durable store/queue behaviour: enqueue, claim, retry/backoff, dead-letter,
 crash recovery, replay, and message finalization. Time is injected for determinism."""
 
@@ -94,6 +96,35 @@ async def test_record_received_logs_filtered_and_error(store: MessageStore) -> N
     emsg = await store.get_message(eid)
     assert emsg["status"] == MessageStatus.ERROR.value
     assert emsg["error"] == "parse error: boom"
+
+
+async def test_disposition_text_is_phi_scrubbed_at_the_store_layer(store: MessageStore) -> None:
+    # #120: error / last_error / detail go through the safe_text PHI chokepoint at write, so an HL7
+    # fragment that a handler/connector put into an exception can't land in those columns — the last
+    # line of defense even if a caller forgot to scrub (and the only one on SQL Server, which stores
+    # these plaintext). Covers mark_failed (last_error) + record_received (messages.error + event detail).
+    phi = "PID|1||100^^^H^MR||DOE^JANE"
+    retry = RetryPolicy(max_attempts=1, backoff_seconds=1, backoff_multiplier=1)
+    mid = await store.enqueue_message(
+        channel_id="c1", raw="MSH|x", deliveries=[("d1", "p1")], now=0.0
+    )
+    item = (await store.claim_ready(now=0.0))[0]
+    await store.mark_failed(
+        item.id, f"delivery rejected: {phi}", retry, now=0.0
+    )  # max=1 → dead-letter
+    last_error = (await store.outbox_for(mid))[0]["last_error"] or ""
+    assert (
+        "DOE^JANE" not in last_error
+        and "100^^^H^MR" not in last_error
+        and "[redacted]" in last_error
+    )
+
+    eid = await store.record_received(
+        channel_id="c1", raw="MSH|x", status=MessageStatus.ERROR, error=f"bad value {phi}", now=0.0
+    )
+    assert "DOE^JANE" not in ((await store.get_message(eid))["error"] or "")
+    # record_received also mirrors the error into a message_events.detail row — scrubbed there too.
+    assert all("DOE^JANE" not in (e["detail"] or "") for e in await store.events_for(eid))
 
 
 async def test_claim_marks_inflight_and_increments_attempts(store: MessageStore) -> None:
@@ -402,6 +433,23 @@ async def test_stats_reports_queue_depth(store: MessageStore) -> None:
     await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=0.0)
     await store.enqueue_message(channel_id="c1", raw="y", deliveries=[("d1", "p2")], now=0.0)
     assert (await store.stats()).get(OutboxStatus.PENDING.value) == 2
+
+
+async def test_in_pipeline_depth_spans_stages_and_excludes_done(store: MessageStore) -> None:
+    # Two outbound rows (pending) are counted.
+    await store.enqueue_message(
+        channel_id="c1", raw="x", deliveries=[("d1", "p1"), ("d2", "p2")], now=0.0
+    )
+    assert await store.in_pipeline_depth() == 2
+    # An ingress-stage row in a DIFFERENT stage is counted too — stats() (outbound-only) can't see it.
+    await store.enqueue_ingress(channel_id="c2", raw="y", now=0.0)
+    assert (await store.stats()).get(OutboxStatus.PENDING.value) == 2  # outbound-only: unchanged
+    assert await store.in_pipeline_depth() == 3  # 1 ingress + 2 outbound, all pending
+    # Claiming flips the outbound rows to inflight (still in-pipeline); marking one done drops it out.
+    items = await store.claim_ready(limit=10, now=1.0)
+    assert await store.in_pipeline_depth() == 3  # inflight still counts as not-done
+    await store.mark_done(items[0].id, now=2.0)
+    assert await store.in_pipeline_depth() == 2  # one outbound delivered → excluded
 
 
 # --- purge (soft-cancel) -----------------------------------------------------

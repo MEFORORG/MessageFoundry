@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Raw-TCP transport with **configurable delimiter framing** — source + destination.
 
 Built to relay **X12 (and other non-HL7) feeds over custom-framed TCP** opaquely: the payload
@@ -27,11 +29,15 @@ import logging
 from collections.abc import Callable
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
     DeliveryError,
+    DeliveryResponse,
     DestinationConnector,
     InboundHandler,
     SourceConnector,
+    peer_ip_allowed,
+    probe_tcp_reachable,
     register_destination,
     register_source,
 )
@@ -104,19 +110,28 @@ class TcpDestination(DestinationConnector):
         self.expect_reply: bool = bool(s.get("expect_reply", False))
         mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
         self.max_frame_bytes: int | None = int(mf) if mf else None
+        # ADR 0013: capture the framed reply. Requires expect_reply=True (enforced at wiring). A missing
+        # reply is already a retryable DeliveryError (peer-close in _read_reply) and stays one — enabling
+        # capture does NOT change delivery semantics, it only returns the frame that was already read.
+        self.capture_response: bool = bool(s.get("capture_response", False))
 
-    async def send(self, payload: str) -> None:
+    async def test_connection(self) -> None:
+        # Reachability only: open + close a connection (no frame sent) so a test never delivers.
+        await probe_tcp_reachable(self.host, self.port, self.connect_timeout, "TCP")
+
+    async def send(self, payload: str) -> DeliveryResponse | None:
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port), self.connect_timeout
             )
         except (OSError, asyncio.TimeoutError) as exc:
             raise DeliveryError(f"TCP connect to {self.host}:{self.port} failed: {exc}") from exc
+        reply: bytes | None = None
         try:
             writer.write(self.codec.frame(payload, self.encoding))
             await asyncio.wait_for(writer.drain(), self.timeout)
             if self.expect_reply:
-                await asyncio.wait_for(self._read_reply(reader), self.timeout)
+                reply = await asyncio.wait_for(self._read_reply(reader), self.timeout)
         except asyncio.TimeoutError as exc:
             raise DeliveryError("TCP timed out") from exc
         except OSError as exc:
@@ -127,6 +142,11 @@ class TcpDestination(DestinationConnector):
                 await writer.wait_closed()
             except OSError:
                 pass
+        if self.capture_response and reply is not None:
+            return DeliveryResponse(
+                body=reply.decode(self.encoding, errors="replace"), outcome="accepted"
+            )
+        return None
 
     async def _read_reply(self, reader: asyncio.StreamReader) -> bytes:
         """Read one framed reply; any frame counts as confirmation (the bytes are not inspected)."""
@@ -166,6 +186,10 @@ class TcpSource(SourceConnector):
         self.receive_timeout: float | None = float(rt) if rt else None
         mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
         self.max_frame_bytes: int | None = int(mf) if mf else None
+        # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.
+        # Absent/empty = no restriction. Mirrors MLLPSource.
+        sa = s.get("source_ip_allowlist")
+        self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         self._active = 0
@@ -220,6 +244,13 @@ class TcpSource(SourceConnector):
         if task is not None:
             self._client_tasks.add(task)
         try:
+            if self.source_ip_allowlist is not None:
+                peer = writer.get_extra_info("peername")
+                if not peer_ip_allowed(peer, self.source_ip_allowlist):
+                    logger.warning(
+                        "TCP connection from %s refused: not in source_ip_allowlist", peer
+                    )
+                    return  # not allowlisted — refuse (closed in the outer finally; _active untouched)
             if self.max_connections is not None and self._active >= self.max_connections:
                 return  # at capacity — refuse the new client (closed in the outer finally)
             self._active += 1
@@ -247,6 +278,16 @@ class TcpSource(SourceConnector):
                             "TCP frame from %s over cap; closing connection: %s", peer, exc
                         )
                         break  # drop the connection rather than buffer without bound
+                    except OSError:
+                        raise  # peer reset / write failure → handled by the outer OSError catch (quiet)
+                    except Exception as exc:
+                        # Last-resort (ASVS 16.5.4): an unexpected handler/codec error must not let the
+                        # per-connection task die silently or leak detail. Log redacted; drop the conn.
+                        peer = writer.get_extra_info("peername")
+                        logger.error(
+                            "TCP connection from %s failed unexpectedly: %s", peer, safe_exc(exc)
+                        )
+                        break
             except OSError:
                 pass  # peer reset; nothing to do but drop the connection
             finally:

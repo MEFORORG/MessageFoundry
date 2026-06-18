@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Headless tests for the console password-change flow: the ChangePasswordDialog widget and the
 forced-change-at-login wiring in LoginDialog. Runs Qt offscreen with a fake client; skipped if
 PySide6 isn't installed."""
@@ -235,6 +237,7 @@ def test_authenticate_forced_change_loops_to_resignin(
         def __init__(self, client: object) -> None:
             self._result = login_results[login_exec_calls["n"]]
             self.must_change_password = self._result.must_change_password
+            self.mfa_required = self._result.mfa_required
             self.entered_password = "JustTyped1!"
             FakeLoginDialog.last = self
 
@@ -286,6 +289,7 @@ def test_authenticate_forced_change_cancel_blocks(qapp, monkeypatch: pytest.Monk
     class FakeLoginDialog:
         def __init__(self, client: object) -> None:
             self.must_change_password = exec_calls["n"] == 0  # first pass forces change
+            self.mfa_required = False
             self.entered_password = "JustTyped1!"
 
         def exec(self) -> int:

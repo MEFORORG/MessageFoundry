@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Authentication + user-administration routes, registered onto the app by :func:`add_auth_routes`.
 
 Kept out of ``app.py`` to keep that file focused on the engine surface. Every route here is
@@ -25,10 +27,19 @@ from messagefoundry.api.auth_models import (
     CurrentUser,
     LoginRequest,
     LoginResponse,
+    MfaConfirmRequest,
+    MfaConfirmResponse,
+    MfaEnrollResponse,
+    MfaStatusResponse,
+    MfaVerifyRequest,
     PasswordChangeRequest,
+    PasswordResetResponse,
     ProvidersInfo,
+    ReauthRequest,
     RoleInfo,
     RolesUpdateRequest,
+    SecurityEventInfo,
+    SecurityEventsList,
     SessionInfo,
     SessionList,
     SimpleMessage,
@@ -36,7 +47,13 @@ from messagefoundry.api.auth_models import (
     UserSummary,
     UserUpdateRequest,
 )
-from messagefoundry.api.security import bearer_token, get_auth, require
+from messagefoundry.api.security import (
+    bearer_token,
+    get_auth,
+    require,
+    require_reauth_only,
+    require_step_up,
+)
 from messagefoundry.auth import (
     BUILTIN_ROLE_PERMISSIONS,
     ROLE_METADATA,
@@ -96,9 +113,14 @@ def _current_user(identity: Identity) -> CurrentUser:
     )
 
 
-def _login_response(token: str, identity: Identity, must_change: bool) -> LoginResponse:
+def _login_response(
+    token: str, identity: Identity, must_change: bool, *, mfa_required: bool = False
+) -> LoginResponse:
     return LoginResponse(
-        token=token, must_change_password=must_change, user=_current_user(identity)
+        token=token,
+        must_change_password=must_change,
+        mfa_required=mfa_required,
+        user=_current_user(identity),
     )
 
 
@@ -156,7 +178,12 @@ def add_auth_routes(app: FastAPI) -> None:
         )
         if not outcome.ok or outcome.token is None or outcome.identity is None:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
-        return _login_response(outcome.token, outcome.identity, outcome.must_change_password)
+        return _login_response(
+            outcome.token,
+            outcome.identity,
+            outcome.must_change_password,
+            mfa_required=outcome.mfa_required,
+        )
 
     @app.post("/auth/negotiate", response_model=LoginResponse)
     async def negotiate(
@@ -204,12 +231,119 @@ def add_auth_routes(app: FastAPI) -> None:
             )
         if not await service.verify_current_password(identity, body.current_password):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "current password is incorrect")
-        violations = await service.change_password(identity, body.new_password)
+        violations = await service.change_password(
+            identity, body.new_password, client=_client(request)
+        )
         if violations:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "password must " + "; ".join(violations)
             )
         return SimpleMessage(detail="password changed; please sign in again")
+
+    @app.post("/me/reauth", response_model=SimpleMessage)
+    async def reauth(
+        body: ReauthRequest,
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require()),
+    ) -> SimpleMessage:
+        """Step-up re-verification (ASVS 7.5.3): re-prove the current credential to refresh this
+        session's step-up window so it may perform highly sensitive operations for the configured
+        period. Rate-limited like the password change; a failure is a 403 and performs nothing."""
+        if not service.allow_login_attempt(_client(request)):
+            raise _rate_limited(request, "reauth")
+        token = bearer_token(request)
+        if token is None or not await service.reauth(
+            identity, body.password, token=token, client=_client(request)
+        ):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
+        return SimpleMessage(detail="re-verified")
+
+    # --- MFA: native TOTP second factor (WP-14, ASVS 6.3.3) ------------------
+
+    @app.post("/auth/mfa-verify", response_model=SimpleMessage)
+    async def mfa_verify(
+        body: MfaVerifyRequest,
+        request: Request,
+        service: AuthService = Depends(_service),
+        _: Identity = Depends(require()),
+    ) -> SimpleMessage:
+        """Satisfy the current session's second factor with a TOTP code or a single-use recovery code.
+        Authenticated but **not** step-up/MFA-gated (this is *how* a session becomes MFA-satisfied);
+        rate-limited like login. A wrong code is a 401 and changes nothing."""
+        if not service.allow_login_attempt(_client(request)):
+            raise _rate_limited(request, "mfa-verify")
+        token = bearer_token(request)
+        if token is None or not await service.verify_mfa(token, body.code, client=_client(request)):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid code")
+        return SimpleMessage(detail="verified")
+
+    @app.get("/me/mfa", response_model=MfaStatusResponse)
+    async def my_mfa(
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require()),
+    ) -> MfaStatusResponse:
+        """The caller's current MFA posture (enabled, enrolled-at, recovery codes left, required)."""
+        st = await service.mfa_status(identity)
+        return MfaStatusResponse(
+            enabled=st.enabled,
+            enrolled_at=st.enrolled_at,
+            recovery_codes_remaining=st.recovery_codes_remaining,
+            required=st.required,
+        )
+
+    @app.post("/me/mfa/enroll", response_model=MfaEnrollResponse)
+    async def enroll_mfa(
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_reauth_only()),
+    ) -> MfaEnrollResponse:
+        """Begin TOTP enrollment: stage a secret and return it + the ``otpauth://`` URI for the QR.
+        Gated by a recent **password** step-up (not MFA — you may have none yet); not active until
+        confirmed via ``/me/mfa/confirm``."""
+        if identity.auth_provider is AuthProvider.AD:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "AD accounts use directory MFA, not an engine TOTP"
+            )
+        try:
+            enroll = await service.begin_mfa_enrollment(identity)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return MfaEnrollResponse(secret=enroll.secret, otpauth_uri=enroll.otpauth_uri)
+
+    @app.post("/me/mfa/confirm", response_model=MfaConfirmResponse)
+    async def confirm_mfa(
+        body: MfaConfirmRequest,
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_reauth_only()),
+    ) -> MfaConfirmResponse:
+        """Confirm a staged enrollment by proving a live TOTP code; activates MFA and returns the
+        single-use recovery codes (shown **once** — save them). A wrong code is a 400."""
+        if not service.allow_login_attempt(_client(request)):
+            raise _rate_limited(request, "mfa-confirm")
+        token = bearer_token(request)
+        if token is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
+        try:
+            codes = await service.confirm_mfa_enrollment(
+                identity, body.code, token=token, client=_client(request)
+            )
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        if codes is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid code")
+        return MfaConfirmResponse(recovery_codes=codes)
+
+    @app.delete("/me/mfa", response_model=SimpleMessage)
+    async def disable_my_mfa(
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_step_up()),
+    ) -> SimpleMessage:
+        """Self-service: turn off the caller's TOTP MFA. Step-up gated — you prove your current factor
+        (a TOTP or recovery code via ``/auth/mfa-verify``) and a recent password."""
+        await service.disable_mfa(identity, client=_client(request))
+        return SimpleMessage(detail="MFA disabled")
 
     # --- self-service session inventory (WP-10, ASVS 7.5.2/7.4.5) -------------
 
@@ -222,6 +356,19 @@ def add_auth_routes(app: FastAPI) -> None:
         current = hash_token(bearer_token(request) or "")
         sessions = await service.list_sessions(identity.user_id)
         return SessionList(sessions=[_session_info(s, current) for s in sessions])
+
+    @app.get("/me/security-events", response_model=SecurityEventsList)
+    async def my_security_events(
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require()),
+        limit: int = Query(100, ge=1, le=1000),
+    ) -> SecurityEventsList:
+        """The caller's own security-event history (WP-L3-05, ASVS 6.3.5/6.3.7): the audited ``auth.*``
+        actions on their account (sign-ins, lockouts, password changes), most-recent-first. The
+        out-of-band email push complements this for events the user should learn of without logging in
+        (and for admin-initiated changes, whose audit actor is the admin)."""
+        rows = await service.security_events_for(identity.username, limit=limit)
+        return SecurityEventsList(events=[SecurityEventInfo(**r) for r in rows])
 
     @app.delete("/me/sessions/{session_id}", response_model=SimpleMessage)
     async def revoke_my_session(
@@ -276,7 +423,7 @@ def add_auth_routes(app: FastAPI) -> None:
     async def create_user(
         body: UserCreateRequest,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> UserSummary:
         _validate_roles(body.roles)
         if await service.store.get_user_by_username(body.username) is not None:
@@ -303,7 +450,7 @@ def add_auth_routes(app: FastAPI) -> None:
         user_id: str,
         body: UserUpdateRequest,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         current = await service.store.get_user(user_id)
         if current is None:
@@ -327,7 +474,7 @@ def add_auth_routes(app: FastAPI) -> None:
     async def delete_user(
         user_id: str,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         if user_id == identity.user_id:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot delete your own account")
@@ -340,7 +487,7 @@ def add_auth_routes(app: FastAPI) -> None:
     async def admin_revoke_user_sessions(
         user_id: str,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         """Force-sign-out: revoke all of a user's sessions (e.g. after a compromise or offboarding)."""
         if await service.store.get_user(user_id) is None:
@@ -353,7 +500,7 @@ def add_auth_routes(app: FastAPI) -> None:
         user_id: str,
         body: RolesUpdateRequest,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         _validate_roles(body.roles)
         user = await service.store.get_user(user_id)
@@ -369,6 +516,51 @@ def add_auth_routes(app: FastAPI) -> None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot remove the last administrator")
         await service.set_roles(user_id, body.roles, actor=identity.username)
         return SimpleMessage(detail="roles updated")
+
+    @app.post("/users/{user_id}/reset-password", response_model=PasswordResetResponse)
+    async def reset_user_password(
+        user_id: str,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+    ) -> PasswordResetResponse:
+        """Admin password reset (ASVS 6.4.6 / WP-L3-12): issue a one-time, must-change credential the
+        administrator never keeps. Returned **once** for out-of-band delivery; the affected user is also
+        notified by email. Use change-password for your own account."""
+        if user_id == identity.user_id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "use change-password for your own account"
+            )
+        try:
+            temp = await service.admin_reset_password(user_id, actor=identity.username)
+        except ValueError as exc:
+            detail = str(exc)
+            code = (
+                status.HTTP_404_NOT_FOUND
+                if detail == "no such user"
+                else status.HTTP_400_BAD_REQUEST
+            )
+            raise HTTPException(code, detail) from exc
+        return PasswordResetResponse(temp_password=temp)
+
+    @app.post("/users/{user_id}/reset-mfa", response_model=SimpleMessage)
+    async def reset_user_mfa(
+        user_id: str,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+    ) -> SimpleMessage:
+        """Admin MFA reset (lost authenticator + no recovery codes): clear the user's TOTP enrollment
+        and revoke their sessions so they re-enroll. The acting admin is itself step-up + MFA gated."""
+        try:
+            await service.admin_reset_mfa(user_id, actor=identity.username)
+        except ValueError as exc:
+            detail = str(exc)
+            code = (
+                status.HTTP_404_NOT_FOUND
+                if detail == "no such user"
+                else status.HTTP_400_BAD_REQUEST
+            )
+            raise HTTPException(code, detail) from exc
+        return SimpleMessage(detail="MFA reset")
 
     @app.get("/users/{user_id}/channel-scope", response_model=ChannelScope)
     async def get_channel_scope(
@@ -386,7 +578,7 @@ def add_auth_routes(app: FastAPI) -> None:
         user_id: str,
         body: ChannelScope,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         """Set a user's per-channel RBAC scope (``channels: null`` = all). Administrators are always
         all-channels, so a scope set on one has no effect."""
@@ -411,7 +603,7 @@ def add_auth_routes(app: FastAPI) -> None:
     async def set_ad_group_map(
         body: AdGroupMap,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         _validate_roles([e.role for e in body.entries])
         await service.set_ad_group_map(
@@ -433,7 +625,7 @@ def add_auth_routes(app: FastAPI) -> None:
     async def set_ad_group_scope_map(
         body: AdGroupScopeMap,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require(Permission.USERS_MANAGE)),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
         await service.set_ad_group_scope_map(
             [(e.ad_group, e.channel) for e in body.entries], actor=identity.username

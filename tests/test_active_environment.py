@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The active-environment accessor for per-face transform logic (current_environment)."""
 
 from __future__ import annotations

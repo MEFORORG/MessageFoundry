@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """End-to-end load run against a real engine on a temp SQLite DB.
 
 Serves ``harness/config/load`` (small fan-out, cheap transform, free ports) via the managed app, then
@@ -25,25 +27,57 @@ from harness.load.runner import PreflightError, run_load
 _LOAD_CONFIG = Path("harness/config/load")
 
 
-def _free_port() -> int:
+def _reserve_port() -> socket.socket:
+    """Reserve a free loopback port by binding a socket to port 0 and KEEPING IT OPEN.
+
+    Returns the still-bound socket; read its port via ``.getsockname()[1]``. Closing a socket just to
+    learn its port (the old ``_free_port``) opens a TOCTOU window where the OS reassigns that freed
+    ephemeral port to another process before the real server binds it — surfacing under contended CI
+    as ``[Errno 98] address already in use``. Holding the socket open removes that race: the API
+    socket is handed straight to uvicorn (never closed), and the MLLP sockets are released only
+    immediately before the engine binds them. ``SO_REUSEADDR`` lets the port be re-bound the instant
+    the reservation socket closes."""
     s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("127.0.0.1", 0))
-    port = int(s.getsockname()[1])
-    s.close()
-    return port
+    return s
+
+
+def _free_port() -> int:
+    """A likely-free loopback port (the reservation socket is closed immediately). Use only where the
+    code under test must itself bind the port (e.g. the load runner's own results sink) or merely
+    needs nothing listening — NOT for a port this fixture binds, which uses :func:`_reserve_port` to
+    hold the socket open and avoid the close→rebind race."""
+    s = _reserve_port()
+    try:
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
 
 
 @pytest.fixture
 def engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[str, int, int]]:
     """Serve the load config with small fan-out + free ports. Yields (api_url, adt_port, sink_port)."""
-    adt_port, results_port, other_port = _free_port(), _free_port(), _free_port()
-    sink_port = _free_port()
+    # Reserve every port up front while all sockets are held open, so the OS hands out mutually
+    # distinct ports (and none can be re-handed to a sibling reservation). The MLLP ports are released
+    # just before the engine binds them; the API socket is never closed — it is handed straight to
+    # uvicorn, so there is no close→rebind gap to race on.
+    adt_sock, results_sock, other_sock, sink_sock, api_sock = (
+        _reserve_port(),
+        _reserve_port(),
+        _reserve_port(),
+        _reserve_port(),
+        _reserve_port(),
+    )
+    adt_port = adt_sock.getsockname()[1]
+    sink_port = sink_sock.getsockname()[1]
+    api_port = api_sock.getsockname()[1]
     monkeypatch.setenv("MEFOR_LOAD_FANOUT", "2")
     monkeypatch.setenv("MEFOR_LOAD_RESULTS_FANOUT", "1")
     monkeypatch.setenv("MEFOR_LOAD_TRANSFORM", "cheap")
     monkeypatch.setenv("MEFOR_LOAD_ADT_PORT", str(adt_port))
-    monkeypatch.setenv("MEFOR_LOAD_RESULTS_PORT", str(results_port))
-    monkeypatch.setenv("MEFOR_LOAD_OTHER_PORT", str(other_port))
+    monkeypatch.setenv("MEFOR_LOAD_RESULTS_PORT", str(results_sock.getsockname()[1]))
+    monkeypatch.setenv("MEFOR_LOAD_OTHER_PORT", str(other_sock.getsockname()[1]))
     monkeypatch.setenv("MEFOR_LOAD_SINK_PORT", str(sink_port))
 
     from messagefoundry.api import create_managed_app
@@ -51,9 +85,13 @@ def engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[st
     app = create_managed_app(
         db_path=tmp_path / "load.db", config_dir=_LOAD_CONFIG, poll_interval=0.05
     )
-    api_port = _free_port()
     uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="warning"))
-    thread = threading.Thread(target=uv.run, daemon=True)
+    # Release the MLLP ports at the last moment (SO_REUSEADDR + never-listened sockets → immediately
+    # re-bindable) so the engine's listeners can claim them on startup; hand the still-bound API socket
+    # to uvicorn directly.
+    for s in (adt_sock, results_sock, other_sock, sink_sock):
+        s.close()
+    thread = threading.Thread(target=lambda: uv.run(sockets=[api_sock]), daemon=True)
     thread.start()
     deadline = time.time() + 15
     while not uv.started:
@@ -65,6 +103,7 @@ def engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[st
     finally:
         uv.should_exit = True
         thread.join(timeout=15)
+        api_sock.close()  # idempotent; uvicorn closes it on clean shutdown, this covers a failed start
 
 
 def _profile(adt_port: int) -> object:
@@ -118,7 +157,8 @@ def test_run_load_end_to_end_no_loss(engine: tuple[str, int, int]) -> None:
 
 
 def test_run_load_preflight_fails_on_wrong_port() -> None:
-    # No engine on this port → preflight raises rather than running a doomed load.
+    # No engine on this port → preflight raises rather than running a doomed load. (Free ports here:
+    # the runner binds its own sink to sink_port, and the adt target just needs nothing listening.)
     profile = _profile(_free_port())
     with pytest.raises(PreflightError):
         asyncio.run(

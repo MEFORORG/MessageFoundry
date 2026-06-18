@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Dry-run a wiring Registry against messages — pure routing/handling, no I/O.
 
 Runs a message through an inbound connection's Router and Handler(s) exactly as the engine would,
@@ -10,17 +12,15 @@ engine (:class:`~messagefoundry.pipeline.wiring_runner.RegistryRunner`) so both 
 from __future__ import annotations
 
 import logging
-import re
-from collections.abc import Mapping
+import time
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
-from messagefoundry.config.code_sets import activated as code_sets_activated
 from messagefoundry.config.models import ContentType
-from messagefoundry.config.reference import activated as reference_activated
-from messagefoundry.config.state import activated as state_activated
+from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.wiring import (
     HandlerFn,
     InboundConnection,
@@ -35,6 +35,7 @@ from messagefoundry.parsing import (
     Peek,
     RawMessage,
     normalize,
+    split_batch,
     summarize,
     validate,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "dry_run",
     "select_inbound",
     "read_messages",
+    "read_message_sets",
     "split_messages",
 ]
 
@@ -185,8 +187,18 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
     return view
 
 
-def route_message(registry: Registry, ic: InboundConnection, raw: str | bytes) -> RouteOutcome:
+def route_message(
+    registry: Registry,
+    ic: InboundConnection,
+    raw: str | bytes,
+    *,
+    ingest_time: float | None = None,
+) -> RouteOutcome:
     """Run ``ic``'s Router then the named Handlers; return what they selected and would send.
+
+    ``ingest_time`` (epoch seconds) is the value a Handler's ``current_ingest_time()`` resolves to in
+    this preview; the CLI passes ``time.time()`` so a now-defaulting transform previews realistically. It
+    is ``None`` (the default) for a pure call, where ``current_ingest_time()`` returns ``None``.
 
     Convenience recomposition of :func:`route_only` + :func:`transform_one` for the dry-run / Test
     Bench / CLI preview, which want the whole routing outcome in one shot. The live **staged** engine
@@ -210,10 +222,20 @@ def route_message(registry: Registry, ic: InboundConnection, raw: str | bytes) -
     sim_reference = _dry_run_reference_view(registry)
     deliveries: list[DeliveryPreview] = []
     state_ops: list[StateOpPreview] = []
-    with (
-        code_sets_activated(registry.code_sets),
-        reference_activated(sim_reference),
-        state_activated(sim_state),
+    # Activate the same run-scoped providers the live engine uses (via the shared run_context registry),
+    # so router + handlers resolve identically here and in the staged engine. Dry-run runs router and
+    # transform in one block, so it uses the transform (superset) phase; it has no live environment, so
+    # active_environment=None — current_environment() then returns None, exactly as when dry-run left the
+    # environment unset. A provider that needs live infrastructure (db_lookup) refuses to run here.
+    with run_contexts(
+        RunContext(
+            code_sets=registry.code_sets,
+            reference_view=sim_reference,
+            state_view=sim_state,
+            active_environment=None,
+            ingest_time=ingest_time,
+        ),
+        phase="transform",
     ):
         names = route_only(registry, ic, raw)
         ct = ic.content_type.value
@@ -275,7 +297,7 @@ def _dry_run_raw(registry: Registry, ic: InboundConnection, raw: str | bytes) ->
     """Dry-run a non-HL7 inbound (ADR 0004): no HL7 peek/validate; route the body as a RawMessage."""
     text = raw if isinstance(raw, str) else raw.decode("utf-8")
     try:
-        outcome = route_message(registry, ic, text)
+        outcome = route_message(registry, ic, text, ingest_time=time.time())
     except Exception as exc:  # a router/handler script raised
         return DryRunResult(
             inbound=ic.name,
@@ -328,7 +350,7 @@ def dry_run(registry: Registry, raw: str | bytes, *, inbound: str | None = None)
             )
 
     try:
-        outcome = route_message(registry, ic, text)
+        outcome = route_message(registry, ic, text, ingest_time=time.time())
     except Exception as exc:  # a router/handler script raised
         return DryRunResult(
             inbound=ic.name,
@@ -357,15 +379,11 @@ def split_messages(raw: bytes) -> list[str]:
     """Split a possibly-batched HL7 payload into individual messages on ``MSH`` boundaries.
 
     A real file connection delivers each ``MSH``-delimited message separately; mirror that so a
-    dry-run / commit-check sees every message in a batch file, not just the first.
+    dry-run / commit-check sees every message in a batch file, not just the first. Delegates to the
+    shared :func:`messagefoundry.parsing.split.split_batch` so the live File-source ingress split
+    (transports/file.py) and this dry-run / ``messagefoundry check`` path stay byte-identical.
     """
-    text = normalize(raw)  # \r-delimited
-    # Split before each non-leading MSH segment. Match `\rMSH` without the field separator so a
-    # batch whose MSH-1 isn't `|` (e.g. `MSH^...`) still splits per-message instead of parsing as
-    # one giant message — after \r a segment id is always 3 chars, so only MSH starts with "MSH".
-    chunks = re.split(r"(?=\rMSH)", text)
-    messages = [c.lstrip("\r") for c in chunks if c.strip()]
-    return messages or [text]
+    return split_batch(raw)
 
 
 def read_messages(paths: list[str]) -> list[tuple[str, str, str]]:
@@ -392,4 +410,41 @@ def read_messages(paths: list[str]) -> list[tuple[str, str, str]]:
                 out.append((f.name, str(f), messages[0]))
             else:
                 out.extend((f"{f.name} [{i}]", str(f), m) for i, m in enumerate(messages, 1))
+    return out
+
+
+def read_message_sets(
+    root: str | Path, inbound_names: Collection[str]
+) -> list[tuple[str, str, str, str | None]]:
+    """Like :func:`read_messages` but **recursive** and feed-aware, for ``messagefoundry check`` (#11).
+
+    A fixture whose top-level subdirectory under ``root`` names an inbound connection
+    (``root/IB_FOO/…``) is *pinned* to that inbound (its 4th tuple field is ``"IB_FOO"``), so it is
+    dry-run only against that feed; a fixture directly under ``root``, or under a subdirectory that
+    names no inbound, is *unmapped* (``None``) and the caller dry-runs it against **every** inbound —
+    the all-×-all fallback. Returns ``(label, file_path, content, target_inbound | None)`` per message
+    (a batch file yields one entry per message). A single-file ``root`` is one unmapped fixture.
+    Raises ``FileNotFoundError`` for a missing ``root``.
+    """
+    names = set(inbound_names)
+    root_path = Path(root)
+    pairs: list[tuple[Path, str | None]] = []
+    if root_path.is_dir():
+        for f in sorted(root_path.rglob("*.hl7")):
+            parts = f.relative_to(root_path).parts
+            # parts[0] is the top-level component under root: a feed name (pin) when it's a real
+            # subdir matching an inbound, else the bare filename (a top-level fixture → unmapped).
+            target = parts[0] if len(parts) >= 2 and parts[0] in names else None
+            pairs.append((f, target))
+    elif root_path.is_file():
+        pairs.append((root_path, None))
+    else:
+        raise FileNotFoundError(f"no such file or directory: {root_path}")
+    out: list[tuple[str, str, str, str | None]] = []
+    for f, target in pairs:
+        messages = split_messages(f.read_bytes())
+        if len(messages) == 1:
+            out.append((f.name, str(f), messages[0], target))
+        else:
+            out.extend((f"{f.name} [{i}]", str(f), m, target) for i, m in enumerate(messages, 1))
     return out

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Users administration page — visible only to users holding ``users:manage``.
 
 Lists users with their roles and supports create / set-roles / delete. All operations go through the
@@ -20,6 +22,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from messagefoundry.api.auth_models import UserSummary
+from messagefoundry.console._async import AsyncRunner
 from messagefoundry.console.client import ApiError, EngineClient
 
 
@@ -35,9 +39,15 @@ class UsersPage(QWidget):
 
     error = Signal(str)
 
-    def __init__(self, client: EngineClient) -> None:
+    def __init__(self, client: EngineClient, *, poll_client: EngineClient | None = None) -> None:
         super().__init__()
-        self._client = client
+        self._client = client  # admin actions — main thread, may step-up/MFA
+        self._poll = poll_client or client  # user-list read — runs off the main thread
+        self._runner = AsyncRunner(self)
+        self._loading = False  # in-flight reload guard (don't pile up during a slow call)
+        # A reload requested while one is in flight is latched (not dropped) and re-fired on
+        # completion, so a post-action reload (create/delete/set-roles) isn't lost during a tick.
+        self._pending = False
         self._row_ids: list[str] = []  # user_id per table row
         self._row_scopes: list[list[str] | None] = []  # channel scope per row (None = all)
         # current roles per row, to prefill the Set-roles dialog (H3)
@@ -83,11 +93,41 @@ class UsersPage(QWidget):
         self.reload()
 
     def reload(self) -> None:
-        try:
-            users = self._client.list_users()
-        except ApiError as exc:
-            self.error.emit(str(exc))
+        # Read the user list OFF the main thread; apply on the main thread (a slow/wedged engine
+        # would otherwise freeze the GUI for the whole /users call).
+        if self._loading:
+            self._pending = True  # latch — re-fire when the in-flight read completes (don't drop)
             return
+        self._pending = False
+        self._loading = True
+        self._runner.submit(self._fetch, on_done=self._apply, on_error=self._on_error)
+
+    def stop(self) -> None:
+        """Stop the background runner (call on window close) so a late result can't touch dead widgets."""
+        self._runner.stop()
+
+    def _fetch(self) -> list[UserSummary]:
+        """Runs on a worker thread — only blocking I/O, no widget access."""
+        return self._poll.list_users()
+
+    def _on_error(self, exc: BaseException) -> None:
+        self._loading = False
+        self.error.emit(str(exc))
+        self._drain_pending()
+
+    def _drain_pending(self) -> bool:
+        """Re-fire a reload that was latched while one was in flight. Returns True if it did."""
+        if not self._pending:
+            return False
+        self._pending = False
+        self.reload()
+        return True
+
+    def _apply(self, users: list[UserSummary]) -> None:
+        """Runs on the main thread (result slot) — safe to touch widgets."""
+        self._loading = False
+        if self._drain_pending():
+            return  # a reload was requested mid-flight — re-fire it, skip this superseded result
         self._row_ids = [u.id for u in users]
         self._row_scopes = [u.channel_scope for u in users]
         self._row_roles = [list(u.roles) for u in users]

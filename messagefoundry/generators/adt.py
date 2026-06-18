@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Generate a corpus of conformant HL7 v2.5.1 **ADT** messages for testing.
 
 For every ADT trigger event defined in 2.5.1 (A01–A62, excluding the query event A19 and

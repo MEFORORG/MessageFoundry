@@ -31,11 +31,11 @@ IDE are separate surfaces over the localhost API.
 | File source + destination | ✅ | Poll source is leader-gated in cluster mode |
 | RemoteFile — SFTP / FTP / FTPS | ✅ | `[sftp]` extra (paramiko); FTP/FTPS via stdlib |
 | TCP source + destination | ✅ | Generic byte-stream framing |
-| DATABASE destination + DB-IN poll source | 🔬→🔨 | aioodbc/SQL-Server path; relabel to production with the SQL Server promotion (Gate #2) |
+| DATABASE destination + DB-IN poll source | ✅ | Production (aioodbc/SQL Server); live round-trip CI-tested (#233) |
 | REST destination | ✅ | ADR 0003 |
 | SOAP destination | ✅ | ADR 0003 |
 | Payload-agnostic ingress (`content_type` / `RawMessage`) | ✅ | ADR 0004 — non-HL7 bodies skip HL7 parsing |
-| MLLP-over-TLS | 🔨 | Gate #4 (WP-13b) |
+| MLLP-over-TLS | ✅ | Gate #4 (WP-13b) |
 | REST-IN / SOAP-IN inbound HTTP-listener sources | ⏭️ | Destinations exist; inbound listeners deferred |
 | MLLP persistent connection pooling | ⏭️ | Throughput optimization |
 
@@ -80,10 +80,10 @@ IDE are separate surfaces over the localhost API.
 |---------|:--:|-------|
 | SQLite (WAL) — default | ✅ | Single-node/dev; `synchronous=NORMAL` |
 | PostgreSQL backend | ✅ | Production single-node; advisory-lock concurrency fixes; row leases |
-| SQL Server backend | 🔬→🔨 | **No staged pipeline today** (`supports_ingest_stage=False`); **promote to production** is the largest v0.1 item |
+| SQL Server backend | ✅ | Production: full staged pipeline + query/response (ADR 0001/0013) on a real SQL Server, CI-tested (store suite + load smoke) |
 | Store abstraction (`Store` protocol / `open_store`) | ✅ | Single backend-selection seam |
-| Encryption-at-rest (AES-256-GCM) + key rotation | ✅ (SQLite, PG) · 🔨 (SQL Server) | SQL Server parity lands with promotion |
-| Retention / purge / maintenance | ✅ (SQLite, PG) · 🔨 (SQL Server) | |
+| Encryption-at-rest (AES-256-GCM) + key rotation | ✅ (SQLite, PG, SQL Server) | |
+| Retention / purge / maintenance | ✅ (SQLite, PG, SQL Server) | |
 | SQLite → server-DB data migration | ⏭️ | v0.1 is **greenfield-only** (drain SQLite before cut-over) |
 | MySQL / Oracle backends | 🧭 | Long-term |
 
@@ -95,9 +95,9 @@ IDE are separate surfaces over the localhost API.
 | Leader election + leader-gated singletons | ✅ | Track B Step 4 |
 | Leader-gated poll-source intake | ✅ | Track B Step 4b |
 | Row leases + expiry-reclaim sweep | ✅ | Track B Step 2 |
-| **Active-passive engine HA** (primary/failover) | 🔨 | v0.1 HA model — leader-gate the whole graph |
-| Leadership lease + **self-fencing** (split-brain guard) | 🔨 | The one core HA correctness item |
-| `GET /cluster/status` | 🔨 | Read-only observability for a cluster |
+| **Active-passive engine HA** (primary/failover) | ✅ | v0.1 HA model — leader-gates the whole graph; both PostgreSQL + SQL Server |
+| Leadership lease + **self-fencing** (split-brain guard) | ✅ | The one core HA correctness item |
+| `GET /cluster/status` | ✅ | Read-only observability for a cluster |
 | **Active-active horizontal scale-out** (lane ownership, `renew_leases` heartbeat, cross-node FIFO) | ⏭️ | **0.2 headline**; code parked, run in active-passive mode for v0.1 |
 | DB-tier HA (replication / Always On) | — | Delegated to the DB admins; not built by MF |
 
@@ -111,15 +111,15 @@ IDE are separate surfaces over the localhost API.
 | Opaque sessions + full audit log (hash-chained, tamper-evident) | ✅ | |
 | Encryption-at-rest for message bodies | ✅ | See §5 |
 | API bind-guard (`serve --allow-insecure-bind`, fail-closed) | ✅ | |
-| MLLP/inbound bind-guard | 🔨 | Gate #4 — refuse non-loopback plaintext |
-| Native API TLS (uvicorn) | 🔨 | Gate #4 (WP-13a); HSTS already activates over https |
-| MLLP-over-TLS | 🔨 | Gate #4 (WP-13b) |
-| Reverse-proxy TLS termination support (`trusted_proxies`) | 🔨 | Offered alongside native TLS |
+| MLLP/inbound bind-guard | ✅ | Gate #4 — refuse non-loopback plaintext |
+| Native API TLS (uvicorn) | ✅ | Gate #4 (WP-13a); HSTS already activates over https |
+| MLLP-over-TLS | ✅ | Gate #4 (WP-13b) |
+| Reverse-proxy TLS termination support (`trusted_proxies`) | ✅ | Offered alongside native TLS |
 | TOTP MFA (local users) | ⏭️ | 0.2 (WP-14); off-loopback v0.1 leans on AD/Entra IdP-MFA or an MFA-terminating proxy |
 | Federated SSO — OAuth 2.0 / OIDC / SAML (Entra) | ⏭️ | 0.2 — admin browser SSO + service-to-service OAuth2; a dedicated federated-SSO ADR precedes the build |
 | mTLS client/peer auth (console/IDE→API; MLLP partner) | ⏭️ | 0.2 — v0.1 native TLS is server-identity only |
 | SMART on FHIR | 🧭 | Later — OAuth2 authZ profile for FHIR REST; needs a FHIR transport first (none today) |
-| OWASP ASVS L2 posture | ✅ | 131 Pass / 22 Partial / 5 Fail (all deferred-until-off-loopback) |
+| OWASP ASVS L3 posture | ✅ | Self-assessed against **Level 3** (345 reqs): **178 Pass / 20 Partial / 6 Fail / 141 N-A** (post-WP-L3-16 step-up + the WP-L3-10/18 L3-C/D free lifts, atop #289/#298/#301/#303/#276/#281; was 177/21/6/141 after the free lifts, 175/23/6/141 after L3-B, 155/40/9/141 at the re-target). The 6 Fails (MFA, off-box logs, + 4 L3-only) are deferred-by-design or off-loopback-conditional |
 
 ## 8. PHI / Compliance
 
@@ -127,8 +127,8 @@ IDE are separate surfaces over the localhost API.
 |---------|:--:|-------|
 | PHI-at-rest encryption + user-attributed PHI-access audit | ✅ | |
 | python-hl7 PHI-logger silencing + control-char scrub filter | ✅ | Targeted, not a general redactor |
-| **Full PHI log redaction** (chained-exception traceback scrubbing + proof test) | 🔨 | **Gate #1** — safe to run above DEBUG with PHI |
-| `serve` prod-DEBUG guard | 🔨 | Gate #1 |
+| **Full PHI log redaction** (chained-exception traceback scrubbing + proof test) | ✅ | **Gate #1** — safe to run above DEBUG with PHI |
+| `serve` prod-DEBUG guard | ✅ | Gate #1 |
 | structlog / JSON logs / off-box (SIEM) forwarding | ⏭️ | Gate #1 closes without structlog |
 | De-identification framework | 🧭 | Planned; centralize when built |
 

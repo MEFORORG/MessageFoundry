@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Sender + governor driven against the real correlation sink on loopback (no engine).
 
 The sink doubles as the peer here: it ACKs each frame (so the sender records ACK latency) *and*

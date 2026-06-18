@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Durable message store + queue (SQLite WAL, transactional inbox/outbox).
 
 The store *is* the queue: persisting an inbound message and its per-destination outbox

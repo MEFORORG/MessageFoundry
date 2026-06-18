@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Service settings: TOML + env + CLI loading with CLI > env > file > default precedence."""
 
 from __future__ import annotations
@@ -183,6 +185,51 @@ def test_invalid_level_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
         load_settings(environ={"MEFOR_LOGGING_LEVEL": "loud"})
 
 
+# --- [logging] structured format + off-box forwarding (sec-offbox-log) --------
+
+
+def test_logging_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    log = load_settings(environ={}).logging
+    assert log.format.value == "text"  # stdout unchanged by default
+    assert log.forward_enabled is False
+    assert log.forward_port == 514
+    assert log.forward_protocol.value == "udp"
+    assert log.forward_format.value == "json"  # JSON is the SIEM-friendly off-box default
+
+
+def test_logging_forward_enabled_requires_host(tmp_path: Path) -> None:
+    cfg = _write(tmp_path / "messagefoundry.toml", "[logging]\nforward_enabled = true\n")
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_logging_forward_settings_parsed(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[logging]\nformat = "json"\nforward_enabled = true\nforward_host = "siem.local"\n'
+        'forward_port = 6514\nforward_protocol = "tcp"\nforward_format = "text"\n',
+    )
+    log = load_settings(config_path=cfg, environ={}).logging
+    assert log.format.value == "json"
+    assert log.forward_enabled and log.forward_host == "siem.local"
+    assert log.forward_port == 6514
+    assert log.forward_protocol.value == "tcp"
+    assert log.forward_format.value == "text"
+
+
+def test_logging_forward_port_out_of_range(tmp_path: Path) -> None:
+    cfg = _write(tmp_path / "messagefoundry.toml", "[logging]\nforward_port = 70000\n")
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_logging_invalid_format_rejected(tmp_path: Path) -> None:
+    cfg = _write(tmp_path / "messagefoundry.toml", '[logging]\nformat = "xml"\n')
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
 def test_invalid_backend_rejected(tmp_path: Path) -> None:
     cfg = _write(tmp_path / "messagefoundry.toml", '[store]\nbackend = "mongodb"\n')
     with pytest.raises(ValidationError):
@@ -334,9 +381,9 @@ def test_cluster_parses_from_file_and_env(tmp_path: Path) -> None:
     assert s.cluster.node_timeout_seconds == 7.5  # str env value coerced to float
 
 
-def test_cluster_enabled_requires_postgres_backend(tmp_path: Path) -> None:
+def test_cluster_enabled_requires_server_db_backend(tmp_path: Path) -> None:
     # SQLite is single-node, so enabling cluster coordination on it is refused (cross-section
-    # validator on ServiceSettings).
+    # validator on ServiceSettings). Postgres and SQL Server are the allowed server-DB backends.
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         '[store]\nbackend = "sqlite"\n[cluster]\nenabled = true\n',
@@ -353,6 +400,18 @@ def test_cluster_enabled_on_postgres_is_ok(tmp_path: Path) -> None:
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.cluster.enabled is True and s.store.backend is StoreBackend.POSTGRES
+
+
+def test_cluster_enabled_on_sqlserver_is_ok(tmp_path: Path) -> None:
+    # SQL Server backs active-passive HA (the SqlServerCoordinator leadership lease), so cluster
+    # coordination is allowed on it too (pool_size >= 2 like any clustered server-DB node).
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "sqlserver"\nserver = "mssql"\ndatabase = "d"\nusername = "u"\n'
+        "pool_size = 3\n[cluster]\nenabled = true\n",
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert s.cluster.enabled is True and s.store.backend is StoreBackend.SQLSERVER
 
 
 def test_cluster_disabled_on_sqlite_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -419,8 +478,8 @@ def test_cluster_reclaim_interval_parses(tmp_path: Path) -> None:
 
 
 def test_cluster_enabled_requires_pool_size_at_least_two(tmp_path: Path) -> None:
-    # The leader holds one dedicated pooled connection for its advisory lock, so a pool of 1 would
-    # starve the store — refused at config load (Track B Step 4).
+    # A clustered node drives concurrent background work (maintenance loop + reclaim sweep + workers)
+    # against the pool, so a pool of 1 would serialize everything — refused at config load.
     cfg = _write(
         tmp_path / "messagefoundry.toml",
         '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\npool_size = 1\n'
@@ -452,3 +511,57 @@ def test_cluster_disabled_pool_size_one_is_ok(
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.cluster.enabled is False and s.store.pool_size == 1
+
+
+# --- [cluster] leadership lease + self-fence (Workstream A2) -----------------
+
+
+def test_cluster_lease_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    cfg = _write(tmp_path / "messagefoundry.toml", "")
+    s = load_settings(config_path=cfg, environ={})
+    assert s.cluster.leader_lease_ttl_seconds == 30.0
+    assert s.cluster.leader_fence_timeout_seconds == 20.0
+
+
+def test_cluster_lease_knobs_parse(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\npool_size = 3\n'
+        "[cluster]\nenabled = true\nheartbeat_seconds = 5\n"
+        "leader_fence_timeout_seconds = 12\nleader_lease_ttl_seconds = 20\n",
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert s.cluster.leader_fence_timeout_seconds == 12.0
+    assert s.cluster.leader_lease_ttl_seconds == 20.0
+
+
+def test_cluster_fence_timeout_must_be_positive(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        "[cluster]\nenabled = true\nleader_fence_timeout_seconds = 0\n",
+    )
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_cluster_fence_must_be_below_lease_ttl(tmp_path: Path) -> None:
+    # The split-brain guard requires fence < TTL (the old leader must stop before the lease can expire).
+    # fence == ttl violates it and is refused at config load.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        "[cluster]\nenabled = true\nleader_fence_timeout_seconds = 30\nleader_lease_ttl_seconds = 30\n",
+    )
+    with pytest.raises(ValidationError, match="leader_fence_timeout_seconds"):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_cluster_heartbeat_must_be_below_fence(tmp_path: Path) -> None:
+    # heartbeat must be < fence so a single missed renew doesn't fence the leader.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        "[cluster]\nenabled = true\nheartbeat_seconds = 20\nleader_fence_timeout_seconds = 20\n"
+        "node_timeout_seconds = 40\n",
+    )
+    with pytest.raises(ValidationError, match="leader_fence_timeout_seconds"):
+        load_settings(config_path=cfg, environ={})

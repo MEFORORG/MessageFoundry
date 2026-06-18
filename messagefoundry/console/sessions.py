@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Self-service active-session inventory dialog (the WP-10 console view).
 
 Lists the signed-in user's active sessions (``GET /me/sessions``) and lets them revoke an individual

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """POST /config/reload — apply a code-first graph to the running engine over the API."""
 
 from __future__ import annotations

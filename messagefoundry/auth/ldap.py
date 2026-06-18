@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Active Directory authentication: LDAP simple-bind + nested-group resolution, and Kerberos SSO.
 
 Pure (no FastAPI). ``ldap3`` does a service-account bind to locate the user, then a bind *as the

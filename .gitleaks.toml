@@ -5,7 +5,10 @@
 useDefault = true
 
 [allowlist]
-description = "Ephemeral CI-only credential (SQL Server test container in .github/workflows/ci.yml) — not a real secret"
+description = "Known non-sensitive values that trip the generic-password/api-key rule — NOT real secrets."
 regexes = [
+  # Ephemeral CI-only credential (SQL Server test container in .github/workflows/ci.yml).
   '''Str0ng_P@ssw0rd!''',
+  # Fake test-fixture passphrase (admin-reset rotation test, tests/test_api_auth.py, WP-L3-12).
+  '''rotated-strong-passphrase-7''',
 ]

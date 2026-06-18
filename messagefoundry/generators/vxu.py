@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Generate conformant HL7 v2.5.1 **VXU** (unsolicited vaccination update) messages.
 
 RXA/RXR live in the shared core (also used by RAS), so this is just the spec.

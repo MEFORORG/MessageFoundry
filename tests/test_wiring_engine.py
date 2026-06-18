@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """End-to-end: RegistryRunner runs inbound → Router → Handler(s) → outbox → delivery.
 
 Real file connectors over a temp dir + a real store; drives the runner and polls for the
@@ -6,6 +8,7 @@ observable outcome (file written, store dispositions)."""
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 import pytest
@@ -25,7 +28,9 @@ from messagefoundry.config.wiring import (
     OutboundConnection,
     Registry,
     Send,
+    WiringError,
 )
+from messagefoundry.logging_setup import ControlCharScrubFilter, RedactionFilter
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
@@ -308,6 +313,118 @@ async def test_handler_exception_redacts_phi_from_stored_error(
     assert all("DOE" not in (e["detail"] or "") for e in await store.events_for(mid))
 
 
+# --- Gate #1: PHI must not reach the general LOG (not just the stored error) --------------------
+
+# Distinctive PHI so the absence assertions can't be fooled by timestamps / control-ids.
+PHI_ADT = (
+    "MSH|^~\\&|SENDINGAPP|SENDINGFAC|RECV|RFAC|20260604||ADT^A01|MSG9|P|2.5.1\r"
+    "EVN|A01|20260604\r"
+    "PID|1||Z9998887^^^H^MR||DOE^JANE\r"
+)
+
+
+def _phi_capture() -> tuple[logging.Handler, list[tuple[int, str]]]:
+    """A capture handler wearing the PRODUCTION filter chain (RedactionFilter → ControlCharScrubFilter),
+    collecting each record's final formatted line so a test can assert no PHI survives to the log."""
+    lines: list[tuple[int, str]] = []
+
+    class _Cap(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            lines.append((record.levelno, self.format(record)))
+
+    handler = _Cap(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    handler.addFilter(RedactionFilter())  # same order configure_logging installs them
+    handler.addFilter(ControlCharScrubFilter())
+    return handler, lines
+
+
+def _phi_leaks(lines: list[tuple[int, str]]) -> list[str]:
+    return [
+        line
+        for level, line in lines
+        if level >= logging.WARNING and any(tok in line for tok in ("DOE", "JANE", "Z9998887"))
+    ]
+
+
+async def test_runner_refuses_non_loopback_plaintext_mllp(store: MessageStore) -> None:
+    # §0 exposed-gate (ADR 0002): starting an MLLP listener bound off-loopback without TLS is refused
+    # (the gate fires before the socket binds). TLS-on, loopback, or --allow-insecure-bind would pass.
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection("mllp_in", ConnectionSpec(ConnectorType.MLLP, {"port": 0}), router="r")
+    )
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(reg, store, inbound_bind_host="0.0.0.0", poll_interval=0.02)
+    with pytest.raises(WiringError, match="without TLS"):
+        await runner._start_inbound_unsafe("mllp_in")
+
+
+async def test_pipeline_handler_exception_logs_no_phi(store: MessageStore, tmp_path: Path) -> None:
+    # Gate #1 end-to-end: a Handler that raises carrying the full body must not leak the name/MRN into
+    # the general log at WARNING+ under the production logging config (the global RedactionFilter).
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    (inbox / "a.hl7").write_bytes(PHI_ADT.encode("utf-8"))
+
+    def boom(m):  # type: ignore[no-untyped-def]
+        raise ValueError(f"cannot transform {m}")  # str(m) is the full HL7 body (PHI)
+
+    reg = _registry(inbox, outdir, lambda m: ["boom"], {"boom": boom})
+    handler, lines = _phi_capture()
+    root = logging.getLogger()
+    root.addHandler(handler)
+    prior = root.level
+    root.setLevel(logging.DEBUG)
+    runner = await _run(reg, store)
+    try:
+        await _until_message(store, MessageStatus.ERROR.value)
+    finally:
+        await runner.stop()
+        root.removeHandler(handler)
+        root.setLevel(prior)
+    # Non-vacuous: the failure must actually surface at WARNING+ (else "no PHI" proves nothing).
+    assert any(level >= logging.WARNING for level, _ in lines), "expected a WARNING+ log on failure"
+    assert _phi_leaks(lines) == [], f"PHI leaked to logs: {_phi_leaks(lines)}"
+
+
+async def test_pipeline_delivery_failure_logs_no_phi(store: MessageStore, tmp_path: Path) -> None:
+    # Gate #1 end-to-end: a delivery failure whose exception carries the transformed body must not leak
+    # the name/MRN into the general log at WARNING+ under the production logging config.
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+
+    class _RejectsWithPayload:
+        async def send(self, payload: str) -> None:
+            # A generic (non-DeliveryError) exception → the delivery worker's `except Exception` branch,
+            # which logs a WARNING and dead-letters. The exc carries the transformed body (PHI); the
+            # WARNING must still not surface it (the worker logs the type only; the filter is the backstop).
+            raise RuntimeError(f"downstream blew up on {payload}")
+
+        async def aclose(self) -> None:
+            return None
+
+    reg = _retry_registry(inbox, outdir, RetryPolicy(max_attempts=1, backoff_seconds=0.02))
+    handler, lines = _phi_capture()
+    root = logging.getLogger()
+    root.addHandler(handler)
+    prior = root.level
+    root.setLevel(logging.DEBUG)
+    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    await runner.start()
+    runner._destinations["file_out"] = _RejectsWithPayload()  # swap in before any traffic
+    (inbox / "a.hl7").write_bytes(PHI_ADT.encode("utf-8"))
+    try:
+        await _until_stat(store, OutboxStatus.DEAD.value, 1)
+    finally:
+        await runner.stop()
+        root.removeHandler(handler)
+        root.setLevel(prior)
+    # Non-vacuous: the failure must actually surface at WARNING+ (else "no PHI" proves nothing).
+    assert any(level >= logging.WARNING for level, _ in lines), "expected a WARNING+ log on failure"
+    assert _phi_leaks(lines) == [], f"PHI leaked to logs: {_phi_leaks(lines)}"
+
+
 async def test_router_handler_transforms_and_delivers(store: MessageStore, tmp_path: Path) -> None:
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
@@ -425,6 +542,10 @@ async def test_strict_validation_nacks(store: MessageStore, tmp_path: Path) -> N
     finally:
         await runner.stop()
     assert (await store.stats()) == {}  # logged ERROR, never enqueued for delivery
+    # #120: the persisted strict-validation error is prefixed and run through the PHI scrub (safe_text),
+    # so hl7apy error strings that quote an offending field VALUE can't land raw in messages.error.
+    errored = (await store.list_messages(channel_id="mllp_in", status=MessageStatus.ERROR.value))[0]
+    assert (errored["error"] or "").startswith("strict-validation failed:")
 
 
 # --- delivery worker: retry / dead-letter ------------------------------------

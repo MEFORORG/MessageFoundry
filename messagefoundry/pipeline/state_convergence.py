@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Cluster-wide transform-state read-through convergence (Track B Step 6b).
 
 Transform state (ADR 0005) is written inside ``PostgresStore.transform_handoff`` and published into the

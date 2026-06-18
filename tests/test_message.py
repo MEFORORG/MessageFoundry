@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The mutable Message primitive: read/set fields by path, then re-encode."""
 
 from __future__ import annotations

@@ -11,8 +11,8 @@
     Run from an elevated (Administrator) PowerShell prompt.
 
 .EXAMPLE
-    .\install-service.ps1
-    .\install-service.ps1 -Port 9000 -LogLevel DEBUG -DataDir D:\MEFOR
+    .\install-service.ps1 -Environment prod
+    .\install-service.ps1 -Environment prod -Port 9000 -LogLevel INFO -DataDir D:\MEFOR
 #>
 [CmdletBinding()]
 param(
@@ -31,7 +31,14 @@ param(
     [string]$ServiceAccount,
     [SecureString]$ServiceAccountPassword,
     [ValidateSet("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")]
-    [string]$LogLevel = "INFO"
+    [string]$LogLevel = "INFO",
+    # Active environment NAME (ADR 0017): selects environments/<name>.toml + the instance's PHI
+    # posture. REQUIRED -- `serve` refuses to start without it (no silent default), so this script
+    # validates it up front rather than installing a service that immediately exits. Built-in names
+    # dev/staging/prod carry a default posture; a custom name also needs [ai].data_class +
+    # [ai].production set in the service config. (Named -Environment, not -Env, to avoid colliding
+    # with PowerShell's $env: automatic variable used below.)
+    [string]$Environment
 )
 
 $ErrorActionPreference = "Stop"
@@ -116,6 +123,18 @@ function Set-ConfigReadAcl {
 
 # --- preflight ---------------------------------------------------------------
 
+# Active environment is REQUIRED (ADR 0017): `serve` won't start without it, so refuse early with a
+# clear message rather than registering a service that immediately exits. The name becomes a filename
+# segment (environments/<name>.toml) and a CLI argument, so keep it a simple token.
+if (-not $Environment) {
+    throw ("specify the active environment with -Environment <name> (e.g. -Environment prod). It " +
+        "selects environments/<name>.toml and the instance's PHI posture (ADR 0017).")
+}
+if ($Environment -notmatch '^[A-Za-z0-9._-]+$') {
+    throw ("invalid -Environment '$Environment': use letters, digits, '.', '_' or '-' (it selects " +
+        "environments/<name>.toml).")
+}
+
 $principal = [Security.Principal.WindowsPrincipal]::new(
     [Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -150,7 +169,7 @@ if ($ServiceAccount) { Set-ConfigReadAcl -Path $Config -Account $ServiceAccount 
 
 $StdoutLog = Join-Path $LogDir "service.out.log"
 $StderrLog = Join-Path $LogDir "service.err.log"
-$AppParams = "serve --config `"$Config`" --db `"$DbPath`" --host $ListenHost --port $Port --log-level $LogLevel"
+$AppParams = "serve --config `"$Config`" --db `"$DbPath`" --host $ListenHost --port $Port --log-level $LogLevel --env $Environment"
 
 # --- install -----------------------------------------------------------------
 

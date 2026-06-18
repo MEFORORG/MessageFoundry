@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Data-retention + store-maintenance worker (PHI.md §8, ASVS 14.2.x).
 
 Without enforcement, PHI accumulates in the message store indefinitely — including dead-lettered

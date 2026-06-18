@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Worked example — a Wave-1 *porting template* for an ORU results relay.
 
 This is the canonical shape almost every migrated feed follows: an inbound MLLP listener → a

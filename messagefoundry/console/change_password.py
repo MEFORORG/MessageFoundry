@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Password-change dialog used both for the forced-change-at-login flow and the in-app
 "Change password…" affordance.
 

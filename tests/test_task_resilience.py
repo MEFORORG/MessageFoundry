@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Long-lived background tasks survive a transient error instead of dying silently (review H-1,
 H-4, M-33). The failure mode these guard against is the worst kind for an interface engine: an
 outbound that stops draining (or a poller that stops receiving) while everything still reports

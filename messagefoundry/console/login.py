@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Sign-in dialog shown before the main window when the engine requires authentication."""
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ class LoginDialog(QDialog):
         self._client = client
         # Seams read by _authenticate() after the dialog is accepted.
         self.must_change_password = False
+        self.mfa_required = False  # engine wants a second factor before sensitive ops (WP-14)
         self.entered_password = ""  # nosec B105 (empty seam init, not a credential)
 
         self._username = QLineEdit()
@@ -97,4 +100,8 @@ class LoginDialog(QDialog):
             # chains a ChangePasswordDialog (prefilling the current password) and re-prompts sign-in.
             self.must_change_password = result.must_change_password
             self.entered_password = password
+        # The engine accepted the password but wants a second factor (local MFA-enrolled / required
+        # admin); _authenticate prompts for the TOTP code before opening the window (always False for
+        # an MFA-delegated AD login).
+        self.mfa_required = result.mfa_required
         self.accept()

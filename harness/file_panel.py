@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """File tab: drop generated messages for the engine's File inbound to poll, and watch a directory
 its File outbound writes to. Two sections in one tab so the file round-trip is exercised in place.
 

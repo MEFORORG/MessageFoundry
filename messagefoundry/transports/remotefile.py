@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Remote-file transport: SFTP / FTP / FTPS — directory destination + directory-polling source.
 
 A single connector type (``REMOTEFILE``) with a ``protocol`` setting selecting the wire protocol:
@@ -462,6 +464,16 @@ class RemoteFileDestination(DestinationConnector):
                 return posixpath.join(self._remote_dir, candidate)
             n += 1
 
+    async def test_connection(self) -> None:
+        # Connect + authenticate + ensure the upload dir (the destination's normal first step) — no
+        # message data written. A failure is mapped like send()'s.
+        try:
+            await asyncio.to_thread(self._client.ensure_dir, self._remote_dir)
+        except _RemoteError as exc:
+            if exc.permanent:
+                raise NegativeAckError(str(exc), code="remotefile", permanent=True) from exc
+            raise DeliveryError(str(exc)) from exc
+
     async def aclose(self) -> None:
         return None  # connect-per-operation — nothing held open
 
@@ -510,6 +522,16 @@ class RemoteFileSource(SourceConnector):
             # quiesce, outside its rollback (mirrors the File / DATABASE sources).
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
+
+    async def test_connection(self) -> None:
+        # Connect + authenticate + list the poll dir (read-only — what the source actually does), no
+        # files moved or deleted. A failure is mapped like the delivery path's.
+        try:
+            await asyncio.to_thread(self._client.list_dir, self._remote_dir)
+        except _RemoteError as exc:
+            if exc.permanent:
+                raise NegativeAckError(str(exc), code="remotefile", permanent=True) from exc
+            raise DeliveryError(str(exc)) from exc
 
     async def _run(self) -> None:
         while not self._stop.is_set():

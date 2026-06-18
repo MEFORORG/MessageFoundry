@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Strict, version-aware HL7 v2 validation — the opt-in tier.
 
 Built on ``hl7apy``, which knows the official HL7 message structures per version and

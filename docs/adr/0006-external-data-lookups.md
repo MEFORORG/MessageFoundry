@@ -11,7 +11,7 @@
   dry-run. SQLite-only snapshot store (SQL Server has an inert stub, like state). **Increment 2 also
   built:** the **`DatabaseRef`** source — the engine queries SQL directly on the refresh cadence
   (reusing `transports/database.py` for the DSN/pool, gated by the fail-closed `[egress].allowed_db`
-  allowlist), experimental + faked-driver tested like the DB connector. **Tier 2** (resolve-at-ingress
+  allowlist), production / supported like the DB connector (faked-driver unit tests + a gated CI round-trip). **Tier 2** (resolve-at-ingress
   per-message lookups) stays deferred to its own ADR.
 - **Decision in one line:** add **reference sets** — managed, hot-swappable, read-only lookup
   snapshots that the engine *materializes* from an external source **off the message path** and that a
@@ -189,9 +189,10 @@ cache. This ADR is its read-side complement, not a change to it.
   an in-memory mirror; a very large universe needs the delta-sync + on-disk-version-read follow-up.
 - A **new moving part** (ReferenceSyncRunner + cadence) to operate, monitor, and seed; a silently
   failing sync serves stale data until the staleness alert fires.
-- The **SQL-Server source sync** needs the `[sqlserver]` extra + ODBC Driver 18 and is exercised only
-  by the CI service-container leg (experimental), like the DATABASE connector / SQL Server store. The
-  **read path** is backend-agnostic (snapshot lives in the SQLite store like state).
+- The **SQL-Server source sync** needs the `[sqlserver]` extra + ODBC Driver 18 and is exercised by the
+  CI SQL Server service-container leg, like the DATABASE connector (now production). The reference
+  **snapshot store** remains **SQLite-only** — `write_reference_snapshot` raises on the SQL Server
+  backend. The **read path** is backend-agnostic (the snapshot lives in the SQLite store like state).
 
 ## Alternatives considered (scored by the design panel)
 

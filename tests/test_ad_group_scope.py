@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Phase-8 PR C3 — AD-group → channel-scope mapping (store + service sync + admin API)."""
 
 from __future__ import annotations
@@ -114,13 +116,19 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 async def test_ad_group_scope_map_admin_endpoint(engine: Engine) -> None:
     service = AuthService(engine.store, AuthSettings())
     await service.initialize()
-    await service.create_local_user(
+    boss_id = await service.create_local_user(
         username="boss",
         password=PW,
         display_name=None,
         email=None,
         roles=[Role.ADMINISTRATOR.value],
         actor="test",
+    )
+    # Admin-created accounts force first-login rotation (WP-L3-12); clear it (keep the same hash).
+    boss = await service.store.get_user(boss_id)
+    assert boss is not None and boss.password_hash is not None
+    await service.store.set_password(
+        boss_id, password_hash=boss.password_hash, must_change_password=False
     )
     transport = httpx.ASGITransport(app=create_app(engine, auth=service))
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:

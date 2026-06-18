@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Code sets: managed, hot-reloadable reference lookup tables for the message graph.
 
 Covers the loaders (CSV scalar/dict, TOML flat/nested, duplicate/missing/malformed), the frozen

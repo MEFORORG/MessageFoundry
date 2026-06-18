@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Console client auth against a real server: login, token injection, permission gating, logout."""
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import pytest
 import uvicorn
 
 from messagefoundry.api import create_managed_app
+from messagefoundry.auth import totp
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.console.client import ApiError, EngineClient
@@ -35,13 +38,20 @@ async def _seed(db_path: Path) -> None:
         service = AuthService(store, AuthSettings())
         await service.initialize()  # seeds roles + a bootstrap admin we ignore
         for username, role in (("root", "administrator"), ("vw", "viewer")):
-            await service.create_local_user(
+            uid = await service.create_local_user(
                 username=username,
                 password=PW,
                 display_name=None,
                 email=None,
                 roles=[role],
                 actor="seed",
+            )
+            # Admin-created accounts force first-login rotation (WP-L3-12); clear it so the seeded
+            # console users log straight into protected routes (keeping the same hash).
+            u = await service.store.get_user(uid)
+            assert u is not None and u.password_hash is not None
+            await service.store.set_password(
+                uid, password_hash=u.password_hash, must_change_password=False
             )
     finally:
         await store.close()
@@ -99,3 +109,36 @@ def test_bad_password_is_401(auth_server: str) -> None:
         with pytest.raises(ApiError) as exc:
             client.login("root", "wrong")
         assert exc.value.status == 401
+
+
+def test_console_mfa_enroll_confirm_and_disable(auth_server: str) -> None:
+    # WP-14: the console client drives the full TOTP lifecycle against a real server.
+    with EngineClient(auth_server) as client:
+        client.login("root", PW)
+        assert client.mfa_status().enabled is False
+        enroll = client.enroll_mfa()  # root just logged in → step-up window is fresh
+        codes = client.confirm_mfa(totp.totp(enroll.secret))
+        assert len(codes) == 10
+        st = client.mfa_status()
+        assert st.enabled is True and st.recovery_codes_remaining == 10
+        client.disable_mfa()
+        assert client.mfa_status().enabled is False
+
+
+def test_console_mfa_handler_auto_verifies_on_step_up(auth_server: str) -> None:
+    # The X-MFA-Required handler transparently prompts-and-retries a sensitive op (mirrors step-up).
+    with EngineClient(auth_server) as client:
+        client.login("root", PW)
+        enroll = client.enroll_mfa()
+        client.confirm_mfa(totp.totp(enroll.secret))
+
+        client.login("root", PW)  # fresh session: 2nd factor pending
+
+        def handler() -> bool:
+            client.verify_mfa(totp.totp(enroll.secret))
+            return True
+
+        client.set_mfa_handler(handler)
+        # A require_step_up route 403s with X-MFA-Required, the handler verifies, the retry succeeds.
+        client.set_ad_group_map([])
+        assert client.mfa_status().enabled is True

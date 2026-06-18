@@ -43,7 +43,7 @@ choice is the whole point). Serve the synthetic high-fan-out system-under-test, 
 ```bash
 # 1) Serve the load config (its own ports, separate from harness/config). Tune via env (below).
 MEFOR_LOAD_FANOUT=20 MEFOR_LOAD_TRANSFORM=edit MEFOR_LOAD_SINK_PORT=2700 \
-  python -m messagefoundry serve --config harness/config/load --db ./load.db
+  python -m messagefoundry serve --config harness/config/load --db ./load.db --env dev
 
 # 2) Drive it. --sink-port must match MEFOR_LOAD_SINK_PORT above.
 python -m harness --load fanout-baseline --engine http://127.0.0.1:8765 --token <T> \
@@ -80,6 +80,7 @@ before any traffic is sent. Built-ins:
 | `smoke` | Tiny zero-loss wiring check (not a perf measurement) | CI gate |
 | `fanout-baseline` | ADT-dominant mixed feed at high fan-out; characterizes a realistic mix | On-demand |
 | `soak` | Long steady-state; watches DB/WAL growth + dead-letter accumulation | On-demand |
+| `failover` | Two-node active-passive primary-kill under load (`--failover`; see below) | On-demand / CI (server DB) |
 
 Phases are `warmup` / `ramp` / `sustained` / `spike` / `soak`; only **`sustained`/`soak`** phases are
 *measured* (SLOs evaluated against them — warmup/ramp/spike are transient). Loop models per phase:
@@ -148,7 +149,7 @@ the engine was served with. Run the same profile against each backend (swap `--d
 
 ```bash
 # SQLite (single-writer WAL ceiling — the baseline to beat)
-python -m messagefoundry serve --config harness/config/load --db ./load.db
+python -m messagefoundry serve --config harness/config/load --db ./load.db --env dev
 python -m harness --load fanout-baseline --engine ... --db-backend sqlite --report-json out/load/sqlite.json
 
 # Postgres (Track B scale-out — full staged-pipeline parity)
@@ -157,14 +158,74 @@ python -m harness --load fanout-baseline --engine ... --db-backend postgres \
   --baseline out/load/sqlite.json --report-json out/load/postgres.json
 ```
 
-> ⚠️ **SQL Server is a pending target.** The SQL Server backend does **not** implement the staged
-> ingress pipeline yet (`supports_ingest_stage = False`), so the engine refuses to start the staged
-> runner on it (gated on BACKLOG #1). The harness is store-agnostic and will drive SQL Server
-> unchanged the moment that backend lands — load-testing it is one of the motivations for that work.
+> **SQL Server** (production — full staged-pipeline parity, `supports_ingest_stage = True`). The
+> harness is store-agnostic; serve with `MEFOR_STORE_BACKEND=sqlserver` and drive it unchanged. The
+> `smoke-sqlserver` profile is the SQL-Server-store CI gate (its drain SLO is sized for a server-DB
+> round-trip, not a perf measurement).
 
 To scale a single Python sender past what one process can offer, shard across processes (partition the
 control-id prefix per process; merge the per-process JSON histograms by summing buckets). Not built in
 v1 — documented as the escape hatch.
+
+## Failover under load (`--failover`)
+
+The steady-state runner drives one already-running engine. The **failover** path is different: it OWNS
+two engines, **kills the primary mid-load**, and measures what an active-passive crash failover actually
+costs. It is the Gate #3 capstone — and the **first live proof** of the on-promotion in-flight recovery
+(`reset_stale_inflight` for SQL Server, the lease-reclaim sweep for Postgres; see
+[`CLUSTERING.md`](CLUSTERING.md)) under a real crash.
+
+```bash
+# Two nodes share ONE server DB (the cluster needs Postgres or SQL Server — SQLite can't cluster).
+export MEFOR_STORE_BACKEND=postgres MEFOR_STORE_SERVER=db.host MEFOR_STORE_DATABASE=mefor \
+       MEFOR_STORE_USERNAME=mefor MEFOR_STORE_PASSWORD=…   # the shared-DB connection
+python -m harness --failover failover --db-backend postgres --report-json out/load/failover.json
+```
+
+What it does ([`harness/load/failover.py`](../harness/load/failover.py)):
+
+1. Spawns **two** `messagefoundry serve` subprocesses against the shared DB with `[cluster].enabled` and
+   tuned-short lease timings (from the profile's `[load.failover]` table), auth off, and the **same**
+   inbound MLLP ports — only the leader binds them, so the sender hits a fixed port and **reconnects
+   through the rebind** (the floating-VIP collapsed to "one binder, one port" on a single host).
+2. Waits for one node to report `role = "primary"` (`GET /cluster/status`), then drives the profile's load.
+3. Partway through the measured phase (`kill_at_fraction`) it **SIGKILLs the current primary** — a faithful
+   crash: uncommitted staged-handoff transactions roll back, committed-but-inflight rows are stranded for
+   the survivor's on-promotion recovery, and the listen socket is released.
+4. Times the survivor's **promotion** (control plane) and **functional recovery** (the DB-backed `/stats`
+   `done` count climbs again — forward progress resumes), then drains and reconciles.
+
+**Two-tier verdict** (matching the release gate). **Conformance** is host-independent and hard-gated by the
+integration tests:
+
+- **No acknowledged loss** — every message the engine *accept-ACKed* (so it durably committed to the
+  ingress stage) reached the sink (`acked ⊆ delivered`), with nothing stranded (`in_pipeline = 0`) and no
+  dead-letters. The un-ACKed-at-kill window (`sent − acked`) is the expected MLLP reconnect gap — a real
+  partner resends un-ACKed frames; the harness sender does not — so it is reported, **not** counted as loss.
+- **No split-brain** (`/cluster/status` never shows two primaries) and **bounded duplicates** (re-deliveries
+  `= sink_received − engine done`, under `max_dup_rate` — a crash *expects* some at-least-once re-delivery).
+- **Promotion observed** — the survivor took over.
+- **Per-lane FIFO** (`lane_inversions == 0` over `lanes_observed ≥ 2`) — the FIFO lane is the engine outbound
+  **destination** (recovered from MSH-6; the MLLP connector opens a fresh connection per delivery, so the
+  lane is the destination, not the socket). With the serialized sender (`pool_size = 1`) and strictly-serial
+  per-lane delivery, the **first** arrival of each seq on a lane must be monotonic; a *new* seq below the
+  lane's high-water is an ordering break (at-least-once re-deliveries are *already-seen* seqs — counted as
+  duplicates, never reorders). `lanes_observed ≥ 2` is asserted so the measurement can't go vacuous. This
+  live check **found a real SQL Server reorder** — `claim_next_fifo`'s `READPAST` hint skipped a head row
+  transiently locked by the producing `transform_handoff`/finalizer, delivering seq N+1 before N — which is
+  **fixed** (#285; both backends now hold 0 inversions), so it is hard-gated as a regression guard.
+
+**Reported, not hard-gated by the integration tests** (contributes to the report's overall verdict and the
+published baseline, but a host-variable result does not block the tag here):
+
+- **Recovery time** — promotion time + functional recovery time (SLO `≤ recovery_ttl_multiple × the lease
+  TTL`). Depends on the runner's OS/network — a killed process's port rebind is near-instant on Linux but can
+  lag tens of seconds on **Windows** — so the gated tests assert only that recovery *occurred*.
+
+The `[load.failover]` table (parsed by [`profile.py`](../harness/load/profile.py)) sets `kill_at_fraction`,
+the lease timings (`heartbeat_seconds < leader_fence_timeout_seconds < leader_lease_ttl_seconds`, passed to
+both nodes), `recovery_ttl_multiple`, and `max_dup_rate`. The profile must declare exactly one
+`[[load.target]]` (single-stream ordering) and exactly one (last) measured phase.
 
 ## CI
 
@@ -173,6 +234,11 @@ v1 — documented as the escape hatch.
 - **On-demand:** the `load-test` CI job (push-to-main + `workflow_dispatch`, Linux 1×) serves the load
   config with auth off and drives the `smoke` profile through the real CLI, uploading the report.
   Heavier `fanout-baseline` / `soak` runs and the backend comparison are run manually / locally.
+- **Failover (server DB):** `tests/test_load_failover_{postgres,sqlserver}.py` run the two-node primary-kill
+  scenario against the real Postgres / SQL Server service containers, as steps in the `postgres store` and
+  `sql server (store + connector)` jobs (gated on `MEFOR_TEST_*` + `MEFOR_STORE_*`, like the other server-DB
+  suites). They assert the conformance invariants (no acknowledged loss, per-lane FIFO, no split-brain,
+  recovered pipeline); the recovery *time* is reported but not gated (host-dependent).
 
 ## Notes
 
@@ -186,11 +252,10 @@ v1 — documented as the escape hatch.
 
 ## Known limitations
 
-- **Drain/no-loss see only the outbound stage.** The engine API exposes outbound-stage depth, not the
-  ingress/routed stages. Drain detection also requires the engine's `read`/`written` counters to stop
-  moving, which catches a *progressing* router/transform worker — but a fully **stalled** worker
-  (hung, or rows stranded after a crash) leaves those counters flat with the outbound backlog at zero,
-  which the harness can't distinguish from "drained". In normal runs the workers progress, so the
-  no-loss check is sound; the robust fix is a stage-aware in-pipeline gauge from the engine (tracked
-  in [BACKLOG.md](BACKLOG.md)). Run the engine at `DEBUG` and watch for `ERROR`/dead-letter dispositions
-  if you suspect a stalled stage.
+- **Stalled-stage detection** relies on the engine's `in_pipeline` gauge. `/stats` exposes
+  `in_pipeline` — the count of NOT-DONE rows (`pending`/`inflight`) across **every** stage (ingress +
+  routed + outbound) — and `await_drain` requires it to reach zero. So a fully **stalled** router/
+  transform (hung, or rows stranded after a crash) — which leaves the outbound backlog at zero but
+  `in_pipeline > 0` — no longer reads as "drained" (the prior blind spot). A stalled stage still shows
+  as a non-draining `in_pipeline`; run the engine at `DEBUG` and watch for `ERROR`/dead-letter
+  dispositions to find the cause.

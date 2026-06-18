@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Configuration: connector models + the code-first wiring layer.
 
 Connectors are described by :class:`Source`/:class:`Destination` (type + free-form

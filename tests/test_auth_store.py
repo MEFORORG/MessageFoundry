@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Store-layer tests for the auth tables (SQLite backend; SQL Server is covered by the CI job)."""
 
 from __future__ import annotations
@@ -46,6 +48,23 @@ async def test_role_assignment_replace_and_resolution() -> None:
         assert set(await store.get_user_role_ids("u1")) == {"operator", "viewer"}
         await store.set_user_roles("u1", ["viewer"], now=3.0)  # replace
         assert await store.get_user_role_ids("u1") == ["viewer"]
+    finally:
+        await store.close()
+
+
+async def test_security_events_for_user_scopes_to_actor() -> None:
+    # The /me/security-events source: only the target actor's auth.* audit rows, newest-first,
+    # honoring limit; other actors' rows and non-auth.* rows are excluded.
+    store = await _store()
+    try:
+        await store.record_audit("auth.login_success", actor="alice", detail="1")
+        await store.record_audit("auth.login_failed", actor="bob", detail="b")  # other actor
+        await store.record_audit("message_view", actor="alice", detail="x")  # not auth.*
+        await store.record_audit("auth.password_changed", actor="alice", detail="2")
+        rows = await store.security_events_for_user("alice")
+        assert [r["action"] for r in rows] == ["auth.password_changed", "auth.login_success"]
+        assert len(await store.security_events_for_user("alice", limit=1)) == 1
+        assert await store.security_events_for_user("carol") == []  # no events → empty feed
     finally:
         await store.close()
 

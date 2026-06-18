@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Leader-only maintenance + engine clustering wiring (Track B Step 4) — always-run unit tests (no DB).
 
 These prove, with fakes:
@@ -64,17 +66,25 @@ class _Coordinator:
 
 
 class _ReclaimSpyStore:
-    """A store stand-in recording reclaim_expired_leases calls (for LeaderMaintenanceRunner)."""
+    """A store stand-in recording reclaim_expired_leases + recover_inflight_on_promotion calls."""
 
     def __init__(self) -> None:
         self.reclaim_calls: list[float | None] = []
         self.to_reclaim = 0
+        self.promotion_calls: list[tuple[str | None, float | None]] = []
+        self.to_recover = 0
 
     async def reclaim_expired_leases(
         self, now: float | None = None, *, stage: str | None = None
     ) -> int:
         self.reclaim_calls.append(now)
         return self.to_reclaim
+
+    async def recover_inflight_on_promotion(
+        self, *, lane_owner: str | None, now: float | None = None
+    ) -> int:
+        self.promotion_calls.append((lane_owner, now))
+        return self.to_recover
 
 
 # --- LeaderMaintenanceRunner.sweep_once -------------------------------------
@@ -99,6 +109,31 @@ async def test_leader_sweep_no_ops_on_follower() -> None:
     reclaimed = await runner.sweep_once(now=123.0)
     assert reclaimed == 0
     assert store.reclaim_calls == []  # follower → no store write at all
+
+
+async def test_recover_on_promotion_runs_when_leader_with_lane_owner() -> None:
+    # #293: the one-shot on-promotion recovery fires when leader, threading the coordinator's lane_owner
+    # (= node_id) so the store can scope the lane-lease takeover.
+    store = _ReclaimSpyStore()
+    store.to_recover = 4
+    coord = _Coordinator(leader=True, reclaims=True)
+    runner = LeaderMaintenanceRunner(store, coord, interval_seconds=10.0)
+    recovered = await runner.recover_on_promotion(now=200.0)
+    assert recovered == 4
+    assert store.promotion_calls == [
+        (coord.node_id, 200.0)
+    ]  # leader → one call, with the lane owner
+    assert store.reclaim_calls == []  # promotion recovery is distinct from the periodic sweep
+
+
+async def test_recover_on_promotion_no_ops_on_follower() -> None:
+    store = _ReclaimSpyStore()
+    runner = LeaderMaintenanceRunner(
+        store, _Coordinator(leader=False, reclaims=True), interval_seconds=10.0
+    )
+    recovered = await runner.recover_on_promotion(now=200.0)
+    assert recovered == 0
+    assert store.promotion_calls == []  # follower → no store write at all
 
 
 async def test_leader_sweep_start_stop_idempotent() -> None:
@@ -128,6 +163,14 @@ class _RecordingStore:
         self, now: float | None = None, *, stage: str | None = None
     ) -> int:
         self.reset_calls += 1
+        return 0
+
+    async def reclaim_expired_leases(
+        self, now: float | None = None, *, stage: str | None = None
+    ) -> int:
+        # Present so this spy models a reclaim-capable (Postgres active-active) clustered store: the
+        # engine only spawns the LeaderMaintenanceRunner when the store has this method (a SQL Server
+        # active-passive store does not, and recovers via on-promotion reset_stale_inflight instead).
         return 0
 
     def enable_state_convergence(self) -> None:

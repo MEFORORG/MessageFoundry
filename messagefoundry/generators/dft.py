@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Generate conformant HL7 v2.5.1 **DFT** (detailed financial transaction) messages.
 
 DFT_P03/P11 require MSH + EVN + PID + a FINANCIAL group (→ FT1); we add an optional visit and

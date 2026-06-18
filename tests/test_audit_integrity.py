@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Phase-8 AUDIT-INTEGRITY: tamper-evident audit-log hash chain + verification."""
 
 from __future__ import annotations

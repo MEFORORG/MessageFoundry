@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The MLLP sender — a pool of persistent, pipelined connections, plus type→target routing.
 
 Unlike the GUI harness's one-socket-per-message ``SendWorker`` (RTT-bound), each
@@ -24,6 +26,7 @@ from messagefoundry.transports.mllp import MLLPDecoder, frame
 
 from harness.load.corpus import Outgoing
 from harness.load.correlator import Correlator
+from harness.load.failover_track import FailoverTracker
 from harness.load.metrics import LiveMetrics
 from harness.load.profile import Target
 
@@ -63,12 +66,14 @@ class PersistentConnection:
         *,
         expect_ack: bool = True,
         queue_max: int = 1000,
+        tracker: FailoverTracker | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._correlator = correlator
         self._m = metrics
         self._expect_ack = expect_ack
+        self._tracker = tracker  # failover-only: record which seqs the engine accept-ACKed
         self._queue: asyncio.Queue[_Job] = asyncio.Queue(maxsize=queue_max)
         self._inflight: deque[tuple[int, int, str, OnDone | None]] = deque()
         self._stop = asyncio.Event()
@@ -209,6 +214,10 @@ class PersistentConnection:
         self._m.ack.record(float(ack_ns - send_ns))
         if _ack_code(ack) in _ACCEPT:
             self._m.counters.acked += 1
+            if self._tracker is not None:
+                # An accept-ACK means the engine durably committed this to the ingress stage (ACK-on-
+                # receipt), so it MUST eventually be delivered — the failover no-loss check keys on this.
+                self._tracker.on_ack(_seq)
         else:
             self._m.counters.nak += 1
         if on_done is not None:
@@ -236,6 +245,7 @@ class ConnectionPool:
         metrics: LiveMetrics,
         *,
         queue_max: int = 1000,
+        tracker: FailoverTracker | None = None,
     ) -> None:
         if size <= 0:
             raise ValueError("pool size must be positive")
@@ -247,6 +257,7 @@ class ConnectionPool:
                 metrics,
                 expect_ack=target.expect_ack,
                 queue_max=queue_max,
+                tracker=tracker,
             )
             for _ in range(size)
         ]

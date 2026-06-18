@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The ``messagefoundry check`` commit/CI gate — one callable for the git hook and the IDE.
 
 ``run_checks`` runs the project's checks against a config directory and reports a clear pass/fail,
@@ -5,8 +7,10 @@ reusing the in-process ``validate``/``dry_run`` paths (no re-shelling for the Me
 checks). Two checks are **required** (they can block a commit):
 
 * ``validate`` — every config module loads and every ``inbound → router`` reference resolves.
-* ``dryrun`` — *only when* a fixtures dir with ``*.hl7`` is given: each message routes through every
-  inbound's Router/Handler(s) without erroring. Absent fixtures → skipped (never blocks).
+* ``dryrun`` — *only when* a fixtures dir with ``*.hl7`` is given (searched recursively): each message
+  routes through its inbound's Router/Handler(s) without erroring. A fixture under a
+  ``<messages>/<inbound_name>/`` subdir is dry-run **only** against that feed (#11); a fixture not under
+  such a subdir runs against **every** inbound. Absent fixtures → skipped (never blocks).
 
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. Exit-code policy lives in the CLI
@@ -93,7 +97,7 @@ def _check_validate(config_dir: str | Path) -> CheckResult:
 
 def _check_dryrun(config_dir: str | Path, messages_dir: str | Path | None) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run, read_messages
+    from messagefoundry.pipeline.dryrun import dry_run, read_message_sets
     from messagefoundry.store import MessageStatus
 
     if messages_dir is None:
@@ -107,8 +111,9 @@ def _check_dryrun(config_dir: str | Path, messages_dir: str | Path | None) -> Ch
         return CheckResult(
             "dryrun", ok=False, required=True, detail=f"messages path not found: {mpath}"
         )
-    if mpath.is_dir() and not any(mpath.glob("*.hl7")):
-        # A real dir with no fixtures is the documented "absent fixtures -> skipped" case. A single
+    if mpath.is_dir() and not any(mpath.glob("**/*.hl7")):
+        # A real dir with no fixtures (searched recursively, since per-feed fixtures live in
+        # <messages>/<inbound>/ subdirs) is the documented "absent fixtures -> skipped" case. A single
         # file (any extension) falls through and is dry-run like the `dryrun` CLI accepts (low-20).
         return CheckResult(
             "dryrun", ok=True, required=False, skipped=True, detail=f"no *.hl7 fixtures in {mpath}"
@@ -125,10 +130,18 @@ def _check_dryrun(config_dir: str | Path, messages_dir: str | Path | None) -> Ch
             "dryrun", ok=True, required=False, skipped=True, detail="no inbound connections"
         )
 
+    # Per-feed mapping (#11): a fixture under <messages>/<inbound_name>/ is dry-run only against that
+    # feed; an unmapped fixture (top-level, or under a non-feed subdir) cross-products every inbound.
+    inbound_names = list(reg.inbound)
+    message_sets = read_message_sets(mpath, inbound_names)
     errors: list[str] = []
     total = 0
-    for label, _path, raw in read_messages([str(mpath)]):
-        for ic_name in reg.inbound:
+    pinned = 0
+    for label, _path, raw, target in message_sets:
+        targets = [target] if target is not None else inbound_names
+        if target is not None:
+            pinned += 1
+        for ic_name in targets:
             total += 1
             result = dry_run(reg, raw, inbound=ic_name)
             if result.error or result.disposition is MessageStatus.ERROR:
@@ -136,7 +149,9 @@ def _check_dryrun(config_dir: str | Path, messages_dir: str | Path | None) -> Ch
     if errors:
         detail = f"{len(errors)}/{total} run(s) errored: " + "; ".join(errors[:5])
         return CheckResult("dryrun", ok=False, required=True, detail=detail)
-    return CheckResult("dryrun", ok=True, required=True, detail=f"{total} run(s) clean")
+    pin_note = f", {pinned} feed-pinned" if pinned else ""
+    detail = f"{total} run(s) clean across {len(message_sets)} message(s){pin_note}"
+    return CheckResult("dryrun", ok=True, required=True, detail=detail)
 
 
 def _run_tool(name: str, cmd: list[str]) -> CheckResult:

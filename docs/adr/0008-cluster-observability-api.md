@@ -89,8 +89,8 @@ With the observability API the scale-out feature set is complete, so the one-tim
 banner becomes an **INFO** (renamed `_log_cluster_enabled_once`) that states the feature set is built
 and summarizes the operational assumptions operators must honor (below), pointing at
 `docs/CLUSTERING.md`. The `[cluster]` docstring and `cluster.py` docs no longer call the **cluster**
-feature experimental. (The separate SQL-Server-backend and DATABASE-connector "experimental" notes are
-unrelated and unchanged.)
+feature experimental. (The separate SQL-Server-*store*-backend "experimental" note is unrelated and
+unchanged; the DATABASE connector is now production, promoted on its own track.)
 
 ## Operational assumptions (called out so operators honor them)
 

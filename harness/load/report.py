@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Assemble, render, and persist the load-run report.
 
 Pulls together the client-side counters/histograms, the per-phase breakdown, the engine-side samples,
@@ -23,6 +25,17 @@ SCHEMA_VERSION = 1
 # Exit codes (shared with the CLI).
 EXIT_OK = 0
 EXIT_SLO_VIOLATION = 1
+
+# CSV formula-injection (CWE-1236 / ASVS 1.2.10): a spreadsheet treats a cell beginning with one of
+# these as a formula. A leading "'" forces it to be read as literal text on open.
+_CSV_FORMULA_TRIGGERS = frozenset("=+-@\t\r\x00")
+
+
+def _spreadsheet_safe(value: str) -> str:
+    """Neutralize a leading formula trigger so a text cell can't execute when the CSV is opened in
+    Excel/Sheets. Applied to the free-text columns of :meth:`RunReport.to_csv`; if a real PHI/message
+    CSV export is ever added to ``api``/``console``, route every string cell through this helper."""
+    return "'" + value if value[:1] in _CSV_FORMULA_TRIGGERS else value
 
 
 @dataclass(frozen=True)
@@ -158,7 +171,10 @@ class RunReport:
         return json.dumps(self.to_json_dict(), indent=2)
 
     def to_csv(self) -> str:
-        """One row per phase (flattened) — for spreadsheet trend tracking."""
+        """One row per phase (flattened) — for spreadsheet trend tracking. The free-text string cells
+        (profile/phase/kind) are run through :func:`_spreadsheet_safe` so a name beginning with a
+        formula trigger can't execute when the CSV is opened in Excel/Sheets (CSV formula injection,
+        ASVS 1.2.10). The numeric cells are written by ``csv`` from int/float and need no escaping."""
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(
@@ -180,9 +196,9 @@ class RunReport:
         for p in self.phases:
             writer.writerow(
                 [
-                    self.profile,
-                    p.name,
-                    p.kind,
+                    _spreadsheet_safe(self.profile),
+                    _spreadsheet_safe(p.name),
+                    _spreadsheet_safe(p.kind),
                     p.measured,
                     p.sent,
                     p.acked,

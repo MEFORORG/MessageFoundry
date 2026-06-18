@@ -1,11 +1,16 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """DATABASE transport: a SQL destination that runs one parameterized statement per payload.
 
 The **destination** executes the operator-declared ``statement`` (an INSERT/UPDATE or a stored-procedure
 call) against an outbound database, binding the payload's fields to the statement's ``:name``
 parameters. The first backend is **SQL Server over ``aioodbc``** (ADR 0003) — the ``[sqlserver]`` extra
 (``pip install 'messagefoundry[sqlserver]'``) plus the Microsoft ODBC Driver 18, **lazily imported** so
-SQLite-only installs never touch it. **Status: experimental**, like the SQL Server *store* backend —
-the real round-trip is exercised only by the CI service-container job.
+SQLite-only installs never touch it. **Status: production / supported** — SQL Server only, via that
+extra. The live aioodbc round-trip is exercised by the CI SQL Server service-container job
+(``tests/test_database_connector_integration.py``); the connector logic is also unit-tested with a
+faked driver. The SQL Server *store* backend is a **separate** (also production) layer — this
+connector does not depend on it.
 
 **Parameters.** The Handler produces a **JSON object** body; the connector binds its keys to the
 ``:name`` placeholders in ``statement`` (translated to positional ODBC ``?`` — always parameterized,
@@ -29,15 +34,17 @@ import base64
 import json
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
+from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
 from messagefoundry.transports.base import (
     DeliveryError,
+    DeliveryResponse,
     DestinationConnector,
     InboundHandler,
     NegativeAckError,
@@ -46,7 +53,7 @@ from messagefoundry.transports.base import (
     register_source,
 )
 
-__all__ = ["DatabaseDestination", "DatabaseSource"]
+__all__ = ["DatabaseDestination", "DatabaseLookupExecutor", "DatabaseSource"]
 
 logger = logging.getLogger(__name__)
 
@@ -85,9 +92,19 @@ def _build_dsn(s: dict[str, Any]) -> str:
     auth = str(s.get("auth", "sql")).lower()
     if auth not in ("sql", "integrated", "entra"):
         raise ValueError(f"DATABASE destination auth must be sql|integrated|entra, got {auth!r}")
+    # SERVER must be emitted UNBRACED so the driver parses the ",port" suffix and resolves the host for
+    # the TLS handshake — a brace-quoted "SERVER={host},port" is malformed ODBC (content after the
+    # closing brace) and breaks certificate handling against a real SQL Server. So the host is
+    # *validated* for connection-string metacharacters instead of brace-quoted (the guard used for every
+    # other free-text value), exactly like the store backend's connection_string.
+    server = str(s["server"])
+    if any(ch in server for ch in ";{}=\r\n"):
+        raise ValueError(
+            "DATABASE server must not contain ';', '{', '}', '=', or newlines (ODBC injection risk)"
+        )
     parts = [
         f"DRIVER={_odbc_brace(str(s.get('odbc_driver', 'ODBC Driver 18 for SQL Server')))}",
-        f"SERVER={_odbc_brace(str(s['server']))},{int(s.get('port', 1433))}",
+        f"SERVER={server},{int(s.get('port', 1433))}",
         f"DATABASE={_odbc_brace(str(s['database']))}",
         f"Connection Timeout={int(s.get('connect_timeout', 15))}",
         f"APP={_odbc_brace(str(s.get('app_name', 'messagefoundry')))}",
@@ -189,6 +206,58 @@ async def _make_pool(dsn: str, pool_max: int, *, autocommit: bool) -> Any:
     )
 
 
+# WP-L3-07 (ASVS 13.1.2/13.2.6): bound a pooled-connection borrow. One delivery/poll worker per
+# connection means pool_max is never legitimately exhausted, so an acquire that can't be satisfied
+# within the timeout means the pool is wedged or the DB is unresponsive — fail it transiently rather
+# than block the worker forever (which would let the queue back up unbounded). Override per connection
+# with the ``acquire_timeout`` setting.
+_DEFAULT_DB_ACQUIRE_TIMEOUT = 30.0
+
+
+async def _acquire(pool: Any, timeout: float) -> Any:
+    """Acquire a connection from ``pool`` within ``timeout`` seconds, or raise a transient
+    :class:`DeliveryError` with a clear, PHI-free message. Wraps the driver's own ``acquire`` so a
+    hung/exhausted pool surfaces as a retryable failure instead of an unbounded await."""
+    try:
+        return await asyncio.wait_for(pool.acquire(), timeout)
+    except TimeoutError as exc:
+        raise DeliveryError(
+            f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
+        ) from exc
+
+
+async def _probe_db(
+    get_pool: Callable[[], Any], *, timeout: float = _DEFAULT_DB_ACQUIRE_TIMEOUT
+) -> None:
+    """Open the pool and run ``SELECT 1`` — a no-data, no-write reachability probe shared by the
+    DATABASE source and destination's ``test_connection``. A driver error is mapped via
+    :func:`_classify_db_error` (transient vs permanent); a non-driver failure (e.g. an unreachable host
+    before any SQLSTATE) becomes a transient :class:`DeliveryError`. Triggers the connector's lazy pool;
+    the caller closes it with ``aclose()``."""
+    try:
+        pool = await get_pool()
+        conn = await _acquire(pool, timeout)
+    except Exception as exc:
+        state = _sqlstate(exc)
+        raise (
+            _classify_db_error(state, str(exc))
+            if state
+            else DeliveryError(f"DATABASE connect failed: {exc}")
+        ) from exc
+    try:
+        cur = await conn.cursor()
+        await cur.execute("SELECT 1")
+    except Exception as exc:
+        state = _sqlstate(exc)
+        raise (
+            _classify_db_error(state, str(exc))
+            if state
+            else DeliveryError(f"DATABASE probe failed: {exc}")
+        ) from exc
+    finally:
+        await pool.release(conn)
+
+
 def _json_default(value: Any) -> Any:
     """JSON-serialize DB column types ``json.dumps`` can't handle natively (dates, ``Decimal``, bytes),
     so a polled row becomes a JSON-object body. An unknown type raises ``TypeError`` (surfaced as a
@@ -215,8 +284,18 @@ class DatabaseDestination(DestinationConnector):
         self._dsn = _build_dsn(s)  # fail fast on a weakened-TLS / bad-auth config
         self._sql, self._param_names = _parse_named_params(str(s["statement"]))
         self._pool_max = int(s.get("pool_max", 5))
+        self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
         self._pool: Any = None
         self._pool_lock = asyncio.Lock()
+        # ADR 0013: capture the statement's result-set (its RETURNING/OUTPUT rows). Default False →
+        # returns None, byte-identical. Capture MUST be a RETURNING/OUTPUT clause of the write itself
+        # (fetched from the SAME cursor BEFORE commit) — a separate post-commit SELECT would re-run on a
+        # crash-replay against changed state. Wiring rejects a capturing statement with no RETURNING/
+        # OUTPUT. The result-set is JSON-serialized and bounded by row/byte caps (over-cap →
+        # outcome='unparseable' with an empty body, never an unbounded blob).
+        self.capture_response: bool = bool(s.get("capture_response", False))
+        self._capture_max_rows = int(s.get("capture_max_rows", 100))
+        self._capture_max_bytes = int(s.get("capture_max_bytes", 256 * 1024))
 
     async def _get_pool(self) -> Any:
         if self._pool is not None:
@@ -226,14 +305,18 @@ class DatabaseDestination(DestinationConnector):
                 self._pool = await _make_pool(self._dsn, self._pool_max, autocommit=False)
         return self._pool
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str) -> DeliveryResponse | None:
         params = _bind_params(payload, self._param_names)  # NegativeAckError(permanent) on bad data
         pool = await self._get_pool()
-        conn = await pool.acquire()
+        conn = await _acquire(pool, self._acquire_timeout)
         try:
             cur = await conn.cursor()
             try:
                 await cur.execute(self._sql, params)
+                # Capture the RETURNING/OUTPUT rows from the SAME cursor BEFORE commit (re-run-stable:
+                # a separate post-commit SELECT could read changed state on a crash-replay). _capture
+                # never raises — a capture problem must not roll back an otherwise-successful write.
+                captured = await self._capture(cur) if self.capture_response else None
                 await conn.commit()
             except Exception as exc:
                 await conn.rollback()
@@ -243,6 +326,49 @@ class DatabaseDestination(DestinationConnector):
                 raise _classify_db_error(state, str(exc)) from exc
         finally:
             await pool.release(conn)
+        return captured
+
+    async def _capture(self, cur: Any) -> DeliveryResponse:
+        """Serialize the statement's RETURNING/OUTPUT result-set to a bounded JSON body (ADR 0013).
+
+        Never raises (capture must not un-succeed a committed write): a missing result set / over-cap
+        becomes ``no_reply`` / ``unparseable`` with an empty body. Generated ids in a RETURNING are
+        only as stable as the write's idempotency — a non-idempotent INSERT re-derives a new id on a
+        crash-re-send (the standing 'outbounds must be idempotent' requirement; see the connector docs)."""
+        try:
+            rows = await cur.fetchall()
+        except Exception:  # noqa: BLE001 - statement produced no result set; capture nothing, keep the write
+            return DeliveryResponse(body="", outcome="no_reply", detail="no result set")
+        if not rows:
+            return DeliveryResponse(body="", outcome="no_reply", detail="0 rows")
+        if len(rows) > self._capture_max_rows:
+            return DeliveryResponse(
+                body="",
+                outcome="unparseable",
+                detail=f"result-set exceeded capture_max_rows={self._capture_max_rows}",
+            )
+        try:
+            cols = [d[0] for d in cur.description] if cur.description else []
+            data = [dict(zip(cols, tuple(row))) for row in rows]
+            body = json.dumps(data, default=_json_default)
+        except Exception as exc:  # noqa: BLE001 - an unserializable column type must NOT fail the write
+            # _json_default raises TypeError on a column type it can't encode; serializing must never
+            # propagate (it runs pre-commit and would roll back an otherwise-successful write).
+            return DeliveryResponse(
+                body="",
+                outcome="unparseable",
+                detail=f"result-set not serializable ({type(exc).__name__})",
+            )
+        if len(body.encode("utf-8")) > self._capture_max_bytes:
+            return DeliveryResponse(
+                body="",
+                outcome="unparseable",
+                detail=f"result-set exceeded capture_max_bytes={self._capture_max_bytes}",
+            )
+        return DeliveryResponse(body=body, outcome="accepted", detail=f"{len(rows)} row(s)")
+
+    async def test_connection(self) -> None:
+        await _probe_db(self._get_pool, timeout=self._acquire_timeout)
 
     async def aclose(self) -> None:
         if self._pool is not None:
@@ -293,6 +419,7 @@ class DatabaseSource(SourceConnector):
         self._poll_seconds = float(s.get("poll_seconds", 5.0))
         self._encoding: str = s.get("encoding", "utf-8")
         self._pool_max = int(s.get("pool_max", 5))
+        self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
         self._pool: Any = None
         self._pool_lock = asyncio.Lock()
         self._handler: InboundHandler | None = None
@@ -403,7 +530,7 @@ class DatabaseSource(SourceConnector):
         the rows are handed to the (possibly slow) handler, so a batch never holds a pool connection
         hostage to downstream store I/O."""
         pool = await self._get_pool()
-        conn = await pool.acquire()
+        conn = await _acquire(pool, self._acquire_timeout)
         try:
             cur = await conn.cursor()
             await cur.execute(self._poll_sql)
@@ -441,12 +568,15 @@ class DatabaseSource(SourceConnector):
             )
             return
         pool = await self._get_pool()
-        conn = await pool.acquire()
+        conn = await _acquire(pool, self._acquire_timeout)
         try:
             cur = await conn.cursor()
             await cur.execute(self._mark_sql, params)
         finally:
             await pool.release(conn)
+
+    async def test_connection(self) -> None:
+        await _probe_db(self._get_pool, timeout=self._acquire_timeout)
 
     async def aclose(self) -> None:
         if self._pool is not None:
@@ -457,3 +587,107 @@ class DatabaseSource(SourceConnector):
 
 register_destination(ConnectorType.DATABASE, DatabaseDestination)
 register_source(ConnectorType.DATABASE, DatabaseSource)
+
+
+def _bind_lookup_params(
+    params: Mapping[str, Any], names: list[str], connection: str
+) -> tuple[Any, ...]:
+    """Bind a params mapping to the statement's ordered ``:name`` placeholders (positional). A missing
+    name is a permanent author error → :class:`DbLookupError` (PHI-free: names the key, never its value)."""
+    try:
+        return tuple(params[n] for n in names)
+    except KeyError as exc:
+        raise DbLookupError(f"db_lookup on {connection!r}: missing parameter {exc}") from exc
+
+
+class DatabaseLookupExecutor:
+    """Pooled executor for handler-callable **live** lookups (``db_lookup``, ADR 0010).
+
+    Built by the :class:`~messagefoundry.pipeline.wiring_runner.RegistryRunner` from the graph's
+    ``DatabaseLookup`` specs (``env()``-resolved + ``[egress].allowed_db``-checked by the runner). Lazily
+    opens one read-only ``aioodbc`` pool per named connection; :meth:`query` runs on the engine loop,
+    while ``db_lookup`` bridges to it from the handler's worker thread via ``run_coroutine_threadsafe``.
+    Reuses the DATABASE connector's DSN build / named-parameter translation / SQLSTATE extraction. Pools
+    are autocommit — a lookup is read-only, so each query is its own implicit transaction; nothing here
+    writes. Production / supported (SQL Server via the ``[sqlserver]`` extra), like the DATABASE connector."""
+
+    def __init__(self, connections: Mapping[str, Mapping[str, Any]]) -> None:
+        # connections: name -> already-env-resolved settings (the runner substitutes env() first).
+        self._dsn: dict[str, str] = {}
+        self._pool_max: dict[str, int] = {}
+        self._acquire_timeout: dict[str, float] = {}
+        for cname, s in connections.items():
+            for req in ("server", "database"):
+                if not s.get(req):
+                    raise ValueError(f"DatabaseLookup {cname!r} requires a {req!r} setting")
+            self._dsn[cname] = _build_dsn(dict(s))  # fail fast on weakened-TLS / bad-auth config
+            self._pool_max[cname] = int(s.get("pool_max", 5))
+            self._acquire_timeout[cname] = float(
+                s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT)
+            )
+        self._pools: dict[str, Any] = {}
+        self._locks: dict[str, asyncio.Lock] = {c: asyncio.Lock() for c in self._dsn}
+
+    @property
+    def connections(self) -> frozenset[str]:
+        """The declared lookup connection names."""
+        return frozenset(self._dsn)
+
+    async def _get_pool(self, connection: str) -> Any:
+        pool = self._pools.get(connection)
+        if pool is not None:
+            return pool
+        async with self._locks[connection]:
+            if connection not in self._pools:
+                self._pools[connection] = await _make_pool(
+                    self._dsn[connection], self._pool_max[connection], autocommit=True
+                )
+        return self._pools[connection]
+
+    async def query(
+        self, connection: str, statement: str, params: Mapping[str, Any] | None
+    ) -> list[dict[str, Any]]:
+        """Run ``statement`` against ``connection`` and return rows as ``{column: value}`` dicts.
+
+        Always parameterized (``:name`` → positional ``?``, bound from ``params`` — a value can never
+        inject SQL). Raises :class:`DbLookupError` (PHI-free) on an unknown connection, a missing
+        parameter, or a DB/driver error — the transform worker turns it into that message's ``ERROR`` /
+        dead-letter disposition. Runs on the engine loop (the handler thread bridges in via
+        ``run_coroutine_threadsafe``), so a slow query never blocks the loop, only its own worker thread."""
+        if connection not in self._dsn:
+            known = ", ".join(sorted(self._dsn)) or "(none declared)"
+            raise DbLookupError(
+                f"db_lookup: no DatabaseLookup connection named {connection!r} (declared: {known})"
+            )
+        sql, names = _parse_named_params(statement)
+        bound = _bind_lookup_params(params or {}, names, connection)
+        pool = await self._get_pool(connection)
+        try:
+            conn = await _acquire(pool, self._acquire_timeout[connection])
+        except DeliveryError as exc:
+            # Map the transient pool-timeout onto the lookup's own PHI-free error type so the transform
+            # worker dead-letters/errors this message consistently with other lookup failures.
+            raise DbLookupError(f"db_lookup on {connection!r}: {exc}") from exc
+        try:
+            cur = await conn.cursor()
+            await cur.execute(sql, bound)
+            columns = [d[0] for d in cur.description] if cur.description else []
+            rows = list(await cur.fetchall())
+        except DbLookupError:
+            raise
+        except Exception as exc:
+            state = _sqlstate(exc)
+            # PHI-free: name the connection + SQLSTATE (if any) only — never the statement/params/rows.
+            raise DbLookupError(
+                f"db_lookup query on {connection!r} failed" + (f" [{state}]" if state else "")
+            ) from exc
+        finally:
+            await pool.release(conn)
+        return [dict(zip(columns, row)) for row in rows]
+
+    async def aclose(self) -> None:
+        """Close every opened pool (idempotent; safe if no pool was ever opened)."""
+        for pool in self._pools.values():
+            pool.close()
+            await pool.wait_closed()
+        self._pools.clear()

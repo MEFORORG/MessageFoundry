@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Generate conformant HL7 v2.5.1 **MFN** (master file notification) messages.
 
 We cover the generic master-file structures (M01, M13) that need only MFI + MFE. The typed

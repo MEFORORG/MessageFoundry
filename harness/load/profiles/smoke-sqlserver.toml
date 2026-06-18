@@ -1,0 +1,42 @@
+# SQL Server smoke load profile — the SQL-Server-store CI gate. Same tiny, deterministic zero-loss
+# wiring check as `smoke`, but with a drain SLO sized for a server-DB backend: every staged-pipeline
+# handoff (ingress→routed→outbound→delivered) is a committed round-trip to SQL Server, so the queue
+# drains much slower than in-process SQLite (~30 deliveries/s vs sub-second). This is NOT a perf
+# measurement — the correctness SLOs (zero_loss, error rate) stay strict; only max_drain_seconds is
+# relaxed so a healthy SQL Server run isn't failed for being a remote DB. Serve harness/config/load
+# with MEFOR_STORE_BACKEND=sqlserver, then: python -m harness --load smoke-sqlserver --engine URL
+#
+# All values are generic and synthetic. This profile names no real partner, site, host, or volume.
+
+[load]
+name = "smoke-sqlserver"
+description = "tiny zero-loss wiring check for the SQL Server store CI gate (not a perf measurement)"
+pool_size = 4
+corpus_count_per_trigger = 5
+poll_interval_s = 0.5
+drain_timeout_s = 120.0
+correlator_capacity = 50000
+
+[[load.target]]
+name = "adt_hub"
+host = "127.0.0.1"
+port = 2600
+types = ["ADT"]
+
+# A single clean trigger keeps corpus generation (hl7apy-validated) fast for CI.
+[load.mix]
+"ADT^A05" = 1.0
+
+[load.slo]
+zero_loss = true
+max_error_rate = 0.01
+# Server-DB drain bound: a local run drains ~800 fan-out deliveries in ~27s; 90s gives headroom for a
+# shared CI runner without hiding a real stall (drain_timeout_s above is the hard ceiling).
+max_drain_seconds = 90.0
+
+[[load.phase]]
+name = "steady"
+kind = "sustained"
+loop = "open"
+rate_start = 20.0
+duration_s = 5.0

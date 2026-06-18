@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Full-coverage example graph — the config the test harness drives to exercise *every* engine
 behavior from one place. Serve it on its own (it binds MLLP 2575, like ``samples/config/adt.py``,
 so don't load both)::

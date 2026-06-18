@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Transport connectors (sources & destinations).
 
 Each connector implements the small async interface in :mod:`.base` and is keyed by
@@ -14,11 +16,14 @@ from __future__ import annotations
 from messagefoundry.transports import (  # noqa: F401  (import = registration)
     database,
     file,
+    loopback,
     mllp,
     remotefile,
     rest,
     soap,
     tcp,
+    timer,
+    x12,
 )
 from messagefoundry.transports.base import (
     DeliveryError,

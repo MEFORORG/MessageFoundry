@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tolerant HL7 v2 *peek* — fast field extraction for routing/filtering.
 
 This is the hot path: every inbound message is peeked to pull the handful of MSH

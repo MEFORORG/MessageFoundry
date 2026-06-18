@@ -1,28 +1,41 @@
-"""Engine Status page: engine-process and database health.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+"""Engine Status page: engine-process, database, and active-passive cluster health.
 
-Cheap fields refresh on the auto-refresh timer; the database integrity check is on-demand
-(``PRAGMA quick_check`` can be slow on a large DB).
+All engine reads run **off the Qt main thread** (:class:`~messagefoundry.console._async.AsyncRunner`) and
+apply on the main thread via the result slot, so a slow DB-backed read — e.g. ``/cluster/nodes`` while a
+new primary is recovering during a failover — can't freeze the window. The database integrity check is
+on-demand (``PRAGMA quick_check`` can run for many seconds on a large DB) and also off-thread.
 """
 
 from __future__ import annotations
+
+import time
+from dataclasses import dataclass
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMessageBox,
     QPushButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from messagefoundry.api.models import ClusterNodeList, ClusterStatus, IntegrityResult, SystemStatus
 from messagefoundry.console import service_control
+from messagefoundry.console._async import AsyncRunner
 from messagefoundry.console.client import ApiError, EngineClient
 
 _ENGINE_ROWS = ["Reachable", "Version", "Uptime", "PID", "Channels", "Queue"]
 _DB_ROWS = ["Path", "Size", "Free disk", "Journal mode", "Messages", "Events", "Audit entries"]
+_NODE_COLS = ["Node", "Host", "PID", "Status", "Last seen", "Leader"]
 
 
 def _human_bytes(n: int) -> str:
@@ -48,8 +61,26 @@ def _human_uptime(seconds: float) -> str:
     return " ".join(parts)
 
 
+def _ago(last_seen: float | None, now: float) -> str:
+    if last_seen is None:
+        return "—"
+    delta = max(0, int(now - last_seen))
+    return "just now" if delta < 1 else f"{delta}s ago"
+
+
+@dataclass(frozen=True)
+class _Snapshot:
+    """One off-thread refresh result, applied on the main thread. ``error`` set ⇒ engine unreachable;
+    ``cluster`` None ⇒ the cluster endpoints aren't available (older engine / not permitted)."""
+
+    service_state: str
+    status: SystemStatus | None
+    cluster: tuple[ClusterStatus, ClusterNodeList] | None
+    error: str | None
+
+
 class EngineStatusPage(QWidget):
-    """Read-only engine + database health, plus an on-demand integrity check."""
+    """Read-only engine + database + cluster health, plus an on-demand integrity check."""
 
     error = Signal(str)
 
@@ -57,6 +88,8 @@ class EngineStatusPage(QWidget):
         super().__init__()
         self._client = client
         self._service_name = service_name
+        self._runner = AsyncRunner(self)
+        self._loading = False  # in-flight refresh guard (don't pile up during a slow call)
         self._engine = {row: QLabel("—") for row in _ENGINE_ROWS}
         self._db = {row: QLabel("—") for row in _DB_ROWS}
 
@@ -69,6 +102,28 @@ class EngineStatusPage(QWidget):
         db_form = QFormLayout(db_box)
         for row, label in self._db.items():
             db_form.addRow(f"{row}:", label)
+
+        # Active-passive cluster roster (Workstream G). Hidden until a /cluster read succeeds — a
+        # single-node or older engine without the endpoints simply doesn't show it.
+        self._cluster_box = QGroupBox("Cluster")
+        self._cluster_box.setVisible(False)
+        self._cl_mode = QLabel("—")
+        self._cl_role = QLabel("—")
+        self._cl_leader = QLabel("—")
+        self._cl_lease = QLabel("—")
+        cluster_form = QFormLayout()
+        cluster_form.addRow("Mode:", self._cl_mode)
+        cluster_form.addRow("This node:", self._cl_role)
+        cluster_form.addRow("Leader:", self._cl_leader)
+        cluster_form.addRow("Lease owner:", self._cl_lease)
+        self._nodes = QTreeWidget()
+        self._nodes.setColumnCount(len(_NODE_COLS))
+        self._nodes.setHeaderLabels(_NODE_COLS)
+        self._nodes.setRootIsDecorated(False)
+        self._nodes.setUniformRowHeights(True)
+        cluster_layout = QVBoxLayout(self._cluster_box)
+        cluster_layout.addLayout(cluster_form)
+        cluster_layout.addWidget(self._nodes)
 
         # Windows service control (sc/net via UAC) — same-machine only; disabled in dev/no-service.
         service_box = QGroupBox(f"Service ({service_name})")
@@ -105,19 +160,57 @@ class EngineStatusPage(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(engine_box)
         layout.addWidget(db_box)
+        layout.addWidget(self._cluster_box)
         layout.addWidget(service_box)
         layout.addLayout(integrity)
         layout.addStretch(1)
 
+    # --- refresh (off the main thread) ---------------------------------------
+
     def refresh(self) -> None:
-        self._refresh_service()  # independent of the API — works even when the engine is down
+        if self._loading:
+            return  # a fetch is already in flight — don't pile up (e.g. during a slow failover)
+        self._loading = True
+        self._runner.submit(self._fetch, on_done=self._apply, on_error=self._on_error)
+
+    def reload(self) -> None:
+        self.refresh()
+
+    def stop(self) -> None:
+        """Stop the background runner (call on window close) so a late result can't touch dead widgets."""
+        self._runner.stop()
+
+    def _on_error(self, exc: BaseException) -> None:
+        # Belt-and-suspenders: the reads in _fetch raise only ApiError (handled via the snapshot), but
+        # an unexpected error must still clear the in-flight guard or the page wedges forever.
+        self._loading = False
+        self.error.emit(str(exc))
+
+    def _fetch(self) -> _Snapshot:
+        """Runs on a worker thread — only blocking I/O, no widget access."""
+        svc = service_control.service_state(self._service_name)
         try:
             status = self._client.status()
         except ApiError as exc:
+            return _Snapshot(svc, None, None, str(exc))
+        cluster: tuple[ClusterStatus, ClusterNodeList] | None
+        try:
+            cluster = (self._client.cluster_status(), self._client.cluster_nodes())
+        except ApiError:
+            cluster = None  # endpoints not available / not permitted — keep the cluster box hidden
+        return _Snapshot(svc, status, cluster, None)
+
+    def _apply(self, snap: _Snapshot) -> None:
+        """Runs on the main thread (result slot) — safe to touch widgets."""
+        self._loading = False
+        self._apply_service(snap.service_state)
+        if snap.error is not None:
             self._engine["Reachable"].setText("no")
-            self.error.emit(str(exc))
+            self._cluster_box.setVisible(False)
+            self.error.emit(snap.error)
             return
-        e = status.engine
+        assert snap.status is not None
+        e = snap.status.engine
         self._engine["Reachable"].setText("yes")
         self._engine["Version"].setText(e.version)
         self._engine["Uptime"].setText(_human_uptime(e.uptime_seconds))
@@ -126,7 +219,7 @@ class EngineStatusPage(QWidget):
         queue = ", ".join(f"{k}={v}" for k, v in sorted(e.outbox_by_status.items()))
         self._engine["Queue"].setText(queue or "empty")
 
-        d = status.db
+        d = snap.status.db
         self._db["Path"].setText(d.path)
         self._db["Size"].setText(_human_bytes(d.size_bytes))
         self._db["Free disk"].setText(_human_bytes(d.disk_free_bytes))
@@ -135,11 +228,41 @@ class EngineStatusPage(QWidget):
         self._db["Events"].setText(str(d.events))
         self._db["Audit entries"].setText(str(d.audit))
 
-    def reload(self) -> None:
-        self.refresh()
+        self._apply_cluster(snap.cluster)
 
-    def _refresh_service(self) -> None:
-        state = service_control.service_state(self._service_name)
+    def _apply_cluster(self, cluster: tuple[ClusterStatus, ClusterNodeList] | None) -> None:
+        if cluster is None:
+            self._cluster_box.setVisible(False)
+            return
+        status, nodes = cluster
+        self._cluster_box.setVisible(True)
+        self._cl_mode.setText("clustered" if status.clustered else "single-node")
+        self._cl_role.setText(f"{status.role} ({status.node_id})")
+        self._cl_leader.setText(nodes.leader_node_id or "— (no live leader)")
+        lease = nodes.lease_owner or "—"
+        if nodes.lease_owner and nodes.lease_expires_at is not None:
+            remaining = int(nodes.lease_expires_at - time.time())
+            lease += f" (lease {'expired' if remaining < 0 else f'~{remaining}s left'})"
+        self._cl_lease.setText(lease)
+
+        now = time.time()
+        self._nodes.clear()
+        for n in nodes.nodes:
+            item = QTreeWidgetItem(
+                [
+                    n.node_id,
+                    n.host or "—",
+                    str(n.pid) if n.pid is not None else "—",
+                    n.status,
+                    _ago(n.last_seen, now),
+                    "✓ leader" if n.is_leader else "",
+                ]
+            )
+            self._nodes.addTopLevelItem(item)
+        for col in range(self._nodes.columnCount()):
+            self._nodes.resizeColumnToContents(col)
+
+    def _apply_service(self, state: str) -> None:
         self._service_state.setText(state)
         # Only enable actions that make sense for the current state; all off in dev/no-service.
         self._svc_start.setEnabled(state == "stopped")
@@ -147,23 +270,52 @@ class EngineStatusPage(QWidget):
         self._svc_restart.setEnabled(state == "running")
         self._svc_install.setVisible(state == "not installed")  # offer install only then
 
+    # --- service control (unchanged; same-machine sc/net via UAC) ------------
+
     def _install_service(self) -> None:
         script = service_control.install_script_path()
         if script is None:
             self._svc_result.setText("Could not find install-service.ps1 — run it manually.")
             return
-        if not self._confirm_install():
+        env = self._prompt_environment()
+        if env is None:
+            return  # cancelled or invalid — leave the page untouched
+        if not self._confirm_install(env):
             return
-        if service_control.install_service(str(script)):
+        if service_control.install_service(str(script), env):
             self._svc_result.setText("Launching installer — approve the UAC prompt.")
         else:
             self._svc_result.setText("Service install is only available on Windows.")
 
-    def _confirm_install(self) -> bool:
+    def _prompt_environment(self) -> str | None:
+        """Ask which active environment the service should run as (ADR 0017: the operator chooses it
+        explicitly — `serve` has no silent default). Returns the validated name, or None if the
+        operator cancelled or entered an invalid name."""
+        env, ok = QInputDialog.getText(
+            self,
+            "Active environment",
+            "Which environment should the service run as?\n"
+            "Selects environments/<name>.toml — e.g. dev, staging, prod, or a custom name.",
+            text="prod",
+        )
+        if not ok:
+            return None
+        env = env.strip()
+        if not service_control.is_safe_environment(env):
+            QMessageBox.warning(
+                self,
+                "Invalid environment",
+                "Use a simple name of letters, digits, '.', '_' or '-' "
+                "(it selects environments/<name>.toml).",
+            )
+            return None
+        return env
+
+    def _confirm_install(self, env: str) -> bool:
         reply = QMessageBox.question(
             self,
             "Install MessageFoundry service",
-            "This will install MessageFoundry as a Windows service:\n\n"
+            f"This will install MessageFoundry as a Windows service (environment: {env}):\n\n"
             "• Downloads NSSM (the service wrapper) if it isn't already present\n"
             "• Registers the service to start automatically at boot\n"
             "• Requires administrator rights — Windows will show a UAC prompt\n"
@@ -204,10 +356,22 @@ class EngineStatusPage(QWidget):
         )
         return reply == QMessageBox.StandardButton.Yes
 
+    # --- integrity check (off the main thread — quick_check can run for minutes) ---
+
     def _run_integrity(self) -> None:
-        try:
-            result = self._client.integrity_check()
-        except ApiError as exc:
-            self.error.emit(str(exc))
-            return
+        self._integrity_btn.setEnabled(False)
+        self._integrity_result.setText("running…")
+        self._runner.submit(
+            self._client.integrity_check,
+            on_done=self._apply_integrity,
+            on_error=self._integrity_error,
+        )
+
+    def _apply_integrity(self, result: IntegrityResult) -> None:
+        self._integrity_btn.setEnabled(True)
         self._integrity_result.setText("✓ ok" if result.ok else f"✗ {result.detail}")
+
+    def _integrity_error(self, exc: BaseException) -> None:
+        self._integrity_btn.setEnabled(True)
+        self._integrity_result.setText("")
+        self.error.emit(str(exc))

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The replay corpus: generate once, stamp a unique control id per send, sample by the mix.
 
 Asserts unique/monotonic control ids that round-trip through MSH-10, that the sampler honors weights,

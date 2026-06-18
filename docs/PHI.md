@@ -20,27 +20,43 @@ Every section is tagged:
 
 **`[MIXED]`**
 
-**Phase 1 (today): single host, localhost-only, authenticated.** The engine API binds
-`127.0.0.1` ([config default](CONFIGURATION.md#api)); the console reaches it over loopback HTTP.
-The trust boundary is the **local machine and its OS accounts**: anyone with the engine's service
-account, the DB file, or a backup of it can read PHI. Network attackers are out of scope *only as
-long as the bind stays on loopback*.
+**Trust boundary: the organization's private network.** MessageFoundry is deployed **inside a single
+healthcare organization's private, trusted network** (on-prem / private cloud), behind its perimeter
+controls (firewall, segmentation, VPN/NAC) — **never directly on the public internet** (the standard
+clinical-interface-engine model). The trust boundary is therefore the **org's internal network + the
+host's OS accounts**. The full operator-facing posture is [DEPLOYMENT.md](DEPLOYMENT.md).
 
-**Phase 2 (later): network exposure.** The moment the API binds anything other than `127.0.0.1`,
-the boundary becomes the network and TLS + (planned) MFA become mandatory, not optional — see
-[§4](#4-data-in-transit) and [§11](#11-hardening-roadmap).
+This is a statement about *trust*, not about the bind interface. Three planes sit at different exposure
+levels:
 
-| Actor / vector | In scope Phase 1? | Mitigation |
+- **Management plane** (console/IDE → API) — **loopback by default** (or a restricted management
+  subnet); always **authenticated** (RBAC + audit). Smallest surface.
+- **Data plane** (inbound MLLP / TCP / X12 / DB-poll feeds) — **network-bound in any real install**
+  (feeds arrive from other systems on the LAN, not `127.0.0.1`), protected by **TLS on the wire**
+  (MLLP-over-TLS, built), the ingress/`[egress]` allow-lists, and your network segmentation. PHI must
+  not cross the LAN in cleartext — and can't accidentally: the bind-guard **refuses any non-loopback
+  *plaintext* API/MLLP bind** (ADR 0002 §0).
+- **Inbound web-service listener** (a partner calling *into* MEFOR) — **not built today**; a distinct
+  surface needing its own auth/TLS when it lands (backlog).
+
+The security controls that only become material off-loopback (MFA, mTLS, certificate revocation,
+off-box logs) are **delegated to the org's environment** (IdP/AD, PKI, SIEM, network controls) and
+documented per deployment — see [DEPLOYMENT.md](DEPLOYMENT.md) and [§11](#11-hardening-roadmap).
+
+| Actor / vector | In scope? | Mitigation |
 |---|---|---|
-| Local operator using the console/API | Yes | Auth + RBAC + audit (built — [SECURITY.md](SECURITY.md)) |
+| Operator using the console/API | Yes | Auth + RBAC + audit (built — [SECURITY.md](SECURITY.md)); step-up re-verification on sensitive ops (ASVS 7.5.3) |
 | Local user reading the DB file directly | Yes | Owner-only file ACL (built) + at-rest body encryption when a key is set (built — §3); volume encryption for the rest |
 | Stolen DB file / backup | Yes | At-rest body encryption (built — §3) + required volume encryption for `summary`/WAL/temp |
-| PHI in logs / CI output / shell redirects | **Yes** | "Never log bodies" rule (built) + redaction framework ([ROADMAP], §7) |
-| Network eavesdropper on MLLP / API | Phase 2 | MLLP-over-TLS, API TLS ([ROADMAP], §4) |
-| Misconfigured outbound destination | Yes | Destination allowlist ([ROADMAP], §4) |
+| PHI in logs / CI output / shell redirects | **Yes** | "Never log bodies" rule + global log redaction (`RedactionFilter`) + `safe_exc()` chokepoint + prod-DEBUG startup guard (built — §7) |
+| Eavesdropper on the **internal LAN** (MLLP / API) | Yes | **API/WSS TLS + MLLP-over-TLS built** (Gate #4, §4) — *enable them*; the bind-guard refuses non-loopback plaintext; + your network segmentation |
+| Compromised internal host / lateral movement | Partly | Network segmentation + TLS + required auth + at-rest encryption; off-box log shipping (delegate to your SIEM — §11) for evidence beyond the host |
+| **Public-internet attacker** | **Out of scope by design** | MEFOR is **not** internet-facing (trust boundary above); off-loopback exposure is internal-only and TLS-required |
+| Misconfigured outbound destination | Yes | Destination allowlist (`[egress].allowed_*`, §4) |
 
-**Correction to older docs:** the API is **localhost-only *and* authenticated** — not "no auth."
-Auth/RBAC/audit are built (see [SECURITY.md](SECURITY.md)); only remote *exposure* is deferred.
+**Note:** the management API is **loopback-default *and* always authenticated** (auth/RBAC/audit built
+— [SECURITY.md](SECURITY.md)); the data plane is network-bound with TLS (above). Only *public-internet*
+exposure is excluded by design.
 
 ---
 
@@ -125,9 +141,30 @@ must be searchable/indexable); volume encryption is what protects them at rest. 
 unacceptable for a deployment, **SQLCipher** (whole-DB, including WAL) is the documented alternative —
 at the cost of a native dependency and replacing the connect path.
 
-**SQL Server backend (experimental):** `encrypt = true` secures the DB *connection* (TLS in transit),
+**SQL Server backend:** `encrypt = true` secures the DB *connection* (TLS in transit),
 **not** data at rest — at-rest there means SQL Server TDE, configured at the database, not by
 MessageFoundry.
+
+### Data minimization during processing (in-use posture, ASVS 11.7.2)
+
+PHI is exposed for the **minimum window and surface** needed to route and transform it:
+
+- **Peek, not full-parse, on the hot path.** Routing/filtering reads only the specific HL7 fields a
+  Router asks for via the tolerant `Peek` ([parsing/peek.py](../messagefoundry/parsing/peek.py)); the
+  version-aware full object model (hl7apy) is built only on the opt-in strict path. The engine never
+  materializes more of a message than the work requires.
+- **Encrypt-after-use at the boundary.** A decrypted body lives in heap only for the lifetime of one
+  pipeline stage; the store cipher re-encrypts every PHI column the moment it is written back
+  ([store/crypto.py](../messagefoundry/store/crypto.py)), so persisted data never lingers in plaintext
+  at rest and the staged queue carries the message forward rather than holding it open.
+- **Searchable `summary` residual `[by design]`.** The `summary` (MRN/name) stays plaintext so it is
+  indexable (accepted residual above); volume encryption covers it at rest.
+
+**Honest limitation:** decrypted PHI is ordinary Python heap for the processing window and is **not
+zeroized after use** — CPython strings/bytes are immutable and not reliably wipeable, and full in-use
+memory encryption (ASVS 11.7.1) is a host/OS capability (Intel TME / AMD SEV / confidential VMs), not
+something an application library can provide. The compensating controls are the documented
+restricted-service-account + volume-encryption posture (§10) on a single-tenant host.
 
 ---
 
@@ -137,11 +174,11 @@ MessageFoundry.
 
 | Path | Today | Plan |
 |---|---|---|
-| MLLP inbound/outbound | **Plaintext** TCP (`asyncio.open_connection`) | MLLP-over-TLS (TLS 1.2+, cert verify on) — [P1-4](#11-hardening-roadmap) |
+| MLLP inbound/outbound | Plaintext by default; **MLLP-over-TLS (TLS 1.2+, server-cert verify + hostname, opt-in mTLS) when `tls=true`** `[BUILT — WP-13b]`. A non-loopback plaintext MLLP listener is **refused at startup** (exposed-gate, ADR 0002 §0) unless `tls=true` or `serve --allow-insecure-bind`. | — |
 | File connector | Plaintext `.hl7` on disk/share | Rely on volume/share encryption; SFTP later |
-| Engine API ↔ console | Loopback HTTP, **no TLS** (Phase 1 localhost-only) | API TLS when bound off-loopback — [P2-1](#11-hardening-roadmap) |
+| Engine API ↔ console | Loopback HTTP by default; off-loopback requires TLS — **in-process** (`[api].tls_cert_file`, WP-13a) **or upstream** at a trusted reverse proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15) `[BUILT]`. HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
 | AD / LDAP auth | **LDAPS** with cert verification (`ad_tls_verify`) `[BUILT]` | — |
-| SQL Server backend | `Encrypt=yes` TLS-to-DB `[BUILT, experimental]` | — |
+| SQL Server backend | `Encrypt=yes` TLS-to-DB `[BUILT]` | — |
 
 **Hard rule:** never bind the API to `0.0.0.0` (or any non-loopback interface) without TLS in front
 of it. Bearer tokens and PHI would otherwise cross the network in cleartext.
@@ -150,6 +187,25 @@ of it. Bearer tokens and PHI would otherwise cross the network in cleartext.
 and a reverse-proxy / forwarded-header alternative are designed in
 [ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md) (*Proposed* — build gated on a
 scheduled off-loopback exposure).
+
+**Key-exchange parameters `[BUILT — WP-L3-10 code half]` (ASVS 11.6.2).** Every TLS context the engine
+builds — the API/WebSocket listener ([api/tls.py](../messagefoundry/api/tls.py)) and the per-connection
+MLLP server/client contexts ([transports/mllp.py](../messagefoundry/transports/mllp.py)) — enforces a
+**TLS 1.2+ floor**, which constrains 1.2 to **(EC)DHE** key exchange and makes 1.3 ECDHE-only: forward-
+secret key establishment, never static RSA/DH. Two controls in
+[config/tls_policy.py](../messagefoundry/config/tls_policy.py) pin the *parameters*:
+
+- **Approved groups pinned where supported.** Built contexts call `harden_kex_groups`, which sets the
+  approved ECDHE groups `X25519:secp384r1:secp256r1` via `SSLContext.set_groups` on Python ≥ 3.13. On
+  3.11/3.12 there is no public group-pinning API and OpenSSL's defaults already lead with exactly these
+  curves, so it is a deliberate no-op, not a downgrade.
+- **`tls_ciphers` is validated, not trusted.** An operator `[api].tls_ciphers` string is rejected at
+  config load if it would admit a **non-forward-secret** (static-RSA/DH) suite, so a misconfiguration
+  cannot widen the key exchange below policy.
+
+No static-DH parameter files are used, and at-rest key material is a pre-shared secret (§3), not
+negotiated — so the only key exchange in the system is inside TLS, with the parameters above. Material
+once the API/MLLP binds off-loopback (when the engine terminates TLS).
 
 **Outbound destination allowlist `[BUILT]` (WP-11c).** The `[egress]` section
 ([CONFIGURATION.md](CONFIGURATION.md#egress)) is a **fail-closed** allowlist for where the engine
@@ -200,7 +256,8 @@ corrected to say so.)
 
 **Hard rule (enforced by convention today):** never log full message bodies at INFO or above. Full
 payloads go only to the secured store, never the general log. Logging is stdlib today (stdout, NSSM
-captures to rotating files); **do not run production at `DEBUG`.**
+captures to rotating files); running a **`prod`** environment at `DEBUG` is **refused at startup**
+(Gate #1 — DEBUG can surface bodies/raw fields; see below).
 
 **Known leak surfaces — treat these as PHI sinks:**
 
@@ -219,16 +276,51 @@ de-identification (§9); the residual control for free-text PHI a user script in
 INFO+, the CR/LF log-injection filter, and silencing python-hl7's PHI-prone loggers — remain in
 [logging_setup.py](../messagefoundry/logging_setup.py).
 
-**Structured logging `[ROADMAP]`.** structlog/JSON log records + **off-box (syslog/SIEM) forwarding**
-are deferred — their payoff is off-box ingestion, so they are bundled with the Phase-2 off-box
-exposure work (P2-3, `[conditional]`). Until then, NSSM captures stdout to access-controlled rotating
-files (harden the log dir per [SERVICE.md](SERVICE.md)).
+**Global log redaction + prod-DEBUG guard `[BUILT]` (Gate #1).** Two handler filters run on **every**
+emitted record ([logging_setup.py](../messagefoundry/logging_setup.py), installed by
+`configure_logging`): a **`RedactionFilter`** that `redact()`-scrubs both the rendered **message** and
+the formatted **exception traceback — chained `__cause__`/`__context__` included** — so every
+`log.exception()` / `exc_info=` site (the delivery/router/transform catches, the `_on_*_worker_done`
+callbacks, the file/db/remotefile pollers, and the cluster leader-sweep/heartbeat loops) is redacted
+*by construction*, not per call site; then the **`ControlCharScrubFilter`** (CR/LF + control-char
+scrub). `redact()` rewrites only HL7-shaped spans, so ordinary operational lines are untouched. This
+makes `safe_exc()` (above) the explicit chokepoint and the global filter the backstop for anything that
+reaches a handler un-redacted. Separately, **`serve` refuses to start at `DEBUG` on a production instance**
+(`[ai].production = true`) — DEBUG can surface full bodies / raw fields and real PHI flows there.
+
+**Gate #1 acceptance (v0.1)** — each criterion with its proving test:
+- the global `RedactionFilter` is installed by `configure_logging` (`tests/test_logging.py`);
+- a chained exception carrying an HL7 body yields no body fragment in any rendered traceback, while the
+  exception **type** is kept (`tests/test_logging.py`);
+- end-to-end across parse→route→transform→deliver, a synthetic ADT with a known patient name + MRN that
+  hits a Handler exception **and** a delivery failure leaves **no record at WARNING+** carrying those
+  values (`tests/test_wiring_engine.py`);
+- `serve` refuses `DEBUG` in a `prod` environment (`tests/test_logging.py`).
+
+**Structured logging + off-box forwarding `[BUILT, sec-offbox-log]`.** The general log can emit
+**structured JSON** (one object per line, `[logging].format = "json"`) and a **copy of every record can
+be forwarded off-box** to a syslog/SIEM collector (`[logging].forward_enabled` + `forward_host`/`_port`/
+`_protocol`/`_format`) — so log evidence survives a host compromise rather than living only in NSSM's
+local files. The forwarder is wired in [`logging_setup.configure_logging`](../messagefoundry/logging_setup.py),
+and the **same two handler filters** (`RedactionFilter` then `ControlCharScrubFilter`) are installed on
+**every** sink, so the forwarded stream carries the identical PHI-redaction + log-injection guarantees as
+stdout; `json.dumps` additionally escapes control characters so a record can't break the one-line-per-
+record framing — JSON is therefore the recommended (and default) off-box `forward_format`; the `text`
+format is best-effort framing (a multi-line traceback spans lines). **Transport caveat:** the syslog
+transport itself is **plaintext** — terminate it at a local TLS-forwarding agent (rsyslog/Vector/the
+SIEM agent) or keep it on a trusted management network. **Availability:** the forwarder never blocks the
+engine *indefinitely* — UDP is fire-and-forget; a TCP collector that is **unreachable at startup** is
+skipped with a warning, and one that **stalls at runtime** is bounded by a socket timeout (the record is
+dropped) so a wedged SIEM can't stall the asyncio event loop. The send is still synchronous, so for a
+high-volume feed prefer UDP or a local agent. **Still deferred:** tee-ing the tamper-evident
+**`audit_log`** itself through the logger (so audit events also ship off-box) is the **store-side**
+follow-on slice; structlog is not used (stdlib `logging` only).
 
 ### Logging inventory (16.1.1 / 16.2.3)
 
 | Stream | Contents | Format / store | PHI controls |
 |---|---|---|---|
-| **General log** (stdout → NSSM rotating files) | operational events, exception **types**, redacted messages | single-line text, UTC `Z` timestamps | never-log-bodies rule; CR/LF + control-char scrub; `safe_exc()` on logged exceptions; python-hl7 PHI loggers silenced |
+| **General log** (stdout → NSSM rotating files; optional off-box **syslog/SIEM** copy — `[logging].forward_*`) | operational events, exception **types**, redacted messages | single-line text or structured **JSON** (`[logging].format`), UTC `Z` timestamps | never-log-bodies rule; CR/LF + control-char scrub; `safe_exc()` on logged exceptions; python-hl7 PHI loggers silenced — **same filters on the off-box forwarder**; syslog transport is plaintext (front with TLS — §7) |
 | **`audit_log`** (SQLite) | who/what/when of auth + PHI *access* (IDs/counts, not bodies) | structured JSON `detail`, tamper-evident hash chain | bodies/credentials never written; read via `GET /audit` |
 | **`messages.error` / `queue.last_error` / `message_events.detail`** (SQLite) | per-message disposition detail | text, **AES-256-GCM at rest** (WP-5) + **`safe_exc()`-redacted** (WP-6c) | encrypted + redacted; volume encryption backstop |
 
@@ -261,7 +353,7 @@ cutoffs + counts (no message content — no PHI).
 pruning is deliberately **not** enforced. Archive-first audit pruning (export → delete → re-anchor the
 chain) is a tracked follow-up.
 
-**SQLite-only.** On the experimental SQL Server backend, at-rest retention is a DBA concern (TDE + a SQL
+**SQLite-only.** On the SQL Server backend, at-rest retention is a DBA concern (TDE + a SQL
 Agent purge/shrink job); the engine's retention task targets the SQLite store.
 
 ---
@@ -320,7 +412,7 @@ For operators standing up the engine (see also [SERVICE.md](SERVICE.md)):
 ## 11. Hardening roadmap
 
 Phased by exposure and effort (S ≈ ≤1 day, M ≈ 2–4 days, L ≈ 1–2 weeks). Mappings are to HIPAA
-§164.312 safeguards and NIST SP 800-53 families; the direction is aligned with the 2025 HIPAA
+§164.312 safeguards; the direction is aligned with the 2025 HIPAA
 Security Rule NPRM, which moves encryption (at rest **and** in transit) and MFA from "addressable" to
 mandatory.
 
@@ -350,7 +442,7 @@ separate follow-up.
 | Item | Closes | Maps to | Effort |
 |---|---|---|---|
 | **P2-1** TLS on the engine API | Tokens + PHI cleartext over the network | §164.312(e) · SC-8 | M |
-| **P2-2** MFA for console/API auth | Single-factor PHI access | §164.312(d) · IA-2(1) (NPRM-mandated) | M–L |
+| **P2-2** MFA for console/API auth — ✅ **Built (WP-14, native TOTP, local accounts)** | Single-factor auth (mitigated for local accounts: `[auth].require_mfa` gates **step-up / sensitive admin operations** for the Administrator role — not every PHI read; AD MFA delegated) | §164.312(d) · IA-2(1) (NPRM-mandated) | M–L |
 | **P2-3** Network-segmentation guidance + periodic integrity checks | Lateral movement; tamper detection | §164.312(c) · SC-7/SI-7 | S–M |
 | **P2-4** Strict-parse CPU/time budget on the hl7apy path | Malformed input pinning a worker — message size/segment caps are built, but the opt-in strict parse itself has no time bound | NIST SC-5 (DoS; not a §164.312 safeguard) | S |
 
@@ -386,7 +478,7 @@ Complements the access/audit mapping in [SECURITY.md](SECURITY.md#hipaa-164312-a
 | Access control (a) | Built (RBAC + owner-only DB/WAL file ACL) | [SECURITY.md](SECURITY.md), §2 |
 | Audit controls (b) | Built (PHI-access audit) + log redaction planned | §6, §7 |
 | Integrity (c) | Built (GCM AEAD tag on bodies; audit hash-chain) + periodic integrity checks planned | §3, §6 |
-| Authentication (d) | Built (argon2id / AD); MFA planned | [SECURITY.md](SECURITY.md), §11 |
+| Authentication (d) | Built (argon2id / AD); native TOTP MFA built for local accounts (WP-14) | [SECURITY.md](SECURITY.md), §11 |
 | Transmission security (e) | LDAPS built; MLLP/API TLS planned | §4 |
 
 ---

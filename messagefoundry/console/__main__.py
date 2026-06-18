@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Console entrypoint:  python -m messagefoundry.console [--url URL]
 
 Connects to a running engine API (default http://127.0.0.1:8765 — start one with
@@ -18,6 +20,8 @@ from PySide6.QtWidgets import QApplication, QDialog
 from messagefoundry.console.change_password import ChangePasswordDialog
 from messagefoundry.console.client import ApiError, EngineClient
 from messagefoundry.console.login import LoginDialog
+from messagefoundry.console.mfa import MfaVerifyDialog, make_mfa_handler
+from messagefoundry.console.reauth import make_step_up_handler
 from messagefoundry.console.shell import AppWindow
 
 log = logging.getLogger(__name__)
@@ -96,6 +100,18 @@ def _authenticate(client: EngineClient) -> bool:
         if login.exec() != QDialog.DialogCode.Accepted:
             return False
         if not login.must_change_password:
+            # A second factor is required (WP-14): prompt for the TOTP / recovery code now. If the
+            # user cancels, REVOKE the un-MFA'd session server-side (not just locally) — the login
+            # already minted a durable session row, so a bare clear_auth() would leave it alive until
+            # expiry. logout() hits /auth/logout to revoke it (mirrors _sign_out); no keyring entry was
+            # saved yet on this branch, so a local clear is the only fallback if the revoke call fails.
+            if login.mfa_required and not _verify_mfa(client):
+                try:
+                    client.logout()
+                except ApiError as exc:
+                    log.warning("server-side logout after MFA cancel failed: %s", exc)
+                    client.clear_auth()
+                continue
             break
         # Forced change: the session is must-change-restricted (403 on protected routes). Let the
         # user set a new password, prefilling the current one they just typed and the server
@@ -110,6 +126,12 @@ def _authenticate(client: EngineClient) -> bool:
     if client.token is not None:
         _save_token(client.base_url, client.token)
     return True
+
+
+def _verify_mfa(client: EngineClient) -> bool:
+    """Prompt for a second factor after a login that reported ``mfa_required`` (WP-14). Returns True
+    iff the TOTP / recovery code verified."""
+    return MfaVerifyDialog(client).exec() == QDialog.DialogCode.Accepted
 
 
 def _sign_out(client: EngineClient, app: QApplication) -> None:
@@ -190,15 +212,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)  # e.g. refusing plaintext http to a remote host
         return 2
 
+    # When the engine demands step-up re-verification on a sensitive action (ASVS 7.5.3), prompt the
+    # operator and retry — instead of surfacing a raw 403 (WP-L3-16, console side).
+    client.set_step_up_handler(make_step_up_handler(client))
+    # And prompt for a second factor when a sensitive op needs one (403 + X-MFA-Required, WP-14).
+    client.set_mfa_handler(make_mfa_handler(client))
+
     if not _authenticate(client):
         client.close()
         return 0
+
+    # A second, read-only client dedicated to background (off-thread) reads — the health poll, the
+    # Engine Status refresh, and the per-page auto-refresh. Keeping those off the primary client
+    # means the handler-bearing, token-mutating primary client is only ever used on the Qt main
+    # thread (sign-in / step-up / MFA / user actions), so no single client is shared across threads.
+    poll_client = client.for_polling()
 
     # Remembered interval wins; fall back to --poll on first run. QSettings returns the value
     # as a str (registry) or float (in-memory), so normalise via str() before parsing.
     settings = QSettings()
     poll_seconds = float(str(settings.value(_SETTINGS_KEY, args.poll)))
-    window = AppWindow(client, poll_seconds=poll_seconds, service_name=args.service_name)
+    window = AppWindow(
+        client, poll_client=poll_client, poll_seconds=poll_seconds, service_name=args.service_name
+    )
     window.interval_changed.connect(lambda seconds: settings.setValue(_SETTINGS_KEY, seconds))
     window.logout_requested.connect(lambda: _sign_out(client, app))
     window.change_password_requested.connect(lambda: _password_changed(client, app))
@@ -215,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
 
     exit_code = app.exec()
     client.close()
+    poll_client.close()
     return int(exit_code)
 
 

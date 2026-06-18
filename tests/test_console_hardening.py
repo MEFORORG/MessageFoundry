@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Phase-6 console hardening: refuse plaintext http to a remote host (CONSOLE-3) and report
 keyring failures on sign-out (CONSOLE-2)."""
 

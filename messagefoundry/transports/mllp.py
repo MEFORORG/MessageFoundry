@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """MLLP (Minimal Lower Layer Protocol) transport + HL7 ACK building.
 
 MLLP wraps each message in a *block*::
@@ -19,18 +21,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+import ssl
+from collections.abc import Callable, Mapping
 from datetime import datetime
+from typing import Any
+
+import hl7
+from hl7.containers import Component, Field, Repetition
 
 from messagefoundry.config.models import AckMode, ConnectorType, Destination, Source
-from messagefoundry.parsing.peek import HL7PeekError, Peek
+from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
+from messagefoundry.config.tls_policy import harden_kex_groups
+from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize
+from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.framing import MLLP_CODEC, FrameDecoder, FrameError
 from messagefoundry.transports.base import (
     DeliveryError,
+    DeliveryResponse,
     DestinationConnector,
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    peer_ip_allowed,
+    probe_tcp_reachable,
     register_destination,
     register_source,
 )
@@ -46,6 +59,9 @@ __all__ = [
     "MLLPDecoder",
     "MLLPFrameError",
     "build_ack",
+    "EncodingCharacters",
+    "parse_encoding_characters",
+    "reencode_delimiters",
     "MLLPDestination",
     "MLLPSource",
 ]
@@ -190,7 +206,158 @@ def build_ack(
     return msh + "\r" + msa + "\r"
 
 
+# --- per-outbound encoding-character override (Corepoint -override parity) ----
+
+#: The five MSH delimiter characters, in MSH order: MSH-1 (field separator) then the four MSH-2
+#: characters (component, repetition, escape, subcomponent). A target set for an outbound re-encode.
+EncodingCharacters = tuple[str, str, str, str, str]
+
+#: The number of characters an ``encoding_characters`` override must carry (MSH-1 + 4 MSH-2 chars).
+_ENCODING_CHARS_LEN = 5
+
+
+def parse_encoding_characters(value: str) -> EncodingCharacters:
+    """Validate an ``encoding_characters`` override and split it into its five MSH delimiters.
+
+    ``value`` is the MSH-1 field separator followed by the four MSH-2 characters
+    (component, repetition, escape, subcomponent) — e.g. the HL7 default ``"|^~\\&"``. Fails **loud**
+    (``ValueError``) on a bad value rather than silently shipping a malformed header: it must be exactly
+    five characters and all five must be distinct (HL7 forbids reusing a delimiter for two roles — a
+    collision would make the message ambiguous to the receiver). Called once at connector build so a bad
+    config is caught at dry-run / ``check`` time, not per delivery."""
+    if not isinstance(value, str) or len(value) != _ENCODING_CHARS_LEN:
+        raise ValueError(
+            f"encoding_characters must be exactly {_ENCODING_CHARS_LEN} characters "
+            "(MSH-1 field separator + the 4 MSH-2 chars: component, repetition, escape, subcomponent), "
+            f"got {value!r}"
+        )
+    if len(set(value)) != _ENCODING_CHARS_LEN:
+        raise ValueError(
+            f"encoding_characters {value!r} reuses a delimiter — all five (field, component, "
+            "repetition, escape, subcomponent) must be distinct"
+        )
+    # Index explicitly rather than unpack the str (mypy disallows str-unpacking) — the five characters
+    # are MSH-1 then the four MSH-2 chars, in order.
+    return value[0], value[1], value[2], value[3], value[4]
+
+
+def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
+    """Re-serialize ``payload`` (an HL7 v2 message) with the ``target`` MSH delimiters.
+
+    The message is parsed with its **own** current delimiters (read from its MSH-1/MSH-2, never assumed
+    to be ``|^~\\&``), then re-joined with the target field/component/repetition/subcomponent separators
+    and a rewritten MSH-1/MSH-2 — so a downstream re-parse sees the same logical fields under the new
+    delimiters. This is the "parse → set new MSH-1/MSH-2 → re-encode" contract, done by re-joining the
+    parse tree rather than by string-slicing the raw bytes.
+
+    Leaf values are carried through **verbatim except for the escape character**: structural delimiters
+    never appear literally inside a leaf (they are escaped), and HL7's named escapes (``\\F\\``,
+    ``\\S\\`` …) are delimiter-agnostic — only their surrounding escape character changes when the
+    escape character does. Crucially we do **not** round-trip leaves through python-hl7's
+    ``unescape``/``escape`` (which corrupt code points above U+007F — accented/CJK names — and would
+    silently mangle PHI; the same quirk :class:`~messagefoundry.parsing.message.Message` avoids). When
+    the source already uses the target escape character, leaves are byte-identical.
+
+    Raises :class:`ValueError` if ``payload`` is not parseable HL7 (no MSH / malformed header), so the
+    caller can fail the delivery loud instead of framing a corrupted message."""
+    field_sep, comp, rep, esc, sub = target
+    try:
+        message = hl7.parse(normalize(payload))
+        seg_sep: str = message.separator  # segment separator (CR) is not part of the override
+        src_esc: str = message.esc  # the source message's own escape character
+    except (hl7.HL7Exception, IndexError, ValueError) as exc:
+        # IndexError covers a header so truncated python-hl7 can't read MSH-2 (e.g. "MSH|"); ValueError
+        # is defensive. A non-HL7 body simply cannot be delimiter-rewritten — surface it, don't corrupt.
+        raise ValueError(
+            f"cannot re-encode delimiters: payload is not parseable HL7 ({exc})"
+        ) from exc
+
+    def leaf_text(node: object) -> str:
+        # Only the escape character can legitimately change inside a leaf; every other byte (incl.
+        # non-ASCII) is preserved exactly. If the escape char is unchanged this is a no-op copy.
+        text = str(node)
+        return text if src_esc == esc else text.replace(src_esc, esc)
+
+    def join_component(node: object) -> str:
+        if isinstance(node, Component):
+            return sub.join(leaf_text(child) for child in node)
+        return leaf_text(node)
+
+    def join_repetition(node: object) -> str:
+        if isinstance(node, Repetition):
+            return comp.join(join_component(child) for child in node)
+        return join_component(node)
+
+    def join_field(node: object) -> str:
+        if isinstance(node, Field):
+            return rep.join(join_repetition(child) for child in node)
+        return join_repetition(node)
+
+    out_segments: list[str] = []
+    for segment in message:
+        seg_id = str(segment[0])
+        if seg_id == "MSH":
+            # python-hl7 indexes MSH as: [0]="MSH", [1]=MSH-1 (the field sep itself), [2]=MSH-2; MSH-1
+            # is implied by the field join and MSH-2 is rewritten to advertise the new delimiters, so
+            # the real fields start at index 3.
+            parts = ["MSH", comp + rep + esc + sub]
+            tail = list(segment)[3:]
+        else:
+            parts = [seg_id]
+            tail = list(segment)[1:]
+        parts.extend(join_field(node) for node in tail)
+        out_segments.append(field_sep.join(parts))
+    return seg_sep.join(out_segments) + seg_sep
+
+
 # --- destination -------------------------------------------------------------
+
+
+def _mllp_ssl_context(s: Mapping[str, Any], *, server: bool) -> ssl.SSLContext | None:
+    """Build the per-connection MLLP ``SSLContext`` (WP-13b, ADR 0002), or ``None`` when ``tls`` is off.
+
+    Built once in the connector ``__init__`` (a bad cert/key fails at build, like LDAPS). TLS 1.2+ floor.
+    **Inbound** (``server=True``): present ``tls_cert_file``/``tls_key_file`` as the server identity;
+    ``tls_ca_file`` opts into mTLS (require + verify a client cert). **Outbound** (``server=False``):
+    verify the peer's cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
+    and optionally present ``tls_cert_file`` for mTLS. ``tls_verify=False`` (outbound) is MITM-able and
+    refused unless ``insecure_tls_allowed()``, with a loud warning — exactly as LDAPS / SQL Server."""
+    if not s.get("tls"):
+        return None
+    cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
+    if server:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        if not cert:
+            raise ValueError("MLLP inbound tls=true requires tls_cert_file (the server identity)")
+        ctx.load_cert_chain(certfile=cert, keyfile=key)
+        if ca:  # opt-in mTLS: require + verify a client cert against this trust anchor
+            ctx.load_verify_locations(cafile=ca)
+            ctx.verify_mode = ssl.CERT_REQUIRED
+        harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+        return ctx
+    # Outbound (client): verify the server cert unless explicitly — and loudly — disabled.
+    verify = bool(s.get("tls_verify", True))
+    if not verify and not insecure_tls_allowed():
+        raise ValueError(
+            "MLLP tls_verify=false disables server-certificate verification (MITM risk). Use a trusted "
+            f"CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a trusted-network bind."
+        )
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    if verify:
+        ctx.check_hostname = bool(s.get("tls_check_hostname", True))
+    else:
+        logger.warning(
+            "MLLP TLS certificate verification is DISABLED (tls_verify=false, permitted by %s).",
+            INSECURE_TLS_ESCAPE_ENV,
+        )
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    if cert:  # optional client identity for mTLS
+        ctx.load_cert_chain(certfile=cert, keyfile=key)
+    harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    return ctx
 
 
 class MLLPDestination(DestinationConnector):
@@ -214,11 +381,41 @@ class MLLPDestination(DestinationConnector):
         self.encoding: str = s.get("encoding", "utf-8")
         mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
         self.max_frame_bytes: int | None = int(mf) if mf else None
+        # Per-outbound delimiter override (Corepoint -override parity): None = ship the payload as-is
+        # (byte-identical, the default). A set value is validated NOW (at build) so a malformed override
+        # fails at dry-run / `check`, not per delivery; it is applied in send() before framing.
+        chars = s.get("encoding_characters")
+        self.encoding_characters: EncodingCharacters | None = (
+            parse_encoding_characters(chars) if chars is not None else None
+        )
+        # ADR 0013: when True, send() returns a DeliveryResponse carrying the application ACK (the
+        # MSA/ERR the partner returned) for the delivery worker to capture. Default False → returns None,
+        # byte-identical. A *read* failure (peer-close, frame-size) is never captured — it stays a
+        # retryable DeliveryError; only a read-but-unparseable ACK becomes outcome='unparseable'.
+        self.capture_response: bool = bool(s.get("capture_response", False))
+        # WP-13b: per-connection outbound TLS (verify the peer). Built once here so a bad cert/CA fails
+        # at build (dry-run/check), not per delivery. None when tls is off → plaintext, byte-identical.
+        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=False)
 
-    async def send(self, payload: str) -> None:
+    async def send(self, payload: str) -> DeliveryResponse | None:
+        if self.encoding_characters is not None:
+            # Re-encode the body with this destination's delimiters before framing. A non-HL7/garbled
+            # payload can't be rewritten — surface it as a DeliveryError (the message reached neither the
+            # wire nor the peer) rather than framing a corrupted message; the pipeline records the ERROR.
+            try:
+                payload = reencode_delimiters(payload, self.encoding_characters)
+            except ValueError as exc:
+                raise DeliveryError(f"MLLP encoding-character override failed: {exc}") from exc
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.port), self.connect_timeout
+                asyncio.open_connection(
+                    self.host,
+                    self.port,
+                    ssl=self._ssl,
+                    # SNI + (when verifying) hostname check against the configured peer host.
+                    server_hostname=self.host if self._ssl else None,
+                ),
+                self.connect_timeout,
             )
         except (OSError, asyncio.TimeoutError) as exc:
             raise DeliveryError(f"MLLP connect to {self.host}:{self.port} failed: {exc}") from exc
@@ -236,7 +433,11 @@ class MLLPDestination(DestinationConnector):
                 await writer.wait_closed()
             except OSError:
                 pass
-        self._check_ack(ack_bytes)
+        return self._check_ack(ack_bytes)
+
+    async def test_connection(self) -> None:
+        # Reachability only: open + close a connection (no frame, no ACK) so a test never delivers.
+        await probe_tcp_reachable(self.host, self.port, self.connect_timeout, "MLLP")
 
     async def _read_ack(self, reader: asyncio.StreamReader) -> bytes:
         decoder = MLLPDecoder(max_frame_bytes=self.max_frame_bytes)
@@ -250,22 +451,36 @@ class MLLPDestination(DestinationConnector):
             except MLLPFrameError as exc:
                 raise DeliveryError(f"ACK exceeded max frame size: {exc}") from exc
 
-    @staticmethod
-    def _check_ack(ack_bytes: bytes) -> None:
+    def _check_ack(self, ack_bytes: bytes) -> DeliveryResponse | None:
         try:
             ack = Peek.parse(ack_bytes)
         except HL7PeekError as exc:
-            # Couldn't read the partner's reply at all — a transport-level problem, not a partner
-            # rejection, so retry like any I/O failure (plain DeliveryError).
+            # A reply frame WAS received (the read above succeeded) but its MSA won't parse. For a
+            # capturing outbound this is a captured outcome='unparseable' — a reply arrived; we just
+            # can't read it — NOT "no reply". For a non-capturing outbound it stays byte-identical:
+            # a transport-level problem retried like any I/O failure (plain DeliveryError).
+            if self.capture_response:
+                return DeliveryResponse(
+                    body=ack_bytes.decode(self.encoding, errors="replace"),
+                    outcome="unparseable",
+                    detail=f"unparseable ACK: {safe_exc(exc)}",  # scrub: a bad ACK can embed a reply fragment (#120)
+                )
             raise DeliveryError(f"unparseable ACK: {exc}") from exc
         msa1 = ack.field("MSA-1")
         if msa1 in ("AA", "CA"):
-            return
+            if self.capture_response:
+                return DeliveryResponse(
+                    body=ack_bytes.decode(self.encoding, errors="replace"),
+                    outcome="accepted",
+                    detail=f"MSA-1={msa1}",
+                )
+            return None
         detail = ack.field("MSA-3") or ""
         # A negative ACK is a *partner rejection*, not a transport failure: the message reached the
-        # peer, which said no. Map the MSA-1 family to the failure policy — AR/CR (reject) is
-        # permanent (fail-fast); AE/CE (error) and any unrecognized negative code are treated as
-        # transient (retry), the conservative choice when the code's intent is unclear (HL7-/ordering).
+        # peer, which said no. It is NOT captured — it routes through the existing NegativeAckError
+        # failure policy (dead-letter on a permanent reject / retry on a transient error), unchanged by
+        # capture. AR/CR (reject) is permanent (fail-fast); AE/CE (error) and any unrecognized negative
+        # code are treated as transient (retry), the conservative choice when the intent is unclear.
         code, permanent = ("AR", True) if msa1 in ("AR", "CR") else ("AE", False)
         raise NegativeAckError(
             f"negative ACK (MSA-1={msa1}): {detail}".rstrip(": "), code=code, permanent=permanent
@@ -294,6 +509,13 @@ class MLLPSource(SourceConnector):
         self.receive_timeout: float | None = float(rt) if rt else None
         mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
         self.max_frame_bytes: int | None = int(mf) if mf else None
+        # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
+        # is not listed is refused at accept time. Absent/empty = no restriction.
+        sa = s.get("source_ip_allowlist")
+        self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
+        # WP-13b: per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file). Built
+        # once here so a bad cert/key fails at build. None when tls is off → plaintext, byte-identical.
+        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True)
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         self._active = 0
@@ -310,7 +532,9 @@ class MLLPSource(SourceConnector):
         # a load balancer / per-node ports distribute inbound connections), so there is no
         # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
-        self._server = await asyncio.start_server(self._on_client, self.host, self.port)
+        self._server = await asyncio.start_server(
+            self._on_client, self.host, self.port, ssl=self._ssl
+        )
 
     @property
     def sockport(self) -> int:
@@ -354,6 +578,13 @@ class MLLPSource(SourceConnector):
         if task is not None:
             self._client_tasks.add(task)
         try:
+            if self.source_ip_allowlist is not None:
+                peer = writer.get_extra_info("peername")
+                if not peer_ip_allowed(peer, self.source_ip_allowlist):
+                    logger.warning(
+                        "MLLP connection from %s refused: not in source_ip_allowlist", peer
+                    )
+                    return  # not allowlisted — refuse (closed in the outer finally; _active untouched)
             if self.max_connections is not None and self._active >= self.max_connections:
                 return  # at capacity — refuse the new client (closed in the outer finally)
             self._active += 1
@@ -381,6 +612,16 @@ class MLLPSource(SourceConnector):
                             "MLLP frame from %s over cap; closing connection: %s", peer, exc
                         )
                         break  # drop the connection rather than buffer without bound
+                    except OSError:
+                        raise  # peer reset / write failure → handled by the outer OSError catch (quiet)
+                    except Exception as exc:
+                        # Last-resort (ASVS 16.5.4): an unexpected handler/codec error must not let the
+                        # per-connection task die silently or leak detail. Log redacted; drop the conn.
+                        peer = writer.get_extra_info("peername")
+                        logger.error(
+                            "MLLP connection from %s failed unexpectedly: %s", peer, safe_exc(exc)
+                        )
+                        break
             except OSError:
                 pass  # peer reset; nothing to do but drop the connection
             finally:

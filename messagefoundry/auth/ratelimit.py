@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """In-process sliding-window rate limiter for the unauthenticated auth surface (AUTH-RATE).
 
 Bounds brute-force / password-spray and argon2 CPU-burn on ``/auth/login`` and friends *ahead*

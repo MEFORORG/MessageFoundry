@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Centralized field-level (property) authorization for API responses (WP-9; ASVS 8.1.2 / 8.2.3).
 
 Some response properties carry PHI — the patient-identifying ``summary``, and exception text
@@ -24,7 +26,14 @@ from typing import TypeVar
 
 from pydantic import BaseModel
 
-from messagefoundry.api.models import DeadLetterRow, MessageSummary
+from messagefoundry.api.models import (
+    CapturedResponseInfo,
+    DeadLetterRow,
+    EventInfo,
+    MessageDetail,
+    MessageSummary,
+    OutboxInfo,
+)
 from messagefoundry.auth import Identity, Permission
 
 #: Response model → {property → Permission that unlocks it}. The single source of truth for which
@@ -40,6 +49,25 @@ PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
     DeadLetterRow: {
         "summary": Permission.MESSAGES_VIEW_SUMMARY,
         "last_error": Permission.MESSAGES_VIEW_SUMMARY,
+    },
+    # The single-message detail view and its nested rows (#120). Redaction keys on the EXACT type
+    # (no MRO walk), so MessageDetail must be declared explicitly even though it subclasses
+    # MessageSummary — otherwise its inherited PHI ``summary``/``error`` would be returned un-gated.
+    # Gated on view_summary (NOT view_raw) so the same logical fields (error / last_error / detail)
+    # sit on one tier across the list and detail surfaces; the detail route already requires view_raw,
+    # so a view_raw gate here would be dead code. The raw body stays on the route's view_raw gate.
+    MessageDetail: {
+        "summary": Permission.MESSAGES_VIEW_SUMMARY,
+        "error": Permission.MESSAGES_VIEW_SUMMARY,
+    },
+    OutboxInfo: {
+        "last_error": Permission.MESSAGES_VIEW_SUMMARY,
+    },
+    EventInfo: {
+        "detail": Permission.MESSAGES_VIEW_SUMMARY,
+    },
+    CapturedResponseInfo: {
+        "detail": Permission.MESSAGES_VIEW_SUMMARY,
     },
 }
 

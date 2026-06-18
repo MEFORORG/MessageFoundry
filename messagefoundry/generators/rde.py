@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Generate conformant HL7 v2.5.1 **RDE** (pharmacy/treatment encoded order) messages.
 
 hl7apy's parser greedily assigns a TQ1 to the optional ``RDE_O11_TIMING`` group (which precedes

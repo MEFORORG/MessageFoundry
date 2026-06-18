@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The ``check`` commit/CI gate: validate (required) + dryrun (gated) + advisory ruff/mypy."""
 
 from __future__ import annotations
@@ -123,6 +125,97 @@ def test_check_dryrun_accepts_single_file(
     assert rc == 0
     dr = _check(_out_json(capsys), "dryrun")
     assert dr["required"] is True and dr["ok"] is True and dr["skipped"] is False
+
+
+# --- per-feed fixture mapping (#11) ------------------------------------------
+# A malformed body ERRORs against an HL7 inbound (peek fails) but routes fine against a text inbound
+# (RawMessage, no parse). That asymmetry is a clean discriminator for "did the fixture run only
+# against its mapped feed, or against every inbound?".
+BAD_HL7 = b"NOT-AN-HL7-MESSAGE\r"
+
+
+def _two_feed_config(tmp_path: Path) -> Path:
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, router, File, ContentType\n"
+        "inbound('IB_HL7', File(directory='in1'), router='r')\n"
+        "inbound('IB_RAW', File(directory='in2'), router='r', content_type=ContentType.TEXT)\n"
+        "@router('r')\n"
+        "def r(m): return []\n",
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def test_check_dryrun_pins_fixture_to_feed_subdir(tmp_path: Path) -> None:
+    # A fixture under <messages>/IB_RAW/ is dry-run ONLY against IB_RAW (which treats it as text), so
+    # it never reaches IB_HL7 (which would ERROR) — the check passes where all-×-all would fail.
+    cfg = _two_feed_config(tmp_path)
+    msgs = tmp_path / "messages"
+    (msgs / "IB_RAW").mkdir(parents=True)
+    (msgs / "IB_RAW" / "x.hl7").write_bytes(BAD_HL7)
+    dr = next(
+        r for r in run_checks(cfg, messages_dir=msgs, run_lint=False).results if r.name == "dryrun"
+    )
+    assert dr.ok and dr.required and not dr.skipped, dr.detail
+    assert "feed-pinned" in dr.detail
+
+
+def test_check_dryrun_unmapped_fixture_runs_every_inbound(tmp_path: Path) -> None:
+    # A top-level fixture (no feed subdir) falls back to all-×-all, so it also hits IB_HL7 and errors.
+    cfg = _two_feed_config(tmp_path)
+    msgs = tmp_path / "messages"
+    msgs.mkdir()
+    (msgs / "x.hl7").write_bytes(BAD_HL7)
+    dr = next(
+        r for r in run_checks(cfg, messages_dir=msgs, run_lint=False).results if r.name == "dryrun"
+    )
+    assert not dr.ok and dr.required and not dr.skipped
+    assert "IB_HL7" in dr.detail  # the error names the inbound the unmapped fixture reached
+
+
+def test_check_dryrun_non_feed_subdir_falls_back_to_all(tmp_path: Path) -> None:
+    # A subdir that names no inbound ('misc') is unmapped → all-×-all (not silently pinned to nothing),
+    # so the malformed body still reaches IB_HL7 and errors. Also proves the recursive discovery (the
+    # fixture lives only in a subdir, none at top level) doesn't skip the gate.
+    cfg = _two_feed_config(tmp_path)
+    msgs = tmp_path / "messages"
+    (msgs / "misc").mkdir(parents=True)
+    (msgs / "misc" / "x.hl7").write_bytes(BAD_HL7)
+    dr = next(
+        r for r in run_checks(cfg, messages_dir=msgs, run_lint=False).results if r.name == "dryrun"
+    )
+    assert not dr.ok and dr.required and not dr.skipped
+    assert "IB_HL7" in dr.detail
+
+
+def test_read_message_sets_maps_by_top_level_subdir(tmp_path: Path) -> None:
+    from messagefoundry.pipeline.dryrun import read_message_sets
+
+    (tmp_path / "IB_FOO" / "nested").mkdir(parents=True)
+    (tmp_path / "IB_FOO" / "a.hl7").write_bytes(b"A")
+    (tmp_path / "IB_FOO" / "nested" / "deep.hl7").write_bytes(b"D")  # nested under the feed
+    (tmp_path / "top.hl7").write_bytes(b"T")
+    (tmp_path / "misc").mkdir()
+    (tmp_path / "misc" / "b.hl7").write_bytes(b"B")
+    got = {
+        label: target
+        for label, _p, _raw, target in read_message_sets(tmp_path, ["IB_FOO", "IB_BAR"])
+    }
+    assert got["a.hl7"] == "IB_FOO"  # directly under a feed subdir → pinned
+    assert got["deep.hl7"] == "IB_FOO"  # nested deeper under the feed subdir → still pinned to it
+    assert got["top.hl7"] is None  # top-level → unmapped (all-×-all)
+    assert got["b.hl7"] is None  # subdir that names no inbound → unmapped (fallback)
+
+
+def test_read_message_sets_single_file_is_unmapped(tmp_path: Path) -> None:
+    from messagefoundry.pipeline.dryrun import read_message_sets
+
+    one = tmp_path / "a.hl7"
+    one.write_bytes(ADT_A01.encode("utf-8"))
+    got = read_message_sets(one, ["IB_FOO"])
+    assert len(got) == 1 and got[0][0] == "a.hl7" and got[0][3] is None
 
 
 def test_run_checks_skips_lint_when_absent(monkeypatch: pytest.MonkeyPatch) -> None:

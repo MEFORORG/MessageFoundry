@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Side-effect import that registers every built-in message type with the generator registry.
 
 Import this before reading ``_core.message_codes()`` (the harness GUI does). Each generator

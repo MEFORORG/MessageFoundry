@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """SOAP destination connector (ADR 0003): Fault classification, version headers, delivery, egress.
 
 The opener is faked so nothing hits the network; SOAP Faults are exercised both as an HTTP-500 body and

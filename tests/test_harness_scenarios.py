@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The headless scenario runner sends traffic and asserts the engine's disposition via the API.
 
 Qt-free: starts a real managed app (engine + API) with an MLLP inbound + file outbound, then runs

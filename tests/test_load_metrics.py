@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Unit tests for the load engine's bounded metrics + correlation primitives.
 
 These are pure and fast — no sockets, no engine. They pin the two properties the load report relies

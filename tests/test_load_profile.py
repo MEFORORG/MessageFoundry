@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Unit tests for the load-profile schema + TOML loader.
 
 Pin the loud-validation contract (a typo'd/missing/wrong-typed key is rejected before any traffic),
@@ -159,7 +161,7 @@ slo = { max_e2e_p99_ms = 999.0 }
         load_profile_text(text)
 
 
-@pytest.mark.parametrize("name", ["smoke", "fanout-baseline", "soak"])
+@pytest.mark.parametrize("name", ["smoke", "fanout-baseline", "soak", "closed-loop"])
 def test_builtin_presets_parse(name: str) -> None:
     p = get_profile(name)
     assert p.name == name
@@ -167,9 +169,26 @@ def test_builtin_presets_parse(name: str) -> None:
     p.default_mix.normalized()  # weights valid
 
 
+def test_closed_loop_profile_sweeps_concurrency_with_conformance_slo() -> None:
+    p = get_profile("closed-loop")
+    # Every phase is closed-loop with a concurrency (the governor's _run_closed needs it).
+    assert p.phases
+    for ph in p.phases:
+        assert ph.loop == "closed"
+        assert ph.concurrency is not None and ph.concurrency >= 1
+    # The measured (sustained) phases step concurrency upward to find the throughput ceiling.
+    measured = [ph.concurrency for ph in p.phases if ph.measured]
+    assert len(measured) >= 2 and measured == sorted(measured)
+    # The sender pool must exceed the highest concurrency, or the pool (not the engine) is the cap.
+    assert p.pool_size > max(c for c in measured if c is not None)
+    # Conformance-tier SLO only: zero loss enforced, no throughput floor (throughput is measured here).
+    assert p.default_slo.zero_loss is True
+    assert p.default_slo.min_sustained_msg_s is None
+
+
 def test_list_profiles_includes_builtins() -> None:
     names = set(list_profiles())
-    assert {"smoke", "fanout-baseline", "soak"} <= names
+    assert {"smoke", "fanout-baseline", "soak", "closed-loop"} <= names
 
 
 def test_get_profile_unknown_lists_choices() -> None:

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Reusable PySide6 leaf widgets for the admin console.
 
 The HL7 parse-tree view, the message browser, the single-message detail pane, and the
@@ -13,6 +15,7 @@ API calls run synchronously on the GUI thread — localhost latency is negligibl
 from __future__ import annotations
 
 import html
+from dataclasses import dataclass
 from datetime import datetime
 
 from PySide6.QtCore import QPoint, QSettings, Qt, Signal
@@ -37,6 +40,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from messagefoundry.api.models import MessageDetail, MessageList
+from messagefoundry.console._async import AsyncRunner
 from messagefoundry.console.client import ApiError, EngineClient
 from messagefoundry.parsing import HL7PeekError, parse_tree
 
@@ -166,16 +171,29 @@ class ParseTreeView(QTreeWidget):
         return item
 
 
+@dataclass(frozen=True)
+class _DetailSnapshot:
+    """One off-thread message-detail read, applied on the main thread. ``message_id`` lets a stale
+    result (superseded by a newer ``load``) be dropped; ``error`` set ⇒ the read failed."""
+
+    message_id: str
+    detail: MessageDetail | None
+    error: str | None
+
+
 class MessageDetailPanel(QWidget):
     """Shows one message: summary, raw, parse tree, outbox, audit trail, and replay."""
 
     error = Signal(str)
     changed = Signal()  # emitted after a successful replay so lists can refresh
 
-    def __init__(self, client: EngineClient) -> None:
+    def __init__(self, client: EngineClient, *, poll_client: EngineClient | None = None) -> None:
         super().__init__()
-        self._client = client
+        self._client = client  # replay action — main thread, may step-up/MFA
+        self._poll = poll_client or client  # message read — runs off the main thread
+        self._runner = AsyncRunner(self)
         self._message_id: str | None = None
+        self._pending_id: str | None = None  # the latest requested load (drops stale results)
 
         self._summary = QLabel("Select a message")
         self._summary.setWordWrap(True)
@@ -209,6 +227,7 @@ class MessageDetailPanel(QWidget):
 
     def clear(self) -> None:
         self._message_id = None
+        self._pending_id = None  # a pending load() must not re-populate after an explicit clear
         self._summary.setText("Select a message")
         self._replay.setEnabled(False)
         self._tree.clear()
@@ -217,11 +236,32 @@ class MessageDetailPanel(QWidget):
         self._events.setRowCount(0)
 
     def load(self, message_id: str) -> None:
+        # Read the message OFF the main thread; apply on the main thread. A newer load() supersedes
+        # an in-flight one (rapid row clicks / replay), so a stale result is dropped in _apply.
+        self._pending_id = message_id
+        self._runner.submit(lambda: self._fetch(message_id), on_done=self._apply)
+
+    def stop(self) -> None:
+        """Stop the background runner (call on window close) so a late result can't touch dead widgets."""
+        self._runner.stop()
+
+    def _fetch(self, message_id: str) -> _DetailSnapshot:
+        """Runs on a worker thread — only blocking I/O, no widget access."""
         try:
-            detail = self._client.get_message(message_id)
+            return _DetailSnapshot(message_id, self._poll.get_message(message_id), None)
         except ApiError as exc:
-            self.error.emit(str(exc))
+            return _DetailSnapshot(message_id, None, str(exc))
+
+    def _apply(self, snap: _DetailSnapshot) -> None:
+        """Runs on the main thread (result slot) — safe to touch widgets."""
+        if snap.message_id != self._pending_id:
+            return  # a newer load() (or a clear()) superseded this result
+        if snap.error is not None:
+            self.error.emit(snap.error)
             return
+        detail = snap.detail
+        assert detail is not None
+        message_id = snap.message_id
         self._message_id = message_id
         self._replay.setEnabled(True)
         # Escape HL7-derived fields (message_type/control_id/error come from raw message content)
@@ -270,6 +310,15 @@ class MessageDetailPanel(QWidget):
         self.changed.emit()
 
 
+@dataclass(frozen=True)
+class _MessagesSnapshot:
+    """One off-thread message-list read, applied on the main thread. ``error`` set ⇒ the read failed
+    (the table is left as-is); otherwise ``result`` holds the page of messages to render."""
+
+    result: MessageList | None
+    error: str | None
+
+
 class MessagesPanel(QWidget):
     """A filterable message list with configurable columns (show/hide, reorder, sort, persisted).
 
@@ -292,9 +341,17 @@ class MessagesPanel(QWidget):
     ]
     _SUMMARY_COL = 6
 
-    def __init__(self, client: EngineClient) -> None:
+    def __init__(self, client: EngineClient, *, poll_client: EngineClient | None = None) -> None:
         super().__init__()
         self._client = client
+        self._poll = poll_client or client  # message-list read — runs off the main thread
+        self._runner = AsyncRunner(self)
+        self._loading = False  # in-flight refresh guard (don't pile up during a slow call)
+        # A refresh requested WHILE one is in flight is latched here (not dropped) and re-fired when
+        # the in-flight read finishes, so a filter change (set_channel_filter / Enter / the Connections
+        # 'Logs' link) or a post-replay refresh can't leave the filter box and the list mismatched —
+        # which would never self-heal with auto-refresh off. None = none pending; bool = pending audit.
+        self._pending: bool | None = None
         self._loaded = False  # autosize columns on the first (and user-initiated) loads
 
         self._channel_filter = QLineEdit()
@@ -329,17 +386,71 @@ class MessagesPanel(QWidget):
         self.refresh(audit=True)
 
     def refresh(self, *, audit: bool = False) -> None:
-        summary_shown = not self._table.isColumnHidden(self._SUMMARY_COL)
-        try:
-            result = self._client.list_messages(
-                channel_id=self._channel_filter.text().strip() or None,
-                status=self._status_filter.text().strip() or None,
-                limit=200,
-                audit_summary=audit and summary_shown,
-            )
-        except ApiError as exc:
-            self.error.emit(str(exc))
+        # Read the message list OFF the main thread (the 200-row read is the heaviest console query,
+        # and a slow/wedged engine would otherwise freeze the GUI for the whole call). The query
+        # parameters are read from the filter widgets HERE, on the main thread, then handed to the
+        # worker — the worker must never touch a widget.
+        if self._loading:
+            # Don't pile up on a slow engine, but don't lose a filter change either — latch it
+            # (OR-merge the audit flag) so it re-fires once the in-flight read completes.
+            self._pending = audit if self._pending is None else (self._pending or audit)
             return
+        self._pending = None
+        summary_shown = not self._table.isColumnHidden(self._SUMMARY_COL)
+        channel = self._channel_filter.text().strip() or None
+        status = self._status_filter.text().strip() or None
+        audit_summary = audit and summary_shown
+        self._loading = True
+        self._runner.submit(
+            lambda: self._fetch(channel, status, audit_summary),
+            on_done=lambda snap: self._apply(snap, autosize=audit),
+            on_error=self._on_error,
+        )
+
+    def stop(self) -> None:
+        """Stop the background runner (call on window close) so a late result can't touch dead widgets."""
+        self._runner.stop()
+
+    def _on_error(self, exc: BaseException) -> None:
+        # Belt-and-suspenders: list_messages raises only ApiError (handled via the snapshot in _apply),
+        # but an unexpected error must still clear the in-flight guard or the panel wedges forever.
+        self._loading = False
+        self.error.emit(str(exc))
+        self._drain_pending()
+
+    def _drain_pending(self) -> bool:
+        """Re-fire a refresh that was latched while one was in flight. Returns True if it did."""
+        if self._pending is None:
+            return False
+        audit = self._pending
+        self._pending = None
+        self.refresh(audit=audit)
+        return True
+
+    def _fetch(
+        self, channel: str | None, status: str | None, audit_summary: bool
+    ) -> _MessagesSnapshot:
+        """Runs on a worker thread — only blocking I/O, no widget access."""
+        try:
+            result = self._poll.list_messages(
+                channel_id=channel, status=status, limit=200, audit_summary=audit_summary
+            )
+            return _MessagesSnapshot(result, None)
+        except ApiError as exc:
+            return _MessagesSnapshot(None, str(exc))
+
+    def _apply(self, snap: _MessagesSnapshot, *, autosize: bool = False) -> None:
+        """Runs on the main thread (result slot) — safe to touch widgets."""
+        self._loading = False
+        # A refresh was requested mid-flight (e.g. the filter changed) — re-fire it and skip rendering
+        # this now-superseded snapshot, so the list always reflects the latest filter.
+        if self._drain_pending():
+            return
+        if snap.error is not None:
+            self.error.emit(snap.error)
+            return
+        result = snap.result
+        assert result is not None
         previously_selected = self._selected_id()
         self._table.begin_populate()
         self._table.setRowCount(len(result.messages))
@@ -359,7 +470,7 @@ class MessagesPanel(QWidget):
                 if c == 0:
                     item.setData(Qt.ItemDataRole.UserRole, m.id)
                 self._table.setItem(r, c, item)
-        self._table.end_populate(autosize=(audit or not self._loaded))
+        self._table.end_populate(autosize=(autosize or not self._loaded))
         self._loaded = True
         self._count.setText(f"{len(result.messages)} shown of {result.total}")
         if previously_selected is not None and not self._reselect(previously_selected):

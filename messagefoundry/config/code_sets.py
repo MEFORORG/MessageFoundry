@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Managed, hot-reloadable **code sets** (reference lookup tables) for the message graph.
 
 A code-first Router/Handler often needs a reference table — an Epic diet code → a food-service

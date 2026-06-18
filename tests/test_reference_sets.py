@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Reference sets — external-data enrichment (ADR 0006 Tier 1): read side, store snapshot, sync."""
 
 from __future__ import annotations
@@ -350,6 +352,21 @@ async def test_database_source_egress_denied_keeps_empty(
     runner = ReferenceSyncRunner(store, lambda: [_db_spec()], REF, egress=egress)
     result = await runner.sync_all()
     assert result.failed == 1  # dial refused before connecting
+    assert "provider_npi" not in store.reference_view()
+    await store.close()
+
+
+async def test_database_source_deny_by_default_refuses_empty_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Parity with the DATABASE source / db_lookup gates: under deny-by-default an empty allowed_db
+    # refuses the reference dial-out outright (the one dial-out path that previously ignored the flag).
+    _patch_pool(monkeypatch, ["provider_id", "npi"], [("MED1", 999)])
+    store = await MessageStore.open(tmp_path / "r.db")
+    egress = EgressSettings(deny_by_default=True)  # no allowed_db -> deny all DB dial-outs
+    runner = ReferenceSyncRunner(store, lambda: [_db_spec()], REF, egress=egress)
+    result = await runner.sync_all()
+    assert result.failed == 1  # refused before connecting
     assert "provider_npi" not in store.reference_view()
     await store.close()
 

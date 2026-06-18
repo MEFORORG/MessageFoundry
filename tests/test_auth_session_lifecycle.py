@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Phase-3b session-lifecycle hardening: backward-clock guard (AUTH-CLOCK), idle-vs-activity
 (AUTH-IDLE), per-user session cap (AUTH-SESS-CAP), AD-resync revoke (AUTH-AD-REVOKE), Kerberos
 reject audit (AUTH-K-AUDIT), and WS token extraction (API-3)."""

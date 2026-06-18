@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The correlation sink absorbs delivered frames, times them end-to-end, and ACKs AA.
 
 Drives a real loopback MLLP connection into the sink (no engine) and asserts: matched messages get an

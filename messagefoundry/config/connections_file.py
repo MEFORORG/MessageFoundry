@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Read ``connections.toml`` — connections authored as **data** (ADR 0007).
 
 A connection's transport (type + settings), the inbound's ``router`` binding, and delivery knobs may
@@ -47,6 +49,7 @@ from messagefoundry.config.wiring import (
     Sftp,
     Soap,
     Tcp,
+    Timer,
     WiringError,
     build_inbound_connection,
     build_outbound_connection,
@@ -62,6 +65,7 @@ _TRANSPORTS: dict[str, Callable[..., ConnectionSpec]] = {
     "mllp": MLLP,
     "tcp": Tcp,
     "file": File,
+    "timer": Timer,
     "rest": Rest,
     "database": Database,
     "database_poll": DatabasePoll,
@@ -82,10 +86,23 @@ _INBOUND_KEYS = frozenset(
         "strict",
         "hl7_version",
         "content_type",
+        "metadata",
+        "bind_address",
+        "source_ip_allowlist",
     }
 )
 _OUTBOUND_KEYS = frozenset(
-    {"name", "transport", "settings", "retry", "ordering", "internal_error", "buildup"}
+    {
+        "name",
+        "transport",
+        "settings",
+        "retry",
+        "ordering",
+        "internal_error",
+        "buildup",
+        "simulate",
+        "metadata",
+    }
 )
 
 _E = TypeVar("_E", bound=Enum)
@@ -138,6 +155,9 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         content_type=_enum(ContentType, table["content_type"], "content_type", where)
         if "content_type" in table
         else ContentType.HL7V2,
+        metadata=_optional_table(table, "metadata", where),
+        bind_address=_optional_str(table, "bind_address", where),
+        source_ip_allowlist=_optional_str_list(table, "source_ip_allowlist", where),
         source_file=source,
         source_line=None,
     )
@@ -159,6 +179,8 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
         if table.get("internal_error") is not None
         else None,
         buildup=_policy(BuildupThreshold, table.get("buildup"), "buildup", where),
+        simulate=_require_bool(table, "simulate", where),
+        metadata=_optional_table(table, "metadata", where),
         source_file=source,
         source_line=None,
     )
@@ -216,6 +238,24 @@ def _optional_str(table: dict[str, Any], key: str, where: str) -> str | None:
     value = table[key]
     if not isinstance(value, str):
         raise WiringError(f"{where}: {key!r} must be a string")
+    return value
+
+
+def _optional_table(table: dict[str, Any], key: str, where: str) -> dict[str, Any] | None:
+    if key not in table or table[key] is None:
+        return None
+    value = table[key]
+    if not isinstance(value, dict):
+        raise WiringError(f"{where}: {key!r} must be a table (key/value mapping)")
+    return value
+
+
+def _optional_str_list(table: dict[str, Any], key: str, where: str) -> list[str] | None:
+    if key not in table or table[key] is None:
+        return None
+    value = table[key]
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise WiringError(f"{where}: {key!r} must be an array of strings")
     return value
 
 

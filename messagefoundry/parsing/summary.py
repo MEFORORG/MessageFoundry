@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Build a short, human-readable message summary from a :class:`Peek`.
 
 Computed once at ingest and stored in its own column (outside the serialized body) so the

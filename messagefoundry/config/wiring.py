@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Code-first wiring: declare **Connections** and decorate **Router**/**Handler** functions.
 
 A config module (loaded from a directory via :func:`load_config`) declares named inbound/outbound
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import ipaddress
 import os
 import sys
 import threading
@@ -63,7 +66,10 @@ __all__ = [
     "ConnectionSpec",
     "MLLP",
     "Tcp",
+    "X12",
     "File",
+    "Timer",
+    "Loopback",
     "Rest",
     "Database",
     "DatabasePoll",
@@ -84,6 +90,7 @@ __all__ = [
     "resolve_env_settings",
     "referenced_env_keys",
     "display_settings",
+    "redacted_settings",
     "InboundConnection",
     "OutboundConnection",
     "Registry",
@@ -272,7 +279,7 @@ def DatabaseRef(
     pool_max: int = 5,
 ) -> ReferenceSourceSpec:
     """A reference **source** backed by a SQL query (ADR 0006 increment 2; SQL Server via the
-    ``[sqlserver]`` extra + ODBC Driver 18 — **experimental**, like the DATABASE connector).
+    ``[sqlserver]`` extra + ODBC Driver 18 — **production / supported**, like the DATABASE connector).
 
     The engine runs ``statement`` (a read-only ``SELECT``/proc) on the set's refresh cadence and builds
     the snapshot from the rows: ``key_column`` is the lookup key; ``value_column`` (if given) is that
@@ -343,6 +350,74 @@ def Reference(
     )
 
 
+# --- live lookup connections (handler-callable db_lookup, ADR 0010) -----------
+# A DatabaseLookup declares a NAMED, read-only database connection a Handler queries LIVE at run time via
+# db_lookup(name, statement, params) (the read accessor lives in messagefoundry.config.db_lookup). Unlike
+# a reference set (a synced snapshot read purely), there is no statement or cadence here — only the
+# connection; each call supplies its own statement. The engine builds one pooled executor from these.
+
+
+@dataclass(frozen=True)
+class DatabaseLookupSpec:
+    """A declared live-lookup database connection: ``name`` + connection ``settings`` (no statement — the
+    statement is supplied per :func:`~messagefoundry.config.db_lookup.db_lookup` call). ``settings`` may
+    hold :class:`EnvRef` values (put secrets like ``password`` in :func:`env`)."""
+
+    name: str
+    settings: dict[str, Any]
+
+
+def DatabaseLookup(
+    name: str,
+    *,
+    server: str | EnvRef,
+    database: str | EnvRef,
+    auth: str = "sql",
+    username: str | EnvRef | None = None,
+    password: str | EnvRef | None = None,
+    port: int | EnvRef = 1433,
+    encrypt: bool = True,
+    trust_server_certificate: bool = False,
+    connect_timeout: int = 15,
+    app_name: str = "messagefoundry",
+    odbc_driver: str = "ODBC Driver 18 for SQL Server",
+    pool_max: int = 5,
+    acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
+) -> None:
+    """Declare a named live-lookup database connection (SQL Server via the ``[sqlserver]`` extra + ODBC
+    Driver 18 — **production / supported**, like the DATABASE connector). A Handler queries it at run time with
+    ``db_lookup(name, statement, params)`` (a read-only ``SELECT``/proc); the rows come back as
+    ``{column: value}`` dicts. Side-effecting, like :func:`Reference`/:func:`inbound`.
+
+    Put secrets (``password``) in :func:`env`. TLS is on by default; weakening it needs
+    ``MEFOR_ALLOW_INSECURE_TLS``. The dial-out is gated by the **fail-closed** ``[egress].allowed_db``
+    allowlist, like a DATABASE source — point the engine only at allowed hosts. Example::
+
+        DatabaseLookup("clarity", server=env("clarity_host"), database="Clarity",
+                       username=env("clarity_user"), password=env("clarity_pw"))
+    """
+    _active_registry().add_lookup(
+        DatabaseLookupSpec(
+            name,
+            {
+                "server": server,
+                "database": database,
+                "auth": auth,
+                "username": username,
+                "password": password,
+                "port": port,
+                "encrypt": encrypt,
+                "trust_server_certificate": trust_server_certificate,
+                "connect_timeout": connect_timeout,
+                "app_name": app_name,
+                "odbc_driver": odbc_driver,
+                "pool_max": pool_max,
+                "acquire_timeout": acquire_timeout,
+            },
+        )
+    )
+
+
 def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:
     """Return a copy of ``settings`` with every :class:`EnvRef` resolved against ``values``.
 
@@ -404,6 +479,58 @@ def display_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
+#: Settings keys whose values are credentials — redacted in the API metadata view. Secrets are
+#: required to be ``env()`` refs (so they already render as ``{"env": ...}``); this is defence in
+#: depth against an inline value, and it suppresses an ``env()`` *default* for a secret field. Covers
+#: every credential-bearing connector setting (HTTP auth, DB user/password, SFTP key + passphrase).
+_SECRET_SETTING_KEYS = frozenset(
+    {
+        "password",
+        "username",
+        "bearer_token",
+        "basic_password",
+        "basic_user",
+        "key_password",
+        "private_key",
+        "api_key",
+        "token",
+    }
+)
+
+#: Header names whose value is a credential — redacted inside a REST/SOAP ``headers`` table (the
+#: project requires secrets via ``env()`` bearer/basic settings, not inline headers; this is defence
+#: in depth for an operator who hard-codes one anyway). Compared case-insensitively.
+_SECRET_HEADER_NAMES = frozenset(
+    {"authorization", "proxy-authorization", "x-api-key", "api-key", "cookie"}
+)
+
+
+def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
+    """A JSON-safe, secret-scrubbed view of a connection's settings for the API ``/metadata`` endpoint:
+    each EnvRef becomes ``{"env": key}`` (the value is never resolved — only the key is shown), a
+    credential field rendered inline is replaced with ``"***"`` (an ``env()`` *default* is dropped for
+    a credential field so a fallback secret can't leak), and a credential header inside a ``headers``
+    table is redacted too."""
+    out: dict[str, Any] = {}
+    for name, value in settings.items():
+        is_secret = name in _SECRET_SETTING_KEYS
+        if isinstance(value, EnvRef):
+            ref: dict[str, Any] = {"env": value.key}
+            if value.default is not _UNSET and not is_secret:
+                ref["default"] = value.default
+            out[name] = ref
+        elif is_secret:
+            out[name] = "***"
+        elif name == "headers" and isinstance(value, dict):
+            out[name] = {
+                k: ("***" if str(k).lower() in _SECRET_HEADER_NAMES else v)
+                for k, v in value.items()
+            }
+        else:
+            out[name] = value
+    return out
+
+
 def MLLP(
     *,
     host: str | EnvRef | None = None,  # OUTBOUND: the downstream peer (required; may be env()).
@@ -416,11 +543,43 @@ def MLLP(
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
     connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
     timeout_seconds: float = 30.0,  # outbound: wait this long for the ACK
+    encoding_characters: str | None = None,  # OUTBOUND: re-encode MSH-1/MSH-2 delimiters per dest
+    capture_response: bool = False,  # outbound: capture the application ACK (MSA/ERR) as a reply (ADR 0013)
+    reingress_to: str
+    | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
+    # --- TLS (WP-13b, ADR 0002) — per-connection MLLP-over-TLS ---
+    tls: bool = False,  # turn TLS on (inbound: present a server cert; outbound: verify the peer)
+    tls_cert_file: str
+    | None = None,  # inbound: SERVER cert (required when tls); outbound: CLIENT cert (mTLS)
+    tls_key_file: str | None = None,  # private key for tls_cert_file
+    tls_ca_file: str
+    | None = None,  # trust anchor — inbound: verify client certs (mTLS); outbound: verify server
+    tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
+    tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
 ) -> ConnectionSpec:
     """An MLLP endpoint. Inbound uses port/max_connections/receive_timeout/max_frame_bytes (the
     bind interface comes from the service's ``[inbound].bind_host``, so ``host`` is rejected on an
     inbound); outbound uses host/port/connect_timeout/timeout_seconds/max_frame_bytes. ``encoding``
-    applies to framing in both directions."""
+    applies to framing in both directions. ``capture_response`` (outbound, ADR 0013) records the
+    application ACK as a captured reply (a negative ACK still dead-letters/retries unchanged).
+
+    ``encoding_characters`` (**outbound only**, Corepoint ``MsgSend -override component`` parity) makes
+    this destination re-encode each outgoing message with a different set of HL7 delimiters before
+    framing. Give the **5 MSH delimiter characters in MSH order** — MSH-1 (field separator) followed by
+    the four MSH-2 characters (component, repetition, escape, subcomponent) — e.g. the HL7 default is
+    ``"|^~\\\\&"``. The connector parses the payload with its *current* (MSH-derived) delimiters,
+    rewrites MSH-1/MSH-2, and re-serializes the whole body with the new ones, so a downstream re-parse
+    yields the same logical fields under the new delimiters. ``None`` (the default) leaves the payload
+    **byte-identical** — fully backward compatible. The string is validated at connector build (exactly
+    five characters, all distinct); a non-HL7 payload that can't be parsed fails the delivery loud
+    (``DeliveryError``) rather than being silently corrupted.
+
+    **TLS (WP-13b).** ``tls=True`` wraps the connection: inbound presents ``tls_cert_file``/``tls_key_file``
+    (a server identity; ``tls_ca_file`` adds opt-in mTLS — require + verify a client cert); outbound
+    verifies the server cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
+    and may present ``tls_cert_file`` for mTLS. ``tls_verify=False`` (outbound) is MITM-able and refused
+    unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning) — exactly like LDAPS / SQL Server. TLS is
+    TLS 1.2+ and composes with the ``[egress].allowed_mllp`` allowlist (both enforced)."""
     return ConnectionSpec(
         ConnectorType.MLLP,
         {
@@ -432,6 +591,15 @@ def MLLP(
             "max_frame_bytes": max_frame_bytes,
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
+            "encoding_characters": encoding_characters,
+            "capture_response": capture_response,
+            "reingress_to": reingress_to,
+            "tls": tls,
+            "tls_cert_file": tls_cert_file,
+            "tls_key_file": tls_key_file,
+            "tls_ca_file": tls_ca_file,
+            "tls_verify": tls_verify,
+            "tls_check_hostname": tls_check_hostname,
         },
     )
 
@@ -454,6 +622,9 @@ def Tcp(
     connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
     timeout_seconds: float = 30.0,  # outbound: send/await-reply timeout
     expect_reply: bool = False,  # outbound: read one framed reply and treat it as confirmation
+    capture_response: bool = False,  # outbound: capture the framed reply (requires expect_reply, ADR 0013)
+    reingress_to: str
+    | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
 ) -> ConnectionSpec:
     """A raw-TCP endpoint with **configurable delimiter framing**, relaying the payload **opaquely**
     (no structured parse) — built for X12-over-TCP feeds. Set ``framing`` to a preset
@@ -482,6 +653,65 @@ def Tcp(
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
             "expect_reply": expect_reply,
+            "capture_response": capture_response,
+            "reingress_to": reingress_to,
+        },
+    )
+
+
+def X12(
+    *,
+    host: str | EnvRef | None = None,  # OUTBOUND: the downstream peer (required; may be env()).
+    # INBOUND: omit — the bind interface is a service setting ([inbound].bind_host), not authored.
+    port: int | EnvRef,
+    encoding: str = "utf-8",
+    # Inbound DoS guards (defaults mirror MLLP/TCP; pass None/0 to disable):
+    max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
+    receive_timeout: float | None = 60.0,  # close a client idle this many seconds (slowloris)
+    max_interchange_bytes: int | None = 16
+    * 1024
+    * 1024,  # cap one interchange's bytes (OOM); both dirs
+    connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
+    timeout_seconds: float = 30.0,  # outbound: send/await-reply timeout
+    expect_reply: bool = False,  # outbound: read one returned interchange and treat it as confirmation
+    # --- ADR 0016: synchronous request/response (real-time eligibility 270/271, 278N, 277) ---
+    capture_response: bool = False,  # capture the returned interchange (271/TA1) as a reply (ADR 0013)
+    reingress_to: str
+    | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
+    ta1_required: bool = False,  # outbound: a delivery that reads no TA1/business reply is a retry
+) -> ConnectionSpec:
+    """A raw-TCP **ASC X12 EDI** endpoint (ADR 0012), framed by the interchange itself (``ISA…IEA``) —
+    there are **no delimiter-framing knobs**: the segment terminator is discovered from each ISA header.
+    Use this when the interchange is the frame; for partners who wrap each interchange in a fixed
+    sentinel (STX/ETX, VT/FS) use ``Tcp(framing=...)`` instead.
+
+    Inbound takes no ``host`` (the bind interface is ``[inbound].bind_host``); pair it with
+    ``content_type="x12"`` on ``inbound(...)`` so the body routes as a ``RawMessage`` (ADR 0004) that a
+    Router/Handler parses on demand via ``messagefoundry.parsing.x12``. The inbound is an opaque relay
+    (no TA1/997/999). Outbound dials ``host``/``port`` and writes the interchange verbatim; with
+    ``expect_reply`` it waits for one returned interchange as confirmation (not parsed). **Synchronous
+    request/response** (ADR 0016): set ``capture_response`` (or ``reingress_to=`` a ``Loopback()``
+    inbound) to capture the returned **271/TA1** as a reply — a **TA1** interchange acknowledgement is
+    classified (TA1*A → accepted; TA1*R → permanent reject/dead-letter; TA1*E → accepted-with-warning,
+    *not* retried), a business 271/277/278 returned instead is itself the confirmation; ``ta1_required``
+    makes a no-reply a retry. Egress is gated by ``[egress].allowed_tcp`` (X12 shares the raw-TCP
+    allowlist). Delivery is at-least-once → the receiver **must be idempotent** (a crash-re-send of a
+    non-idempotent 270 yields a fresh 271 captured at the next ``response_seq``)."""
+    return ConnectionSpec(
+        ConnectorType.X12,
+        {
+            "host": host,
+            "port": port,
+            "encoding": encoding,
+            "max_connections": max_connections,
+            "receive_timeout": receive_timeout,
+            "max_interchange_bytes": max_interchange_bytes,
+            "connect_timeout": connect_timeout,
+            "timeout_seconds": timeout_seconds,
+            "expect_reply": expect_reply,
+            "capture_response": capture_response,
+            "reingress_to": reingress_to,
+            "ta1_required": ta1_required,
         },
     )
 
@@ -525,6 +755,43 @@ def File(
     )
 
 
+def Timer(
+    *,
+    body: str,
+    interval_seconds: float | None = None,
+    run_once: bool = False,
+    encoding: str = "utf-8",
+) -> ConnectionSpec:
+    """A Timer **source** (inbound): emit ``body`` on a schedule (ADR 0011).
+
+    Set ``interval_seconds`` to fire every N seconds (heartbeat starts at t=0), or ``run_once=True`` to
+    fire a single time. ``body`` is emitted verbatim — declare its format with
+    ``inbound(..., content_type=...)``: the default ``hl7v2`` runs the HL7 peek/validate/ACK path, while
+    ``text``/``json`` route a :class:`RawMessage` (ADR 0004). In a cluster the schedule is leader-gated,
+    so exactly one node fires it (single-node fires as normal). ``cron`` scheduling is a follow-up."""
+    return ConnectionSpec(
+        ConnectorType.TIMER,
+        {
+            "body": body,
+            "interval_seconds": interval_seconds,
+            "run_once": run_once,
+            "encoding": encoding,
+        },
+    )
+
+
+def Loopback() -> ConnectionSpec:
+    """A Loopback **inbound** (ADR 0013 Increment 2): an inert inbound with **no source**. Messages
+    arrive *only* via the engine-internal ``ingress_handoff`` — a captured reply re-ingressed as a new
+    inbound message (a capturing outbound names this inbound with ``reingress_to=...``).
+
+    It is an ordinary ``inbound(...)`` otherwise: declare its ``router`` (which routes the answer) and
+    ``content_type`` (``hl7v2`` → :class:`Message`; ``x12``/``text``/``json`` → :class:`RawMessage`). It
+    takes **no** ``ack_mode`` (no external peer to ACK — forced to ``NONE``), no ``bind_address``/
+    ``source_ip_allowlist`` (no socket), and no ``strict`` validation (no untrusted intake)."""
+    return ConnectionSpec(ConnectorType.LOOPBACK, {})
+
+
 def Rest(
     *,
     url: str | EnvRef,  # the endpoint; may be env() for DEV/PROD-specific hosts
@@ -539,6 +806,9 @@ def Rest(
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     encoding: str = "utf-8",
+    capture_response: bool = False,  # capture the HTTP response body as a reply (ADR 0013)
+    reingress_to: str
+    | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
 ) -> ConnectionSpec:
     """An HTTP(S) endpoint (**outbound only** today — there is no REST source yet, ADR 0003). The
     Handler produces the request body; this delivers it to ``url`` via ``method`` with ``content_type``
@@ -559,6 +829,8 @@ def Rest(
             "timeout_seconds": timeout_seconds,
             "verify_tls": verify_tls,
             "encoding": encoding,
+            "capture_response": capture_response,
+            "reingress_to": reingress_to,
         },
     )
 
@@ -578,9 +850,14 @@ def Database(
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
+    acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
+    capture_response: bool = False,  # capture the statement's RETURNING/OUTPUT result-set (ADR 0013)
+    reingress_to: str
+    | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
+    capture_max_rows: int = 100,  # cap captured rows (over-cap → outcome='unparseable', empty body)
 ) -> ConnectionSpec:
     """A SQL database endpoint (**outbound only** today; SQL Server via the ``[sqlserver]`` extra + ODBC
-    Driver 18 — **experimental**). The Handler produces a JSON-object body; the connector binds its keys
+    Driver 18 — **production / supported**). The Handler produces a JSON-object body; the connector binds its keys
     to the ``:name`` parameters in ``statement`` (translated to positional ``?`` — always parameterized,
     never string-built) and runs it. A transient DB error retries; a constraint/data error (or a payload
     that doesn't match) dead-letters. Put secrets (``password``) in ``env()``. TLS is on by default;
@@ -601,6 +878,10 @@ def Database(
             "app_name": app_name,
             "odbc_driver": odbc_driver,
             "pool_max": pool_max,
+            "acquire_timeout": acquire_timeout,
+            "capture_response": capture_response,
+            "reingress_to": reingress_to,
+            "capture_max_rows": capture_max_rows,
         },
     )
 
@@ -624,10 +905,11 @@ def DatabasePoll(
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
+    acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
     encoding: str = "utf-8",
 ) -> ConnectionSpec:
     """A SQL database polling **source** (inbound, ADR 0003 §3; SQL Server via the ``[sqlserver]`` extra +
-    ODBC Driver 18 — **experimental**). Every ``poll_seconds`` it runs ``poll_statement`` (a ``SELECT``),
+    ODBC Driver 18 — **production / supported**). Every ``poll_seconds`` it runs ``poll_statement`` (a ``SELECT``),
     hands each row to the bound router as a body, then runs ``mark_statement`` (bound from the row's
     columns) so the row isn't re-read — the File source's *process-then-mark-done* shape. At-least-once:
     a crash before the mark re-emits the row, so the downstream pipeline **must tolerate duplicates**.
@@ -658,6 +940,7 @@ def DatabasePoll(
             "app_name": app_name,
             "odbc_driver": odbc_driver,
             "pool_max": pool_max,
+            "acquire_timeout": acquire_timeout,
             "encoding": encoding,
         },
     )
@@ -675,12 +958,38 @@ def Soap(
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     encoding: str = "utf-8",
+    capture_response: bool = False,  # capture the SOAP response envelope as a reply (ADR 0013)
+    reingress_to: str
+    | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
+    # --- ADR 0015: mutual TLS + WS-* (Timestamp / UsernameToken / WS-Addressing) ---
+    client_cert_file: str
+    | EnvRef
+    | None = None,  # PEM client cert (mTLS); requires client_key_file
+    client_key_file: str | EnvRef | None = None,  # PEM private key (path or env() text)
+    client_key_password: str | EnvRef | None = None,  # key passphrase — secret, use env()
+    ws_security: bool = False,  # stamp <wsse:Security> (Timestamp + optional UsernameToken) in send()
+    ws_username: str | EnvRef | None = None,  # UsernameToken username (defaults to basic_user)
+    ws_password: str | EnvRef | None = None,  # UsernameToken password (defaults to basic_password)
+    ws_password_type: str = "text",  # "text" (PasswordText; recommended over mTLS) | "digest"
+    ws_addressing: bool = False,  # stamp <wsa:Action/To/MessageID> in send(); requires soap_version 1.2
+    ws_timestamp_ttl_seconds: int = 300,  # Created→Expires window (must be >= max retry backoff)
 ) -> ConnectionSpec:
-    """A SOAP web-service endpoint (**outbound only**, ADR 0003). The Handler produces the full SOAP
-    envelope; this POSTs it to ``url`` with the SOAP ``Content-Type`` (+ a ``SOAPAction`` header for
-    1.1). A **Sender/Client** fault dead-letters; a **Receiver/Server** fault retries; otherwise the
-    HTTP status decides. Put secrets in ``env()`` (``bearer_token``/``basic_*``); the host is gated by
-    ``[egress].allowed_http`` (shared with REST). The operation **must be idempotent** (at-least-once)."""
+    """A SOAP web-service endpoint (**outbound only**, ADR 0003 + 0015).
+
+    *Plain mode* (default): the Handler produces the **full SOAP envelope** and this POSTs it to ``url``
+    with the SOAP ``Content-Type`` (+ a ``SOAPAction`` header for 1.1). *WS-\\* mode* (``ws_addressing``
+    / ``ws_security``, ADR 0015): the Handler produces only the operation **``<Body>`` fragment** and
+    the transport wraps it + stamps the non-deterministic ``<wsa:MessageID>`` / ``<wsu:Timestamp>`` /
+    optional ``<wsse:UsernameToken>`` headers in ``send()`` (so a pure transform never mints them);
+    WS-\\* requires ``soap_version="1.2"``. ``client_cert_file``/``client_key_file`` enable **mutual
+    TLS** (incompatible with ``verify_tls=False``).
+
+    A WS-Security auth/expiry fault, a **Sender/Client** fault, or an unrecognized fault dead-letters;
+    a **Receiver/Server** fault retries; otherwise the HTTP status decides. Put secrets in ``env()``
+    (``bearer_token``/``basic_*``/``client_key_password``/``ws_password``); the host is gated by
+    ``[egress].allowed_http`` (shared with REST — **populate it for a PHI mTLS destination**). The
+    operation **must be idempotent**: an at-least-once re-send mints a fresh ``<wsa:MessageID>`` (correct
+    WS-\\* retry semantics), so the partner's dedup must treat a re-send as a retry, not a duplicate."""
     return ConnectionSpec(
         ConnectorType.SOAP,
         {
@@ -694,6 +1003,17 @@ def Soap(
             "timeout_seconds": timeout_seconds,
             "verify_tls": verify_tls,
             "encoding": encoding,
+            "capture_response": capture_response,
+            "reingress_to": reingress_to,
+            "client_cert_file": client_cert_file,
+            "client_key_file": client_key_file,
+            "client_key_password": client_key_password,
+            "ws_security": ws_security,
+            "ws_username": ws_username,
+            "ws_password": ws_password,
+            "ws_password_type": ws_password_type,
+            "ws_addressing": ws_addressing,
+            "ws_timestamp_ttl_seconds": ws_timestamp_ttl_seconds,
         },
     )
 
@@ -873,6 +1193,13 @@ class InboundConnection:
     ack_after: AckAfter | None = None
     validation: Validation = field(default_factory=Validation)
     content_type: ContentType = ContentType.HL7V2  # payload format (ADR 0004); HL7V2 = the HL7 path
+    # Operability (Tier 4): free-form operator metadata (owner/runbook/env labels — surfaced by the
+    # API, never used for routing); a per-connection inbound bind interface that overrides the service
+    # [inbound].bind_host; and an inbound peer-IP allowlist (MLLP/TCP listen sources only). All
+    # default to None/absent = unchanged behaviour.
+    metadata: Mapping[str, Any] | None = None
+    bind_address: str | None = None
+    source_ip_allowlist: tuple[str, ...] | None = None
     source_file: str | None = None  # where it was declared (for IDE go-to-definition)
     source_line: int | None = None
 
@@ -887,6 +1214,12 @@ class OutboundConnection:
     ordering: OrderingMode | None = None
     internal_error: InternalErrorPolicy | None = None
     buildup: BuildupThreshold | None = None
+    # Shadow / parallel-run egress suppression (#15). False = deliver normally; True = the delivery
+    # worker suppresses the real egress + finalizes PROCESSED. [shadow].simulate_all_egress forces it on.
+    simulate: bool = False
+    metadata: Mapping[str, Any] | None = (
+        None  # operability labels (Tier 4); API-surfaced, not routing
+    )
     source_file: str | None = None
     source_line: int | None = None
 
@@ -906,6 +1239,10 @@ class Registry:
     # materializes each into a store snapshot; reference(name) reads the snapshot (data lives in the
     # store, not here). Carried with the graph so a reload re-arms the sync set atomically.
     references: dict[str, ReferenceSpec] = field(default_factory=dict)
+    # Live-lookup connection declarations (ADR 0010): name -> connection settings. The RegistryRunner
+    # builds one pooled executor from these; db_lookup(name, ...) queries it at handler run time. Carried
+    # with the graph so a reload re-arms the executor atomically.
+    lookups: dict[str, DatabaseLookupSpec] = field(default_factory=dict)
 
     def add_inbound(self, conn: InboundConnection) -> None:
         self._add(self.inbound, conn.name, conn, "inbound connection")
@@ -921,6 +1258,9 @@ class Registry:
 
     def add_reference(self, spec: ReferenceSpec) -> None:
         self._add(self.references, spec.name, spec, "reference set")
+
+    def add_lookup(self, spec: DatabaseLookupSpec) -> None:
+        self._add(self.lookups, spec.name, spec, "database lookup")
 
     @staticmethod
     def _add(table: dict[str, Any], name: str, value: Any, kind: str) -> None:
@@ -978,6 +1318,62 @@ def _call_site() -> tuple[str | None, int | None]:
     return caller.f_code.co_filename, caller.f_lineno
 
 
+def _check_metadata(name: str, metadata: Mapping[str, Any] | None) -> None:
+    """Operability metadata must be a key/value table (or absent) — operator labels, not config."""
+    if metadata is not None and not isinstance(metadata, Mapping):
+        raise WiringError(f"connection {name!r}: metadata must be a table (key/value mapping)")
+
+
+def _check_source_ip_allowlist(
+    name: str, listens: bool, allowlist: list[str] | None
+) -> tuple[str, ...] | None:
+    """Validate an inbound peer-IP allowlist and freeze it to a tuple. Each entry must parse as an IP
+    address or a CIDR network; the allowlist is only meaningful for an MLLP/TCP **listen** source.
+    ``None``/empty = no restriction (the ``[egress]`` allowlist convention)."""
+    if not allowlist:
+        return None
+    if not listens:
+        raise WiringError(
+            f"inbound connection {name!r}: source_ip_allowlist is only valid for an MLLP/TCP "
+            "listen source"
+        )
+    for entry in allowlist:
+        if not isinstance(entry, str) or not entry.strip():
+            raise WiringError(
+                f"inbound connection {name!r}: source_ip_allowlist entries must be non-empty strings"
+            )
+        try:
+            if "/" in entry:
+                ipaddress.ip_network(entry, strict=False)
+            else:
+                ipaddress.ip_address(entry)
+        except ValueError as exc:
+            raise WiringError(
+                f"inbound connection {name!r}: source_ip_allowlist entry {entry!r} is not a valid "
+                f"IP address or CIDR network ({exc})"
+            ) from exc
+    return tuple(allowlist)
+
+
+def _coerce_content_type(name: str, content_type: ContentType | str) -> ContentType:
+    """Coerce a ``content_type`` argument to the :class:`ContentType` enum (or fail loud).
+
+    A code-first author may pass the bare string (``content_type="x12"``) rather than the enum member;
+    coerce it here, at the one shared inbound boundary, so a raw string can't flow into the pipeline and
+    blow up later as ``'str' object has no attribute 'value'`` deep in dry-run. An unrecognized value
+    fails loud as a :class:`WiringError` naming the connection and the allowed values — the same loud
+    failure the ``connections.toml`` loader already gives. A member passed in is returned unchanged."""
+    if isinstance(content_type, ContentType):
+        return content_type
+    try:
+        return ContentType(content_type)
+    except ValueError as exc:
+        allowed = ", ".join(repr(member.value) for member in ContentType)
+        raise WiringError(
+            f"inbound connection {name!r}: invalid content_type {content_type!r} (allowed: {allowed})"
+        ) from exc
+
+
 def build_inbound_connection(
     name: str,
     spec: ConnectionSpec,
@@ -987,7 +1383,10 @@ def build_inbound_connection(
     ack_after: AckAfter | None = None,
     strict: bool = False,
     hl7_version: str | None = None,
-    content_type: ContentType = ContentType.HL7V2,
+    content_type: ContentType | str = ContentType.HL7V2,
+    metadata: Mapping[str, Any] | None = None,
+    bind_address: str | None = None,
+    source_ip_allowlist: list[str] | None = None,
     source_file: str | None = None,
     source_line: int | None = None,
 ) -> InboundConnection:
@@ -995,9 +1394,12 @@ def build_inbound_connection(
 
     The shared core of code-first :func:`inbound` **and** the ``connections.toml`` loader (ADR 0007),
     so both authoring surfaces enforce identical guards. Pure — it does not touch the active registry;
-    the caller is responsible for ``add_inbound``."""
+    the caller is responsible for ``add_inbound``. ``content_type`` accepts a :class:`ContentType`
+    member **or** its bare string value (``"x12"``, ``"json"``, …); it is coerced to the enum here so a
+    raw string can't reach the pipeline and crash later."""
+    content_type = _coerce_content_type(name, content_type)
     if (
-        spec.type in (ConnectorType.MLLP, ConnectorType.TCP)
+        spec.type in (ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.X12)
         and spec.settings.get("host") is not None
     ):
         # The bind interface is an environment/service decision (which NIC this instance exposes),
@@ -1027,6 +1429,38 @@ def build_inbound_connection(
             f"inbound connection {name!r}: validation.strict is HL7-specific and can't apply to a "
             f"{content_type.value!r} content_type — validate non-HL7 payloads in the Handler instead"
         )
+    if spec.type is ConnectorType.LOOPBACK:
+        # A loopback inbound (ADR 0013) has no socket and no untrusted intake: strict HL7 validation is
+        # meaningless, and there is no external peer to ACK. Messages arrive only via ingress_handoff.
+        if strict:
+            raise WiringError(
+                f"inbound connection {name!r}: validation.strict is meaningless for a Loopback() "
+                "inbound (no socket / no untrusted intake)"
+            )
+        if ack_mode in (AckMode.NONE, AckMode.ORIGINAL):
+            ack_mode = AckMode.NONE  # unset/default → NONE (no external peer to ACK)
+        else:
+            raise WiringError(
+                f"inbound connection {name!r}: Loopback() takes no ACK (no external peer) — "
+                "ack_mode must be NONE"
+            )
+    _check_metadata(name, metadata)
+    listens = spec.type in (ConnectorType.MLLP, ConnectorType.TCP)
+    if bind_address is not None:
+        if not listens:
+            # Only a listen source (MLLP/TCP) binds an interface; File/DB/etc. have nothing to bind.
+            raise WiringError(
+                f"inbound connection {name!r}: bind_address is only valid for an MLLP/TCP "
+                "listen source"
+            )
+        if not bind_address.strip():
+            # A present-but-blank bind_address would crash asyncio.start_server at boot (getaddrinfo
+            # fails on whitespace) — fail loud at wiring so it's caught in dry-run / `messagefoundry
+            # check`, like the allowlist. (Omit bind_address to inherit [inbound].bind_host.)
+            raise WiringError(
+                f"inbound connection {name!r}: bind_address must be a non-empty host/IP, not blank"
+            )
+    allowlist = _check_source_ip_allowlist(name, listens, source_ip_allowlist)
     return InboundConnection(
         name=name,
         spec=spec,
@@ -1035,6 +1469,9 @@ def build_inbound_connection(
         ack_after=ack_after,
         validation=Validation(strict=strict, hl7_version=hl7_version),
         content_type=content_type,
+        metadata=metadata,
+        bind_address=bind_address,
+        source_ip_allowlist=allowlist,
         source_file=source_file,
         source_line=source_line,
     )
@@ -1049,7 +1486,10 @@ def inbound(
     ack_after: AckAfter | None = None,
     strict: bool = False,
     hl7_version: str | None = None,
-    content_type: ContentType = ContentType.HL7V2,
+    content_type: ContentType | str = ContentType.HL7V2,
+    metadata: Mapping[str, Any] | None = None,
+    bind_address: str | None = None,
+    source_ip_allowlist: list[str] | None = None,
 ) -> None:
     """Declare an inbound connection that feeds every received message to ``router``.
 
@@ -1060,8 +1500,15 @@ def inbound(
 
     ``content_type`` (ADR 0004) selects the payload format: the default ``HL7V2`` runs the HL7
     peek/validate/ACK path and the Router/Handler receive a :class:`Message`; any other value skips HL7
-    parsing and they receive a :class:`RawMessage` (``.raw``/``.text``/``.json()``). ``strict``
-    validation is HL7-only, so it cannot combine with a non-HL7 ``content_type``."""
+    parsing and they receive a :class:`RawMessage` (``.raw``/``.text``/``.json()``). It may be a
+    :class:`ContentType` member **or** its bare string value (``content_type="x12"``), coerced at load —
+    an unrecognized string fails loud as a :class:`WiringError`. ``strict`` validation is HL7-only, so it
+    cannot combine with a non-HL7 ``content_type``.
+
+    Operability (Tier 4, all optional): ``metadata`` attaches free-form operator labels
+    (owner/runbook/environment) surfaced by the API and never used for routing; ``bind_address``
+    overrides the service ``[inbound].bind_host`` for this MLLP/TCP listener only; ``source_ip_allowlist``
+    restricts an MLLP/TCP listener to the given peer IPs / CIDR networks (absent/empty = no restriction)."""
     file, line = _call_site()
     _active_registry().add_inbound(
         build_inbound_connection(
@@ -1073,6 +1520,9 @@ def inbound(
             strict=strict,
             hl7_version=hl7_version,
             content_type=content_type,
+            metadata=metadata,
+            bind_address=bind_address,
+            source_ip_allowlist=source_ip_allowlist,
             source_file=file,
             source_line=line,
         )
@@ -1087,6 +1537,8 @@ def build_outbound_connection(
     ordering: OrderingMode | None = None,
     internal_error: InternalErrorPolicy | None = None,
     buildup: BuildupThreshold | None = None,
+    simulate: bool = False,
+    metadata: Mapping[str, Any] | None = None,
     source_file: str | None = None,
     source_line: int | None = None,
 ) -> OutboundConnection:
@@ -1094,14 +1546,86 @@ def build_outbound_connection(
 
     The shared core of code-first :func:`outbound` **and** the ``connections.toml`` loader (ADR 0007).
     Pure — it does not touch the active registry; the caller is responsible for ``add_outbound``."""
-    if spec.type in (ConnectorType.MLLP, ConnectorType.TCP) and spec.settings.get("host") is None:
-        # Outbound MLLP/TCP dials a downstream peer, so a host is mandatory. (It's the value that
+    if (
+        spec.type in (ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.X12)
+        and spec.settings.get("host") is None
+    ):
+        # Outbound MLLP/TCP/X12 dials a downstream peer, so a host is mandatory. (It's the value that
         # legitimately differs per environment — see env() for DEV/PROD-specific peers.)
         kind = spec.type.value.upper()
         raise WiringError(
             f"outbound connection {name!r}: {kind} outbound requires a host (the downstream peer), "
             f"e.g. {kind.title()}(host=..., port=...)."
         )
+    _check_metadata(name, metadata)
+    # ADR 0013 Increment 2: reingress_to (route this outbound's reply back as a new inbound message)
+    # IMPLIES capture (the reply must be captured to re-ingress it). Force capture_response here so the
+    # capture-validity guards below also gate a re-ingress declaration; the cross-registry check that
+    # reingress_to names an existing Loopback() inbound runs in build_check_registry (it sees the whole
+    # registry). A re-ingress on FILE/REMOTEFILE therefore fails with the "no synchronous response" error.
+    reingress_to = spec.settings.get("reingress_to")
+    if reingress_to is not None:
+        if not isinstance(reingress_to, str) or not reingress_to.strip():
+            raise WiringError(
+                f"outbound connection {name!r}: reingress_to must be a non-empty inbound name (ADR 0013)"
+            )
+        spec.settings["capture_response"] = True
+    # ADR 0013: response capture must be wiring-valid at `check`/dry-run time (no store needed), and
+    # this is the choke point for BOTH the code-first factories and the connections.toml desugar.
+    if spec.settings.get("capture_response"):
+        if spec.type in (ConnectorType.FILE, ConnectorType.REMOTEFILE):
+            raise WiringError(
+                f"outbound connection {name!r}: {spec.type.value.upper()} has no synchronous response, "
+                "so capture_response=True is invalid (ADR 0013)."
+            )
+        if spec.type is ConnectorType.TCP and not spec.settings.get("expect_reply"):
+            raise WiringError(
+                f"outbound connection {name!r}: TCP capture_response=True requires expect_reply=True "
+                "(there is no reply to capture otherwise) (ADR 0013)."
+            )
+        if spec.type is ConnectorType.X12 and not spec.settings.get("expect_reply"):
+            raise WiringError(
+                f"outbound connection {name!r}: X12 capture_response=True requires expect_reply=True "
+                "(there is no returned interchange to capture otherwise) (ADR 0016)."
+            )
+        if spec.type is ConnectorType.DATABASE:
+            stmt = str(spec.settings.get("statement") or "").lower()
+            if "returning" not in stmt and "output" not in stmt:
+                raise WiringError(
+                    f"outbound connection {name!r}: DATABASE capture_response=True requires a "
+                    "RETURNING/OUTPUT clause in the statement (it is fetched from the same cursor "
+                    "before commit), not a separate SELECT (ADR 0013)."
+                )
+    # ADR 0015: WS-* / mutual-TLS validity for SOAP, at `check`/dry-run time (no store). The url-scheme
+    # checks (https required for a client cert, cleartext-credential refusal) need the resolved url and
+    # run in SoapDestination.__init__; the structural ones below work on the unresolved spec (an EnvRef
+    # is truthy, so presence/pairing checks hold even before env() resolution).
+    if spec.type is ConnectorType.SOAP:
+        cert = spec.settings.get("client_cert_file")
+        key = spec.settings.get("client_key_file")
+        if bool(cert) != bool(key):
+            raise WiringError(
+                f"outbound connection {name!r}: SOAP client_cert_file and client_key_file must be set "
+                "together (a client cert needs its key) (ADR 0015)."
+            )
+        if cert and spec.settings.get("verify_tls") is False:
+            raise WiringError(
+                f"outbound connection {name!r}: SOAP client cert is incompatible with verify_tls=false "
+                "(presenting an identity to an unverified peer is incoherent) (ADR 0015)."
+            )
+        pw_type = spec.settings.get("ws_password_type", "text")
+        if pw_type not in ("text", "digest"):
+            raise WiringError(
+                f"outbound connection {name!r}: SOAP ws_password_type must be 'text' or 'digest', "
+                f"got {pw_type!r} (ADR 0015)."
+            )
+        if (spec.settings.get("ws_security") or spec.settings.get("ws_addressing")) and str(
+            spec.settings.get("soap_version", "1.1")
+        ) != "1.2":
+            raise WiringError(
+                f"outbound connection {name!r}: SOAP ws_security/ws_addressing require "
+                "soap_version='1.2' (WS-Addressing/WS-Security are coherent only on SOAP 1.2) (ADR 0015)."
+            )
     return OutboundConnection(
         name=name,
         spec=spec,
@@ -1109,6 +1633,8 @@ def build_outbound_connection(
         ordering=ordering,
         internal_error=internal_error,
         buildup=buildup,
+        simulate=simulate,
+        metadata=metadata,
         source_file=source_file,
         source_line=source_line,
     )
@@ -1122,13 +1648,18 @@ def outbound(
     ordering: OrderingMode | None = None,
     internal_error: InternalErrorPolicy | None = None,
     buildup: BuildupThreshold | None = None,
+    simulate: bool = False,
+    metadata: Mapping[str, Any] | None = None,
 ) -> None:
     """Declare an outbound connection that Handlers can ``Send`` to.
 
     ``retry``/``ordering``/``internal_error``/``buildup`` override the global ``[delivery]`` defaults
     for this connection only (omit to inherit). ``ordering`` defaults to FIFO — strict in-order
     delivery per connection; ``internal_error`` defaults to continue (dead-letter a code-error row and
-    advance); ``buildup`` sets the ``queue_buildup`` alert thresholds for this lane."""
+    advance); ``buildup`` sets the ``queue_buildup`` alert thresholds for this lane. ``simulate=True``
+    runs the full pipeline but **suppresses the real egress** (shadow / parallel-run mode, #15) — no
+    bytes leave the box and the message still finalizes PROCESSED. ``metadata`` attaches free-form
+    operator labels (Tier 4) surfaced by the API, never used for delivery."""
     file, line = _call_site()
     _active_registry().add_outbound(
         build_outbound_connection(
@@ -1138,6 +1669,8 @@ def outbound(
             ordering=ordering,
             internal_error=internal_error,
             buildup=buildup,
+            simulate=simulate,
+            metadata=metadata,
             source_file=file,
             source_line=line,
         )

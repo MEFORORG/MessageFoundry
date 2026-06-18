@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """End-to-end latency correlation with bounded memory.
 
 Each message carries a dense, monotonic sequence number ``seq`` (encoded into MSH-10 as the control

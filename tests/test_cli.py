@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """CLI introspection subcommands (validate/graph/dryrun/hl7schema) emit JSON for the IDE."""
 
 from __future__ import annotations
@@ -50,13 +52,33 @@ def test_graph_of_sample(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["graph", "--config", str(SAMPLES_CONFIG), "--json"]) == 0
     g = _out_json(capsys)
     inbound = {c["name"]: c for c in g["inbound"]}
-    # samples/config ships two routes: the ADT file-archive route and the env()-driven ACME route.
-    assert {"IB_Test_ADT", "IB_ACME_ADT"} <= set(inbound)
+    # samples/config ships: the ADT file-archive route, the env()-driven ACME route, the X12 EDI route
+    # (IB_PARTNER_X12, ADR 0012), the WS-* SOAP submit (ADR 0015), and the X12 RTE route (ADR 0016).
+    assert {"IB_Test_ADT", "IB_ACME_ADT", "IB_PARTNER_X12"} <= set(inbound)
     adt_in = inbound["IB_Test_ADT"]
     assert adt_in["router"] == "adt_router" and adt_in["type"] == "mllp"
-    assert {c["name"] for c in g["outbound"]} >= {"FILE-OUT_Test_ADT", "OB_ACME_ADT"}
-    assert {r["name"] for r in g["routers"]} == {"adt_router", "acme_adt_router"}
-    assert {h["name"] for h in g["handlers"]} == {"archive", "acme_adt_handler"}
+    assert inbound["IB_PARTNER_X12"]["type"] == "x12"
+    assert {c["name"] for c in g["outbound"]} >= {
+        "FILE-OUT_Test_ADT",
+        "OB_ACME_ADT",
+        "OB_PAYER_X12",
+    }
+    assert {r["name"] for r in g["routers"]} == {
+        "adt_router",
+        "acme_adt_router",
+        "partner_x12_router",
+        "immunization_router",
+        "rte_request_router",
+        "rte_response_router",
+    }
+    assert {h["name"] for h in g["handlers"]} == {
+        "archive",
+        "acme_adt_handler",
+        "partner_x12_handler",
+        "immunization_submit_handler",
+        "rte_query_handler",
+        "rte_result_handler",
+    }
     # env()-driven settings serialize JSON-safely as {"env": key}, never a raw EnvRef object
     acme_out = next(c for c in g["outbound"] if c["name"] == "OB_ACME_ADT")
     assert acme_out["settings"]["host"] == {"env": "acme_adt_host"}
@@ -225,19 +247,21 @@ def test_serve_refuses_without_key_when_require_encryption(
     (tmp_path / "messagefoundry.toml").write_text(
         "[store]\nrequire_encryption = true\n", encoding="utf-8"
     )
-    assert main(["serve", "--config", str(SAMPLES_CONFIG)]) == 2
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 2
     assert "require_encryption" in capsys.readouterr().err
 
 
-def test_serve_warns_in_prod_without_key(
+def test_serve_refuses_in_prod_without_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # A PRODUCTION PHI instance must not run keyless: serve fails closed (the prod analogue of
+    # require_encryption — no flag needed), distinct from the staging warning below.
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
-    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)  # don't actually serve
-    # environment defaults to 'prod', so the no-key at-rest warning fires (serve still starts).
-    assert main(["serve", "--config", str(SAMPLES_CONFIG)]) == 0
-    assert "UNENCRYPTED at rest" in capsys.readouterr().err
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)  # never reached, but be safe
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"]) == 2
+    err = capsys.readouterr().err
+    assert "production PHI instance" in err and "UNENCRYPTED at rest" in err
 
 
 def test_serve_warns_in_staging_without_key(
@@ -263,6 +287,76 @@ def test_serve_quiet_in_dev_without_key(
     assert "UNENCRYPTED at rest" not in capsys.readouterr().err
 
 
+def test_serve_refuses_open_egress_in_prod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # With a key configured (so the keyless gate passes), a production PHI instance whose outbound
+    # egress is fully unrestricted (no [egress].deny_by_default, no allowlists) fails closed.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        "MEFOR_STORE_ENCRYPTION_KEY", "x" * 44
+    )  # passes the keyless gate (mocked app)
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"]) == 2
+    err = capsys.readouterr().err
+    assert "egress is UNRESTRICTED on a production" in err
+
+
+def test_serve_warns_open_egress_in_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A non-production PHI instance (staging) only WARNS on unrestricted egress and still starts —
+    # the fail-closed escalation is production-only.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # silence the keyless warning
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]) == 0
+    err = capsys.readouterr().err
+    assert "egress is UNRESTRICTED in a PHI-carrying environment" in err and "staging" in err
+
+
+# --- C3: required active environment + custom-name posture (ADR 0017) --------
+
+
+def test_serve_requires_active_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # No --env and no [ai].environment: serve refuses (no silent PROD default), so a missing env can
+    # never resolve another environment's values/secrets.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG)]) == 2
+    assert "no active environment" in capsys.readouterr().err
+
+
+def test_serve_custom_env_requires_explicit_posture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A custom env name with no [ai].data_class/[ai].production refuses — posture is never inferred
+    # from a free-form name (ADR 0017).
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "test"]) == 2
+    assert "data_class" in capsys.readouterr().err
+
+
+def test_serve_custom_env_with_posture_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A custom env with an explicit posture starts cleanly (app + uvicorn mocked).
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[ai]\nenvironment = "test"\ndata_class = "synthetic"\nproduction = false\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG)]) == 0
+
+
 # --- non-loopback API bind guard (--allow-insecure-bind) ---------------------
 
 
@@ -273,7 +367,7 @@ def test_serve_refuses_non_loopback_bind_by_default(
     # Phase 1 has no API TLS, so a non-loopback bind must fail closed unless the operator opts in.
     monkeypatch.chdir(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text('[api]\nhost = "0.0.0.0"\n', encoding="utf-8")
-    assert main(["serve", "--config", str(SAMPLES_CONFIG)]) == 2
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 2
     assert "refusing to serve the API on non-loopback" in capsys.readouterr().err
 
 
@@ -286,7 +380,10 @@ def test_serve_allows_non_loopback_bind_with_flag(
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())  # silence the at-rest warning
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)  # don't actually serve
     (tmp_path / "messagefoundry.toml").write_text('[api]\nhost = "0.0.0.0"\n', encoding="utf-8")
-    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind"]) == 0
+    assert (
+        main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "dev"])
+        == 0
+    )
     err = capsys.readouterr().err
     assert "--allow-insecure-bind" in err and "cleartext" in err  # warned, but served
 
@@ -300,7 +397,7 @@ def test_serve_loopback_bind_needs_no_flag(
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     (tmp_path / "messagefoundry.toml").write_text('[api]\nhost = "127.0.0.1"\n', encoding="utf-8")
-    assert main(["serve", "--config", str(SAMPLES_CONFIG)]) == 0
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     assert "non-loopback" not in capsys.readouterr().err  # loopback never trips the guard
 
 
@@ -317,3 +414,127 @@ def test_serve_non_loopback_with_auth_off_refused_despite_flag(
     err = capsys.readouterr().err
     assert "enabled=false" in err  # the no-auth gate fired...
     assert "refusing to serve the API on non-loopback" not in err  # ...not the bind gate
+
+
+# --- MFA-at-exposure posture (sec-mfa-on; off-loopback bind + [auth].require_mfa) ----------------
+#
+# An exposed (non-loopback) PHI bind with require_mfa off is single-factor over the network: refuse on
+# a production PHI instance, warn on a non-production PHI instance, stay quiet on synthetic. These
+# reach the MFA gate via --allow-insecure-bind (passes the cleartext-bind gate) with the keyless and
+# open-egress gates pre-satisfied (a key + [egress].deny_by_default), so only the MFA posture is under
+# test. create_managed_app + uvicorn are mocked so no socket is opened.
+
+
+def _expose_toml(tmp_path: Path, *, extra: str = "") -> None:
+    """A non-loopback bind with egress locked down (so the open-egress gate is silent)."""
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[api]\nhost = "0.0.0.0"\n[egress]\ndeny_by_default = true\n' + extra, encoding="utf-8"
+    )
+
+
+def test_serve_refuses_exposed_without_mfa_in_prod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # passes the keyless gate
+    _expose_toml(tmp_path)
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert (
+        main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "prod"])
+        == 2
+    )
+    assert "require_mfa off; refusing to start" in capsys.readouterr().err
+
+
+def test_serve_warns_exposed_without_mfa_in_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Non-production PHI (staging) only WARNS and still starts — the fail-closed refuse is prod-only.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # silence the keyless warning
+    _expose_toml(tmp_path)
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert (
+        main(
+            ["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "staging"]
+        )
+        == 0
+    )
+    err = capsys.readouterr().err
+    assert "require_mfa off" in err and "single-factor" in err
+    assert "refusing to start" not in err  # warned, did not refuse
+
+
+def test_serve_quiet_exposed_without_mfa_in_synthetic_dev(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A synthetic instance (dev) stays quiet on the MFA posture (parity with keyless/egress gates).
+    monkeypatch.chdir(tmp_path)
+    _expose_toml(tmp_path)
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert (
+        main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "dev"])
+        == 0
+    )
+    assert "require_mfa" not in capsys.readouterr().err  # synthetic → no MFA advisory
+
+
+def test_serve_exposed_with_mfa_on_starts_in_prod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # require_mfa on satisfies the posture, so a production exposed bind starts (gates all mocked).
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    _expose_toml(tmp_path, extra="[auth]\nrequire_mfa = true\n")
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert (
+        main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "prod"])
+        == 0
+    )
+    assert "require_mfa off" not in capsys.readouterr().err
+
+
+def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The gate keys on require_mfa only — AD/Kerberos MFA is delegated to the directory — so an
+    # AD-enabled prod exposed bind with require_mfa off is STILL refused, pinning the error text's
+    # "safe even on an AD-only deployment (it gates only local Administrator accounts)".
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    monkeypatch.setenv("MEFOR_AUTH_AD_BIND_PASSWORD", "s3cret-pw")
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[api]\nhost = "0.0.0.0"\n'
+        "[egress]\ndeny_by_default = true\n"
+        "[auth]\nad_enabled = true\n"
+        'ad_server = "ldaps://dc1.example.com:636"\n'
+        'ad_user_search_base = "ou=users,dc=example,dc=com"\n'
+        'ad_bind_dn = "cn=svc,dc=example,dc=com"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert (
+        main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "prod"])
+        == 2
+    )
+    assert "require_mfa off; refusing to start" in capsys.readouterr().err
+
+
+def test_serve_loopback_never_trips_mfa_advisory_in_prod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The loopback default is not exposed, so even a production instance with require_mfa off is quiet.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[api]\nhost = "127.0.0.1"\n[egress]\ndeny_by_default = true\n', encoding="utf-8"
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"]) == 0
+    assert "require_mfa" not in capsys.readouterr().err

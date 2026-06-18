@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Code-first wiring: the registry + loader for inbound/outbound/router/handler."""
 
 from __future__ import annotations

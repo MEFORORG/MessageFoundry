@@ -1,0 +1,100 @@
+# Reference throughput profile — open-loop sustainable-rate STEPS. It measures the engine's end-to-end
+# (delivery) throughput ceiling WITHOUT the ACK-on-receipt overshoot the closed-loop sweep suffers: the
+# engine ACKs on receipt (before delivery), so a concurrency sweep gated on the ACK lets intake outrun
+# the delivery path and just floods an undrainable backlog. Instead, each step holds a fixed offered
+# RATE: where the engine sustains it, achieved ≈ offered and e2e p99 stays bounded; past the knee, e2e
+# climbs and achieved < offered (deferred). A final low cooldown lets the pipeline DRAIN so the
+# conformance tier (zero loss + bounded drain) still passes. The reported "sustained msg/s" is the
+# highest step that held achieved ≈ offered with bounded e2e.
+#
+# IMPORTANT: every number here is generic and synthetic — illustrative rate steps + an ADT-dominant
+# message shape, loopback hosts, generic labels. No real partner, site code, IP, or volume. See
+# docs/LOAD-TESTING.md.
+
+[load]
+name = "reference"
+description = "Open-loop sustainable-rate steps — the engine's end-to-end throughput ceiling, drained"
+pool_size = 64
+corpus_count_per_trigger = 20
+poll_interval_s = 1.0
+drain_timeout_s = 180.0
+correlator_capacity = 2000000
+
+[[load.target]]
+name = "adt_hub"
+port = 2600
+types = ["ADT"]
+weight = 6.0
+
+[[load.target]]
+name = "results_hub"
+port = 2601
+types = ["ORU", "ORM", "OML"]
+weight = 3.0
+
+[[load.target]]
+name = "other_hub"
+port = 2602
+types = ["SIU", "RDE", "RAS", "DFT", "MDM", "MFN", "BAR"]
+weight = 1.0
+
+# Same ADT-dominant shape as fanout-baseline / closed-loop (weights relative, normalized at load).
+[load.mix]
+ADT = 55.0
+ORU = 18.0
+ORM = 10.0
+SIU = 5.0
+RDE = 4.0
+RAS = 3.0
+DFT = 2.0
+MDM = 1.0
+MFN = 1.0
+BAR = 1.0
+
+# Conformance-tier invariants ONLY (hardware-independent). NO e2e/throughput floor here: the per-step e2e
+# is the SIGNAL used to read the knee (reported, not pass/failed), and throughput is measured "as
+# observed on this host", per the Q3 two-tier gate. zero_loss + drain still gate (the cooldown drains).
+[load.slo]
+max_error_rate = 0.001
+max_dead_letters = 0
+zero_loss = true
+
+[[load.phase]]
+name = "warmup"
+kind = "warmup"
+loop = "open"
+rate_start = 15.0
+duration_s = 15.0
+
+# Rate steps — each a MEASURED (sustained) phase, so the report shows achieved vs offered + ACK/e2e
+# latency at each offered rate. The sustainable ceiling is the highest step where achieved ≈ offered and
+# e2e p99 stays bounded.
+[[load.phase]]
+name = "r30"
+kind = "sustained"
+loop = "open"
+rate_start = 30.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r50"
+kind = "sustained"
+loop = "open"
+rate_start = 50.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r70"
+kind = "sustained"
+loop = "open"
+rate_start = 70.0
+duration_s = 40.0
+
+# Cooldown well below any backend's delivery ceiling, so whatever backlog the steps above built drains
+# within the run + the final drain — keeping the zero_loss + drain conformance check honest.
+[[load.phase]]
+name = "cooldown"
+kind = "sustained"
+loop = "open"
+rate_start = 12.0
+duration_s = 45.0

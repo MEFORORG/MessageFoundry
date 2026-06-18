@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The real AlertSink notifier: webhook + email transports, background fan-out, dedup, PHI-safety."""
 
 from __future__ import annotations
@@ -82,6 +84,7 @@ async def test_events_carry_no_message_body_only_queue_shape() -> None:
             "depth",
             "oldest_age_seconds",
             "ts",
+            "severity",  # non-PHI rule outcome (info/warning/critical)
         }
 
 

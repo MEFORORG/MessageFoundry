@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Send tab: generate messages of a chosen type/trigger and fire them at an MLLP endpoint."""
 
 from __future__ import annotations

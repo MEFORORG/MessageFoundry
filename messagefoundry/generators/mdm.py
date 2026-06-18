@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Generate conformant HL7 v2.5.1 **MDM** (medical document management) messages.
 
 MDM_T01/T02 require MSH + EVN + PID + PV1 + TXA (T02 adds an observation/OBX).

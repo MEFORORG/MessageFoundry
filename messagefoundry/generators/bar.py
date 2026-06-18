@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Generate conformant HL7 v2.5.1 **BAR** (add/change billing account) messages.
 
 BAR_Pxx require MSH + EVN + PID + a VISIT group; we add procedures (PR1), guarantor (GT1) and

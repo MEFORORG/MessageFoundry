@@ -35,8 +35,13 @@ This is the localhost, single-machine setup. Networked deployment (binding beyon
 
 ```powershell
 # from repo root, elevated PowerShell
-.\scripts\service\install-service.ps1
+.\scripts\service\install-service.ps1 -Environment prod
 ```
+
+`-Environment` is **required** (ADR 0017): it selects which `environments/<name>.toml` value file the
+engine resolves and the instance's PHI posture. `serve` refuses to start without it (no silent
+default), so the install script refuses too — pass `dev`, `staging`, `prod`, or a custom name. The
+console's **Install service…** button prompts for it.
 
 Defaults:
 
@@ -45,6 +50,7 @@ Defaults:
 | Service name | `MessageFoundry` |
 | Engine exe | `<repo>\.venv\Scripts\messagefoundry.exe` |
 | Config dir | `<repo>\samples\config` |
+| Active environment | *(required — `-Environment`)* |
 | Data dir | `C:\ProgramData\MessageFoundry` |
 | Message store | `<DataDir>\messagefoundry.db` |
 | Logs | `<DataDir>\logs\service.out.log`, `service.err.log` |
@@ -54,7 +60,7 @@ Defaults:
 Override any of them, e.g.:
 
 ```powershell
-.\scripts\service\install-service.ps1 -Port 9000 -LogLevel DEBUG `
+.\scripts\service\install-service.ps1 -Environment prod -Port 9000 -LogLevel DEBUG `
     -Config D:\hl7\config -DataDir D:\MessageFoundry
 ```
 
@@ -78,7 +84,7 @@ Because the install is editable, a restart runs **whatever branch is checked out
 definition drifted — the install script is idempotent (it stops and reconfigures in place):
 
 ```powershell
-.\scripts\service\install-service.ps1            # elevated; re-points the exe + AppParameters
+.\scripts\service\install-service.ps1 -Environment prod   # elevated; re-points the exe + AppParameters
 & C:\ProgramData\MessageFoundry\bin\nssm.exe start MessageFoundry
 ```
 
@@ -111,7 +117,7 @@ Install under a dedicated low-privilege account instead. A **virtual service acc
 password and is the simplest option:
 
 ```powershell
-.\scripts\service\install-service.ps1 -ServiceAccount "NT SERVICE\MessageFoundry"
+.\scripts\service\install-service.ps1 -Environment prod -ServiceAccount "NT SERVICE\MessageFoundry"
 ```
 
 When `-ServiceAccount` is supplied the install script now **auto-grants the account exactly what it

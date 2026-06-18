@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The shipped sample config loads/routes, and the Engine runs a loaded Registry end-to-end."""
 
 from __future__ import annotations
@@ -27,9 +29,27 @@ def test_sample_config_loads_and_routes() -> None:
         reg.inbound["IB_Test_ADT"].spec.settings.get("host") is None
     )  # bind interface is service-set
     assert "FILE-OUT_Test_ADT" in reg.outbound
-    # samples/config ships two modules: the ADT archive route and the ACME env()-driven route.
-    assert set(reg.routers) == {"adt_router", "acme_adt_router"}
-    assert set(reg.handlers) == {"archive", "acme_adt_handler"}
+    # samples/config ships: the ADT archive route, the ACME env()-driven route, the X12 EDI route
+    # (IB_PARTNER_X12, ADR 0012), the WS-* SOAP submit (IB_IMMUNIZATION_VXU, ADR 0015), and the X12
+    # real-time-eligibility route (IB_RTE_ELIGIBILITY, ADR 0016).
+    assert set(reg.routers) == {
+        "adt_router",
+        "acme_adt_router",
+        "partner_x12_router",
+        "immunization_router",
+        "rte_request_router",
+        "rte_response_router",
+    }
+    assert set(reg.handlers) == {
+        "archive",
+        "acme_adt_handler",
+        "partner_x12_handler",
+        "immunization_submit_handler",
+        "rte_query_handler",
+        "rte_result_handler",
+    }
+    assert reg.inbound["IB_PARTNER_X12"].spec.settings["port"] == 2710
+    assert reg.inbound["IB_PARTNER_X12"].content_type.value == "x12"
 
     a01 = Message.parse("MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\r")
     a99 = Message.parse("MSH|^~\\&|A|B|C|D|20260101||ADT^A99|M2|P|2.5.1\r")

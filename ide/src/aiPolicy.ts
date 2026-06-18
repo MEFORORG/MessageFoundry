@@ -9,7 +9,7 @@ import { getJson } from "./engineClient";
 export interface AiPolicy {
   mode: string;
   dataScope: string;
-  environment: string;
+  environment: string | null;
   // null = RBAC could not be evaluated (no/invalid token under enabled auth, or resolved offline).
   assistPermitted: boolean | null;
   reason: string | null;
@@ -19,7 +19,7 @@ export interface AiPolicy {
 interface AiPolicyWire {
   mode: string;
   data_scope: string;
-  environment: string;
+  environment: string | null;
   assist_permitted: boolean | null;
   reason: string | null;
 }
@@ -29,7 +29,7 @@ interface AiPolicyWire {
 const DEFAULT_POLICY: AiPolicy = {
   mode: "byo",
   dataScope: "code_only",
-  environment: "prod",
+  environment: null,
   assistPermitted: null,
   reason: null,
 };

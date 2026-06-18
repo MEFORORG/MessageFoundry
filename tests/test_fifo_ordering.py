@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """FIFO-per-outbound delivery (ordering Phase 1, layer 2).
 
 Store-level: ``claim_next_fifo`` returns the oldest *due* head per destination and **blocks the lane**

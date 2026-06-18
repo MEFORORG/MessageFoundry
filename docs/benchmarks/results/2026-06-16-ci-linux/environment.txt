@@ -1,0 +1,14 @@
+## postgres
+Linux runnervm1li68 6.17.0-1018-azure #18~24.04.1-Ubuntu SMP Thu May 28 16:39:11 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+Python 3.13.13
+psql (PostgreSQL) 16.14 (Ubuntu 16.14-1.pgdg24.04+1)
+5d9d39673d8c98427e1501d0dbd40a07123dcb10
+## sqlite
+Linux runnervm1li68 6.17.0-1018-azure #18~24.04.1-Ubuntu SMP Thu May 28 16:39:11 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+Python 3.13.13
+sqlite 3.45.1
+5d9d39673d8c98427e1501d0dbd40a07123dcb10
+## sqlserver
+Linux runnervm1li68 6.17.0-1018-azure #18~24.04.1-Ubuntu SMP Thu May 28 16:39:11 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+Python 3.13.13
+5d9d39673d8c98427e1501d0dbd40a07123dcb10

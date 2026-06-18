@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Connector configuration models — the transport-level building blocks.
 
 A :class:`Source`/:class:`Destination` is a transport endpoint (type + free-form
@@ -28,8 +30,12 @@ class ConnectorType(str, Enum):
     DATABASE = "database"  # SQL destination — SQL Server first (ADR 0003)
     SOAP = "soap"  # SOAP / web-service destination over HTTP (ADR 0003)
     REMOTEFILE = "remotefile"  # remote-file transport — SFTP / FTP / FTPS (source + destination)
+    TIMER = "timer"  # clock-driven source — emits a configured body on a schedule (source only, ADR 0011)
+    X12 = "x12"  # raw-TCP X12 EDI — ISA/IEA-framed (no transport sentinel), source + destination (ADR 0012)
+    LOOPBACK = "loopback"  # inert inbound — messages arrive only via ingress_handoff (re-ingress, ADR 0013)
     # DATABASE also has an inbound poll source (DatabasePoll, ADR 0003 §3 + 0004); REMOTEFILE is both
-    # source and destination. REST/SOAP sources (HTTP listeners) and TCP/FHIR are future.
+    # source and destination. TIMER is source-only (it generates, never delivers). REST/SOAP sources
+    # (HTTP listeners) and TCP/FHIR are future.
 
 
 class ContentType(str, Enum):
@@ -147,6 +153,11 @@ class Destination(BaseModel):
     type: ConnectorType
     settings: dict[str, Any] = Field(default_factory=dict)
     retry: RetryPolicy = Field(default_factory=RetryPolicy)
+    # Shadow / parallel-run mode (#15): when True the delivery worker runs the full pipeline + count-
+    # and-log but SUPPRESSES the real egress (no bytes/SQL leave the box) and finalizes the message
+    # PROCESSED, so a shadow instance can process real traffic without double-delivering to live
+    # partners. A deployment-wide [shadow].simulate_all_egress forces this on for every outbound.
+    simulate: bool = False
 
 
 class Validation(BaseModel):

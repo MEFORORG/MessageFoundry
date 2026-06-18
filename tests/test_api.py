@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Localhost API: connections, message tracking/detail/replay, stats, audit, WebSocket.
 
 REST is exercised with httpx's ASGI transport (async, shares this test's event loop, so
@@ -27,6 +29,15 @@ from messagefoundry.store import MessageStatus, OutboxStatus
 ADT = (
     "MSH|^~\\&|SENDINGAPP|SENDINGFAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
     "PID|1||100^^^H^MR||DOE^JANE\r"
+)
+
+# A transformed outbound body, deliberately distinct from the raw inbound (different sending app + an
+# extra segment), so a test can prove the /outbound endpoint returns the *transformed* payload — not
+# the raw — and that it was decrypted at rest (#14).
+TRANSFORMED = (
+    "MSH|^~\\&|MEFOR|RFAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
+    "PID|1||100^^^H^MR||DOE^JANE\r"
+    "ZXF|transformed-by-mefor\r"
 )
 
 
@@ -63,6 +74,14 @@ async def test_health(client: httpx.AsyncClient) -> None:
     r = await client.get("/health")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
+
+
+async def test_unsupported_method_returns_405(client: httpx.AsyncClient) -> None:
+    # WP-L3-08 / ASVS 4.1.4: each route declares exactly one HTTP method, so an unsupported method on a
+    # known path is rejected with 405 by the router (before any handler runs) — that per-route
+    # single-method declaration IS the intentional method-blocking control. No CORS/OPTIONS surface.
+    assert (await client.request("DELETE", "/health")).status_code == 405
+    assert (await client.request("PUT", "/messages")).status_code == 405
 
 
 async def test_chunked_request_body_rejected(client: httpx.AsyncClient) -> None:
@@ -129,6 +148,43 @@ async def test_message_detail_includes_body_and_records_audit_view(
     assert (await client.get("/messages/missing")).status_code == 404
 
 
+async def test_message_outbound_returns_transformed_payload_and_audits(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    # #14: the parity tool reads MEFOR's transformed outbound body per destination. Seed a transformed
+    # payload distinct from the raw inbound to prove we return the decrypted transform, not the raw.
+    mid = await engine.store.enqueue_message(
+        channel_id="ch1", raw=ADT, deliveries=[("archive", TRANSFORMED)], control_id="MSG1"
+    )
+    r = await client.get(f"/messages/{mid}/outbound")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["message_id"] == mid
+    assert len(body["payloads"]) == 1
+    p = body["payloads"][0]
+    assert p["destination_name"] == "archive"
+    assert p["payload"] == TRANSFORMED  # the decrypted, transformed outbound body...
+    assert p["payload"] != ADT  # ...not the raw inbound
+    # Returning a PHI body is audited: a per-message 'viewed' event + an 'outbound.read' audit action.
+    assert any(e["event"] == "viewed" for e in await engine.store.events_for(mid))
+    assert "outbound.read" in [a["action"] for a in await engine.store.list_audit()]
+
+    assert (await client.get("/messages/missing/outbound")).status_code == 404
+
+
+async def test_message_outbound_no_deliveries_is_empty_and_unviewed(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    # No outbound rows → empty payload list, and no body was opened, so no 'viewed' event is recorded
+    # (the read itself is still audited as outbound.read).
+    mid = await engine.store.enqueue_message(channel_id="ch1", raw=ADT, deliveries=[])
+    r = await client.get(f"/messages/{mid}/outbound")
+    assert r.status_code == 200
+    assert r.json()["payloads"] == []
+    assert not any(e["event"] == "viewed" for e in await engine.store.events_for(mid))
+    assert "outbound.read" in [a["action"] for a in await engine.store.list_audit()]
+
+
 async def test_audit_and_event_detail_never_contain_message_body(
     engine: Engine, client: httpx.AsyncClient
 ) -> None:
@@ -142,6 +198,7 @@ async def test_audit_and_event_detail_never_contain_message_body(
         summary="MRN 1 · DOE",
     )
     await client.get(f"/messages/{mid}")  # view → 'viewed' event
+    await client.get(f"/messages/{mid}/outbound")  # transformed-body view → 'outbound.read' audit
     await client.get("/messages", params={"audit_summary": "true"})  # summary display → audited
     blobs = [a["detail"] or "" for a in await engine.store.list_audit()]
     blobs += [e["detail"] or "" for e in await engine.store.events_for(mid)]
@@ -322,6 +379,7 @@ async def test_stats(engine: Engine, client: httpx.AsyncClient) -> None:
     r = await client.get("/stats")
     assert r.status_code == 200
     assert r.json()["outbox_by_status"][OutboxStatus.PENDING.value] == 1
+    assert r.json()["in_pipeline"] == 1  # whole-pipeline gauge (one outbound row, pending)
 
 
 # --- connections -------------------------------------------------------------
@@ -468,13 +526,14 @@ async def test_cluster_status_single_node(client: httpx.AsyncClient) -> None:
     body = r.json()
     assert body["clustered"] is False
     assert body["is_leader"] is True
+    assert body["role"] == "single-node"  # Workstream A5: active-passive role
     assert body["node_id"]  # non-empty stable identity
     assert body["config_version"] == 0
 
 
 async def test_cluster_nodes_single_node(client: httpx.AsyncClient) -> None:
     # Single-node /cluster/nodes synthesizes exactly one self-member, leader, with the matching
-    # leader_node_id.
+    # leader_node_id and lease state (Workstream A5).
     r = await client.get("/cluster/nodes")
     assert r.status_code == 200
     body = r.json()
@@ -483,6 +542,9 @@ async def test_cluster_nodes_single_node(client: httpx.AsyncClient) -> None:
     assert node["is_leader"] is True
     assert node["status"] == "active"
     assert body["leader_node_id"] == node["node_id"]
+    # A5: single-node reports itself as the lease owner with no expiry (permanently leader, no lease row).
+    assert body["lease_owner"] == node["node_id"]
+    assert body["lease_expires_at"] is None
     # The single-node synthetic entry has no heartbeat history.
     assert node["started_at"] is None and node["last_seen"] is None
 

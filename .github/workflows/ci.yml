@@ -67,13 +67,20 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: pytest -q
 
-  # Build + type-check the VS Code extension. The Python jobs never touch ide/, so a dep bump or
-  # IDE code change that breaks the bundle or the types would otherwise pass CI unbuilt (this job
-  # exists because an esbuild bump merged "green" without anything having compiled it). Cheap,
-  # Linux-only, runs on PRs.
+  # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
+  # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise
+  # pass CI unbuilt (this job exists because an esbuild bump merged "green" without anything having
+  # compiled it). The build runs on both OSes; the @vscode/test-electron suite (which downloads and
+  # launches a real headless VS Code to assert the extension activates and its commands register/run)
+  # runs on the Windows leg — Electron launches headless there with no xvfb, and Windows is a
+  # deployment target.
   ide:
-    name: ide build (typecheck + bundle)
-    runs-on: ubuntu-latest
+    name: ide build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     defaults:
       run:
         working-directory: ide
@@ -96,13 +103,50 @@ jobs:
       - name: Bundle (esbuild)
         run: npm run compile
 
-  # Experimental SQL Server store backend: run the gated store suite against a real SQL Server
-  # service container (Linux, so 1x minutes). Skipped on PRs (like the smoke job) to save spend;
-  # runs on push to main and on-demand (workflow_dispatch). This is what actually exercises the
-  # T-SQL that the SQLite tests can't.
+      - name: Integration tests (headless VS Code)
+        if: runner.os == 'Windows'
+        run: npm test
+
+  # Path filter for the container-pulling server-DB leg(s). A docs/unrelated PR shouldn't pull the SQL
+  # Server image (mcr.microsoft.com anonymous pulls are rate-limited — repeated PRs flake on
+  # "toomanyrequests"). This job decides whether the SQL Server leg needs to run: ALWAYS true on push to
+  # main + workflow_dispatch (full coverage); on a PR, true only when store / cluster / server-DB tests /
+  # this workflow changed. (NB: if `sqlserver-store` is later made a *required* check in branch
+  # protection, a path-skipped run reports "skipped" — use a ruleset that treats skips as success, or
+  # switch to an always-run job whose heavy steps are step-gated, since the service container starts
+  # before steps.)
+  changes:
+    name: detect server-DB changes
+    runs-on: ubuntu-latest
+    outputs:
+      serverdb: ${{ steps.f.outputs.serverdb }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - id: f
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "serverdb=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          changed=$(git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD")
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/cluster|messagefoundry/transports/database|tests/test_(sqlserver|postgres|cluster|database_connector)|\.github/workflows/ci\.yml)'; then
+            echo "serverdb=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "serverdb=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # SQL Server service-container leg: runs the gated suites that need a real SQL Server (Linux, so 1x
+  # minutes) — the PRODUCTION store backend suite AND the PRODUCTION DATABASE connector round-trip
+  # (ADR 0003/0010/0013). Now that the SQL Server store is promoted to production (staged pipeline +
+  # query/response, ADR 0001/0013), this runs on push to main + on PRs that touch the server-DB surface
+  # (gated by `changes` above, so docs/unrelated PRs don't pull the container) — make it a required check
+  # in branch protection so a T-SQL regression can't merge. Exercises the T-SQL + the live aioodbc
+  # round-trip the SQLite / faked-driver tests can't.
   sqlserver-store:
-    name: sql server store (experimental)
-    if: github.event_name != 'pull_request'
+    name: sql server (store + connector)
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.serverdb == 'true'
     runs-on: ubuntu-latest
     services:
       mssql:
@@ -164,6 +208,75 @@ jobs:
           MEFOR_ALLOW_INSECURE_TLS: "1"
         run: pytest tests/test_sqlserver_store.py -v
 
+      - name: Run the SQL Server coordinator suite (active-passive HA leader election)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          # Same trusted-network TLS escape as the store suite (self-signed container cert): ODBC Driver
+          # 18 defaults to Encrypt=yes + verify, so trust_server_certificate=true is required to connect,
+          # and the store's TLS-hardening guard needs MEFOR_ALLOW_INSECURE_TLS to permit it. Exercises the
+          # SqlServerCoordinator leader-lease (MERGE WITH(HOLDLOCK) acquire/renew/take-over, self-fence,
+          # membership) against the real T-SQL the faked-driver tests can't.
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        run: pytest tests/test_sqlserver_coordinator.py -v
+
+      - name: Run the SQL Server failover suite (real TTL takeover + 2-node lifecycle)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          # Same trusted-network TLS escape (self-signed container cert). Drives two coordinators sharing
+          # the store through real DB-clock lease expiry + the full start()/stop() election + failover.
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        run: pytest tests/test_cluster_failover_sqlserver.py -v
+
+      - name: Run the DATABASE connector round-trip (against the real DB)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          # The connector suite reuses the same MEFOR_STORE_* connection env + the trusted-network TLS
+          # escape (self-signed container cert), exactly like the store suite above. This is the live
+          # aioodbc/ODBC round-trip backing the connector's "production" status (PR D).
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        run: pytest tests/test_database_connector_integration.py -v
+
+      - name: Run the failover-LOAD test (two nodes, SIGKILL the primary mid-load, against the real DB)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          # Gate #3 capstone + the FIRST LIVE PROOF of the SQL Server on-promotion recovery under a real
+          # crash: two `serve` nodes share this container, the harness SIGKILLs the primary mid-load and
+          # hard-asserts the host-independent CONFORMANCE invariants (zero acknowledged loss, per-lane FIFO,
+          # no split-brain, bounded duplicates, a recovered + drained pipeline). Recovery *time* is reported,
+          # not hard-gated (host-variable — see docs/LOAD-TESTING.md). This run guards the #285 claim-FIFO
+          # fix. The orchestrator spawns the nodes with auth off + the cluster env; they inherit MEFOR_STORE_*.
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        run: pytest tests/test_load_failover_sqlserver.py -v
+
   # Postgres store backend (Track B): run the gated store suite against a real PostgreSQL service
   # container (Linux, so 1x minutes). Skipped on PRs like the other server-DB job to save spend; runs
   # on push to main and on-demand (workflow_dispatch — use `gh workflow run ci.yml --ref <branch>` to
@@ -217,6 +330,24 @@ jobs:
           MEFOR_ALLOW_INSECURE_TLS: "1"
         run: pytest tests/test_postgres_store.py -v
 
+      - name: Run the failover-LOAD test (two nodes, SIGKILL the primary mid-load, against the real DB)
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          # Gate #3 capstone: two `serve` nodes share this container; the harness SIGKILLs the primary
+          # mid-load and hard-asserts the host-independent CONFORMANCE invariants (zero acknowledged loss,
+          # per-lane FIFO, no split-brain, bounded duplicates, a recovered + drained pipeline). Recovery
+          # time is reported, not hard-gated. The orchestrator spawns the nodes with auth off + the cluster
+          # env itself; they inherit MEFOR_STORE_* (incl. the plaintext-TLS escape) from here.
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        run: pytest tests/test_load_failover_postgres.py -v
+
   # Headless load test (Track B / throughput): serve the synthetic high-fan-out load config (auth
   # off, small fan-out) and drive the smoke profile through the real `python -m harness --load` CLI,
   # asserting zero message loss + all SLOs (exit 0) and uploading the JSON/CSV report. Skipped on PRs
@@ -251,7 +382,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p out/load
-          python -m messagefoundry serve --config harness/config/load --db ./load-ci.db \
+          python -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
           for _ in $(seq 1 60); do
@@ -271,6 +402,100 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: load-report
+          path: out/load/
+          if-no-files-found: ignore
+
+  # SQL Server throughput smoke: the same zero-loss fan-out wiring check as `load test (smoke, sqlite)`,
+  # but driven through the **SQL Server store** end-to-end (ingress→routed→outbound→delivered, each a
+  # committed server-DB round-trip) on a real mssql service container. This is the load path that caught
+  # the routed-stage `handler_name`-drop regression the in-process tests missed. Uses the `smoke-sqlserver`
+  # profile (correctness SLOs strict; drain bound sized for a server DB). Skipped on PRs to save spend —
+  # runs on push to main + on-demand (workflow_dispatch). Heavier SQL Server profiles run manually.
+  load-test-sqlserver:
+    name: load test (smoke, sqlserver)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "Str0ng_P@ssw0rd!"
+        ports:
+          - 1433:1433
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Microsoft ODBC Driver 18 + sqlcmd
+        run: |
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
+          curl -fsSL "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release; echo "$VERSION_ID")/prod.list" \
+            | sudo tee /etc/apt/sources.list.d/mssql-release.list > /dev/null
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev
+
+      - name: Wait for SQL Server and create the database (RCSI on, like the store suite)
+        run: |
+          sqlcmd=/opt/mssql-tools18/bin/sqlcmd
+          for i in $(seq 1 40); do
+            if "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1; then
+              echo "SQL Server is up"; break
+            fi
+            echo "waiting for SQL Server ($i)"; sleep 2
+          done
+          "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C \
+            -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry; ALTER DATABASE MessageFoundry SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;"
+
+      - name: Install project (dev + sqlserver extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,sqlserver]"
+
+      - name: Serve on the SQL Server store and run the smoke-sqlserver profile
+        env:
+          MEFOR_AUTH_ENABLED: "false"  # the load CLI polls /stats etc. without a bearer token
+          MEFOR_LOAD_FANOUT: "8"
+          MEFOR_LOAD_RESULTS_FANOUT: "2"
+          MEFOR_LOAD_TRANSFORM: edit
+          MEFOR_LOAD_SINK_PORT: "2700"  # matches --sink-port below
+          MEFOR_STORE_BACKEND: sqlserver  # no --db: the backend + connection come from MEFOR_STORE_*
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          MEFOR_ALLOW_INSECURE_TLS: "1"  # trusted-network escape for the container's self-signed cert
+        run: |
+          set -o pipefail
+          mkdir -p out/load
+          python -m messagefoundry serve --config harness/config/load --env dev \
+            --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
+          engine_pid=$!
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8765/health > /dev/null && break || sleep 0.5
+          done
+          set +e
+          python -m harness --load smoke-sqlserver --engine http://127.0.0.1:8765 --sink-port 2700 \
+            --report-json out/load/smoke-sqlserver-ci.json --report-csv out/load/smoke-sqlserver-ci.csv
+          rc=$?
+          set -e
+          kill "$engine_pid" 2>/dev/null || true
+          echo "===== engine log (tail) ====="; tail -50 engine.log || true
+          exit $rc
+
+      - name: Upload load report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: load-report-sqlserver
           path: out/load/
           if-no-files-found: ignore
 
@@ -311,11 +536,38 @@ jobs:
         shell: powershell
         run: |
           $exe = (Get-Command messagefoundry).Source
-          .\scripts\service\install-service.ps1 -AppExe $exe -LogLevel DEBUG
+          # Run as the 'prod' environment (ADR 0017: `serve` requires an explicit active environment;
+          # install-service.ps1 -Environment threads it into the service command + resolves
+          # environments/prod.toml). INFO not DEBUG: `serve` refuses DEBUG in prod (Gate #1 — DEBUG can
+          # surface PHI); INFO is enough to smoke service start + MLLP.
+          .\scripts\service\install-service.ps1 -AppExe $exe -LogLevel INFO -Environment prod
+          # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
+          # connector LOADS its client cert at wiring time, so the engine refuses to start the graph
+          # without a readable cert+key. Mint a throwaway pair for the smoke — the smoke sends only an
+          # MLLP ADT, never a VXU, so the cert is loaded but never used in a handshake. Run openssl via
+          # `cmd /c "... 2>nul"`: it streams RSA key-gen progress to stderr, and a bare `2>$null` did NOT
+          # suppress it on the runner's openssl build — PowerShell 5.1 wrapped that stderr as a
+          # NativeCommandError and aborted the step. Redirecting at the cmd level keeps PowerShell out of
+          # openssl's stderr path entirely, so no NativeCommandError regardless of the openssl build.
+          $certDir = Join-Path $env:RUNNER_TEMP "registry-cert"
+          New-Item -ItemType Directory -Force -Path $certDir | Out-Null
+          $cert = Join-Path $certDir "client.pem"
+          $key  = Join-Path $certDir "client.key"
+          cmd /c "openssl req -x509 -newkey rsa:2048 -keyout ""$key"" -out ""$cert"" -days 1 -subj /CN=mefor-smoke -passout pass:smoke-key-pass 2>nul"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $cert)) { throw "openssl failed to mint the smoke client cert" }
           # This smoke validates the Windows service + MLLP plumbing, not authentication (auth is
-          # covered by the pytest suite: test_api_auth / test_console_auth). Run the service with
-          # auth disabled so the /messages verification call below doesn't need a bearer token.
-          nssm set MessageFoundry AppEnvironmentExtra MEFOR_AUTH_ENABLED=false
+          # covered by the pytest suite: test_api_auth / test_console_auth). Run with auth disabled so
+          # the /messages call below needs no bearer token, and supply the registry endpoint's secrets
+          # (cert/key/password + WS-Security creds) so the SOAP feed wires — placeholders, never used
+          # since no VXU is sent; the non-secret endpoints live in environments/prod.toml (selected by
+          # the -Environment prod passed to install-service.ps1 above).
+          nssm set MessageFoundry AppEnvironmentExtra `
+            "MEFOR_AUTH_ENABLED=false" `
+            "MEFOR_VALUE_REGISTRY_CLIENT_CERT=$cert" `
+            "MEFOR_VALUE_REGISTRY_CLIENT_KEY=$key" `
+            "MEFOR_VALUE_REGISTRY_KEY_PASSWORD=smoke-key-pass" `
+            "MEFOR_VALUE_REGISTRY_USER=smoke-user" `
+            "MEFOR_VALUE_REGISTRY_PASSWORD=smoke-pass"
 
       - name: Start and verify /health
         run: |

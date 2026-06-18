@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """HL7 v2.5.1 datatype encoders + synthetic data pools for the ADT generator.
 
 This module is deliberately small and dependency-free: it knows how to render a handful

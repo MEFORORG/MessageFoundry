@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Windows DPAPI secret-at-rest helper (WP-11d; ASVS 13.3.1/13.3.2).
 
 The store encryption key is normally supplied as base64 via ``MEFOR_STORE_ENCRYPTION_KEY`` (the

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Retention / purge enforcement (WP-12, PHI.md §8): body-purge keeps metadata, never touches an
 in-flight or (for the messages window) a dead body; dead-letters have their own window; WAL/VACUUM
 maintenance runs clean; the RetentionRunner audits each working pass and alerts past max_db_mb.

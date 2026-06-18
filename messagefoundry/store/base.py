@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Backend-agnostic store interface + construction seam.
 
 The engine and API depend on the store **protocols**, not on a concrete backend, so adding a new
@@ -29,6 +31,7 @@ from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import SqliteSync, StoreBackend, StoreSettings
 from messagefoundry.store.crypto import make_cipher
 from messagefoundry.store.store import (
+    CapturedResponse,
     ConnectionMetrics,
     DbStatus,
     MessageStatus,
@@ -79,6 +82,12 @@ class QueueStore(StoreLifecycle, Protocol):
     #: ``False`` backends (e.g. SQL Server, gated on BACKLOG #1) are rejected at engine start rather
     #: than trapping the first received message in a ``NotImplementedError``.
     supports_ingest_stage: bool
+
+    #: Whether this backend can capture request/response replies (ADR 0013: the ``response`` table +
+    #: :meth:`complete_with_response`). ``True`` on SQLite/Postgres/SQL Server; a backend returning
+    #: ``False`` makes the runner reject a capturing outbound at start (fail-closed) rather than drop
+    #: captures.
+    supports_response_capture: bool
 
     # --- write path ----------------------------------------------------------
     async def enqueue_message(
@@ -263,6 +272,59 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None: ...
 
+    async def complete_with_response(
+        self,
+        outbox_id: str,
+        *,
+        body: str,
+        outcome: str,
+        detail: str | None = None,
+        reingress_to: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Mark one outbound row delivered **and** persist the partner's captured reply (ADR 0013) in
+        one atomic transaction — :meth:`mark_done` plus an immutable ``response`` row keyed
+        ``(message_id, destination_name, response_seq)``. The delivery worker calls **exactly one** of
+        this or :meth:`mark_done` per successful delivery (the capture XOR). The ``response`` table is
+        invisible to disposition (the finalizer scans ``queue`` only), so a captured delivery finalizes
+        ``PROCESSED`` exactly as a one-way one does.
+
+        When ``reingress_to`` is set (Increment 2), the same transaction *also* inserts a drainable
+        ``Stage.RESPONSE`` work-row on the named loopback inbound's lane (a token referencing the
+        artifact) so the reply is re-ingressed; ``None`` is byte-identical to Increment 1 (no work-row)."""
+        ...
+
+    async def correlate_response(self, message_id: str) -> list[CapturedResponse]:
+        """Every captured reply for ``message_id`` (ADR 0013), ordered by destination then
+        ``response_seq`` (latest seq per destination = the authoritative reply). The PHI read surface
+        behind the audited, body-gated ``GET /messages/{id}/responses`` route."""
+        ...
+
+    async def ingress_handoff(
+        self,
+        *,
+        response_row_id: str,
+        loopback_channel_id: str,
+        correlation_depth_cap: int,
+        control_id: str | None,
+        message_type: str | None,
+        summary: str | None,
+        peek_failed: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """Consume one INFLIGHT ``Stage.RESPONSE`` work-row and produce the re-ingressed message+ingress
+        row in one transaction (ADR 0013 Increment 2) — the re-ingress edge. A guarded ``DELETE`` of the
+        work-row is the exactly-once commit, so a committed run is an idempotent no-op (``False``). The
+        re-ingress worker peeks the loopback body and passes the derived metadata in. Returns ``True`` if
+        this call performed the handoff."""
+        ...
+
+    async def response_body_for_work_row(self, response_row_id: str) -> str | None:
+        """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
+        read by the re-ingress worker to HL7-peek the reply (in ``pipeline/``) before
+        :meth:`ingress_handoff`. ``None`` if the row/artifact is gone."""
+        ...
+
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
     ) -> None: ...
@@ -371,9 +433,22 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def outbox_for(self, message_id: str) -> Sequence[Row]: ...
 
+    async def outbox_payloads_for(self, message_id: str) -> Sequence[Row]:
+        """Like :meth:`outbox_for` but the rows also carry the **decrypted transformed ``payload``**
+        (PHI body) per destination — the #14 parity-comparison read path. Kept separate from
+        :meth:`outbox_for` so the metadata-only message-detail view never decrypts bodies; the API
+        gates this on ``MESSAGES_VIEW_RAW`` and audits every access."""
+        ...
+
     async def events_for(self, message_id: str) -> Sequence[Row]: ...
 
     async def stats(self) -> dict[str, int]: ...
+
+    async def in_pipeline_depth(self) -> int:
+        """Count of NOT-DONE rows (status ``pending``|``inflight``) across **every** stage
+        (ingress + routed + outbound) — a whole-pipeline drain gauge, vs :meth:`stats` which sees only
+        the outbound stage. Lets a consumer tell a true drain from a stalled router/transform."""
+        ...
 
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
     async def reencrypt_to_active(self, *, batch: int = 500) -> int: ...
@@ -420,6 +495,29 @@ class AuditStore(Protocol):
     ) -> None: ...
 
     async def list_audit(self, *, limit: int = 50) -> Sequence[Row]: ...
+
+    async def security_events_for_user(
+        self, username: str, *, limit: int = 100
+    ) -> Sequence[Row]: ...
+
+    async def create_pending_approval(
+        self,
+        *,
+        approval_id: str,
+        operation: str,
+        params: str,
+        requester: str,
+        requested_at: float,
+        expires_at: float | None,
+    ) -> None: ...
+
+    async def get_pending_approval(self, approval_id: str) -> Row | None: ...
+
+    async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]: ...
+
+    async def decide_pending_approval(
+        self, approval_id: str, *, status: str, approver: str | None, decided_at: float
+    ) -> bool: ...
 
     async def audit_anchor(self) -> tuple[int, str]: ...
 
@@ -480,6 +578,25 @@ class AuthStore(Protocol):
 
     async def delete_user(self, user_id: str) -> None: ...
 
+    # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
+    async def set_totp_secret(
+        self, user_id: str, *, secret: str | None, now: float | None = None
+    ) -> None: ...
+
+    async def get_totp_secret(self, user_id: str) -> str | None: ...
+
+    async def enable_totp(
+        self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+    ) -> None: ...
+
+    async def disable_totp(self, user_id: str, *, now: float | None = None) -> None: ...
+
+    async def get_recovery_code_hashes(self, user_id: str) -> list[str]: ...
+
+    async def consume_recovery_code_hash(
+        self, user_id: str, code_hash: str, *, now: float | None = None
+    ) -> bool: ...
+
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None: ...
 
     async def record_login_failure(
@@ -538,6 +655,7 @@ class AuthStore(Protocol):
         user_id: str,
         expires_at: float,
         client: str | None = None,
+        seed_reauth: bool = True,
         now: float | None = None,
     ) -> None: ...
 
@@ -548,6 +666,19 @@ class AuthStore(Protocol):
     ) -> list[SessionRecord]: ...
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None: ...
+
+    async def mark_session_reauthed(
+        self, token_hash: str, *, now: float | None = None, client: str | None = None
+    ) -> None:
+        """Refresh the session's step-up freshness (``reauth_at``). When ``client`` is given, also
+        re-anchor the session's last-verified client address to it (the new-client-IP risk signal in
+        WP-L3-13 uses this so a re-verify from a roamed address clears the forced step-up); a ``None``
+        ``client`` leaves the stored address unchanged."""
+        ...
+
+    async def mark_session_mfa_verified(
+        self, token_hash: str, *, now: float | None = None
+    ) -> None: ...
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
@@ -599,8 +730,8 @@ async def open_store(settings: StoreSettings) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
 
     ``sqlite`` is the default; ``postgres`` is a production server-DB backend with single-node parity
-    (lazy-imported, needs the ``postgres`` extra); ``sqlserver`` is **experimental** and lazy-imported
-    (needs the ``sqlserver`` extra). Unknown backends raise ``NotImplementedError``.
+    (lazy-imported, needs the ``postgres`` extra); ``sqlserver`` is a production server-DB backend,
+    lazy-imported (needs the ``sqlserver`` extra). Unknown backends raise ``NotImplementedError``.
     """
     # AES-256-GCM keyring at rest when a key is set (STORE-1): active key (env or DPAPI key file) +
     # any retired decrypt-only keys for an in-progress rotation (WP-5). No key → identity cipher.

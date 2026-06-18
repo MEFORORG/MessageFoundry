@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Engine-side sampling — the aggregate view the per-message metrics can't give.
 
 Polls the engine's HTTP API on an interval (``/stats``, ``/connections``, ``/status``) to track
@@ -31,6 +33,9 @@ class EngineSample:
     written: int  # Σ outbound `written` (deliveries made)
     out_dead: int  # Σ outbound `errored` (deliveries dead-lettered)
     queue_depth: int  # Σ outbound queue_depth (pending + inflight)
+    in_pipeline: (
+        int  # NOT-DONE rows across ALL stages (ingress+routed+outbound) — whole-pipeline gauge
+    )
     db_size_bytes: int
     journal_mode: str
     uptime_s: float
@@ -91,19 +96,14 @@ class EnginePoller:
                 await self.sample_once()
 
     async def await_drain(self, *, timeout: float, interval: float) -> float | None:
-        """Poll until the engine's backlog clears and inbound/delivery counters stop moving. Returns
-        seconds-to-drain, or ``None`` on timeout.
+        """Poll until the engine's whole pipeline is empty and inbound/delivery counters stop moving.
+        Returns seconds-to-drain, or ``None`` on timeout.
 
-        Requires the backlog (outbound pending+inflight) to be zero *and* ``read``/``written`` to be
-        unchanged across a poll — so a still-draining ingress/routed stage (which would keep producing
-        outbound rows, advancing ``written``) doesn't read as drained.
-
-        KNOWN LIMITATION: the engine API exposes only outbound-stage depth (``/stats`` + per-edge
-        ``queue_depth``), not the ingress/routed stages. The read/written-stability check covers a
-        *progressing* router/transform worker, but a fully **stalled** one (hung, or rows stranded
-        after a crash) leaves ``read``/``written`` flat with backlog 0 — indistinguishable from drained
-        here. A robust fix needs a stage-aware in-pipeline gauge from the engine; tracked in
-        docs/BACKLOG.md. In normal runs the workers progress, so this is sound."""
+        Drain requires ``in_pipeline == 0`` (no NOT-DONE rows in ANY stage — ingress, routed, or
+        outbound), the outbound backlog + summed per-edge ``queue_depth`` at zero, and ``read``/
+        ``written`` unchanged across a poll. The ``in_pipeline`` gauge (from ``/stats``) closes the prior
+        blind spot: a fully **stalled** router/transform (hung, or rows stranded after a crash) leaves
+        the outbound backlog at 0 but ``in_pipeline > 0``, so it no longer reads as drained."""
         loop = asyncio.get_running_loop()
         start = loop.time()
         prev = self.final or await self.sample_once()
@@ -116,7 +116,7 @@ class EnginePoller:
             if cur is None:
                 continue
             stable = prev is not None and cur.read == prev.read and cur.written == prev.written
-            if cur.backlog == 0 and cur.queue_depth == 0 and stable:
+            if cur.backlog == 0 and cur.queue_depth == 0 and cur.in_pipeline == 0 and stable:
                 return loop.time() - start
             prev = cur
         return None
@@ -155,6 +155,7 @@ class EnginePoller:
             written=written,
             out_dead=out_dead,
             queue_depth=queue_depth,
+            in_pipeline=stats.in_pipeline,
             db_size_bytes=status.db.size_bytes,
             journal_mode=status.db.journal_mode,
             uptime_s=status.engine.uptime_seconds,

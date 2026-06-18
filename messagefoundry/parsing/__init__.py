@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """HL7 v2 parsing & validation.
 
 Two-tier strategy (see docs/ARCHITECTURE.md):
@@ -14,16 +16,26 @@ Two-tier strategy (see docs/ARCHITECTURE.md):
 
 from __future__ import annotations
 
+from messagefoundry.parsing.groups import SegmentGroup
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize, parse_path
+from messagefoundry.parsing.split import split_batch, split_by_obr
 from messagefoundry.parsing.summary import summarize
 from messagefoundry.parsing.tree import TreeNode, parse_tree
 from messagefoundry.parsing.validate import ValidationResult, validate
+from messagefoundry.parsing.x12 import (
+    X12FrameReader,
+    X12Group,
+    X12Message,
+    X12Peek,
+    X12PeekError,
+)
 
 __all__ = [
     "Peek",
     "Message",
     "RawMessage",
+    "SegmentGroup",
     "HL7PeekError",
     "normalize",
     "parse_path",
@@ -32,6 +44,14 @@ __all__ = [
     "validate",
     "ValidationResult",
     "summarize",
+    "split_batch",
+    "split_by_obr",
+    # X12 EDI codec (ADR 0012) — full surface under messagefoundry.parsing.x12.
+    "X12Peek",
+    "X12Group",
+    "X12Message",
+    "X12FrameReader",
+    "X12PeekError",
 ]
 
 # Defense-in-depth for review finding C-1: python-hl7 logs raw field values at ERROR on

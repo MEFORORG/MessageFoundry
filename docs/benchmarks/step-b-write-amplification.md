@@ -50,8 +50,8 @@ replay, like a dead ingress row). At-least-once is preserved by the per-stage tr
 the extra re-run boundary is safe because routers and transforms are pure.
 
 The modest +1-commit/message (single-handler) is acceptable at typical HL7 volumes (not high-
-frequency). The multi-writer **SQL Server backend remains the scale path** for high volumes, gated on
-BACKLOG #1 (`supports_ingest_stage = False` — the engine refuses to run the staged pipeline on it).
+frequency). The multi-writer **SQL Server backend is the scale path** for high volumes (production,
+`supports_ingest_stage = True` — the engine runs the full staged pipeline on it).
 
 ## Regression guard
 

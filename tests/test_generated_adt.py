@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Tests for the ADT message generator (``messagefoundry/generators/adt.py``).
 
 Messages are generated **deterministically at test time** — the corpus itself is not committed

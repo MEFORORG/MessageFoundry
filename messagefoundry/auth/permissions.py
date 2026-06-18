@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Permission catalog and the fixed built-in roles for RBAC.
 
 Authorization is **deny-by-default**: an action is allowed only when one of the caller's roles grants
@@ -28,6 +30,9 @@ class Permission(str, Enum):
     MESSAGES_REPLAY = "messages:replay"
     MESSAGES_PURGE = "messages:purge"
     CONNECTIONS_CONTROL = "connections:control"
+    CONNECTIONS_TEST = (
+        "connections:test"  # probe a connection's reachability (POST /connections/{name}/test)
+    )
     CONFIG_DEPLOY = "config:deploy"  # endpoint lands in a later effort
     CONFIG_VALIDATE = "config:validate"  # endpoint lands in a later effort
     CODE_EDIT = "code:edit"  # endpoint lands in a later effort
@@ -36,6 +41,9 @@ class Permission(str, Enum):
     USERS_READ = "users:read"
     USERS_MANAGE = "users:manage"
     AUDIT_READ = "audit:read"
+    APPROVALS_APPROVE = (
+        "approvals:approve"  # release a pending high-value action (dual-control, 2.3.5)
+    )
 
 
 class Role(str, Enum):
@@ -75,6 +83,7 @@ _OPERATOR_PERMISSIONS: frozenset[Permission] = frozenset(
         Permission.MESSAGES_REPLAY,
         Permission.MESSAGES_PURGE,
         Permission.CONNECTIONS_CONTROL,
+        Permission.CONNECTIONS_TEST,
     }
 )
 
@@ -83,7 +92,12 @@ BUILTIN_ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
     Role.ADMINISTRATOR: frozenset(Permission),  # every permission
     Role.OPERATOR: _OPERATOR_PERMISSIONS,
     Role.DEPLOYMENT: frozenset(
-        {Permission.MONITORING_READ, Permission.CONFIG_DEPLOY, Permission.CONFIG_VALIDATE}
+        {
+            Permission.MONITORING_READ,
+            Permission.CONFIG_DEPLOY,
+            Permission.CONFIG_VALIDATE,
+            Permission.CONNECTIONS_TEST,
+        }
     ),
     Role.CODING: frozenset(
         {

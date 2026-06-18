@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """argon2id password hashing (argon2-cffi) for *local* users.
 
 AD users never reach here — they authenticate by binding to the directory. The hash string embeds

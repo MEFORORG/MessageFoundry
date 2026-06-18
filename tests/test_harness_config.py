@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The harness coverage fixture (``harness/config``) reaches every disposition.
 
 Loads the graph and dry-runs generated messages, asserting the routing decisions documented in

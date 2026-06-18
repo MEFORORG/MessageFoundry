@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """A mutable HL7 v2 message — read and set fields by path, then re-encode.
 
 Wraps a ``python-hl7`` parse. Field paths use the same ``SEG-F[.C[.S]]`` syntax as
@@ -22,11 +24,14 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import hl7
 
 from messagefoundry.parsing.peek import normalize, parse_path
+
+if TYPE_CHECKING:  # the SegmentGroup view imports Message back; keep the cycle out of runtime
+    from messagefoundry.parsing.groups import SegmentGroup
 
 # A segment id is exactly three chars: an upper-case letter then two alphanumerics (HL7 §2.5),
 # e.g. ``MSH``/``PID``/``ZAL``. Used to validate :meth:`Message.add_segment` input.
@@ -294,6 +299,34 @@ class Message:
                 del self._m[i]
                 removed += 1
         return removed
+
+    def _delete_segment_at(self, position: int) -> None:
+        """Remove the segment at 1-based ``position`` among segments (``1`` = just after MSH,
+        matching :meth:`add_segment`'s ``index``).
+
+        This is the positional delete that group-scoped edits use: a group addresses its members by
+        position, not by id (an ``OBX`` may belong to any order), so id-based
+        :meth:`delete_segments` can't target one order's segments. Deleting MSH (position 0) is
+        refused so the header always survives. Raises ``ValueError`` on an out-of-range position."""
+        if position < 1 or position >= len(self._m):
+            raise ValueError(
+                f"position {position} out of range (1..{len(self._m) - 1}); position 1 is after MSH"
+            )
+        del self._m[position]
+
+    # --- group-scoped structural view ----------------------------------------
+
+    def groups(self, boundary: str = "OBR") -> list[SegmentGroup]:
+        """The message's order/observation groups for ``boundary`` (default ``OBR``), in order.
+
+        A group is a contiguous run starting at a boundary segment and ending just before the next
+        boundary (or end of message); segments before the first boundary are the header and form no
+        group. Use it to scope structural edits to **one** order — per-OBR rebuilds, per-group
+        OBX prune/renumber — which the flat (by-id, by-occurrence) API can't address. Returns ``[]``
+        if the message has no boundary segment. See :class:`SegmentGroup`."""
+        from messagefoundry.parsing.groups import groups_of
+
+        return groups_of(self, boundary)
 
     # --- encode --------------------------------------------------------------
 

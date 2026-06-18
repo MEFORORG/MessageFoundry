@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Conformant **synthetic** HL7 v2.5.1 message generators (no real PHI).
 
 The reference-driven machinery lives in :mod:`messagefoundry.generators._core`; each message-type

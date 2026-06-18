@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Generate conformant HL7 v2.5.1 **ORU** (observation result) messages.
 
 The required PATIENT_RESULT → ORDER_OBSERVATION groups give MSH + OBR; we include the optional

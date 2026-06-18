@@ -1,0 +1,235 @@
+{
+  "schema_version": 1,
+  "profile": "reference",
+  "engine_url": "http://127.0.0.1:8765",
+  "result": "PASS",
+  "exit_code": 0,
+  "totals": {
+    "sent": 6765,
+    "acked": 6765,
+    "nak": 0,
+    "errors": 0,
+    "timeouts": 0,
+    "deferred": 0,
+    "sink_received": 10494,
+    "correlation_misses": 0
+  },
+  "overall": {
+    "ack_ms": {
+      "count": 6765,
+      "p50": 7.652,
+      "p95": 18.821,
+      "p99": 27.523,
+      "max": 112.198,
+      "mean": 8.881
+    },
+    "e2e_ms": {
+      "count": 10494,
+      "p50": 44.479,
+      "p95": 14118.178,
+      "p99": 14991.228,
+      "max": 15296.463,
+      "mean": 2943.041
+    }
+  },
+  "phases": [
+    {
+      "name": "warmup",
+      "kind": "warmup",
+      "loop": "open",
+      "measured": false,
+      "duration_s": 15.0,
+      "sent": 225,
+      "acked": 225,
+      "nak": 0,
+      "deferred": 0,
+      "achieved_msg_s": 15.0,
+      "ack_ms": {
+        "count": 225,
+        "p50": 3.877,
+        "p95": 6.787,
+        "p99": 9.728,
+        "max": 43.397,
+        "mean": 4.355
+      },
+      "e2e_ms": {
+        "count": 358,
+        "p50": 19.202,
+        "p95": 30.417,
+        "p99": 40.247,
+        "max": 61.036,
+        "mean": 21.077
+      }
+    },
+    {
+      "name": "r30",
+      "kind": "sustained",
+      "loop": "open",
+      "measured": true,
+      "duration_s": 40.0,
+      "sent": 1200,
+      "acked": 1200,
+      "nak": 0,
+      "deferred": 0,
+      "achieved_msg_s": 30.0,
+      "ack_ms": {
+        "count": 1200,
+        "p50": 3.238,
+        "p95": 5.028,
+        "p99": 8.457,
+        "max": 18.367,
+        "mean": 3.493
+      },
+      "e2e_ms": {
+        "count": 1876,
+        "p50": 18.083,
+        "p95": 27.523,
+        "p99": 36.416,
+        "max": 47.94,
+        "mean": 19.755
+      }
+    },
+    {
+      "name": "r50",
+      "kind": "sustained",
+      "loop": "open",
+      "measured": true,
+      "duration_s": 40.0,
+      "sent": 2000,
+      "acked": 2000,
+      "nak": 0,
+      "deferred": 0,
+      "achieved_msg_s": 50.0,
+      "ack_ms": {
+        "count": 2000,
+        "p50": 6.652,
+        "p95": 12.122,
+        "p99": 18.083,
+        "max": 50.424,
+        "mean": 7.209
+      },
+      "e2e_ms": {
+        "count": 3061,
+        "p50": 33.617,
+        "p95": 76.328,
+        "p99": 120.912,
+        "max": 160.887,
+        "mean": 38.407
+      }
+    },
+    {
+      "name": "r70",
+      "kind": "sustained",
+      "loop": "open",
+      "measured": true,
+      "duration_s": 40.0,
+      "sent": 2800,
+      "acked": 2800,
+      "nak": 0,
+      "deferred": 0,
+      "achieved_msg_s": 70.0,
+      "ack_ms": {
+        "count": 2800,
+        "p50": 12.122,
+        "p95": 22.087,
+        "p99": 34.296,
+        "max": 112.198,
+        "mean": 13.427
+      },
+      "e2e_ms": {
+        "count": 3161,
+        "p50": 1694.508,
+        "p95": 13838.61,
+        "p99": 14991.228,
+        "max": 15296.463,
+        "mean": 4253.786
+      }
+    },
+    {
+      "name": "cooldown",
+      "kind": "sustained",
+      "loop": "open",
+      "measured": true,
+      "duration_s": 45.0,
+      "sent": 540,
+      "acked": 540,
+      "nak": 0,
+      "deferred": 0,
+      "achieved_msg_s": 12.0,
+      "ack_ms": {
+        "count": 540,
+        "p50": 4.284,
+        "p95": 8.98,
+        "p99": 14.805,
+        "max": 25.665,
+        "mean": 5.365
+      },
+      "e2e_ms": {
+        "count": 2038,
+        "p50": 12273.697,
+        "p95": 14991.228,
+        "p99": 14991.228,
+        "max": 15289.137,
+        "mean": 8476.88
+      }
+    }
+  ],
+  "engine_side": {
+    "db_backend": "postgres",
+    "journal_mode": "postgres",
+    "peak_backlog": 4,
+    "peak_queue_depth": 3,
+    "db_growth_bytes": 35037184,
+    "dead_letters": 0,
+    "drain_seconds": 2.0691589529999987
+  },
+  "no_loss": {
+    "ok": true,
+    "sent": 6765,
+    "engine_read": 6765,
+    "engine_written": 10494,
+    "sink_received": 10494,
+    "backlog": 0,
+    "at_least_once_redeliveries": 0,
+    "detail": "read>=sent, sink_received>=written, backlog drained"
+  },
+  "slo": [
+    {
+      "name": "r30:max_error_rate",
+      "threshold": 0.001,
+      "observed": 0.0,
+      "ok": true
+    },
+    {
+      "name": "r50:max_error_rate",
+      "threshold": 0.001,
+      "observed": 0.0,
+      "ok": true
+    },
+    {
+      "name": "r70:max_error_rate",
+      "threshold": 0.001,
+      "observed": 0.0,
+      "ok": true
+    },
+    {
+      "name": "cooldown:max_error_rate",
+      "threshold": 0.001,
+      "observed": 0.0,
+      "ok": true
+    },
+    {
+      "name": "zero_loss",
+      "threshold": true,
+      "observed": true,
+      "ok": true
+    },
+    {
+      "name": "max_dead_letters",
+      "threshold": 0,
+      "observed": 0,
+      "ok": true
+    }
+  ],
+  "notes": []
+}

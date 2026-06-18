@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Atomic config reload (quiesce-and-swap) on a running RegistryRunner / Engine.
 
 Covers the CD linchpin: applying a new code-first graph to a *running* engine without losing

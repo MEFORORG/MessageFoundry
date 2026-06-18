@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Synthetic high-fan-out system-under-test for load testing.
 
 Models the *shape* of a large integration estate — one big ADT hub plus results/orders hubs, each

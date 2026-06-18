@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The harness Monitor tab: it builds disconnected, and observes a running engine over the API.
 
 Like ``test_console_client``, this starts a real managed app (engine + API, auth disabled) in a

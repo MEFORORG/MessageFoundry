@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """REST destination connector (ADR 0003): delivery, error→retry/dead-letter mapping, egress, TLS.
 
 The opener is faked so nothing hits the network — we assert the Request that would be sent and the
@@ -120,6 +122,22 @@ def test_rest_rejects_non_http_scheme() -> None:
 def test_rest_basic_auth_header() -> None:
     dest = _dest(basic_user="u", basic_password="p")
     assert dest._headers["Authorization"] == "Basic dTpw"  # base64("u:p")
+
+
+def test_rest_rejects_over_length_url() -> None:
+    # WP-L3-09 (ASVS 4.2.5): an over-length URL is rejected at construction with a clear config error.
+    long_url = URL + "a" * 9000
+    with pytest.raises(ValueError, match="over the 8192-char limit"):
+        build_destination(
+            Destination(name="OB", type=ConnectorType.REST, settings=Rest(url=long_url).settings)
+        )
+
+
+def test_rest_rejects_over_length_header_value() -> None:
+    # WP-L3-09: an over-length built header value (here a runaway bearer credential) is rejected, and
+    # the message names the header — never its value (it may be a secret).
+    with pytest.raises(ValueError, match="outbound header 'Authorization'"):
+        _dest(bearer_token="x" * 9000)
 
 
 def test_rest_verify_tls_false_refused_without_escape(monkeypatch: pytest.MonkeyPatch) -> None:

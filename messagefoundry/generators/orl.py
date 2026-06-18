@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Generate conformant HL7 v2.5.1 **ORL** (laboratory order response) messages.
 
 ORL is an order acknowledgement: MSH + MSA, optionally echoing the patient/order. We emit an

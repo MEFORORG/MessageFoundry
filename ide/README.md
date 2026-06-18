@@ -93,7 +93,13 @@ cd ide
 npm install
 npm run compile        # bundle to dist/ (or: npm run watch)
 npm run typecheck      # tsc --noEmit
+npm test               # integration tests: launch a headless VS Code (@vscode/test-electron + mocha)
 ```
+
+`npm test` downloads a real VS Code build, loads the extension, and asserts it activates and that every
+command it contributes is registered and runnable. It needs a machine with **no VS Code already
+running** (on Windows a running instance steals the launch args), so it runs on the **Windows `ide`
+leg in CI** (`.github/workflows/ci.yml`) rather than in a dev session that has VS Code open.
 
 Then press **F5** ("Run Extension") to launch an Extension Development Host. Open a workspace that
 has a `samples/config` (this repo does). The `messagefoundry` CLI must be importable by

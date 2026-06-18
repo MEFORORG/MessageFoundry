@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Cluster coordination seam (Track B Steps 3-7).
 
 Horizontal scale-out runs the engine as several nodes against one shared server-DB store. Two
@@ -13,13 +15,15 @@ The contract is deliberately tiny and the hot-path gates (:meth:`ClusterCoordina
 cheap** — they read cached in-memory state / a plain attribute so a per-message gate check adds no
 ``await``. :class:`NullCoordinator` is the default used everywhere on a single node; :class:`DbCoordinator`
 is the Postgres-backed implementation that registers the node in a ``nodes`` table, heartbeats, runs
-(Step 4) **real leader election** via a session-level advisory lock so exactly one node reports
-``is_leader()`` at a time, and (Step 5) maintains a cached owned-lane set. :func:`build_coordinator`
+(Step 4) **real leader election** via a **self-fencing leadership lease** (a single ``leader_lease``
+row with a DB-clock TTL) so exactly one node reports ``is_leader()`` at a time — and, for active-passive
+HA (Workstream A2), a partitioned old leader **self-fences** before a standby can acquire it — and
+(Step 5) maintains a cached owned-lane set. :func:`build_coordinator`
 picks between them defensively — a non-Postgres or not-``[cluster].enabled`` store always gets the
 :class:`NullCoordinator`.
 
 **Steps 4 + 4b + 5 add leader election, leader-gated poll-source intake, and per-lane FIFO ownership:**
-``is_leader()`` reflects a contended advisory lock, the engine gates its leader-only WRITE singletons
+``is_leader()`` reflects the held leadership lease, the engine gates its leader-only WRITE singletons
 (retention, the lease-reclaim sweep) on it, and the runner threads ``is_leader`` as a plain predicate
 into each source so only the leader polls a **shared external resource** (a directory / DB table /
 remote dir) — listen sources (MLLP/TCP) ignore it and run on every node. For ordering, the runner
@@ -50,9 +54,9 @@ endpoint; ``/cluster/status`` reads the cheap in-memory gates (:meth:`node_id` /
 ``cluster_members`` reports leader on the **single freshest** node whose flag is set and whose
 ``last_seen`` is within the node timeout, so a crashed ex-leader's lingering flag is never reported as
 the live leader and a failover window (an old leader's flag not yet cleared while a new leader's flag is
-already set) can never surface two leaders — the live, still-beating node wins. Leadership itself is a
-session advisory lock recorded nowhere else, so the flag is the only durable signal of it.
-:class:`NullCoordinator` synthesizes a single self-entry (single node, always leader).
+already set) can never surface two leaders — the live, still-beating node wins. Leadership itself is the
+``leader_lease`` row (Workstream A2's self-fencing lease); the ``nodes.is_leader`` flag mirrors it for
+the observability API. :class:`NullCoordinator` synthesizes a single self-entry (single node, always leader).
 
 Backend-agnostic by design: :class:`DbCoordinator` takes a raw asyncpg pool (typed ``Any``,
 duck-typed) and never imports :class:`~messagefoundry.store.postgres.PostgresStore`, so this module
@@ -66,6 +70,7 @@ import logging
 import os
 import socket
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
@@ -90,13 +95,15 @@ __all__ = [
 # schema-namespaced per node (see DbCoordinator._lock_key), matching PostgresStore._lock_key.
 _LOCK_CLASS_CLUSTER = 4
 
-# Advisory-lock classid for **leader election** (Track B Step 4). Distinct from every other family
-# (1=AUDIT/2=SCHEMA/3=FINALIZE in the store, 4=cluster-nodes above) so its hashtext namespace can't
-# collide. Unlike the store's xact-scoped locks, the leader lock is **session-level**: held on a
-# dedicated pooled connection for the leader's lifetime and only released when the leader stops or its
-# connection drops — that "the lock follows the connection" is precisely what makes a crashed leader's
-# lock auto-release server-side so a follower can take over.
-_LOCK_CLASS_LEADER = 5
+# Leader election (Track B Step 4 / Workstream A2) is a **self-fencing lease**, not an advisory lock.
+# A single ``leader_lease`` row carries ``(lease_key, owner, lease_expires_at)``; the leader renews it
+# every heartbeat to ``DB_now + leader_lease_ttl`` and a standby may acquire ONLY once the lease has
+# expired (per the DB's own clock — ``clock_timestamp()`` — so inter-node clock skew is irrelevant to
+# correctness). A leader that cannot renew within ``leader_fence_timeout`` (measured on its own
+# monotonic clock, with no DB I/O) halts its leader work BEFORE the lease can expire, so a partitioned
+# old leader stops processing before any standby can take over (the split-brain guard). The lease
+# replaces the earlier session-level advisory lock, which gave fast crash-release but could not enforce
+# the "wait out the TTL" fence a standby needs to be safe.
 
 
 def default_node_id() -> str:
@@ -216,6 +223,15 @@ class ClusterCoordinator(Protocol):
         DB read on the clustered path, none single-node — off the message hot path (operator-driven)."""
         ...
 
+    async def leadership_lease(self) -> tuple[str | None, float | None]:
+        """The current leadership-lease state for the observability API (Workstream A5): ``(owner,
+        lease_expires_at)`` — who holds the self-fencing leadership lease and the DB-clock epoch at which
+        it expires (when a standby could acquire if the leader stops renewing). :class:`DbCoordinator`
+        reads the single ``leader_lease`` row (one DB read, off the hot path); ``(None, None)`` before any
+        lease exists. :class:`NullCoordinator` returns ``(node_id, None)`` — single-node is permanently
+        leader with no lease/expiry."""
+        ...
+
 
 class NullCoordinator:
     """The single-node default (SQLite and single-node Postgres). Every gate is ``True``, there is no
@@ -281,6 +297,11 @@ class NullCoordinator:
             )
         ]
 
+    async def leadership_lease(self) -> tuple[str | None, float | None]:
+        # Single-node: permanently leader, no lease row / expiry. Report self as the holder with no
+        # expiry so /cluster/nodes is byte-identical in shape to a real cluster's.
+        return (self.node_id, None)
+
 
 # One-time-per-process info guard: the scale-out feature set is COMPLETE — election (Step 4),
 # leader-gated WRITE singletons, leader-gated poll-source intake (Step 4b), per-lane FIFO ownership
@@ -298,12 +319,16 @@ _logged_cluster_enabled = False
 class DbCoordinator:
     """Postgres-backed cluster membership + **leader election** (Track B Steps 3-7).
 
-    On :meth:`start` it idempotently creates a ``nodes`` table, upserts this node's row, and spawns a
-    cooperatively-cancellable maintenance task that each tick (a) refreshes ``last_seen`` and (b)
-    maintains leadership via a **session-level** advisory lock held on a dedicated pooled connection.
-    Exactly one node across the cluster holds that lock, so exactly one reports :meth:`is_leader`
-    ``True``; if the leader stops or its connection drops, the lock is released and a follower acquires
-    it on its next tick. :meth:`stop` releases leadership, cancels the loop, and marks this node left.
+    On :meth:`start` it idempotently creates the ``nodes`` + ``leader_lease`` tables, upserts this
+    node's row, and spawns two cooperatively-cancellable tasks: a **maintenance** task that each tick
+    (a) refreshes ``last_seen`` and (b) maintains leadership via a **self-fencing lease** (the single
+    ``leader_lease`` row, renewed to ``DB_now + leader_lease_ttl``; a standby acquires only once that
+    lease has expired per the DB clock), and a **fence watchdog** task that does NO DB I/O and demotes
+    this node if it has not renewed within ``leader_fence_timeout`` (< the TTL) — so a partitioned old
+    leader stops reporting :meth:`is_leader` ``True`` before any standby can acquire the lease (the
+    split-brain guard, Workstream A2). Exactly one node holds the lease, so exactly one reports
+    :meth:`is_leader` ``True``. :meth:`stop` releases the lease, cancels both tasks, and marks this node
+    left.
 
     Lane ownership (Track B Step 5) IS built: :meth:`lane_owner` returns this node's identity, the
     runner threads it into each FIFO claim, and :meth:`Store.claim_next_fifo` atomically leases the
@@ -334,7 +359,10 @@ class DbCoordinator:
         *,
         heartbeat_seconds: float = 10.0,
         node_timeout_seconds: float = 30.0,
+        leader_lease_ttl_seconds: float = 30.0,
+        leader_fence_timeout_seconds: float = 20.0,
         db_schema: str | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._pool = pool
         self.node_id = node_id
@@ -342,38 +370,50 @@ class DbCoordinator:
         # A node is considered dead when its last_seen is older than this. Consulted by
         # cluster_members() (Step 7) as the freshness filter that discards a crashed ex-leader's stale
         # is_leader flag (and bounds the failover-overlap window). It is NOT what transfers leadership —
-        # the session-level advisory lock is (a crashed leader's lock auto-releases server-side); lowering
-        # this shrinks the window in which a just-beaten node can still count toward the derived leader,
+        # the leadership lease is (a standby acquires only once the lease has expired); lowering this
+        # shrinks the window in which a just-beaten node can still count toward the derived leader,
         # raising it lets a just-crashed ex-leader's row stay "fresh" (and thus a leader candidate) longer.
         self._node_timeout_seconds = node_timeout_seconds
+        # The leadership LEASE TTL (Workstream A2): the leader renews the lease to DB_now + this every
+        # heartbeat; a standby may acquire only once the lease has expired (per the DB clock), so it
+        # always waits out the full TTL before taking over.
+        self._lease_ttl = leader_lease_ttl_seconds
+        # The SELF-FENCE timeout: a leader that has not renewed within this many seconds (its own
+        # monotonic clock, no DB I/O) demotes itself. MUST be < the TTL so the old leader stops before
+        # the lease can expire and a standby acquire — the split-brain guard.
+        self._fence_timeout = leader_fence_timeout_seconds
+        # The fence watchdog polls this often; small relative to the fence timeout so a fence fires
+        # promptly (well before the lease TTL). Pure in-memory check — no DB.
+        self._fence_tick = max(0.05, min(1.0, leader_fence_timeout_seconds / 5.0))
+        # Monotonic clock for the fence (injectable for deterministic tests). Distinct from the DB clock
+        # the lease uses: the fence measures a node-local elapsed duration (skew-free by construction),
+        # the lease compares against the DB's own clock_timestamp() (so inter-node skew is irrelevant).
+        self._monotonic = monotonic
         # Namespace the nodes-DDL advisory lock by schema, exactly as PostgresStore._lock_key does:
         # advisory locks are database-scoped (not schema-scoped), so two deployments sharing one
         # database via different db_schema values must not contend on this lock. The nodes table
         # itself lands in the right schema via the pool's search_path; the lock key must match.
         self._lock_key = f"{db_schema or 'public'}:mefor_cluster_nodes"
-        # A DISTINCT key for the leader lock so leadership contention never collides with the nodes-DDL
-        # lock (different classid too). Schema-namespaced for the same reason: two deployments sharing a
-        # database via different schemas must elect leaders independently.
-        self._leader_lock_key = f"{db_schema or 'public'}:mefor_cluster_leader"
+        # The leadership-lease KEY (the single leader_lease row's primary key). Schema-namespaced so two
+        # deployments sharing one database via different schemas elect leaders independently.
+        self._lease_key = f"{db_schema or 'public'}:mefor_cluster_leader"
         self._host = socket.gethostname()
         self._pid = os.getpid()
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._fence_task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         # Cached leadership state read by the cheap/synchronous is_leader() gate (no DB round-trip on
-        # the hot path). Maintained only by the single maintenance task.
+        # the hot path). Maintained by the maintenance task (acquire/renew/lose) and the fence watchdog
+        # (self-fence on a stalled renew).
         self._is_leader: bool = False
+        # The monotonic time of the last CONFIRMED lease hold (acquire or successful renew), or None if
+        # this node has never held the lease. The fence watchdog demotes when now - this > fence_timeout.
+        self._last_renew_ok: float | None = None
         # Cached set of FIFO lanes this node currently holds, read by the cheap/synchronous owns_lane()
         # HINT (Track B Step 5). Refreshed once per maintenance tick from lane_leases; it is NOT the
         # correctness gate (the claim-time atomic lease acquire in claim_next_fifo is) — just an
         # eventually-consistent observability signal, so a tick of staleness is harmless.
         self._owned_lanes: set[str] = set()
-        # The dedicated pooled connection the SESSION-LEVEL leader lock lives on. A session lock is
-        # bound to its connection, so the lock must be held on one connection kept out of the store's
-        # pool rotation for the leader's lifetime (hence the pool_size >= 2 requirement). Duck-typed
-        # ``Any`` (like the pool); ``None`` until the maintenance task acquires it (and after stop / on a
-        # connection error). Compared against None at every use, so the invariant "_is_leader ⇒ conn set"
-        # need not be expressed in the type.
-        self._leader_conn: Any = None
         # Cached cluster-wide config-reload version (Track B Step 6), read by the cheap/synchronous
         # config_version_cached() the engine's convergence loop polls. Refreshed once per maintenance
         # tick and updated immediately by bump_config_version() (so the node that bumps sees its own new
@@ -390,23 +430,27 @@ class DbCoordinator:
         await self._register()
         self._stop.clear()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        # The fence watchdog runs SEPARATELY from the maintenance loop and does NO DB I/O, so a hung DB
+        # (which would block the maintenance loop mid-await) can never block self-fencing.
+        self._fence_task = asyncio.create_task(self._fence_watchdog_loop())
 
     async def stop(self) -> None:
-        """Release leadership, cancel the maintenance loop, and mark this node left. Idempotent and
-        safe even if :meth:`start` raised before the task/connection existed (then there's nothing to
-        tear down). Ordered so the loop is stopped BEFORE the leader connection is released, so the
-        loop can't touch a connection that's been handed back to the pool (no use-after-release)."""
+        """Release leadership, cancel both background tasks, and mark this node left. Idempotent and
+        safe even if :meth:`start` raised before the tasks existed (then there's nothing to tear down).
+        Ordered so the tasks are stopped BEFORE the lease is released, so a still-running tick can't
+        re-acquire after we release."""
         self._stop.set()
-        task = self._heartbeat_task
+        tasks = [t for t in (self._heartbeat_task, self._fence_task) if t is not None]
         self._heartbeat_task = None
-        if task is not None:
-            task.cancel()
-            # Absorb the cancellation (and any error the loop stored) so stop() never raises.
-            await asyncio.gather(task, return_exceptions=True)
-        # Drop leadership and hand the dedicated connection back. Demote the cached gate FIRST so any
-        # concurrent is_leader() reader sees "not leader" the instant we begin releasing. Releasing the
-        # advisory lock is best-effort: closing/returning the connection releases a session lock
-        # server-side anyway, so a failed unlock is harmless.
+        self._fence_task = None
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            # Absorb the cancellation (and any error a loop stored) so stop() never raises.
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # Drop leadership: demote the cached gate FIRST so any concurrent is_leader() reader sees "not
+        # leader" the instant we begin releasing, then expire the lease row so a standby can take over
+        # immediately on a clean shutdown (best-effort — a failed release just lets the lease age out).
         await self._release_leadership()
         # Mark the row left rather than DELETE it: keeping a 'left' tombstone gives an operator a
         # visible "this node shut down cleanly" signal (vs a crashed node whose row goes stale), which
@@ -427,8 +471,8 @@ class DbCoordinator:
             log.warning("cluster: failed to mark node %s left: %s", self.node_id, safe_exc(exc))
 
     def is_leader(self) -> bool:
-        # Cheap + synchronous: read the cached state the maintenance loop maintains (no DB round-trip
-        # on the hot path). True only while this node holds the session-level leader advisory lock.
+        # Cheap + synchronous: read the cached state the maintenance loop + fence watchdog maintain (no
+        # DB round-trip on the hot path). True only while this node holds the leadership lease.
         return self._is_leader
 
     def owns_lane(self, lane_key: str) -> bool:
@@ -542,6 +586,19 @@ class DbCoordinator:
             )
         return members
 
+    async def leadership_lease(self) -> tuple[str | None, float | None]:
+        """Read the single ``leader_lease`` row — (owner, DB-clock expiry) — for the observability API
+        (Workstream A5). One DB read, off the message hot path; ``(None, None)`` before any lease row
+        exists. This is the AUTHORITATIVE lease state (the source of truth for who may process), distinct
+        from the ``nodes.is_leader`` heartbeat flag :meth:`cluster_members` derives from."""
+        row = await self._pool.fetchrow(
+            "SELECT owner, lease_expires_at FROM leader_lease WHERE lease_key = $1",
+            self._lease_key,
+        )
+        if row is None:
+            return (None, None)
+        return (row["owner"], row["lease_expires_at"])
+
     # --- internals -----------------------------------------------------------
 
     def _log_cluster_enabled_once(self) -> None:
@@ -567,9 +624,9 @@ class DbCoordinator:
         )
 
     async def _ensure_nodes_table(self) -> None:
-        """Create the ``nodes`` table IF NOT EXISTS, serialized across concurrent opens by a
-        transaction-scoped advisory lock (auto-released at commit) — the same guard the store uses for
-        its own schema DDL, so two nodes opening at once can't race the CREATE. The lock key is
+        """Create the ``nodes`` + ``leader_lease`` tables IF NOT EXISTS, serialized across concurrent
+        opens by a transaction-scoped advisory lock (auto-released at commit) — the same guard the store
+        uses for its own schema DDL, so two nodes opening at once can't race the CREATE. The lock key is
         schema-namespaced (see :attr:`_lock_key`), matching :meth:`PostgresStore._lock_key`, so two
         deployments sharing one database via different schemas don't contend on it."""
         async with self._pool.acquire() as conn:
@@ -596,6 +653,17 @@ class DbCoordinator:
                 # fresh CREATE above and on any node that already migrated.
                 await conn.execute(
                     "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS is_leader BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+                # The self-fencing leadership lease (Workstream A2): a single row per cluster (keyed by
+                # the schema-namespaced lease_key) holding the current leader + its DB-clock expiry. The
+                # leader renews lease_expires_at every heartbeat; a standby acquires only once it has
+                # expired. Created under the same DDL lock so concurrent opens can't race it.
+                await conn.execute(
+                    "CREATE TABLE IF NOT EXISTS leader_lease ("
+                    " lease_key        TEXT PRIMARY KEY,"
+                    " owner            TEXT,"
+                    " lease_expires_at DOUBLE PRECISION NOT NULL"
+                    ")"
                 )
 
     async def _register(self) -> None:
@@ -662,9 +730,9 @@ class DbCoordinator:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # Election maintenance is best-effort per tick (e.g. a momentary pool hiccup acquiring
-                # the dedicated connection); _maintain_leadership already demotes + drops a bad
-                # connection on a connection error, so just log and retry next tick.
+                # Lease maintenance is best-effort per tick (e.g. a momentary pool hiccup). We do NOT
+                # demote here on a DB error — _last_renew_ok simply isn't advanced, so the fence
+                # watchdog demotes us if the failure persists past the fence timeout. Just log + retry.
                 log.warning(
                     "cluster: leadership maintenance failed for node %s; will retry: %s",
                     self.node_id,
@@ -716,96 +784,105 @@ class DbCoordinator:
         )
         self._owned_lanes = {r["lane"] for r in rows}
 
-    # --- leader election (Track B Step 4) ------------------------------------
+    # --- leader election: self-fencing lease (Track B Step 4 / Workstream A2) ----
 
     async def _maintain_leadership(self) -> None:
-        """One tick of leadership maintenance on the dedicated session connection.
+        """One tick of leadership maintenance: try to acquire-or-renew the lease, then reconcile the
+        cached gate. A single atomic statement either takes a free/expired lease, renews ours, or no-ops
+        if another node holds a live lease (see :meth:`_claim_or_renew_lease`).
 
-        Not leader: acquire a fresh dedicated connection if needed, then try the session-level advisory
-        lock **exactly once** (advisory locks are re-entrant/counted, so we must not re-try while held —
-        that would stack the lock count and a single unlock wouldn't release it). On success, cache
-        leader = True.
-
-        Already leader: do a cheap liveness ping on the dedicated connection. A dropped connection
-        releases the session lock server-side, so a failed ping means we've silently lost leadership —
-        demote, drop the bad connection, and re-acquire a fresh one next tick.
+        On hold: stamp ``_last_renew_ok`` (monotonic) so the fence watchdog knows we are fresh, and
+        promote if we weren't already leader. On not-hold: demote if we were leader (someone else holds
+        it / our lease expired). A DB error propagates to the loop, which logs and retries — we do NOT
+        demote on an error here; ``_last_renew_ok`` simply isn't advanced, so the fence watchdog demotes
+        us only if the failure persists past the fence timeout (and always before the lease can expire).
         """
-        if not self._is_leader:
-            if self._leader_conn is None:
-                self._leader_conn = await self._pool.acquire()
-            try:
-                got = await self._leader_conn.fetchval(
-                    "SELECT pg_try_advisory_lock($1, hashtext($2))",
-                    _LOCK_CLASS_LEADER,
-                    self._leader_lock_key,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # The try-lock failed (e.g. a stale/broken connection). Drop it so the next tick
-                # re-acquires a fresh one rather than retrying forever on a dead connection; re-raise so
-                # the loop logs it once via safe_exc.
-                await self._drop_leader_conn()
-                raise
-            if got:
+        held = await self._claim_or_renew_lease()
+        if held:
+            self._last_renew_ok = self._monotonic()
+            if not self._is_leader:
                 self._is_leader = True
-                log.info("cluster: node %s acquired leadership", self.node_id)
+                log.info("cluster: node %s acquired leadership (lease)", self.node_id)
+        elif self._is_leader:
+            # The lease is held by another node (or expired and taken over) — we are no longer leader.
+            self._is_leader = False
+            log.info("cluster: node %s lost leadership (lease taken or expired)", self.node_id)
+
+    async def _claim_or_renew_lease(self) -> bool:
+        """Atomically acquire OR renew the leadership lease and return whether this node now holds it.
+
+        One statement covers all cases against the DB's own clock (``clock_timestamp()`` — so node
+        clock skew never affects who may hold the lease): INSERT the row if absent (we acquire); on
+        conflict, UPDATE owner + expiry **only if** we already own it (renew) OR the existing lease has
+        expired (take over a dead leader). If another node holds a live lease the WHERE is false, the
+        UPDATE no-ops, ``RETURNING`` yields nothing, and we report not-held."""
+        row = await self._pool.fetchrow(
+            "INSERT INTO leader_lease (lease_key, owner, lease_expires_at) "
+            "VALUES ($1, $2, EXTRACT(EPOCH FROM clock_timestamp()) + $3) "
+            "ON CONFLICT (lease_key) DO UPDATE SET "
+            "owner = EXCLUDED.owner, lease_expires_at = EXCLUDED.lease_expires_at "
+            "WHERE leader_lease.owner = $2 "
+            "OR leader_lease.lease_expires_at < EXTRACT(EPOCH FROM clock_timestamp()) "
+            "RETURNING owner",
+            self._lease_key,
+            self.node_id,
+            self._lease_ttl,
+        )
+        return row is not None and row["owner"] == self.node_id
+
+    async def _fence_watchdog_loop(self) -> None:
+        """Self-fence watchdog (Workstream A2). Wakes every ``_fence_tick`` and, doing **no DB I/O**,
+        demotes this node if it has not confirmed a lease hold within ``_fence_timeout`` (monotonic).
+        Because it never awaits the pool, a hung/partitioned DB — which would block the maintenance loop
+        mid-await — cannot stop it from fencing. ``_fence_timeout < lease_ttl`` guarantees a partitioned
+        old leader stops reporting leader BEFORE its lease can expire and a standby acquire it."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self._fence_tick)
+                return  # stop requested
+            except asyncio.TimeoutError:
+                pass
+            self._check_fence()
+
+    def _check_fence(self) -> None:
+        """Demote (self-fence) if we are leader but haven't confirmed a lease hold within the fence
+        timeout. Pure in-memory; called by the watchdog (and directly by tests)."""
+        if not self._is_leader:
             return
-        # Already leader — verify the dedicated connection (and thus the session lock) is still live.
-        try:
-            await self._leader_conn.execute("SELECT 1")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            # The connection (and the session lock it carried) is gone — we are no longer leader.
-            # Demote, drop the bad connection so the pool can discard it, and let the next tick
-            # re-acquire a fresh connection and contend for the lock again.
+        last = self._last_renew_ok
+        if last is None:
+            return  # leader is only set alongside _last_renew_ok; defensive no-op
+        if self._monotonic() - last > self._fence_timeout:
             self._is_leader = False
             log.warning(
-                "cluster: node %s lost its leader connection; demoting: %s",
+                "cluster: node %s SELF-FENCED — leadership lease not renewed within %.1fs (fence "
+                "timeout); halting leader work before the lease (TTL %.1fs) can expire",
                 self.node_id,
-                safe_exc(exc),
+                self._fence_timeout,
+                self._lease_ttl,
             )
-            await self._drop_leader_conn()
 
     async def _release_leadership(self) -> None:
-        """Best-effort: demote, release the advisory lock, and return the dedicated connection. Demotes
-        the cached gate first so a concurrent is_leader() reader never sees a stale True while we tear
-        down. Safe to call when never elected (no connection → nothing to do)."""
+        """Best-effort clean release: demote the cached gate first (so a concurrent is_leader() reader
+        never sees a stale True), then expire our lease row so a standby can acquire immediately on a
+        clean shutdown. Safe to call when never elected (the UPDATE simply matches no owned row)."""
         was_leader = self._is_leader
         self._is_leader = False
-        conn = self._leader_conn
-        if conn is None:
-            return
-        if was_leader:
-            try:
-                await conn.execute(
-                    "SELECT pg_advisory_unlock($1, hashtext($2))",
-                    _LOCK_CLASS_LEADER,
-                    self._leader_lock_key,
-                )
-            except Exception as exc:
-                # Returning/closing the connection releases the session lock server-side regardless, so
-                # a failed explicit unlock is harmless — log and continue to the release below.
-                log.warning(
-                    "cluster: node %s failed to release the leader lock (it releases on connection "
-                    "return anyway): %s",
-                    self.node_id,
-                    safe_exc(exc),
-                )
-        await self._drop_leader_conn()
-
-    async def _drop_leader_conn(self) -> None:
-        """Return the dedicated leader connection to the pool (best-effort) and forget it."""
-        conn = self._leader_conn
-        self._leader_conn = None
-        if conn is None:
+        self._last_renew_ok = None
+        if not was_leader:
             return
         try:
-            await self._pool.release(conn)
+            # Expire the lease (set it to the epoch) only if we still own it, so a standby's next
+            # acquire tick takes over at once instead of waiting out the full TTL.
+            await self._pool.execute(
+                "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = $1 AND owner = $2",
+                self._lease_key,
+                self.node_id,
+            )
         except Exception as exc:  # the pool may already be closing on shutdown — log, don't raise
             log.warning(
-                "cluster: node %s failed to release its leader connection: %s",
+                "cluster: node %s failed to release the leadership lease (it will expire on its "
+                "own): %s",
                 self.node_id,
                 safe_exc(exc),
             )
@@ -847,10 +924,32 @@ def build_coordinator(store: Any, cluster_settings: Any) -> ClusterCoordinator:
     # when the store has no _settings (a non-Postgres path never reaches here).
     settings = getattr(store, "_settings", None)
     db_schema = getattr(settings, "db_schema", None)
+    # The SQL Server store ALSO exposes a `_pool` (aioodbc), but DbCoordinator drives the asyncpg API, so
+    # dispatch a SQL Server store to its own active-passive coordinator instead. Backend is duck-typed off
+    # the settings enum's value (no StoreBackend import → no config dependency here); the import is local
+    # to avoid a cluster.py <-> cluster_sqlserver.py cycle (cluster_sqlserver imports this module).
+    backend = getattr(settings, "backend", None)
+    if getattr(backend, "value", backend) == "sqlserver":
+        from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+
+        return SqlServerCoordinator(
+            store,
+            node_id,
+            heartbeat_seconds=getattr(cluster_settings, "heartbeat_seconds", 10.0),
+            node_timeout_seconds=getattr(cluster_settings, "node_timeout_seconds", 30.0),
+            leader_lease_ttl_seconds=getattr(cluster_settings, "leader_lease_ttl_seconds", 30.0),
+            leader_fence_timeout_seconds=getattr(
+                cluster_settings, "leader_fence_timeout_seconds", 20.0
+            ),
+        )
     return DbCoordinator(
         pool,
         node_id,
         heartbeat_seconds=getattr(cluster_settings, "heartbeat_seconds", 10.0),
         node_timeout_seconds=getattr(cluster_settings, "node_timeout_seconds", 30.0),
+        leader_lease_ttl_seconds=getattr(cluster_settings, "leader_lease_ttl_seconds", 30.0),
+        leader_fence_timeout_seconds=getattr(
+            cluster_settings, "leader_fence_timeout_seconds", 20.0
+        ),
         db_schema=db_schema,
     )

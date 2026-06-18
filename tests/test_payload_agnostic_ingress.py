@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Payload-agnostic ingress (ADR 0004): RawMessage, content_type routing, and the HL7 path intact."""
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
     WiringError,
+    build_inbound_connection,
     load_config,
 )
 from messagefoundry.parsing import Message, RawMessage
@@ -146,3 +149,54 @@ def test_inbound_rejects_strict_on_non_hl7(tmp_path: Path) -> None:
     )
     with pytest.raises(WiringError, match="strict"):
         load_config(tmp_path)
+
+
+def test_inbound_content_type_string_is_coerced(tmp_path: Path) -> None:
+    # Regression (#12): a code-first author may pass the bare string ("x12") instead of the enum
+    # member. The boundary must coerce it to ContentType so it can't flow into the pipeline as a raw
+    # str and blow up later as `'str' object has no attribute 'value'` deep in dry-run.
+    (tmp_path / "c.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, Send, File, ContentType\n"
+        "inbound('IB', File(directory='in'), router='r', content_type='x12')\n"
+        "outbound('OUT', File(directory='out'))\n"
+        "@router('r')\n"
+        "def r(m): return ['h']\n"
+        "@handler('h')\n"
+        "def h(m): return Send('OUT', m.raw)\n",
+        encoding="utf-8",
+    )
+    reg = load_config(tmp_path)
+    assert reg.inbound["IB"].content_type is ContentType.X12  # coerced, not left a bare str
+    # and it now dry-runs without the AttributeError the raw string used to cause:
+    result = dry_run(reg, "ISA*00*~", inbound="IB")
+    assert result.message_type == "x12"
+    assert result.handlers == ["h"]
+
+
+def test_inbound_invalid_content_type_string_fails_loud(tmp_path: Path) -> None:
+    # An unrecognized content_type string fails loud at load (WiringError naming the connection +
+    # allowed values), not silently nor with an opaque crash deeper in the pipeline.
+    (tmp_path / "c.py").write_text(
+        "from messagefoundry import inbound, router, File\n"
+        "inbound('IB', File(directory='in'), router='r', content_type='yaml')\n"
+        "@router('r')\n"
+        "def r(m): return []\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match=r"invalid content_type 'yaml'"):
+        load_config(tmp_path)
+
+
+def test_build_inbound_connection_coerces_content_type() -> None:
+    # The shared core (used by both inbound() and the connections.toml loader) coerces a string and is
+    # idempotent on an enum member — so both authoring surfaces enforce the same guard.
+    spec = ConnectionSpec(ConnectorType.FILE, {})
+    assert build_inbound_connection("IB", spec, router="r", content_type="json").content_type is (
+        ContentType.JSON
+    )
+    assert (
+        build_inbound_connection("IB", spec, router="r", content_type=ContentType.X12).content_type
+        is ContentType.X12
+    )
+    with pytest.raises(WiringError, match="invalid content_type"):
+        build_inbound_connection("IB", spec, router="r", content_type="nope")

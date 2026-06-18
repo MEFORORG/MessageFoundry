@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Console active-sessions dialog + admin force-sign-out (the WP-10 console view).
 
 Headless Qt (offscreen). Stubs stand in for EngineClient; QMessageBox confirmations/info are
@@ -151,7 +153,15 @@ def test_admin_revoke_user_sessions(qapp: object, monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(up_mod.QMessageBox, "information", lambda *a, **k: None)
     client = _AdminClient()
     page = UsersPage(client)  # type: ignore[arg-type]
-    page.reload()
+    page.reload()  # off-thread (M-25 / backlog #2) — wait for the user list to apply before selecting
+    page._runner._pool.waitForDone(5000)
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    assert app is not None
+    for _ in range(5):
+        app.processEvents()
     page._table.selectRow(0)
     page._revoke_sessions()
     assert client.revoked_users == ["u1"]
+    page.stop()

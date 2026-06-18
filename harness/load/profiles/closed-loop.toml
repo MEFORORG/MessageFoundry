@@ -1,0 +1,100 @@
+# Closed-loop max-throughput finder — a concurrency sweep that holds a FIXED number of messages in
+# flight per phase (via the closed-loop governor) and measures the throughput the engine sustains at
+# each level. Where the open-loop fanout-baseline holds a target offered RATE to measure latency, this
+# answers "what is the most this engine can do?" by climbing concurrency until throughput plateaus (the
+# durable-write path saturates). The SLO enforces only the hardware-INDEPENDENT conformance invariants
+# (zero loss, error rate); throughput here is MEASURED and reported, never floored — see the v0.1 plan's
+# two-tier Gate #3 (docs/releases/v0.1-EXECUTION-PLAN.md §Q3). Serve harness/config/load, then:
+#   python -m harness --load closed-loop --engine URL --token T
+#
+# IMPORTANT: every number here is generic and synthetic — illustrative concurrency steps + an ADT-
+# dominant message shape, loopback hosts, generic labels. No real partner, site code, IP, or volume
+# appears in this file. See docs/LOAD-TESTING.md.
+
+[load]
+name = "closed-loop"
+description = "Closed-loop concurrency sweep — measures max sustainable throughput while proving zero loss"
+pool_size = 160                # sender connection pool; must exceed the highest phase concurrency (128)
+corpus_count_per_trigger = 20
+poll_interval_s = 1.0
+drain_timeout_s = 180.0
+correlator_capacity = 4000000
+
+[[load.target]]
+name = "adt_hub"
+port = 2600
+types = ["ADT"]
+weight = 6.0
+
+[[load.target]]
+name = "results_hub"
+port = 2601
+types = ["ORU", "ORM", "OML"]
+weight = 3.0
+
+[[load.target]]
+name = "other_hub"
+port = 2602
+types = ["SIU", "RDE", "RAS", "DFT", "MDM", "MFN", "BAR"]
+weight = 1.0
+
+# Same ADT-dominant shape as fanout-baseline so the two runs are directly comparable (weights are
+# relative, normalized at load). Illustrative only — not any real site's message percentages.
+[load.mix]
+ADT = 55.0
+ORU = 18.0
+ORM = 10.0
+SIU = 5.0
+RDE = 4.0
+RAS = 3.0
+DFT = 2.0
+MDM = 1.0
+MFN = 1.0
+BAR = 1.0
+
+# Conformance-tier invariants ONLY — hardware-independent, must hold at EVERY concurrency level. There
+# is deliberately no min_sustained_msg_s floor: throughput is the quantity this run measures, so a
+# performance number is reported "as measured on this host", not pass/failed (Q3 two-tier gate).
+[load.slo]
+max_error_rate = 0.001
+max_dead_letters = 0
+zero_loss = true
+
+[[load.phase]]
+name = "warmup"
+kind = "warmup"
+loop = "closed"
+concurrency = 8
+duration_s = 15.0
+
+# Concurrency sweep — each step is a MEASURED (sustained) phase, so the report shows the achieved
+# throughput (and ACK / end-to-end latency) at each in-flight level. Throughput climbs with concurrency
+# until the engine's single durable-writer path saturates; the highest step that still holds zero loss
+# is the measured ceiling on this host.
+[[load.phase]]
+name = "c16"
+kind = "sustained"
+loop = "closed"
+concurrency = 16
+duration_s = 60.0
+
+[[load.phase]]
+name = "c32"
+kind = "sustained"
+loop = "closed"
+concurrency = 32
+duration_s = 60.0
+
+[[load.phase]]
+name = "c64"
+kind = "sustained"
+loop = "closed"
+concurrency = 64
+duration_s = 60.0
+
+[[load.phase]]
+name = "c128"
+kind = "sustained"
+loop = "closed"
+concurrency = 128
+duration_s = 60.0

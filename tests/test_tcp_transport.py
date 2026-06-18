@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Raw-TCP transport with configurable delimiter framing (tcp.py + framing.py).
 
 Covers the shared frame codec (frame/deframe, reassembly across chunks, inter-frame noise, oversize

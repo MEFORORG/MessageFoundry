@@ -7,3 +7,17 @@
 # Downstream peer for OB_ACME_ADT (samples/config/IB_ACME_ADT.py): a local test receiver in DEV.
 acme_adt_host = "127.0.0.1"
 acme_adt_port = 2601
+
+# Downstream payer for OB_PAYER_X12 (samples/config/IB_PARTNER_X12.py): a local test receiver in DEV.
+payer_x12_host = "127.0.0.1"
+payer_x12_port = 2701
+
+# WS-* SOAP submit (samples/config/IB_IMMUNIZATION_VXU.py). Non-secret endpoint only; the client
+# cert/key/password + WS-Security credentials come from MEFOR_VALUE_REGISTRY_* env vars, never here.
+registry_url = "https://127.0.0.1:8443/iis/services/submit"
+
+# Real-time eligibility peers (samples/config/IB_RTE_ELIGIBILITY.py): local test receivers in DEV.
+payer_rte_host = "127.0.0.1"
+payer_rte_port = 2731
+rte_result_host = "127.0.0.1"
+rte_result_port = 2732

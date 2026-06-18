@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Example config (code-first): receive ADT over MLLP, archive A01/A04/A08 to a file.
 
 Connection names follow the project convention ``[TYPE]_[PARTNER]_[MESSAGE]`` (see
@@ -6,9 +8,9 @@ outbound file writer. Run it with::
 
     python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 
-Pass ``--env dev`` for local work: the active environment defaults to ``prod``, which is what
-resolves any ``env()`` value lookups (this sample uses none, so it runs in any environment). The
-engine logs the active environment at startup.
+Pass ``--env dev`` for local work: the active environment is **required** (no default) and selects
+which ``environments/<env>.toml`` resolves any ``env()`` value lookups (this sample uses none, so it
+runs in any environment). The engine logs the active environment at startup.
 
 The Router sees every received message (non-ADT is routed nowhere → logged UNROUTED); the
 Handler archives admit/register/update events and drops the rest (→ logged FILTERED). Nothing is

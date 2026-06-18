@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The rate governor — turns a profile :class:`~harness.load.profile.Phase` into a stream of sends.
 
 Two loop models share one connection pool, differing only in *when* the next send is admitted:

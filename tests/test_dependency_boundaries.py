@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Architectural boundary guards (CLAUDE.md §4): the engine stays GUI/web-framework free, and
 importing the api package's pure models must not drag the server into a GUI process."""
 

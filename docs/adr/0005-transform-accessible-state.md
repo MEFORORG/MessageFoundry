@@ -7,7 +7,8 @@
 - **Built:** Implemented. `SetState` + `state_get` authoring surface, the transactional write applied
   inside `transform_handoff` (`store/store.py`), the read-through cache + `config/state.py` read layer,
   at-rest encryption + key-rotation coverage of the `state` table, and a `[retention].state_max_age_days`
-  age purge. SQL Server has a parity table only (inert). **Clustered (Track B Step 6b):** a clustered
+  age purge. SQL Server writes state via its staged `transform_handoff` (live; parity with SQLite/
+  Postgres). **Clustered (Track B Step 6b):** a clustered
   write bumps a per-namespace `state_version` token **in the same transaction** as the state writes, and
   every node's `StateConvergenceRunner` read-throughs newer namespaces into its own `_state_cache` (a
   background, off-hot-path refresh so `state_get` stays a pure synchronous dict lookup); single-node never
@@ -83,10 +84,9 @@ router/transform run.
 ### Storage, encryption, retention
 
 - New `state` table in **both** store backends (`store.py` SQLite + `sqlserver.py`): `(namespace, key,
-  value, set_at, message_id)`, PK `(namespace, key)`. **SQL Server caveat:** its `transform_handoff` is
-  already `NotImplementedError` (staged pipeline is SQLite-only today), so transactional state writes are
-  **SQLite-only** for now; the SQL Server table + apply-method are added for parity but inert until the
-  staged pipeline lands there.
+  value, set_at, message_id)`, PK `(namespace, key)`. **SQL Server:** its `transform_handoff` now
+  applies state writes in the same transaction (the staged pipeline landed there), so state is **live**
+  on SQL Server with parity to SQLite/Postgres.
 - **Encryption at rest:** state values may carry PHI (MRN↔id). Reuse the store's existing
   `self._cipher` ([store/crypto.py](../../messagefoundry/store/crypto.py) AES-256-GCM keyring) to
   encrypt `value`; cover the `state` table in `reencrypt_to_active()` (key rotation), exactly like
@@ -128,8 +128,8 @@ def anonymize(msg):
 - **In-memory cache** assumes bounded state (TTL mitigates); unbounded estates need the follow-up reader.
 - **Read non-linearization** across concurrent handlers — documented; not a correctness bug for the target
   read-mostly use cases.
-- **SQL Server**: state writes inert until its staged pipeline exists (consistent with today's SQLite-only
-  staged pipeline).
+- **SQL Server**: state writes are **live** — the staged pipeline (and its `transform_handoff`) is
+  implemented on the SQL Server backend.
 
 ### Clustered (Track B Step 6b)
 
@@ -154,7 +154,7 @@ documents).
 1. `SetState` + widened `HandlerFn` union; `transform_one` returns `(deliveries, state_ops)`; `_sends`
    updated. 2. `state` table + `_apply_state_op` in `store.py`; `transform_handoff(state_ops=...)` applies
    within the txn; cache update on commit; `reencrypt_to_active` + retention cover it. 3. Parity table +
-   apply-method in `sqlserver.py` (inert). 4. `state_get` + cache + `ContextVar` activation in the runner
+   apply-method in `sqlserver.py` (now live). 4. `state_get` + cache + `ContextVar` activation in the runner
    + dry-run (mirror code sets). 5. Exports + docs (CONFIGURATION.md) + sample. 6. **Adversarial tests:**
    exactly-once under simulated crash/replay, encryption round-trip, key-rotation, TTL purge, read
    non-linearization documented behavior.

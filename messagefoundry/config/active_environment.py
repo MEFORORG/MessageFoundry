@@ -1,10 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The active **environment** name, readable inside a transform (per-face logic).
 
 A migrated feed sometimes branches on which deployment it is running as — e.g. stamp MSH-11 (Processing
 Id) ``P`` in production vs ``T`` in test (Corepoint's ``If #Environment[ActiveFace]="Test"``). The
-engine's single active-environment selector is ``[ai].environment`` / ``serve --env``
-(``dev``/``staging``/``prod``); this module makes that name readable synchronously inside a Router or
-Handler via :func:`current_environment`.
+engine's single active-environment selector is ``[ai].environment`` / ``serve --env`` (a free-form
+name, ADR 0017); this module makes that name readable synchronously inside a Router or Handler via
+:func:`current_environment`.
 
 It is shaped like :mod:`messagefoundry.config.state` / :mod:`messagefoundry.config.reference`: a
 ContextVar the runner publishes around each router/transform run, read synchronously by the accessor.
@@ -64,7 +66,7 @@ def activated(name: str | None) -> Iterator[None]:
 
 
 def current_environment() -> str | None:
-    """The active environment name (``"dev"``/``"staging"``/``"prod"``), or ``None`` outside a run.
+    """The active environment name (a free-form string, e.g. ``"prod"``/``"test"``), or ``None`` outside a run.
 
     Read it inside a Router/Handler for per-face logic::
 

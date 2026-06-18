@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Synchronous **read side** for transform-accessible state (cross-message correlation, ADR 0005).
 
 A Handler **declares** writes by returning :class:`~messagefoundry.config.wiring.SetState` (applied

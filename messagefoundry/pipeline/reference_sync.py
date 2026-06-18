@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Materializes reference sets off the message path (ADR 0006 Tier 1).
 
 The :class:`ReferenceSyncRunner` is a supervised background loop (modelled on
@@ -115,14 +117,21 @@ async def _load_database_source(
     from messagefoundry.transports.database import _build_dsn, _make_pool
 
     server = str(settings.get("server", ""))
-    if (
-        egress is not None
-        and egress.allowed_db
-        and not _egress_allows(server, settings.get("port", 1433), egress.allowed_db)
-    ):
-        raise ReferenceSyncError(
-            f"DATABASE reference server {server!r} is not in the [egress].allowed_db allowlist"
-        )
+    if egress is not None:
+        # Under deny-by-default an empty allowed_db refuses the dial-out outright (parity with the
+        # DATABASE source / db_lookup gates in wiring_runner.py — this is the one dial-out path that
+        # otherwise ignored the flag).
+        if egress.deny_by_default and not egress.allowed_db:
+            raise ReferenceSyncError(
+                "DATABASE reference source: [egress].deny_by_default is set and [egress].allowed_db "
+                "is empty — list the reference server to permit it"
+            )
+        if egress.allowed_db and not _egress_allows(
+            server, settings.get("port", 1433), egress.allowed_db
+        ):
+            raise ReferenceSyncError(
+                f"DATABASE reference server {server!r} is not in the [egress].allowed_db allowlist"
+            )
     key_col = settings.get("key_column")
     value_col = settings.get("value_column")
     statement = str(settings.get("statement", ""))

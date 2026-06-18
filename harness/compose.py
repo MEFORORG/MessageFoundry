@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Compose tab: send an arbitrary raw HL7 message — including deliberately malformed ones — to
 exercise the engine's error/validation paths the generators can't reach.
 

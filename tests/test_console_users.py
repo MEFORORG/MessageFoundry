@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Headless tests for the console Users page — per-channel scope column + editor (C2)."""
 
 from __future__ import annotations
@@ -82,6 +84,14 @@ def qapp():
     yield QApplication.instance() or QApplication([])
 
 
+def _settle(qapp, runner) -> None:
+    """Let the off-thread user-list reload finish and deliver its result to the main thread
+    (UsersPage.reload now runs /users on a worker thread — M-25 / backlog #2)."""
+    runner._pool.waitForDone(5000)
+    for _ in range(5):
+        qapp.processEvents()
+
+
 def test_scope_label_renders_all_none_and_list() -> None:
     from messagefoundry.console.users_page import _scope_label
 
@@ -96,9 +106,11 @@ def test_users_page_shows_scope_column(qapp) -> None:
     client = FakeClient([_user("alice", None), _user("bob", ["IB_A"])])
     page = UsersPage(client)  # type: ignore[arg-type]
     page.reload()
+    _settle(qapp, page._runner)
     assert page._table.columnCount() == 5
     assert page._table.item(0, 3).text() == "all"  # alice: unscoped
     assert page._table.item(1, 3).text() == "IB_A"  # bob: scoped
+    page.stop()
 
 
 def test_set_scope_sends_list(qapp, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -107,12 +119,14 @@ def test_set_scope_sends_list(qapp, monkeypatch: pytest.MonkeyPatch) -> None:
     client = FakeClient([_user("bob", None)])
     page = users_page.UsersPage(client)  # type: ignore[arg-type]
     page.reload()
+    _settle(qapp, page._runner)
     page._table.setCurrentCell(0, 0)
     monkeypatch.setattr(
         users_page.QInputDialog, "getText", staticmethod(lambda *a, **k: ("IB_A, IB_B", True))
     )
     page._set_scope()
     assert client.scope_calls == [("id-bob", ["IB_A", "IB_B"])]
+    page.stop()
 
 
 def test_set_scope_star_means_all(qapp, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -121,12 +135,14 @@ def test_set_scope_star_means_all(qapp, monkeypatch: pytest.MonkeyPatch) -> None
     client = FakeClient([_user("bob", ["IB_A"])])
     page = users_page.UsersPage(client)  # type: ignore[arg-type]
     page.reload()
+    _settle(qapp, page._runner)
     page._table.setCurrentCell(0, 0)
     monkeypatch.setattr(
         users_page.QInputDialog, "getText", staticmethod(lambda *a, **k: ("*", True))
     )
     page._set_scope()
     assert client.scope_calls == [("id-bob", None)]  # '*' clears the scope (all channels)
+    page.stop()
 
 
 def test_set_roles_prefills_current_roles(qapp, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -136,6 +152,7 @@ def test_set_roles_prefills_current_roles(qapp, monkeypatch: pytest.MonkeyPatch)
     client = FakeClient([_user("bob", None)])  # _user() assigns roles=["operator"]
     page = users_page.UsersPage(client)  # type: ignore[arg-type]
     page.reload()
+    _settle(qapp, page._runner)
     page._table.setCurrentCell(0, 0)
     captured: dict[str, str] = {}
 
@@ -149,6 +166,7 @@ def test_set_roles_prefills_current_roles(qapp, monkeypatch: pytest.MonkeyPatch)
     # can't silently wipe them.
     assert captured["prefill"] == "operator"  # prefilled from the row, not blank
     assert client.role_calls == [("id-bob", ["operator", "viewer"])]
+    page.stop()
 
 
 def test_set_roles_empty_submission_is_confirmed(qapp, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -158,6 +176,7 @@ def test_set_roles_empty_submission_is_confirmed(qapp, monkeypatch: pytest.Monke
     client = FakeClient([_user("bob", None)])
     page = users_page.UsersPage(client)  # type: ignore[arg-type]
     page.reload()
+    _settle(qapp, page._runner)
     page._table.setCurrentCell(0, 0)
     monkeypatch.setattr(
         users_page.QInputDialog, "getText", staticmethod(lambda *a, **k: ("", True))
@@ -169,3 +188,4 @@ def test_set_roles_empty_submission_is_confirmed(qapp, monkeypatch: pytest.Monke
     )
     page._set_roles()
     assert client.role_calls == []  # declined -> nothing stripped
+    page.stop()

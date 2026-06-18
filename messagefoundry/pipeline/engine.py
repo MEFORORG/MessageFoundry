@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The engine: owns the store and supervises the code-first :class:`RegistryRunner`.
 
 This is the object the API layer (and tests) drive. It opens the durable store, recovers
@@ -22,13 +24,16 @@ from messagefoundry.config.models import (
     RetryPolicy,
 )
 from messagefoundry.config.settings import (
+    CertMonitorSettings,
     ClusterSettings,
     EgressSettings,
     ReferenceSettings,
     RetentionSettings,
+    ShadowSettings,
 )
 from messagefoundry.config.wiring import Registry, WiringError, load_config
 from messagefoundry.pipeline.alerts import AlertSink
+from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
@@ -62,9 +67,11 @@ class Engine:
         store: Store,
         *,
         poll_interval: float = 0.25,
+        max_correlation_depth: int = 8,
         config_dir: str | Path | None = None,
         config_reload_roots: Sequence[str | Path] = (),
         inbound_bind_host: str = "127.0.0.1",
+        allow_insecure_bind: bool = False,
         delivery_defaults: RetryPolicy | None = None,
         ordering_default: OrderingMode | None = None,
         internal_error_default: InternalErrorPolicy | None = None,
@@ -72,8 +79,11 @@ class Engine:
         ack_after_default: AckAfter | None = None,
         alert_sink: AlertSink | None = None,
         retention_settings: RetentionSettings | None = None,
+        cert_monitor_settings: CertMonitorSettings | None = None,
+        api_tls_cert_file: str | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings | None = None,
+        shadow_settings: ShadowSettings | None = None,
         active_environment: str | None = None,
         env_values: Mapping[str, Any] | None = None,
         env_values_provider: Callable[[], Mapping[str, Any]] | None = None,
@@ -109,12 +119,20 @@ class Engine:
         # engine builds so a Handler's current_environment() resolves to it (per-face transform logic).
         self._active_environment = active_environment
         self._poll_interval = poll_interval
+        # [pipeline] re-ingress loop-prevention cap (ADR 0013 Increment 2); every runner inherits it.
+        self._max_correlation_depth = max_correlation_depth
         # Where the runner reports operational alerts; None → the runner's default logging sink.
         self._alert_sink = alert_sink
         # [retention] enforcement. None (embedding/tests) → no retention task; the runner itself is a
         # no-op when nothing is configured, so passing default settings is also safe.
         self._retention_settings = retention_settings
         self._retention_runner: RetentionRunner | None = None
+        # [cert_monitor] TLS-cert expiry monitor (Q5c). None (embedding/tests) → no monitor task. The
+        # set of certs to watch is derived at scan time from the [api] TLS cert + the wired graph's MLLP
+        # certs (read live, so a reload that adds/removes a TLS connection is picked up).
+        self._cert_monitor_settings = cert_monitor_settings
+        self._api_tls_cert_file = api_tls_cert_file
+        self._cert_expiry_runner: CertExpiryRunner | None = None
         # [reference] enforcement (ADR 0006). None (embedding/tests) → default settings; the reference
         # sync runner is a no-op when the graph declares no reference sets.
         self._reference_settings = reference_settings
@@ -122,8 +140,13 @@ class Engine:
         # Fail-closed outbound destination allowlist (WP-11c); passed to every runner this engine builds
         # (and the reload dry-run checker), so a denied destination is refused at start + on reload.
         self._egress_settings = egress_settings
+        # [shadow] parallel-run egress suppression (#15); simulate_all_egress is threaded into every
+        # runner this engine builds so a shadow instance suppresses all delivery. None → defaults (off).
+        self._shadow_settings = shadow_settings or ShadowSettings()
         # The interface inbound listeners bind to; every runner this engine builds inherits it.
         self._inbound_bind_host = inbound_bind_host
+        # The serve --allow-insecure-bind dev escape; every runner inherits it for the §0 exposed-gate.
+        self._allow_insecure_bind = allow_insecure_bind
         # Global [delivery] defaults (retry + ordering + internal-error action + buildup thresholds);
         # every runner inherits them. A connection's own retry=/ordering=/internal_error=/buildup= wins.
         self._delivery_defaults = delivery_defaults
@@ -141,6 +164,20 @@ class Engine:
         initial = env_values_provider() if env_values_provider is not None else env_values
         self._env_values: dict[str, Any] = dict(initial or {})
         self._registry_runner: RegistryRunner | None = None
+        # Active-passive graph supervisor (Workstream A1). In CLUSTERED mode the wired graph (listeners
+        # + workers) runs ONLY while this node holds leadership: this task polls leadership and
+        # starts/stops the graph on acquire/lose, so a standby stays warm without binding listeners or
+        # processing. NEVER spawned single-node (NullCoordinator is always leader, so the graph is
+        # brought up directly at start() — byte-identical). The lock serializes reconciles; the event
+        # stops the loop. NOTE the hard guarantee against concurrent double-processing of any given row
+        # is NOT this gate — it is the store's row/lane leases (a standby's reclaim only takes EXPIRED
+        # leases, so it can never claim a row the old leader still holds; Track B Step 2/5). This gate
+        # promptly stops a demoted/fenced node from accepting NEW inbound work and initiating NEW
+        # processing; the poll interval is bounded (at start()) to keep that stop prompt.
+        self._graph_supervisor: asyncio.Task[None] | None = None
+        self._graph_stop = asyncio.Event()
+        self._graph_lock = asyncio.Lock()
+        self._graph_reconcile_interval = 1.0
         # Set when start() runs; the "since" for since-engine-start metric counts.
         self.started_at: float = 0.0
         # The startup config dir is the default reload target and an implicit allowed root.
@@ -159,10 +196,12 @@ class Engine:
         db_path: str | Path,
         *,
         poll_interval: float = 0.25,
+        max_correlation_depth: int = 8,
         synchronous: str = "NORMAL",
         config_dir: str | Path | None = None,
         config_reload_roots: Sequence[str | Path] = (),
         inbound_bind_host: str = "127.0.0.1",
+        allow_insecure_bind: bool = False,
         delivery_defaults: RetryPolicy | None = None,
         ordering_default: OrderingMode | None = None,
         internal_error_default: InternalErrorPolicy | None = None,
@@ -170,8 +209,11 @@ class Engine:
         ack_after_default: AckAfter | None = None,
         alert_sink: AlertSink | None = None,
         retention_settings: RetentionSettings | None = None,
+        cert_monitor_settings: CertMonitorSettings | None = None,
+        api_tls_cert_file: str | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings | None = None,
+        shadow_settings: ShadowSettings | None = None,
         active_environment: str | None = None,
         env_values: Mapping[str, Any] | None = None,
         env_values_provider: Callable[[], Mapping[str, Any]] | None = None,
@@ -186,9 +228,11 @@ class Engine:
         return cls(
             store,
             poll_interval=poll_interval,
+            max_correlation_depth=max_correlation_depth,
             config_dir=config_dir,
             config_reload_roots=config_reload_roots,
             inbound_bind_host=inbound_bind_host,
+            allow_insecure_bind=allow_insecure_bind,
             delivery_defaults=delivery_defaults,
             ordering_default=ordering_default,
             internal_error_default=internal_error_default,
@@ -196,8 +240,11 @@ class Engine:
             ack_after_default=ack_after_default,
             alert_sink=alert_sink,
             retention_settings=retention_settings,
+            cert_monitor_settings=cert_monitor_settings,
+            api_tls_cert_file=api_tls_cert_file,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
+            shadow_settings=shadow_settings,
             active_environment=active_environment,
             env_values=env_values,
             env_values_provider=env_values_provider,
@@ -214,6 +261,7 @@ class Engine:
             self.store,
             poll_interval=self._poll_interval,
             inbound_bind_host=self._inbound_bind_host,
+            allow_insecure_bind=self._allow_insecure_bind,
             delivery_defaults=self._delivery_defaults,
             ordering_default=self._ordering_default,
             internal_error_default=self._internal_error_default,
@@ -221,9 +269,11 @@ class Engine:
             ack_after_default=self._ack_after_default,
             alert_sink=self._alert_sink,
             egress=self._egress_settings,
+            simulate_all=self._shadow_settings.simulate_all_egress,
             env_values=self._env_values,
             active_environment=self._active_environment,
             coordinator=self._coordinator,
+            max_correlation_depth=self._max_correlation_depth,
         )
         self._registry_runner = runner
         return runner
@@ -231,6 +281,13 @@ class Engine:
     @property
     def registry_runner(self) -> RegistryRunner | None:
         return self._registry_runner
+
+    def _monitored_certs(self) -> list[MonitoredCert]:
+        """The TLS certs the engine serves with right now: the ``[api]`` cert + the wired graph's MLLP
+        ``tls_cert_file`` certs (read live off the registry, so a config reload is reflected). Passed to
+        the :class:`CertExpiryRunner` as its cert source so each scan reflects the current graph."""
+        registry = self._registry_runner.registry if self._registry_runner is not None else None
+        return certs_from_registry(registry, self._api_tls_cert_file)
 
     @property
     def coordinator(self) -> ClusterCoordinator:
@@ -308,51 +365,30 @@ class Engine:
             # Fail loud (not at the first received message) if the configured store can't run the
             # staged ingress pipeline: the inbound path unconditionally calls store.enqueue_ingress,
             # so a backend whose enqueue_ingress/handoff is a NotImplementedError stub (SQL Server,
-            # gated on BACKLOG #1) would otherwise wedge every inbound at runtime with no ACK/NAK.
+            # gated on BACKLOG #1) would otherwise wedge every inbound at runtime with no ACK/NAK. This
+            # check fails loud on EVERY node (leader or standby) — a misconfigured backend should refuse
+            # at startup, not only when this node is promoted.
             if not getattr(self.store, "supports_ingest_stage", True):
                 raise RuntimeError(
                     "the configured store backend does not support the staged ingress pipeline "
                     "(ADR 0001 Step A is SQLite-only; SQL Server staging is gated on BACKLOG #1) — "
                     "use the sqlite backend"
                 )
-            # Dead-letter OUTBOUND rows whose outbound was removed/renamed from the config — no worker
-            # would ever drain them, so they'd strand forever (review H-5). After reset_stale_inflight
-            # (so recovered inflight rows are considered) and before the workers start. Scoped to
-            # outbound inside the store, so ingress rows (NULL destination) are never swept up.
-            # NOTE (Track B Step 4): these two config-drift sweeps run UNCONDITIONALLY on every node,
-            # NOT leader-gated, keyed off THIS node's in-process registry. They only dead-letter rows
-            # whose destination/handler has LEFT *this* registry, and gating them on is_leader() at
-            # startup would be racy (leadership is acquired asynchronously after coordinator.start()).
-            # The "idempotent across nodes" property holds ONLY under the implicit assumption that every
-            # clustered node runs IDENTICAL config: a node mid rolling-config-change whose registry has
-            # not yet learned of a newly-added outbound/handler would dead-letter a sibling's valid rows,
-            # and the sweep clears pending AND inflight rows without checking the lease holder, so it can
-            # kill a row another node is actively leasing. Until that is hardened (a possible later
-            # refinement = fold into the leader sweep / scope to rows whose lease is not still live),
-            # clustered nodes MUST run identical config and config changes require a coordinated (not
-            # rolling) restart. On a single node this is byte-identical to before (it always ran).
-            await self.store.dead_letter_missing_destinations(
-                set(self._registry_runner.registry.outbound)
-            )
-            # Likewise dead-letter ROUTED rows whose handler left the registry (a config edit during
-            # downtime) — no transform worker can run a missing handler, so they'd strand forever (the
-            # routed-stage analogue of the above; ADR 0001 Step B). Scoped to stage='routed' inside the
-            # store. Unreachable on a non-staged backend (the supports_ingest_stage gate above raises).
-            await self.store.dead_letter_missing_handlers(
-                set(self._registry_runner.registry.handlers)
-            )
-            # Reference sets (ADR 0006): materialize declared sets BEFORE the listeners start, so a
-            # transform's reference(...) resolves on the very first message; then run the periodic
-            # refresh loop. A no-op when the graph declares none; a sync failure is isolated per-set
-            # (last-good kept) and never blocks intake.
-            # Track B Step 6: the reference sync runner is now leader-gated for materialize-from-source
-            # AND converges every node's read cache from the shared snapshot (the runner holds this
-            # engine's coordinator). So in a cluster the leader reads the external source once and writes
-            # the shared snapshot; every follower converges by reading the shared table (no N-fold source
-            # load, no stale follower caches). NullCoordinator (single-node) is always leader, so this is
-            # byte-identical: materialize from source every pass, converge a no-op.
-            await self._reconcile_reference_sync(startup=True)
-            await self._registry_runner.start()
+            if not self._coordinator.is_clustered():
+                # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
+                # before — byte-identical. The config-drift sweeps + reference materialize + listener
+                # bring-up live in _start_graph (shared with the clustered leader path).
+                await self._start_graph()
+            else:
+                # CLUSTERED (active-passive, Workstream A1): the graph runs ONLY on the leader, so do
+                # NOT bring it up here — the graph supervisor (spawned at the end of start()) starts it
+                # when this node acquires leadership and stops it on loss. A standby stays warm without
+                # binding listeners or running workers. Start the reference-sync loop on EVERY node now
+                # so a follower converges its read cache from the leader's snapshot (the leader also
+                # materializes before listeners in _start_graph). Idempotent: _start_graph re-ensures it.
+                if self._reference_runner is None:
+                    self._reference_runner = self._make_reference_runner()
+                self._reference_runner.start()
         # Retention/purge is independent of the message graph (a store-level maintenance task), so it
         # runs whether or not a graph is wired and survives config reloads. The runner is a no-op when
         # nothing is configured, so this only spawns a task when [retention] is actually set. It is a
@@ -366,16 +402,31 @@ class Engine:
                 coordinator=self._coordinator,
             )
             self._retention_runner.start()
+        # [cert_monitor] TLS-cert expiry monitor (Q5c) — a maintenance task like retention, independent
+        # of the message graph and surviving reloads; a no-op when warn_days=0. NOT leader-gated: certs
+        # are node-local files, so each node alerts on its own (the per-cert realert throttle bounds
+        # spam). The served-cert set is recomputed each scan from the live registry + [api] cert.
+        if self._cert_monitor_settings is not None:
+            self._cert_expiry_runner = CertExpiryRunner(
+                self._monitored_certs,
+                self._cert_monitor_settings,
+                alert_sink=self._alert_sink,
+            )
+            self._cert_expiry_runner.start()
         # Leader lease-reclaim sweep (Track B Step 4) — only in clustered mode (reclaims_inflight()),
         # so single-node / SQLite never spawns it. It is itself leader-gated each pass, so a follower's
         # runner ticks but no-ops; the current leader recovers crashed nodes' expired-lease rows.
-        if self._coordinator.reclaims_inflight():
+        if self._coordinator.reclaims_inflight() and hasattr(self.store, "reclaim_expired_leases"):
+            # Postgres active-active: per-row lease reclaim recovers crashed nodes' EXPIRED-lease rows.
             self._leader_maintenance = LeaderMaintenanceRunner(
-                self.store,  # type: ignore[arg-type]  # Postgres-only reclaim_expired_leases; clustered ⇒ Postgres
+                self.store,  # type: ignore[arg-type]  # reclaim_expired_leases guarded above (Postgres)
                 self._coordinator,
                 interval_seconds=self._cluster_settings.reclaim_interval_seconds,
             )
             self._leader_maintenance.start()
+        # else (SQL Server active-passive): no per-row leases, so there is no reclaim sweep — failover
+        # recovery is the on-promotion reset_stale_inflight in _start_graph (the old leader self-fenced
+        # before its lease expired, so re-pending its in-flight rows can't steal from a live processor).
         # Config-reload convergence (Track B Step 6) — only in clustered mode (is_clustered()), so
         # single-node / SQLite never spawns it. Seed the applied version to the coordinator's CURRENT
         # shared version BEFORE the loop starts, so a fresh node does not immediately self-reload (it is
@@ -400,6 +451,117 @@ class Engine:
                 alert_sink=self._alert_sink,
             )
             self._state_convergence.start()
+        # Active-passive graph supervisor (Workstream A1) — spawned LAST (after _leader_maintenance
+        # exists, so the on-promotion reclaim can fire) and ONLY in clustered mode with a wired graph.
+        # It polls leadership and starts/stops the graph so only the leader binds listeners + runs
+        # workers. The poll interval is kept short (relative to the fence/TTL margin) so a demoted/fenced
+        # node stops accepting + initiating new work promptly; concurrent double-processing of a given
+        # row is independently prevented by the store's row/lane leases (see __init__). Single-node
+        # never spawns it (the graph is already running, brought up directly above).
+        if self._coordinator.is_clustered() and self._registry_runner is not None:
+            ttl = self._cluster_settings.leader_lease_ttl_seconds
+            fence = self._cluster_settings.leader_fence_timeout_seconds
+            # Stay comfortably inside the (ttl - fence) margin and never slower than ~1s.
+            self._graph_reconcile_interval = max(0.1, min(1.0, (ttl - fence) / 3.0))
+            self._graph_stop.clear()
+            # Reconcile ONCE synchronously before the loop: if this node is already the leader (it
+            # acquired the lease on coordinator.start()'s first tick, or in tests a stand-in reports
+            # leader immediately), the graph comes up during start() rather than a poll-interval later.
+            # A real DbCoordinator is usually not-yet-leader here (the lease is acquired asynchronously),
+            # so this is a no-op and the supervisor brings the graph up on promotion.
+            await self._reconcile_graph()
+            self._graph_supervisor = asyncio.create_task(self._graph_supervisor_loop())
+
+    # --- active-passive graph gating (Workstream A1/A3/A4) -------------------
+
+    async def _start_graph(self) -> None:
+        """Bring the wired graph up: (A4) recover the prior leader's stranded in-flight rows + lane
+        leases on promotion, (A3) dead-letter rows whose outbound/handler left the config, materialize
+        reference sets, then start the listeners + workers. In a cluster this runs ONLY on the leader and
+        is (re)invoked on each leadership acquire; single-node runs it once at startup. Idempotent
+        against the runner's own ``running`` guard."""
+        if self._registry_runner is None:
+            return
+        # A4 — on promotion (clustered Postgres), recover the prior leader's stranded in-flight rows AND
+        # take over its lane leases IMMEDIATELY (owner-scoped, lease-blind), instead of waiting out the
+        # ~[store].lease_ttl_seconds per-row/lane lease TTL — which was the dominant failover-recovery
+        # delay (#293: ~60s on PG vs ~7s on SQL Server). This brings Postgres to parity with the SQL
+        # Server reset_stale_inflight path; the periodic, lease-GATED sweep keeps running in the
+        # background (clock-skew / future active-active recovery). Single-node has no leader maintenance
+        # (_leader_maintenance is None), and its own crash residue was already recovered by the
+        # unconditional reset_stale_inflight in start().
+        if self._leader_maintenance is not None:
+            await self._leader_maintenance.recover_on_promotion()
+        elif self._coordinator.is_clustered():
+            # Active-passive without per-row leases (SQL Server): on promotion, re-pend the prior
+            # leader's in-flight rows. The prior leader self-fenced and its leadership lease EXPIRED
+            # before this node could acquire it, so it has stopped processing — and the graph runs ONLY
+            # on the leader, so there is no live sibling whose rows an unconditional reset could steal.
+            # (Single-node NullCoordinator is_clustered() is False, so this never runs there; its boot
+            # residue was already recovered by the unconditional reset_stale_inflight in start().)
+            await self.store.reset_stale_inflight()
+        # A3 — dead-letter OUTBOUND/ROUTED rows whose destination/handler left the config (no worker
+        # would ever drain them). Now part of graph bring-up, so in a cluster ONLY the leader (the one
+        # node that runs the graph) sweeps — a restarting standby never dead-letters the primary's
+        # in-flight rows (the hazard the old unconditional placement carried). Single-node is unchanged
+        # (it always runs the graph). Keyed off THIS node's registry, so clustered nodes must still run
+        # identical config (a coordinated, not rolling, restart for config changes).
+        await self.store.dead_letter_missing_destinations(
+            set(self._registry_runner.registry.outbound)
+        )
+        await self.store.dead_letter_missing_handlers(set(self._registry_runner.registry.handlers))
+        # Reference sets (ADR 0006): materialize declared sets BEFORE listeners accept (a transform's
+        # reference(...) resolves on the first message), then keep the periodic loop running (idempotent
+        # — already started on every node in start() for clustered followers to converge). Leader-gated
+        # materialize inside the runner; a sync failure is isolated per-set and never blocks intake.
+        await self._reconcile_reference_sync(startup=True)
+        await self._registry_runner.start()
+        log.info("engine graph started — this node is processing")
+
+    async def _stop_graph(self) -> None:
+        """Tear the graph down on loss of leadership: stop the listeners + workers so a demoted node
+        stops binding/processing. The reference-sync loop and the self-gated maintenance/convergence
+        loops keep running (a follower still converges its caches), so only the runner is stopped."""
+        if self._registry_runner is not None:
+            await self._registry_runner.stop()
+        log.info("engine graph stopped — this node is now standby")
+
+    async def _reconcile_graph(self) -> None:
+        """Align the running graph with this node's leadership: start it on becoming leader, stop it on
+        losing leadership. Serialized by ``_graph_lock`` so overlapping triggers can't double act."""
+        if self._registry_runner is None:
+            return
+        async with self._graph_lock:
+            running = self._registry_runner.running
+            if self._coordinator.is_leader() and not running:
+                await self._start_graph()
+                # Leadership can be lost DURING the (potentially slow) bring-up — a fence mid-start. If
+                # so, tear straight back down within the same lock so a demoted node never keeps the
+                # graph running for a whole extra poll cycle.
+                if not self._coordinator.is_leader():
+                    await self._stop_graph()
+            elif not self._coordinator.is_leader() and running:
+                await self._stop_graph()
+
+    async def _graph_supervisor_loop(self) -> None:
+        """Active-passive graph supervisor (Workstream A1): poll leadership and start/stop the graph so
+        only the leader binds listeners + runs workers. Polled at ``_graph_reconcile_interval`` (kept
+        short so a demotion/fence promptly stops this node accepting + initiating new work; the row/lane
+        leases independently prevent concurrent double-processing of a given row). Clustered only;
+        cooperatively stopped via ``_graph_stop`` (the loop wakes on it and exits between reconciles)."""
+        while not self._graph_stop.is_set():
+            try:
+                await self._reconcile_graph()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("engine graph supervisor reconcile failed; will retry")
+            try:
+                await asyncio.wait_for(
+                    self._graph_stop.wait(), timeout=self._graph_reconcile_interval
+                )
+            except asyncio.TimeoutError:
+                pass
 
     def _set_applied_config_version(self, version: int) -> None:
         """Setter the convergence runner calls after a successful follower reload (Track B Step 6)."""
@@ -487,6 +649,7 @@ class Engine:
                 ack_after_default=self._ack_after_default,
                 alert_sink=self._alert_sink,
                 egress=self._egress_settings,
+                simulate_all=self._shadow_settings.simulate_all_egress,
                 env_values=self._env_values,
                 coordinator=self._coordinator,
             )
@@ -551,8 +714,24 @@ class Engine:
     async def stop(self) -> None:
         """Stop the retention task + the wired graph, then close the store."""
         log.info("engine stopping")
+        # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
+        # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
+        # the stop event and let any in-flight reconcile finish under the lock (so we never abandon a
+        # half-started graph), falling back to cancel only if a reconcile hangs past the timeout. The
+        # graph itself is then stopped by the registry_runner.stop() below, as before.
+        if self._graph_supervisor is not None:
+            self._graph_stop.set()
+            supervisor = self._graph_supervisor
+            self._graph_supervisor = None
+            try:
+                await asyncio.wait_for(supervisor, timeout=10.0)
+            except asyncio.TimeoutError:
+                # wait_for already cancelled the task on timeout; absorb its cancellation.
+                await asyncio.gather(supervisor, return_exceptions=True)
         if self._retention_runner is not None:
             await self._retention_runner.stop()
+        if self._cert_expiry_runner is not None:
+            await self._cert_expiry_runner.stop()
         # Stop the leader sweep before deregistering membership (it consults the coordinator's gate, so
         # it must quiesce while the coordinator is still up). A no-op when single-node (never spawned).
         if self._leader_maintenance is not None:

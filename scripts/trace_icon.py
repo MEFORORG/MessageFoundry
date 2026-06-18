@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """One-off: trace the flat-silhouette media/icon.png into a themeable currentColor SVG.
 
 Stdlib only (zlib/struct). Decodes the indexed PNG, builds a foreground mask, prints an ASCII

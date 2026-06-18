@@ -30,6 +30,8 @@ Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sa
 | `FILE-OUT` | outbound | folder write | File Writer | ✅ |
 | `TCP-IN` | inbound | raw TCP listener (configurable framing) | TCP Listener | ✅ |
 | `TCP-OUT` | outbound | raw TCP sender (configurable framing) | TCP Sender | ✅ |
+| `X12-IN` | inbound | raw TCP listener, ISA/IEA-framed X12 EDI | TCP Listener (X12) | ✅ |
+| `X12-OUT` | outbound | raw TCP sender, X12 EDI (verbatim) | TCP Sender (X12) | ✅ |
 | `SFTP-IN` | inbound | SFTP poll | File Reader (SFTP scheme) | ⏳ planned |
 | `SFTP-OUT` | outbound | SFTP write | File Writer (SFTP scheme) | ⏳ planned |
 | `SOAP-IN` | inbound | SOAP endpoint | Web Service Listener | ⏳ planned † |
@@ -94,8 +96,13 @@ registry the factories produce, so the runtime, validation, and egress gating ar
 name      = "IB_ACME_ADT"
 transport = "mllp"
 router    = "acme_adt_router"   # binds a router declared in a .py module
+bind_address        = "0.0.0.0"                     # optional: override [inbound].bind_host here
+source_ip_allowlist = ["10.0.0.0/8", "192.0.2.7"]   # optional: only these peers may connect (MLLP/TCP)
   [inbound.settings]
   port = 2576
+  [inbound.metadata]                                # optional operator labels (API-surfaced, not routing)
+  owner   = "integration-team"
+  runbook = "https://wiki/acme-adt"
 
 [[outbound]]
 name      = "OB_EPIC_ADT"
@@ -103,6 +110,8 @@ transport = "mllp"
   [outbound.settings]
   host = { env = "epic_host" }            # resolved per environment (environments/<env>.toml)
   port = { env = "epic_port", cast = "int" }
+  [outbound.metadata]
+  owner = "integration-team"
 ```
 
 - The `transport` maps to the same factory (`MLLP`/`Tcp`/`File`/`Rest`/`Database`/`DatabasePoll`/
@@ -153,16 +162,58 @@ collision.
 | `max_frame_bytes` | both | `16 MiB` | reject a single MLLP frame larger than this before buffering it whole (OOM guard); applies to inbound frames and outbound ACKs. `None`/`0` = unlimited. |
 | `connect_timeout` | out | `10.0` | TCP connect timeout (s) |
 | `timeout_seconds` | out | `30.0` | wait this long for the ACK |
+| `tls` | both | `false` | **`[BUILT]` (WP-13b, ADR 0002):** wrap the connection in TLS (1.2+). |
+| `tls_cert_file` | both | — | **in:** the server-identity cert (required when `tls`). **out:** a client cert for mTLS (optional). PEM path. |
+| `tls_key_file` | both | — | private key for `tls_cert_file`. |
+| `tls_ca_file` | both | — | trust anchor — **in:** verify client certs (opt-in mTLS → require a client cert); **out:** verify the server cert. |
+| `tls_verify` | out | `true` | verify the server's certificate. `false` is MITM-able → refused unless `MEFOR_ALLOW_INSECURE_TLS=1` (loud warning), like LDAPS / SQL Server. |
+| `tls_check_hostname` | out | `true` | require the server cert to match `host` (SNI + hostname check). |
 
 Plus on `inbound(...)`: `ack_mode` (`original`/`enhanced`/`none`), `strict`, `hl7_version`. On
-`outbound(...)`: `retry` (`RetryPolicy`).
+`outbound(...)`: `retry` (`RetryPolicy`), `ordering`, `internal_error`, `buildup`, and `simulate`
+(`bool`, default `false`). `simulate=True` puts the outbound in **shadow / parallel-run mode** (#15): it
+runs the full transform + count-and-log and finalizes the message `PROCESSED`, but **suppresses the real
+egress** (no bytes/SQL leave the box) and retains the would-send payload for parity comparison — so a
+shadow instance can process real traffic without double-delivering. Set it per-outbound here, or force it
+on for every outbound with `[shadow].simulate_all_egress` (see [CONFIGURATION.md](CONFIGURATION.md)). A
+simulated lane shows as `simulated` on `GET /connections` and `[SIMULATED]` in the console.
 
-> **Inbound bind interface (service-level).** Inbound MLLP/TCP listeners take **only a port** —
-> passing a `host` is a wiring error. Every inbound binds to the service-level `[inbound].bind_host`
-> (default `127.0.0.1`). Binding `0.0.0.0` exposes unauthenticated MLLP to the network, so the
-> interface is a deliberate **per-environment operator decision** (DEV typically loopback, PROD a
-> specific NIC or `0.0.0.0` behind a firewall) set in `messagefoundry.toml`, never authored per
-> connection. See [docs/CONFIGURATION.md](CONFIGURATION.md).
+> **TLS** composes with the fail-closed `[egress].allowed_mllp` allowlist (both enforced). A non-loopback
+> MLLP listener should set `tls=true`; loopback test rigs may stay plaintext.
+
+**Operability (optional, validated at wiring time — caught in dry-run / `messagefoundry check`):**
+`metadata` — a free-form table of operator labels (owner / runbook / environment) on **either**
+direction, surfaced by the API and never used for routing. On an **MLLP/TCP inbound** only:
+`bind_address` overrides the service `[inbound].bind_host` for that one listener, and
+`source_ip_allowlist` restricts it to the listed peer IPs / CIDR networks — fail-closed when set; omit
+or leave empty for no restriction.
+
+> **Inbound bind interface (service-level, with a per-connection override).** Inbound MLLP/TCP
+> listeners take **only a port** — passing a `host` is a wiring error. Every inbound binds to the
+> service-level `[inbound].bind_host` (default `127.0.0.1`). Binding `0.0.0.0` exposes unauthenticated
+> MLLP to the network, so the interface is a deliberate **per-environment operator decision** (DEV
+> typically loopback, PROD a specific NIC or `0.0.0.0` behind a firewall) set in `messagefoundry.toml`.
+> A single connection may override it with a per-connection **`bind_address`** (same operator decision,
+> scoped to one listener; the same off-loopback risk applies), and **`source_ip_allowlist`** restricts
+> which peers that listener accepts. See [docs/CONFIGURATION.md](CONFIGURATION.md).
+
+#### Inspecting & testing a connection (API)
+
+Two read/diagnostic endpoints back the console's connection view (auth + per-channel RBAC apply — see
+[SECURITY.md](SECURITY.md)):
+
+- **`GET /connections/{name}/metadata`** (`monitoring:read`) — the connector type, the operator
+  `metadata` labels, running state, and a **secret-scrubbed** settings view (`env()` refs show as
+  `{"env": key}` and are never resolved; credential fields render as `"***"`). Inbound is per-channel;
+  a shared outbound is barred to channel-scoped users.
+- **`POST /connections/{name}/test`** (`connections:test`) — a **reachability probe** that builds a
+  *fresh* connector (never the live one), honors the `[egress]` allowlist fail-closed, and **sends no
+  real message** — a socket connect (MLLP/TCP/X12), `SELECT 1` (Database), an HTTP `HEAD` (REST/SOAP),
+  a directory-writability check (File), or an SFTP/FTP connect (RemoteFile). It is **audited**. The
+  result is `{supported, success, detail}`: a listen source (MLLP/TCP/X12) or a Timer reports
+  `supported=false` (nothing external to probe), and a `401/403` from an HTTP endpoint is a *failure*
+  (bad credentials), not a pass. A probe never sends data, but a File/RemoteFile probe may create the
+  target directory, exactly as a real delivery would.
 
 > **At-least-once / duplicates:** an outbound delivery that is sent but whose ACK is lost
 > (peer closes or times out after receiving) is retried, so the receiver may see a duplicate.
@@ -215,10 +266,84 @@ outbound("TCP-OUT_DOWNSTREAM_X12", Tcp(host="downstream", port=9200, framing="vt
 - **Egress allowlist.** A `Tcp(...)` destination is gated by `[egress].allowed_tcp` (host or
   host:port); an inbound `Tcp(...)` is a local listener and is not connect-gated. See
   [docs/CONFIGURATION.md](CONFIGURATION.md).
-- **Deferred follow-ups:** structured X12 parsing (ISA/GS/ST) and X12 acknowledgements (997/TA1)
-  are intentionally **not** built — this round is framing + opaque relay only. **Length-prefix
-  framing** (a leading byte count instead of an end delimiter) is also a follow-up; only
-  delimiter framing is supported today.
+- **Structured X12 parsing** (ISA/GS/ST) is now available as a **pure library** —
+  `messagefoundry.parsing.x12` ([ADR 0012](adr/0012-x12-edi-codec.md)) — that a Router/Handler calls
+  on demand against the `RawMessage`. For X12 feeds that arrive with **no transport sentinel** (the
+  interchange itself is the frame), use the dedicated **`X12(...)`** connector below instead of
+  `Tcp(...)`.
+- **Deferred follow-ups:** X12 acknowledgements (997/TA1) and strict implementation-guide validation
+  are intentionally **not** built. **Length-prefix framing** (a leading byte count instead of an end
+  delimiter) is also a follow-up; only delimiter framing is supported by `Tcp(...)` today.
+
+### X12 EDI — `X12(...)`
+
+A raw-TCP transport (source **and** destination) for **ASC X12 EDI** that frames by the **interchange
+itself** (`ISA…IEA`) — there is **no transport sentinel**, and the segment terminator is **discovered
+from each ISA header** (it may even be `CR`+`LF`), so `X12(...)` takes **no framing knobs**
+([ADR 0012](adr/0012-x12-edi-codec.md)). Use it when partners send bare interchanges; use `Tcp(...)`
+when each interchange is wrapped in a fixed sentinel (STX/ETX, VT/FS). The payload is relayed
+**opaquely** — pair an inbound `X12(...)` with `content_type="x12"` so it routes as a `RawMessage`
+([ADR 0004](adr/0004-payload-agnostic-ingress.md)); a Router/Handler parses it on demand via
+`messagefoundry.parsing.x12` (a cheap `X12Peek` for routing, `X12Message` for transforms).
+
+| Setting | Dir | Default | Meaning |
+|---------|-----|---------|---------|
+| `host` | out | — (required) | the downstream peer to dial. **Inbound takes no host** (wiring error) — listeners bind the service-level `[inbound].bind_host`. |
+| `port` | both | — (required) | bind/connect port |
+| `encoding` | both | `utf-8` | charset used to encode/decode the interchange bytes |
+| `max_connections` | in | `256` | cap on concurrent client connections (flood guard). `None`/`0` = unlimited. |
+| `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris). `None`/`0` = no timeout. |
+| `max_interchange_bytes` | both | `16 MiB` | reject a single interchange larger than this before it completes (OOM guard); applies inbound and to any returned interchange. `None`/`0` = unlimited. |
+| `connect_timeout` | out | `10.0` | TCP connect timeout (s) |
+| `timeout_seconds` | out | `30.0` | send / await-reply timeout (s) |
+| `expect_reply` | out | `false` | read one returned interchange and treat receiving it as confirmation (not parsed). `false` = fire-and-forget after the write. |
+| `capture_response` | out | `false` | **synchronous request/response** (ADR 0016): capture the returned **271/TA1** as a reply (ADR 0013). Implies a reply is read; a **TA1** is classified (below). |
+| `reingress_to` | out | — | route the captured reply into this `Loopback()` inbound; **implies `capture_response=True`** (ADR 0013). Requires `expect_reply=True`. |
+| `ta1_required` | out | `false` | a delivery that reads **no** TA1/business reply within `timeout_seconds` is a `DeliveryError` (retry), for partners who always TA1. Set `true` on RTE feeds. |
+
+```python
+from messagefoundry import X12, ContentType, inbound, outbound
+
+# Receive bare ISA…IEA interchanges over TCP; route opaquely as a RawMessage.
+inbound("X12-IN_PARTNER_270", X12(port=2710), router="partner_x12_router",
+        content_type=ContentType.X12)
+# Relay verbatim to a downstream payer.
+outbound("X12-OUT_PAYER", X12(host="payer.example.org", port=5010))
+
+# Real-time eligibility (270 → 271 on one socket): capture the 271 + route it back.
+outbound("X12-OUT_RTE", X12(host="payer.example.org", port=5010,
+                            expect_reply=True, reingress_to="X12-IN_ELIG_RESULT", ta1_required=True))
+inbound("X12-IN_ELIG_RESULT", Loopback(), router="route_elig_result",
+        content_type=ContentType.X12)   # the captured 271 re-ingresses as a RawMessage
+```
+
+See `samples/config/IB_PARTNER_X12.py` + `samples/messages/x12_270_eligibility.edi` for a runnable
+example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
+
+- **No X12 ACK on the *inbound*.** An `X12(...)` source does **not** generate a TA1/997/999. If a
+  Handler returns a payload it is written back **verbatim** on the same connection; returning `None`
+  sends nothing.
+- **Synchronous request/response on the *outbound* (ADR 0016).** With `capture_response`/`reingress_to`
+  the destination blocks for the returned interchange and classifies a **TA1** interchange ack:
+  **TA1\*A** → accepted; **TA1\*R** → permanent reject → **dead-letter**; **TA1\*E** →
+  accepted-with-warning (delivered, **not** retried, logged). A business **271/277/278** returned
+  *instead of* a TA1 is itself the confirmation and rides re-ingress. Only a **TA1** is a transport
+  retry gate — **999/997** functional acks are content, routed by a Handler. A non-idempotent 270
+  re-sent in the at-least-once crash window yields a fresh 271 captured at the next `response_seq`
+  (latest-wins) — the partner must tolerate a re-send. The **X12-over-REST** variant is zero new code
+  (`Rest(..., reingress_to=...)` captures the bare-X12 HTTP body); the **X12-over-SOAP** variant needs
+  the trigger Handler to build the SOAP envelope and the `Loopback()` handler to un-wrap the response
+  envelope (declare it `content_type="soap"`/raw) before peeking via `parsing/x12`.
+- **Opaque relay; delimiters discovered.** The connector never rewrites the bytes — delimiters are
+  read from the ISA, not configured, and the interchange is preserved verbatim in the store.
+- **At-least-once / duplicates.** An outbound send may be retried — **the receiver must be
+  idempotent.**
+- **Egress allowlist.** An `X12(...)` destination shares `[egress].allowed_tcp` (host or host:port);
+  an inbound `X12(...)` is a local listener and is not connect-gated.
+- **Deferred follow-ups:** **TA1** classification on a *capturing outbound* is built (ADR 0016); an
+  *inbound* TA1/997/999 **generator**, outbound **999/997** functional-ack classification, and strict
+  implementation-guide validation are **not** built (a Router can branch on `X12Peek`'s `ST01`/`GS08`
+  today).
 
 ### File — `File(...)`
 
@@ -316,8 +441,9 @@ outbound(
 
 An **outbound** SQL connector ([ADR 0003](adr/0003-non-hl7-transports-database-rest-soap.md)) — **SQL
 Server** today, via the `[sqlserver]` extra (`pip install 'messagefoundry[sqlserver]'`) + the Microsoft
-ODBC Driver 18, **lazily imported** (SQLite-only installs unaffected). **Status: experimental**, like
-the SQL Server *store* backend — the live round-trip is exercised only by the CI service-container job.
+ODBC Driver 18, **lazily imported** (SQLite-only installs unaffected). **Status: production / supported**
+— the live aioodbc round-trip is exercised by the CI SQL Server service-container job. (The SQL Server
+*store* backend is a **separate** layer, also production; the connector doesn't depend on it.)
 The **inbound** direction is the DB poll source below (`DatabasePoll(...)`).
 
 The Handler produces a **JSON-object** body; the connector binds its keys to the `:name` parameters in
@@ -371,7 +497,7 @@ outbound(
 
 The **inbound** DB poll ([ADR 0003](adr/0003-non-hl7-transports-database-rest-soap.md) §3 + the
 payload-agnostic ingress of [ADR 0004](adr/0004-payload-agnostic-ingress.md)). Same connection settings
-and `[sqlserver]`-extra / experimental status as the destination above; it is the File source's
+and `[sqlserver]`-extra / production status as the destination above; it is the File source's
 *process-then-mark-done* shape with a query instead of a directory. Every `poll_seconds` it runs
 `poll_statement` (a `SELECT`), hands each row to the bound Router as a body, then — **only after the
 handler returns** — runs `mark_statement` (bound from the row's columns) so the row isn't re-read.
@@ -463,6 +589,117 @@ outbound(
     Soap(url=env("acme_soap_url"), soap_action="urn:SubmitOrder"),
 )
 ```
+
+#### WS-\* mode — mutual TLS + WS-Security / WS-Addressing ([ADR 0015](adr/0015-ws-soap-outbound-mtls-wssecurity.md))
+
+For a certificate-authenticated service with a hardened WS-\* contract, opt in to **WS-\* mode**. The key
+difference: in WS-\* mode the **Handler returns only the operation `<Body>` fragment** (e.g. the element
+wrapping an HL7 payload) — **not** the full envelope. The transport builds the `<soap:Envelope>` and
+**stamps the non-deterministic headers in `send()`** (`<wsa:MessageID>`, `<wsu:Timestamp>`, optional
+`<wsse:UsernameToken>` Nonce/Created), so a **pure transform never mints a per-call nonce/timestamp**
+(re-run purity). **WS-\* requires `soap_version="1.2"`.**
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `client_cert_file` / `client_key_file` | — | **mutual TLS** client cert + key (PEM path or `env()` text). Must be set together; server verification stays on, so **incompatible with `verify_tls=false`**. |
+| `client_key_password` | — | key passphrase (a **secret** — via `env()`) |
+| `ws_security` | `false` | stamp `<wsse:Security>` (a `Timestamp` + optional `UsernameToken`) |
+| `ws_username` / `ws_password` | `basic_*` | `UsernameToken` credentials (secrets — via `env()`) |
+| `ws_password_type` | `text` | `text` (PasswordText; **recommended over mTLS**) or `digest` (PasswordDigest, computed in `send()`) |
+| `ws_addressing` | `false` | stamp `<wsa:Action>` (from `soap_action`), `<wsa:To>` (from `url`), `<wsa:MessageID>` (per-call) |
+| `ws_timestamp_ttl_seconds` | `300` | the `Created`→`Expires` window |
+
+**Operational notes (read before going live):**
+- **Populate `[egress].allowed_http`.** The host gate is fail-closed only **once configured** — an empty
+  allowlist gates nothing. A WS-\* mTLS destination carries PHI, so set its host in `[egress].allowed_http`.
+- **`ws_timestamp_ttl_seconds` must be ≥ the worst-case retry backoff.** The timestamp is re-stamped on
+  each `send()`, but a held FIFO lane plus a short TTL can fail the peer's `Expires` check.
+- **Idempotency footgun.** An at-least-once **re-send mints a fresh `<wsa:MessageID>`** (correct WS-\*
+  retry semantics) for the *same* clinical message — the partner's submit operation **must dedup** a
+  re-send as a retry, not a duplicate submission. (A stable engine-side idempotency key is deferred to the
+  XML-DSig follow-up.)
+- **Scope:** WS-Security here is `Timestamp` + `UsernameToken` only; **XML-DSig body signing is not yet
+  supported** (ADR 0015 §4).
+- A WS-Security auth/expiry fault (`FailedAuthentication` / `InvalidSecurityToken` / `MessageExpired`)
+  **dead-letters** (a credential/expiry reject won't fix on a retry).
+
+```python
+from messagefoundry import outbound, Soap, env
+
+outbound(
+    "SOAP-OUT_REGISTRY_SUBMIT",
+    Soap(
+        url=env("registry_url"),
+        soap_version="1.2",
+        soap_action="urn:submitSingleMessage",
+        client_cert_file=env("registry_client_cert"),
+        client_key_file=env("registry_client_key"),
+        client_key_password=env("registry_key_pw"),
+        ws_addressing=True,
+        ws_security=True,
+        ws_username=env("registry_user"),
+        ws_password=env("registry_pw"),
+        capture_response=True,  # capture the submit confirmation/error (ADR 0013)
+    ),
+)
+# The Handler returns ONLY the <Body> fragment, e.g. "<submitSingleMessage>…HL7…</submitSingleMessage>".
+```
+
+### Loopback — `Loopback()` + `reingress_to=` (request → response → route, ADR 0013)
+
+A **request/response** feed sends a query to a partner and **routes the partner's answer**. The capturing
+outbound names a **loopback inbound** with `reingress_to=`; the captured reply is re-ingressed as a *new*
+inbound message and routed by that loopback's `router`, exactly like any inbound.
+
+- **`Loopback()`** is an inbound with **no source** — messages arrive *only* via the engine-internal
+  re-ingress, never a socket/poll. It takes a `router` and `content_type` (`hl7v2` → `Message`;
+  `x12`/`text`/`json` → `RawMessage`); it takes **no** `ack_mode` (forced `NONE` — no peer to ACK), no
+  `bind_address`/`source_ip_allowlist` (no socket), and no `strict` validation (no untrusted intake).
+- **`reingress_to="<loopback inbound name>"`** on a capturing outbound (`MLLP`/`Tcp`/`Rest`/`Soap`/
+  `Database`) **implies `capture_response=True`** and points the reply at that loopback. It is validated at
+  `messagefoundry check` / dry-run (the target must exist and be a `Loopback()`), both code-first and via
+  `connections.toml` (`reingress_to` is a `[settings]` field).
+- A re-ingressed reply's Handler can read the **original request's** captured reply with
+  `response_get("<the query outbound>")`. Re-ingress is **exactly-once** (a guarded handoff, no
+  double-injection) and loop-bounded by `[pipeline] max_correlation_depth` (default 8): a reply chain
+  deeper than the cap dead-letters and the origin is marked `ERROR`. Today's status (`docs/api/test`) is
+  visible on the message timeline (`reingressed` / `received (reingress …)` events) and the message
+  metadata (`correlation_id` / `correlation_root_id`).
+
+```python
+# loopback inbound — NO source; the eligibility result arrives via re-ingress and is routed here.
+inbound("IB-LOOP_PAYER_ELIG", Loopback(), router="route_elig_result", content_type=ContentType.HL7V2)
+
+# capturing outbound — declares BOTH "capture" and "where the reply re-enters" in one place.
+outbound("MLLP-OUT_PAYER_ELIG", MLLP(host=env("payer_host"), port=2575, reingress_to="IB-LOOP_PAYER_ELIG"))
+# a Handler Sends the eligibility query to MLLP-OUT_PAYER_ELIG; its reply re-ingresses into IB-LOOP_PAYER_ELIG.
+```
+
+## Resource management & limits (ASVS 13.1.2 / 13.1.3 / 13.2.6)
+
+How the engine bounds connections, threads, and retries per external system, and what happens **when a
+limit is reached** — the resource-management contract a reviewer needs.
+
+- **Concurrent connections & behaviour at the limit (13.1.2 / 13.2.6).** *Inbound* listeners enforce a
+  bounded `max_connections` plus an accept throttle; past the cap new clients are not accepted until one
+  frees (slowloris/flood guard). *Outbound* runs **exactly one delivery worker per outbound connection**,
+  so concurrent borrows from any connection/driver pool are bounded to that single worker — a pool's
+  `pool_max` is not exhausted under normal flow. A database pool `acquire` currently **waits** for a free
+  connection (no explicit acquire timeout *yet* — a finite acquire timeout is tracked as WP-L3-07 in
+  [security/ASVS-L3-REMEDIATION-PLAN.md](security/ASVS-L3-REMEDIATION-PLAN.md)); the operation is still
+  bounded by the connector's `timeout_seconds`.
+- **Timeouts.** Every networked connector exposes `connect_timeout` / `timeout_seconds` (and inbound
+  `receive_timeout`) — see the per-connector tables above. For **synchronous** request→response feeds
+  (REST/SOAP, X12 270/271) set a **short** `timeout_seconds`.
+- **Retry strategy (13.1.3).** Delivery failures retry per the connection's `RetryPolicy`. **Note the
+  default `retry_max_attempts` is `None` = retry forever** (with backoff). For synchronous HTTP
+  (REST/SOAP) **set a finite `retry_max_attempts` and a short `timeout_seconds`** to prevent cascading
+  delays / resource exhaustion; failures classified *permanent* go straight to the dead-letter path
+  rather than retrying.
+- **Resource release & recovery.** Sockets, cursors, and pool connections are released in `try/finally`
+  (e.g. `transports/mllp.py`, `transports/database.py`); long-running workers are **cooperatively
+  cancelled** on stop. The staged queue is at-least-once, so an in-flight row left by a crash is
+  recovered on startup (`reset_stale_inflight`), never leaked.
 
 ## Competitive parity — full connector catalog
 

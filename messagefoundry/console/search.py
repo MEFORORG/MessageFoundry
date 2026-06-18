@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Log Search page: search options on top, the message list below, and the single-message
 detail (parse tree / raw / deliveries / audit) at the bottom. Composes the existing
 ``MessagesPanel`` and ``MessageDetailPanel``, stacked vertically.
@@ -17,10 +19,10 @@ class LogSearchPage(QWidget):
 
     error = Signal(str)
 
-    def __init__(self, client: EngineClient) -> None:
+    def __init__(self, client: EngineClient, *, poll_client: EngineClient | None = None) -> None:
         super().__init__()
-        self.messages = MessagesPanel(client)
-        self.detail = MessageDetailPanel(client)
+        self.messages = MessagesPanel(client, poll_client=poll_client)
+        self.detail = MessageDetailPanel(client, poll_client=poll_client)
 
         self.messages.message_selected.connect(self.detail.load)
         self.messages.selection_cleared.connect(self.detail.clear)
@@ -48,3 +50,8 @@ class LogSearchPage(QWidget):
     def set_channel(self, channel_id: str) -> None:
         """Filter the list to one channel (used by the Connections 'Logs' link)."""
         self.messages.set_channel_filter(channel_id)
+
+    def stop(self) -> None:
+        """Stop the message-list + detail background runners (call on window close)."""
+        self.messages.stop()
+        self.detail.stop()

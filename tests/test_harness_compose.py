@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The harness Compose tab: presets seed the editor, fire-and-forget send skips the ACK wait, and
 the ACK-expectation match logic classifies results correctly."""
 

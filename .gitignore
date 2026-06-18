@@ -11,6 +11,7 @@ dist/
 *.db
 *.db-wal
 *.db-shm
+*.pid
 out/
 harness_io/
 *.log
@@ -48,6 +49,6 @@ secrets/
 TRANSCRIPTS.md
 
 # Local planning/marketing/security working docs — keep out of the repo
-/docs/DUAL_LICENSING_PLAN.md
+# (docs/DUAL_LICENSING_PLAN.md is now a committed artifact — see ADR 0017 / #13 licensing)
 /docs/marketing/
 /docs/security/CISO-REVIEW.md

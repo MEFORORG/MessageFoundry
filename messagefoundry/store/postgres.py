@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """PostgreSQL implementation of the :class:`~messagefoundry.store.base.Store` protocol.
 
 A **production** server-database backend with single-node parity to the SQLite
@@ -54,6 +56,8 @@ from messagefoundry.config.settings import (
     StoreSettings,
     insecure_tls_allowed,
 )
+from messagefoundry.redaction import safe_text
+from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import Row
 from messagefoundry.store.crypto import PREFIX as _ENC_PREFIX
 from messagefoundry.store.crypto import AesGcmCipher, Cipher, CipherError, IdentityCipher
@@ -62,7 +66,9 @@ from messagefoundry.store.store import (
     DbStatus,
     DestinationMetrics,
     InboundMetrics,
+    CapturedResponse,
     MessageStatus,
+    MessageStore,
     OutboxItem,
     OutboxStatus,
     SessionRecord,
@@ -171,6 +177,20 @@ _SCHEMA: list[str] = [
         synced_at DOUBLE PRECISION NOT NULL,
         row_count INTEGER NOT NULL
     )""",
+    # Captured request/response replies (ADR 0013) — immutable artifact, NOT a queue stage, so it is
+    # invisible to _maybe_finalize_message's `FROM queue` scan. response_seq is replay-stable (1+MAX,
+    # not queue.attempts which replay resets). body/detail are cipher-encrypted at rest (PHI).
+    """CREATE TABLE IF NOT EXISTS response (
+        message_id       TEXT NOT NULL REFERENCES messages(id),
+        destination_name TEXT NOT NULL,
+        response_seq     INTEGER NOT NULL,
+        body             TEXT,
+        outcome          TEXT NOT NULL,
+        detail           TEXT,
+        captured_at      DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY (message_id, destination_name, response_seq)
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_response_message ON response(message_id)",
     """CREATE TABLE IF NOT EXISTS audit_log (
         id         BIGSERIAL PRIMARY KEY,
         ts         DOUBLE PRECISION NOT NULL,
@@ -181,6 +201,19 @@ _SCHEMA: list[str] = [
         row_hash   TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts)",
+    """CREATE TABLE IF NOT EXISTS pending_approvals (
+        id           TEXT PRIMARY KEY,
+        operation    TEXT NOT NULL,
+        params       TEXT NOT NULL,
+        requester    TEXT NOT NULL,
+        requested_at DOUBLE PRECISION NOT NULL,
+        status       TEXT NOT NULL DEFAULT 'pending',
+        approver     TEXT,
+        decided_at   DOUBLE PRECISION,
+        expires_at   DOUBLE PRECISION
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_pending_approvals_status"
+    " ON pending_approvals(status, requested_at)",
     """CREATE TABLE IF NOT EXISTS users (
         id                   TEXT PRIMARY KEY,
         username             TEXT NOT NULL UNIQUE,
@@ -196,7 +229,11 @@ _SCHEMA: list[str] = [
         must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
         failed_attempts      INTEGER NOT NULL DEFAULT 0,
         locked_until         DOUBLE PRECISION,
-        channel_scope        TEXT
+        channel_scope        TEXT,
+        totp_secret          TEXT,
+        totp_enabled         BOOLEAN NOT NULL DEFAULT FALSE,
+        totp_enrolled_at     DOUBLE PRECISION,
+        totp_recovery_codes  TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS roles (
         id           TEXT PRIMARY KEY,
@@ -228,7 +265,9 @@ _SCHEMA: list[str] = [
         expires_at   DOUBLE PRECISION NOT NULL,
         last_used_at DOUBLE PRECISION NOT NULL,
         revoked_at   DOUBLE PRECISION,
-        client       TEXT
+        client       TEXT,
+        reauth_at    DOUBLE PRECISION,
+        mfa_verified_at DOUBLE PRECISION
     )""",
     "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at)",
@@ -309,6 +348,10 @@ class PostgresStore:
     # transform_handoff), so the engine starts the staged runner on this backend.
     supports_ingest_stage = True
 
+    # Postgres implements request/response capture (ADR 0013: the `response` table +
+    # complete_with_response), with the same single-transaction atomicity as SQLite.
+    supports_response_capture = True
+
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
     #: columns (error/last_error/detail). Used by the on-open migration and rotate-key (mirrors
     #: MessageStore._CIPHER_COLUMNS).
@@ -318,6 +361,9 @@ class PostgresStore:
         ("messages", "error"),
         ("queue", "last_error"),
         ("message_events", "detail"),
+        ("users", "totp_secret"),  # MFA secret (WP-14) — id-keyed, rides the migration + rotation
+        # NB: the `response` table (ADR 0013) is cipher-covered (body, detail) but has a COMPOSITE PK,
+        # so it rides the composite helpers below, not this id-keyed list (like state/reference).
     )
 
     def __init__(self, pool: Any, settings: StoreSettings, *, cipher: Cipher | None = None) -> None:
@@ -428,6 +474,35 @@ class PostgresStore:
             "CREATE INDEX IF NOT EXISTS ix_queue_lease ON queue(lease_expires_at)"
             " WHERE status='inflight'"
         )
+        # Step-up re-verification (ASVS 7.5.3) adds sessions.reauth_at; pre-existing rows get NULL.
+        sessions_has_reauth = await conn.fetch(
+            "SELECT 1 FROM information_schema.columns"
+            " WHERE table_name='sessions' AND column_name='reauth_at'"
+        )
+        if not sessions_has_reauth:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN reauth_at DOUBLE PRECISION")
+        # MFA (WP-14): TOTP columns on users + sessions.mfa_verified_at on a pre-existing DB. Column
+        # names are static literals (not user input). Idempotent: skipped once present.
+        users_cols = {
+            r["column_name"]
+            for r in await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='users'"
+            )
+        }
+        for column, decl in (
+            ("totp_secret", "TEXT"),
+            ("totp_enabled", "BOOLEAN NOT NULL DEFAULT FALSE"),
+            ("totp_enrolled_at", "DOUBLE PRECISION"),
+            ("totp_recovery_codes", "TEXT"),
+        ):
+            if column not in users_cols:
+                await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
+        sessions_has_mfa = await conn.fetch(
+            "SELECT 1 FROM information_schema.columns"
+            " WHERE table_name='sessions' AND column_name='mfa_verified_at'"
+        )
+        if not sessions_has_mfa:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN mfa_verified_at DOUBLE PRECISION")
 
     async def close(self) -> None:
         await self._pool.close()
@@ -686,22 +761,38 @@ class PostgresStore:
         total += await self._encrypt_existing_composite(
             "reference", ("name", "version", "key"), like, encrypt=True
         )
+        # The `response` table (composite PK + TWO cipher columns — ADR 0013) migrates each column.
+        for col in ("body", "detail"):
+            total += await self._encrypt_existing_composite(
+                "response",
+                ("message_id", "destination_name", "response_seq"),
+                like,
+                encrypt=True,
+                value_col=col,
+            )
         if total:
             log.info("encrypted %d existing value(s) at rest", total)
 
     async def _encrypt_existing_composite(
-        self, table: str, pk_cols: tuple[str, ...], like: str, *, encrypt: bool
+        self,
+        table: str,
+        pk_cols: tuple[str, ...],
+        like: str,
+        *,
+        encrypt: bool,
+        value_col: str = "value",
     ) -> int:
-        """Encrypt the ``value`` column of a composite-PK table (``state``/``reference``) in place —
-        the migration loop for tables that can't ride the id-keyed loop. ``encrypt=True`` is the
+        """Encrypt the ``value_col`` of a composite-PK table (``state``/``reference``/``response``) in
+        place — the migration loop for tables that can't ride the id-keyed loop. ``encrypt=True`` is the
         on-open plaintext→active migration (this method's only caller; rotation uses
-        :meth:`_reencrypt_composite`)."""
+        :meth:`_reencrypt_composite`). ``value_col`` defaults to ``value`` (state/reference);
+        ``response`` passes ``body``/``detail``."""
         rotated = 0
         pk_select = ", ".join(pk_cols)
         while True:
             rows = await self._fetchall(
-                f"SELECT {pk_select}, value FROM {table}"
-                f" WHERE value NOT LIKE $1 AND value <> '' LIMIT 500",
+                f"SELECT {pk_select}, {value_col} AS v FROM {table}"
+                f" WHERE {value_col} NOT LIKE $1 AND {value_col} <> '' LIMIT 500",
                 like,
             )
             if not rows:
@@ -711,8 +802,8 @@ class PostgresStore:
                 async with conn.transaction():
                     for r in rows:
                         await conn.execute(
-                            f"UPDATE {table} SET value=$1 WHERE {where}",
-                            self._cipher.encrypt(r["value"]),
+                            f"UPDATE {table} SET {value_col}=$1 WHERE {where}",
+                            self._cipher.encrypt(r["v"]),
                             *[r[c] for c in pk_cols],
                         )
             rotated += len(rows)
@@ -757,6 +848,16 @@ class PostgresStore:
         total += await self._reencrypt_composite(
             cipher, "reference", ("name", "version", "key"), active_like, batch
         )
+        # The `response` table (composite PK + two cipher columns — ADR 0013) rotates each column.
+        for col in ("body", "detail"):
+            total += await self._reencrypt_composite(
+                cipher,
+                "response",
+                ("message_id", "destination_name", "response_seq"),
+                active_like,
+                batch,
+                value_col=col,
+            )
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         return total
@@ -768,30 +869,32 @@ class PostgresStore:
         pk_cols: tuple[str, ...],
         active_like: str,
         batch: int,
+        value_col: str = "value",
     ) -> int:
-        """Re-encrypt the ``value`` column of a composite-PK table under the active key (the rotation
+        """Re-encrypt the ``value_col`` of a composite-PK table under the active key (the rotation
         parallel of :meth:`_encrypt_existing_composite`). Decrypt→encrypt up front; a value no key can
-        decrypt raises before any UPDATE."""
+        decrypt raises before any UPDATE. ``value_col`` defaults to ``value``; ``response`` rotates
+        ``body``/``detail``."""
         rotated = 0
         pk_select = ", ".join(pk_cols)
         where = " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(pk_cols))
         while True:
             rows = await self._fetchall(
-                f"SELECT {pk_select}, value FROM {table}"
-                f" WHERE value NOT LIKE $1 AND value <> '' LIMIT $2",
+                f"SELECT {pk_select}, {value_col} AS v FROM {table}"
+                f" WHERE {value_col} NOT LIKE $1 AND {value_col} <> '' LIMIT $2",
                 active_like,
                 batch,
             )
             if not rows:
                 break
             updates = [
-                (cipher.encrypt(cipher.decrypt(r["value"])), [r[c] for c in pk_cols]) for r in rows
+                (cipher.encrypt(cipher.decrypt(r["v"])), [r[c] for c in pk_cols]) for r in rows
             ]
             async with self._pool.acquire() as conn:
                 async with conn.transaction():
                     for new_value, pk_vals in updates:
                         await conn.execute(
-                            f"UPDATE {table} SET value=$1 WHERE {where}", new_value, *pk_vals
+                            f"UPDATE {table} SET {value_col}=$1 WHERE {where}", new_value, *pk_vals
                         )
             rotated += len(rows)
         return rotated
@@ -810,6 +913,7 @@ class PostgresStore:
         """Append a ``message_events`` row, encrypting ``detail`` here so the cipher boundary lives in
         ONE place (mirrors MessageStore._event; ``detail`` is a declared cipher column). Callers pass
         plaintext — never pre-wrap with ``_enc``."""
+        detail = safe_text(detail) if detail else detail  # PHI chokepoint (#120)
         await conn.execute(
             "INSERT INTO message_events (message_id, ts, event, destination, detail)"
             " VALUES ($1,$2,$3,$4,$5)",
@@ -947,10 +1051,10 @@ class PostgresStore:
     @staticmethod
     def _lane_col(stage: str) -> str:
         """The FIFO/depth lane column for a stage (code-controlled literal): ``channel_id`` for
-        ingress/routed, ``destination_name`` for outbound."""
+        ingress/routed/response, ``destination_name`` for outbound."""
         return (
             "channel_id"
-            if stage in (Stage.INGRESS.value, Stage.ROUTED.value)
+            if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
             else "destination_name"
         )
 
@@ -1014,6 +1118,7 @@ class PostgresStore:
     ) -> str:
         """Log an inbound message that isn't routed (``FILTERED`` or parse/validation ``ERROR``),
         stored with no queue rows so an operator still sees exactly what arrived."""
+        error = safe_text(error) if error else error  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         mid = uuid4().hex
         event = "error" if status is MessageStatus.ERROR else "filtered"
@@ -1520,11 +1625,15 @@ class PostgresStore:
             attempts=row["attempts"],
             stage=row["stage"],
             handler_name=row["handler_name"],
+            created_at=row["created_at"],  # claim RETURNING q.* includes it (ingest-time, ADR 0009)
         )
 
     async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
         """Force one row terminal (``DEAD``) immediately — fail-fast, no retry consumed. Serializes
         the finalize per message (H-8)."""
+        error = safe_text(
+            error
+        )  # PHI chokepoint (#120) — incl. the f"undecryptable payload: {exc}" callers
         now = time.time() if now is None else now
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -1569,10 +1678,312 @@ class PostgresStore:
                 )
                 await self._maybe_finalize_message(conn, row["message_id"], now)
 
+    async def complete_with_response(
+        self,
+        outbox_id: str,
+        *,
+        body: str,
+        outcome: str,
+        detail: str | None = None,
+        reingress_to: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Mark one outbound row delivered AND persist the partner's captured reply in one transaction
+        (ADR 0013) — the Postgres twin of :meth:`MessageStore.complete_with_response`, with the
+        **identical single-transaction atomicity** (mark-done + INSERT response under one
+        ``conn.transaction()``). ``response_seq`` is ``1 + MAX(seq)`` per ``(message_id,
+        destination_name)`` so it is replay-stable, and the ``response`` table is invisible to the
+        finalizer (it scans ``queue`` only). When ``reingress_to`` is set (Increment 2) the same
+        transaction also inserts the drainable ``Stage.RESPONSE`` work-row (identical to SQLite)."""
+        now = time.time() if now is None else now
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                if row is None:
+                    return
+                message_id = row["message_id"]
+                destination_name = row["destination_name"]
+                await conn.execute(
+                    "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$3",
+                    OutboxStatus.DONE.value,
+                    now,
+                    outbox_id,
+                )
+                seq = await conn.fetchval(
+                    "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
+                    " WHERE message_id=$1 AND destination_name=$2",
+                    message_id,
+                    destination_name,
+                )
+                await conn.execute(
+                    "INSERT INTO response"
+                    " (message_id, destination_name, response_seq, body, outcome, detail, captured_at)"
+                    " VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                    message_id,
+                    destination_name,
+                    seq,
+                    self._enc(body),
+                    outcome,
+                    self._enc(detail),
+                    now,
+                )
+                if reingress_to is not None:
+                    # ADR 0013 Increment 2: drainable Stage.RESPONSE work-row in the SAME txn (orphan-free)
+                    # — a token referencing the immutable artifact by its PK, on the loopback inbound's lane.
+                    artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
+                    work_created = await self._fifo_created_at(
+                        conn, Stage.RESPONSE.value, "channel_id", reingress_to, now
+                    )
+                    await conn.execute(
+                        "INSERT INTO queue"
+                        " (id, message_id, stage, channel_id, destination_name, handler_name, payload,"
+                        "  status, attempts, next_attempt_at, created_at, updated_at)"
+                        " VALUES ($1,$2,$3,$4,NULL,NULL,$5,$6,0,$7,$8,$9)",
+                        uuid4().hex,
+                        message_id,
+                        Stage.RESPONSE.value,
+                        reingress_to,
+                        self._enc(artifact_ref),
+                        OutboxStatus.PENDING.value,
+                        now,
+                        work_created,
+                        now,
+                    )
+                await self._event(
+                    conn,
+                    message_id,
+                    "delivered",
+                    destination_name,
+                    f"attempt {row['attempts']} (response {outcome})",
+                    now,
+                )
+                await self._maybe_finalize_message(conn, message_id, now)
+
+    async def ingress_handoff(
+        self,
+        *,
+        response_row_id: str,
+        loopback_channel_id: str,
+        correlation_depth_cap: int,
+        control_id: str | None,
+        message_type: str | None,
+        summary: str | None,
+        peek_failed: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """Postgres twin of :meth:`MessageStore.ingress_handoff` (ADR 0013 Increment 2) — the same
+        single-transaction guarded-DELETE handoff under one ``conn.transaction()``. A no-op (work-row
+        already consumed) rolls the transaction back via the internal sentinel and returns ``False``."""
+
+        class _Noop(Exception):
+            pass
+
+        now = time.time() if now is None else now
+        try:
+            async with self._pool.acquire() as conn:
+                async with conn.transaction():
+                    wr = await conn.fetchrow(
+                        "SELECT message_id, payload FROM queue WHERE id=$1 AND stage=$2 AND status=$3",
+                        response_row_id,
+                        Stage.RESPONSE.value,
+                        OutboxStatus.INFLIGHT.value,
+                    )
+                    if wr is None:
+                        raise _Noop()  # already consumed by a committed prior run
+                    origin_id = wr["message_id"]
+                    try:
+                        ref = self._dec(wr["payload"]) or ""
+                        origin_msg_id, dest, seq_s = ref.split("\x1f")
+                        seq = int(seq_s)
+                    except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
+                        # A corrupt/undecryptable work-row reference can never be re-ingressed: dead-letter
+                        # the token + ERROR the origin in THIS transaction and CONSUME it (return True ⇒
+                        # the conn.transaction() commits) — never re-loop. Mirrors the SQLite branch and
+                        # the depth-cap branch (NOT the _Noop rollback, which would leave the token live).
+                        await conn.execute(
+                            "UPDATE queue SET status=$1, last_error=$2, next_attempt_at=$3,"
+                            " updated_at=$4 WHERE id=$5",
+                            OutboxStatus.DEAD.value,
+                            self._enc("re-ingress work-row reference is corrupt/unparseable"),
+                            now,
+                            now,
+                            response_row_id,
+                        )
+                        await self._event(
+                            conn, origin_id, "dead", None, "re-ingress ref corrupt", now
+                        )
+                        await self._maybe_finalize_message(conn, origin_id, now)
+                        return True
+                    art = await conn.fetchrow(
+                        "SELECT body FROM response"
+                        " WHERE message_id=$1 AND destination_name=$2 AND response_seq=$3",
+                        origin_msg_id,
+                        dest,
+                        seq,
+                    )
+                    body = self._dec(art["body"]) if (art and art["body"] is not None) else ""
+                    body = body or ""
+                    mrow = await conn.fetchrow(
+                        "SELECT metadata FROM messages WHERE id=$1", origin_id
+                    )
+                    origin_meta: dict[str, Any] = {}
+                    if mrow and mrow["metadata"]:
+                        loaded = json.loads(mrow["metadata"])
+                        if isinstance(loaded, dict):
+                            origin_meta = loaded
+                    child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
+                    root = origin_meta.get("correlation_root_id") or origin_id
+                    if child_depth > correlation_depth_cap:
+                        await conn.execute(
+                            "UPDATE queue SET status=$1, last_error=$2, next_attempt_at=$3,"
+                            " updated_at=$4 WHERE id=$5",
+                            OutboxStatus.DEAD.value,
+                            self._enc(
+                                f"re-ingress correlation depth exceeded "
+                                f"({child_depth} > {correlation_depth_cap})"
+                            ),
+                            now,
+                            now,
+                            response_row_id,
+                        )
+                        await self._event(
+                            conn,
+                            origin_id,
+                            "dead",
+                            dest,
+                            f"re-ingress depth cap ({child_depth})",
+                            now,
+                        )
+                        await self._maybe_finalize_message(conn, origin_id, now)
+                        return True
+                    new_mid = MessageStore._reingress_message_id(origin_id, dest, seq, body)
+                    exists = await conn.fetchval("SELECT 1 FROM messages WHERE id=$1", new_mid)
+                    if exists is None:
+                        child_meta = json.dumps(
+                            {
+                                "correlation_id": origin_id,
+                                "correlation_root_id": root,
+                                "correlation_depth": child_depth,
+                                "reingress_of_seq": seq,
+                            }
+                        )
+                        await self._insert_message(
+                            conn,
+                            new_mid,
+                            channel_id=loopback_channel_id,
+                            raw=body,
+                            status=(
+                                MessageStatus.ERROR.value
+                                if peek_failed
+                                else MessageStatus.RECEIVED.value
+                            ),
+                            control_id=control_id,
+                            message_type=message_type,
+                            source_type="reingress",
+                            summary=summary,
+                            metadata=child_meta,
+                            error="re-ingress body failed HL7 peek" if peek_failed else None,
+                            now=now,
+                        )
+                        if not peek_failed:
+                            ingress_created = await self._fifo_created_at(
+                                conn, Stage.INGRESS.value, "channel_id", loopback_channel_id, now
+                            )
+                            await conn.execute(
+                                "INSERT INTO queue (id, message_id, stage, channel_id,"
+                                " destination_name, handler_name, payload, status, attempts,"
+                                " next_attempt_at, created_at, updated_at)"
+                                " VALUES ($1,$2,$3,$4,NULL,NULL,$5,$6,0,$7,$8,$9)",
+                                uuid4().hex,
+                                new_mid,
+                                Stage.INGRESS.value,
+                                loopback_channel_id,
+                                self._cipher.encrypt(body),
+                                OutboxStatus.PENDING.value,
+                                now,
+                                ingress_created,
+                                now,
+                            )
+                        await self._event(
+                            conn,
+                            new_mid,
+                            "received",
+                            None,
+                            f"reingress from {origin_id}/{dest}/seq{seq}",
+                            now,
+                        )
+                        await self._event(
+                            conn,
+                            origin_id,
+                            "reingressed",
+                            dest,
+                            f"-> {new_mid} depth {child_depth}",
+                            now,
+                        )
+                    deleted = await conn.fetchval(
+                        "DELETE FROM queue WHERE id=$1 AND stage=$2 AND status=$3 RETURNING id",
+                        response_row_id,
+                        Stage.RESPONSE.value,
+                        OutboxStatus.INFLIGHT.value,
+                    )
+                    if deleted is None:
+                        raise _Noop()  # unreachable under single-owner claim; roll back defensively
+                    await self._maybe_finalize_message(conn, origin_id, now)
+        except _Noop:
+            return False
+        return True
+
+    async def response_body_for_work_row(self, response_row_id: str) -> str | None:
+        """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013) — the Postgres
+        twin of :meth:`MessageStore.response_body_for_work_row`."""
+        row = await self._pool.fetchrow(
+            "SELECT payload FROM queue WHERE id=$1 AND stage=$2",
+            response_row_id,
+            Stage.RESPONSE.value,
+        )
+        if row is None:
+            return None
+        ref = self._dec(row["payload"]) or ""
+        try:
+            mid, dest, seq_s = ref.split("\x1f")
+        except ValueError:
+            return None
+        art = await self._pool.fetchrow(
+            "SELECT body FROM response WHERE message_id=$1 AND destination_name=$2 AND response_seq=$3",
+            mid,
+            dest,
+            int(seq_s),
+        )
+        return self._dec(art["body"]) if (art and art["body"] is not None) else ""
+
+    async def correlate_response(self, message_id: str) -> list[CapturedResponse]:
+        """Every captured reply for ``message_id`` (ADR 0013), ordered by destination then
+        ``response_seq``; ``body``/``detail`` decrypted. The PHI read surface behind the audited,
+        body-gated ``GET /messages/{id}/responses`` route."""
+        rows = await self._pool.fetch(
+            "SELECT message_id, destination_name, response_seq, body, outcome, detail, captured_at"
+            " FROM response WHERE message_id=$1 ORDER BY destination_name, response_seq",
+            message_id,
+        )
+        return [
+            CapturedResponse(
+                message_id=r["message_id"],
+                destination_name=r["destination_name"],
+                response_seq=r["response_seq"],
+                outcome=r["outcome"],
+                detail=self._dec(r["detail"]),
+                captured_at=r["captured_at"],
+                body=self._dec(r["body"]),
+            )
+            for r in rows
+        ]
+
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
     ) -> None:
         """Reschedule with exponential backoff, or dead-letter if retries are exhausted."""
+        error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -1701,6 +2112,53 @@ class PostgresStore:
             OutboxStatus.PENDING.value,
             OutboxStatus.INFLIGHT.value,
         )
+        return _rowcount(result)
+
+    async def recover_inflight_on_promotion(
+        self, *, lane_owner: str | None, now: float | None = None
+    ) -> int:
+        """On active-passive promotion: recover the PRIOR leader's stranded work IMMEDIATELY, without
+        waiting out the per-row/lane lease TTL — the dominant ~``[store].lease_ttl_seconds`` failover-
+        recovery delay on Postgres (#293; SQL Server already recovers at once via its on-promotion
+        ``reset_stale_inflight``). Two parts, ONE transaction:
+
+        1. **Owner-scoped queue-row reclaim** — return INFLIGHT rows owned by ANY OTHER store instance
+           (the prior leader) to PENDING, **ignoring** lease expiry. Scoped to ``owner IS DISTINCT FROM
+           self._owner``, so it is STRUCTURALLY incapable of re-pending THIS node's own freshly-claimed
+           rows (no self-theft); at promotion this node has not claimed anything yet, so the set is
+           exactly the prior leader's residue. Re-pending the stranded lane HEAD restores per-lane
+           head-of-line blocking (no N+1-before-N reorder).
+        2. **Lane-lease takeover** — delete the prior coordinator's ``lane_leases`` (``owner <>
+           lane_owner``) so the new leader can claim those lanes at once instead of waiting
+           ~``lease_ttl_seconds`` for them to expire. ``reset_stale_inflight`` / ``reclaim_expired_leases``
+           touch only the ``queue`` table, so without this the LANE lease independently blocks the new
+           leader for the full TTL — both gates must be cleared.
+
+        **Safe ONLY in active-passive** (the wired graph runs on the leader ONLY): the prior leader
+        self-fenced and its LEADERSHIP lease expired on the DB clock before this node could acquire it
+        (``heartbeat < fence < leader_lease_ttl`` is validator-enforced), so there is no live processor
+        whose rows/lanes this could steal — the SAME interlock the shipping SQL Server on-promotion
+        ``reset_stale_inflight`` relies on. A future **active-active** build (parked for 0.2) MUST NOT
+        call this — with multiple live processors it would steal a live sibling's rows; that model uses
+        only the lease-gated :meth:`reclaim_expired_leases`. Returns the number of queue rows re-pended."""
+        now = time.time() if now is None else now
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                result = await conn.execute(
+                    "UPDATE queue SET status=$1, owner=NULL, lease_expires_at=NULL,"
+                    " next_attempt_at=$2, updated_at=$2"
+                    " WHERE status=$3 AND owner IS DISTINCT FROM $4",
+                    OutboxStatus.PENDING.value,
+                    now,
+                    OutboxStatus.INFLIGHT.value,
+                    self._owner,
+                )
+                # lane_owner is the coordinator node_id (always set in clustered mode, where this runs);
+                # None defensively clears all lanes (single-node never calls this).
+                if lane_owner is None:
+                    await conn.execute("DELETE FROM lane_leases")
+                else:
+                    await conn.execute("DELETE FROM lane_leases WHERE owner <> $1", lane_owner)
         return _rowcount(result)
 
     async def dead_letter_missing_destinations(
@@ -2075,6 +2533,17 @@ class PostgresStore:
         # bodies come through get_message (audited). Don't add `payload` to this projection's decrypt.
         return [self._decode_record(r, "last_error") for r in rows]
 
+    async def outbox_payloads_for(self, message_id: str) -> list[dict[str, Any]]:
+        """Like :meth:`outbox_for`, but also decrypts the transformed ``payload`` (PHI body) for the
+        parity-comparison read path (#14). A separate method so ``outbox_for`` (message-detail
+        metadata) never decrypts bodies; the API gates this on ``MESSAGES_VIEW_RAW`` and audits it."""
+        rows = await self._fetchall(
+            "SELECT * FROM queue WHERE message_id=$1 AND stage=$2 ORDER BY destination_name",
+            message_id,
+            Stage.OUTBOUND.value,
+        )
+        return [self._decode_record(r, "last_error", "payload") for r in rows]
+
     async def events_for(self, message_id: str) -> list[dict[str, Any]]:
         rows = await self._fetchall(
             "SELECT * FROM message_events WHERE message_id=$1 ORDER BY id", message_id
@@ -2088,6 +2557,18 @@ class PostgresStore:
             Stage.OUTBOUND.value,
         )
         return {r["status"]: int(r["n"]) for r in rows}
+
+    async def in_pipeline_depth(self) -> int:
+        """NOT-DONE rows (``pending``|``inflight``) across every stage — the whole-pipeline drain gauge."""
+        rows = await self._fetchall(
+            "SELECT COUNT(*) AS n FROM queue WHERE stage IN ($1,$2,$3) AND status IN ($4,$5)",
+            Stage.INGRESS.value,
+            Stage.ROUTED.value,
+            Stage.OUTBOUND.value,
+            OutboxStatus.PENDING.value,
+            OutboxStatus.INFLIGHT.value,
+        )
+        return int(rows[0]["n"]) if rows else 0
 
     # --- audit log -----------------------------------------------------------
 
@@ -2110,7 +2591,11 @@ class PostgresStore:
         now: float | None = None,
     ) -> None:
         """Append a row to the audit hash chain. H-7: takes the audit-chain advisory lock first, so
-        concurrent writers serialize on the read-tail + insert and can't fork the chain."""
+        concurrent writers serialize on the read-tail + insert and can't fork the chain.
+
+        After the row commits, a **PHI-safe metadata copy** is teed off-box via the shared
+        :func:`~messagefoundry.store.audit_tee.emit_audit_tee` (sec-offbox-log) — the same redaction
+        path the SQLite and SQL Server backends use."""
         now = time.time() if now is None else now
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -2132,10 +2617,82 @@ class PostgresStore:
                     detail,
                     row_hash,
                 )
+        # Tee off-box AFTER the transaction commits + the connection is released (only forward what
+        # truly persisted; never hold the advisory lock / a pooled connection across a syslog send).
+        emit_audit_tee(action=action, actor=actor, channel_id=channel_id, detail=detail, ts=now)
 
     async def list_audit(self, *, limit: int = 50) -> Sequence[Row]:
         """Most-recent-first audit entries (for review tooling / tests)."""
         return await self._fetchall("SELECT * FROM audit_log ORDER BY id DESC LIMIT $1", limit)
+
+    async def security_events_for_user(self, username: str, *, limit: int = 100) -> Sequence[Row]:
+        """A user's own security events (``auth.*``), most-recent-first — for ``GET
+        /me/security-events`` (ASVS 6.3.5/6.3.7); admin-initiated changes go out-of-band by email."""
+        return await self._fetchall(
+            "SELECT ts, action, detail FROM audit_log "
+            "WHERE actor = $1 AND action LIKE 'auth.%' ORDER BY id DESC LIMIT $2",
+            username,
+            limit,
+        )
+
+    # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
+
+    async def create_pending_approval(
+        self,
+        *,
+        approval_id: str,
+        operation: str,
+        params: str,
+        requester: str,
+        requested_at: float,
+        expires_at: float | None,
+    ) -> None:
+        """Persist a high-value action awaiting a distinct second approver (dual-control, 2.3.5)."""
+        await self._execute(
+            "INSERT INTO pending_approvals "
+            "(id, operation, params, requester, requested_at, status, expires_at) "
+            "VALUES ($1,$2,$3,$4,$5,'pending',$6)",
+            approval_id,
+            operation,
+            params,
+            requester,
+            requested_at,
+            expires_at,
+        )
+
+    async def get_pending_approval(self, approval_id: str) -> Row | None:
+        row: Row | None = await self._fetchone(
+            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
+            " expires_at FROM pending_approvals WHERE id = $1",
+            approval_id,
+        )
+        return row
+
+    async def list_pending_approvals(self, *, now: float, limit: int = 100) -> Sequence[Row]:
+        """Open (still-``pending``, unexpired) approval requests, newest-first."""
+        return await self._fetchall(
+            "SELECT id, operation, params, requester, requested_at, status, approver, decided_at,"
+            " expires_at FROM pending_approvals"
+            " WHERE status = 'pending' AND (expires_at IS NULL OR expires_at > $1)"
+            " ORDER BY requested_at DESC LIMIT $2",
+            now,
+            limit,
+        )
+
+    async def decide_pending_approval(
+        self, approval_id: str, *, status: str, approver: str | None, decided_at: float
+    ) -> bool:
+        """Atomically move a still-``pending`` request to ``status`` (approved/rejected/expired).
+        Returns ``True`` iff this call made the transition — guards against a double decision."""
+        result = await self._pool.execute(
+            "UPDATE pending_approvals SET status = $1, approver = $2, decided_at = $3"
+            " WHERE id = $4 AND status = 'pending'",
+            status,
+            approver,
+            decided_at,
+            approval_id,
+        )
+        return _rowcount(result) > 0
 
     async def audit_anchor(self) -> tuple[int, str]:
         """The audit log's external anchor — ``(row_count, head_hash)`` (head ``""`` when empty)."""
@@ -2243,6 +2800,79 @@ class PostgresStore:
             must_change_password,
             user_id,
         )
+
+    # --- MFA: native TOTP second factor (local accounts, WP-14) --------------
+
+    async def set_totp_secret(
+        self, user_id: str, *, secret: str | None, now: float | None = None
+    ) -> None:
+        """Stage (or clear) a user's base32 TOTP secret, store-cipher encrypted. Does not enable MFA."""
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET totp_secret=$1, updated_at=$2 WHERE id=$3",
+            self._enc(secret),
+            now,
+            user_id,
+        )
+
+    async def get_totp_secret(self, user_id: str) -> str | None:
+        d = await self._fetchone("SELECT totp_secret FROM users WHERE id=$1", user_id)
+        if not d or d["totp_secret"] is None:
+            return None
+        return self._dec(d["totp_secret"])
+
+    async def enable_totp(
+        self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
+    ) -> None:
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET totp_enabled=TRUE, totp_enrolled_at=$1, totp_recovery_codes=$2,"
+            " updated_at=$1 WHERE id=$3",
+            now,
+            json.dumps(recovery_code_hashes),
+            user_id,
+        )
+
+    async def disable_totp(self, user_id: str, *, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET totp_secret=NULL, totp_enabled=FALSE, totp_enrolled_at=NULL,"
+            " totp_recovery_codes=NULL, updated_at=$1 WHERE id=$2",
+            now,
+            user_id,
+        )
+
+    async def get_recovery_code_hashes(self, user_id: str) -> list[str]:
+        d = await self._fetchone("SELECT totp_recovery_codes FROM users WHERE id=$1", user_id)
+        if not d or d["totp_recovery_codes"] is None:
+            return []
+        return [str(h) for h in json.loads(d["totp_recovery_codes"])]
+
+    async def consume_recovery_code_hash(
+        self, user_id: str, code_hash: str, *, now: float | None = None
+    ) -> bool:
+        """Atomically remove one recovery-code hash; ``True`` iff present. The ``SELECT ... FOR UPDATE``
+        + ``UPDATE`` run in one transaction, so concurrent verifications (even cross-node) can't
+        double-spend a single-use recovery code (WP-14)."""
+        now = time.time() if now is None else now
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT totp_recovery_codes FROM users WHERE id=$1 FOR UPDATE", user_id
+                )
+                if row is None or row["totp_recovery_codes"] is None:
+                    return False
+                hashes = [str(h) for h in json.loads(row["totp_recovery_codes"])]
+                if code_hash not in hashes:
+                    return False  # already consumed by a concurrent caller
+                hashes.remove(code_hash)
+                await conn.execute(
+                    "UPDATE users SET totp_recovery_codes=$1, updated_at=$2 WHERE id=$3",
+                    json.dumps(hashes),
+                    now,
+                    user_id,
+                )
+                return True
 
     async def set_user_disabled(
         self, user_id: str, *, disabled: bool, now: float | None = None
@@ -2423,17 +3053,21 @@ class PostgresStore:
         user_id: str,
         expires_at: float,
         client: str | None = None,
+        seed_reauth: bool = True,
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
         await self._execute(
+            # reauth_at ($6) seeds the step-up window from login (ASVS 7.5.3); seed_reauth=False leaves
+            # it NULL for an MFA-PENDING session (WP-14) so a stolen pre-MFA token can't enroll/step-up.
             "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-            " revoked_at, client) VALUES ($1,$2,$3,$4,$3,NULL,$5)",
+            " revoked_at, client, reauth_at) VALUES ($1,$2,$3,$4,$3,NULL,$5,$6)",
             token_hash,
             user_id,
             now,
             expires_at,
             client,
+            now if seed_reauth else None,
         )
 
     async def get_session(self, token_hash: str) -> SessionRecord | None:
@@ -2455,6 +3089,25 @@ class PostgresStore:
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE sessions SET last_used_at=$1 WHERE token_hash=$2", now, token_hash
+        )
+
+    async def mark_session_reauthed(
+        self, token_hash: str, *, now: float | None = None, client: str | None = None
+    ) -> None:
+        now = time.time() if now is None else now
+        # COALESCE keeps the stored client when none is supplied; a re-verify carrying the current
+        # address re-anchors the session to it (WP-L3-13 new-client-IP step-up).
+        await self._execute(
+            "UPDATE sessions SET reauth_at=$1, client=COALESCE($2, client) WHERE token_hash=$3",
+            now,
+            client,
+            token_hash,
+        )
+
+    async def mark_session_mfa_verified(self, token_hash: str, *, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE sessions SET mfa_verified_at=$1 WHERE token_hash=$2", now, token_hash
         )
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -2541,6 +3194,14 @@ class PostgresStore:
                 await conn.execute(
                     f"UPDATE message_events SET detail=NULL"
                     f" WHERE detail IS NOT NULL AND message_id IN ({eligible})",
+                    older_than,
+                    inflight,
+                )
+                # Captured replies (ADR 0013) are PHI on the same window as the body; null in place
+                # (row kept, FK to messages(id) never violated — purge keeps the messages row).
+                await conn.execute(
+                    f"UPDATE response SET body=NULL, detail=NULL"
+                    f" WHERE (body IS NOT NULL OR detail IS NOT NULL) AND message_id IN ({eligible})",
                     older_than,
                     inflight,
                 )

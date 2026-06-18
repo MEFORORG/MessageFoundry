@@ -46,7 +46,7 @@ light up automatically as they're added to `messagefoundry/generators/all_types.
 and delivery path (see its docstring). Serve it, then drive it from the tabs above:
 
 ```powershell
-python -m messagefoundry serve --config harness/config --db ./messagefoundry.db
+python -m messagefoundry serve --config harness/config --db ./messagefoundry.db --env dev
 ```
 
 | Send (Send/Compose tab → 127.0.0.1:2575) | Disposition (Monitor tab) |

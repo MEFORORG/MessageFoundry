@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Staged pipeline (ADR 0001): the ingress stage + ACK-on-receipt (Step A) and the routed-stage split
 (Step B) — the two transactional handoffs (route_handoff/transform_handoff), the finalizer as the
 single disposition authority, per-stage recovery, the multi-handler disposition flow, the outbox→queue

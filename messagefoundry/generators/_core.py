@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Shared, reference-driven machinery for the HL7 message generators.
 
 Each message type (ADT, ORM, …) registers a :class:`MessageSpec` describing its

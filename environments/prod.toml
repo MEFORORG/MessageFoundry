@@ -8,3 +8,17 @@
 # deployment). A referenced key missing here would make a promote to PROD fail loud, by design.
 acme_adt_host = "receiver-prod.example.org"
 acme_adt_port = 6661
+
+# Downstream payer for OB_PAYER_X12 (placeholder host — edit for a real deployment).
+payer_x12_host = "payer-prod.example.org"
+payer_x12_port = 6662
+
+# WS-* SOAP submit (samples/config/IB_IMMUNIZATION_VXU.py). Non-secret endpoint only; the client
+# cert/key/password + WS-Security credentials come from MEFOR_VALUE_REGISTRY_* env vars, never here.
+registry_url = "https://iis-prod.example.org:8443/iis/services/submit"
+
+# Real-time eligibility peers (samples/config/IB_RTE_ELIGIBILITY.py — placeholder hosts).
+payer_rte_host = "rte-prod.example.org"
+payer_rte_port = 6663
+rte_result_host = "rte-result-prod.example.org"
+rte_result_port = 6664

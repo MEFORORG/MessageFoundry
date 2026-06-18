@@ -19,10 +19,11 @@ who runs a modified version as a network service must offer its source to users.
 ## Contributor License Agreement (CLA)
 
 Before your first contribution can be merged, you must agree to the **[Contributor License
-Agreement](CLA.md)**. It confirms you have the right to contribute your code and grants the project
-maintainer the rights needed to keep MessageFoundry sustainable — including the ability to offer a
-separately-licensed commercial edition (the standard "open-core" model). You keep the copyright to
-your contributions.
+Agreement](CLA.md)**. It confirms you have the right to contribute your code and grants MessageFoundry
+Organization (the Project Owner) the rights needed to keep MessageFoundry sustainable — including the
+ability to offer a separately-licensed commercial edition under the standard "open-core" model
+(planned; the CLA and the commercial terms are pending legal review — see [CLA.md](CLA.md)). You keep
+the copyright to your contributions.
 
 How to sign: our **CLA Assistant** bot comments on every new pull request. Agree by replying with:
 

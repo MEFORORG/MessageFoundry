@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """App shell: a persistent left nav over stacked pages, with the auto-refresh timer driving
 whichever page is active. Pages: Connections, Alerts (stub), Log Search, Engine Status.
 """
@@ -22,7 +24,9 @@ from PySide6.QtWidgets import (
 )
 
 from messagefoundry.console import service_control
+from messagefoundry.console._async import AsyncRunner
 from messagefoundry.console.change_password import ChangePasswordDialog
+from messagefoundry.console.mfa import manage_mfa
 from messagefoundry.console.sessions import SessionsDialog
 from messagefoundry.console.client import ApiError, EngineClient
 from messagefoundry.console.connections import ConnectionsPage
@@ -111,18 +115,24 @@ class AppWindow(QWidget):
         self,
         client: EngineClient,
         *,
+        poll_client: EngineClient | None = None,
         poll_seconds: float = 2.0,
         service_name: str = "MessageFoundry",
     ) -> None:
         super().__init__()
         self.setWindowTitle("MessageFoundry Console")
-        self._client = client
+        self._client = client  # user actions + modal auth flows — main thread only
+        # All BACKGROUND (off-thread) reads — the nav health poll, Engine Status, and the per-page
+        # auto-refresh — go through this read-only client, so the handler-bearing primary client is
+        # never touched from a worker thread (the cross-thread-shared-client hazard). Defaults to the
+        # primary client when not supplied (tests / embedding), which keeps single-client behaviour.
+        self._poll_client = poll_client or client
         self._service_name = service_name
         self._interval = max(0.0, poll_seconds)
 
-        self.connections = ConnectionsPage(client)
-        self.log_search = LogSearchPage(client)
-        self.engine_status = EngineStatusPage(client, service_name=service_name)
+        self.connections = ConnectionsPage(client, poll_client=self._poll_client)
+        self.log_search = LogSearchPage(client, poll_client=self._poll_client)
+        self.engine_status = EngineStatusPage(self._poll_client, service_name=service_name)
         nav_items = list(_NAV)
         self._pages: list[QWidget] = [
             self.connections,
@@ -131,7 +141,7 @@ class AppWindow(QWidget):
             self.engine_status,
         ]
         if client.can("users:manage"):  # user administration is permission-gated
-            self.users = UsersPage(client)
+            self.users = UsersPage(client, poll_client=self._poll_client)
             self.users.error.connect(self._show_error)
             nav_items.append("Users")
             self._pages.append(self.users)
@@ -175,6 +185,8 @@ class AppWindow(QWidget):
             # Directory (the server rejects /me/password for them), so omit it for AD users.
             if signed_in.auth_provider != "ad":
                 menu.addAction("Change password…", lambda *_: self._change_password())
+                # Native TOTP MFA is for local accounts; AD users get MFA from the directory.
+                menu.addAction("Two-factor authentication…", lambda *_: self._manage_mfa())
             # All users (incl. AD) have server-side sessions they can inventory and revoke.
             menu.addAction("Active sessions…", lambda *_: self._active_sessions())
             menu.addAction("Sign out", lambda *_: self.logout_requested.emit())
@@ -225,6 +237,10 @@ class AppWindow(QWidget):
             shortcut.activated.connect(lambda s=step: self._zoom(s))
 
         # The nav heart polls health on its own timer so it updates even when auto-refresh is off.
+        # The poll reads the engine off the main thread (a /status read can stall for seconds during
+        # a failover) and applies the heart on the main thread.
+        self._health_runner = AsyncRunner(self)
+        self._health_loading = False  # in-flight guard — one poll at a time
         self._health_timer = QTimer(self)
         self._health_timer.timeout.connect(self._poll_health)
         self._health_timer.start(_HEALTH_INTERVAL_MS)
@@ -235,9 +251,17 @@ class AppWindow(QWidget):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         # Stop the timers before teardown so a queued tick/health-poll can't touch widgets while
-        # the window is being destroyed (M3).
+        # the window is being destroyed (M3). Then stop the off-thread runners so a late in-flight
+        # result (engine read) is dropped rather than delivered to a torn-down widget.
         self._timer.stop()
         self._health_timer.stop()
+        self._health_runner.stop()
+        # Stop every page that runs a background runner (Connections, Log Search, Engine Status,
+        # Users); the PlaceholderPage has no stop() and is skipped.
+        for page in self._pages:
+            stop = getattr(page, "stop", None)
+            if callable(stop):
+                stop()
         super().closeEvent(event)
 
     def _app(self) -> QApplication:
@@ -287,21 +311,34 @@ class AppWindow(QWidget):
         self._refresh_current()
 
     def _poll_health(self) -> None:
-        """Drive the nav heart and own the engine-reachability status line.
+        """Kick off a health poll off the main thread (the apply runs on the main thread)."""
+        if self._health_loading:
+            return  # a poll is already in flight — don't pile up while the engine is slow/down
+        self._health_loading = True
+        self._health_runner.submit(self._fetch_health, on_done=self._apply_health)
+
+    def _fetch_health(self) -> tuple[str, float | None, ApiError | None]:
+        """Runs on a worker thread — only blocking I/O. Returns (service_state, free_disk, error)."""
+        svc = service_control.service_state(self._service_name)
+        try:
+            status = self._poll_client.status()  # read-only poll client (never the main-thread one)
+        except ApiError as exc:
+            return svc, None, exc
+        return svc, float(status.db.disk_free_bytes), None
+
+    def _apply_health(self, data: tuple[str, float | None, ApiError | None]) -> None:
+        """Drive the nav heart and own the engine-reachability status line (main thread).
 
         Service-aware: if the Windows service is installed it is the source of truth — a stopped
         service is red even if a terminal happens to answer the API. With no service installed
         (dev), fall back to API reachability + disk. Reachability also governs the status line:
         when the engine answers we clear any stale 'could not reach engine' error; while it's
         down we show it."""
-        svc = service_control.service_state(self._service_name)
+        self._health_loading = False
+        svc, free_disk, exc = data
         reachable = False
         low_disk = False
-        try:
-            status = self._client.status()
-            reachable = True
-            low_disk = status.db.disk_free_bytes < _LOW_DISK_BYTES
-        except ApiError as exc:
+        if exc is not None:
             if exc.status == 401:
                 # Session expired/revoked mid-session — distinct from "engine down". Tell the user and
                 # let the entrypoint re-prompt sign-in, not a misleading "Engine unreachable" (M-26).
@@ -310,6 +347,9 @@ class AppWindow(QWidget):
                 self.session_expired.emit()
                 return
             self._set_health_error(str(exc))
+        else:
+            reachable = True
+            low_disk = free_disk is not None and free_disk < _LOW_DISK_BYTES
         if reachable:
             self._clear_health_error()  # engine answered -> clear our reachability error only
 
@@ -346,6 +386,10 @@ class AppWindow(QWidget):
         dialog = ChangePasswordDialog(self._client, parent=self)
         if dialog.exec():
             self.change_password_requested.emit()
+
+    def _manage_mfa(self) -> None:
+        """Open the two-factor flow: enroll a TOTP authenticator if off, or turn it off if on."""
+        manage_mfa(self._client, parent=self)
 
     def _active_sessions(self) -> None:
         """Open the self-service active-sessions dialog (it never revokes the current session)."""

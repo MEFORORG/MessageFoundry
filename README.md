@@ -74,18 +74,55 @@ No hand-rolled IPC; the deployment split is a config choice, not an architectura
 - [x] Staged pipeline (ingress → routed → outbound): at-least-once handoff, dead-letter, replay
 - [x] Authentication, RBAC, user-attributed audit log, at-rest body encryption (AES-256-GCM)
 - [x] **PostgreSQL** store backend (production, single-node)
+- [x] **Microsoft SQL Server** store backend (production, single-node)
 - [x] REST, SOAP, and Database destinations
-- [x] Database poll source *(experimental)*
+- [x] Database poll source
 - [x] Reference / lookup tables (`code_set`) for enrichment
 - [x] Alerting — logging sink + webhook/email notifier
 - [x] Connections-as-data (`connections.toml`) editable by hand or a VS Code GUI
+- [x] **Active-passive high availability** — self-fencing leadership lease, leader-gated graph, and a
+      failover-load test harness (kill-the-primary-under-load), on **both** PostgreSQL and SQL Server
+- [x] **Native transport TLS** — in-process API TLS (HTTPS/WSS) and MLLP-over-TLS, with an off-loopback
+      bind guard and a certificate-expiry monitor
+- [x] Published throughput + active-passive failover **baseline** ([docs/benchmarks/TUNING-BASELINE.md](docs/benchmarks/TUNING-BASELINE.md))
 
-**Later / in progress** — engine-native high availability (active-passive failover) and the
-experimental multi-node cluster path; native transport TLS (API + MLLP); a read-only component
-SDK (fork-to-customize); a de-identification framework; SQL Server store promotion. See
+**Later** — horizontal **active-active** scale-out (the experimental multi-node cluster path);
+higher-throughput delivery (a pooled/persistent MLLP connector); a read-only **component SDK**
+(fork-to-customize); a **de-identification** framework; MFA and off-box log shipping. See
 [docs/EARLY-ADOPTER-GUIDE.md](docs/EARLY-ADOPTER-GUIDE.md) §2 for the current built-vs-experimental map.
 
 ## Installing & rolling out
+
+**The recommended way to deploy MessageFoundry is to install the published package from
+[PyPI](https://pypi.org/project/messagefoundry/)** — a signed, version-pinned wheel is the
+supported production artifact, with no source checkout required. Install it as a **pinned
+dependency**, then scaffold your own config repo ([ADR 0017](docs/adr/0017-consumer-deployment-model.md)):
+
+```bash
+pip install "messagefoundry==0.1.0rc1"   # pin the exact engine version (core runtime, SQLite store)
+messagefoundry init ./my-config-repo     # scaffold a standalone config repo
+cd ./my-config-repo
+messagefoundry serve --config config --env dev
+```
+
+`0.1.0rc1` is the current **Early Access** release on PyPI. Always **pin the exact version** so
+upgrades stay deliberate. Add the extras your deployment needs (each is opt-in and lazy-imported):
+
+```bash
+pip install "messagefoundry[postgres]==0.1.0rc1"    # PostgreSQL store backend (production server DB)
+pip install "messagefoundry[sqlserver]==0.1.0rc1"   # SQL Server store backend (+ OS-level ODBC Driver 18)
+pip install "messagefoundry[console]==0.1.0rc1"     # PySide6 admin console
+pip install "messagefoundry[sftp]==0.1.0rc1"        # SFTP transport for the REMOTEFILE connector
+```
+
+> **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow,
+> Sigstore-signed, and carries SLSA build-provenance + PEP 740 attestations. Verify a downloaded
+> wheel against its source commit with
+> `gh attestation verify <wheel> --repo MEFORORG/MessageFoundry`, or pull the signed wheel + SBOM
+> from the [GitHub Release assets](https://github.com/MEFORORG/MessageFoundry/releases). For an
+> air-gapped site, mirror the wheel to a private index.
+>
+> *(Engine developers install from a checkout instead — see [Development](#development).)*
 
 Piloting MessageFoundry? The **[Early-Adopter Installation & Rollout Guide](docs/EARLY-ADOPTER-GUIDE.md)**
 takes you from first install through a staged, go/no-go-gated path to full production
@@ -95,16 +132,19 @@ configuration, validation, load testing, backup/DR, day-2 operations, and upgrad
 
 ## Development
 
+**Working on the engine itself?** Install from a source checkout — **editable**, with the dev tools.
+(This is the contributor path; deployments install the pinned wheel, [above](#installing--rolling-out).)
+
 ```bash
 python -m venv .venv && . .venv/Scripts/activate   # Windows PowerShell: .venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 pytest
 ```
 
-Run the engine + localhost API (loads the sample config):
+Run the engine + localhost API (loads the bundled sample config, which ships only in a checkout):
 
 ```bash
-python -m messagefoundry serve --config samples/config --db messagefoundry.db
+python -m messagefoundry serve --config samples/config --db messagefoundry.db --env dev
 # API on http://127.0.0.1:8765 — GET /connections, /messages, /stats, WS /ws/stats
 ```
 
@@ -127,8 +167,10 @@ python -m messagefoundry.console --url http://127.0.0.1:8765
 
 MessageFoundry is licensed under the **GNU Affero General Public License v3.0 or later**
 (`AGPL-3.0-or-later`) — see [LICENSE](LICENSE). Running a modified version as a network service
-triggers the AGPL's §13 source-offer obligation. A separately-licensed commercial edition may be
-available from the maintainer.
+triggers the AGPL's §13 source-offer obligation. A separately-licensed commercial edition is planned
+by **MessageFoundry Organization** under the standard open-core model — see
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) (terms pending legal review). See [NOTICE](NOTICE)
+for copyright and attribution.
 
 ## Contributing
 

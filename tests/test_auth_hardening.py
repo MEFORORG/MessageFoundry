@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Security-hardening regression tests for the auth subsystem.
 
 Each test pins one fix from the security review so it can't silently regress:
@@ -55,13 +57,20 @@ def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
 
 
 async def _add(service: AuthService, username: str, *roles: Role) -> None:
-    await service.create_local_user(
+    user_id = await service.create_local_user(
         username=username,
         password=PW,
         display_name=None,
         email=None,
         roles=[r.value for r in roles],
         actor="test",
+    )
+    # Admin-created accounts force first-login rotation (WP-L3-12); clear it so these fixtures behave
+    # like already-onboarded users (keeping the same hash).
+    user = await service.store.get_user(user_id)
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        user_id, password_hash=user.password_hash, must_change_password=False
     )
 
 

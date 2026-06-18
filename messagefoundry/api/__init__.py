@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Localhost engine API (FastAPI): channel deploy/start/stop, message tracking &
 search, replay, live stats over WebSocket. This is the only surface the PySide6
 console talks to, so local vs remote operation is transparent to the UI.

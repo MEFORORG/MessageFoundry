@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Inbound bind interface is a service setting, not a per-connection host (Part A).
 
 Inbound MLLP takes only a port; the listen interface comes from ``[inbound].bind_host`` and is

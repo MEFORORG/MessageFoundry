@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Cluster coordination seam (Track B Step 3) — the always-run unit tests (no DB needed).
 
 These prove the **no-op safety layer**: the :class:`NullCoordinator` default makes every gate True
@@ -99,6 +101,11 @@ class _NotLeaderCoordinator:
             )
         ]
 
+    async def leadership_lease(self) -> tuple[str | None, float | None]:
+        # A follower stand-in: it holds no lease (Workstream A5). The live lease read is in the gated PG
+        # suite. Present so this stand-in still structurally satisfies the ClusterCoordinator protocol.
+        return (None, None)
+
 
 # --- NullCoordinator (the byte-identical default) ---------------------------
 
@@ -164,22 +171,29 @@ def test_db_coordinator_reclaims_inflight() -> None:
     assert DbCoordinator(None, "n").reclaims_inflight() is True
 
 
-def test_db_coordinator_leader_lock_key_namespaced_by_schema() -> None:
-    # The leader lock key is a DISTINCT, schema-namespaced key (not the nodes-DDL key), so leadership
-    # contention never collides with the nodes-table lock and two schemas elect independently.
-    assert DbCoordinator(None, "n")._leader_lock_key == "public:mefor_cluster_leader"
+async def test_null_coordinator_leadership_lease_is_self_no_expiry() -> None:
+    # Workstream A5: single-node is permanently leader with no lease row, so leadership_lease() reports
+    # itself as the owner with no expiry — keeping /cluster/nodes byte-identical in shape to a cluster.
+    owner, expires = await NullCoordinator(node_id="solo").leadership_lease()
+    assert owner == "solo"
+    assert expires is None
+
+
+def test_db_coordinator_lease_key_namespaced_by_schema() -> None:
+    # The leadership-lease key is a DISTINCT, schema-namespaced key (not the nodes-DDL key), so the
+    # single leader_lease row is per-deployment and two schemas elect independently.
+    assert DbCoordinator(None, "n")._lease_key == "public:mefor_cluster_leader"
     assert (
-        DbCoordinator(None, "n", db_schema="tenant_a")._leader_lock_key
-        == "tenant_a:mefor_cluster_leader"
+        DbCoordinator(None, "n", db_schema="tenant_a")._lease_key == "tenant_a:mefor_cluster_leader"
     )
     # ...and it differs from the nodes-DDL lock key.
     c = DbCoordinator(None, "n", db_schema="tenant_a")
-    assert c._leader_lock_key != c._lock_key
+    assert c._lease_key != c._lock_key
 
 
 def test_db_coordinator_starts_not_leader() -> None:
-    # is_leader() reads cached state; before any election tick a freshly-built coordinator is NOT yet
-    # leader (it becomes leader only after acquiring the advisory lock on its maintenance tick).
+    # is_leader() reads cached state; before any maintenance tick a freshly-built coordinator is NOT yet
+    # leader (it becomes leader only after acquiring the leadership lease on its maintenance tick).
     assert DbCoordinator(None, "n").is_leader() is False
 
 
@@ -380,7 +394,10 @@ async def test_runner_threads_coordinator_is_leader_into_source(
 ) -> None:
     # The runner must pass coordinator.is_leader (a cheap sync bound method = Callable[[], bool]) to
     # source.start — NOT the coordinator object — so transports/ stays free of any pipeline import.
-    fake = _NotLeaderCoordinator()
+    # Under active-passive (Workstream A1) the graph (and thus the source) starts only on the LEADER, so
+    # drive a clustered LEADER coordinator: the engine brings the graph up and the runner threads the
+    # predicate, which on the leader reports True.
+    fake = _LeaderCoordinator()
     monkeypatch.setattr(wiring_runner, "build_source", lambda cfg: _SpySource())
 
     cfgdir = tmp_path / "cfg"
@@ -410,10 +427,10 @@ async def test_runner_threads_coordinator_is_leader_into_source(
     eng.add_registry(load_config(cfgdir))
     await eng.start()
     try:
-        # The spy captured the exact bound method the coordinator exposes — calling it reflects the
-        # follower's gate (False), proving the live predicate (not the object) was threaded through.
+        # The spy captured the exact bound method the coordinator exposes — calling it reflects this
+        # leader's gate (True), proving the live predicate (not the object) was threaded through.
         assert _SpySource.last_gate == fake.is_leader
-        assert _SpySource.last_gate is not None and _SpySource.last_gate() is False
+        assert _SpySource.last_gate is not None and _SpySource.last_gate() is True
     finally:
         await eng.stop()
 
@@ -424,7 +441,9 @@ async def test_runner_logs_leader_gated_only_for_poll_sources(
     # The operator-facing 'intake is leader-gated' start-time INFO line is the signal an operator
     # relies on to know only the leader polls this resource. It must fire for a POLL source
     # (polls_shared_resource True) and NOT for a LISTEN source — so a silent drop or an inverted
-    # polls_shared_resource guard in the runner is caught.
+    # polls_shared_resource guard in the runner is caught. Under active-passive (Workstream A1) the
+    # graph only starts on the LEADER, so drive a clustered LEADER coordinator (the runner emits the
+    # line when it starts the poll source on the leader).
     import logging
 
     def _build(source_cls: type[_SpySource]) -> str:
@@ -468,7 +487,7 @@ async def test_runner_logs_leader_gated_only_for_poll_sources(
             finally:
                 await eng.stop()
 
-    fake = _NotLeaderCoordinator()
+    fake = _LeaderCoordinator()
     poll_msgs = await _run(_SpySource)  # polls_shared_resource True → logged
     assert any("intake is leader-gated" in m for m in poll_msgs)
     listen_msgs = await _run(_ListenSpySource)  # listen source → NOT logged
@@ -477,9 +496,10 @@ async def test_runner_logs_leader_gated_only_for_poll_sources(
 
 async def test_follower_file_source_does_not_ingest(tmp_path: Path) -> None:
     # End-to-end: a real FileSource on a node whose coordinator reports NOT leader must leave a
-    # dropped file untouched (a non-leader does not poll a shared directory). Single-node (the null
-    # coordinator, is_leader True) ingests it — covered by test_wiring_serve; here we prove the
-    # follower side stays idle.
+    # dropped file untouched. Under active-passive (Workstream A1) a follower does not run the graph at
+    # all, so the source is never even started (an even stronger guarantee than Step 4b's poll-skip).
+    # Single-node (the null coordinator, is_leader True) ingests it — covered by test_wiring_serve; here
+    # we prove the follower side stays idle.
     fake = _NotLeaderCoordinator()
     cfgdir = tmp_path / "cfg"
     cfgdir.mkdir()
@@ -976,3 +996,56 @@ async def test_state_convergence_runner_isolates_errors() -> None:
 
     runner = StateConvergenceRunner(converge=bad_converge, interval_seconds=10.0)
     assert await runner.converge_once() == []  # isolated, not raised
+
+
+# --- build_coordinator backend dispatch (no DB; stub stores) ----------------
+
+
+def test_build_coordinator_dispatches_sqlserver_to_its_own_coordinator() -> None:
+    # A SQL Server store ALSO exposes a `_pool` (aioodbc), but DbCoordinator drives asyncpg — so it must
+    # be dispatched to SqlServerCoordinator, not the (crashing) DbCoordinator path. Stub store; no DB.
+    from messagefoundry.pipeline.cluster import build_coordinator
+    from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+
+    class _Backend:
+        value = "sqlserver"
+
+    class _Settings:
+        backend = _Backend()
+        db_schema = None
+
+    class _Store:
+        _pool = object()
+        _owner = "host:1:abcd"
+        _settings = _Settings()
+
+    class _Cluster:
+        enabled = True
+        node_id = None
+
+    coord = build_coordinator(_Store(), _Cluster())
+    assert isinstance(coord, SqlServerCoordinator)
+    assert coord.node_id == "host:1:abcd"  # reuses store._owner as the node id
+
+
+def test_build_coordinator_postgres_still_gets_dbcoordinator() -> None:
+    # Dispatch must NOT regress the Postgres path: a non-sqlserver store with a pool still gets DbCoordinator.
+    from messagefoundry.pipeline.cluster import DbCoordinator, build_coordinator
+
+    class _Backend:
+        value = "postgres"
+
+    class _Settings:
+        backend = _Backend()
+        db_schema = None
+
+    class _Store:
+        _pool = object()
+        _owner = "host:2:beef"
+        _settings = _Settings()
+
+    class _Cluster:
+        enabled = True
+        node_id = None
+
+    assert isinstance(build_coordinator(_Store(), _Cluster()), DbCoordinator)

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Export HL7 v2.5.1 segment/field/component metadata (from hl7apy) as plain dicts.
 
 Drives the IDE's HL7 field-path autocomplete: the extension ships this JSON and offers paths like

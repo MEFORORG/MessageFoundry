@@ -1,7 +1,9 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """AI-assistance **policy model** — the authoritative two-axis policy and its clamping algorithm.
 
 A central operator governs how much AI coding assistance is permitted across a spectrum from
-**OFF** to **PHI-safe**, expressed as two independent axes bounded by an environment ceiling:
+**OFF** to **PHI-safe**, expressed as two independent axes bounded by a posture ceiling:
 
 * **mode** (:class:`AiMode`) — *whether and how* assistance runs: ``off`` (none), ``byo``
   (the user's own provider; this extension version's only working path), or the engine-brokered
@@ -10,9 +12,12 @@ A central operator governs how much AI coding assistance is permitted across a s
 * **data_scope** (:class:`AiDataScope`) — *how sensitive* the context attached to a request may be,
   ordered least→most sensitive: ``code_only`` < ``synthetic`` < ``deidentified`` < ``phi``.
 
-The **environment** (:class:`AiEnvironment`) imposes a ceiling on ``data_scope`` so the same
-config behaves conservatively in dev/staging and only reaches ``phi`` in ``prod`` under a BAA mode.
-``mode`` itself is never clamped by environment — a central ``off`` is honored everywhere.
+The instance's **production** posture flag imposes a ceiling on ``data_scope`` so the same config
+behaves conservatively on a non-production instance and only reaches ``phi`` on a production instance
+under a BAA mode. ``mode`` itself is never clamped — a central ``off`` is honored everywhere. Posture
+is **decoupled from the environment *name*** (ADR 0017): an instance is ``production`` (and/or
+PHI-carrying, see :class:`DataClass`) regardless of whether it is literally named ``prod`` — so an
+org can name instances ``poc``/``test``/… while choosing posture explicitly.
 
 This module is **pure** (no I/O) and imports nothing from :mod:`messagefoundry.config.settings`
 (the dependency is one-way: settings imports these enums, not the reverse, to avoid a cycle). It is
@@ -48,12 +53,16 @@ class AiDataScope(str, Enum):
     PHI = "phi"  # real message bodies (only over a BAA + zero-retention provider)
 
 
-class AiEnvironment(str, Enum):
-    """The deployment environment, which imposes a data-scope ceiling. The value is the wire string."""
+class DataClass(str, Enum):
+    """Whether an instance handles real PHI, **independent of its (free-form) environment name**.
 
-    DEV = "dev"
-    STAGING = "staging"
-    PROD = "prod"
+    Drives the at-rest-encryption + open-egress startup advisories (a synthetic instance stays quiet;
+    a ``phi`` instance is warned). The AI data-scope ceiling keys off the separate ``production`` flag,
+    not this. Decoupling the data class from the environment name (ADR 0017) lets an org name instances
+    freely (``poc``/``test``/…) while choosing posture explicitly. The value is the wire string."""
+
+    SYNTHETIC = "synthetic"  # synthetic/sample data only — relaxed at-rest/egress posture
+    PHI = "phi"  # carries real PHI — encryption + egress advisories apply
 
 
 #: Scope ordering, least→most sensitive. Used to take the *lower* of (requested, ceiling).
@@ -71,41 +80,44 @@ class EffectivePolicy:
 
     ``reason`` is a human-readable, ``"; "``-joined note of every clamp applied (``None`` when the
     requested policy passed through unchanged) — surfaced in the API/CLI so an operator can see *why*
-    the effective scope differs from what was configured.
+    the effective scope differs from what was configured. The environment *name* and the posture
+    (``data_class``/``production``) are carried by the caller's wire model, not here.
     """
 
     mode: AiMode
     data_scope: AiDataScope
-    environment: AiEnvironment
     reason: str | None
 
 
 def resolve_effective_policy(
-    *, mode: AiMode, data_scope: AiDataScope, environment: AiEnvironment
+    *, mode: AiMode, data_scope: AiDataScope, production: bool
 ) -> EffectivePolicy:
-    """Clamp a requested (mode, data_scope, environment) to the enforceable effective policy.
+    """Clamp a requested (mode, data_scope) to the enforceable effective policy for this instance.
 
-    The algorithm (in order): apply the environment's data-scope ceiling; defensively block ``phi``
-    unless the mode is BAA-managed; block ``deidentified`` (the de-id framework is unbuilt); and
-    normalize scope to ``code_only`` when the mode is ``off``. ``mode`` is never clamped — a central
-    ``off``/managed choice is honored regardless of environment.
+    The algorithm (in order): apply the production-posture data-scope ceiling; defensively block
+    ``phi`` unless the mode is BAA-managed; block ``deidentified`` (the de-id framework is unbuilt);
+    and normalize scope to ``code_only`` when the mode is ``off``. ``mode`` is never clamped — a
+    central ``off``/managed choice is honored regardless of posture. ``production`` is the instance's
+    posture flag (decoupled from the environment *name*, ADR 0017), not whether it is literally named
+    ``prod``.
     """
     reasons: list[str] = []
 
-    # 1. Environment data-scope ceiling. dev/staging never exceed synthetic; prod reaches phi only
-    #    under a BAA-managed mode, otherwise it floors at code_only.
-    if environment is AiEnvironment.PROD:
+    # 1. Posture data-scope ceiling. A non-production instance never exceeds synthetic; a production
+    #    instance reaches phi only under a BAA-managed mode, otherwise it floors at code_only.
+    if production:
         ceiling = AiDataScope.PHI if mode is AiMode.MANAGED_CLAUDE_BAA else AiDataScope.CODE_ONLY
-    else:  # dev, staging
+    else:
         ceiling = AiDataScope.SYNTHETIC
 
     eff = data_scope
     if _SCOPE_ORDER[ceiling] < _SCOPE_ORDER[eff]:
         eff = ceiling
-        reasons.append(f"data scope capped to {eff.value} by environment={environment.value}")
+        tier = "production" if production else "non-production"
+        reasons.append(f"data scope capped to {eff.value} by a {tier} instance")
 
     # 2. phi hard rule (defensive): phi requires a BAA-managed mode. The ceiling already enforces
-    #    this in prod; this guards any path that reached phi outside it.
+    #    this on a production instance; this guards any path that reached phi outside it.
     if eff is AiDataScope.PHI and mode is not AiMode.MANAGED_CLAUDE_BAA:
         eff = AiDataScope.CODE_ONLY
         reasons.append("phi scope requires managed_claude_baa mode; fell back to code_only")
@@ -124,6 +136,5 @@ def resolve_effective_policy(
     return EffectivePolicy(
         mode=mode,
         data_scope=eff,
-        environment=environment,
         reason="; ".join(reasons) if reasons else None,
     )

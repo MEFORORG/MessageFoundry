@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """PostgreSQL store behaviour — mirrors the SQLite/SQL Server suites, against a real Postgres.
 
 **Gated**: skipped unless ``MEFOR_TEST_POSTGRES`` is set (plus ``MEFOR_STORE_*`` connection env),
@@ -35,6 +37,7 @@ _TABLES = (
     "lane_leases",
     "cluster_config",
     "queue",
+    "response",
     "messages",
     "state",
     "state_version",
@@ -117,6 +120,83 @@ async def test_mark_done_finalizes_message(store) -> None:
     item = (await store.claim_ready(now=200.0))[0]
     await store.mark_done(item.id, now=300.0)
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+
+async def test_complete_with_response_parity(store) -> None:
+    # ADR 0013 backend parity: Postgres complete_with_response must produce an identical `response` row
+    # + PROCESSED finalization to SQLite, with the same single-transaction atomicity, and response_seq
+    # must be replay-stable (replay resets attempts=0, so an attempts-keyed row would collide).
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    item = (await store.claim_ready(now=200.0))[0]
+    await store.complete_with_response(
+        item.id, body="MSA|AA", outcome="accepted", detail="MSA-1=AA", now=300.0
+    )
+    outbox = await store.outbox_for(mid)
+    assert outbox[0]["status"] == OutboxStatus.DONE.value
+    # The `response` table is invisible to the finalizer (it scans `queue` only) → PROCESSED.
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    caps = await store.correlate_response(mid)
+    assert len(caps) == 1
+    assert (caps[0].destination_name, caps[0].response_seq, caps[0].outcome, caps[0].body) == (
+        "OB1",
+        1,
+        "accepted",
+        "MSA|AA",
+    )
+    # Re-send (replay → attempts reset to 0) → seq=2, no PK collision.
+    assert await store.replay(mid, now=400.0) == 1
+    item2 = (await store.claim_ready(now=500.0))[0]
+    await store.complete_with_response(item2.id, body="MSA|AA|2", outcome="accepted", now=600.0)
+    caps2 = await store.correlate_response(mid)
+    assert [(c.response_seq, c.body) for c in caps2] == [(1, "MSA|AA"), (2, "MSA|AA|2")]
+
+
+async def test_ingress_handoff_parity(store) -> None:
+    # ADR 0013 Increment 2 backend parity: Postgres ingress_handoff must consume the Stage.RESPONSE
+    # work-row + produce the re-ingressed message+ingress row atomically, exactly-once, like SQLite.
+    from messagefoundry.store.store import MessageStore, Stage
+
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    item = (await store.claim_ready(now=200.0))[0]
+    reply = "MSH|^~\\&|P|F|R|RF|20260101||RSP^K11|R1|P|2.5.1\r"
+    await store.complete_with_response(
+        item.id, body=reply, outcome="accepted", reingress_to="IB_LOOP", now=300.0
+    )
+    work = await store.claim_next_fifo("IB_LOOP", now=400.0, stage=Stage.RESPONSE.value)
+    assert work is not None and work.channel_id == "IB_LOOP" and work.message_id == mid
+    ok = await store.ingress_handoff(
+        response_row_id=work.id,
+        loopback_channel_id="IB_LOOP",
+        correlation_depth_cap=8,
+        control_id="R1",
+        message_type="RSP^K11",
+        summary=None,
+        now=500.0,
+    )
+    assert ok is True
+    # token consumed; origin PROCESSED; a re-ingressed child + ingress row on the loopback lane
+    assert await store.claim_next_fifo("IB_LOOP", now=501.0, stage=Stage.RESPONSE.value) is None
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    child_mid = MessageStore._reingress_message_id(mid, "OB1", 1, reply)
+    child = await store.get_message(child_mid)
+    assert child is not None and child["status"] == MessageStatus.RECEIVED.value
+    # idempotent: a second handoff on the same (now-gone) token is a no-op
+    assert (
+        await store.ingress_handoff(
+            response_row_id=work.id,
+            loopback_channel_id="IB_LOOP",
+            correlation_depth_cap=8,
+            control_id="R1",
+            message_type="RSP^K11",
+            summary=None,
+            now=502.0,
+        )
+        is False
+    )
 
 
 async def test_failure_reschedules_with_backoff(store) -> None:
@@ -208,6 +288,7 @@ async def test_stats_and_metrics(store) -> None:
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
     stats = await store.stats()
     assert stats.get(OutboxStatus.PENDING.value) == 1
+    assert await store.in_pipeline_depth() == 1  # whole-pipeline gauge (one outbound row, pending)
     metrics = await store.connection_metrics(since=0.0, now=200.0, rate_window=60.0)
     assert metrics.inbound["IB"].read == 1
     assert metrics.destinations[("IB", "OB1")].queue_depth == 1
@@ -251,6 +332,45 @@ async def test_audit_chain_verifies(store) -> None:
     assert [r["action"] for r in rows] == ["export", "message_view"]  # newest first
 
 
+async def test_record_audit_tees_off_box_redacted(store) -> None:
+    # The off-box audit tee must fire on the real backend too (sec-offbox-log), via the same shared
+    # emit_audit_tee path as SQLite — metadata only, with any HL7 in `detail` redacted.
+    import json as _json
+    import logging as _logging
+
+    captured: list[str] = []
+
+    class _Handler(_logging.Handler):
+        def emit(self, record: _logging.LogRecord) -> None:
+            captured.append(record.getMessage())
+
+    handler = _Handler()
+    logger = _logging.getLogger("messagefoundry.audit")
+    logger.addHandler(handler)
+    try:
+        await store.record_audit("message.error", actor="svc", detail="PID|1||DOE^JANE^Q", now=1.0)
+    finally:
+        logger.removeHandler(handler)
+    assert len(captured) == 1
+    line = captured[0]
+    assert "DOE" not in line and "JANE" not in line  # PHI scrubbed before it leaves the process
+    rec = _json.loads(line)
+    assert rec["event"] == "audit" and rec["action"] == "message.error" and rec["actor"] == "svc"
+
+
+async def test_security_events_for_user_scopes_to_actor(store) -> None:
+    # The /me/security-events source on the real backend: only the target actor's auth.* rows,
+    # newest-first, honoring limit; other actors' rows and non-auth.* rows excluded.
+    await store.record_audit("auth.login_success", actor="alice", detail="1")
+    await store.record_audit("auth.login_failed", actor="bob", detail="b")  # other actor
+    await store.record_audit("message_view", actor="alice", detail="x")  # not auth.*
+    await store.record_audit("auth.password_changed", actor="alice", detail="2")
+    rows = await store.security_events_for_user("alice")
+    assert [r["action"] for r in rows] == ["auth.password_changed", "auth.login_success"]
+    assert len(await store.security_events_for_user("alice", limit=1)) == 1
+    assert len(await store.security_events_for_user("carol")) == 0
+
+
 async def test_auth_users_roles_sessions(store) -> None:
     await store.upsert_role(role_id="operator", display_name="Operator", description=None)
     await store.create_user(
@@ -291,6 +411,32 @@ async def test_auth_users_roles_sessions(store) -> None:
     await store.delete_user("u1")
     assert await store.get_user("u1") is None
     assert await store.get_user_role_ids("u1") == []
+
+
+async def test_mark_session_reauthed_reanchors_client(store) -> None:
+    """WP-L3-13: mark_session_reauthed(client=) re-anchors the session's client address via COALESCE;
+    a None client leaves it unchanged while still refreshing reauth_at. Exercises the new COALESCE
+    write (incl. the None-bind / asyncpg $2 type inference) on the real Postgres backend."""
+    await store.create_user(
+        user_id="u2",
+        username="bob",
+        auth_provider="local",
+        display_name=None,
+        email=None,
+        password_hash="h",
+        now=1.0,
+    )
+    await store.create_session(
+        token_hash="s1", user_id="u2", expires_at=9_999.0, client="10.1.1.1", now=1.0
+    )
+    await store.mark_session_reauthed("s1", now=50.0, client="10.2.2.2")
+    s = await store.get_session("s1")
+    assert s is not None and s.client == "10.2.2.2" and s.reauth_at == 50.0
+    # client=None keeps the stored address (COALESCE) while still refreshing reauth_at.
+    await store.mark_session_reauthed("s1", now=60.0)
+    s = await store.get_session("s1")
+    assert s is not None and s.client == "10.2.2.2" and s.reauth_at == 60.0
+    await store.delete_user("u2")
 
 
 # --- staged-pipeline tests (Postgres-only; the full ingress→routed→outbound flow) ---
@@ -717,6 +863,60 @@ async def test_reclaim_expired_leases_only_reclaims_expired(store) -> None:
     assert again is not None and again.id == expired.id
 
 
+async def test_recover_inflight_on_promotion_owner_scoped_and_takes_lanes(store) -> None:
+    # #293: on promotion the new leader recovers the PRIOR leader's stranded inflight rows (owner-scoped,
+    # lease-BLIND) AND takes over its lane leases — WITHOUT waiting out the ~ttl per-row/lane lease, and
+    # WITHOUT touching its own freshly-claimed rows (no self-theft). Both gates (queue row + lane lease)
+    # must clear, or real failover still hangs ~ttl on the lane.
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    # The PRIOR leader = a distinct store instance + cluster node, claiming via the clustered FIFO path
+    # (→ inflight under a FUTURE row lease + a lane lease owned by its node_id).
+    other = await PostgresStore.open(load_settings(environ=os.environ).store)
+    try:
+        assert other._owner != store._owner
+        await store.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB_OLD", "p")], now=100.0
+        )
+        old = await other.claim_next_fifo("OB_OLD", now=200.0, owner="old-node")
+        assert old is not None
+        # The SURVIVOR claims its OWN row via the clustered FIFO path (queue owner=store._owner, lane
+        # owner="new-node"). A future lease, so nothing can recover it on lease-expiry grounds.
+        await store.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB_NEW", "p")], now=100.0
+        )
+        mine = await store.claim_next_fifo("OB_NEW", now=200.0, owner="new-node")
+        assert mine is not None
+        # Recover at t=210, while BOTH leases (claimed at 200, ttl=60 → expire at 260) are still in the
+        # FUTURE — so the recovery is provably lease-BLIND, not merely an early expired-lease sweep.
+        recover_at = 210.0
+        assert (await _queue_row(store, old.id))["lease_expires_at"] > recover_at  # not yet expired
+
+        recovered = await store.recover_inflight_on_promotion(lane_owner="new-node", now=recover_at)
+        assert recovered == 1  # ONLY the prior leader's row (owner-scoped)
+
+        old_row = await _queue_row(store, old.id)
+        assert old_row["status"] == OutboxStatus.PENDING.value  # re-pended despite a future lease
+        assert old_row["owner"] is None and old_row["lease_expires_at"] is None
+        mine_row = await _queue_row(store, mine.id)
+        assert (
+            mine_row["status"] == OutboxStatus.INFLIGHT.value
+        )  # OUR row untouched (no self-theft)
+        assert mine_row["owner"] == store._owner
+
+        # The prior leader's lane lease is gone (survivor can claim it now); the survivor's is kept.
+        async with store._pool.acquire() as conn:
+            owners = [r["owner"] for r in await conn.fetch("SELECT owner FROM lane_leases")]
+        assert owners and all(o == "new-node" for o in owners)  # only the survivor's lane remains
+
+        # End-to-end: the re-pended head is claimable again at once — both gates cleared.
+        again = await store.claim_next_fifo("OB_OLD", now=211.0, owner="new-node")
+        assert again is not None and again.id == old.id
+    finally:
+        await other.close()
+
+
 async def test_reclaim_expired_leases_is_stage_scoped(store) -> None:
     """A stage filter restricts the reclaim to that stage's expired rows."""
     # Expired ingress row.
@@ -1030,8 +1230,14 @@ async def _node_row(store, node_id: str):
 
 
 async def _drop_nodes(store) -> None:
+    # Clear BOTH lazily-created coordinator tables for a clean slate. `leader_lease` is NOT in the
+    # per-test TRUNCATE (_TABLES) — it is created on demand by a coordinator's start() — so without
+    # dropping it here a prior test's lease row (default TTL 30s, >> the 2s election window) survives
+    # into the next leader-election test and blocks acquisition, surfacing as "neither node is leader".
+    # The next start() recreates both via _ensure_nodes_table.
     async with store._pool.acquire() as conn:
         await conn.execute("DROP TABLE IF EXISTS nodes")
+        await conn.execute("DROP TABLE IF EXISTS leader_lease")
 
 
 async def _wait_leader(coord, *, want: bool, timeout: float = 2.0) -> None:

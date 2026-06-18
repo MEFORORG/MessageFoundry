@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """File transport: directory destination + directory-polling source.
 
 **Destination** writes each payload to a file in a directory. The filename may contain
@@ -24,6 +26,7 @@ from pathlib import Path
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.parsing.peek import HL7PeekError, Peek
+from messagefoundry.parsing.split import split_batch
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
@@ -87,6 +90,17 @@ def _sanitize(value: str) -> str:
     return _UNSAFE.sub("_", value).lstrip(".")
 
 
+def _probe_dir_writable(directory: Path) -> None:
+    """Reachability probe shared by the FILE connectors: ensure ``directory`` exists and accepts a
+    write — a destination writes messages there and a source moves processed files into its subdirs,
+    so writability is the meaningful check for both. Creates and removes a temp file; raises ``OSError``
+    if the directory is missing or unwritable."""
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".probe")
+    os.close(fd)
+    os.unlink(tmp)
+
+
 class FileDestination(DestinationConnector):
     def __init__(self, config: Destination) -> None:
         s = config.settings
@@ -103,6 +117,12 @@ class FileDestination(DestinationConnector):
             await asyncio.to_thread(self._write, payload)
         except OSError as exc:
             raise DeliveryError(f"file write failed: {exc}") from exc
+
+    async def test_connection(self) -> None:
+        try:
+            await asyncio.to_thread(_probe_dir_writable, self.directory)
+        except OSError as exc:
+            raise DeliveryError(f"file directory {self.directory} not writable: {exc}") from exc
 
     def _write(self, payload: str) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -151,6 +171,9 @@ class FileSource(SourceConnector):
         self.after_read: str = s.get("after_read", "move")  # "move" | "delete"
         self.sort: str = s.get("sort", "name")  # "name" | "mtime"
         self.recursive: bool = bool(s.get("recursive", False))
+        # Encoding used to re-encode split batch messages back to bytes for the handler. A single
+        # (non-batch) message is handed off verbatim, so its bytes never round-trip through this.
+        self.encoding: str = s.get("encoding", "utf-8")
         mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
         self.max_file_bytes: int | None = int(mfb) if mfb else None
         self.processed_dir = self.directory / s.get("processed_subdir", ".processed")
@@ -175,6 +198,12 @@ class FileSource(SourceConnector):
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         self.error_dir.mkdir(parents=True, exist_ok=True)
         self._task = asyncio.create_task(self._run())
+
+    async def test_connection(self) -> None:
+        try:
+            await asyncio.to_thread(_probe_dir_writable, self.directory)
+        except OSError as exc:
+            raise DeliveryError(f"file directory {self.directory} not writable: {exc}") from exc
 
     async def _run(self) -> None:
         while not self._stop.is_set():
@@ -257,16 +286,66 @@ class FileSource(SourceConnector):
                 await asyncio.to_thread(self._move, path, self.error_dir)
                 continue
             try:
-                await self._handler(raw)
+                await self._emit(raw)
             except Exception as exc:
                 # The handler records every message-level outcome (parse/validation/routing → ERROR)
                 # itself and returns, so an exception escaping here is an infrastructure failure: the
                 # durable store write failed (DB locked, disk full). Leave the file in place so the
                 # next scan retries once the store recovers (at-least-once) — moving it to .error would
                 # drop a *received* message that was never recorded, an accept-and-drop (review M-15).
+                #
+                # CRITICAL (Tier 2.2 batch split): a batch is split into N hand-offs (_emit), and the
+                # file is moved/deleted ONLY after ALL of them succeed (below). If hand-off K fails,
+                # we `continue` WITHOUT moving the file, so the next scan re-reads the WHOLE file and
+                # re-emits every message 1..N. That is at-least-once: messages 1..K-1 may be re-emitted
+                # (duplicates, acceptable — handlers are idempotent), but the file is NEVER moved with
+                # only some of its messages emitted (no accept-and-drop of the tail).
                 logger.warning("handler failed for %s (will retry next scan): %s", path.name, exc)
                 continue
             await asyncio.to_thread(self._after_processing, path)
+
+    async def _emit(self, raw: bytes) -> None:
+        """Hand every HL7 message in ``raw`` to the pipeline handler, in file order (FIFO).
+
+        Corepoint-style **batch split** (Tier 2.2-A): a dropped file may hold several MSH-delimited
+        messages (a batch, or an FHS/BHS envelope). Each becomes one pipeline hand-off — the same
+        per-message split a dry-run / ``messagefoundry check`` sees, via the shared
+        :func:`~messagefoundry.parsing.split.split_batch`.
+
+        Splitting must decode the bytes to find the MSH boundaries, so we decode with the
+        connection's **declared encoding** (``errors="strict"``) — never UTF-8 by accident — so a
+        non-UTF-8 batch (e.g. latin-1) splits without mojibake. If the file isn't decodable in that
+        encoding, or it holds a single message, the **original bytes are handed off verbatim** (one
+        hand-off): a single-message file is then byte-for-byte identical to before the split existed,
+        and an undecodable file flows to the pipeline unchanged so its ``normalize(errors="strict")``
+        records the proper ``ERROR`` disposition exactly as today (we don't pre-empt that here). A
+        true batch is split and each message **re-encoded with the same declared encoding**, so the
+        handler still receives ``bytes`` exactly as in the un-split path.
+
+        Any exception (a durable-store failure on hand-off K) propagates to the caller, which then
+        leaves the whole file in place for the next scan — preserving at-least-once with no partial
+        move (see :meth:`_scan_once`)."""
+        assert self._handler is not None
+        try:
+            text = raw.decode(self.encoding)
+        except (UnicodeDecodeError, LookupError):
+            # Not decodable in the declared encoding (or an unknown codec name): can't safely find MSH
+            # boundaries, so hand the raw bytes off unchanged — the pipeline's strict-decode then
+            # records ERROR for it, exactly as in the pre-split single-hand-off path. Never a drop.
+            await self._handler(raw)
+            return
+        messages = split_batch(
+            text
+        )  # str in → no UTF-8 re-decode (normalize only fixes line endings)
+        if len(messages) == 1:
+            # Fast path / strict back-compat: a lone message is handed off verbatim (its original
+            # bytes), so a non-batch file behaves byte-for-byte as before the split was introduced.
+            await self._handler(raw)
+            return
+        for message in messages:
+            # FIFO per connection: emit in file order, awaiting each so a slow/failing hand-off
+            # back-pressures the rest (and a failure stops the file from being moved — see above).
+            await self._handler(message.encode(self.encoding))
 
     def _oversize(self, path: Path) -> bool:
         """True if ``path`` is larger than the configured cap (checked before reading it)."""

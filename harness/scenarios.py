@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Scenario runner: send generated traffic, then assert the engine's resulting disposition (or
 dead-lettering) over the API. Pass/fail, scriptable, and **Qt-free** so it runs headless in CI.
 

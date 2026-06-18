@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Password-strength and account-lockout policy (ASVS 6.2.x).
 
 Modernized per ASVS 5.0 (WP-3): length-first (15+), **no mandatory character-class composition**

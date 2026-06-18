@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The harness File tab: the drop worker writes pollable files; the folder watcher sees new ones."""
 
 from __future__ import annotations

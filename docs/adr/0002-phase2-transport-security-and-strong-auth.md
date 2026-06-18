@@ -3,14 +3,22 @@
 - **Status:** **Accepted (2026-06-14) — build authorized for the v0.1 transport-TLS subset.** The
   off-loopback trigger has fired: the [v0.1 Release Plan](../releases/v0.1-PLAN.md) makes **native
   off-loopback TLS a hard release gate (Gate #4)**, so **WP-13a (API/WSS TLS), WP-13b (MLLP-over-TLS),
-  and WP-15 (reverse-proxy / forwarded headers) are authorized for v0.1**. **WP-14 (TOTP MFA) stays
-  deferred to 0.2** (owner decision 2026-06-14: off-loopback v0.1 relies on AD/Entra IdP-MFA or an
-  MFA-terminating proxy; local-password admins stay loopback). **Federated SSO (OAuth 2.0 / OIDC /
+  and WP-15 (reverse-proxy / forwarded headers) are authorized for v0.1**. **WP-14 (TOTP MFA) is now
+  BUILT (2026-06-17)** — native RFC 6238 TOTP for local accounts, enforced for the Administrator role
+  via `[auth].require_mfa` + the step-up gate; AD/Entra MFA stays delegated. *(Supersedes the
+  2026-06-14 "defer to 0.2" decision — the owner pulled MFA forward because some level of local
+  accounts is a supported deployment, so the engine carries its own MFA.)* On top of WP-14, the
+  **multi-layer administrative-interface defense (ASVS 8.4.2, WP-L3-13) is now BUILT (2026-06-17)**:
+  WP-14 MFA is wired as a genuine second factor at the step-up boundary, plus a **new-client-IP
+  contextual-risk signal** (`[auth].admin_new_ip_step_up`, default off). **Device-posture assessment
+  for 8.4.2 is delegated to the deployment** — a managed/attested host + an mTLS client cert terminated
+  at the **WP-15** reverse proxy — not built in-process (stdlib `ssl` does no device attestation).
+  **Federated SSO (OAuth 2.0 / OIDC /
   SAML via Entra) and SMART on FHIR are *out of this ADR's scope*** — they get a dedicated
   federated-SSO ADR when 0.2 design begins. *(Originally Proposed 2026-06-12 as design-only under the
   "design now, build then" rule; this acceptance supersedes that deferral.)*
 - **Built:** Nothing in this ADR is built yet — it designs **WP-13a** (API/WebSocket TLS), **WP-13b**
-  (MLLP-over-TLS, v0.1), **WP-14** (MFA, **deferred to 0.2**), and **WP-15** (reverse-proxy /
+  (MLLP-over-TLS, v0.1), **WP-14** (MFA, **built 2026-06-17 — see §3**), and **WP-15** (reverse-proxy /
   forwarded-header hardening). The
   Phase-0/1 groundwork it *builds on* is already shipped and must **not** be redesigned:
   the HSTS response header that fires on `https` ([api/app.py](../../messagefoundry/api/app.py)
@@ -22,7 +30,7 @@
 - **Supersedes:** the `tls_*` "future" placeholder row in [CONFIGURATION.md](../CONFIGURATION.md) `[api]`
   and the one-line stub bullets under **Phase 2** in
   [ASVS-L2-REMEDIATION-PLAN.md](../security/ASVS-L2-REMEDIATION-PLAN.md) (expanded here).
-- **Related:** [ASVS-L2-ASSESSMENT.md](../security/ASVS-L2-ASSESSMENT.md) (the five
+- **Related:** [ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md) (the five
   deferred-until-off-loopback Fails: HSTS 3.4.1, WSS 4.4.1, MFA 6.3.3, transport TLS 12.3.1, off-box
   logs 16.4.3 — this ADR addresses the first four), [PHI.md](../PHI.md) §4 (data in transit) + §11
   (roadmap P1-4 / P2-1 / P2-2 / P2-3), [SECURITY.md](../SECURITY.md) "Not yet built", and
@@ -221,7 +229,9 @@ enterprise healthcare — the engine stays `http` on a restricted interface **be
 ---
 
 *Accepted for v0.1 (Gate #4): build the transport-TLS subset in the order **WP-13a → WP-15 → WP-13b**,
-one WP per branch/PR with the standard quartet gate; **WP-14 (MFA) lands in 0.2**, not this release.
-Flip the relevant [ASVS-L2-ASSESSMENT.md](../security/ASVS-L2-ASSESSMENT.md) rows and update
+one WP per branch/PR with the standard quartet gate. **WP-14 (MFA) was subsequently pulled forward and
+BUILT 2026-06-17** (native RFC 6238 TOTP for local accounts) rather than waiting for 0.2, since the
+engine must carry its own MFA for local-account deployments.
+Flip the relevant [ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md) rows and update
 [PHI.md](../PHI.md) §4/§11 + [CONFIGURATION.md](../CONFIGURATION.md) + [SECURITY.md](../SECURITY.md) as
 each lands. Update CLAUDE.md / ARCHITECTURE.md only when code ships, not now.*

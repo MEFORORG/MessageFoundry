@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Structured HL7 parse tree for the message viewer.
 
 Turns a raw message into a nested ``segment → field → repetition → component →

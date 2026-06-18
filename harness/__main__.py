@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Test harness entrypoint.
 
 ``python -m harness``                 → launch the GUI (Send/Receive/File/Compose/Monitor).
@@ -9,6 +11,12 @@
                                                 0 (SLOs met) / 1 (SLO violation, incl. zero_loss when
                                                 the profile sets it, or a baseline regression) / 2
                                                 (setup error) / 3 (interrupted).
+``python -m harness --failover NAME`` → run the two-node primary-kill scenario (the profile must carry a
+                                                [load.failover] table) against a shared server DB
+                                                (MEFOR_STORE_BACKEND=postgres|sqlserver + MEFOR_STORE_*);
+                                                the harness OWNS the two engines, SIGKILLs the primary
+                                                mid-load, and exits 0 (recovery + no-loss + ordering met)
+                                                / 1 (an SLO violated) / 2 (setup) / 3 (interrupted).
 
 The headless paths import no PySide6, so they run on a display-less runner; the GUI import is
 deferred into :func:`_launch_gui`.
@@ -39,6 +47,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--load", help="run this load profile (built-in name or path to a .toml) and exit"
     )
+    parser.add_argument(
+        "--failover",
+        help="run this profile's two-node primary-kill scenario (needs a [load.failover] table + a "
+        "shared server DB via MEFOR_STORE_*) and exit",
+    )
+    parser.add_argument(
+        "--inbound-base-port",
+        type=int,
+        default=2600,
+        help="failover: base inbound MLLP port (ADT hub; results/other = base+1/+2). Both nodes bind it",
+    )
     parser.add_argument("--list-profiles", action="store_true", help="list built-in load profiles")
     parser.add_argument("--engine", default="http://127.0.0.1:8765", help="engine API base URL")
     parser.add_argument("--token", help="bearer token for an auth-enabled engine")
@@ -66,9 +85,11 @@ def main(argv: list[str] | None = None) -> int:
         return _list_scenarios()
     if args.list_profiles:
         return _list_profiles()
-    if args.load and args.scenario:
-        print("--load and --scenario are mutually exclusive", file=sys.stderr)
+    if sum(bool(x) for x in (args.load, args.scenario, args.failover)) > 1:
+        print("--load, --failover, and --scenario are mutually exclusive", file=sys.stderr)
         return 2
+    if args.failover:
+        return _run_failover(args)
     if args.load:
         return _run_load(args)
     if args.scenario:
@@ -180,6 +201,80 @@ def _run_load(args: argparse.Namespace) -> int:
                 print(f"  - {r}", file=sys.stderr)
             exit_code = exit_code or 1
     return exit_code
+
+
+def _run_failover(args: argparse.Namespace) -> int:
+    import asyncio
+    import json
+    import os
+    import socket
+    from pathlib import Path
+
+    from harness.load.failover import FailoverError, FailoverPorts, run_failover_load
+    from harness.load.profile import LoadProfileError, get_profile
+
+    try:
+        profile = get_profile(args.failover)
+    except LoadProfileError as exc:
+        print(f"bad profile: {exc}", file=sys.stderr)
+        return 2
+    if profile.failover is None:
+        print(
+            f"profile {profile.name!r} has no [load.failover] table — not a failover profile",
+            file=sys.stderr,
+        )
+        return 2
+    # A failover needs a SHARED server DB (SQLite is single-file/single-node — it can't cluster).
+    backend = os.environ.get("MEFOR_STORE_BACKEND", "").strip().lower()
+    if backend not in ("postgres", "sqlserver"):
+        print(
+            "failover needs a shared server DB: set MEFOR_STORE_BACKEND=postgres|sqlserver (+ the "
+            f"MEFOR_STORE_* connection env); got {backend or '(unset → sqlite)'!r}",
+            file=sys.stderr,
+        )
+        return 2
+
+    def _two_free_ports() -> tuple[int, int]:
+        # Hold BOTH sockets open while reading their ports so the kernel can't hand the same ephemeral
+        # port back to the second bind (the close->rebind race that would launch both nodes on one --port).
+        s1, s2 = socket.socket(), socket.socket()
+        for s in (s1, s2):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 0))
+        try:
+            return int(s1.getsockname()[1]), int(s2.getsockname()[1])
+        finally:
+            s1.close()
+            s2.close()
+
+    base = args.inbound_base_port
+    api_a, api_b = _two_free_ports()
+    ports = FailoverPorts(
+        inbound_adt=base,
+        inbound_results=base + 1,
+        inbound_other=base + 2,
+        sink=args.sink_port,
+        sink_count=args.sink_ports,
+        api_a=api_a,
+        api_b=api_b,
+    )
+    try:
+        report = asyncio.run(
+            run_failover_load(profile, ports=ports, db_backend=args.db_backend or backend)
+        )
+    except FailoverError as exc:
+        print(f"failover setup failed: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render_console())
+    if args.report_json:
+        Path(args.report_json).write_text(
+            json.dumps(report.to_json_dict(), indent=2), encoding="utf-8"
+        )
+    return report.exit_code
 
 
 def _launch_gui() -> int:

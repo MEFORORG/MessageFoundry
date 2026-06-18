@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Localhost FastAPI surface for the console.
 
 This is the *only* boundary a client uses, so in-process / local-daemon / remote
@@ -25,21 +27,36 @@ import logging
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse
 
 from messagefoundry import __version__
+from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.api.models import (
     AiPolicy,
+    ApprovalDecisionResult,
+    ApprovalList,
+    CapturedResponseInfo,
     ChannelInfo,
     ClusterNode,
     ClusterNodeList,
     ClusterStatus,
+    ConnectionMetadata,
     ConnectionRow,
+    ConnectionTestResult,
     DbInfo,
     DeadLetterList,
     DeadLetterReplayRequest,
@@ -51,8 +68,13 @@ from messagefoundry.api.models import (
     IntegrityResult,
     MessageDetail,
     MessageList,
+    MessageResponses,
     MessageSummary,
+    OutboundPayloadInfo,
+    OutboundPayloads,
     OutboxInfo,
+    PendingApprovalInfo,
+    PendingApprovalResponse,
     PurgeResult,
     ReloadRequest,
     ReloadResult,
@@ -67,6 +89,7 @@ from messagefoundry.api.security import (
     optional_identity,
     require,
     require_phi_read,
+    require_step_up,
     ws_token,
 )
 from messagefoundry.auth import Identity, Permission
@@ -82,18 +105,28 @@ from messagefoundry.config.models import (
 from messagefoundry.config.settings import (
     AiSettings,
     AlertsSettings,
+    ApprovalsSettings,
     AuthSettings,
+    CertMonitorSettings,
     ClusterSettings,
     EgressSettings,
     ReferenceSettings,
     RetentionSettings,
+    ShadowSettings,
     StoreSettings,
 )
-from messagefoundry.config.wiring import EnvRef, WiringError, load_config
+from messagefoundry.config.wiring import EnvRef, WiringError, load_config, redacted_settings
+from messagefoundry.last_resort import install_loop_exception_handler
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
 from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.cluster import build_coordinator
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.transports.base import (
+    DeliveryError,
+    DestinationConnector,
+    TestNotSupportedError,
+)
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import _secure_file
@@ -102,6 +135,7 @@ __all__ = ["create_app", "create_managed_app"]
 
 _RATE_WINDOW = 60.0  # seconds; window for the backlog throughput estimate
 _MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024  # 1 MiB cap on HTTP request bodies (API-INPUT)
+_CONNECTION_TEST_TIMEOUT = 35.0  # overall cap for a POST /connections/{name}/test probe (seconds)
 _MAX_WS_CONNECTIONS = 64  # cap concurrent /ws/stats sockets (API-WS)
 _WS_REVALIDATE_SECONDS = 30.0  # re-check the session on an open /ws/stats this often (API-WS)
 _log = logging.getLogger(__name__)
@@ -160,6 +194,34 @@ def _get_engine(request: Request) -> Engine:
     return engine
 
 
+def _get_gate(request: Request) -> ApprovalGate | None:
+    """The dual-control approval gate (ASVS 2.3.5), or ``None`` when no engine is bound — then gated
+    endpoints execute inline and the ``/approvals`` routes report 503."""
+    return getattr(request.app.state, "approval_gate", None)
+
+
+def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> ApprovalGate:
+    """Build the approval gate and register the high-value operations dual-control can hold. Each
+    executor re-runs its captured operation on approval (params are JSON, persisted at request time)."""
+    gate = ApprovalGate(engine.store, settings)
+
+    async def _replay(p: Mapping[str, Any]) -> dict[str, Any]:
+        requeued = await engine.replay_dead(
+            channel_id=p.get("channel_id"), destination_name=p.get("destination_name")
+        )
+        return {"requeued": requeued}
+
+    async def _purge(p: Mapping[str, Any]) -> dict[str, Any]:
+        cancelled = await engine.store.cancel_queued(
+            None, str(p["name"]), top_only=(p.get("scope") == "top")
+        )
+        return {"cancelled": cancelled}
+
+    gate.register("dead_letter_replay", "Replay dead-lettered deliveries", _replay)
+    gate.register("connection_purge", "Purge queued deliveries to an outbound connection", _purge)
+    return gate
+
+
 def _summary(row: Row) -> MessageSummary:
     # dict() so optional columns (last_event on list rows; summary/metadata) read via .get,
     # letting the same builder serve list rows and SELECT * detail rows.
@@ -208,6 +270,53 @@ async def _audit_channel_denied(engine: Engine, identity: Identity, channel: str
         actor=identity.username,
         channel_id=channel,
         detail=json.dumps({"channel": channel}),
+    )
+
+
+async def _run_connection_test(
+    rr: RegistryRunner, name: str, direction: str
+) -> ConnectionTestResult:
+    """Build a fresh connector for ``name`` and probe its reachability, never disturbing the live one.
+    Reports a config (bad ``env()``/egress) or connectivity failure in the result rather than raising —
+    only an unexpected bug would 500. Closes the test connector afterward."""
+
+    def _result(
+        *, supported: bool, success: bool, ms: float, detail: str | None
+    ) -> ConnectionTestResult:
+        return ConnectionTestResult(
+            name=name,
+            direction=direction,
+            supported=supported,
+            success=success,
+            duration_ms=round(ms, 1),
+            detail=detail,
+        )
+
+    try:
+        _direction, connector = rr.build_test_connector(name)
+    except WiringError as exc:
+        return _result(supported=True, success=False, ms=0.0, detail=str(exc))
+    start = time.monotonic()
+    supported, success, detail = True, False, None
+    try:
+        await asyncio.wait_for(connector.test_connection(), _CONNECTION_TEST_TIMEOUT)
+        success = True
+    except TestNotSupportedError as exc:
+        supported, detail = False, str(exc)
+    except asyncio.TimeoutError:
+        detail = f"timed out after {_CONNECTION_TEST_TIMEOUT:.0f}s"
+    except DeliveryError as exc:
+        detail = str(exc)
+    except Exception as exc:  # noqa: BLE001 - any probe failure is reported in the result, never a 500
+        detail = f"{type(exc).__name__}: {exc}"
+    finally:
+        with suppress(Exception):  # closing a test connector must never mask the result
+            if isinstance(connector, DestinationConnector):
+                await connector.aclose()
+            else:
+                await connector.stop()
+    return _result(
+        supported=supported, success=success, ms=(time.monotonic() - start) * 1000.0, detail=detail
     )
 
 
@@ -275,6 +384,7 @@ def create_app(
     lifespan: object | None = None,
     auth: AuthService | None = None,
     ai_settings: AiSettings | None = None,
+    approvals: ApprovalsSettings | None = None,
     expose_docs: bool = False,
     allow_no_auth: bool = False,
     ws_allowed_origins: Sequence[str] = (),
@@ -292,6 +402,7 @@ def create_app(
     )
     if engine is not None:
         app.state.engine = engine
+        app.state.approval_gate = _build_approval_gate(engine, approvals or ApprovalsSettings())
     if auth is not None:
         app.state.auth = auth
     if ai_settings is not None:
@@ -365,8 +476,11 @@ def create_app(
         return await call_next(request)
 
     @app.get("/health", response_model=Health)
-    async def health() -> Health:
-        return Health(version=__version__)
+    async def health(identity: Identity | None = Depends(optional_identity)) -> Health:
+        # Liveness is always answerable (tokenless), but the build version is fingerprinting info, so
+        # it is disclosed only to an authenticated caller (WP-L3-07 / ASVS 13.4.6). When auth is
+        # disabled-with-allow_no_auth, optional_identity returns the system identity → version shown.
+        return Health(version=__version__ if identity is not None else None)
 
     @app.get("/ai/policy", response_model=AiPolicy)
     async def ai_policy(
@@ -380,14 +494,18 @@ def create_app(
         ``assist_permitted`` carries the identity-dependent bit (``None`` = RBAC not evaluable, i.e.
         no/invalid token under enabled auth). Policy reads are not audited in this MVP."""
         ai = getattr(request.app.state, "ai", None) or AiSettings()
+        data_class, prod = ai.derived_posture()
+        production = True if prod is None else prod  # unresolved posture -> strictest ceiling
         eff = resolve_effective_policy(
-            mode=ai.mode, data_scope=ai.data_scope, environment=ai.environment
+            mode=ai.mode, data_scope=ai.data_scope, production=production
         )
         permitted = None if identity is None else identity.has(Permission.AI_ASSIST)
         return AiPolicy(
             mode=eff.mode,
             data_scope=eff.data_scope,
-            environment=eff.environment,
+            environment=ai.environment,
+            data_class=data_class,
+            production=production,
             assist_permitted=permitted,
             reason=eff.reason,
         )
@@ -494,6 +612,9 @@ def create_app(
                         delivered_age_seconds=(
                             (now - dm.oldest_pending_at) if dm.oldest_pending_at else None
                         ),
+                        # Effective simulate flag — queried even for a draining (removed) outbound,
+                        # whose suppression persists in the runner until full shutdown (#15).
+                        simulated=rr.outbound_simulated(dname),
                     )
                 )
         return rows
@@ -545,13 +666,99 @@ def create_app(
         await rr.restart_inbound(name)
         return {"name": name, "running": rr.inbound_running(name)}
 
-    @app.post("/connections/{name}/purge", response_model=PurgeResult)
-    async def purge_connection(
+    @app.get("/connections/{name}/metadata", response_model=ConnectionMetadata)
+    async def connection_metadata(
         name: str,
         engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+    ) -> ConnectionMetadata:
+        """Static metadata for one connection (operability Tier 4): operator labels + a secret-scrubbed
+        settings view. No live probe — see ``POST /connections/{name}/test``."""
+        rr = engine.registry_runner
+        if rr is None:
+            raise HTTPException(503, "engine not started")
+        ic = rr.registry.inbound.get(name)
+        if ic is not None:
+            await _control_guard(engine, identity, name)  # inbound config is per-channel
+            return ConnectionMetadata(
+                name=name,
+                direction="in",
+                method=ic.spec.type.value,
+                running=rr.inbound_running(name),
+                router=ic.router,
+                metadata=dict(ic.metadata) if ic.metadata else None,
+                settings=redacted_settings(ic.spec.settings),
+            )
+        oc = rr.registry.outbound.get(name)
+        if oc is not None:
+            if identity.allowed_channels is not None:
+                # An outbound spans channels, so a channel-scoped user can't read a shared one — the
+                # same boundary /test and /purge enforce (don't disclose shared-outbound topology).
+                await _audit_channel_denied(engine, identity, name)
+                raise HTTPException(
+                    403, "channel-scoped users cannot read a shared outbound connection"
+                )
+            return ConnectionMetadata(
+                name=name,
+                direction="out",
+                method=oc.spec.type.value,
+                running=rr.running,
+                metadata=dict(oc.metadata) if oc.metadata else None,
+                settings=redacted_settings(oc.spec.settings),
+                simulated=rr.outbound_simulated(name),
+            )
+        raise HTTPException(404, f"no such connection: {name}")
+
+    @app.post("/connections/{name}/test", response_model=ConnectionTestResult)
+    async def connection_test(
+        name: str,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.CONNECTIONS_TEST)),
+    ) -> ConnectionTestResult:
+        """Probe a connection's reachability (operability Tier 4) — builds a **fresh** connector
+        (never the live one), honors the ``[egress]`` allowlist, and sends NO real data. Audited."""
+        rr = engine.registry_runner
+        if rr is None:
+            raise HTTPException(503, "engine not started")
+        is_inbound = name in rr.registry.inbound
+        if not is_inbound and name not in rr.registry.outbound:
+            raise HTTPException(404, f"no such connection: {name}")
+        direction = "in" if is_inbound else "out"
+        if is_inbound:
+            await _control_guard(engine, identity, name)  # inbound test is per-channel
+        elif identity.allowed_channels is not None:
+            # An outbound spans channels, so a channel-scoped user can't probe a shared one (like purge).
+            await _audit_channel_denied(engine, identity, name)
+            raise HTTPException(
+                403, "channel-scoped users cannot test a shared outbound connection"
+            )
+
+        result = await _run_connection_test(rr, name, direction)
+        await engine.store.record_audit(
+            "connection_test",
+            actor=identity.username,
+            channel_id=name if direction == "in" else None,
+            detail=json.dumps(
+                {
+                    "connection": name,
+                    "direction": direction,
+                    "supported": result.supported,
+                    "success": result.success,
+                    "detail": result.detail,
+                }
+            ),
+        )
+        return result
+
+    @app.post("/connections/{name}/purge", response_model=PurgeResult | PendingApprovalResponse)
+    async def purge_connection(
+        name: str,
+        response: Response,
+        engine: Engine = Depends(_get_engine),
         scope: str = Query("all", pattern="^(top|all)$"),
-        identity: Identity = Depends(require(Permission.MESSAGES_PURGE)),
-    ) -> PurgeResult:
+        identity: Identity = Depends(require_step_up(Permission.MESSAGES_PURGE)),
+        gate: ApprovalGate | None = Depends(_get_gate),
+    ) -> PurgeResult | PendingApprovalResponse:
         """Soft-cancel queued deliveries to an outbound connection (across all inbounds)."""
         # Purge targets an outbound and spans every inbound feeding it, so it can't be confined to a
         # per-(inbound-)channel scope — a channel-scoped user may not purge a shared outbound.
@@ -563,6 +770,19 @@ def create_app(
         rr = engine.registry_runner
         if rr is None or name not in rr.registry.outbound:
             raise HTTPException(404, f"no such outbound connection: {name}")
+        if (
+            gate is not None
+        ):  # dual-control: hold for a second approver when [approvals] gates purge
+            pending = await gate.guard(
+                "connection_purge", {"name": name, "scope": scope}, requester=identity.username
+            )
+            if pending is not None:
+                response.status_code = 202
+                return PendingApprovalResponse(
+                    approval_id=pending,
+                    operation="connection_purge",
+                    detail="held for a second approver (dual-control)",
+                )
         cancelled = await engine.store.cancel_queued(None, name, top_only=(scope == "top"))
         return PurgeResult(cancelled=cancelled)
 
@@ -604,12 +824,16 @@ def create_app(
             )
         return DeadLetterList(total=total, limit=limit, offset=offset, dead_letters=dead)
 
-    @app.post("/dead-letters/replay", response_model=DeadLetterReplayResult)
+    @app.post(
+        "/dead-letters/replay", response_model=DeadLetterReplayResult | PendingApprovalResponse
+    )
     async def replay_dead_letters(
         req: DeadLetterReplayRequest,
+        response: Response,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MESSAGES_REPLAY)),
-    ) -> DeadLetterReplayResult:
+        identity: Identity = Depends(require_step_up(Permission.MESSAGES_REPLAY)),
+        gate: ApprovalGate | None = Depends(_get_gate),
+    ) -> DeadLetterReplayResult | PendingApprovalResponse:
         """Re-queue dead-lettered deliveries (optionally scoped). Already-delivered rows are left
         alone; each affected message reverts from ``error`` to ``received`` and re-drains."""
         # A channel-scoped user must target one of their channels (replay isn't channel-filtered at
@@ -619,6 +843,21 @@ def create_app(
         ):
             await _audit_channel_denied(engine, identity, req.channel_id)
             raise HTTPException(403, "specify a channel within your scope to replay")
+        if (
+            gate is not None
+        ):  # dual-control: hold for a second approver when [approvals] gates replay
+            pending = await gate.guard(
+                "dead_letter_replay",
+                {"channel_id": req.channel_id, "destination_name": req.destination_name},
+                requester=identity.username,
+            )
+            if pending is not None:
+                response.status_code = 202
+                return PendingApprovalResponse(
+                    approval_id=pending,
+                    operation="dead_letter_replay",
+                    detail="held for a second approver (dual-control)",
+                )
         requeued = await engine.replay_dead(
             channel_id=req.channel_id, destination_name=req.destination_name
         )
@@ -631,13 +870,56 @@ def create_app(
             )
         return DeadLetterReplayResult(requeued=requeued)
 
+    # --- dual-control approvals (ASVS 2.3.5) ---------------------------------
+
+    @app.get("/approvals", response_model=ApprovalList)
+    async def list_approvals(
+        _: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
+        gate: ApprovalGate | None = Depends(_get_gate),
+    ) -> ApprovalList:
+        """Open (still-pending, unexpired) high-value actions awaiting a second approver."""
+        if gate is None:
+            raise HTTPException(503, "approval workflow is not available")
+        return ApprovalList(approvals=[PendingApprovalInfo(**a) for a in await gate.list_pending()])
+
+    @app.post("/approvals/{approval_id}/approve", response_model=ApprovalDecisionResult)
+    async def approve_action(
+        approval_id: str,
+        identity: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
+        gate: ApprovalGate | None = Depends(_get_gate),
+    ) -> ApprovalDecisionResult:
+        """Release a pending action: re-executes the captured operation and audits both identities. A
+        requester can never approve their own request (dual-control, 2.3.5)."""
+        if gate is None:
+            raise HTTPException(503, "approval workflow is not available")
+        try:
+            outcome = await gate.approve(approval_id, approver=identity.username)
+        except ApprovalError as exc:
+            raise HTTPException(exc.status, exc.detail) from exc
+        return ApprovalDecisionResult(**outcome)
+
+    @app.post("/approvals/{approval_id}/reject", response_model=ApprovalDecisionResult)
+    async def reject_action(
+        approval_id: str,
+        identity: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
+        gate: ApprovalGate | None = Depends(_get_gate),
+    ) -> ApprovalDecisionResult:
+        """Decline a pending action without executing it (audited)."""
+        if gate is None:
+            raise HTTPException(503, "approval workflow is not available")
+        try:
+            outcome = await gate.reject(approval_id, approver=identity.username)
+        except ApprovalError as exc:
+            raise HTTPException(exc.status, exc.detail) from exc
+        return ApprovalDecisionResult(**outcome)
+
     # --- config promote / reload ---------------------------------------------
 
     @app.post("/config/reload", response_model=ReloadResult)
     async def reload_config(
         req: ReloadRequest,
         engine: Engine = Depends(_get_engine),
-        user: Identity = Depends(require(Permission.CONFIG_DEPLOY)),
+        user: Identity = Depends(require_step_up(Permission.CONFIG_DEPLOY)),
     ) -> ReloadResult:
         """Load the code-first graph and atomically apply it to the running engine (quiesce-and-swap;
         in-flight outbox deliveries keep draining). ``config_dir`` defaults to the server's startup
@@ -754,6 +1036,7 @@ def create_app(
     @app.get("/messages/{message_id}", response_model=MessageDetail)
     async def get_message(
         message_id: str,
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
     ) -> MessageDetail:
@@ -774,9 +1057,9 @@ def create_app(
             channel_id=row["channel_id"],
             detail=json.dumps({"message_id": message_id}),
         )
-        outbox = await engine.store.outbox_for(message_id)
-        events = await engine.store.events_for(message_id)
-        return MessageDetail(
+        outbox_rows = await engine.store.outbox_for(message_id)
+        event_rows = await engine.store.events_for(message_id)
+        detail = MessageDetail(
             **_summary(row).model_dump(),
             raw=row["raw"],
             outbox=[
@@ -788,7 +1071,7 @@ def create_app(
                     next_attempt_at=o["next_attempt_at"],
                     last_error=o["last_error"],
                 )
-                for o in outbox
+                for o in outbox_rows
             ],
             events=[
                 EventInfo(
@@ -797,7 +1080,116 @@ def create_app(
                     destination=e["destination"],
                     detail=e["detail"],
                 )
-                for e in events
+                for e in event_rows
+            ],
+        )
+        # Per-property PHI gate (#120): the patient `summary`, the exception `error`, every delivery
+        # `last_error`, and every event `detail` gate on messages:view_summary. Redaction keys on the
+        # EXACT type (no MRO walk), so the MessageDetail wrapper and each nested OutboxInfo/EventInfo are
+        # redacted individually. The raw body stays on this route's view_raw gate. Exposure is audited
+        # server-side, mirroring the list endpoints (count after redaction = what's actually returned).
+        outbox = [redact_unauthorized(o, identity) for o in detail.outbox]
+        events = [redact_unauthorized(e, identity) for e in detail.events]
+        detail = redact_unauthorized(detail, identity).model_copy(
+            update={"outbox": outbox, "events": events}
+        )
+        exposed = count_exposed([detail, *outbox, *events])
+        if exposed:
+            await request.app.state.summary_auditor.note(
+                engine.store, identity.username, row["channel_id"], exposed, time.time()
+            )
+        return detail
+
+    @app.get("/messages/{message_id}/responses", response_model=MessageResponses)
+    async def get_message_responses(
+        message_id: str,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_phi_read(Permission.MESSAGES_READ)),
+    ) -> MessageResponses:
+        """The captured request/response replies for a message (ADR 0013). ``outcome``/``detail`` need
+        the message-read permission; the PHI ``body`` is included only for a caller that also holds the
+        raw-body permission (``MESSAGES_VIEW_RAW``). Every access is audited (``response.read``)."""
+        row = await engine.store.get_message(message_id)
+        # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
+        # channel (per-channel RBAC), mirroring get_message.
+        if row is None or not identity.can_access_channel(row["channel_id"]):
+            if row is not None:
+                await _audit_channel_denied(engine, identity, row["channel_id"])
+            raise HTTPException(404, f"no such message: {message_id}")
+        captured = await engine.store.correlate_response(message_id)
+        include_body = identity.has(Permission.MESSAGES_VIEW_RAW)
+        # Reading captured replies is PHI access — audit it. If bodies are exposed, also record the
+        # per-message PHI view timeline (record_view), exactly like opening a raw body.
+        await engine.store.record_audit(
+            "response.read",
+            actor=identity.username,
+            channel_id=row["channel_id"],
+            detail=json.dumps(
+                {"message_id": message_id, "count": len(captured), "body": include_body}
+            ),
+        )
+        if include_body and captured:
+            await engine.store.record_view(message_id, actor=identity.username)
+        # `detail` can embed a reply fragment (e.g. an unparseable-ACK note), so it gates on
+        # messages:view_summary like every other disposition text (#120) — a bare messages:read caller
+        # (Viewer) reaches this endpoint but gets `detail` nulled. The PHI `body` stays on view_raw above.
+        return MessageResponses(
+            message_id=message_id,
+            responses=[
+                redact_unauthorized(
+                    CapturedResponseInfo(
+                        destination_name=c.destination_name,
+                        response_seq=c.response_seq,
+                        outcome=c.outcome,
+                        detail=c.detail,
+                        captured_at=c.captured_at,
+                        body=c.body if include_body else None,
+                    ),
+                    identity,
+                )
+                for c in captured
+            ],
+        )
+
+    @app.get("/messages/{message_id}/outbound", response_model=OutboundPayloads)
+    async def get_message_outbound(
+        message_id: str,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
+    ) -> OutboundPayloads:
+        """The **transformed outbound payloads** MEFOR routed for a message — one entry per
+        destination (#14 parity tool). The PHI bodies are returned in full, so the route requires
+        ``MESSAGES_VIEW_RAW`` outright (unlike ``/responses``, where the body is conditional). Works on
+        both simulate/shadow and live runs — the transformed payload is retained on the done outbound
+        row in either mode. Every access is audited (``outbound.read`` + a per-message ``viewed``
+        event when bodies are returned)."""
+        row = await engine.store.get_message(message_id)
+        # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
+        # channel (per-channel RBAC), mirroring get_message.
+        if row is None or not identity.can_access_channel(row["channel_id"]):
+            if row is not None:
+                await _audit_channel_denied(engine, identity, row["channel_id"])
+            raise HTTPException(404, f"no such message: {message_id}")
+        payload_rows = await engine.store.outbox_payloads_for(message_id)
+        # Returning transformed bodies is PHI access — audit the read, and (when bodies are actually
+        # returned) record the per-message PHI view timeline, exactly like opening a raw body.
+        await engine.store.record_audit(
+            "outbound.read",
+            actor=identity.username,
+            channel_id=row["channel_id"],
+            detail=json.dumps({"message_id": message_id, "count": len(payload_rows)}),
+        )
+        if payload_rows:
+            await engine.store.record_view(message_id, actor=identity.username)
+        return OutboundPayloads(
+            message_id=message_id,
+            payloads=[
+                OutboundPayloadInfo(
+                    destination_name=o["destination_name"],
+                    status=o["status"],
+                    payload=o["payload"],
+                )
+                for o in payload_rows
             ],
         )
 
@@ -805,7 +1197,7 @@ def create_app(
     async def replay_message(
         message_id: str,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MESSAGES_REPLAY)),
+        identity: Identity = Depends(require_step_up(Permission.MESSAGES_REPLAY)),
     ) -> ReplayResult:
         row = await engine.store.get_message(message_id)
         if row is None or not identity.can_access_channel(row["channel_id"]):
@@ -838,7 +1230,10 @@ def create_app(
         engine: Engine = Depends(_get_engine),
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> StatsResponse:
-        return StatsResponse(outbox_by_status=await engine.store.stats())
+        return StatsResponse(
+            outbox_by_status=await engine.store.stats(),
+            in_pipeline=await engine.store.in_pipeline_depth(),
+        )
 
     # --- engine + DB status --------------------------------------------------
 
@@ -883,14 +1278,19 @@ def create_app(
         engine: Engine = Depends(_get_engine),
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> ClusterStatus:
-        """This node's cluster posture: id, whether it's clustered, whether it's the leader, and the
-        cached config version. All cheap in-memory coordinator gates — no DB round-trip. Single-node
-        (NullCoordinator) reports clustered=false, is_leader=true, config_version=0."""
+        """This node's cluster posture: id, whether it's clustered, whether it's the leader, its
+        active-passive role, and the cached config version. All cheap in-memory coordinator gates — no DB
+        round-trip. Single-node (NullCoordinator) reports clustered=false, is_leader=true,
+        role="single-node", config_version=0."""
         c = engine.coordinator
+        clustered = c.is_clustered()
+        is_leader = c.is_leader()
+        role = "single-node" if not clustered else ("primary" if is_leader else "standby")
         return ClusterStatus(
             node_id=c.node_id,
-            clustered=c.is_clustered(),
-            is_leader=c.is_leader(),
+            clustered=clustered,
+            is_leader=is_leader,
+            role=role,
             config_version=c.config_version_cached(),
         )
 
@@ -900,9 +1300,11 @@ def create_app(
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> ClusterNodeList:
         """Cluster membership: one row per known node with liveness + derived leadership, plus the single
-        leader's node_id. One DB read on a real cluster (the shared ``nodes`` table); single-node
+        leader's node_id and the authoritative leadership-lease state (owner + expiry). One-to-two DB
+        reads on a real cluster (the shared ``nodes`` table + the ``leader_lease`` row); single-node
         synthesizes one self-entry with no DB."""
-        members = await engine.coordinator.cluster_members()
+        c = engine.coordinator
+        members = await c.cluster_members()
         nodes = [
             ClusterNode(
                 node_id=m.node_id,
@@ -916,7 +1318,13 @@ def create_app(
             for m in members
         ]
         leader = next((n.node_id for n in nodes if n.is_leader), None)
-        return ClusterNodeList(nodes=nodes, leader_node_id=leader)
+        lease_owner, lease_expires_at = await c.leadership_lease()
+        return ClusterNodeList(
+            nodes=nodes,
+            leader_node_id=leader,
+            lease_owner=lease_owner,
+            lease_expires_at=lease_expires_at,
+        )
 
     @app.post("/status/integrity-check", response_model=IntegrityResult)
     async def integrity_check(
@@ -1020,20 +1428,26 @@ def create_managed_app(
     poll_interval: float = 0.25,
     synchronous: str = "NORMAL",
     inbound_bind_host: str = "127.0.0.1",
+    allow_insecure_bind: bool = False,
     delivery_defaults: RetryPolicy | None = None,
     ordering_default: OrderingMode | None = None,
     internal_error_default: InternalErrorPolicy | None = None,
     buildup_default: BuildupThreshold | None = None,
     ack_after_default: AckAfter | None = None,
+    max_correlation_depth: int = 8,
     env_values: Mapping[str, Any] | None = None,
     env_values_provider: Callable[[], Mapping[str, Any]] | None = None,
     auth_settings: AuthSettings | None = None,
     ai_settings: AiSettings | None = None,
     alerts_settings: AlertsSettings | None = None,
     retention_settings: RetentionSettings | None = None,
+    cert_monitor_settings: CertMonitorSettings | None = None,
+    api_tls_cert_file: str | None = None,
     reference_settings: ReferenceSettings | None = None,
     egress_settings: EgressSettings | None = None,
+    shadow_settings: ShadowSettings | None = None,
     cluster_settings: ClusterSettings | None = None,
+    approvals_settings: ApprovalsSettings | None = None,
     expose_docs: bool = False,
     ws_allowed_origins: Sequence[str] = (),
 ) -> FastAPI:
@@ -1053,6 +1467,10 @@ def create_managed_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # Process-level last-resort: route any otherwise-unhandled asyncio task/callback exception
+        # through safe_exc → the log, so it can't escape as a raw traceback (possible PHI) or die
+        # silently (ASVS 16.5.4). Here because set_exception_handler needs the running loop.
+        install_loop_exception_handler()
         store = await open_store(resolved)
         # Operational alert notifier (webhook/email). None when no transport is configured → the
         # engine falls back to the logging sink. Its background dispatch task is owned by this
@@ -1068,9 +1486,11 @@ def create_managed_app(
         engine = Engine(
             store,
             poll_interval=poll_interval,
+            max_correlation_depth=max_correlation_depth,
             config_dir=config_dir,
             config_reload_roots=config_reload_roots,
             inbound_bind_host=inbound_bind_host,
+            allow_insecure_bind=allow_insecure_bind,
             delivery_defaults=delivery_defaults,
             ordering_default=ordering_default,
             internal_error_default=internal_error_default,
@@ -1078,9 +1498,12 @@ def create_managed_app(
             ack_after_default=ack_after_default,
             alert_sink=notifier,
             retention_settings=retention_settings,
+            cert_monitor_settings=cert_monitor_settings,
+            api_tls_cert_file=api_tls_cert_file,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
-            active_environment=ai_settings.environment.value if ai_settings else None,
+            shadow_settings=shadow_settings,
+            active_environment=ai_settings.environment if ai_settings else None,
             env_values=env_values,
             env_values_provider=env_values_provider,
             coordinator=coordinator,
@@ -1090,9 +1513,21 @@ def create_managed_app(
             engine.add_registry(load_config(config_dir))
         await engine.start()
         app.state.engine = engine
+        app.state.approval_gate = _build_approval_gate(
+            engine, approvals_settings or ApprovalsSettings()
+        )
         reaper: asyncio.Task[None] | None = None
+        security_notifier = None
         if auth_settings is not None and auth_settings.enabled:
-            auth = AuthService(store, auth_settings)
+            # Out-of-band security-event email (ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP transport,
+            # sent to each affected user's own address. None when disabled or no SMTP configured; the
+            # /me/security-events feed still records events. Its background task is owned by this
+            # lifespan (started here, drained + closed after the engine in the finally below).
+            if auth_settings.notify_security_events and alerts_settings is not None:
+                security_notifier = security_notifier_from_settings(alerts_settings)
+                if security_notifier is not None:
+                    security_notifier.start()
+            auth = AuthService(store, auth_settings, security_notifier=security_notifier)
             bootstrap = await auth.initialize()
             app.state.auth = auth
             if bootstrap is not None:
@@ -1108,6 +1543,10 @@ def create_managed_app(
                 # (review M-33).
                 await asyncio.gather(reaper, return_exceptions=True)
             await engine.stop()
+            if security_notifier is not None:
+                await (
+                    security_notifier.aclose()
+                )  # drain queued user emails, bounded by SMTP timeout
             if notifier is not None:
                 # Stop accepting alerts last (after the engine quiesces) so any final
                 # connection_stopped/queue_buildup still drains; bounded by the transport timeouts.

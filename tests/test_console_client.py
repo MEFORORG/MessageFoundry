@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Console API client, exercised against a real uvicorn server in a background thread.
 
 This is an integration test: it starts the managed app (engine + API) on a free port with a
@@ -106,6 +108,10 @@ def test_message_flow_list_detail_replay(server: tuple[str, Path]) -> None:
         mid = listing.messages[0].id
         assert listing.messages[0].message_type == "ADT^A01"
 
+        # The ingress row is listed the instant it commits, but the staged pipeline
+        # produces the outbound row asynchronously (ingress → routed → outbound). Wait for
+        # delivery before reading the outbox, or a slow runner races the worker and sees [].
+        _wait(lambda: client.get_message(mid).outbox)
         detail = client.get_message(mid)
         assert detail.raw == ADT
         assert detail.outbox[0].destination_name == "archive"
@@ -185,12 +191,14 @@ def test_integrity_check_uses_generous_timeout(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_decode_maps_schema_mismatch_to_apierror() -> None:
-    from messagefoundry.api.models import Health
+    from messagefoundry.api.models import EngineInfo
     from messagefoundry.console.client import _decode
 
+    # EngineInfo has required fields (version/uptime_seconds/pid); a mismatched shape must error.
+    # (Health is deliberately all-optional now — version is auth-gated — so it can't stand in here.)
     resp = httpx.Response(200, json={"unexpected": "shape"})  # missing required fields
     with pytest.raises(ApiError, match="invalid response"):
-        _decode(resp, Health)
+        _decode(resp, EngineInfo)
 
 
 def test_decode_maps_malformed_json_to_apierror() -> None:
@@ -209,3 +217,30 @@ def test_decode_list_maps_bad_payload_to_apierror() -> None:
     resp = httpx.Response(200, json={"not": "a list"})
     with pytest.raises(ApiError):
         _decode_list(resp, ChannelInfo)
+
+
+# --- poll client (backlog #2): a separate read-only client for off-thread reads ----------------
+
+
+def test_for_polling_is_a_distinct_readonly_client() -> None:
+    # The dedicated poll client (background, off-thread reads) must be a SEPARATE httpx.Client that
+    # shares the bearer token but carries NO step-up/MFA handlers, so worker threads never touch the
+    # main-thread client's connection pool or its mutable auth state — the cross-thread-shared-client
+    # hazard the off-thread conversion closes.
+    client = EngineClient("http://127.0.0.1:8765", timeout=3.0)
+    client._token = "tok-123"  # simulate an authenticated session
+    client.set_step_up_handler(lambda: True)
+    client.set_mfa_handler(lambda: True)
+
+    poll = client.for_polling()
+    try:
+        assert poll is not client
+        assert poll._http is not client._http  # its own connection pool
+        assert poll.base_url == client.base_url
+        assert poll.token == "tok-123"  # shares the bearer token at creation
+        # read-only: it must never prompt, so the 403→prompt→retry branches stay inert
+        assert poll._step_up_handler is None
+        assert poll._mfa_handler is None
+    finally:
+        poll.close()
+        client.close()

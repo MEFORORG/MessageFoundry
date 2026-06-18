@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Per-message pipeline + connection supervision.
 
 The inbound path (parse/validate → Router → Handler(s) → fan out to outbound outboxes →

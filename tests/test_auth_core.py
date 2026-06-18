@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Unit tests for the provider-agnostic auth core (permissions, identity, policy, tokens, passwords)."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """The load system-under-test graph (``harness/config/load``) + the "don't bake Corepoint in" guard.
 
 Loads the graph and dry-runs generated traffic, asserting the fan-out factor and transform cost are

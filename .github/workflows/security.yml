@@ -71,9 +71,8 @@ jobs:
           python -m pip install --upgrade pip "cyclonedx-bom~=4.6"
           cyclonedx-py requirements requirements.lock --output-format JSON --outfile sbom.cdx.json
       - name: Upload the SBOM artifact
-        # TODO(supply-chain): pin to a commit SHA like the other actions here before this gate is
-        # made blocking (kept on the @v4 tag for now to avoid a guessed SHA).
-        uses: actions/upload-artifact@v4
+        # SHA-pinned for supply-chain integrity, matching ci.yml's upload-artifact pin.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: sbom-cyclonedx
           path: sbom.cdx.json
@@ -137,3 +136,37 @@ jobs:
           python -m pip install --upgrade pip "semgrep~=1.90"
           # --error: any finding fails the step — and the job, now that this gate is blocking.
           semgrep --config .semgrep --error --metrics off messagefoundry
+
+  crypto-inventory:
+    name: crypto-inventory (ASVS 11.1.3 discovery gate)
+    runs-on: ubuntu-latest
+    # BLOCKING: enumerate every crypto call site (hashlib/secrets/hmac/ssl/argon2/cryptography) and diff
+    # against the maintained inventory in scripts/security/crypto_inventory_check.py (machine-readable
+    # companion to docs/security/ASVS-L2-PHASE0-CHANGES.md §4). A new/moved/undocumented crypto usage —
+    # or a stale inventory entry — fails the build, so the inventory can't silently drift (WP-L3-02).
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+      - name: Diff crypto call sites against the inventory
+        # Stdlib-only (no install). Exits non-zero — failing the build — on any drift.
+        run: python scripts/security/crypto_inventory_check.py
+
+  forbidden-content:
+    name: forbidden-content (customer/PHI leak guard)
+    runs-on: ubuntu-latest
+    # BLOCKING: scan the PUBLISHABLE subset — every tracked file MINUS scripts/publish/publish-denylist.txt
+    # (the same deny-list publish.ps1 removes) — for customer/PHI-adjacent strings: partner/site names, the
+    # real production estate, routable host IPs. These are not *secrets* (gitleaks won't flag them) but must
+    # never reach the open-source mirror. This is the same scanner publish.ps1 runs as its fail-closed gate,
+    # brought forward to PR/push-to-main time so a token can't ride a squash-merge onto main and sit there
+    # until the next publish catches it. See docs/security/PUBLISHING.md.
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+      - name: Scan the publishable subset for forbidden content
+        # Stdlib-only scanner (no install). Exits non-zero — failing the build — on any hit.
+        run: python scripts/publish/scan_forbidden.py --published

@@ -19,7 +19,7 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[A-Za-z0-9._-]+$')]
     [string]$Name,
-    [string]$Base = "main",
+    [string]$Base = "origin/main",  # forwarded to new.ps1; matches its fetched-remote-tip default
     [string]$Python = "python",
     [switch]$Sqlserver,
     [switch]$Ide,

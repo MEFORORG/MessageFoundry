@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Opaque session tokens: the client holds the secret; the store keeps only its SHA-256.
 
 Opaque server-side tokens (not JWT) are chosen so logout, expiry, and role changes take effect

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Windows DPAPI secret-at-rest helper + store key-file resolution (WP-11d, ASVS 13.3.1/13.3.2).
 
 The actual CryptProtectData round-trips are Windows-only (skipped elsewhere); the platform guard and

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """FastAPI authentication + authorization dependencies (deny-by-default).
 
 ``require(*permissions)`` is a dependency factory applied to every protected route. Once an enabled
@@ -50,6 +52,13 @@ def bearer_token(request: Request) -> str | None:
     return None
 
 
+def _client_ip(request: Request) -> str | None:
+    """The caller's client address, matching how login records it on the session (``_client`` in
+    ``auth_routes``). Used by the WP-L3-13 new-client-IP risk signal so the comparison is
+    apples-to-apples. (Forwarded-header resolution behind a trusted proxy is WP-15, not yet built.)"""
+    return request.client.host if request.client else None
+
+
 def require(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
     """Build a dependency that authenticates the caller and asserts each of ``permissions``."""
 
@@ -98,6 +107,75 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
                 "too many requests; please slow down",
                 headers={"Retry-After": "10"},
             )
+        return identity
+
+    return dependency
+
+
+def require_step_up(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
+    """Like :func:`require`, plus **step-up re-verification** (ASVS 7.5.3): the caller's session must
+    have re-proved its credential — at login or via ``POST /me/reauth`` — within
+    ``[auth].step_up_max_age_seconds``. Gates the highly sensitive admin / replay / config flows; a
+    stale session is refused with 403 (the console then prompts to re-authenticate and retries). The
+    embedding/no-auth path is unaffected (there is no session to step up)."""
+    base = require(*permissions)
+
+    async def dependency(request: Request) -> Identity:
+        identity = await base(request)
+        auth = get_auth(request)
+        if auth is not None and auth.enabled:
+            token = bearer_token(request)
+            # Second factor first (WP-14, ASVS 6.3.3): an MFA-required session that has not verified
+            # its TOTP / recovery code cannot perform a sensitive op until it does. A distinct header
+            # tells the console to prompt for a code rather than a password reauth.
+            if not await auth.mfa_satisfied(token):
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "multi-factor verification required; POST /auth/mfa-verify then retry",
+                    headers={"X-MFA-Required": "1"},
+                )
+            # Contextual-risk layer (WP-L3-13, ASVS 8.4.2): a sensitive admin action from a client IP
+            # the session has not verified from forces a fresh step-up (and audits + notifies). A
+            # successful POST /me/reauth re-anchors the session to the new IP, so this then clears.
+            new_ip = await auth.flag_new_client_ip(
+                token, _client_ip(request), path=request.url.path
+            )
+            if new_ip or not await auth.has_recent_step_up(token):
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "step-up re-verification required; POST /me/reauth then retry",
+                    headers={"X-Step-Up-Required": "1"},
+                )
+        return identity
+
+    return dependency
+
+
+def require_reauth_only(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
+    """Like :func:`require_step_up` but with **only** the password step-up — **not** the MFA gate.
+
+    Used by the MFA *enrollment* endpoints: a user enrolling their first second factor (or a
+    ``require_mfa`` administrator who has not enrolled yet) cannot satisfy an MFA gate, so a
+    :func:`require_step_up` there would deadlock. Re-proving the password still defends a stolen
+    session from silently enrolling an attacker-controlled authenticator (WP-14)."""
+    base = require(*permissions)
+
+    async def dependency(request: Request) -> Identity:
+        identity = await base(request)
+        auth = get_auth(request)
+        if auth is not None and auth.enabled:
+            token = bearer_token(request)
+            # Same new-client-IP contextual-risk layer as require_step_up (WP-L3-13); the MFA gate is
+            # intentionally skipped here (enrollment would otherwise deadlock — see the docstring).
+            new_ip = await auth.flag_new_client_ip(
+                token, _client_ip(request), path=request.url.path
+            )
+            if new_ip or not await auth.has_recent_step_up(token):
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "step-up re-verification required; POST /me/reauth then retry",
+                    headers={"X-Step-Up-Required": "1"},
+                )
         return identity
 
     return dependency

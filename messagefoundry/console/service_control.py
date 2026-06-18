@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Windows service control for the Engine Status page.
 
 The engine can't control its *own* hosting service through the API (stopping it kills the API;
@@ -26,6 +28,7 @@ __all__ = [
     "parse_service_state",
     "install_script_path",
     "install_service",
+    "is_safe_environment",
 ]
 
 _ACTIONS = {
@@ -43,6 +46,19 @@ _SAFE_SERVICE_NAME = re.compile(r"^[A-Za-z0-9 ._-]+$")
 
 def _is_safe_service_name(name: str) -> bool:
     return bool(_SAFE_SERVICE_NAME.match(name))
+
+
+# The active-environment name is passed to install-service.ps1 as `-Environment <name>`, interpolated
+# into an ELEVATED PowerShell command line (ShellExecuteW "runas"). It also becomes a filename segment
+# (environments/<name>.toml), so constrain it to the same token charset the engine validates
+# ([ai].environment) and reject anything else — an unsafe value could break out of the quoted arg and
+# run as admin (cf. the service-name guard above).
+_SAFE_ENV_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def is_safe_environment(name: str) -> bool:
+    """True if ``name`` is a valid active-environment name (letters, digits, ``.``, ``_``, ``-``)."""
+    return bool(_SAFE_ENV_NAME.match(name))
 
 
 def parse_service_state(sc_output: str) -> str:
@@ -98,11 +114,24 @@ def install_script_path() -> Path | None:
     return script if script.exists() else None
 
 
-def install_service(script_path: str) -> bool:
+def _install_params(script_path: str, environment: str) -> str:
+    """Build the argument string for the elevated installer launch.
+
+    ``environment`` is the active environment the service will run as (``serve --env``); it is
+    interpolated into an elevated command line, so reject anything that isn't a plain environment
+    name (raises :class:`ValueError`). Validation runs on every platform so it is unit-testable."""
+    if not is_safe_environment(environment):
+        raise ValueError(f"unsafe environment name {environment!r}")
+    return f'-NoExit -ExecutionPolicy Bypass -File "{script_path}" -Environment "{environment}"'
+
+
+def install_service(script_path: str, environment: str) -> bool:
     """Run the install script elevated in a *visible* PowerShell window (one-time setup, so the
-    operator can read the output / 'next steps' and any errors). Returns False off Windows."""
+    operator can read the output / 'next steps' and any errors). ``environment`` is the active
+    environment the service runs as (ADR 0017 — install-service.ps1 requires it). Returns False off
+    Windows. Raises :class:`ValueError` for an unsafe environment name (it runs elevated)."""
+    params = _install_params(script_path, environment)  # validates env on every platform
     if sys.platform != "win32":
         return False
-    params = f'-NoExit -ExecutionPolicy Bypass -File "{script_path}"'
     ctypes.windll.shell32.ShellExecuteW(None, "runas", "powershell.exe", params, None, 1)
     return True

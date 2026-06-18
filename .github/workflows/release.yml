@@ -1,0 +1,146 @@
+# Release — build, SBOM, Sigstore-sign, publish a GitHub release, and upload to PyPI when a `vX.Y.Z`
+# tag is pushed.
+#
+# Cut a release:  git tag v0.1.0 && git push origin v0.1.0   (on a commit that already passed CI on main).
+# Dry-run:        run this workflow manually (workflow_dispatch) — it builds + SBOMs + signs and uploads
+#                 the artifacts for inspection. It does NOT create a GitHub release and does NOT publish
+#                 to PyPI (both are gated on a tag push), so the dry-run validates build/SBOM/sign/upload
+#                 ONLY — the publish step never runs on a branch ref. The first live PyPI publish is the
+#                 first real tag; validate it with a `vX.Y.Z-rc1` pre-release tag (also matched below)
+#                 once Trusted Publishing is configured.
+#
+# PyPI publish uses Trusted Publishing (OIDC) — no API token. OWNER PREREQ (one-time, before the first
+# tag): claim the `messagefoundry` PyPI project + configure a Trusted Publisher (a PENDING publisher works
+# before the first upload) for repo MEFORORG/MessageFoundry + workflow `release.yml`. Note: pre-release
+# `-*` tags publish to PRODUCTION PyPI (a TestPyPI route would need its own Trusted Publisher). Cut the tag
+# only AFTER the py.typed marker (WS-3) is on main — the wheel smoke step enforces this on a tag.
+#
+# The version is single-sourced from messagefoundry/__init__.py (hatchling dynamic version), so the built
+# artifact's version must match the tag.
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"  # pre-releases: v0.1.0-rc1, …
+  workflow_dispatch:
+
+permissions:
+  contents: write       # create the release + upload its assets
+  id-token: write       # Sigstore signing, PyPI Trusted Publishing, + provenance — all via the GitHub OIDC identity
+  attestations: write   # write the SLSA build-provenance attestation (actions/attest-build-provenance)
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+          ls -l dist/
+
+      - name: Smoke-check the built wheel (clean venv → import + version)
+        run: |
+          python -m venv /tmp/relsmoke
+          /tmp/relsmoke/bin/pip install --quiet dist/*.whl
+          built=$(/tmp/relsmoke/bin/python -c "import messagefoundry; print(messagefoundry.__version__)")
+          echo "built version: $built"
+          # On a tag push, the built version MUST equal the tag (single-source check).
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            want="${GITHUB_REF_NAME#v}"
+            [ "$built" = "$want" ] || { echo "::error::built version $built != tag $want"; exit 1; }
+            # A released wheel MUST ship the PEP 561 marker so an external consumer's mypy sees the
+            # typed surface. Enforced ONLY on a tag, so the workflow_dispatch dry-run is never blocked
+            # before py.typed (WS-3) merges. This is the CI enforcement of the cross-workstream rule
+            # "py.typed must merge before the v0.1.0 tag is cut" — a wheel is a zip, so grep its listing.
+            if ! unzip -l dist/*.whl | grep -q 'messagefoundry/py.typed'; then
+              echo "::error::messagefoundry/py.typed missing from the wheel — the py.typed marker (WS-3) must merge before tagging a release"; exit 1
+            fi
+          fi
+
+      - name: Stage a clean dist for PyPI (wheel + sdist only — no signature bundles)
+        run: |
+          # PyPI's uploader (twine) rejects non-distribution files, and the Sigstore step below signs
+          # in-place into dist/ (writing *.sigstore bundles there). Snapshot ONLY the wheel + sdist into
+          # a clean dir now — before signing — and publish FROM it as the last step, so the irreversible
+          # PyPI upload runs last and the uploader never sees the signature bundles.
+          mkdir -p dist-pub
+          cp dist/*.whl dist/*.tar.gz dist-pub/
+          ls -l dist-pub/
+
+      - name: Generate CycloneDX SBOM (from the hash-locked runtime deps)
+        run: |
+          python -m pip install cyclonedx-bom
+          python -m cyclonedx_py requirements requirements.lock --of JSON -o messagefoundry-sbom.cdx.json
+          python -c "import json; d=json.load(open('messagefoundry-sbom.cdx.json')); print('SBOM', d['bomFormat'], d['specVersion'], '-', len(d.get('components',[])), 'components')"
+
+      - name: Sign artifacts with Sigstore (keyless, GitHub OIDC)
+        run: |
+          python -m pip install sigstore
+          python -m sigstore sign dist/*.tar.gz dist/*.whl
+          ls -l dist/
+
+      # SLSA build provenance (Beyond-ASVS-L3 WP-BL3-01): a signed in-toto provenance attestation
+      # (predicateType slsaprovenance v1) binding each artifact's sha256 -> this source commit + the
+      # builder workflow identity, transparency-logged via the OIDC identity above. This is the
+      # GitHub-native artifact attestation for the GitHub release assets, COMPLEMENTING the PyPI-side
+      # PEP 740 attestations emitted by the publish step below (dist-pub/ is a byte-identical copy, so
+      # the digests match either source). Runs on a tag push AND the workflow_dispatch dry-run, so the
+      # attestation path is validated before the real tag. Verify a downloaded artifact with:
+      #   gh attestation verify dist/<artifact> --repo MEFORORG/MessageFoundry
+      - name: Attest build provenance (SLSA) for sdist + wheel
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: "dist/*.tar.gz, dist/*.whl"
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          # Release notes = this version's CHANGELOG section (fall back to a one-liner).
+          awk -v v="$ver" 'BEGIN{f=0} /^## \[/{ if(f) exit; if(index($0,"["v"]")) f=1 } f{print}' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "MessageFoundry $tag" > notes.md
+          pre=""
+          case "$ver" in *-*) pre="--prerelease";; esac
+          gh release create "$tag" \
+            dist/*.tar.gz dist/*.whl dist/*.sigstore* messagefoundry-sbom.cdx.json \
+            --title "$tag" --notes-file notes.md $pre
+
+      - name: Upload artifacts (dry-run / always)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-artifacts
+          path: |
+            dist/
+            messagefoundry-sbom.cdx.json
+          if-no-files-found: ignore
+
+      # LAST step on purpose: PyPI is the one IRREVERSIBLE sink (uploads can't be replaced), so it runs
+      # after build/smoke/sign/release — the step's `if` has an implicit success(), so any earlier
+      # failure skips it and nothing can fail AFTER an upload. Tag-gated, so the workflow_dispatch
+      # dry-run skips it entirely (a branch ref isn't `refs/tags/...`). Reads dist-pub/ (clean wheel +
+      # sdist; dist/ now also holds the *.sigstore bundles, which twine would reject). Trusted Publishing
+      # (OIDC) — no token, uses the job's `id-token: write`. attestations: PEP 740 provenance ON PyPI,
+      # distinct from the Sigstore bundle attached to the GitHub release above. skip-existing: a re-run /
+      # same-version re-push is a no-op, NOT a failure (a version bump is required to republish; the
+      # version==tag smoke check already prevents a wrong-version upload).
+      - name: Publish to PyPI (Trusted Publishing / OIDC)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: dist-pub/
+          skip-existing: true
+          attestations: true

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Operational **service settings** — deployment config, distinct from the code-first message graph.
 
 The message graph (Connections/Routers/Handlers) is authored in Python and loaded from ``--config``;
@@ -8,10 +10,11 @@ the API bind address, logging. They load from a TOML file + environment + CLI, w
 
 Secrets (e.g. a future DB password) belong in **env** (``MEFOR_<SECTION>_<KEY>``), never in the file.
 This is the first cut (build-order step 1 of docs/CONFIGURATION.md): ``[store]`` (backend/path/
-synchronous), ``[api]`` (host/port), and ``[logging]`` (level). ``[retention]`` is now enforced (the
+synchronous), ``[api]`` (host/port), and ``[logging]`` (level + structured-JSON ``format`` + off-box
+``forward_*`` syslog shipping — sec-offbox-log). ``[retention]`` is now enforced (the
 ``RetentionRunner``), except its ``audit_days`` key, which is reserved/keep-forever by design.
-Remaining planned keys (some server-DB ``[store]`` keys, structured ``[logging]``) are
-accepted-but-ignored for now so a forward-looking config file still loads.
+Remaining planned keys (some server-DB ``[store]`` keys) are accepted-but-ignored for now so a
+forward-looking config file still loads.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from messagefoundry.config.ai_policy import AiDataScope, AiEnvironment, AiMode
+from messagefoundry.config.ai_policy import AiDataScope, AiMode, DataClass
 from messagefoundry.config.models import (
     AckAfter,
     BuildupThreshold,
@@ -34,6 +37,7 @@ from messagefoundry.config.models import (
     OrderingMode,
     RetryPolicy,
 )
+from messagefoundry.config.tls_policy import validate_tls_ciphers
 from messagefoundry.logging_setup import LOG_LEVELS
 
 __all__ = [
@@ -44,18 +48,23 @@ __all__ = [
     "ApiSettings",
     "InboundSettings",
     "DeliverySettings",
+    "PipelineSettings",
     "EnvironmentsSettings",
     "LoggingSettings",
+    "LogFormat",
+    "SyslogProtocol",
     "ReferenceSettings",
     "RetentionSettings",
     "AuthSettings",
     "AiSettings",
     "AiMode",
     "AiDataScope",
-    "AiEnvironment",
+    "DataClass",
     "EgressSettings",
+    "ShadowSettings",
     "AlertsSettings",
     "ClusterSettings",
+    "ApprovalsSettings",
     "ServiceSettings",
     "load_settings",
 ]
@@ -73,8 +82,10 @@ _SECTIONS = (
     "auth",
     "ai",
     "egress",
+    "shadow",
     "alerts",
     "cluster",
+    "approvals",
 )
 _ENV_PREFIX = "MEFOR_"
 _DEFAULT_FILE = "messagefoundry.toml"
@@ -88,13 +99,14 @@ _FILE_SECRET_KEYS = (
     ("store", "encryption_keys_retired"),
     ("auth", "ad_bind_password"),
     ("alerts", "email_password"),
+    ("api", "tls_key_password"),
 )
 
 
 class StoreBackend(str, Enum):
     SQLITE = "sqlite"
     SQLSERVER = (
-        "sqlserver"  # implemented but EXPERIMENTAL / not production-ready (see store/sqlserver.py)
+        "sqlserver"  # production server-DB backend; full staged pipeline (see store/sqlserver.py)
     )
     POSTGRES = (
         "postgres"  # production server-DB backend with single-node parity (see store/postgres.py)
@@ -249,15 +261,89 @@ class ApiSettings(_Section):
     # a request that carries an Origin (i.e. a browser) is rejected unless its Origin is listed here.
     ws_allowed_origins: list[str] = []
 
-    @field_validator("config_reload_roots", "ws_allowed_origins", mode="before")
+    # --- In-process API/WebSocket TLS (WP-13a, ADR 0002) --------------------
+    # When tls_cert_file is set the engine terminates TLS in uvicorn, so the API serves https/wss and
+    # HSTS (already emitted on https) engages — the first-class way to bind off-loopback safely. PEM
+    # paths (not secrets); the key may be in the cert PEM (tls_key_file optional).
+    tls_cert_file: str | None = None
+    tls_key_file: str | None = None
+    # Passphrase for an encrypted private key. Secret — supply via MEFOR_API_TLS_KEY_PASSWORD, never
+    # the file.
+    tls_key_password: str | None = None
+    # Minimum negotiated TLS version floor (NIST SP 800-52r2: 1.2+). "1.2" or "1.3".
+    tls_min_version: str = "1.2"
+    # Optional OpenSSL cipher string (default = the interpreter's secure defaults).
+    tls_ciphers: str | None = None
+    # Optional CA bundle to verify CLIENT certs (mTLS for the console; opt-in, future).
+    tls_client_ca_file: str | None = None
+
+    # --- Reverse-proxy / upstream TLS termination (WP-15, ADR 0002) --------
+    # Proxy IPs whose X-Forwarded-For/-Proto headers are trusted (uvicorn forwarded_allow_ips). Empty =
+    # trust nothing (the audit/rate-limit source IP is then the direct TCP peer). Set this ONLY to the
+    # reverse proxy's address(es), or XFF spoofing returns.
+    trusted_proxies: list[str] = []
+    # Declare that a reverse proxy / load balancer terminates TLS in front of the engine. Lets a
+    # non-loopback bind satisfy the exposed-gate WITHOUT in-process TLS — but only when trusted_proxies
+    # is set (so the engine knows a terminator is really in front).
+    tls_terminated_upstream: bool = False
+
+    @property
+    def tls_enabled(self) -> bool:
+        """Whether in-process API TLS is configured (a server cert is present)."""
+        return bool(self.tls_cert_file)
+
+    @property
+    def exposure_protected(self) -> bool:
+        """Whether an off-loopback bind is safe: in-process TLS (WP-13a) OR a declared upstream TLS
+        terminator behind trusted proxies (WP-15)."""
+        return self.tls_enabled or (self.tls_terminated_upstream and bool(self.trusted_proxies))
+
+    @property
+    def is_loopback(self) -> bool:
+        """Whether the API binds a loopback host — i.e. is **not** exposed off-box, so the exposed-bind
+        TLS gate and the MFA-at-exposure advisory (``serve``) don't apply. Treats ``127.0.0.1``,
+        ``localhost`` and ``::1`` as loopback (a dual-stack box never spuriously counts as exposed)."""
+        return self.host in ("127.0.0.1", "localhost", "::1")
+
+    @field_validator("config_reload_roots", "ws_allowed_origins", "trusted_proxies", mode="before")
     @classmethod
     def _split_roots(cls, v: object) -> object:
         # The env layer delivers list settings (MEFOR_API_CONFIG_RELOAD_ROOTS,
-        # MEFOR_API_WS_ALLOWED_ORIGINS) as one string; split it on the platform path separator so
-        # these list-typed settings can be set via env (review low-12).
+        # MEFOR_API_WS_ALLOWED_ORIGINS, MEFOR_API_TRUSTED_PROXIES) as one string; split it on the
+        # platform path separator so these list-typed settings can be set via env (review low-12).
         if isinstance(v, str):
             return [p for p in v.split(os.pathsep) if p]
         return v
+
+    @field_validator("tls_min_version")
+    @classmethod
+    def _check_tls_min_version(cls, v: str) -> str:
+        if v not in ("1.2", "1.3"):
+            raise ValueError(f"tls_min_version must be '1.2' or '1.3' (NIST 800-52r2), got {v!r}")
+        return v
+
+    @field_validator("tls_ciphers")
+    @classmethod
+    def _check_tls_ciphers(cls, v: str | None) -> str | None:
+        # Reject a cipher string that would admit a non-forward-secret key exchange (ASVS 11.6.2), so a
+        # misconfiguration can't widen the suite below the ECDHE policy. Fails loud at load, not bind.
+        return v if v is None else validate_tls_ciphers(v)
+
+    @model_validator(mode="after")
+    def _check_tls_cert_dependency(self) -> "ApiSettings":
+        # A key (or its passphrase / a client-CA) is meaningless without a server cert; require it so a
+        # half-configured TLS block fails loud at load, not at bind.
+        if (
+            self.tls_key_file or self.tls_key_password or self.tls_client_ca_file
+        ) and not self.tls_cert_file:
+            raise ValueError(
+                "tls_key_file / tls_key_password / tls_client_ca_file require [api].tls_cert_file"
+            )
+        # An upstream TLS terminator only satisfies the exposed-gate when the engine knows (and trusts)
+        # the proxy in front — otherwise it's an unverifiable claim that XFF could spoof.
+        if self.tls_terminated_upstream and not self.trusted_proxies:
+            raise ValueError("[api].tls_terminated_upstream requires [api].trusted_proxies")
+        return self
 
 
 class InboundSettings(_Section):
@@ -318,19 +404,78 @@ class DeliverySettings(_Section):
         )
 
 
+class PipelineSettings(_Section):
+    """Staged-pipeline tunables (ADR 0013 Increment 2). ``max_correlation_depth`` bounds re-ingress
+    loops: a re-ingressed message at this correlation depth still routes, but the next hop (depth+1)
+    dead-letters its work-row and the origin is marked ``ERROR``. Coarse by design (it bounds total work,
+    not topology) — a chain that legitimately bounces A→B→A a few times needs headroom; the default 8 is
+    safe for typical request→response→route feeds. Floor of 1 (a value of 0 would dead-letter every
+    re-ingress)."""
+
+    max_correlation_depth: int = Field(default=8, ge=1)
+
+
 class EnvironmentsSettings(_Section):
     """Where the per-environment **values** (``env()`` lookups in the message graph) live.
 
-    The ACTIVE environment is the single cross-cutting selector ``[ai].environment`` (dev/staging/
-    prod); this section only locates the value files. Each environment has a ``<env>.toml`` flat
-    table under ``dir`` for non-secret values (versioned), overlaid by ``MEFOR_VALUE_<KEY>`` env
+    The ACTIVE environment is the single cross-cutting selector ``[ai].environment`` (a free-form
+    name, ADR 0017); this section only locates the value files. Each environment has a ``<env>.toml``
+    flat table under ``dir`` for non-secret values (versioned), overlaid by ``MEFOR_VALUE_<KEY>`` env
     vars for secrets. See docs/CONFIGURATION.md."""
 
-    dir: str = "environments"  # directory of <env>.toml value files, relative to the working dir
+    dir: str = "environments"  # directory of <env>.toml value files, relative to base_dir (below)
+    # Anchor that ``dir`` (and thus ``environments/<env>.toml``) resolves against. Empty (default) =
+    # the process working directory — the original behavior, so an existing deployment is unchanged.
+    # Set it to the config-repo root (a standalone config repo keeps environments/ at its root, a
+    # sibling of the --config dir) so env-value resolution no longer depends on where serve was
+    # launched — important under NSSM, whose working dir is rarely the repo. A relative value is taken
+    # against the working dir; an absolute value is used as-is (on Windows it must be drive-qualified,
+    # e.g. C:/repo — a leading-slash "/repo" is drive-relative and still inherits the launch drive).
+    # Overridable per run via ``serve --project-root``. See resolve_values_base_dir + docs/CONFIGURATION.md.
+    base_dir: str = ""
+
+
+class LogFormat(str, Enum):
+    TEXT = "text"  # human-readable (the default; stdout unchanged)
+    JSON = "json"  # one JSON object per line — structured for a log shipper / SIEM
+
+
+class SyslogProtocol(str, Enum):
+    UDP = "udp"  # RFC 5426; fire-and-forget, never blocks the engine (the default)
+    TCP = (
+        "tcp"  # RFC 6587; connection-oriented (down-at-startup skipped; runtime stall bounded by a
+    )
+    #              socket timeout so a wedged collector can't block the event loop — synchronous send)
 
 
 class LoggingSettings(_Section):
+    """``[logging]`` — log level, stdout rendering, and optional off-box forwarding (sec-offbox-log).
+
+    PHI redaction + control-char scrubbing are applied to **every** sink (stdout and the forwarder) by
+    ``logging_setup.configure_logging``, so structured output and off-box shipping never weaken the
+    "never log full PHI bodies" guarantee (docs/PHI.md §7)."""
+
     level: str = "INFO"
+    # stdout rendering: "text" (default, unchanged) or "json" (one JSON object per line, friendlier to
+    # a log shipper tailing NSSM's captured stdout).
+    format: LogFormat = LogFormat.TEXT
+
+    # --- Off-box forwarding to a syslog/SIEM collector (ASVS 16.x) ----------
+    # Ship a copy of every log record to a remote syslog collector so log evidence survives a host
+    # compromise (the local audit_log is tamper-evident, but lives on the same host). Off by default.
+    # PHI redaction applies to the forwarded stream exactly as to stdout, but the syslog transport
+    # itself is plaintext — terminate it at a local TLS-forwarding agent or keep it on a trusted
+    # management network (see docs/SECURITY.md / docs/PHI.md). The forwarder never blocks the engine
+    # indefinitely: UDP is fire-and-forget; a TCP collector unreachable at startup is skipped (warns),
+    # and a runtime stall is bounded by a socket timeout (record dropped). Synchronous send — for a
+    # high-volume feed prefer UDP or a local agent.
+    forward_enabled: bool = False
+    forward_host: str | None = None
+    forward_port: int = 514
+    forward_protocol: SyslogProtocol = SyslogProtocol.UDP
+    # Wire format sent off-box, independent of the stdout `format`. JSON is the SIEM-friendly default and
+    # guarantees one record per line; "text" framing is best-effort (a multi-line traceback spans lines).
+    forward_format: LogFormat = LogFormat.JSON
 
     @field_validator("level")
     @classmethod
@@ -341,6 +486,21 @@ class LoggingSettings(_Section):
                 f"invalid log level {value!r}; expected one of {', '.join(LOG_LEVELS)}"
             )
         return upper
+
+    @field_validator("forward_port")
+    @classmethod
+    def _check_forward_port(cls, value: int) -> int:
+        if not 1 <= value <= 65535:
+            raise ValueError("[logging].forward_port must be between 1 and 65535")
+        return value
+
+    @model_validator(mode="after")
+    def _forward_needs_host(self) -> "LoggingSettings":
+        if self.forward_enabled and not self.forward_host:
+            raise ValueError(
+                "[logging].forward_enabled requires [logging].forward_host (the syslog/SIEM collector)"
+            )
+        return self
 
 
 class ReferenceSettings(_Section):
@@ -470,6 +630,38 @@ class AuthSettings(_Section):
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
     # active session. 0 = unlimited. Default 5 (WP-10): generous for a few devices/console instances.
     max_sessions_per_user: int = 5
+    # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
+    # re-verified its credential — at login or via POST /me/reauth — within this many seconds. The
+    # initial login counts as the first verification (sudo-timestamp model). Default 5 minutes.
+    step_up_max_age_seconds: int = 300
+
+    # Multi-factor authentication (WP-14, ADR 0002 §3; ASVS 6.3.3) — a native RFC 6238 TOTP second
+    # factor for LOCAL accounts. AD/Kerberos MFA is delegated to the directory (Entra Conditional
+    # Access / an MFA proxy), so a directory login is never prompted for an engine TOTP. When
+    # require_mfa is on, a user holding the Administrator role MUST enroll TOTP and satisfy it before
+    # any step-up (sensitive) operation; non-admins may opt in voluntarily. Default OFF preserves
+    # today's loopback behavior byte-for-byte (on the 127.0.0.1 bind 6.3.3 is deferred-by-design with
+    # the single-trusted-host compensating control). An off-loopback bind that serves local accounts
+    # SHOULD turn this on; ``serve`` now makes that posture explicit (sec-mfa-on) — on an exposed
+    # (non-loopback) PHI bind with this off it **refuses to start** on a production instance and
+    # **warns** on a non-production one, mirroring the keyless-store / open-egress startup gates (see
+    # __main__._serve), so MFA can't be silently skipped at exposure. Scope: it gates **step-up
+    # (sensitive) operations** for the Administrator role — it is NOT a gate on every authenticated PHI
+    # read (those stay behind RBAC + the PHI-read throttle).
+    require_mfa: bool = False
+    # How many single-use recovery codes are minted at enrollment (the lost-authenticator escape
+    # hatch). 0 disables recovery codes (an admin reset is then the only recovery path).
+    mfa_recovery_code_count: int = 10
+    # Admin-interface defense-in-depth contextual-risk signal (WP-L3-13, ADR 0002; ASVS 8.4.2). When
+    # on, a step-up (sensitive admin) request arriving from a client IP that differs from the one the
+    # session last verified from is treated as higher-risk: it emits an audit + out-of-band notice and
+    # FORCES a fresh step-up (a successful re-verify re-anchors the session to the new IP). It is
+    # advisory + step-up-forcing only — it NEVER changes an RBAC allow/deny and never blocks the
+    # non-admin request path. Default OFF preserves today's behavior byte-for-byte; and even on, a
+    # single-host loopback deployment never trips it (loopback addresses 127.0.0.1 and ::1 are treated
+    # as the same host, so a dual-stack box doesn't spuriously fire).
+    # An off-loopback bind serving admins SHOULD turn this on (operator/runbook responsibility).
+    admin_new_ip_step_up: bool = False
 
     # Local-password policy — ASVS 5.0-aligned (WP-3): length-first, no mandatory composition.
     password_min_length: int = 15
@@ -529,6 +721,19 @@ class AuthSettings(_Section):
     phi_read_rate_limit_global: int = 0  # max PHI reads across all users per window (0 = off)
     phi_read_rate_limit_window_seconds: float = 60.0
 
+    # Out-of-band user notification of security events (ASVS 6.3.5/6.3.7): email the affected user on
+    # lockout / first-success-after-failures / password/email/role/disable changes. Email requires the
+    # [alerts] SMTP transport to be configured (no SMTP → email is skipped); the audited
+    # /me/security-events feed records these regardless of this toggle.
+    notify_security_events: bool = True
+
+    @field_validator("mfa_recovery_code_count")
+    @classmethod
+    def _check_recovery_count(cls, value: int) -> int:
+        if not 0 <= value <= 50:
+            raise ValueError("mfa_recovery_code_count must be between 0 and 50 (0 = disabled)")
+        return value
+
     @model_validator(mode="after")
     def _require_ad_fields(self) -> "AuthSettings":
         """AD/SSO need their connection essentials present when enabled."""
@@ -554,16 +759,44 @@ class AuthSettings(_Section):
         return self
 
 
+#: Characters permitted in a free-form environment NAME (it selects ``environments/<name>.toml``, so
+#: it must be a safe single path segment).
+_ENV_NAME_ALLOWED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+
+#: Built-in environment names whose security posture (data_class, production) is derived when
+#: ``[ai].data_class`` / ``[ai].production`` are left unset — back-compat with the original
+#: dev/staging/prod tiers. A CUSTOM name must set posture explicitly (it is never inferred from a
+#: free-form string), so a 'test'/'poc' instance can never default permissive (ADR 0017).
+_KNOWN_ENV_POSTURE: dict[str, tuple[DataClass, bool]] = {
+    "dev": (DataClass.SYNTHETIC, False),
+    "staging": (DataClass.PHI, False),
+    "prod": (DataClass.PHI, True),
+}
+
+
 class AiSettings(_Section):
-    """Central AI-assistance policy: the two axes (mode + data scope) bounded by an environment
-    ceiling. The effective, enforced policy is computed by
-    :func:`~messagefoundry.config.ai_policy.resolve_effective_policy` (the API endpoint and the
-    ``ai-policy`` CLI both clamp these before serving them). See docs/AI.md."""
+    """Central AI-assistance policy plus the instance's active **environment name** and security
+    **posture**. The two AI axes (mode + data scope) are bounded by the production-posture ceiling
+    computed by :func:`~messagefoundry.config.ai_policy.resolve_effective_policy` (the API endpoint
+    and the ``ai-policy`` CLI both clamp these before serving them). See docs/AI.md.
+
+    ``environment`` is the **free-form** active-environment name (ADR 0017): it selects
+    ``environments/<name>.toml`` and is what ``current_environment()`` returns. It has **no default** —
+    ``serve`` requires it, so a missing env can never silently resolve another environment's
+    values/secrets. ``data_class`` / ``production`` are the explicit security posture, **decoupled from
+    the name**: for the built-in names dev/staging/prod they are derived when unset, but a custom name
+    must set them (see :meth:`require_posture`)."""
 
     mode: AiMode = AiMode.BYO
     data_scope: AiDataScope = AiDataScope.CODE_ONLY
-    # Unset resolves to the safest ceiling: prod floors non-BAA modes at code_only.
-    environment: AiEnvironment = AiEnvironment.PROD
+    # Free-form active-environment NAME (ADR 0017): selects environments/<name>.toml + what
+    # current_environment() returns. No default — serve requires it (a missing env must never silently
+    # resolve another env's values/secrets).
+    environment: str | None = None
+    # Explicit security POSTURE, decoupled from the name. Unset is derived from a built-in name
+    # (dev->synthetic/non-prod, staging->phi/non-prod, prod->phi/prod); a custom name must set them.
+    data_class: DataClass | None = None
+    production: bool | None = None
 
     # --- forward-compat (accepted-but-UNUSED in this MVP; for the P1 engine broker) ----------
     # These describe a managed provider connection. They parse so a forward-looking config loads,
@@ -572,6 +805,45 @@ class AiSettings(_Section):
     model: str = "claude-opus-4-8"
     baa_attested: bool = False
     endpoint: str | None = None
+
+    @field_validator("environment")
+    @classmethod
+    def _valid_environment_name(cls, v: str | None) -> str | None:
+        # The name becomes a filename segment (environments/<name>.toml), so keep it a simple token.
+        if v is not None and (not v or not set(v) <= _ENV_NAME_ALLOWED):
+            raise ValueError(
+                "[ai].environment must be a non-empty name of letters, digits, '.', '_' or '-' "
+                "(it selects environments/<name>.toml)"
+            )
+        return v
+
+    def derived_posture(self) -> tuple[DataClass | None, bool | None]:
+        """``(data_class, production)`` with built-in-name derivation applied where each is unset.
+
+        Either element may still be ``None`` when a *custom* environment name leaves it unset — callers
+        that need a definite posture use :meth:`require_posture` (fail-closed) or default the missing
+        ``production`` to ``True`` (strictest ceiling) for an advisory read."""
+        dc, prod = self.data_class, self.production
+        known = _KNOWN_ENV_POSTURE.get(self.environment or "")
+        if known is not None:
+            if dc is None:
+                dc = known[0]
+            if prod is None:
+                prod = known[1]
+        return dc, prod
+
+    def require_posture(self) -> tuple[DataClass, bool]:
+        """The fail-closed ``(data_class, production)`` posture; raises ``ValueError`` when a custom or
+        unset environment name has no explicit posture. Used at ``serve`` so a custom env never defaults
+        permissive (ADR 0017)."""
+        dc, prod = self.derived_posture()
+        if dc is None or prod is None:
+            raise ValueError(
+                f"environment {self.environment!r} has no built-in security posture (not one of "
+                "dev/staging/prod); set [ai].data_class (synthetic|phi) and [ai].production "
+                "(true|false) explicitly"
+            )
+        return dc, prod
 
 
 class EgressSettings(_Section):
@@ -582,6 +854,10 @@ class EgressSettings(_Section):
     list is set, a destination of that transport not on it is **refused at config load/reload**
     (fail-closed), checked against the resolved (``env()``-substituted) destination. The webhook/SMTP
     *alert* sinks carry no PHI bodies and keep their own ``[alerts]`` host allowlists.
+
+    Set ``deny_by_default = true`` to flip the whole posture fail-closed: a transport with an **empty**
+    allowlist then refuses *every* destination of that type (so each permitted destination must be
+    listed). Default false keeps the per-list opt-in behavior.
     """
 
     # Allowed MLLP outbound destinations: each entry is "host" (any port) or "host:port".
@@ -598,6 +874,12 @@ class EgressSettings(_Section):
     # dials out to poll, the destination dials out to upload). Each entry is "host" or "host:port".
     allowed_remote: list[str] = []
 
+    # Opt-in deny-by-default (Q5b): when true, a transport with an EMPTY allowlist refuses every
+    # destination of that type instead of allowing any. A global on-ramp to fail-closed egress without
+    # having to enumerate one list just to flip the posture; pairs with the prod/staging open-egress
+    # startup advisory. Default false = the per-list opt-in behavior above (empty = unrestricted).
+    deny_by_default: bool = False
+
     @field_validator(
         "allowed_mllp",
         "allowed_tcp",
@@ -612,6 +894,82 @@ class EgressSettings(_Section):
         # Allow setting via env (MEFOR_EGRESS_ALLOWED_MLLP=...) as one comma-separated string.
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
+        return v
+
+
+class ShadowSettings(_Section):
+    """``[shadow]`` — parallel-run / shadow-instance egress suppression (#15).
+
+    A *shadow* MessageFoundry instance processes real (teed) traffic to validate it against a legacy
+    engine, but must **not** deliver to live partners (the legacy engine is still the real sender).
+    Set ``simulate_all_egress = true`` to force **every** outbound into ``simulate`` mode regardless of
+    its per-connection ``simulate=`` flag — the deployment-wide safety switch so a shadow stand-up
+    can't accidentally leave one outbound live. Default false = each outbound's own ``simulate=`` flag
+    applies. (Per-outbound is the precise control; this is the blunt instance-wide override.)
+    """
+
+    simulate_all_egress: bool = False
+
+
+class AlertSeverity(str, Enum):
+    """Severity a matching rule tags a fired alert with (ADR 0014) — carried in the payload so a
+    webhook target (PagerDuty/Slack/Teams) or the email subject can triage by it."""
+
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+
+#: The alert event types a rule may match (plus ``"any"``); mirror the AlertSink methods.
+_ALERT_EVENT_TYPES = frozenset(
+    {"connection_stopped", "queue_buildup", "storage_threshold", "cert_expiry"}
+)
+#: The transport names a rule may route to; mirror ``AlertTransport.name``.
+_ALERT_TRANSPORTS = frozenset({"webhook", "email"})
+
+
+class AlertRule(BaseModel):
+    """One operator-authored alerting rule (ADR 0014). The **first** rule that matches an event decides
+    its severity, which transports fire, and the re-alert cooldown; an event matching no rule keeps the
+    default (notify every configured transport at ``warning`` with the global ``realert_seconds``).
+    Rules are pure data — there is no embedded code/expression."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # --- match (all conditions must hold) ---
+    event_type: str = (
+        "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry
+    )
+    connection: str = "*"  # fnmatch glob over the connection name; "*" = all
+    min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
+    min_oldest_seconds: float | None = Field(
+        None, ge=0
+    )  # queue_buildup: …or oldest-message age (s)
+    # --- outcome ---
+    severity: AlertSeverity = AlertSeverity.WARNING
+    transports: list[str] | None = (
+        None  # None = every configured transport; [] = suppress entirely (event dropped, never sent)
+    )
+    cooldown_seconds: float | None = Field(
+        None, gt=0
+    )  # override realert_seconds for matching events
+
+    @field_validator("event_type")
+    @classmethod
+    def _check_event_type(cls, v: str) -> str:
+        if v != "any" and v not in _ALERT_EVENT_TYPES:
+            allowed = ", ".join(sorted({"any", *_ALERT_EVENT_TYPES}))
+            raise ValueError(f"event_type must be one of {allowed}; got {v!r}")
+        return v
+
+    @field_validator("transports")
+    @classmethod
+    def _check_transports(cls, v: list[str] | None) -> list[str] | None:
+        if v is not None:
+            bad = [t for t in v if t not in _ALERT_TRANSPORTS]
+            if bad:
+                allowed = ", ".join(sorted(_ALERT_TRANSPORTS))
+                raise ValueError(f"transports must be a subset of [{allowed}]; unknown: {bad}")
         return v
 
 
@@ -649,6 +1007,11 @@ class AlertsSettings(_Section):
     # flapping lane can't spam the channel.
     realert_seconds: float = 300.0
 
+    # Operator alert rules (ADR 0014): refine severity / which transports fire / cooldown / suppression
+    # per event + connection. Empty = today's behaviour (every event → every transport, global throttle).
+    # Authored as ``[[alerts.rules]]`` tables in the config file. First match wins.
+    rules: list[AlertRule] = []
+
     @field_validator("email_to", "webhook_allowed_hosts", "smtp_allowed_hosts", mode="before")
     @classmethod
     def _split_recipients(cls, v: object) -> object:
@@ -674,28 +1037,48 @@ class ClusterSettings(_Section):
     read-through the shared snapshot; an operator config reload propagates cluster-wide via a version
     token; and operators can see membership + leadership over the API. Operators must keep node clocks
     synced (NTP — leases are wall-clock), run identical config dirs on every node, and apply config
-    changes via a coordinated (not rolling) restart — see ``docs/CLUSTERING.md``. The cross-section
-    validator below requires ``[store].backend = postgres`` and ``[store].pool_size >= 2`` when this is
-    enabled (the leader holds one dedicated pooled connection for its leadership advisory lock)."""
+    changes via a coordinated (not rolling) restart — see ``docs/CLUSTERING.md``. Leadership itself is a
+    **self-fencing lease** (Workstream A2): the leader renews a ``leader_lease`` row every
+    ``heartbeat_seconds`` to ``DB_now + leader_lease_ttl_seconds``, a standby acquires only once that
+    lease has expired, and a leader that cannot renew within ``leader_fence_timeout_seconds`` self-fences
+    before the lease can expire (the split-brain guard). The cross-section validator below requires
+    ``[store].backend = postgres`` and ``[store].pool_size >= 2`` when this is enabled (a clustered node
+    drives concurrent background work against the pool)."""
 
     enabled: bool = False
     # Override the auto-generated node id (host:pid:hex). Pin it for a stable identity across restarts
     # or in tests; left unset, the factory reuses the store's lease owner-id so node-id == owner-id.
     node_id: str | None = None
-    # How often a node refreshes its `last_seen` heartbeat. The same cadence drives leader-lock
-    # maintenance (Track B Step 4) — no separate leader-check knob. Must be > 0.
+    # How often a node refreshes its `last_seen` heartbeat. The same cadence drives leadership-lease
+    # renewal (Track B Step 4 / Workstream A2) — no separate leader-check knob. Must be > 0.
     heartbeat_seconds: float = 10.0
     # A node is considered dead when its last_seen is older than this. Consulted by DbCoordinator's
     # cluster_members() (Step 7) as the freshness filter for the /cluster/nodes observability endpoint —
     # it discards a crashed ex-leader's stale is_leader flag and bounds the failover window in which a
     # just-beaten node still counts toward the derived leader. It is NOT what transfers leadership: the
-    # session-level leader advisory lock is (a crashed leader's lock auto-releases server-side). Must be > 0.
+    # self-fencing leadership lease is (a standby acquires only once the lease has expired). Must be > 0.
     node_timeout_seconds: float = 30.0
     # How often the LEADER runs the lease-reclaim sweep (reclaim_expired_leases) that recovers crashed
     # nodes' in-flight rows (Track B Step 4). Only the current leader acts; followers no-op. Must be > 0.
     reclaim_interval_seconds: float = 30.0
+    # The leadership LEASE TTL (Workstream A2 active-passive self-fencing). The current leader renews the
+    # lease every heartbeat_seconds, extending its expiry to DB_now + this; a standby may acquire leadership
+    # ONLY once the lease has expired, so it always waits out the full TTL. Measured on the DB's own clock
+    # (clock_timestamp()), so inter-node clock skew is irrelevant to leadership correctness. Must be > 0.
+    leader_lease_ttl_seconds: float = 30.0
+    # The SELF-FENCE timeout: a leader that has not renewed its lease within this many seconds (its own
+    # monotonic clock, with NO DB I/O so a hung/partitioned DB can't block it) halts its leader work.
+    # MUST be < leader_lease_ttl_seconds so the old leader stops BEFORE the lease can expire and a standby
+    # acquire — the split-brain guard. MUST be > heartbeat_seconds so a single missed renew doesn't fence.
+    leader_fence_timeout_seconds: float = 20.0
 
-    @field_validator("heartbeat_seconds", "node_timeout_seconds", "reclaim_interval_seconds")
+    @field_validator(
+        "heartbeat_seconds",
+        "node_timeout_seconds",
+        "reclaim_interval_seconds",
+        "leader_lease_ttl_seconds",
+        "leader_fence_timeout_seconds",
+    )
     @classmethod
     def _positive(cls, value: float) -> float:
         if value <= 0:
@@ -716,6 +1099,90 @@ class ClusterSettings(_Section):
             )
         return self
 
+    @model_validator(mode="after")
+    def _fence_ordering(self) -> "ClusterSettings":
+        """The split-brain guard's timing invariant (Workstream A2): heartbeat < fence < lease TTL. The
+        leader must renew faster than it fences (so one missed beat doesn't demote it) and must fence
+        before the lease can expire (so a partitioned old leader stops before a standby acquires).
+        Caught at config load, not at failover."""
+        if not (
+            self.heartbeat_seconds
+            < self.leader_fence_timeout_seconds
+            < self.leader_lease_ttl_seconds
+        ):
+            raise ValueError(
+                "cluster lease timing must satisfy heartbeat_seconds < leader_fence_timeout_seconds "
+                "< leader_lease_ttl_seconds "
+                f"(got heartbeat_seconds={self.heartbeat_seconds}, "
+                f"leader_fence_timeout_seconds={self.leader_fence_timeout_seconds}, "
+                f"leader_lease_ttl_seconds={self.leader_lease_ttl_seconds}) — the leader must renew "
+                "faster than it fences, and fence before the lease can expire and a standby acquire it"
+            )
+        return self
+
+
+class CertMonitorSettings(_Section):
+    """Periodic TLS-certificate expiry monitor (``[cert_monitor]``). The engine scans the certificate
+    PEM files it actually serves with — the ``[api]`` TLS cert and every connection's ``tls_cert_file``
+    (MLLP server/client identity) — and raises a ``cert_expiry`` alert when one is expired or within
+    ``warn_days`` of expiry. Now that native off-loopback TLS is the supported posture, this catches a
+    silently expiring cert (a hard PHI-feed outage at renewal time) ahead of time. Only the public
+    certificate is read, never any private key. Set ``warn_days`` to 0 to disable the monitor."""
+
+    warn_days: int = 30  # alert this many days before expiry (0 = monitor off)
+    check_interval_seconds: float = 43_200.0  # rescan cadence (default 12h)
+
+    @field_validator("warn_days")
+    @classmethod
+    def _check_warn_days(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("cert_monitor.warn_days must be >= 0 (0 disables the monitor)")
+        return v
+
+    @field_validator("check_interval_seconds")
+    @classmethod
+    def _check_interval(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("cert_monitor.check_interval_seconds must be > 0")
+        return v
+
+
+#: The high-value operations dual-control can gate (registry keys). Confining ``[approvals].operations``
+#: to this set catches a typo'd op name at startup rather than silently never gating it.
+APPROVABLE_OPERATIONS: frozenset[str] = frozenset({"dead_letter_replay", "connection_purge"})
+
+
+class ApprovalsSettings(_Section):
+    """Optional dual-control (maker-checker) approval for high-value actions (``[approvals]``, ASVS
+    2.3.5). **Off by default** so a single-operator deployment is never blocked. When ``enabled``, an
+    action in ``operations`` is held as a pending request and must be released by a *distinct* second
+    user holding ``approvals:approve`` — the requester can never approve their own. A request older than
+    ``expiry_hours`` can no longer be approved."""
+
+    enabled: bool = False
+    operations: list[str] = Field(default_factory=lambda: sorted(APPROVABLE_OPERATIONS))
+    expiry_hours: float = (
+        72.0  # a pending request expires this many hours after it's made (0 = never)
+    )
+
+    @field_validator("operations")
+    @classmethod
+    def _known_operations(cls, v: list[str]) -> list[str]:
+        unknown = sorted(set(v) - APPROVABLE_OPERATIONS)
+        if unknown:
+            raise ValueError(
+                f"[approvals].operations has unknown operation(s) {unknown}; "
+                f"valid: {sorted(APPROVABLE_OPERATIONS)}"
+            )
+        return v
+
+    @field_validator("expiry_hours")
+    @classmethod
+    def _check_expiry(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("approvals.expiry_hours must be >= 0 (0 = never expires)")
+        return v
+
 
 class ServiceSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")  # tolerate forward-looking/unknown sections
@@ -724,6 +1191,7 @@ class ServiceSettings(BaseModel):
     api: ApiSettings = Field(default_factory=ApiSettings)
     inbound: InboundSettings = Field(default_factory=InboundSettings)
     delivery: DeliverySettings = Field(default_factory=DeliverySettings)
+    pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
     environments: EnvironmentsSettings = Field(default_factory=EnvironmentsSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     reference: ReferenceSettings = Field(default_factory=ReferenceSettings)
@@ -731,32 +1199,40 @@ class ServiceSettings(BaseModel):
     auth: AuthSettings = Field(default_factory=AuthSettings)
     ai: AiSettings = Field(default_factory=AiSettings)
     egress: EgressSettings = Field(default_factory=EgressSettings)
+    shadow: ShadowSettings = Field(default_factory=ShadowSettings)
     alerts: AlertsSettings = Field(default_factory=AlertsSettings)
+    cert_monitor: CertMonitorSettings = Field(default_factory=CertMonitorSettings)
     cluster: ClusterSettings = Field(default_factory=ClusterSettings)
+    approvals: ApprovalsSettings = Field(default_factory=ApprovalsSettings)
 
     @model_validator(mode="after")
-    def _cluster_requires_postgres(self) -> "ServiceSettings":
-        """Cluster coordination needs a shared multi-node store. SQLite is single-file/single-node and
-        SQL Server is experimental (no leases), so only the Postgres backend can back the ``nodes``
-        table + row leases the coordinator depends on. This spans two sections, so it lives here (not
-        on :class:`ClusterSettings`, which can't see ``[store]``)."""
+    def _cluster_requires_server_db(self) -> "ServiceSettings":
+        """Cluster coordination needs a shared **server-DB** store to back the ``nodes`` + leadership-
+        lease tables. SQLite is single-file/single-node, so it cannot. **Postgres** and **SQL Server**
+        both can: each runs the active-passive leadership lease (one leader drains the graph; a standby
+        takes over on failure). Postgres additionally backs the active-active per-lane row leases (0.2
+        horizontal scale-out); SQL Server is **active-passive only** (no row leases — the leader-gate +
+        self-fence keep a single active processor at a time). This spans two sections, so it lives here
+        (not on :class:`ClusterSettings`, which can't see ``[store]``)."""
         if self.cluster.enabled:
-            if self.store.backend is not StoreBackend.POSTGRES:
+            if self.store.backend not in (StoreBackend.POSTGRES, StoreBackend.SQLSERVER):
                 raise ValueError(
-                    "[cluster].enabled requires [store].backend = 'postgres' "
-                    f"(got {self.store.backend.value!r}); SQLite is single-node and SQL Server is "
-                    "experimental — cluster coordination is Postgres-only"
+                    "[cluster].enabled requires [store].backend in {'postgres', 'sqlserver'} "
+                    f"(got {self.store.backend.value!r}); SQLite is single-node — cluster coordination "
+                    "needs a shared server-DB store (Postgres active-active/active-passive, or SQL "
+                    "Server active-passive)"
                 )
             if self.store.pool_size < 2:
-                # Leader election holds ONE pooled connection for the lifetime of its session-level
-                # advisory lock (Track B Step 4). With pool_size=1 that lone connection would be the
-                # store's only connection, starving every query, so require headroom.
+                # A clustered node runs concurrent background work against the pool — the maintenance
+                # loop (heartbeat + lease renew + lane/config refresh), the leader-gated reclaim sweep,
+                # and the per-stage workers — alongside request traffic. A pool of 1 would serialize all
+                # of it behind a single connection, so require headroom.
                 raise ValueError(
                     "[cluster].enabled requires [store].pool_size >= 2 "
-                    f"(got {self.store.pool_size}); the leader holds one dedicated pooled connection "
-                    "for its leadership advisory lock, so a pool of 1 would starve the store. Note the "
-                    "floor of 2 leaves only ONE working connection while a node holds the leader "
-                    "connection under contention — prefer pool_size >= 3 for clustered Postgres"
+                    f"(got {self.store.pool_size}); a clustered node drives concurrent background work "
+                    "(the membership/lease maintenance loop + the leader reclaim sweep + the per-stage "
+                    "workers) against the pool, so a pool of 1 would serialize everything — prefer "
+                    "pool_size >= 3 for clustered Postgres"
                 )
         return self
 

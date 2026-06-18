@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Run a code-first wiring :class:`~messagefoundry.config.wiring.Registry` as a **staged pipeline**.
 
 Staged pipeline (ADR 0001, Step A): for each **inbound connection** a listener decodes/parses/
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import logging
 import time
 import urllib.parse
@@ -41,10 +44,8 @@ from messagefoundry.config.models import (
     RetryPolicy,
     Source,
 )
-from messagefoundry.config.active_environment import activated as environment_activated
-from messagefoundry.config.code_sets import activated as code_sets_activated
-from messagefoundry.config.reference import activated as reference_activated
-from messagefoundry.config.state import activated as state_activated
+from messagefoundry.config.db_lookup import DbLookupError, activated as db_lookup_activated
+from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     InboundConnection,
@@ -56,7 +57,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.parsing import HL7PeekError, Peek, normalize, summarize, validate
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.pipeline.dryrun import route_only, transform_one
 from messagefoundry.store import MessageStatus, QueueStore, Stage
 from messagefoundry.transports import (
@@ -67,6 +68,7 @@ from messagefoundry.transports import (
     build_destination,
     build_source,
 )
+from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.mllp import build_ack
 
 __all__ = ["RegistryRunner"]
@@ -86,6 +88,29 @@ _BUILDUP_REALERT_SECONDS = 300.0
 # COUNT+MIN query rate on the ingress hot path regardless of throughput.
 _BUILDUP_CHECK_INTERVAL = 1.0
 
+# How long the handler's worker thread blocks on a single db_lookup() before giving up (ADR 0010).
+# A live lookup that exceeds this raises (→ the message's transform fails and dead-letters) rather than
+# pinning a worker thread forever; the orphaned query still completes on the loop and releases its conn.
+_LOOKUP_RESULT_TIMEOUT_SECONDS = 30.0
+
+
+def _peek_for_loopback(
+    ic: InboundConnection, body: str
+) -> tuple[str | None, str | None, str | None, bool]:
+    """Derive ``(control_id, message_type, summary, peek_failed)`` for a re-ingressed loopback body
+    (ADR 0013 Increment 2, Q5) — the re-ingress worker's parsing step, kept in ``pipeline/`` (not the
+    store) so the store stays parsing-free, exactly as ``_handle_inbound`` peeks before
+    ``enqueue_ingress``. An HL7V2 loopback runs ``Peek.parse`` (``peek_failed=True`` on ``HL7PeekError``
+    → the child is recorded RECEIVED→ERROR, not dropped); any other ``content_type`` (x12/text/json) is
+    relayed verbatim as a ``RawMessage`` — no parse, ``message_type`` = the content_type value."""
+    if ic.content_type is ContentType.HL7V2:
+        try:
+            peek = Peek.parse(body)
+        except HL7PeekError:
+            return None, None, None, True
+        return peek.control_id, peek.message_type, (summarize(peek) or None), False
+    return None, ic.content_type.value, None, False
+
 
 class RegistryRunner:
     """Runs every inbound connection in a Registry + one delivery worker per outbound."""
@@ -98,6 +123,7 @@ class RegistryRunner:
         poll_interval: float = 0.25,
         claim_limit: int = 20,
         inbound_bind_host: str = "127.0.0.1",
+        allow_insecure_bind: bool = False,
         delivery_defaults: RetryPolicy | None = None,
         ordering_default: OrderingMode | None = None,
         internal_error_default: InternalErrorPolicy | None = None,
@@ -105,12 +131,18 @@ class RegistryRunner:
         ack_after_default: AckAfter | None = None,
         alert_sink: AlertSink | None = None,
         egress: EgressSettings | None = None,
+        simulate_all: bool = False,
         env_values: Mapping[str, Any] | None = None,
         active_environment: str | None = None,
         coordinator: ClusterCoordinator | None = None,
+        max_correlation_depth: int = 8,
     ) -> None:
         self.registry = registry
         self.store = store
+        # ADR 0013 Increment 2: the loop-prevention cap for re-ingress. A re-ingressed message at this
+        # correlation depth still routes; the next hop (depth+1) dead-letters its work-row and ERRORs the
+        # origin. Coarse by design (bounds total work, not topology). From [pipeline] max_correlation_depth.
+        self._max_correlation_depth = max_correlation_depth
         # Cluster coordination seam (Track B Step 3). Threaded in + held so Steps 4/5 can consult the
         # cheap, synchronous gates (is_leader / owns_lane) on the hot path — this step adds NO call
         # sites; the object is only stored + exposed. None → the no-op NullCoordinator (every gate
@@ -137,9 +169,16 @@ class RegistryRunner:
         # Fail-closed outbound destination allowlist (WP-11c); empty = unrestricted. Enforced at
         # build_check (config load/reload) and start, so a non-allowed destination is refused.
         self._egress = egress or EgressSettings()
+        # Deployment-wide shadow override ([shadow].simulate_all_egress, #15): when True, EVERY outbound
+        # runs egress-suppressed regardless of its own simulate= flag. Resolved per-connection into
+        # self._simulate at reconcile (per-connection simulate OR this).
+        self._simulate_all = simulate_all
         # The interface inbound listeners bind to (service-level; authors never set a host). Loopback
         # by default — see config.settings.InboundSettings.bind_host.
         self._inbound_bind_host = inbound_bind_host
+        # Whether `serve --allow-insecure-bind` was passed — the dev escape that downgrades the MLLP
+        # exposed-gate (a non-loopback plaintext bind) from refuse to a loud warning (ADR 0002 §0).
+        self._allow_insecure_bind = allow_insecure_bind
         # This instance's environment values (DEV/PROD): env() references in connection specs resolve
         # against this map when a connector is built (a missing key fails loud — see resolve_env_settings).
         self._env_values: dict[str, Any] = dict(env_values or {})
@@ -155,14 +194,25 @@ class RegistryRunner:
         # source is stopped). Addressable by inbound name so a reload/restart can re-arm one in place.
         self._router_workers: dict[str, asyncio.Task[None]] = {}
         self._transform_workers: dict[str, asyncio.Task[None]] = {}
+        # ADR 0013 Increment 2: a RESPONSE worker per LOOPBACK inbound, draining its Stage.RESPONSE
+        # tokens (a captured reply owes a re-ingress) via ingress_handoff. Non-loopback inbounds have none.
+        self._response_workers: dict[str, asyncio.Task[None]] = {}
         # connector + retry are re-resolved per item from these maps, so a reload can swap an
         # outbound's settings under a running worker without tearing the worker down.
         self._retry: dict[str, RetryPolicy] = {}
         self._ordering: dict[str, OrderingMode] = {}
         self._internal_error: dict[str, InternalErrorPolicy] = {}
         self._buildup: dict[str, BuildupThreshold] = {}
+        # Effective per-connection egress-suppression (#15): per-connection simulate= OR simulate_all.
+        self._simulate: dict[str, bool] = {}
         # Per-connection re-alert throttle: the earliest time a queue_buildup alert may fire again.
         self._next_buildup_alert: dict[str, float] = {}
+        # Live-lookup executor (db_lookup, ADR 0010): built from registry.lookups at start/reload, None
+        # when the graph declares no DatabaseLookup — in which case the transform path stays byte-identical
+        # (inline call, no thread hop, no runner). The engine loop is captured at start so a handler's
+        # worker thread can bridge a db_lookup back onto it (run_coroutine_threadsafe).
+        self._lookup_executor: DatabaseLookupExecutor | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._stop = asyncio.Event()
         # Per-stage wake events so a producer wakes only its own downstream consumer class. A single
         # shared auto-clearing event would let an idle worker of one class swallow another class's
@@ -171,6 +221,9 @@ class RegistryRunner:
         # (_work). Each worker class waits on (and clears) only its own event.
         self._ingress_work = asyncio.Event()
         self._routed_work = asyncio.Event()
+        # ADR 0013 Increment 2: wakes the per-loopback re-ingress worker when a Stage.RESPONSE work-row
+        # is produced (a captured reply owes a re-ingress) — a sibling of _ingress_work/_routed_work.
+        self._response_work = asyncio.Event()
         self._work = asyncio.Event()
         self._running = False
         self._reload_lock = asyncio.Lock()  # serialize concurrent reloads
@@ -189,6 +242,7 @@ class RegistryRunner:
         """Wake every stage worker now (e.g. after a replay re-queues rows at an unknown stage)."""
         self._ingress_work.set()
         self._routed_work.set()
+        self._response_work.set()
         self._work.set()
 
     def set_env_values(self, values: Mapping[str, Any]) -> None:
@@ -196,10 +250,86 @@ class RegistryRunner:
         The engine calls this on reload so a promote picks up edited values without a restart (M-23)."""
         self._env_values = dict(values)
 
+    def _build_lookup_executor(self) -> DatabaseLookupExecutor | None:
+        """Build the pooled live-lookup executor from the current graph's ``DatabaseLookup`` specs, or
+        ``None`` if the graph declares none (so the transform path stays byte-identical — inline call,
+        no thread hop, no runner). Resolves ``env()`` in each spec and fail-closed egress-checks the
+        server, exactly like a DATABASE source. ``build_check`` already validated these on a reload, so
+        this won't raise there; at start a bad spec surfaces here and unwinds the partial start."""
+        if not self.registry.lookups:
+            return None
+        resolved: dict[str, dict[str, Any]] = {}
+        for name, spec in self.registry.lookups.items():
+            settings = resolve_env_settings(spec.settings, self._env_values)
+            check_lookup_allowed(name, settings, self._egress)
+            resolved[name] = settings
+        return DatabaseLookupExecutor(resolved)
+
+    def _run_lookup(
+        self, connection: str, statement: str, params: Mapping[str, Any] | None
+    ) -> list[dict[str, Any]]:
+        """The lookup runner published to Handlers (``db_lookup`` → this). Called FROM the handler's
+        worker thread (``transform_one`` runs off the loop when lookups are declared), it bridges the
+        async query onto the engine loop via ``run_coroutine_threadsafe`` and blocks the WORKER THREAD —
+        never the loop — for the result (bounded by ``_LOOKUP_RESULT_TIMEOUT_SECONDS``)."""
+        executor = self._lookup_executor
+        loop = self._loop
+        if executor is None or loop is None:  # only published when both exist; guard defensively
+            raise DbLookupError("db_lookup is unavailable — no lookup connections are configured")
+        future = asyncio.run_coroutine_threadsafe(
+            executor.query(connection, statement, params), loop
+        )
+        return future.result(_LOOKUP_RESULT_TIMEOUT_SECONDS)
+
     # --- per-connection control (console operations) -------------------------
 
     def inbound_running(self, name: str) -> bool:
         return name in self._sources
+
+    def outbound_simulated(self, name: str) -> bool:
+        """Whether the named outbound is in **simulate** mode — egress suppressed (#15). The *effective*
+        value (per-connection ``simulate=`` OR ``[shadow].simulate_all_egress``), for the ``/connections``
+        API + console so a simulated lane is unmissable.
+
+        Prefers the value resolved at reconcile (what the delivery worker actually uses, and the only
+        source for a *draining* outbound the registry no longer declares); falls back to resolving from
+        the registry for a connection that is declared but not yet reconciled (e.g. the metadata endpoint
+        on a not-yet-started engine)."""
+        if name in self._simulate:
+            return self._simulate[name]
+        oc = self.registry.outbound.get(name)
+        return (bool(oc.simulate) or self._simulate_all) if oc is not None else False
+
+    def _resolve_simulate(self, name: str, oc: OutboundConnection) -> bool:
+        """Resolve a connection's effective simulate flag and log **once** when a lane (newly) enters
+        simulate mode (so it's loud in the operator log, not just the API)."""
+        simulate = bool(oc.simulate) or self._simulate_all
+        if simulate and not self._simulate.get(name, False):
+            log.warning(
+                "outbound %r is in SIMULATE mode — real egress SUPPRESSED (no delivery to the live "
+                "peer); messages still finalize PROCESSED for shadow/parallel-run comparison (#15)",
+                name,
+            )
+        return simulate
+
+    def build_test_connector(self, name: str) -> tuple[str, SourceConnector | DestinationConnector]:
+        """Build a **fresh** connector for the named connection so it can be reachability-tested —
+        never the live one in ``_sources``/``_destinations`` (probing the live connector would disturb
+        running traffic). Resolves ``env()`` and enforces the ``[egress]`` allowlist fail-closed, the
+        same as a real build. Returns ``("in", source)`` or ``("out", destination)``. Raises
+        :class:`KeyError` if ``name`` isn't a connection, :class:`WiringError` on a bad ``env()`` /
+        egress. The caller closes the connector (``stop()`` / ``aclose()``) after testing."""
+        ic = self.registry.inbound.get(name)
+        if ic is not None:
+            source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
+            check_source_allowed(source_cfg, name, self._egress)
+            return "in", build_source(source_cfg)
+        oc = self.registry.outbound.get(name)
+        if oc is not None:
+            dest_cfg = _dest_config(oc, self._env_values)
+            check_egress_allowed(dest_cfg, self._egress)
+            return "out", build_destination(dest_cfg)
+        raise KeyError(name)
 
     async def start_inbound(self, name: str) -> None:
         """Start receiving on one inbound connection (no-op if already listening).
@@ -239,6 +369,8 @@ class RegistryRunner:
             )
         source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
         check_source_allowed(source_cfg, ic.name, self._egress)  # fail-closed connect allowlist
+        # Exposed-gate (ADR 0002 §0): refuse a non-loopback MLLP listener without TLS at start.
+        check_mllp_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
         source = build_source(source_cfg)
         # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
         # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/
@@ -277,6 +409,8 @@ class RegistryRunner:
             if self._running:
                 return
             self._stop.clear()
+            # Capture the engine loop so a handler's worker thread can bridge a db_lookup back onto it.
+            self._loop = asyncio.get_running_loop()
             try:
                 for name, oc in self.registry.outbound.items():
                     dest = _dest_config(oc, self._env_values)
@@ -284,11 +418,25 @@ class RegistryRunner:
                         dest, self._egress
                     )  # fail-closed egress allowlist (WP-11c)
                     self._destinations[name] = build_destination(dest)
+                    # ADR 0013: fail closed at start if a capturing outbound is wired on a backend that
+                    # can't persist captures (the SQL Server preview) — never silently drop replies.
+                    if getattr(self._destinations[name], "capture_response", False) and not getattr(
+                        self.store, "supports_response_capture", True
+                    ):
+                        raise RuntimeError(
+                            f"outbound {name!r} sets capture_response=True but the store backend does "
+                            "not support request/response capture (ADR 0013); use the SQLite or "
+                            "Postgres backend"
+                        )
                     self._retry[name] = oc.retry or self._delivery_defaults
                     self._ordering[name] = oc.ordering or self._ordering_default
                     self._internal_error[name] = oc.internal_error or self._internal_error_default
                     self._buildup[name] = oc.buildup or self._buildup_default
+                    self._simulate[name] = self._resolve_simulate(name, oc)
                     self._spawn_worker(name)
+                # Build the live-lookup executor from the graph (env-resolved + egress-checked here);
+                # None when no DatabaseLookup is declared, keeping the transform path byte-identical.
+                self._lookup_executor = self._build_lookup_executor()
                 for ic in self.registry.inbound.values():
                     await self._start_inbound_unsafe(ic.name)
                 # A router + transform worker per inbound — spawned after the sources bind, so a bind
@@ -324,22 +472,32 @@ class RegistryRunner:
         self._stop.set()
         self._ingress_work.set()
         self._routed_work.set()
+        self._response_work.set()
         self._work.set()
         for source in self._sources.values():
             await source.stop()
-        inbound_tasks = (*self._router_workers.values(), *self._transform_workers.values())
+        inbound_tasks = (
+            *self._router_workers.values(),
+            *self._transform_workers.values(),
+            *self._response_workers.values(),
+        )
         for task in (*self._workers.values(), *inbound_tasks):
             task.cancel()
         await asyncio.gather(*self._workers.values(), *inbound_tasks, return_exceptions=True)
         for connector in self._destinations.values():
             await connector.aclose()
+        if self._lookup_executor is not None:
+            await self._lookup_executor.aclose()
+            self._lookup_executor = None
         self._workers.clear()
         self._router_workers.clear()
         self._transform_workers.clear()
+        self._response_workers.clear()
         self._destinations.clear()
         self._retry.clear()
         self._internal_error.clear()
         self._buildup.clear()
+        self._simulate.clear()
         self._next_buildup_alert.clear()
         self._sources.clear()
         self._running = False
@@ -369,17 +527,31 @@ class RegistryRunner:
             self._spawn_worker(name)
 
     def _inbound_worker_coro(self, kind: str):  # type: ignore[no-untyped-def]
-        """The coroutine factory for an inbound worker ``kind`` (``"router"`` | ``"transform"``)."""
-        return self._router_worker if kind == "router" else self._transform_worker
+        """The coroutine factory for an inbound worker ``kind`` (``router`` | ``transform`` |
+        ``response``). The ``response`` worker (ADR 0013) runs only for loopback inbounds."""
+        return {
+            "router": self._router_worker,
+            "transform": self._transform_worker,
+            "response": self._response_worker,
+        }[kind]
 
     def _inbound_worker_dict(self, kind: str) -> dict[str, asyncio.Task[None]]:
-        return self._router_workers if kind == "router" else self._transform_workers
+        return {
+            "router": self._router_workers,
+            "transform": self._transform_workers,
+            "response": self._response_workers,
+        }[kind]
 
     def _ensure_inbound_workers(self, name: str) -> None:
-        """Ensure both the router and transform worker for one inbound are running, spawning any that
-        exited (a STOP-policy halt, a reload adding the inbound, or a crash). Idempotent — the shared
-        re-arm used by start(), start_inbound(), and reload()."""
-        for kind in ("router", "transform"):
+        """Ensure the router + transform (+ for a loopback inbound, the response) workers for one inbound
+        are running, spawning any that exited (a STOP-policy halt, a reload adding the inbound, or a
+        crash). Idempotent — the shared re-arm used by start(), start_inbound(), and reload()."""
+        kinds = ["router", "transform"]
+        ic = self.registry.inbound.get(name)
+        if ic is not None and ic.spec.type is ConnectorType.LOOPBACK:
+            # ADR 0013: a loopback inbound also gets a RESPONSE worker draining its Stage.RESPONSE tokens.
+            kinds.append("response")
+        for kind in kinds:
             task = self._inbound_worker_dict(kind).get(name)
             if task is None or task.done():
                 self._spawn_inbound_worker(kind, name)
@@ -435,6 +607,7 @@ class RegistryRunner:
             self._ordering[name] = oc.ordering or self._ordering_default
             self._internal_error[name] = oc.internal_error or self._internal_error_default
             self._buildup[name] = oc.buildup or self._buildup_default
+            self._simulate[name] = self._resolve_simulate(name, oc)
             worker = self._workers.get(name)
             if worker is None or worker.done():
                 # added (or replacing a crashed worker): close any stale connector, build + spawn.
@@ -486,6 +659,12 @@ class RegistryRunner:
             try:
                 # 2. Swap the registry and restart inbound listeners from it (intake back up first).
                 self.registry = new_registry
+                # Rebuild the live-lookup executor from the new graph, closing the old pools. build_check
+                # already validated the new specs, so this can't fail on a bad spec here.
+                old_lookup_executor = self._lookup_executor
+                self._lookup_executor = self._build_lookup_executor()
+                if old_lookup_executor is not None:
+                    await old_lookup_executor.aclose()
                 for ic in new_registry.inbound.values():
                     await self._start_inbound_unsafe(ic.name)
                 # 2b. Ensure the router + transform workers run for every inbound in the new graph.
@@ -600,9 +779,21 @@ class RegistryRunner:
                 validate, text, expected_version=ic.validation.hl7_version
             )
             if not result.ok:
-                detail = "; ".join(result.errors)[:200]
-                await self._record(ic, peek, text, MessageStatus.ERROR, error=detail)
-                return build_ack(peek, code="AE", text=detail, ack_mode=ack_mode) if reply else None
+                joined = "; ".join(result.errors)
+                # Persist a PHI-scrubbed form: hl7apy error strings quote the offending field VALUE
+                # (PHI), so this is a persisted-disposition write that must go through the scrub like
+                # every other one — it keeps the field NAME / segment ID (the diagnostic an operator
+                # needs) but cuts the value (review #120). The scrubbed text is gated behind
+                # messages:view_summary on read, like every other stored error.
+                persisted = f"strict-validation failed: {safe_text(joined)}"
+                await self._record(ic, peek, text, MessageStatus.ERROR, error=persisted)
+                # The AE ACK goes back to the partner that SENT this message (their own data) and is
+                # transient (never persisted), so it may carry the fuller, bounded validation text.
+                return (
+                    build_ack(peek, code="AE", text=joined[:200], ack_mode=ack_mode)
+                    if reply
+                    else None
+                )
 
         # ACK-on-receipt (staged pipeline, ADR 0001 Step A): persist the raw message durably to the
         # ingress stage, then ACK. Routing/transform/delivery run AFTER the ACK in the ingress worker,
@@ -678,7 +869,16 @@ class RegistryRunner:
                         await self.store.mark_failed(item.id, "outbound reloading", retry)
                         continue
                     try:
-                        await connector.send(item.payload)
+                        if self._simulate.get(name, False):
+                            # Shadow / parallel-run (#15): suppress the real egress entirely — no bytes/
+                            # SQL leave the box. With egress suppressed there is no real partner reply to
+                            # capture or re-ingress, so treat it as a completed ONE-WAY delivery: response
+                            # = None → mark_done → the message finalizes PROCESSED, and the would-send
+                            # outbound payload is retained on the done row for parity comparison. (A
+                            # capturing/reingress_to outbound therefore captures nothing in simulate.)
+                            response = None
+                        else:
+                            response = await connector.send(item.payload)
                     except NegativeAckError as exc:
                         # Partner rejection. AR/CR (permanent) → fail-fast: the partner will never
                         # accept this message, so dead-letter it now rather than block the FIFO lane
@@ -733,7 +933,29 @@ class RegistryRunner:
                             item.id, f"internal error: {safe_exc(exc)}"
                         )
                     else:
-                        await self.store.mark_done(item.id)
+                        # ADR 0013: a capturing outbound returns a DeliveryResponse; persist the reply
+                        # AND mark the row done in ONE transaction (exactly-once capture). A non-capturing
+                        # outbound returns None → plain mark_done, byte-identical. The XOR (never both)
+                        # is the single-writer discipline that yields exactly one captured reply per row.
+                        if response is not None:
+                            # ADR 0013 Increment 2: if this outbound declares reingress_to, the same
+                            # capture transaction also produces a Stage.RESPONSE work-row; wake the
+                            # re-ingress worker. Read live from the registry (a reload swaps it).
+                            oc = self.registry.outbound.get(name)
+                            reingress_to = (
+                                oc.spec.settings.get("reingress_to") if oc is not None else None
+                            )
+                            await self.store.complete_with_response(
+                                item.id,
+                                body=response.body,
+                                outcome=response.outcome,
+                                detail=response.detail,
+                                reingress_to=reingress_to,
+                            )
+                            if reingress_to is not None:
+                                self._response_work.set()  # wake the re-ingress worker for the new token
+                        else:
+                            await self.store.mark_done(item.id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -782,14 +1004,21 @@ class RegistryRunner:
                     await self.store.mark_failed(item.id, "inbound not in registry", RetryPolicy())
                     return
                 try:
-                    # Publish the live graph's code sets so a call-time code_set(...) inside the
-                    # Router resolves (the loader only had them active during import). The active set
-                    # is read from self.registry live, so a reload's swapped tables apply to the next
-                    # routed row; activated() restores cleanly after each run (no leak across rows).
-                    with (
-                        code_sets_activated(self.registry.code_sets),
-                        reference_activated(self.store.reference_view()),
-                        environment_activated(self._active_environment),
+                    # Publish the live graph's run-scoped views (code sets / reference snapshots /
+                    # active environment) so a call-time code_set(...)/reference(...)/current_environment()
+                    # inside the Router resolves (the loader only had them active during import). Views
+                    # are read from self.registry/self.store live, so a reload's swapped tables apply to
+                    # the next routed row; run_contexts restores cleanly after each run (no leak). The
+                    # set of providers is the run_context registry (router phase) — features add one
+                    # provider there, never edit this call site.
+                    with run_contexts(
+                        RunContext(
+                            code_sets=self.registry.code_sets,
+                            reference_view=self.store.reference_view(),
+                            active_environment=self._active_environment,
+                            ingest_time=item.created_at,
+                        ),
+                        phase="router",
                     ):
                         names = route_only(self.registry, ic, item.payload)
                 except Exception as exc:
@@ -849,6 +1078,59 @@ class RegistryRunner:
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
 
+    async def _response_worker(self, name: str) -> None:
+        """Drain the **response** stage for one LOOPBACK inbound — re-ingress a captured reply as a new
+        inbound message (ADR 0013 Increment 2). Strict FIFO per loopback lane: claim the oldest
+        ``Stage.RESPONSE`` token, peek the reply body for the loopback's ``content_type``, and hand it
+        off **atomically** via :meth:`~messagefoundry.store.base.QueueStore.ingress_handoff` (which
+        produces the re-ingressed message + ingress row, depth-caps it, or errors a non-peekable body).
+        Mirrors :meth:`_router_worker`'s claim / missing-inbound / backoff supervision. Re-ingress is a
+        single-owner internal stage: the per-lane claim owner is the only leader gate (``LoopbackSource``
+        is inert, so there is no source-level gate)."""
+        while not self._stop.is_set():
+            try:
+                item = await self.store.claim_next_fifo(
+                    name, stage=Stage.RESPONSE.value, owner=self._coordinator.lane_owner()
+                )
+                if item is None:
+                    await self._wait_for_work(self._response_work)
+                    continue
+                ic = self.registry.inbound.get(name)
+                if ic is None:
+                    # The loopback was removed by a reload but residual tokens remain. Revert the claim
+                    # (retry-FOREVER, never dropped) and EXIT; a reload restoring the loopback re-arms
+                    # this worker and drains the backlog — mirrors the router worker's missing-inbound exit.
+                    await self.store.mark_failed(item.id, "inbound not in registry", RetryPolicy())
+                    return
+                # Peek the reply body for the loopback's content_type (in pipeline/, not the store), then
+                # hand off in one atomic transaction. response_body_for_work_row reads the same immutable
+                # artifact ingress_handoff re-reads for the message raw, so peek and raw always agree.
+                body = await self.store.response_body_for_work_row(item.id)
+                control_id, message_type, summary, peek_failed = _peek_for_loopback(ic, body or "")
+                produced = await self.store.ingress_handoff(
+                    response_row_id=item.id,
+                    loopback_channel_id=name,
+                    correlation_depth_cap=self._max_correlation_depth,
+                    control_id=control_id,
+                    message_type=message_type,
+                    summary=summary,
+                    peek_failed=peek_failed,
+                )
+                if produced:
+                    # Wake the loopback's router worker to route the freshly-ingressed answer (a no-op
+                    # wake for a depth-capped / peek-failed token that produced no ingress row).
+                    self._ingress_work.set()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A store error in the loop itself (claim/handoff failing) must never kill the worker —
+                # log, back off, keep going (mirrors the router/delivery workers).
+                log.exception(
+                    "response worker %r: unexpected error; backing off and retrying", name
+                )
+                if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
+                    return
+
     async def _transform_worker(self, name: str) -> None:
         """Drain the **routed** stage for one inbound — the transform half of the split pipeline (ADR
         0001 Step B).
@@ -896,23 +1178,67 @@ class RegistryRunner:
                         item.id, f"handler {hname!r} removed from registry"
                     )
                     continue
+                # ADR 0013 Increment 2: for a RE-INGRESSED message (only ever on a loopback inbound),
+                # feed the run-context `response` provider the ORIGIN request's captured replies so its
+                # Handler can read them via response_get(dest). A normal message → None (byte-identical,
+                # and the metadata read is skipped entirely for non-loopback inbounds).
+                response_view: dict[str, Any] | None = None
+                if ic.spec.type is ConnectorType.LOOPBACK:
+                    msg = await self.store.get_message(item.message_id)
+                    raw_meta = msg.get("metadata") if msg else None
+                    meta = json.loads(raw_meta) if raw_meta else {}
+                    corr = meta.get("correlation_id") if isinstance(meta, dict) else None
+                    if corr:
+                        # {destination_name: latest CapturedResponse}: correlate_response orders by
+                        # (dest, response_seq), so the last per destination wins (the authoritative
+                        # reply). Immutable committed rows → re-run-stable (ADR 0009).
+                        response_view = {
+                            c.destination_name: c for c in await self.store.correlate_response(corr)
+                        }
                 try:
-                    # Same as the router worker: make the live graph's code sets active so a call-time
-                    # code_set(...) inside the Handler resolves; restored cleanly after the run. Also
-                    # publish the store's transform-state read-through cache view (ADR 0005) so a
-                    # call-time state_get(...) inside the Handler resolves against committed writes.
-                    with (
-                        code_sets_activated(self.registry.code_sets),
-                        reference_activated(self.store.reference_view()),
-                        state_activated(self.store.state_view()),
-                        environment_activated(self._active_environment),
+                    # Same as the router worker, plus the transform-only providers: publish the run-scoped
+                    # views so call-time code_set(...)/reference(...)/state_get(...)/current_environment()
+                    # inside the Handler resolve; restored cleanly after the run. The transform phase adds
+                    # the store's transform-state read-through cache view (ADR 0005) so state_get(...)
+                    # resolves against committed writes. Providers come from the run_context registry
+                    # (transform phase) — features add one provider, never edit this call site.
+                    with run_contexts(
+                        RunContext(
+                            code_sets=self.registry.code_sets,
+                            reference_view=self.store.reference_view(),
+                            state_view=self.store.state_view(),
+                            response_view=response_view,
+                            active_environment=self._active_environment,
+                            ingest_time=item.created_at,
+                        ),
+                        phase="transform",
                     ):
-                        deliveries_preview, state_preview = transform_one(
-                            self.registry,
-                            hname,
-                            item.payload,
-                            self.registry.inbound[name].content_type.value,
-                        )
+                        if self._lookup_executor is not None:
+                            # The graph declares ≥1 DatabaseLookup, so a Handler may call db_lookup() — a
+                            # LIVE, synchronous DB read (ADR 0010). A handler is synchronous and must not
+                            # block the event loop, so run the transform OFF the loop in a worker thread.
+                            # asyncio.to_thread copies THIS context into the thread — the run_contexts
+                            # views AND the active lookup runner — so db_lookup()/code_set()/reference()/
+                            # state_get()/current_environment() all resolve there, while the loop stays
+                            # free to service the lookup's async query and every other connection. The
+                            # runner bridges back onto the loop (run_coroutine_threadsafe). db_lookup is
+                            # the deliberate re-run-stability exception (ADR 0009) and raises in dry-run.
+                            with db_lookup_activated(self._run_lookup):
+                                deliveries_preview, state_preview = await asyncio.to_thread(
+                                    transform_one,
+                                    self.registry,
+                                    hname,
+                                    item.payload,
+                                    self.registry.inbound[name].content_type.value,
+                                )
+                        else:
+                            # No DatabaseLookup declared → byte-identical to before: run inline on the loop.
+                            deliveries_preview, state_preview = transform_one(
+                                self.registry,
+                                hname,
+                                item.payload,
+                                self.registry.inbound[name].content_type.value,
+                            )
                 except Exception as exc:
                     # Handler/transform code error (incl. an unknown outbound name). Post-ACK, so no
                     # NAK — the global internal_error policy decides. Log the exception TYPE only (PHI).
@@ -1033,10 +1359,15 @@ class RegistryRunner:
 def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[str, Any]) -> Source:
     # Resolve any env() references first (a missing value raises WiringError here, before bind).
     settings = resolve_env_settings(ic.spec.settings, env_values)
-    # Inbound MLLP/TCP listeners never carry an author-supplied host (wiring rejects one) — they bind
-    # to the service-level interface. File and other inbounds have no host and ignore this.
-    if ic.spec.type in (ConnectorType.MLLP, ConnectorType.TCP):
-        settings["host"] = bind_host
+    # Inbound MLLP/TCP/X12 listeners never carry an author-supplied host (wiring rejects one) — they
+    # bind to the per-connection bind_address if set, else the service-level [inbound].bind_host. File
+    # and other inbounds have no host and ignore this. A peer-IP allowlist rides into the connector's
+    # settings so the listener can reject a non-allowlisted peer at accept time. (bind_address and the
+    # allowlist are MLLP/TCP-only at wiring, so for X12 both fields are None here = unchanged behaviour.)
+    if ic.spec.type in (ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.X12):
+        settings["host"] = ic.bind_address or bind_host
+        if ic.source_ip_allowlist:
+            settings["source_ip_allowlist"] = list(ic.source_ip_allowlist)
     return Source(type=ic.spec.type, settings=settings, ack_mode=ic.ack_mode)
 
 
@@ -1066,14 +1397,62 @@ def build_check_registry(
             source_cfg = _source_config(ic, inbound_bind_host, env_values)
             check_source_allowed(source_cfg, ic.name, egress)
             build_source(source_cfg)
+        reingress_targets: set[str] = set()
         for oc in registry.outbound.values():
             dest = _dest_config(oc, env_values)
             check_egress_allowed(dest, egress)  # fail-closed egress allowlist (WP-11c)
             build_destination(dest)
+            # ADR 0013 Increment 2: reingress_to must name an existing Loopback() inbound. This is a
+            # CROSS-registry fact (build_outbound_connection is registry-blind), enforced here so it
+            # fails at `check`/dry-run with no store, like every other connector validation.
+            target = oc.spec.settings.get("reingress_to")
+            if target is not None:
+                tic = registry.inbound.get(str(target))
+                if tic is None or tic.spec.type is not ConnectorType.LOOPBACK:
+                    raise WiringError(
+                        f"outbound connection {oc.name!r}: reingress_to names unknown/non-loopback "
+                        f"inbound {target!r} — declare it as inbound(..., Loopback(), ...) (ADR 0013)."
+                    )
+                reingress_targets.add(str(target))
+        # A loopback inbound with no capturing outbound pointing at it is legal but inert (never fed) —
+        # surface it (it may be a staging artifact), but don't error.
+        for iname, ic in registry.inbound.items():
+            if ic.spec.type is ConnectorType.LOOPBACK and iname not in reingress_targets:
+                log.warning(
+                    "loopback inbound %r has no reingress_to source; it will never receive a message",
+                    iname,
+                )
+        resolved_lookups: dict[str, dict[str, Any]] = {}
+        for lname, lspec in registry.lookups.items():
+            lsettings = resolve_env_settings(lspec.settings, env_values)
+            check_lookup_allowed(lname, lsettings, egress)  # fail-closed connect allowlist
+            resolved_lookups[lname] = lsettings
+        if resolved_lookups:
+            # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
+            DatabaseLookupExecutor(resolved_lookups)
     except WiringError:
         raise
     except Exception as exc:
         raise WiringError(f"connector build failed: {exc}") from exc
+
+
+def _allowlist_for(conn_type: ConnectorType, egress: EgressSettings) -> list[str]:
+    """The ``[egress]`` allowlist that governs a connector type (X12 shares TCP's; REST/SOAP share the
+    HTTP list). Returns ``[]`` for a type with no egress list — which under ``deny_by_default`` means
+    'nothing is configured to permit it', so the destination is refused."""
+    if conn_type is ConnectorType.MLLP:
+        return egress.allowed_mllp
+    if conn_type in (ConnectorType.TCP, ConnectorType.X12):
+        return egress.allowed_tcp
+    if conn_type is ConnectorType.FILE:
+        return egress.allowed_file_dirs
+    if conn_type in (ConnectorType.REST, ConnectorType.SOAP):
+        return egress.allowed_http
+    if conn_type is ConnectorType.DATABASE:
+        return egress.allowed_db
+    if conn_type is ConnectorType.REMOTEFILE:
+        return egress.allowed_remote
+    return []
 
 
 def check_source_allowed(source: Source, name: str, egress: EgressSettings) -> None:
@@ -1085,7 +1464,21 @@ def check_source_allowed(source: Source, name: str, egress: EgressSettings) -> N
 
     A TCP/MLLP/File *source* is a local **listener** (it binds ``[inbound].bind_host`` and waits for
     peers, never dialing out), so there is nothing to connect-gate here — ``[egress].allowed_tcp``
-    governs only the TCP *destination* (see :func:`check_egress_allowed`)."""
+    governs only the TCP *destination* (see :func:`check_egress_allowed`).
+
+    Under ``[egress].deny_by_default`` a DATABASE/REMOTEFILE source whose allowlist is empty is refused
+    outright; a listener source (TCP/MLLP/File) never dials out, so it is unaffected."""
+    if egress.deny_by_default:
+        if source.type is ConnectorType.DATABASE and not egress.allowed_db:
+            raise WiringError(
+                f"inbound {name!r}: [egress].deny_by_default is set and [egress].allowed_db is empty "
+                "— list the DATABASE server to permit it"
+            )
+        if source.type is ConnectorType.REMOTEFILE and not egress.allowed_remote:
+            raise WiringError(
+                f"inbound {name!r}: [egress].deny_by_default is set and [egress].allowed_remote is "
+                "empty — list the REMOTEFILE host to permit it"
+            )
     if source.type is ConnectorType.DATABASE and egress.allowed_db:
         host = str(source.settings.get("server", ""))
         port = source.settings.get("port", 1433)
@@ -1114,12 +1507,77 @@ def check_source_allowed(source: Source, name: str, egress: EgressSettings) -> N
             )
 
 
+def check_lookup_allowed(name: str, settings: Mapping[str, Any], egress: EgressSettings) -> None:
+    """Fail-closed connect-allowlist for a ``DatabaseLookup`` (it dials out to a SQL host for a live,
+    read-only ``db_lookup``). Reuses ``[egress].allowed_db`` (opt-in; an empty list = unrestricted), like
+    the DATABASE source — checked at load/reload/start so the engine is never pointed at a non-allowlisted
+    server. ``settings`` are the already-``env()``-resolved connection settings. Under
+    ``[egress].deny_by_default`` an empty ``allowed_db`` refuses the lookup outright."""
+    if egress.deny_by_default and not egress.allowed_db:
+        raise WiringError(
+            f"DatabaseLookup {name!r}: [egress].deny_by_default is set and [egress].allowed_db is "
+            "empty — list the lookup server to permit it"
+        )
+    if egress.allowed_db:
+        host = str(settings.get("server", ""))
+        port = settings.get("port", 1433)
+        if not _mllp_egress_allowed(host, port, egress.allowed_db):  # same host[:port] matching
+            log.warning(
+                "connect denied: DatabaseLookup %r server %r not in [egress].allowed_db", name, host
+            )
+            raise WiringError(
+                f"DatabaseLookup {name!r}: server {host!r} is not in the [egress].allowed_db allowlist"
+            )
+
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
+
+
+def check_mllp_tls_exposure(source: Source, name: str, *, allow_insecure_bind: bool) -> None:
+    """Exposed-gate (ADR 0002 §0, MLLP side): refuse a **non-loopback MLLP listener without TLS** — it
+    would put HL7 bodies on the wire in cleartext. Set ``tls=true`` (+ cert) on the connection, or pass
+    ``serve --allow-insecure-bind`` to accept the risk on a trusted segment (then warn). Loopback binds
+    and TLS-on binds pass unconditionally. MLLP only (raw-TCP/X12 TLS is out of ADR-0002 scope)."""
+    if source.type is not ConnectorType.MLLP:
+        return
+    host = str(source.settings.get("host", "127.0.0.1"))
+    if host in _LOOPBACK_HOSTS or source.settings.get("tls"):
+        return
+    if allow_insecure_bind:
+        log.warning(
+            "inbound %r binds non-loopback host %r without TLS (--allow-insecure-bind); HL7 bodies "
+            "cross the network in cleartext — set tls=true (+ tls_cert_file/tls_key_file) on it.",
+            name,
+            host,
+        )
+        return
+    raise WiringError(
+        f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; HL7 bodies would "
+        "cross the network in cleartext. Set tls=true (+ tls_cert_file/tls_key_file) on the MLLP "
+        "connection, or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
+        "firewalled network."
+    )
+
+
 def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     """Fail-closed: refuse (raise :class:`WiringError`) an outbound destination not on the ``[egress]``
     allowlist (WP-11c — ASVS 13.2.4/13.2.5/14.2.3), so a fat-fingered or hostile destination can't
     exfiltrate PHI. Opt-in per transport (an empty list = unrestricted), checked against the resolved
     (``env()``-substituted) destination at config load/reload/start. Webhook/SMTP alert sinks carry no
-    PHI bodies and keep their own ``[alerts]`` host allowlists."""
+    PHI bodies and keep their own ``[alerts]`` host allowlists.
+
+    Under ``[egress].deny_by_default`` a destination whose transport has no allowlist is refused
+    outright (fail-closed); with the list set, the per-list matching below is unchanged."""
+    if egress.deny_by_default and not _allowlist_for(dest.type, egress):
+        log.warning(
+            "egress denied: outbound %r %s has no [egress] allowlist under deny_by_default",
+            dest.name,
+            dest.type.value,
+        )
+        raise WiringError(
+            f"outbound {dest.name!r}: [egress].deny_by_default is set and no allowlist permits a "
+            f"{dest.type.value} destination — add it to the matching [egress].allowed_* list"
+        )
     if dest.type is ConnectorType.MLLP and egress.allowed_mllp:
         host = str(dest.settings.get("host", "127.0.0.1"))
         port = dest.settings.get("port")
@@ -1146,6 +1604,21 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
             )
             raise WiringError(
                 f"outbound {dest.name!r}: TCP destination {host}:{port} is not in the "
+                "[egress].allowed_tcp allowlist"
+            )
+    elif dest.type is ConnectorType.X12 and egress.allowed_tcp:
+        # X12 is raw TCP, so it shares the [egress].allowed_tcp allowlist (same host[:port] matching).
+        host = str(dest.settings.get("host", "127.0.0.1"))
+        port = dest.settings.get("port")
+        if not _mllp_egress_allowed(host, port, egress.allowed_tcp):
+            log.warning(
+                "egress denied: outbound %r X12 %s:%s not in [egress].allowed_tcp",
+                dest.name,
+                host,
+                port,
+            )
+            raise WiringError(
+                f"outbound {dest.name!r}: X12 destination {host}:{port} is not in the "
                 "[egress].allowed_tcp allowlist"
             )
     elif dest.type is ConnectorType.FILE and egress.allowed_file_dirs:

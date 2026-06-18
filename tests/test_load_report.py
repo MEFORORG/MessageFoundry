@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
 """Report assembly: no-loss reconciliation, SLO verdict, JSON/CSV shape (no PHI), baseline compare.
 
 Pure — feeds synthetic counters/histograms/engine-samples, so no engine or sockets. Also checks the
@@ -11,7 +13,7 @@ from types import SimpleNamespace
 from harness.load.enginepoll import EnginePoller, EngineSample
 from harness.load.metrics import Counters, Histogram
 from harness.load.profile import load_profile_text
-from harness.load.report import PhaseRecord, build_report, compare_to_baseline
+from harness.load.report import PhaseRecord, _spreadsheet_safe, build_report, compare_to_baseline
 
 _PROFILE = """
 [load]
@@ -50,8 +52,10 @@ def _hist(value_ms: float, n: int) -> Histogram:
 
 def _poller(read: int, written: int, *, backlog: int = 0) -> EnginePoller:
     p = EnginePoller("http://x", None, origin=0.0)
-    base = EngineSample(0.0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, "wal", 1.0)
-    final = EngineSample(10.0, backlog, 0, written, 0, read, written, 0, backlog, 5000, "wal", 11.0)
+    base = EngineSample(0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, "wal", 1.0)
+    final = EngineSample(
+        10.0, backlog, 0, written, 0, read, written, 0, backlog, backlog, 5000, "wal", 11.0
+    )
     p._samples.extend([base, final])
     return p
 
@@ -150,6 +154,30 @@ def test_json_is_metrics_only_no_phi() -> None:
     assert report.to_csv().count("\n") >= 3  # header + 2 phase rows
 
 
+def test_spreadsheet_safe_neutralizes_formula_triggers() -> None:
+    # WP-L3-08 / ASVS 1.2.10: a cell beginning with a formula trigger is prefixed with a literal "'".
+    assert _spreadsheet_safe("=1+1") == "'=1+1"
+    assert _spreadsheet_safe("+SUM(A1)") == "'+SUM(A1)"
+    assert _spreadsheet_safe("-2+cmd") == "'-2+cmd"
+    assert _spreadsheet_safe("@cmd") == "'@cmd"
+    assert _spreadsheet_safe("\tTAB") == "'\tTAB"
+    # Benign names (and the empty string) pass through untouched.
+    assert _spreadsheet_safe("steady") == "steady"
+    assert _spreadsheet_safe("") == ""
+
+
+def test_to_csv_escapes_formula_in_string_cell() -> None:
+    # A profile name beginning with "=" reaches the CSV neutralized, never as a raw formula cell.
+    profile = load_profile_text(_PROFILE.replace('name = "rep"', 'name = "=danger()"', 1))
+    counters = Counters(sent=105, acked=105, sink_received=300)
+    report = build_report(profile, "http://x", _records(105, 105), counters, _poller(105, 300), 2.0)
+    csv_text = report.to_csv()
+    assert "'=danger()" in csv_text
+    # No data row begins with a bare formula trigger (header line is literal column names).
+    for line in csv_text.splitlines()[1:]:
+        assert not line or line[0] not in "=+-@"
+
+
 def test_console_renders_result_line() -> None:
     profile = load_profile_text(_PROFILE)
     sent = 105
@@ -189,7 +217,8 @@ def test_engine_poller_parses_sample_from_client() -> None:
     poller = EnginePoller("http://x", None, origin=0.0)
     poller._client = SimpleNamespace(  # type: ignore[assignment]
         stats=lambda: SimpleNamespace(
-            outbox_by_status={"pending": 2, "inflight": 1, "done": 50, "dead": 3}
+            outbox_by_status={"pending": 2, "inflight": 1, "done": 50, "dead": 3},
+            in_pipeline=4,  # whole-pipeline gauge — deliberately != the outbound-only backlog (3)
         ),
         connections=lambda: [
             SimpleNamespace(read=100, written=None, errored=1, queue_depth=None),  # inbound row
@@ -207,4 +236,5 @@ def test_engine_poller_parses_sample_from_client() -> None:
     assert sample.written == 300  # 280 + 20 outbound
     assert sample.out_dead == 3  # errored summed over outbound rows
     assert sample.backlog == 3 and sample.queue_depth == 3
+    assert sample.in_pipeline == 4  # taken straight from /stats, not derived from outbox_by_status
     assert sample.db_size_bytes == 4096

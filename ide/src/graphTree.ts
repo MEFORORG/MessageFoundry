@@ -74,7 +74,7 @@ function buildMaps(g: Graph): Maps {
 
 function outboundRefNode(name: string, maps: Maps): Node {
   const o = maps.outbound.get(name);
-  const node = new Node(name, NONE, [], "arrow-up");
+  const node = new Node(name, NONE, [], "arrow-up", o ? `outbound · ${o.type}` : "outbound");
   node.command = openCommand(o ?? {});
   return node;
 }
@@ -82,7 +82,7 @@ function outboundRefNode(name: string, maps: Maps): Node {
 function handlerNode(name: string, maps: Maps): Node {
   const h = maps.handlers.get(name);
   const outs = (h?.sends ?? []).map((s) => outboundRefNode(s, maps));
-  const node = new Node(name, outs.length ? COLLAPSED : NONE, outs, "symbol-method");
+  const node = new Node(name, outs.length ? COLLAPSED : NONE, outs, "symbol-method", "handler");
   node.command = openCommand(h ?? {});
   return node;
 }
@@ -90,7 +90,7 @@ function handlerNode(name: string, maps: Maps): Node {
 function routerNode(name: string, maps: Maps): Node {
   const r = maps.routers.get(name);
   const handlers = (r?.handlers ?? []).map((h) => handlerNode(h, maps));
-  const node = new Node(name, handlers.length ? COLLAPSED : NONE, handlers, "git-branch");
+  const node = new Node(name, handlers.length ? COLLAPSED : NONE, handlers, "git-branch", "router");
   node.command = openCommand(r ?? {});
   return node;
 }
@@ -98,14 +98,14 @@ function routerNode(name: string, maps: Maps): Node {
 // Inbound: expands to router → handler → outbound. Outbound: a leaf. Both carry contextValue
 // "meforConnection" so the title/inline "settings" action applies, and a command to jump to their def.
 function inboundNode(c: Graph["inbound"][number], maps: Maps): Node {
-  const node = new Node(c.name, COLLAPSED, [routerNode(c.router, maps)], "arrow-right", `${c.type} → ${c.router}`);
+  const node = new Node(c.name, COLLAPSED, [routerNode(c.router, maps)], "arrow-right", `inbound · ${c.type} → ${c.router}`);
   node.command = openCommand(c);
   node.contextValue = "meforConnection";
   return node;
 }
 
 function outboundNode(c: Graph["outbound"][number]): Node {
-  const node = new Node(c.name, NONE, [], "arrow-up", c.type);
+  const node = new Node(c.name, NONE, [], "arrow-up", `outbound · ${c.type}`);
   node.command = openCommand(c);
   node.contextValue = "meforConnection";
   return node;
