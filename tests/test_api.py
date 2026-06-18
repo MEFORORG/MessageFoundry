@@ -94,6 +94,33 @@ async def test_chunked_request_body_rejected(client: httpx.AsyncClient) -> None:
     assert r.status_code == 411
 
 
+async def test_both_content_length_and_transfer_encoding_rejected(
+    client: httpx.AsyncClient,
+) -> None:
+    # ASVS 4.2.1: a request carrying BOTH Content-Length and Transfer-Encoding is ambiguously framed
+    # (the CL.TE request-smuggling vector) and is refused with 400 before routing/auth.
+    r = await client.post("/auth/login", content=b"{}", headers={"transfer-encoding": "chunked"})
+    assert r.status_code == 400
+
+
+async def test_query_param_pollution_last_value_still_validated(client: httpx.AsyncClient) -> None:
+    # ASVS 15.3.7: duplicate scalar query params resolve last-wins (Starlette) and the surviving value
+    # is still Pydantic-validated — a polluted duplicate can't smuggle past the bound. limit is capped
+    # le=500, so a trailing over-cap duplicate is rejected (422), not silently aggregated/accepted.
+    r = await client.get("/messages", params=[("limit", "1"), ("limit", "999")])
+    assert r.status_code == 422
+    # An in-bounds trailing duplicate is accepted (last wins = 2).
+    r = await client.get("/messages", params=[("limit", "999"), ("limit", "2")])
+    assert r.status_code == 200
+
+
+async def test_dead_letters_query_params_length_capped(client: httpx.AsyncClient) -> None:
+    # Parity with /messages (ASVS 1.2.10 / 15.3.7): the /dead-letters channel_id/destination_name
+    # scalar query params are now length-capped, so an over-length value is rejected up front.
+    assert (await client.get("/dead-letters", params={"channel_id": "x" * 257})).status_code == 422
+    assert (await client.get("/dead-letters", params={"channel_id": "x" * 256})).status_code == 200
+
+
 def test_docs_endpoints_disabled_by_default() -> None:
     # /docs, /redoc, /openapi.json widen the attack surface and disclose the schema — off by default.
     with TestClient(create_app(allow_no_auth=True)) as c:

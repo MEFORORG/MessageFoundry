@@ -13,7 +13,7 @@ from __future__ import annotations
 import ssl
 
 from messagefoundry.config.settings import ApiSettings
-from messagefoundry.config.tls_policy import harden_kex_groups
+from messagefoundry.config.tls_policy import harden_kex_groups, harden_verify_flags
 
 __all__ = ["build_api_ssl_context"]
 
@@ -40,6 +40,7 @@ def build_api_ssl_context(api: ApiSettings) -> ssl.SSLContext:
     if api.tls_ciphers:
         ctx.set_ciphers(api.tls_ciphers)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where the runtime supports it (ASVS 11.6.2)
+    harden_verify_flags(ctx)  # strict RFC 5280 cert validation (ASVS 12.1.4)
     if api.tls_client_ca_file:
         ctx.load_verify_locations(cafile=api.tls_client_ca_file)
         ctx.verify_mode = ssl.CERT_REQUIRED

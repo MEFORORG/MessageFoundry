@@ -452,11 +452,28 @@ def create_app(
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
         client = request.client.host if request.client else None
         length = request.headers.get("content-length")
+        transfer_encoding = request.headers.get("transfer-encoding", "").lower()
+        # A request carrying BOTH Content-Length and Transfer-Encoding is ambiguously framed (RFC 9112
+        # §6.1 — TE overrides CL) and is the classic CL.TE request-smuggling vector. Our single h11
+        # parser doesn't desync on the default loopback bind, but reject it outright so a future front
+        # proxy can never disagree with us about where the message ends (ASVS 4.2.1).
+        if length is not None and "chunked" in transfer_encoding:
+            _log.warning(
+                "rejected request with both Content-Length and Transfer-Encoding on %s from %s",
+                request.url.path,
+                client,
+            )
+            return JSONResponse(
+                {
+                    "detail": "ambiguous framing: Content-Length with Transfer-Encoding is not accepted"
+                },
+                status_code=400,
+            )
         if length is None:
             # No Content-Length means a chunked body (HTTP/1.1 requires one or the other), which the
             # Content-Length cap can't bound up front — Starlette would buffer it unbounded, a pre-auth
             # memory DoS. We only accept small JSON, so require a Content-Length (review M-19).
-            if "chunked" in request.headers.get("transfer-encoding", "").lower():
+            if "chunked" in transfer_encoding:
                 _log.warning(
                     "rejected chunked request body on %s from %s", request.url.path, client
                 )
@@ -793,8 +810,8 @@ def create_app(
         request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_READ)),
-        channel_id: str | None = None,
-        destination_name: str | None = None,
+        channel_id: str | None = Query(None, max_length=256),
+        destination_name: str | None = Query(None, max_length=256),
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> DeadLetterList:

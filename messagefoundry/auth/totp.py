@@ -35,6 +35,7 @@ __all__ = [
     "generate_secret",
     "totp",
     "verify_totp",
+    "verify_totp_step",
     "otpauth_uri",
     "generate_recovery_codes",
 ]
@@ -86,6 +87,38 @@ def totp(
     return _hotp(_decode_secret(secret), counter, digits)
 
 
+def verify_totp_step(
+    secret: str,
+    code: str,
+    *,
+    now: float | None = None,
+    period: int = DEFAULT_PERIOD,
+    digits: int = DEFAULT_DIGITS,
+    window: int = DEFAULT_WINDOW,
+) -> int | None:
+    """Return the time-step counter ``code`` matches within ±``window`` steps of ``now``, or ``None``.
+
+    Unlike :func:`verify_totp` this returns *which* step matched, so the caller can enforce single-use
+    by rejecting a step that was already consumed — RFC 6238 codes are otherwise replayable inside
+    their ~30 s step window (ASVS 6.5.1). Constant-time compared over a fixed set of candidate steps
+    (no early break) so a match near the window edge can't be distinguished by timing; a non-numeric
+    or wrong-length ``code`` returns ``None``.
+    """
+    candidate = code.strip()
+    if len(candidate) != digits or not candidate.isdigit():
+        return None
+    moment = time.time() if now is None else now
+    key = _decode_secret(secret)
+    counter = int(moment // period)
+    matched: int | None = None
+    for step in range(counter - window, counter + window + 1):
+        if step < 0:
+            continue
+        if hmac.compare_digest(_hotp(key, step, digits), candidate):
+            matched = step
+    return matched
+
+
 def verify_totp(
     secret: str,
     code: str,
@@ -97,23 +130,13 @@ def verify_totp(
 ) -> bool:
     """True iff ``code`` matches the TOTP for ``secret`` within ±``window`` steps of ``now``.
 
-    Constant-time compared over a fixed set of candidate steps (no early break) so a match near the
-    window edge can't be distinguished by timing. A non-numeric or wrong-length ``code`` is rejected
-    outright.
+    A thin bool wrapper over :func:`verify_totp_step` (which also reports *which* step matched, for
+    single-use enforcement). Constant-time; rejects a non-numeric or wrong-length ``code`` outright.
     """
-    candidate = code.strip()
-    if len(candidate) != digits or not candidate.isdigit():
-        return False
-    moment = time.time() if now is None else now
-    key = _decode_secret(secret)
-    counter = int(moment // period)
-    matched = False
-    for step in range(counter - window, counter + window + 1):
-        if step < 0:
-            continue
-        if hmac.compare_digest(_hotp(key, step, digits), candidate):
-            matched = True
-    return matched
+    return (
+        verify_totp_step(secret, code, now=now, period=period, digits=digits, window=window)
+        is not None
+    )
 
 
 def otpauth_uri(

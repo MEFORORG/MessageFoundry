@@ -30,6 +30,7 @@ from typing import Any, Protocol, runtime_checkable
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import SqliteSync, StoreBackend, StoreSettings
 from messagefoundry.store.crypto import make_cipher
+from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.store import (
     CapturedResponse,
     ConnectionMetrics,
@@ -597,6 +598,8 @@ class AuthStore(Protocol):
         self, user_id: str, code_hash: str, *, now: float | None = None
     ) -> bool: ...
 
+    async def consume_totp_step(self, user_id: str, step: int) -> bool: ...
+
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None: ...
 
     async def record_login_failure(
@@ -712,18 +715,16 @@ class Store(QueueStore, AuditStore, AuthStore, Protocol):
 
 
 def resolve_active_key(settings: StoreSettings) -> str | None:
-    """The effective base64 active key: ``encryption_key`` (env/config) if set, else the Windows
-    DPAPI-protected ``encryption_key_file`` decrypted (WP-11d). ``None`` when neither is configured
-    (→ identity cipher). The env key takes precedence so a deployment can override the file. A
-    configured-but-unreadable/foreign key file raises ``DpapiError`` here — fail-closed, not silently
-    unencrypted."""
-    if settings.encryption_key:
-        return settings.encryption_key
-    if settings.encryption_key_file:
-        from messagefoundry.secrets_dpapi import load_protected_key
+    """The effective base64 active key, sourced through the :class:`KeyProvider` seam selected by
+    ``[store].key_provider`` (ADR 0019). The default ``auto`` provider is the env-then-DPAPI ladder —
+    ``encryption_key`` (env/config) if set, else the Windows DPAPI-protected ``encryption_key_file``
+    decrypted (WP-11d), else ``None`` (→ identity cipher) — so the default is **byte-identical** to the
+    pre-seam behavior. The env key takes precedence so a deployment can override the file.
 
-        return load_protected_key(settings.encryption_key_file)
-    return None
+    Fail-closed: a configured-but-unreadable/foreign DPAPI key file raises ``DpapiError`` here, and a
+    selected-but-unresolvable/unknown provider raises ``KeyProviderError`` — both propagate so
+    ``serve`` refuses to start rather than silently degrading to the identity (plaintext) cipher."""
+    return resolve_key_provider(settings).active_key()
 
 
 async def open_store(settings: StoreSettings) -> Store:

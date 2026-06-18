@@ -46,6 +46,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     register_destination,
 )
+from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
 __all__ = [
     "RestDestination",
@@ -164,6 +165,10 @@ class RestDestination(DestinationConnector):
         self._headers = self._build_headers(s)
         enforce_outbound_length_limits(self.url, self._headers)
         refuse_cleartext_credentials(scheme, self._headers, self.url)
+        # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing of the outbound body. None = off (byte-
+        # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
+        # dry-run/start), like a bad TLS cert; the per-request signature is minted in _post (off-loop).
+        self._signer: MessageSigner | None = signer_from_destination(config)
         if bool(s.get("verify_tls", True)):
             self._opener = _NO_REDIRECT_OPENER
         else:
@@ -235,10 +240,17 @@ class RestDestination(DestinationConnector):
             raise DeliveryError(f"REST {_redact_url(self.url)} failed: {exc}") from exc
 
     def _post(self, payload: str) -> tuple[str, int]:
+        data = payload.encode(self.encoding)
+        headers = self._headers
+        if self._signer is not None:
+            # ASVS 4.1.5 (ADR 0018): mint a detached JWS over the exact body bytes and carry it in a
+            # per-request header. Minted here in send()'s off-loop worker, past the queue boundary, so
+            # a retry re-mints it (re-run purity holds, like the WS-Security nonce — ADR 0015).
+            headers = {**self._headers, **self._signer.signature_headers(data)}
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self.url,
-            data=payload.encode(self.encoding),
-            headers=self._headers,
+            data=data,
+            headers=headers,
             method=self.method,
         )
         try:

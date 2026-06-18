@@ -4,18 +4,121 @@ Rendered architecture views for MessageFoundry (`MEFOR`). These are [Mermaid](ht
 diagrams — they render as graphics directly in the VS Code Markdown preview (`Ctrl+Shift+V`) and on
 GitHub. The prose source of truth is [ARCHITECTURE.md](ARCHITECTURE.md); this file is the picture.
 
-Three views, each answering a different question:
+Four views, each answering a different question:
 
-1. **System topology** — what the components are, the process boundaries, and which way dependencies point.
-2. **Runtime message flow** — how a received message moves through the staged queue and earns a disposition.
-3. **Config wiring graph** — how Connections, Routers, and Handlers wire together by name (no "channel" object).
+1. **Top-level components** — every shipped component (engine, console, IDE extension, Windows service, test harness, tee relay, CLI) and how they relate.
+2. **System topology** — the engine's internal packages, process boundaries, and the one-way dependency rule.
+3. **Runtime message flow** — how a received message moves through the staged queue and earns a disposition.
+4. **Config wiring graph** — how Connections, Routers, and Handlers wire together by name (no "channel" object).
 
 **Legend.** Solid/thick arrows = *depends on / calls*. Dotted arrows = *talks to over the API or wire*
 (separate process). Cylinders = persisted stage/store. Hexagon = the single disposition authority.
 
 ---
 
-## 1. System topology — components & boundaries
+## 1. Top-level components — the whole system
+
+MessageFoundry ships as a set of **independent, separately-buildable components**, not just the
+engine. This is everything at a glance — operator tools, dev/test tooling, the standalone tee relay,
+and the build/release path — and how each relates to the engine. Colour groups the *kind* of
+component (operator tool · runtime · author-time input · dev/test · standalone · external · build).
+
+```mermaid
+flowchart TB
+  classDef core fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
+  classDef api fill:#ede7f6,stroke:#5e35b1,color:#22103f;
+  classDef store fill:#fff3e0,stroke:#ef6c00,color:#3a1d00;
+  classDef opstool fill:#e3f2fd,stroke:#1565c0,color:#0d2b45;
+  classDef devtool fill:#e0f2f1,stroke:#00796b,color:#06302b;
+  classDef cfg fill:#f1f8e9,stroke:#9e9d24,color:#1f2400;
+  classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
+  classDef standalone fill:#fce4ec,stroke:#c2185b,color:#3d0a1f;
+  classDef build fill:#f3e5f5,stroke:#6a1b9a,color:#2a0a3d;
+
+  subgraph OPS["Operator tools — separate processes, API clients"]
+    CONSOLE["Monitoring / admin console<br/>messagefoundry.console · PySide6"]:::opstool
+    IDEEXT["VS Code extension<br/>ide/ · setup · promote · test bench · AI"]:::opstool
+  end
+
+  subgraph RUNTIME["Runtime"]
+    SERVICE["Windows service · NSSM"]:::ext
+    API["API · FastAPI/uvicorn<br/>127.0.0.1 · auth + RBAC"]:::api
+    ENGINE["Engine — headless asyncio<br/>pipeline · transports · parsing · store · config · auth"]:::core
+    STORE[("Message store / staged queue<br/>SQLite WAL · SQL Server · Postgres")]:::store
+  end
+
+  subgraph AUTHOR["Author-time inputs · version-controlled"]
+    CFG["Code-first config<br/>Connections · Routers · Handlers"]:::cfg
+    ENVS["environments/<br/>per-env value files"]:::cfg
+  end
+
+  subgraph DEV["Dev / test tooling"]
+    CLI["CLI · messagefoundry<br/>serve · generate · check · dryrun"]:::devtool
+    GEN["Synthetic HL7 generators<br/>messagefoundry generate"]:::devtool
+    HARNESS["Test harness<br/>harness/ · PySide6 · MLLP send/receive"]:::devtool
+  end
+
+  subgraph MIGRATE["Migration tooling — standalone (no engine imports)"]
+    TEE["Tee relay · python -m tee<br/>parallel-run parity"]:::standalone
+    TEEDB[("tee.db · own SQLite")]:::store
+  end
+
+  subgraph PARTNERS["External HL7 systems"]
+    UP(["Upstream senders"]):::ext
+    DOWN(["Downstream receivers"]):::ext
+    EPIC(["Epic · source"]):::ext
+    CORE(["Corepoint · legacy engine"]):::ext
+  end
+
+  subgraph BUILD["Build / release"]
+    CI["CI · .github/workflows<br/>tests · SAST · SBOM · sign"]:::build
+    PYPI(["PyPI · messagefoundry<br/>Trusted Publishing on a vX.Y.Z tag"]):::build
+  end
+
+  %% operator tools reach the engine only through the API
+  CONSOLE -.->|"HTTP/WS"| API
+  IDEEXT -.->|"HTTP"| API
+  API --> ENGINE
+  ENGINE --> STORE
+
+  %% how the engine is launched
+  SERVICE ==>|"runs"| CLI
+  CLI ==>|"serve → boots"| ENGINE
+
+  %% author-time inputs are loaded by the engine
+  CFG --> ENGINE
+  ENVS --> ENGINE
+
+  %% dev / test feeds
+  GEN -.->|"synthetic HL7"| HARNESS
+  HARNESS -.->|"MLLP"| ENGINE
+
+  %% live message traffic
+  UP -.->|"MLLP/file"| ENGINE
+  ENGINE -.->|"MLLP/file"| DOWN
+
+  %% migration parity (tee is standalone)
+  EPIC -.->|"MLLP"| TEE
+  TEE -.->|"production · unchanged"| CORE
+  TEE -.->|"shadow · egress suppressed"| ENGINE
+  TEE --> TEEDB
+
+  %% release
+  CI ==>|"vX.Y.Z tag"| PYPI
+```
+
+The engine ([`messagefoundry`](../messagefoundry/)) is the core; everything else is a separate
+component around it. **Operator tools** — the [console](../messagefoundry/console/) and the
+[VS Code extension](../ide/) — reach it **only** through the API. The **Windows service** (NSSM) runs
+it in production; the **CLI**, **synthetic generators**, and **test harness** ([`harness/`](../harness/))
+exercise it in dev/test. The **tee relay** ([`tee/`](../tee/)) is fully standalone — it imports no
+engine code and keeps its own SQLite — used to run MEFOR in parallel with a legacy engine during a
+migration ([TEE-RELAY.md](TEE-RELAY.md)). **CI** builds, signs, and publishes the package to PyPI on a
+version tag.
+
+---
+
+## 2. System topology — components & boundaries
 
 The engine is a headless **asyncio** service; clients are **separate processes** that reach it
 **only** through the localhost HTTP/WebSocket API. The dependency rule is one-way: `pipeline` /
@@ -67,7 +170,7 @@ flowchart TB
 
 ---
 
-## 2. Runtime message flow — the staged queue (ADR 0001, Step B)
+## 3. Runtime message flow — the staged queue (ADR 0001, Step B)
 
 The message store **is** the queue: a transactional staged queue on SQLite (WAL) with a `stage`
 discriminator. The inbound is **ACKed on receipt** — once the raw message is durably committed to the
@@ -128,7 +231,7 @@ post-ACK failures are logged + dead-lettered (operators rely on disposition + Al
 
 ---
 
-## 3. Config wiring graph — Connections, Routers, Handlers
+## 4. Config wiring graph — Connections, Routers, Handlers
 
 The configuration is a **graph wired by name, authored as Python** — there is no enclosing "channel"
 object. An inbound Connection names a Router; the Router forwards to Handler(s) by name; each Handler

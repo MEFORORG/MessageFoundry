@@ -13,6 +13,7 @@ from messagefoundry.config.tls_policy import (
     APPROVED_KEX_GROUPS,
     _is_forward_secret,
     harden_kex_groups,
+    harden_verify_flags,
     validate_tls_ciphers,
 )
 
@@ -72,3 +73,29 @@ def test_harden_is_noop_without_set_groups() -> None:
 
 def test_approved_groups_are_ecdhe_curves() -> None:
     assert APPROVED_KEX_GROUPS.split(":") == ["X25519", "secp384r1", "secp256r1"]
+
+
+# --- harden_verify_flags -----------------------------------------------------------------------
+def test_harden_verify_flags_sets_strict() -> None:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    harden_verify_flags(ctx)
+    # VERIFY_X509_STRICT is ORed in so a presented chain must be RFC 5280-conformant (ASVS 12.1.4).
+    assert ctx.verify_flags & ssl.VERIFY_X509_STRICT
+
+
+def test_harden_verify_flags_is_idempotent() -> None:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    harden_verify_flags(ctx)
+    first = ctx.verify_flags
+    harden_verify_flags(ctx)  # ORing the same flag twice must not flip or clear anything
+    assert ctx.verify_flags == first
+    assert ctx.verify_flags & ssl.VERIFY_X509_STRICT
+
+
+def test_harden_verify_flags_preserves_existing_flags() -> None:
+    # The OR must add VERIFY_X509_STRICT without dropping flags a context already carries.
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    harden_verify_flags(ctx)
+    assert ctx.verify_flags & ssl.VERIFY_X509_PARTIAL_CHAIN
+    assert ctx.verify_flags & ssl.VERIFY_X509_STRICT

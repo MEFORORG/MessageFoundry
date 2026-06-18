@@ -7,6 +7,16 @@
 > plus 2 ungated dependencies — all fixed below). Shared across the parallel worktrees per
 > [`../WORKTREES.md`](../WORKTREES.md). This is a planning artifact, not a gate — update it as items land.
 
+> **✅ STATUS — ALL NOW/NEXT LANES LANDED (2026-06-17).** Every staffed lane shipped to `main`:
+> **Lane 1 parity** (#354 endpoint + store cession · #364 full tee parity tool — closes backlog #14) ·
+> **Lane 2 store-core** (#359 lockfree-reads RO-WAL pool · #361 + #363 cross-backend off-box audit-tee) ·
+> **Lane 3 security-posture** (#356 `require_mfa` enforcement · #357 off-box log forwarder + `__main__.py` SPDX) ·
+> **Lane 4 quickwins** (#347 · #348 · #349 · #351) · **Lane 5 licensing** (#350 — artifacts drafted; counsel review deferred to v0.2).
+> Plus coord: #346 (this plan) · #352 (backlog markers) · #353 (Dependabot → 0 vulns). What remains is
+> **on-trigger only** (`sec-842`/`sec-1214`/`wp14b`/`sec-accepted`, `16-eventlog`, `3-perkey`, `7-soap-source`,
+> `misc-tail`) plus #13 licensing/counsel review — **deferred to v0.2** (accepted risk 2026-06-17: `v0.1.0` ships on the drafted AGPL posture without counsel sign-off; see backlog #13). The lane
+> tables below are kept as the historical plan of record.
+
 ---
 
 ## 0. The two dominating objectives

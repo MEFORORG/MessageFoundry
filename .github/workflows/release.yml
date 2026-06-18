@@ -97,7 +97,14 @@ jobs:
       # the digests match either source). Runs on a tag push AND the workflow_dispatch dry-run, so the
       # attestation path is validated before the real tag. Verify a downloaded artifact with:
       #   gh attestation verify dist/<artifact> --repo MEFORORG/MessageFoundry
+      # GATED to PUBLIC repos: the GitHub attestation API (actions/attest-build-provenance) is "not
+      # available for user-owned private repositories" and FAILS there, aborting the job BEFORE the PyPI
+      # publish below. While this repo is private the step is SKIPPED (skip != fail, so the release
+      # proceeds); provenance is still covered by the Sigstore bundle (above) and the PyPI-side PEP 740
+      # attestations (publish step below). Auto-resumes if a release ever runs from the public mirror.
+      # `github.event.repository.private` is populated on the tag-push event.
       - name: Attest build provenance (SLSA) for sdist + wheel
+        if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: "dist/*.tar.gz, dist/*.whl"

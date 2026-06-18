@@ -87,7 +87,8 @@ Terminate TLS **in-process** via uvicorn, the self-contained default. Add to `Ap
 - `tls_cert_file: str | None`, `tls_key_file: str | None` (PEM paths; not secrets),
 - `tls_key_password` (**secret**, env `MEFOR_API_TLS_KEY_PASSWORD`, for an encrypted key),
 - `tls_min_version: str = "1.2"` (floor; 1.2+ per NIST 800-52r2),
-- optional `tls_ciphers`, `tls_client_ca_file` (future mTLS for the console).
+- optional `tls_ciphers`, `tls_client_ca_file` (server-side trust anchor that makes the API **require**
+  a client cert → `CERT_REQUIRED`; the console can now present one — see *Console* below). (12.3.5)
 
 Wire them into the single `uvicorn.run(...)` call ([__main__.py](../../messagefoundry/__main__.py)) as
 `ssl_certfile` / `ssl_keyfile` / `ssl_keyfile_password` / `ssl_version` / `ssl_ciphers`, **or** build an
@@ -101,7 +102,10 @@ Falls out for free:
   needs **no** change. (4.4.1)
 - **Console** — `EngineClient` already refuses plaintext `http` to a non-loopback host unless
   `--insecure` ([console/client.py](../../messagefoundry/console/client.py) `_assert_safe_transport`);
-  point it at `https://`/`wss://` for remote engines.
+  point it at `https://`/`wss://` for remote engines. For **mutual TLS** (12.3.5) it can now present a
+  client certificate via `--client-cert` / `--client-key` (threaded into `httpx.Client(cert=…)`), so
+  when the API sets `tls_client_ca_file` (→ `CERT_REQUIRED`) the console authenticates by certificate,
+  not only the bearer token. Opt-in; cert issuance/PKI is delegated to the deploying org.
 
 ### 2. WP-13b — MLLP-over-TLS
 
@@ -174,6 +178,35 @@ enterprise healthcare — the engine stays `http` on a restricted interface **be
   TLS, but only when `trusted_proxies` is set (so the engine knows a terminator is really in front).
 - Document the proxy↔uvicorn framing agreement (4.2.1) and explicit duplicate-query-parameter handling
   (HPP, 15.3.7).
+
+### Certificate revocation (12.1.4)
+
+TLS certificate **revocation** is delegated to the deploying organization's PKI rather than
+re-implemented in-engine. Python's stdlib `ssl` exposes **no** online revocation check (no built-in
+OCSP/CRL fetch), and hand-rolling an OCSP client is error-prone and adds an outbound network
+side-channel that fights the on-prem, offline-by-default posture (see *Context*). So the engine
+**attempts no stdlib OCSP/CRL fetch of its own**; revocation is enforced where it belongs:
+
+- **At the WP-15 reverse proxy / terminator** (the recommended exposed path): issue certs with
+  **OCSP-must-staple** and let the proxy (IIS / nginx / Caddy) staple a fresh OCSP response — the
+  standard, hardware-friendly place to do live revocation. The org PKI publishes the OCSP responder /
+  CRL distribution points.
+- **Via the OS trust store**: CA trust (and any platform CRL / AIA the OS itself consults) is managed
+  by the enterprise's certificate plumbing, not duplicated by the engine.
+- **What the engine *does* add** ([config/tls_policy.py](../../messagefoundry/config/tls_policy.py)
+  `harden_verify_flags`): it ORs `ssl.VERIFY_X509_STRICT` into every *verifying* TLS context it builds —
+  the API listener ([api/tls.py](../../messagefoundry/api/tls.py)) and the inbound / verifying-outbound
+  MLLP contexts ([transports/mllp.py](../../messagefoundry/transports/mllp.py)) — so a presented chain
+  must be RFC 5280-conformant, a precondition for any revocation metadata (AIA / CRL-DP) to be
+  trustworthy. This is **strict path validation, not revocation checking**, and it is deliberately
+  *skipped* on the opt-in `tls_verify=false` (`CERT_NONE`) MLLP path, where nothing is being validated.
+
+**Residual (accepted, documented).** The in-process (uvicorn) API-TLS and direct MLLP-over-TLS
+termination paths do **not** perform live, in-engine revocation — a revoked-but-unexpired cert is not
+rejected by the engine itself on those paths. Operators who require enforced revocation terminate at
+the WP-15 proxy with OCSP-must-staple, and/or pair short-lived (e.g. ACME-rotated) certs with the
+cert-expiry alerting flagged under *Consequences*. This is the honest 12.1.4 posture —
+**Pass-with-documented-residual**, not a claim of in-engine OCSP.
 
 ## Options considered
 

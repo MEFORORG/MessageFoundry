@@ -119,7 +119,7 @@ IDE are separate surfaces over the localhost API.
 | Federated SSO — OAuth 2.0 / OIDC / SAML (Entra) | ⏭️ | 0.2 — admin browser SSO + service-to-service OAuth2; a dedicated federated-SSO ADR precedes the build |
 | mTLS client/peer auth (console/IDE→API; MLLP partner) | ⏭️ | 0.2 — v0.1 native TLS is server-identity only |
 | SMART on FHIR | 🧭 | Later — OAuth2 authZ profile for FHIR REST; needs a FHIR transport first (none today) |
-| OWASP ASVS L3 posture | ✅ | Self-assessed against **Level 3** (345 reqs): **178 Pass / 20 Partial / 6 Fail / 141 N-A** (post-WP-L3-16 step-up + the WP-L3-10/18 L3-C/D free lifts, atop #289/#298/#301/#303/#276/#281; was 177/21/6/141 after the free lifts, 175/23/6/141 after L3-B, 155/40/9/141 at the re-target). The 6 Fails (MFA, off-box logs, + 4 L3-only) are deferred-by-design or off-loopback-conditional |
+| OWASP ASVS L3 posture | ✅ | Self-assessed against **Level 3** (345 reqs): **192 Pass / 20 Partial / 0 Fail / 133 N-A** (post-sec-offbox-log off-box log+audit forwarding #357/#363, which closed 16.4.3 + 16.2.4; was 187/21/4/133 after WP-L3-13 admin defense, 186/21/5/133 after WP-14 MFA, 178/20/6/141 after WP-L3-16 step-up, 155/40/9/141 at the re-target). 0 open Fails — the former three (4.1.5, 12.1.4, 13.3.3) are now built controls with documented residuals (4.1.5 opt-in detached-JWS outbound signing #378; 12.1.4 VERIFY_X509_STRICT chains + org-PKI-delegated revocation #376; 13.3.3 operator-activated KeyProvider HSM/KMS/Vault seam #377); MFA (6.3.3), admin defense (8.4.2) + off-box logs (16.4.3) are now built |
 
 ## 8. PHI / Compliance
 

@@ -41,6 +41,7 @@ from messagefoundry.config.models import (
     Destination,
     InternalErrorPolicy,
     OrderingMode,
+    OutboundSigning,
     RetryPolicy,
     Source,
 )
@@ -1372,11 +1373,17 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
 
 
 def _dest_config(oc: OutboundConnection, env_values: Mapping[str, Any]) -> Destination:
+    # Resolve env() first so any signing key/password ref is materialized here, then assemble the
+    # typed signing config (ASVS 4.1.5, ADR 0018) from the resolved sign_* settings. None = signing
+    # off (every existing outbound unchanged). The connector loads the key + mints the signature; this
+    # is the single choke point feeding start/check/dry-run, so a bad key fails loud at all three.
+    settings = resolve_env_settings(oc.spec.settings, env_values)
     return Destination(
         name=oc.name,
         type=oc.spec.type,
-        settings=resolve_env_settings(oc.spec.settings, env_values),
+        settings=settings,
         retry=oc.retry or RetryPolicy(),
+        sign=OutboundSigning.from_settings(settings),
     )
 
 

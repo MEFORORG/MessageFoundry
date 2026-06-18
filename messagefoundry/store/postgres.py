@@ -233,7 +233,8 @@ _SCHEMA: list[str] = [
         totp_secret          TEXT,
         totp_enabled         BOOLEAN NOT NULL DEFAULT FALSE,
         totp_enrolled_at     DOUBLE PRECISION,
-        totp_recovery_codes  TEXT
+        totp_recovery_codes  TEXT,
+        last_totp_step       INTEGER
     )""",
     """CREATE TABLE IF NOT EXISTS roles (
         id           TEXT PRIMARY KEY,
@@ -494,6 +495,7 @@ class PostgresStore:
             ("totp_enabled", "BOOLEAN NOT NULL DEFAULT FALSE"),
             ("totp_enrolled_at", "DOUBLE PRECISION"),
             ("totp_recovery_codes", "TEXT"),
+            ("last_totp_step", "INTEGER"),
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -2872,6 +2874,24 @@ class PostgresStore:
                     now,
                     user_id,
                 )
+                return True
+
+    async def consume_totp_step(self, user_id: str, step: int) -> bool:
+        """Atomically record ``step`` as the user's highest consumed TOTP time-step; ``True`` iff newly
+        consumed (strictly greater than any prior step). A code replayed inside its ±1-step verify
+        window resolves to a non-greater step and returns ``False`` — single-use per ASVS 6.5.1. The
+        ``SELECT ... FOR UPDATE`` + ``UPDATE`` run in one transaction (no cross-node double-spend)."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT last_totp_step FROM users WHERE id=$1 FOR UPDATE", user_id
+                )
+                if row is None:
+                    return False
+                last = row["last_totp_step"]
+                if last is not None and last >= step:
+                    return False  # already consumed (or an older step) — replay within the window
+                await conn.execute("UPDATE users SET last_totp_step=$1 WHERE id=$2", step, user_id)
                 return True
 
     async def set_user_disabled(

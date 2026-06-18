@@ -31,7 +31,7 @@ from hl7.containers import Component, Field, Repetition
 
 from messagefoundry.config.models import AckMode, ConnectorType, Destination, Source
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
-from messagefoundry.config.tls_policy import harden_kex_groups
+from messagefoundry.config.tls_policy import harden_kex_groups, harden_verify_flags
 from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.framing import MLLP_CODEC, FrameDecoder, FrameError
@@ -335,6 +335,7 @@ def _mllp_ssl_context(s: Mapping[str, Any], *, server: bool) -> ssl.SSLContext |
             ctx.load_verify_locations(cafile=ca)
             ctx.verify_mode = ssl.CERT_REQUIRED
         harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+        harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
         return ctx
     # Outbound (client): verify the server cert unless explicitly — and loudly — disabled.
     verify = bool(s.get("tls_verify", True))
@@ -357,6 +358,8 @@ def _mllp_ssl_context(s: Mapping[str, Any], *, server: bool) -> ssl.SSLContext |
     if cert:  # optional client identity for mTLS
         ctx.load_cert_chain(certfile=cert, keyfile=key)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
+        harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert
     return ctx
 
 

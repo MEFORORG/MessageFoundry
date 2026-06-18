@@ -188,8 +188,10 @@ installs use the pinned wheel. That migration already had to repurpose the built
 6. **Licensing → "config is a separate work" + commercial edition.** Adopt a written position that
    Routers/Handlers loaded via `--config` are a separate work (not a derivative of the AGPL engine), and
    route orgs wanting to modify+redistribute the engine itself to the planned dual-license/commercial
-   edition ([DUAL_LICENSING_PLAN.md](../DUAL_LICENSING_PLAN.md)). **Pending legal review before the
-   statement is published.** Config-repo hosting is per-adopter.
+   edition ([DUAL_LICENSING_PLAN.md](../DUAL_LICENSING_PLAN.md)). **Status 2026-06-17 (owner accepted-risk):**
+   the legal review is **deferred to v0.2** — `v0.1.0` ships publicly on the drafted AGPL-3.0-or-later +
+   `NOTICE`/`CLA`/`COMMERCIAL-LICENSE` posture **without** prior counsel sign-off (the original "pending legal
+   review before the statement is published" stance is superseded; see backlog #13). Config-repo hosting is per-adopter.
 7. **Container image → fast-follow.** An official image (byte-identical multi-instance rollout) lands
    after the env-name Blocker; not on the critical path for the model.
 8. **Deployment trust boundary → inside the adopter's private healthcare network.** Every instance runs

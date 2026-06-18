@@ -33,7 +33,13 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar
 
-from messagefoundry.config.settings import AlertRule, AlertSeverity, AlertsSettings
+from messagefoundry.config.settings import (
+    INSECURE_TLS_ESCAPE_ENV,
+    AlertRule,
+    AlertSeverity,
+    AlertsSettings,
+    insecure_tls_allowed,
+)
 
 __all__ = [
     "AlertTransport",
@@ -148,6 +154,26 @@ class WebhookTransport:
     def __init__(
         self, url: str, *, timeout: float = 10.0, allowed_hosts: tuple[str, ...] = ()
     ) -> None:
+        # Refuse a plaintext http:// webhook target unless the explicit dev escape is set: the alert
+        # POST otherwise crosses the network in cleartext (ASVS 12.2.1 — no insecure fallback). https
+        # is the only scheme accepted by default; http(s) remain the only schemes at all (see _post).
+        # Same refuse-unless-MEFOR_ALLOW_INSECURE_TLS pattern as LDAPS / SQL Server / MLLP — stricter
+        # than the credentialed-only http refusal on REST/SOAP, since a webhook has no PHI but should
+        # still never fall back to cleartext.
+        scheme = urllib.parse.urlsplit(url).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise ValueError(f"webhook url must be http or https, got scheme {scheme!r}")
+        if scheme == "http" and not insecure_tls_allowed():
+            raise ValueError(
+                f"webhook url {url!r} uses plaintext http; refused unless "
+                f"{INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only) — use https"
+            )
+        if scheme == "http":
+            log.warning(
+                "webhook target uses plaintext http; permitted only because %s is set "
+                "(cleartext, MITM-able — trusted-network/dev use only)",
+                INSECURE_TLS_ESCAPE_ENV,
+            )
         self.url = url
         self.timeout = timeout
         # Optional egress allowlist (lower-cased); empty = any host. SSRF defense-in-depth (1.3.6).

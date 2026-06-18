@@ -150,8 +150,26 @@ def test_dead_letter_replay_request_bounds_length() -> None:
 
 
 def test_webhook_rejects_non_http_scheme() -> None:
-    with pytest.raises(ValueError):
-        WebhookTransport("ftp://host/hook")._post({"type": "t", "connection": "c"})
+    # Non-http(s) schemes are refused at construction (urllib would otherwise honour file:/ftp:).
+    with pytest.raises(ValueError, match="must be http or https"):
+        WebhookTransport("ftp://host/hook")
+
+
+def test_webhook_rejects_plaintext_http_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ASVS 12.2.1: a plaintext http:// webhook target is refused at construction (no insecure
+    # fallback) unless the explicit MEFOR_ALLOW_INSECURE_TLS dev escape is set.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with pytest.raises(ValueError, match="plaintext http"):
+        WebhookTransport("http://hooks.example/x")
+
+
+def test_webhook_allows_plaintext_http_with_insecure_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With the explicit escape set, a plaintext target constructs (trusted-network dev only).
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    t = WebhookTransport("http://hooks.example/x")
+    assert t.url == "http://hooks.example/x"
 
 
 def test_webhook_rejects_host_outside_allowlist() -> None:

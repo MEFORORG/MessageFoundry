@@ -18,6 +18,10 @@ jobs:
   test:
     name: test (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    # Backstop for the intermittent py3.11 pytest wedge (BACKLOG #17): bound the leg's wall-clock so a
+    # hang fails in minutes, not the 6h default. The pytest-timeout watchdog (60s/test) should catch the
+    # culprit first; this is the belt-and-suspenders cap if the whole process deadlocks below pytest.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -66,6 +70,36 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: pytest -q
+
+  # BACKLOG #17 production-bug check. The intermittent py3.11 asyncio<->aiosqlite lost-wakeup hang has
+  # only ever surfaced under pytest (per-test event-loop churn + log-capture teardown are the suspected
+  # triggers). This job runs the store the way the engine does in PRODUCTION — one asyncio.run() loop,
+  # no pytest — and hammers aiosqlite with concurrent DB ops on py3.11. A clean pass is evidence the
+  # hang is a test-lifecycle artifact, not a product defect; a hang here (caught by the per-run
+  # `timeout`, exit 124) would be a real, pytest-free repro that flips it to a confirmed product bug.
+  py311-store-soak:
+    name: py3.11 store soak (BACKLOG #17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install project (base — no pytest, no console)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - name: Soak the aiosqlite store on one long-lived loop (5x)
+        run: |
+          for run in $(seq 1 5); do
+            echo "::group::soak run $run"
+            timeout 150 python scripts/soak/store_soak.py 64 300
+            echo "::endgroup::"
+          done
 
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
   # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise
@@ -555,14 +589,31 @@ jobs:
           $key  = Join-Path $certDir "client.key"
           cmd /c "openssl req -x509 -newkey rsa:2048 -keyout ""$key"" -out ""$cert"" -days 1 -subj /CN=mefor-smoke -passout pass:smoke-key-pass 2>nul"
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path $cert)) { throw "openssl failed to mint the smoke client cert" }
+          # `prod` is a PHI environment, so the engine FAIL-CLOSES at startup unless a store encryption
+          # key is set (PHI-at-rest must never be plaintext). Without one, `serve` refuses to start, NSSM
+          # throttles the crash-loop to SERVICE_PAUSED, and /health never comes up. Mint a throwaway AES
+          # key for the smoke — `gen-key` prints only the key (stdout, pipeable; no stderr to trip PS 5.1).
+          $storeKey = (& $exe gen-key).Trim()
+          if (-not $storeKey) { throw "messagefoundry gen-key produced no store encryption key" }
           # This smoke validates the Windows service + MLLP plumbing, not authentication (auth is
           # covered by the pytest suite: test_api_auth / test_console_auth). Run with auth disabled so
           # the /messages call below needs no bearer token, and supply the registry endpoint's secrets
           # (cert/key/password + WS-Security creds) so the SOAP feed wires — placeholders, never used
           # since no VXU is sent; the non-secret endpoints live in environments/prod.toml (selected by
           # the -Environment prod passed to install-service.ps1 above).
+          # `prod` also FAIL-CLOSES on unrestricted egress (a transform could send PHI anywhere): lock it
+          # down (deny_by_default) AND allowlist the samples/config graph's 6 outbound destinations, or the
+          # engine refuses to start at wiring. [egress] is SERVICE settings (MEFOR_EGRESS_*), NOT an
+          # environments/<env>.toml value; lists are comma-separated host:port matching the resolved
+          # prod.toml endpoints (MLLP->allowed_mllp; X12->allowed_tcp; SOAP->allowed_http; File->allowed_file_dirs).
           nssm set MessageFoundry AppEnvironmentExtra `
             "MEFOR_AUTH_ENABLED=false" `
+            "MEFOR_STORE_ENCRYPTION_KEY=$storeKey" `
+            "MEFOR_EGRESS_DENY_BY_DEFAULT=true" `
+            "MEFOR_EGRESS_ALLOWED_MLLP=receiver-prod.example.org:6661" `
+            "MEFOR_EGRESS_ALLOWED_TCP=payer-prod.example.org:6662,rte-prod.example.org:6663,rte-result-prod.example.org:6664" `
+            "MEFOR_EGRESS_ALLOWED_HTTP=iis-prod.example.org:8443" `
+            "MEFOR_EGRESS_ALLOWED_FILE_DIRS=out" `
             "MEFOR_VALUE_REGISTRY_CLIENT_CERT=$cert" `
             "MEFOR_VALUE_REGISTRY_CLIENT_KEY=$key" `
             "MEFOR_VALUE_REGISTRY_KEY_PASSWORD=smoke-key-pass" `

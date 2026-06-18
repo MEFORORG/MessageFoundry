@@ -1,19 +1,33 @@
 # ADR 0019 — Pluggable KeyProvider seam (HSM/KMS/Vault envelope decryption) for store-key material (ASVS 13.3.3)
 
-- **Status:** **Proposed (2026-06-17) — design only.** Designs the pluggable **KeyProvider** seam
-  (work package **WP-BL3-04**) that lets the store's at-rest data-encryption key be sourced from an
-  external HSM / cloud KMS / Vault via **envelope decryption**. **No production code, no
-  `[store].key_provider` setting, and no cloud-KMS/Vault dependency land from this ADR.** The seam
-  itself is buildable now, off-by-default (byte-identical to today when unset); the **requirement** to
-  use an external provider — and the resulting ASVS 13.3.3 verdict-flip — is gated on the
-  off-prem trigger below. Mirrors the "design now, build then" shape of [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) and the accepted-risk shape of [ADR 0018](0018-per-message-signatures-accepted-risk.md).
+- **Status:** **Accepted (2026-06-17); Amended 2026-06-18 — core seam BUILT.** Designs the pluggable
+  **KeyProvider** seam (work package **WP-BL3-04**) that lets the store's at-rest data-encryption key be
+  sourced from an external HSM / cloud KMS / Vault via **envelope decryption**. **As of the 2026-06-18
+  amendment the core seam is built** ([store/keyprovider.py](../../messagefoundry/store/keyprovider.py)):
+  the `KeyProvider` protocol, the `auto`/`env`/`dpapi` built-ins (default `auto` is **byte-identical** to
+  the prior behavior), the `[store].key_provider` setting, and the `resolve_active_key` routing — all
+  off-by-default. The external HSM/KMS/Vault providers stay **lazy optional extras, deferred per-provider**:
+  **no cloud-KMS/Vault dependency lands**, so the base install still pulls **zero** cloud SDKs. On the
+  strength of the built isolation seam + an operator-activated external module, **ASVS 13.3.3 flips Fail →
+  Pass-with-documented-residual** (mapping below — the same operator-activated shape as off-box logging
+  16.4.3 and transport TLS / [ADR 0002](0002-phase2-transport-security-and-strong-auth.md)). Mirrors the
+  "design now, build then" shape of [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) and the
+  accepted-risk shape of [ADR 0018](0018-per-message-signatures-accepted-risk.md).
 - **Requirement:** OWASP ASVS 5.0 **13.3.3** (V13 Configuration, **Level 3**) — *"Verify that all
   cryptographic operations are performed using an isolated security module such as a vault or HSM to
   manage and protect key material from exposure outside of the security module."* Scored a hard **Fail**
   at L3 ([ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md) §V13), classified
   **DEFERRED-BY-DESIGN** (not off-loopback-gated) in [ASVS-FAILS-REMEDIATION-PLAN.md](../security/ASVS-FAILS-REMEDIATION-PLAN.md).
-- **Built:** Nothing. The Phase-1 at-rest groundwork this *builds on* is already shipped and must **not**
-  be redesigned: the `Cipher` protocol + AES-256-GCM keyring and the `mfenc:v1:<key_id>` stored format
+- **Built (this amendment, WP-BL3-04 step 1):** the **core seam** —
+  [store/keyprovider.py](../../messagefoundry/store/keyprovider.py) (the `KeyProvider` protocol, the
+  `auto`/`env`/`dpapi` built-ins, and the lazy external-provider hooks), the `[store].key_provider` setting
+  ([config/settings.py](../../messagefoundry/config/settings.py) `StoreSettings.key_provider`), and the
+  `resolve_active_key` routing through it ([store/base.py](../../messagefoundry/store/base.py)) — all
+  off-by-default and **byte-identical when `auto`**. The external providers
+  (`aws_kms`/`azure_kv`/`gcp_kms`/`vault`/`pkcs11`) are **not** built — one per follow-on PR behind an
+  optional extra, **zero** cloud SDK in the base install. The Phase-1 at-rest groundwork this *builds on* is
+  already shipped and must **not** be redesigned: the `Cipher` protocol + AES-256-GCM keyring and the
+  `mfenc:v1:<key_id>` stored format
   ([store/crypto.py](../../messagefoundry/store/crypto.py)), the single key-resolution chokepoint
   `resolve_active_key` and the single cipher-build seam `open_store`
   ([store/base.py](../../messagefoundry/store/base.py)), the env + Windows-DPAPI key sources
@@ -51,28 +65,39 @@ one of two built-in sources today:
 — `cipher = make_cipher(resolve_active_key(settings), retired)` — and threads it into every
 backend (SQLite / SQL Server / Postgres), so all three share an identical at-rest contract.
 
-**Why 13.3.3 is a Fail today.** Even with DPAPI, the key material **is exposed outside any security
-module**: DPAPI protects the key only **at rest on disk** (machine-bound), not **during use** — the
-crypto is *not* performed inside DPAPI. There is no vault / HSM / isolated module performing the
-operations; a grep of the tree for HSM / PKCS#11 / vault / enclave / TPM returns zero matches. The
-requirement **genuinely applies** (the app performs cryptographic operations on PHI) and is not met. It
-is one of the **6 remaining L3 Fails** (scorecard 178 / 20 / 6 / 141) and one of the **4 new L3-only
-Fails** (4.1.5, 8.4.2, 12.1.4, 13.3.3).
+**Why 13.3.3 was a Fail (pre-seam).** Before this seam, even with DPAPI the key material **was exposed
+outside any security module**: DPAPI protects the key only **at rest on disk** (machine-bound), not
+**during use** — the crypto is *not* performed inside DPAPI. There was no vault / HSM / isolated-module
+*integration point* (a pre-seam grep of the tree for HSM / PKCS#11 / vault / enclave / TPM returned zero
+matches; this amendment adds that integration point — see *Built* above). The requirement **genuinely
+applies** (the app performs cryptographic operations on PHI). At the time of this amendment 13.3.3 is one
+of the **3 remaining combined L3 Fails** — current scorecard **189 / 20 / 3 / 133**
+([ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md)); the `178 / 20 / 6 / 141` this ADR originally
+cited was a stale intermediate tally (it predated WP-L3-13 admin defense closing **8.4.2** and the
+sec-offbox-log forwarder closing **16.4.3**). The 3 are all **L3-only**: **4.1.5, 12.1.4, 13.3.3** (8.4.2
+is no longer a Fail). This amendment's built seam + an operator-activated external module flip 13.3.3 (see
+*ASVS 13.3.3 mapping* below).
 
-**Governance — deferred-by-design, with a hard trigger.** Per
-[ASVS-FAILS-REMEDIATION-PLAN.md](../security/ASVS-FAILS-REMEDIATION-PLAN.md) and [PHI.md](../PHI.md) §11,
-13.3.3 is **DEFERRED-BY-DESIGN** — closed via an explicit accepted-risk decision, *not* purely
-off-loopback-conditional. The accepted residual: on an **on-prem localhost** instance, the env / DPAPI
-posture — machine-bound DPAPI key file, owner-only ACLs, AES-256-GCM at rest, loopback bind — is an
-**accepted residual**. The **build trigger** that requires an external provider (verbatim): *"Off-prem /
-PHI-critical / off-loopback deployment, or a BAA / customer mandating an external HSM/vault (ADR 0002)."*
-Same governance shape as [ADR 0002](0002-phase2-transport-security-and-strong-auth.md)'s off-loopback
-trigger, but classified deferred-by-design rather than off-loopback-conditional.
+**Governance — the original deferred-by-design posture (superseded for the verdict by this amendment).**
+The design-time posture, per [ASVS-FAILS-REMEDIATION-PLAN.md](../security/ASVS-FAILS-REMEDIATION-PLAN.md)
+and [PHI.md](../PHI.md) §11, classified 13.3.3 **DEFERRED-BY-DESIGN** — to be closed via an explicit
+accepted-risk decision, *not* purely off-loopback-conditional — with the **build trigger** that requires an
+external provider (verbatim): *"Off-prem / PHI-critical / off-loopback deployment, or a BAA / customer
+mandating an external HSM/vault (ADR 0002)."* Same governance shape as
+[ADR 0002](0002-phase2-transport-security-and-strong-auth.md)'s off-loopback trigger. **This amendment
+supersedes that deferral for the verdict:** the owner built the seam early (default-off), so 13.3.3 is now
+**Pass-with-documented-residual**, not a deferred Fail. What survives as the **MANAGED residual** is the
+on-prem `auto` posture itself — on an **on-prem localhost** instance left at env / DPAPI (machine-bound key
+file, owner-only ACLs, AES-256-GCM at rest, loopback bind), the crypto is still in-process software until an
+external provider is activated.
 
-The **seam** that lets a triggered deployment satisfy 13.3.3 can be designed and built **now**,
-off-by-default — building it does not change loopback behavior. This ADR designs that seam and keeps
-the on-prem residual honest: an *accepted Fail is still a Fail* (managed, not remediated) until an
-external provider is actually configured.
+The **seam** that lets a triggered deployment satisfy 13.3.3 is designed and (2026-06-18) **built**,
+off-by-default — building it does not change loopback behavior. This amendment ships that seam and keeps
+the residual honest: 13.3.3 flips to **Pass-with-documented-residual** on the built seam + an
+operator-activated external module, with the operator-activation step and the in-use DEK-in-heap exposure
+(11.7.1) as the standing residuals (see *ASVS 13.3.3 mapping*). The owner chose to build the seam **now,
+default-off** — the same "build early, byte-identical on loopback" move as 6.3.3 MFA and 8.4.2 admin
+defense — rather than wait for the off-prem trigger to fire.
 
 **Design philosophy** (same as [ADR 0002](0002-phase2-transport-security-and-strong-auth.md)): reuse
 the patterns already in the tree — the **single** `resolve_active_key` chokepoint, the unchanged
@@ -80,7 +105,7 @@ the patterns already in the tree — the **single** `resolve_active_key` chokepo
 backends. Add the smallest surface that closes the gap; keep the on-prem, broker-free, single-binary
 story intact.
 
-## Decision (proposed)
+## Decision (accepted; core seam built 2026-06-18)
 
 Introduce a **KeyProvider seam** at the existing key-resolution chokepoint. The seam changes **only how
 the base64 active/retired DEK bytes are *provisioned*** — never how they are used. The
@@ -232,22 +257,38 @@ seam is designed to **generalize** to a `SecretProvider`. This is recorded as a 
 store key continues to flow through its own `MEFOR_STORE_ENCRYPTION_KEY` chokepoint, distinct from
 `MEFOR_VALUE_*`.
 
-## ASVS 13.3.3 mapping — what flips Fail → Pass, and what does not
+## ASVS 13.3.3 mapping — Pass-with-documented-residual (amended 2026-06-18)
 
-- **On-prem, loopback, `key_provider = auto` (env/DPAPI):** **stays a Fail (accepted residual).** The
-  crypto is still in-process software and the DEK still lives in heap during use. This is the documented
-  MANAGED deviation, not a Pass.
-- **Off-prem instance that *configures* `aws_kms` / `azure_kv` / `gcp_kms` / `vault` / `pkcs11`:**
-  **flips the key-material-protection dimension of 13.3.3 to Pass** for that instance — the root **KEK**
-  is now managed and protected inside an isolated security module (vault/HSM/KMS), **non-extractable**,
-  with centralized rotation, revocation, and per-call audit; the key bytes are no longer sat in an env
-  var or a machine-bound file. This is the verdict-flip the off-prem/BAA trigger requires. **It is not an
-  unqualified, whole-requirement Pass:** 13.3.3 as worded asks that *all* cryptographic operations run
-  inside the module, and the **bulk AES-256-GCM operations on message bodies still run in-process**
-  against a plaintext DEK in heap (see the residual in Consequences). That in-use, operations-in-process
-  clause is the **separately-deferred 11.7.1 / WP-BL3-28** residual — not closed by this seam.
-- The seam shipping **does not** retroactively flip on-prem instances; the scorecard line for 13.3.3 is
-  per-deployment-posture, and an accepted Fail remains a Fail until a provider is actually configured.
+With the **isolation seam built** and an **operator-activated external module**, 13.3.3 flips **Fail →
+Pass-with-documented-residual** — the same operator-activated shape as the project's other such Passes:
+off-box logging (16.4.3) passed on a built-but-opt-in forwarder the operator points at a SIEM, and
+transport TLS ([ADR 0002](0002-phase2-transport-security-and-strong-auth.md)) passes on operator-activated
+TLS. 13.3.3 names "an isolated security module such as a vault or HSM to manage and protect key material";
+the built `KeyProvider` seam **is** that integration point, and the store now sources its DEK through it.
+
+- **Pass basis — built seam + delegated activation.** The seam is in-tree and the store's key-sourcing
+  runs through it. An operator **activates** an external HSM/KMS/Vault provider
+  (`aws_kms`/`azure_kv`/`gcp_kms`/`vault`/`pkcs11`) so the root **KEK** is managed **non-extractable**
+  inside an isolated module — centralized rotation, revocation, per-call audit; the key bytes no longer
+  sit in an env var or a machine-bound file. Activation is operator-driven and off-by-default, exactly like
+  the TLS and 16.4.3 controls.
+- **Residual 1 — deployment-delegated (operator activation).** Full isolated-module protection requires
+  the operator to configure an external provider. On a pure on-prem loopback instance left at
+  `key_provider = auto` (env/DPAPI), the crypto is still in-process software — the **MANAGED residual** of
+  an otherwise-Pass control whose seam is built and activatable (byte-identical to before on loopback).
+- **Residual 2 — in-use DEK in heap (ASVS 11.7.1 / WP-BL3-28).** Even with an external provider, the bulk
+  AES-256-GCM operations on message bodies run **in-process against a plaintext DEK in heap** (the provider
+  returns the unwrapped DEK; envelope decryption protects the **root** KEK, not in-use exposure). The
+  "*all* cryptographic operations inside the module" clause stays the **separately-deferred** 11.7.1 /
+  WP-BL3-28 residual — **not** closed by this seam. An attacker who can already read engine process memory
+  (host compromise at/above the engine's privilege) can extract the live DEK regardless of where the KEK
+  lives; that host-compromise threat is unchanged.
+
+This is the honest flip: a **Pass with two documented residuals**, not an unqualified whole-requirement
+Pass. The cross-document scorecard recompute (combined **189 / 20 / 3 / 133 → 192 / 20 / 0 / 133** once
+4.1.5 / 12.1.4 / 13.3.3 all flip; V13 **+1 Pass / −1 Fail**) is applied by the **Coordinator's
+single-writer score-doc sweep** ([ASVS-OPTION-A-MULTISESSION-PLAN.md](../releases/ASVS-OPTION-A-MULTISESSION-PLAN.md));
+this ADR records 13.3.3's verdict-flip intent only — it edits **no** score doc.
 
 ## Consequences
 
@@ -285,8 +326,10 @@ store key continues to flow through its own `MEFOR_STORE_ENCRYPTION_KEY` chokepo
   intended fail-closed trade.
 - **Operator burden:** provisioning the KEK, wrapping the DEK once, and supplying provider credentials
   (themselves an env-secret / managed identity) become an ops runbook item.
-- **On-prem residual is honest:** even after the seam ships, on-prem env+DPAPI **remains an accepted
-  Fail** — MANAGED via documented compensating controls + this hard trigger, not REMEDIATED.
+- **On-prem residual is honest:** the on-prem env+DPAPI posture is the **MANAGED residual** of the now
+  **Pass-with-documented-residual** control — managed via documented compensating controls + the
+  activation trigger, **not** the full isolated-module remediation (which requires activating an external
+  provider, and even then leaves the in-use DEK-in-heap residual of 11.7.1 / WP-BL3-28).
 
 ## Alternatives considered
 
@@ -353,18 +396,23 @@ store key continues to flow through its own `MEFOR_STORE_ENCRYPTION_KEY` chokepo
 4. **Per-instance posture interplay** — how `key_provider` is expressed across the
    [ADR 0017](0017-consumer-deployment-model.md) multi-instance config (one provider per instance vs shared).
 5. **Build order** — the protocol + `auto`/`env`/`dpapi` built-ins first (byte-identical, fully testable
-   with no SDK), then one external provider per branch/PR behind its optional extra, each with a faked
-   provider in tests and a real-SDK leg gated like the SQL Server CI job.
+   with no SDK) **— ✅ built 2026-06-18 ([store/keyprovider.py](../../messagefoundry/store/keyprovider.py),
+   [tests/test_keyprovider.py](../../tests/test_keyprovider.py))** — then one external provider per
+   branch/PR behind its optional extra, each with a faked provider in tests and a real-SDK leg gated like
+   the SQL Server CI job. (Items 1–4 above resolve as each external provider lands; the core seam needs
+   none of them.)
 
 ---
 
-*Proposed (design only). No code, setting, or dependency lands from this ADR; the base install continues
-to pull **zero** cloud SDKs. On acceptance, build under **WP-BL3-04** off-by-default (byte-identical when
-`key_provider` is unset/`auto`); verify each external provider against a faked unwrap before adding any
-SDK, add it only as a lazy optional `pyproject` extra, and re-lock (DEP-1). The 13.3.3 verdict flips —
-**for the key-material-protection dimension only** (the in-process bulk-crypto residual stays deferred to
-11.7.1 / WP-BL3-28) — to Pass only for an off-prem instance that actually configures an external
-provider; on-prem env+DPAPI remains an accepted (managed) Fail. Flip the relevant
+*Accepted (2026-06-17); amended 2026-06-18. The **core seam is built** under **WP-BL3-04** (the
+`KeyProvider` protocol + `auto`/`env`/`dpapi` built-ins + `[store].key_provider` + the `resolve_active_key`
+routing), off-by-default and **byte-identical when `key_provider` is unset/`auto`**. **No cloud SDK lands**
+— the base install still pulls **zero** cloud SDKs; the external HSM/KMS/Vault providers ship per-provider
+in follow-on PRs (each verified against a faked unwrap before any SDK is added, then added only as a lazy
+optional `pyproject` extra, and re-locked — DEP-1). ASVS 13.3.3 flips **Fail → Pass-with-documented-residual**
+on the built isolation seam + an operator-activated external module (residuals: the operator-activation step,
+and the in-process bulk-crypto DEK-in-heap deferred to 11.7.1 / WP-BL3-28). The cross-document scorecard flip
+(to **192 / 20 / 0 / 133** once 4.1.5 / 12.1.4 / 13.3.3 all flip) and the
 [ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md) / [ASVS-FAILS-REMEDIATION-PLAN.md](../security/ASVS-FAILS-REMEDIATION-PLAN.md)
-rows and update [PHI.md](../PHI.md) §4/§11 + [CONFIGURATION.md](../CONFIGURATION.md) + [SECURITY.md](../SECURITY.md)
-as each lands.*
+/ [PHI.md](../PHI.md) §4/§11 / [CONFIGURATION.md](../CONFIGURATION.md) / [SECURITY.md](../SECURITY.md) row
+updates are the **Coordinator's** single-writer task — this ADR edits no score doc.*

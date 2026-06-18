@@ -54,7 +54,12 @@ from messagefoundry.transports.base import (
     register_destination,
     register_source,
 )
-from messagefoundry.transports.file import DEFAULT_MAX_FILE_BYTES, render_filename
+from messagefoundry.transports.file import (
+    DEFAULT_MAX_FILE_BYTES,
+    ScanRejected,
+    render_filename,
+    scan_inbound_file,
+)
 
 __all__ = ["RemoteFileDestination", "RemoteFileSource"]
 
@@ -608,6 +613,20 @@ class RemoteFileSource(SourceConnector):
                 logger.warning(
                     "REMOTEFILE could not retrieve %s (will retry next poll): %s", name, exc
                 )
+                continue
+            try:
+                await asyncio.to_thread(scan_inbound_file, raw, name)
+            except ScanRejected as exc:
+                # A configured pre-ingest scanner (AV/ICAP/plugin) rejected the content before it
+                # entered the pipeline (ASVS 5.4.3) — the control that matters most for a remote /
+                # less-trusted drop source. Quarantine + log; like the oversize reject above it never
+                # became a "received message", so there's no store disposition.
+                logger.warning(
+                    "REMOTEFILE file %s rejected by the pre-ingest scan hook (%s); routing to error dir",
+                    name,
+                    exc,
+                )
+                await self._move(path, self._error_dir, name)
                 continue
             try:
                 await self._handler(raw)

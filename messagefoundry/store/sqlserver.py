@@ -148,7 +148,7 @@ _SCHEMA: list[str] = [
         failed_attempts INT NOT NULL DEFAULT 0, locked_until FLOAT NULL,
         channel_scope NVARCHAR(MAX) NULL, totp_secret NVARCHAR(MAX) NULL,
         totp_enabled BIT NOT NULL DEFAULT 0, totp_enrolled_at FLOAT NULL,
-        totp_recovery_codes NVARCHAR(MAX) NULL)""",
+        totp_recovery_codes NVARCHAR(MAX) NULL, last_totp_step INT NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -160,6 +160,9 @@ _SCHEMA: list[str] = [
         ALTER TABLE users ADD totp_enrolled_at FLOAT NULL""",
     """IF COL_LENGTH('users','totp_recovery_codes') IS NULL
         ALTER TABLE users ADD totp_recovery_codes NVARCHAR(MAX) NULL""",
+    # Single-use TOTP within the step window (ASVS 6.5.1): highest consumed time-step.
+    """IF COL_LENGTH('users','last_totp_step') IS NULL
+        ALTER TABLE users ADD last_totp_step INT NULL""",
     """IF OBJECT_ID('roles','U') IS NULL CREATE TABLE roles (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, display_name NVARCHAR(128) NOT NULL,
         description NVARCHAR(512) NULL, builtin BIT NOT NULL DEFAULT 1)""",
@@ -2572,6 +2575,33 @@ class SqlServerStore:
                     "UPDATE users SET totp_recovery_codes=?, updated_at=? WHERE id=?",
                     (json.dumps(hashes), now, user_id),
                 )
+                await conn.commit()
+                return True
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def consume_totp_step(self, user_id: str, step: int) -> bool:
+        """Atomically record ``step`` as the user's highest consumed TOTP time-step; ``True`` iff newly
+        consumed (strictly greater than any prior step). A code replayed inside its ±1-step verify
+        window resolves to a non-greater step and returns ``False`` — single-use per ASVS 6.5.1. The
+        ``UPDLOCK`` SELECT + UPDATE run in one transaction so concurrent verifications can't both win."""
+        async with self._acquire() as conn:
+            cur = await conn.cursor()
+            try:
+                await cur.execute(
+                    "SELECT last_totp_step FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                    (user_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    await conn.commit()
+                    return False
+                last = row[0]
+                if last is not None and last >= step:
+                    await conn.commit()
+                    return False  # already consumed (or an older step) — replay within the window
+                await cur.execute("UPDATE users SET last_totp_step=? WHERE id=?", (step, user_id))
                 await conn.commit()
                 return True
             except Exception:

@@ -895,6 +895,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
     from messagefoundry.store.base import open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.keyprovider import KeyProviderError
 
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
@@ -907,7 +908,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
 
     try:
         active_key = resolve_active_key(settings.store)
-    except (DpapiError, DpapiUnavailable) as exc:
+    except (DpapiError, DpapiUnavailable, KeyProviderError) as exc:
+        # KeyProviderError: a non-default [store].key_provider that is unknown or not-yet-built (an
+        # external HSM/KMS/Vault provider) — fail closed with a clean exit-2, not a traceback (ADR 0019).
         print(f"error: cannot load the active key for rotation: {exc}", file=sys.stderr)
         return 2
     if not active_key:

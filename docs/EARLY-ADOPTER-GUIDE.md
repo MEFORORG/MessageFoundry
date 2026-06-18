@@ -157,11 +157,11 @@ pip install "messagefoundry==0.1.0"        # pin the exact engine version (core 
 `messagefoundry==0.1.0` pulls only the **core runtime** — what a headless engine needs. Add extras
 (§4.2) for the desktop console, a server-DB backend, or SFTP.
 
-> ⚠️ **Early access — pre-release on PyPI.** MessageFoundry's first **pre-release** (`0.1.0rc1`) is
-> published on public PyPI, so `pip install --pre messagefoundry` (or `pip install
-> messagefoundry==0.1.0rc1`) resolves today. The exact-pin command above (`==0.1.0`) is the shape your
-> install takes once the **final** `0.1.0` is tagged. You can equally install from the engine's **GitHub
-> Release assets** or your organization's **private index**.
+> ⚠️ **Early access.** `0.1.0` is an **Early Access** release on public PyPI — feature-complete and
+> test-validated, but the external review + pen test that gate a security-certified **v1.0** land after
+> launch. The exact-pin command above (`==0.1.0`) resolves today; the earlier `0.1.0rc1` pre-release also
+> remains installable. You can equally install from the engine's **GitHub Release assets** or your
+> organization's **private index**.
 
 **Verify the release before you install.** MessageFoundry ships one signed wheel to many PHI-bearing
 instances, so verify the artifact's provenance *before* installing — pinning a version (or a hash) proves

@@ -396,6 +396,14 @@ drop source, front it with an AV/ICAP scan or a staging gateway *before* files l
 directory, and lock the directory's ACLs down to the engine's service account + the upstream producer
 (see [SERVICE.md](SERVICE.md)).
 
+For an **in-process** scan, the engine exposes a **pre-ingest scan-hook seam**: an operator/plugin calls
+`messagefoundry.transports.file.set_scan_hook(hook)` to install a scanner that runs over the raw bytes of
+**every** inbound file — both the local `File(...)` source and the remote `Sftp(...)`/`Ftp(...)` source —
+*before* they enter the pipeline. The hook raises `ScanRejected` to reject content, which the connector
+then quarantines to `.error` and never emits. The seam is **off by default** (no-op) and format-agnostic
+(it sees raw bytes, so it works for HL7, X12, or any payload); it is the integration point for an
+in-process AV/ICAP/YARA scanner, complementing — not replacing — the gateway-fronting above.
+
 ### REST — `Rest(...)`
 
 An **outbound** HTTP(S) client ([ADR 0003](adr/0003-non-hl7-transports-database-rest-soap.md)). The

@@ -131,7 +131,25 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    the row is dead-lettered, never crashes a worker.
    **Fail-closed/warn:** `serve` warns loudly when no key is set in a `prod` environment, and **refuses
    to start** when `[store].require_encryption = true` and no key is configured.
-3. **Required volume encryption.** App-level AEAD **cannot** encrypt the `-wal`/`-shm`/temp files or
+3. **Pluggable key sourcing — the KeyProvider seam `[BUILT]` (ASVS 13.3.3; ADR 0019 amended 2026-06-18,
+   PR #377).** Where the DEK *comes from* is now routed through a pluggable **KeyProvider** seam
+   ([store/keyprovider.py](../messagefoundry/store/keyprovider.py)) selected by the `[store].key_provider`
+   setting — built-in `auto`/`env`/`dpapi` (the default `auto` is **byte-identical** to the prior
+   env-then-DPAPI ladder above) plus lazy `aws_kms`/`azure_kv`/`gcp_kms`/`vault`/`pkcs11` hooks that
+   **envelope-decrypt** a wrapped DEK inside an **isolated security module** (HSM/KMS/Vault). The seam
+   changes only *how* the key bytes are provisioned, never how they are used — the AES-256-GCM keyring,
+   the `mfenc:v1` format, and `rotate-key` are unchanged. Selecting an unbuilt/unknown provider **fails
+   closed** (`KeyProviderError` → `serve` won't start), never silently to the identity (plaintext) cipher.
+   An operator **activates** an external module so the root **KEK** is managed **non-extractable** inside
+   it (centralized rotation/revocation/per-call audit; the key bytes no longer sit in an env var or a
+   machine-bound file). On the strength of this built seam + an operator-activated external module **ASVS
+   13.3.3 is Pass *(conditional, operator-activated)*** — the same operator-activated shape as off-box
+   logging (16.4.3) and transport TLS. **Residual:** on-prem `auto` (env/DPAPI) is the **managed residual**
+   — in-process software crypto until a provider is activated; and even with a provider the unwrapped DEK
+   lives in process heap during bulk AES-256-GCM, the separately-deferred **ASVS 11.7.1 / WP-BL3-28**
+   residual (see the in-use limitation below). The cloud/HSM SDKs are optional extras — the base install
+   pulls **zero** of them; external providers land per-provider in follow-on PRs.
+4. **Required volume encryption.** App-level AEAD **cannot** encrypt the `-wal`/`-shm`/temp files or
    the searchable `summary`/index columns. **BitLocker (Windows) / LUKS (Linux) on the data volume is
    a documented deployment prerequisite** to cover those at rest. App-level + volume together close
    both the "stolen file from a powered-off host" and the "live-host file copy" cases.
@@ -163,7 +181,10 @@ PHI is exposed for the **minimum window and surface** needed to route and transf
 **Honest limitation:** decrypted PHI is ordinary Python heap for the processing window and is **not
 zeroized after use** — CPython strings/bytes are immutable and not reliably wipeable, and full in-use
 memory encryption (ASVS 11.7.1) is a host/OS capability (Intel TME / AMD SEV / confidential VMs), not
-something an application library can provide. The compensating controls are the documented
+something an application library can provide. This in-use DEK-in-heap exposure is the standing
+**ASVS 11.7.1 / WP-BL3-28** residual that survives even when the KeyProvider seam (§3) is pointed at an
+external HSM/KMS/Vault — envelope decryption protects the **root KEK**, not the unwrapped DEK the bulk
+AES-256-GCM path holds in process. The compensating controls are the documented
 restricted-service-account + volume-encryption posture (§10) on a single-tenant host.
 
 ---
@@ -312,9 +333,10 @@ SIEM agent) or keep it on a trusted management network. **Availability:** the fo
 engine *indefinitely* — UDP is fire-and-forget; a TCP collector that is **unreachable at startup** is
 skipped with a warning, and one that **stalls at runtime** is bounded by a socket timeout (the record is
 dropped) so a wedged SIEM can't stall the asyncio event loop. The send is still synchronous, so for a
-high-volume feed prefer UDP or a local agent. **Still deferred:** tee-ing the tamper-evident
-**`audit_log`** itself through the logger (so audit events also ship off-box) is the **store-side**
-follow-on slice; structlog is not used (stdlib `logging` only).
+high-volume feed prefer UDP or a local agent. The tamper-evident **`audit_log`** is **also tee'd
+off-box** (sec-offbox-log #361/#363): every committed audit row is emitted as PHI-redacted metadata
+through the `messagefoundry.audit` logger to the same forwarder, across all three store backends
+([`store/audit_tee.py`](../messagefoundry/store/audit_tee.py)). **Not used:** structlog (stdlib `logging` only).
 
 ### Logging inventory (16.1.1 / 16.2.3)
 
@@ -425,8 +447,16 @@ traceability:
 - **`dryrun`/`generate` redact bodies by default; `--show-phi` to opt in** (§7) — was P0-2.
 - **`/docs` `/redoc` `/openapi.json` off by default (`[api] expose_docs`); non-loopback bind refused (unconditionally without auth; otherwise unless `serve --allow-insecure-bind` accepts the Phase-1 no-TLS cleartext risk)** (§10, [SECURITY.md](SECURITY.md)) — was P0-3.
 - **At-rest body encryption (AES-256-GCM) + required volume encryption** (§3) — was P1-1.
+- **Pluggable at-rest key sourcing — the KeyProvider seam** (`[store].key_provider`,
+  [store/keyprovider.py](../messagefoundry/store/keyprovider.py); §3) — built-in `auto`/`env`/`dpapi`
+  (default `auto` byte-identical to before) + lazy external HSM/KMS/Vault hooks that envelope-decrypt a
+  wrapped DEK inside an isolated module; fails closed on an unbuilt/unknown provider. Flips **ASVS 13.3.3
+  Fail → Pass *(conditional, operator-activated)*** on the built seam + an operator-activated external
+  module (ADR 0019 amended 2026-06-18, PR #377). Residuals: on-prem `auto` is the managed residual, and
+  the in-use DEK-in-heap is the separately-deferred ASVS 11.7.1 / WP-BL3-28. Cloud SDKs are optional
+  extras (zero in the base install); external providers land per-provider in follow-on PRs.
 - **Retention/purge enforcement — `[retention]` body-null (keep metadata) + dead-letter window + WAL/VACUUM, audited; `audit_days` reserved/keep-forever by design** (§8) — was P1-2.
-- **Exception-path PHI redaction — the `safe_exc()` chokepoint (`redaction.py`) at every exception→`last_error`/`detail`/log site** (§7) — the security half of P1-3 (WP-6c). Structlog/JSON + off-box forwarding remain deferred (below).
+- **Exception-path PHI redaction — the `safe_exc()` chokepoint (`redaction.py`) at every exception→`last_error`/`detail`/log site** (§7) — the security half of P1-3 (WP-6c). Structured-JSON logging + off-box (syslog/SIEM) forwarding + the cross-backend `audit_log` off-box tee are now **built** (sec-offbox-log #357/#361/#363; residual: native TLS-syslog).
 - **Outbound/egress allowlist — fail-closed `[egress]` (MLLP host:port + File dirs) enforced at config load/reload/start; webhook/SMTP host allowlists in `[alerts]`** (§4) — the data-plane half of P1-4 (WP-11c). MLLP-over-TLS remains deferred (Phase 2, off-loopback).
 
 P0-4 (doc corrections) is this reconciliation; remaining stale claims in ARCHITECTURE/README are a
@@ -435,7 +465,7 @@ separate follow-up.
 ### P1 — core safeguards (remaining)
 | Item | Closes | Maps to | Effort |
 |---|---|---|---|
-| **P1-3′** Structured (JSON) logging + off-box (syslog/SIEM) forwarding (§7) — `[conditional]`, bundles with P2-3 | Off-box log shipping / tamper-resistance | §164.312(b) · AU-9/AU-4 | M |
+| **P1-3′** Structured (JSON) logging + off-box (syslog/SIEM) forwarding (§7) — ✅ **Built (sec-offbox-log #357/#361/#363)**; residual: native TLS-syslog + default-off | Off-box log shipping / tamper-resistance | §164.312(b) · AU-9/AU-4 | M |
 | **P1-4′** MLLP-over-TLS (§4) — `[conditional]`, Phase 2 (the egress-allowlist half shipped — WP-11c, above) | Cleartext PHI on the wire | §164.312(e) Transmission · SC-8 (NIST 800-52r2) | L |
 
 ### P2 — remote / Phase-2 (deferrable while strictly localhost; each flips to mandatory on remote exposure)
@@ -460,7 +490,7 @@ prerequisite (encrypted, access-controlled backups) is the checklist item in
 
 Retention is enforced (`[retention]`, §8) but `audit_days` audit-log pruning is **reserved/keep-forever
 by design** (archive-first pruning is a follow-up) · the exception path is redacted (`safe_exc`, §7,
-WP-6c) but structured (JSON) logging + off-box forwarding are roadmap (bundled with P2-3) · the
+WP-6c); structured (JSON) logging + off-box (syslog/SIEM) forwarding + the cross-backend audit-tee are now **built** (sec-offbox-log #357/#361/#363; residual: native TLS-syslog) · the
 searchable `summary` column stays outside the encryption seam by design (volume encryption covers it;
 `error`/`last_error`/`detail` are now ciphered — WP-5) · a fail-closed outbound/egress allowlist is
 enforced (`[egress]`, WP-11c) but **MLLP is still plaintext** (MLLP-over-TLS is Phase 2) · no

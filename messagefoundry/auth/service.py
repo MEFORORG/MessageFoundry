@@ -1030,8 +1030,15 @@ class AuthService:
         if not code:
             return False
         secret = await self._store.get_totp_secret(user.id)
-        if secret and totp.verify_totp(secret, code):
-            return True
+        if secret:
+            matched_step = totp.verify_totp_step(secret, code)
+            if matched_step is not None:
+                # Single-use within the step window (ASVS 6.5.1): the store advances the user's
+                # highest-consumed time-step atomically, so a code captured and replayed inside its
+                # ~30 s verify window resolves to a non-greater step and is rejected. Mirrors the
+                # recovery-code compare-and-set; a genuine code always advances the step as time
+                # moves forward, so a legitimate later login is unaffected.
+                return await self._store.consume_totp_step(user.id, matched_step)
         normalized = code.upper()  # recovery codes are minted uppercase
         hashes = await self._store.get_recovery_code_hashes(user.id)
         for h in hashes:

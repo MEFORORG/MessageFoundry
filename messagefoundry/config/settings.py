@@ -168,6 +168,14 @@ class StoreSettings(_Section):
     # environment. This is a *path*, not a secret, so it may live in the config file. Windows-only;
     # the env key takes precedence. Empty = use `encryption_key` (the cross-platform default).
     encryption_key_file: str | None = None
+    # KeyProvider seam (ADR 0019, ASVS 13.3.3): selects HOW the active/retired DEK bytes are *sourced* —
+    # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the
+    # default) is the env-then-DPAPI ladder, BYTE-IDENTICAL to the pre-seam behavior; `env`/`dpapi` pin a
+    # single built-in source; `aws_kms`|`azure_kv`|`gcp_kms`|`vault`|`pkcs11` are external HSM/KMS/Vault
+    # envelope-decrypt providers (lazy, optional extras — not built yet, fail closed if selected). This
+    # names a *provider*, not key material, so it is NOT a secret — it must never be added to
+    # `_FILE_SECRET_KEYS`. Unknown/unresolvable values fail closed at `open_store` (store/keyprovider.py).
+    key_provider: str = "auto"
 
     # --- Server-DB backends (backend = "sqlserver" | "postgres") ------------
     # These connection fields are shared by every server-database backend. SQL Server consumes them

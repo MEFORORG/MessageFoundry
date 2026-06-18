@@ -46,6 +46,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/store.py": frozenset({"hashlib"}),
     "messagefoundry/transports/mllp.py": frozenset({"ssl"}),
     "messagefoundry/transports/rest.py": frozenset({"ssl"}),
+    "messagefoundry/transports/signing.py": frozenset({"cryptography"}),
     "messagefoundry/transports/soap.py": frozenset({"hashlib", "ssl"}),
 }
 

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Shared TLS key-exchange policy (ASVS 11.6.2, WP-L3-10 code half).
+"""Shared TLS hardening policy (ASVS 11.6.2 key exchange + 12.1.4 strict X.509, WP-L3-10 code half).
 
 Pure stdlib ``ssl`` helpers, importable by ``api/`` and ``transports/`` (and the ``config`` settings
-validator) without crossing the engine's one-way dependency boundaries. Two controls:
+validator) without crossing the engine's one-way dependency boundaries. Three controls:
 
 * :func:`validate_tls_ciphers` — reject an operator ``tls_ciphers`` string that would admit a
   non-forward-secret (non-ECDHE/DHE) key exchange, so a misconfiguration cannot widen the suite below
@@ -11,6 +11,10 @@ validator) without crossing the engine's one-way dependency boundaries. Two cont
 * :func:`harden_kex_groups` — pin the approved ECDHE groups on a built context where the runtime
   supports it (``SSLContext.set_groups``, Python 3.13+); on older interpreters OpenSSL already leads
   with these groups, so it is a best-effort no-op rather than a downgrade.
+* :func:`harden_verify_flags` — OR ``ssl.VERIFY_X509_STRICT`` into a verifying context's
+  ``verify_flags`` so a presented chain must be RFC 5280-conformant (ASVS 12.1.4 strict path
+  validation). Revocation itself is delegated to the org PKI / OCSP-must-staple proxy + OS trust store
+  (ADR 0002); the engine attempts no stdlib OCSP. Guarded like ``harden_kex_groups`` for old runtimes.
 """
 
 from __future__ import annotations
@@ -21,7 +25,12 @@ from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["APPROVED_KEX_GROUPS", "harden_kex_groups", "validate_tls_ciphers"]
+__all__ = [
+    "APPROVED_KEX_GROUPS",
+    "harden_kex_groups",
+    "harden_verify_flags",
+    "validate_tls_ciphers",
+]
 
 #: Approved forward-secret key-exchange groups in preference order (X25519 first). These are the modern
 #: NIST/FIPS-permitted ECDHE curves; the string is the OpenSSL group list passed to ``set_groups``.
@@ -45,6 +54,24 @@ def harden_kex_groups(ctx: ssl.SSLContext) -> None:
         ValueError,
     ) as exc:  # pragma: no cover - depends on the linked OpenSSL build
         logger.warning("Could not pin TLS key-exchange groups %r: %s", APPROVED_KEX_GROUPS, exc)
+
+
+def harden_verify_flags(ctx: ssl.SSLContext) -> None:
+    """Best-effort enable strict X.509 path validation on a *verifying* ``ctx`` (ASVS 12.1.4).
+
+    ORs ``ssl.VERIFY_X509_STRICT`` into ``ctx.verify_flags`` so a presented certificate chain must be
+    RFC 5280-conformant — no malformed/ambiguous fields from which revocation metadata (AIA / CRL-DP)
+    would otherwise be read. This is **strict validation, not revocation checking**: live revocation is
+    delegated to the deploying org's PKI — OCSP-must-staple at the WP-15 proxy plus the OS trust store —
+    because stdlib ``ssl`` exposes no OCSP/CRL fetch and the engine deliberately attempts none (ADR 0002).
+
+    Guarded like :func:`harden_kex_groups`: a runtime/OpenSSL build without ``VERIFY_X509_STRICT`` is a
+    deliberate no-op, not an error. Call it **only** on a context that actually verifies the peer (skip
+    the MLLP ``tls_verify=false`` / ``CERT_NONE`` path, where there is nothing to validate)."""
+    strict = getattr(ssl, "VERIFY_X509_STRICT", None)
+    if strict is None:  # pragma: no cover - depends on the linked OpenSSL build
+        return
+    ctx.verify_flags |= strict
 
 
 def validate_tls_ciphers(value: str) -> str:

@@ -546,7 +546,8 @@ CREATE TABLE IF NOT EXISTS users (
     totp_secret          TEXT,                 -- MFA (WP-14): base32 TOTP secret, store-cipher encrypted; NULL = none
     totp_enabled         INTEGER NOT NULL DEFAULT 0,  -- TOTP enrolled + confirmed active
     totp_enrolled_at     REAL,
-    totp_recovery_codes  TEXT                  -- JSON list of argon2id hashes of single-use recovery codes
+    totp_recovery_codes  TEXT,                 -- JSON list of argon2id hashes of single-use recovery codes
+    last_totp_step       INTEGER               -- highest TOTP time-step already consumed (single-use within window, ASVS 6.5.1); NULL = none yet
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -1085,6 +1086,7 @@ class MessageStore:
             ("totp_enabled", "INTEGER NOT NULL DEFAULT 0"),
             ("totp_enrolled_at", "REAL"),
             ("totp_recovery_codes", "TEXT"),
+            ("last_totp_step", "INTEGER"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -3122,6 +3124,25 @@ class MessageStore:
                 "UPDATE users SET totp_recovery_codes=?, updated_at=? WHERE id=?",
                 (json.dumps(hashes), now, user_id),
             )
+            await self._db.commit()
+            return True
+
+    async def consume_totp_step(self, user_id: str, step: int) -> bool:
+        """Atomically record ``step`` as the user's highest consumed TOTP time-step; return ``True``
+        iff it was newly consumed (strictly greater than any previously used step). A captured TOTP
+        code replayed inside its ±1-step verify window resolves to a step that is no longer greater
+        than the stored ``last_totp_step``, so this returns ``False`` — making each code single-use
+        (ASVS 6.5.1). The re-read + compare + write run under one ``self._lock``, so two concurrent
+        verifications of the same code can't both win."""
+        async with self._lock:
+            cur = await self._db.execute("SELECT last_totp_step FROM users WHERE id=?", (user_id,))
+            row = await cur.fetchone()
+            if row is None:
+                return False
+            last = row["last_totp_step"]
+            if last is not None and last >= step:
+                return False  # already consumed (or an older step) — replay within the window
+            await self._db.execute("UPDATE users SET last_totp_step=? WHERE id=?", (step, user_id))
             await self._db.commit()
             return True
 

@@ -286,6 +286,19 @@ class FileSource(SourceConnector):
                 await asyncio.to_thread(self._move, path, self.error_dir)
                 continue
             try:
+                await asyncio.to_thread(scan_inbound_file, raw, path.name)
+            except ScanRejected as exc:
+                # A configured pre-ingest scanner (AV/ICAP/plugin) rejected the content before it
+                # entered the pipeline (ASVS 5.4.3). Like the oversize / non-HL7 rejects above, it
+                # never became a "received message", so there's no store disposition; quarantine + log.
+                logger.warning(
+                    "file %s rejected by the pre-ingest scan hook (%s); routing to error dir",
+                    path.name,
+                    exc,
+                )
+                await asyncio.to_thread(self._move, path, self.error_dir)
+                continue
+            try:
                 await self._emit(raw)
             except Exception as exc:
                 # The handler records every message-level outcome (parse/validation/routing → ERROR)
@@ -441,6 +454,44 @@ def _looks_like_hl7(raw: bytes) -> bool:
     if head.startswith(b"\xef\xbb\xbf"):  # UTF-8 BOM
         head = head[3:].lstrip(b"\x0b\r\n \t")
     return head[:3] in _HL7_LEADING_SEGMENTS
+
+
+class ScanRejected(Exception):
+    """Raised by a pre-ingest scan hook to reject malicious/disallowed inbound file content (ASVS
+    5.4.3). The connector quarantines the file to its error dir and never emits it."""
+
+
+#: Pre-ingest content-scan hook: ``(raw_bytes, source_label) -> None``; raise :class:`ScanRejected`
+#: to reject. ``(bytes, str)`` so an operator scanner can label its logs. Default = no-op.
+ScanHook = Callable[[bytes, str], None]
+
+
+def _no_scan(raw: bytes, source: str) -> None:
+    return None
+
+
+_scan_hook: ScanHook = _no_scan
+
+
+def set_scan_hook(hook: ScanHook | None) -> None:
+    """Install (or clear, with ``None``) the pre-ingest content-scan hook (ASVS 5.4.3).
+
+    MessageFoundry ships **no** built-in antivirus/malware scan: the supported model trusts the drop
+    directory, and a less-trusted or remote source should be fronted by an AV/ICAP gateway (see
+    docs/CONNECTIONS.md). This seam lets an operator/plugin install an in-process scanner that runs over
+    the raw bytes of every inbound file — both the local FILE source and the remote SFTP/FTP(S) source —
+    *before* they enter the pipeline; it must raise :class:`ScanRejected` to reject content, which the
+    connector then quarantines to its error dir (never emitted). Format-agnostic (it sees raw bytes), so
+    it works for HL7, X12, or any payload."""
+    global _scan_hook
+    _scan_hook = hook or _no_scan
+
+
+def scan_inbound_file(raw: bytes, source: str) -> None:
+    """Run the configured pre-ingest scan hook over ``raw`` (default no-op); raise :class:`ScanRejected`
+    to reject — the caller quarantines and never emits. Run off the event loop (it may do blocking I/O
+    to an AV/ICAP service)."""
+    _scan_hook(raw, source)
 
 
 def _claim_unique(tmp: Path, target: Path) -> Path:

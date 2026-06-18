@@ -83,6 +83,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     refuse_cleartext_credentials,
 )
+from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
 __all__ = ["SoapDestination"]
 
@@ -277,6 +278,10 @@ class SoapDestination(DestinationConnector):
         self._headers = self._build_headers(s)
         enforce_outbound_length_limits(self.url, self._headers)
         refuse_cleartext_credentials(scheme, self._headers, self.url)
+        # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing of the outbound envelope. None = off
+        # (byte-identical). Built here so a bad key/algorithm fails loud at connector construction; the
+        # signature is minted in _post over the FINAL wire bytes (the WS-* wrapped envelope, ADR 0015).
+        self._signer: MessageSigner | None = signer_from_destination(config)
 
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
@@ -464,10 +469,18 @@ class SoapDestination(DestinationConnector):
             raise DeliveryError(f"SOAP {_redact_url(self.url)} failed: {exc}") from exc
 
     def _post(self, payload: str) -> tuple[str, int]:
+        # payload is the FINAL wire body (in WS-* mode send() already wrapped + stamped the envelope),
+        # so signing over these bytes covers exactly what the partner receives.
+        data = payload.encode(self.encoding)
+        headers = self._headers
+        if self._signer is not None:
+            # ASVS 4.1.5 (ADR 0018): detached JWS over the envelope, minted off-loop past the queue
+            # boundary so a retry re-mints it (re-run purity holds, like the WS-Security nonce).
+            headers = {**self._headers, **self._signer.signature_headers(data)}
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self.url,
-            data=payload.encode(self.encoding),
-            headers=self._headers,
+            data=data,
+            headers=headers,
             method="POST",
         )
         try:

@@ -14,10 +14,11 @@ touching this file.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ConnectorType(str, Enum):
@@ -145,6 +146,72 @@ class BuildupThreshold(BaseModel):
     max_oldest_seconds: float | None = 300.0
 
 
+class SignatureAlgorithm(str, Enum):
+    """JWS algorithm for opt-in per-connection outbound message signing (ASVS 4.1.5, ADR 0018).
+
+    All three are produced with the **core** ``cryptography`` dependency (no new package). ``RS256``
+    (RSASSA-PKCS1-v1_5) is **deterministic** — the same key + payload always yields the same signature;
+    ``PS256`` (RSASSA-PSS) and ``ES256`` (ECDSA P-256) are **randomized** (a fresh signature per call,
+    like the WS-Security nonce, ADR 0015) — all SHA-256."""
+
+    RS256 = "RS256"  # RSASSA-PKCS1-v1_5 + SHA-256 (RSA key; deterministic)
+    PS256 = "PS256"  # RSASSA-PSS + SHA-256 (RSA key; randomized)
+    ES256 = "ES256"  # ECDSA P-256 (secp256r1) + SHA-256 (EC key; randomized)
+
+
+class OutboundSigning(BaseModel):
+    """Opt-in per-connection message signing for a **REST/SOAP outbound** (ASVS 4.1.5, ADR 0018).
+
+    OFF unless configured. When set, the connector mints a **detached JWS** (RFC 7515 Appendix F) over
+    the exact outbound payload bytes in ``send()`` — past the queue boundary, like the WS-Security
+    timestamp/nonce (ADR 0015), so a retry re-mints it and routers/transforms stay pure — and carries it
+    in the ``header_name`` HTTP header. The receiver verifies it against the matching **public** key,
+    out-of-band per partner contract (the signing code's :func:`verify` counterpart does this). RSA
+    (``RS256``/``PS256``) or ECDSA (``ES256``) via the core ``cryptography`` library — no new dependency.
+
+    ``private_key`` is the signing key as **inline PEM** *(use* :func:`~messagefoundry.config.wiring.env`
+    *for the secret)* **or a path to a PEM file** (the file, like a TLS key, is protected by OS perms).
+    Put every secret — an inline key, or ``private_key_password`` for an encrypted key — in ``env()`` so
+    it is never stored in config. The key never leaves the box; only the public-verifiable signature does.
+
+    Authored code-first with :func:`~messagefoundry.transports.signing.with_signing` over a ``Rest()`` /
+    ``Soap()`` spec, or assembled from flat ``sign_*`` connector settings via :meth:`from_settings`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    algorithm: SignatureAlgorithm = SignatureAlgorithm.RS256
+    private_key: str  # inline PEM (use env() for the secret) or a path to a PEM private-key file
+    private_key_password: str | None = None  # passphrase for an encrypted key (secret — use env())
+    key_id: str | None = None  # JWS 'kid' so the receiver can select the verifying key
+    header_name: str = "X-JWS-Signature"  # the HTTP header that carries the detached JWS
+
+    @classmethod
+    def from_settings(cls, settings: Mapping[str, Any]) -> OutboundSigning | None:
+        """Build from flat ``sign_*`` connector settings, or ``None`` when signing isn't configured.
+
+        Signing is OFF (``None``) unless ``sign_private_key`` is present, so every existing outbound is
+        unchanged. The flat keys (vs a nested table) keep each value a top-level setting that ``env()``
+        resolution and ``connections.toml`` decoding already handle. Recognized keys: ``sign_enabled``,
+        ``sign_algorithm``, ``sign_private_key``, ``sign_private_key_password``, ``sign_key_id``,
+        ``sign_header``. An unknown/typo'd field raises (``extra='forbid'``)."""
+        key = settings.get("sign_private_key")
+        if not key:
+            return None
+        data: dict[str, Any] = {"private_key": key}
+        if "sign_enabled" in settings:
+            data["enabled"] = settings["sign_enabled"]
+        if settings.get("sign_algorithm"):
+            data["algorithm"] = settings["sign_algorithm"]
+        if settings.get("sign_private_key_password"):
+            data["private_key_password"] = settings["sign_private_key_password"]
+        if settings.get("sign_key_id"):
+            data["key_id"] = settings["sign_key_id"]
+        if settings.get("sign_header"):
+            data["header_name"] = settings["sign_header"]
+        return cls.model_validate(data)
+
+
 class Destination(BaseModel):
     """An outbound connector endpoint. Each outbound connection queues independently
     so a slow/failed one never blocks the others."""
@@ -158,6 +225,10 @@ class Destination(BaseModel):
     # PROCESSED, so a shadow instance can process real traffic without double-delivering to live
     # partners. A deployment-wide [shadow].simulate_all_egress forces this on for every outbound.
     simulate: bool = False
+    # ASVS 4.1.5 (ADR 0018): opt-in per-connection detached-JWS signing for REST/SOAP outbound. None
+    # (the default) = OFF — every existing outbound is byte-identical. Assembled from the env-resolved
+    # sign_* settings by the runner's _dest_config; the connector mints the signature in send().
+    sign: OutboundSigning | None = None
 
 
 class Validation(BaseModel):

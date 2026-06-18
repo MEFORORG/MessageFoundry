@@ -131,6 +131,45 @@ async def test_recovery_code_single_use() -> None:
         await store.close()
 
 
+async def test_totp_code_is_single_use_within_its_window() -> None:
+    # ASVS 6.5.1: a TOTP code is consumed on first use; replaying the SAME code (still valid inside its
+    # ~30 s step window) on a fresh session is rejected, so a captured code can't be reused.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        identity, token, password = await _bootstrap_login(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        await service.confirm_mfa_enrollment(identity, totp.totp(enroll.secret), token=token)
+
+        code = totp.totp(enroll.secret)
+        out = await service.login("admin", password)
+        assert out.token is not None
+        assert await service.verify_mfa(out.token, code) is True  # consumes the step
+
+        out2 = await service.login("admin", password)
+        assert out2.token is not None
+        # Same code, still inside its window, fresh session → rejected (replay within the window).
+        assert await service.verify_mfa(out2.token, code) is False
+    finally:
+        await store.close()
+
+
+async def test_consume_totp_step_is_monotonic() -> None:
+    # The store records the highest consumed TOTP time-step (single-use compare-and-set, ASVS 6.5.1):
+    # a step <= the last consumed is rejected (replay/older), a strictly greater step is accepted.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings())
+        identity, _token, _password = await _bootstrap_login(service)
+        uid = identity.user_id
+        assert await store.consume_totp_step(uid, 1000) is True  # first use
+        assert await store.consume_totp_step(uid, 1000) is False  # exact replay
+        assert await store.consume_totp_step(uid, 999) is False  # older step
+        assert await store.consume_totp_step(uid, 1001) is True  # advances the high-water mark
+    finally:
+        await store.close()
+
+
 async def test_disable_and_admin_reset_clear_mfa() -> None:
     store = await _store()
     try:

@@ -29,15 +29,10 @@ The PySide6 console talks to it over a localhost HTTP + WebSocket API — the sa
 whether the engine runs in-process, as a local daemon, or (later) on a remote host.
 No hand-rolled IPC; the deployment split is a config choice, not an architectural fork.
 
-```
-┌────────────────────┐      HTTP + WebSocket       ┌────────────────────┐
-│  PySide6 console   │ ──────(localhost)─────────▶ │   engine runtime   │
-│  (design / monitor)│                              │  (asyncio core)    │
-└────────────────────┘                              └─────────┬──────────┘
-                                                              │
-                  config (Python modules, git-friendly)    ◀───┤
-                  message store / queue (SQLite WAL) ◀─────────┘
-```
+See **[docs/architecture-diagram.md](docs/architecture-diagram.md)** for the rendered diagrams —
+system topology, runtime message flow through the staged queue, and the config wiring graph (Mermaid,
+renders on GitHub and in the VS Code preview). The prose source of truth is
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ### Key decisions
 - **Reliable by default.** A durable, transactional pipeline gives at-least-once delivery,
@@ -99,20 +94,20 @@ supported production artifact, with no source checkout required. Install it as a
 dependency**, then scaffold your own config repo ([ADR 0017](docs/adr/0017-consumer-deployment-model.md)):
 
 ```bash
-pip install "messagefoundry==0.1.0rc1"   # pin the exact engine version (core runtime, SQLite store)
+pip install "messagefoundry==0.1.0"   # pin the exact engine version (core runtime, SQLite store)
 messagefoundry init ./my-config-repo     # scaffold a standalone config repo
 cd ./my-config-repo
 messagefoundry serve --config config --env dev
 ```
 
-`0.1.0rc1` is the current **Early Access** release on PyPI. Always **pin the exact version** so
+`0.1.0` is the current **Early Access** release on PyPI. Always **pin the exact version** so
 upgrades stay deliberate. Add the extras your deployment needs (each is opt-in and lazy-imported):
 
 ```bash
-pip install "messagefoundry[postgres]==0.1.0rc1"    # PostgreSQL store backend (production server DB)
-pip install "messagefoundry[sqlserver]==0.1.0rc1"   # SQL Server store backend (+ OS-level ODBC Driver 18)
-pip install "messagefoundry[console]==0.1.0rc1"     # PySide6 admin console
-pip install "messagefoundry[sftp]==0.1.0rc1"        # SFTP transport for the REMOTEFILE connector
+pip install "messagefoundry[postgres]==0.1.0"    # PostgreSQL store backend (production server DB)
+pip install "messagefoundry[sqlserver]==0.1.0"   # SQL Server store backend (+ OS-level ODBC Driver 18)
+pip install "messagefoundry[console]==0.1.0"     # PySide6 admin console
+pip install "messagefoundry[sftp]==0.1.0"        # SFTP transport for the REMOTEFILE connector
 ```
 
 > **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow,

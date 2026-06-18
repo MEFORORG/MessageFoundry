@@ -200,6 +200,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="allow plaintext http to a non-loopback engine (trusted-network dev only; no TLS yet)",
     )
+    parser.add_argument(
+        "--client-cert",
+        default=None,
+        help="PEM client certificate to present for mutual TLS (ASVS 12.3.5; opt-in, https only)",
+    )
+    parser.add_argument(
+        "--client-key",
+        default=None,
+        help="private key for --client-cert, when it is not bundled in the cert PEM",
+    )
     args = parser.parse_args(argv)
 
     app = QApplication(sys.argv[:1])
@@ -207,7 +217,12 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationName("Console")
 
     try:
-        client = EngineClient(args.url, allow_insecure=args.insecure)
+        client = EngineClient(
+            args.url,
+            allow_insecure=args.insecure,
+            tls_client_cert=args.client_cert,
+            tls_client_key=args.client_key,
+        )
     except ApiError as exc:
         print(f"error: {exc}", file=sys.stderr)  # e.g. refusing plaintext http to a remote host
         return 2

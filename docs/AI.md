@@ -11,6 +11,12 @@ talks to the engine.
 > in [PHI.md](PHI.md#ai-coding-assistance); the RBAC permission that gates it is in
 > [SECURITY.md](SECURITY.md).
 
+> **Scope — product feature, not the dev process.** This governs the AI assistant the *shipped
+> product* offers operators. The maintainers' *own* discipline for using Claude Code to **build**
+> MessageFoundry — risk-tiered guardrails, the daily loop, provenance — is a **distinct,
+> complementary** standard: [`Secure_AI_Development_Standards.md`](Secure_AI_Development_Standards.md).
+> The two share the word "AI" and nothing else.
+
 > **Status (MVP).** The policy model + config + RBAC + the engine policy endpoint + the CLI + gating
 > of the existing **provider-agnostic, bring-your-own** IDE chat assistant are built. **No
 > model-provider or engine broker integration exists yet** — `managed_claude` / `managed_claude_baa`
@@ -32,6 +38,8 @@ The policy is two independent axes, then **clamped** by the instance's **product
   | `byo` | **Bring-your-own** provider, configured in the IDE; the engine never sees the traffic. Code-only by construction (PHI-safe). |
   | `managed_claude` | Engine-brokered managed provider. **Future** — not serviceable by this IDE version. |
   | `managed_claude_baa` | Engine-brokered managed provider under a **BAA** + zero-data-retention connection — the only mode that can reach `phi` scope. **Future.** |
+
+  > **Dev-process analogue (§4.5).** `managed_claude_baa` is the *product / runtime* path for PHI to reach an LLM under a BAA. Its **build-time** counterpart — when real PHI may enter the AI assistant used to *develop* MessageFoundry, under a signed **BAA + zero-data-retention** agreement (operator-enabled, minimum-necessary, audited) — is **§4.5** of [`Secure_AI_Development_Standards.md`](Secure_AI_Development_Standards.md). Same control (BAA + ZDR), different surface; both default to **no PHI**.
 
 - **`data_scope`** — *the most sensitive data the assistant may be given*, least→most sensitive:
 

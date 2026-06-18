@@ -376,6 +376,55 @@ def test_source_may_poll_logs_transition_once_then_resumes(
     assert src._may_poll() is True and src._skipping is False  # became leader → resume
 
 
+# === security: pre-ingest content scan hook (ASVS 5.4.3) =====================
+
+
+async def test_source_quarantines_content_rejected_by_scan_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An operator/plugin AV scan-hook runs over every inbound REMOTE file before it enters the pipeline
+    # (the control that matters most for a remote/less-trusted drop source); rejected content is
+    # quarantined to .error and never handed to the handler.
+    from messagefoundry.transports.file import ScanRejected, set_scan_hook
+
+    def _reject_eicar(raw: bytes, source: str) -> None:
+        if b"EICAR" in raw:
+            raise ScanRejected("malware signature")
+
+    set_scan_hook(_reject_eicar)
+    try:
+        client = _FakeClient(files={"/in/bad.hl7": b"MSH|EICAR", "/in/ok.hl7": b"MSH|clean"})
+        src = _src(monkeypatch, client)
+        h = _RecordingHandler()
+        src._handler = h
+        await src._poll_once()
+    finally:
+        set_scan_hook(None)  # restore the default no-op
+    assert h.bodies == [b"MSH|clean"]  # only the clean file was delivered
+    assert "/in/.error/bad.hl7" in client.files  # the flagged file was quarantined
+    assert "/in/.processed/bad.hl7" not in client.files
+
+
+def test_scan_hook_seam_defaults_to_noop_and_is_settable() -> None:
+    from messagefoundry.transports.file import ScanRejected, scan_inbound_file, set_scan_hook
+
+    scan_inbound_file(b"anything", "src")  # default no-op: does not raise
+    try:
+        captured: list[tuple[bytes, str]] = []
+
+        def _hook(raw: bytes, source: str) -> None:
+            captured.append((raw, source))
+            raise ScanRejected("nope")
+
+        set_scan_hook(_hook)
+        with pytest.raises(ScanRejected):
+            scan_inbound_file(b"x", "lbl")
+        assert captured == [(b"x", "lbl")]
+    finally:
+        set_scan_hook(None)
+    scan_inbound_file(b"x", "lbl")  # cleared → no-op again
+
+
 # === security: cleartext-ftp credential guard ================================
 
 

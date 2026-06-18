@@ -131,12 +131,22 @@ class EngineClient:
         *,
         timeout: float = 5.0,
         allow_insecure: bool = False,
+        tls_client_cert: str | None = None,
+        tls_client_key: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._allow_insecure = allow_insecure
         _assert_safe_transport(self.base_url, allow_insecure=allow_insecure)
-        self._http = httpx.Client(base_url=self.base_url, timeout=timeout)
+        # Optional client certificate for mutual TLS (ASVS 12.3.5): when the engine API requires a
+        # client cert (api.tls_client_ca_file → CERT_REQUIRED), the console presents this PEM cert
+        # (plus a separate key file when the key isn't bundled in the cert PEM) so it authenticates to
+        # the API by certificate, not only the bearer token. Off by default; meaningful only over https
+        # (the server, not the console, decides whether the cert is required).
+        cert: str | tuple[str, str] | None = None
+        if tls_client_cert is not None:
+            cert = (tls_client_cert, tls_client_key) if tls_client_key else tls_client_cert
+        self._http = httpx.Client(base_url=self.base_url, timeout=timeout, cert=cert)
         self._token: str | None = None
         self._user: CurrentUser | None = None
         #: Invoked when the engine demands step-up re-verification (403 + X-Step-Up-Required); the GUI

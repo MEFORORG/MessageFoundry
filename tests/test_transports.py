@@ -265,6 +265,44 @@ async def test_file_source_keeps_persistently_failing_file_for_retry(tmp_path: P
     assert not (inbox / ".processed" / "bad.hl7").exists()
 
 
+async def test_file_source_quarantines_content_rejected_by_scan_hook(tmp_path: Path) -> None:
+    # ASVS 5.4.3: a configured pre-ingest scan hook (AV/ICAP/plugin) runs over every inbound file; the
+    # content it rejects is quarantined to .error and never handed to the handler.
+    from messagefoundry.transports.file import ScanRejected, set_scan_hook
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "msg1.hl7").write_bytes(ADT.encode("utf-8"))
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+        return None
+
+    def _reject_all(raw: bytes, source: str) -> None:
+        raise ScanRejected("blocked by test scanner")
+
+    set_scan_hook(_reject_all)
+    try:
+        src = build_source(
+            Source(
+                type=ConnectorType.FILE,
+                settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
+            )
+        )
+        task = asyncio.create_task(src.start(handler))
+        try:
+            await _until(lambda: (inbox / ".error" / "msg1.hl7").exists())
+        finally:
+            await src.stop()
+            await task
+    finally:
+        set_scan_hook(None)  # restore the default no-op so the global doesn't leak between tests
+    assert received == []  # the scanner blocked it before the handler
+    assert (inbox / ".error" / "msg1.hl7").exists()  # quarantined
+    assert not (inbox / ".processed" / "msg1.hl7").exists()
+
+
 # --- MLLP source <-> destination round trip ----------------------------------
 
 

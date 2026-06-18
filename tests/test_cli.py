@@ -239,6 +239,17 @@ def test_rotate_key_requires_a_key(
     assert "MEFOR_STORE_ENCRYPTION_KEY" in capsys.readouterr().err
 
 
+def test_rotate_key_unbuilt_provider_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A non-default [store].key_provider that isn't built yet (an external HSM/KMS/Vault provider) must
+    # fail CLOSED with a clean exit-2 + an actionable message, not a traceback (ADR 0019, ASVS 13.3.3).
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_KEY_PROVIDER", "aws_kms")
+    assert main(["rotate-key", "--db", str(tmp_path / "any.db")]) == 2
+    assert "aws_kms" in capsys.readouterr().err  # the message names the offending provider
+
+
 def test_serve_refuses_without_key_when_require_encryption(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -460,8 +460,10 @@ host as the data it protects; if that host is compromised, local evidence can be
 independent copy survives a host compromise. The same PHI-redaction + control-char-scrub filters apply to
 the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-redaction)); the syslog transport
 is plaintext, so terminate it at a local TLS-forwarding agent or keep it on a trusted management network.
-Forwarding the **`audit_log`** rows *themselves* through the logger (so audit events ship off-box too) is a
-store-side follow-on; today the general log carries the operational + redacted-message evidence.
+The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
+committed audit row ships as PHI-redacted metadata through the `messagefoundry.audit` logger to the same
+forwarder, across all three store backends — so both the operational log and the tamper-evident audit
+trail survive a host/DB compromise.
 
 ### HIPAA §164.312 alignment
 

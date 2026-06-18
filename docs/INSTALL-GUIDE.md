@@ -55,11 +55,11 @@ python -m venv .venv
 pip install "messagefoundry==0.1.0"          # pin the exact version (core runtime only)
 ```
 
-> ⚠️ **Early access — pre-release on PyPI.** MessageFoundry's first **pre-release** (`0.1.0rc1`) is
-> published on public PyPI, so `pip install --pre messagefoundry` (or `pip install
-> messagefoundry==0.1.0rc1`) resolves today. The exact-pin command above (`==0.1.0`) is the shape your
-> install takes once the **final** `0.1.0` is tagged — until then a plain `==0.1.0` returns no match. You
-> can equally install from the engine's **GitHub Release assets** or your organization's **private index**.
+> ⚠️ **Early access.** `0.1.0` is an **Early Access** release on public PyPI — feature-complete and
+> test-validated, but the external review + pen test that gate a security-certified **v1.0** land after
+> launch. The exact-pin command above (`==0.1.0`) resolves today; the earlier `0.1.0rc1` pre-release also
+> remains installable (`pip install messagefoundry==0.1.0rc1`). You can equally install from the engine's
+> **GitHub Release assets** or your organization's **private index**.
 
 Add extras only for what a host actually runs — `messagefoundry[postgres]` (PostgreSQL store),
 `messagefoundry[sqlserver]` (SQL Server store + the DATABASE connectors, needs OS-level ODBC Driver 18),
