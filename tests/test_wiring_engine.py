@@ -205,18 +205,20 @@ async def test_start_inbound_does_not_register_on_bind_failure(
     assert "mllp_in" not in runner._sources
 
 
-async def test_start_unwinds_partial_failure_and_retry_succeeds(
+async def test_start_isolates_inbound_bind_failure_and_recovers(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # M-8: an inbound bind failure mid-start() tears down the already-built outbound worker +
-    # destination, leaves _running False, and a retry (once the bind succeeds) starts cleanly.
+    # ADR 0031: an inbound bind failure mid-start() is ISOLATED — start() does NOT raise, the engine
+    # comes up (degraded), the already-built outbound stays, the failed inbound is reported in
+    # degraded_connections() + alerted, and a later restart (once the bind succeeds) clears + binds it.
     from messagefoundry.pipeline import wiring_runner as wr
 
     reg = _inbound_registry("utf-8")
     reg.add_outbound(
         OutboundConnection("out", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path)}))
     )
-    runner = RegistryRunner(reg, store)
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(reg, store, alert_sink=sink)
     real_build_source = wr.build_source
     calls = {"n": 0}
 
@@ -225,17 +227,45 @@ async def test_start_unwinds_partial_failure_and_retry_succeeds(
         return _BoomSource() if calls["n"] == 1 else real_build_source(cfg)
 
     monkeypatch.setattr(wr, "build_source", flaky)
-    with pytest.raises(OSError):
-        await runner.start()
-    assert not runner.running
-    assert runner._sources == {} and runner._workers == {} and runner._destinations == {}
-
-    await runner.start()  # retry: build_source now succeeds → clean start
     try:
-        assert runner.running
+        await runner.start()  # does NOT raise — the bad inbound is isolated
+        assert runner.running  # engine is up, just degraded
+        assert not runner.inbound_running("mllp_in")  # the failed listener isn't bound
+        assert "mllp_in" in runner.degraded_connections()
+        reason = runner.connection_failed("mllp_in")
+        assert reason and "address already in use" in reason
+        assert "out" in runner._destinations  # the healthy outbound still came up
+        assert sink.stopped and sink.stopped[0][0] == "mllp_in"  # alerted
+
+        await runner.restart_inbound("mllp_in")  # bind now succeeds → recovers
+        assert runner.inbound_running("mllp_in")
+        assert runner.connection_failed("mllp_in") is None  # marker cleared
+        assert runner.degraded_connections() == {}
     finally:
         await runner.stop()
     assert not runner.running  # stop() is idempotent and leaves a clean slate
+
+
+async def test_fatal_startup_error_still_unwinds_and_raises(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ADR 0031 backstop: a graph-WIDE startup error (here the live-lookup executor build) is NOT a
+    # single connection, so it still unwinds the partial start + re-raises and leaves _running False
+    # (M-8) — only per-connection build/bind failures are isolated.
+    reg = _inbound_registry("utf-8")
+    reg.add_outbound(
+        OutboundConnection("out", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path)}))
+    )
+    runner = RegistryRunner(reg, store)
+
+    def boom():  # type: ignore[no-untyped-def]
+        raise RuntimeError("lookup executor build failed")
+
+    monkeypatch.setattr(runner, "_build_lookup_executor", boom)
+    with pytest.raises(RuntimeError, match="lookup executor"):
+        await runner.start()
+    assert not runner.running  # truly fatal → unwound, not degraded
+    assert runner._sources == {} and runner._workers == {} and runner._destinations == {}
 
 
 async def test_per_connection_ops_take_reload_lock(store: MessageStore) -> None:

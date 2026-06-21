@@ -27,8 +27,9 @@
   (the `connections.toml` desugar `reingress_to` rides through), [ADR 0009](0009-run-scoped-context-providers.md)
   (the `response` run-context provider this finally feeds), [ADR 0011](0011-timer-scheduled-source.md)
   (the synthetic timer source — re-ingress is *not* a source, contrasted below),
-  [ADR 0008](0008-cluster-observability-api.md) / Track B (leader-gating + lane ownership the new stage
-  inherits), [ADR 0012](0012-x12-edi-codec.md) (an X12 loopback's `content_type`),
+  [ADR 0008](0008-cluster-observability-api.md) / Track B (active-passive leader-gating the new stage
+  inherits; the per-lane ownership it originally rode was removed with the active-active drop, 2026-06-18),
+  [ADR 0012](0012-x12-edi-codec.md) (an X12 loopback's `content_type`),
   [CLAUDE.md](../../CLAUDE.md) §2 (reliability + count-and-log invariants — *do not break*).
 
 ## Context
@@ -609,7 +610,7 @@ produced and on startup. It mirrors `_router_worker`
 
 ```text
 loop until stop:
-  item = claim_next_fifo(name, stage='response', owner=self._coordinator.lane_owner())  # FIFO per lane
+  item = claim_next_fifo(name, stage='response')  # FIFO per lane (the per-lane `owner=` arg was removed with the active-active drop, 2026-06-18; under single-leader active-passive HA the leader is the sole claimant, and a failover-stranded head is reclaimed by the ordinary FIFO claim)
   if item is None: await self._wait_for_work(self._response_work); continue
   ic = self.registry.inbound.get(name)
   if ic is None:                         # loopback removed by a reload, residual RESPONSE rows remain
@@ -669,11 +670,14 @@ like router/transform.
     `self.registry.inbound.get(name) is None`; the worker reverts the claim with a retry-forever policy and
     exits (mirrors the router worker's missing-inbound handling, [pipeline/wiring_runner.py:851](../../messagefoundry/pipeline/wiring_runner.py)–[:859](../../messagefoundry/pipeline/wiring_runner.py));
     a reload restoring the loopback re-arms the worker and drains the backlog. Never dropped.
-- **Leader-gating + single ownership.** Re-ingress is an **internal single-owner** stage: the claim is gated
-  by `coordinator.lane_owner()` exactly like every other FIFO claim, so on a clustered Postgres store
-  exactly one node owns a given loopback lane (Track B Step 5 claim-time lease); single-node passes `None`
-  (byte-identical). There is **no** separate "global drainer" and no `is_leader()` gate at the worker — the
-  lane-owner claim is the singleton mechanism, consistent with ingress/routed/outbound.
+- **Leader-gating + single ownership.** Re-ingress is an **internal single-owner** stage: it drains via the
+  ordinary FIFO claim exactly like every other stage. *(As designed this rode `coordinator.lane_owner()`'s
+  per-lane claim — Track B Step 5 claim-time lease — to give exactly one node a loopback lane on a clustered
+  Postgres store. That per-lane mechanism was **removed with the active-active drop (2026-06-18)**; under
+  single-leader **active-passive** HA the leader is the sole claimant of every lane, so the loopback lane is
+  single-owned by construction, and a failover-stranded head is reclaimed by the ordinary FIFO claim.)* There
+  is **no** separate "global drainer" and no extra `is_leader()` gate at the worker beyond the active-passive
+  graph gating that already runs the whole graph on the leader only.
   (`LoopbackSource.polls_shared_resource=False` means no *source*-level leader gate either; correct, because
   there is no source.)
 

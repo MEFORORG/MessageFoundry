@@ -71,6 +71,8 @@ __all__ = [
     "Timer",
     "Loopback",
     "Rest",
+    "FHIR",
+    "DICOM",
     "Database",
     "DatabasePoll",
     "Soap",
@@ -494,6 +496,10 @@ _SECRET_SETTING_KEYS = frozenset(
         "private_key",
         "api_key",
         "token",
+        # ADR 0024 — SMART Backend Services signing-key material (the minted access token / assertion
+        # are runtime-only and never persisted, so only the key inputs need redacting in /metadata).
+        "smart_private_key",
+        "smart_private_key_password",
     }
 )
 
@@ -831,6 +837,129 @@ def Rest(
             "encoding": encoding,
             "capture_response": capture_response,
             "reingress_to": reingress_to,
+        },
+    )
+
+
+def FHIR(
+    *,
+    url: str | EnvRef,  # the FHIR service BASE url, e.g. https://host/fhir (may be env())
+    fhir_version: str = "R4B",  # "R4B" (default) | "R5" | "STU3" — explicit, no autodetect
+    format: str = "json",  # "json" (MVP); "xml" is deferred (ADR 0022 Options #5)
+    interaction: str = "create",  # "create" (POST) | "update" (PUT) | "transaction" | "batch" (Bundle POST)
+    conditional: str | None = None,  # None | "if-none-exist" | "conditional-update" | "if-match"
+    conditional_query: str
+    | None = None,  # search params for if-none-exist / conditional-update (e.g. "identifier=sys|val")
+    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (SMART/OAuth; use env())
+    basic_user: str
+    | EnvRef
+    | None = None,  # HTTP Basic (with basic_password); use env() for secrets
+    basic_password: str | EnvRef | None = None,
+    timeout_seconds: float = 30.0,
+    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    encoding: str = "utf-8",
+    capture_response: bool = False,  # capture the server reply / OperationOutcome (ADR 0013)
+    reingress_to: str
+    | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
+) -> ConnectionSpec:
+    """A FHIR REST endpoint (**outbound destination only** — the inbound FHIR server facade is ADR 0023).
+    The Handler produces a FHIR-JSON resource (or transaction/batch ``Bundle``) body; this delivers it to
+    the FHIR service ``url`` (the **base**, e.g. ``https://host/fhir``) using the FHIR HTTP interaction:
+    ``create`` → ``POST {base}/{ResourceType}``, ``update`` → ``PUT {base}/{ResourceType}/{id}``,
+    ``transaction``/``batch`` → ``POST {base}`` with the Bundle. ``application/fhir+json`` media type
+    (JSON-only MVP). The three opt-in conditional knobs are the idempotency/concurrency levers:
+    ``if-none-exist`` (conditional create, ``If-None-Exist`` header), ``conditional-update`` (search-based
+    ``PUT`` with ``conditional_query`` in the URL), ``if-match`` (version-aware ``PUT`` whose ``If-Match``
+    ETag is derived from the resource's ``meta.versionId``). A 2xx is delivered; 5xx / a transient
+    OperationOutcome / 408 / 429 / connection errors retry; other 4xx dead-letter. Redirects are refused
+    and the egress host is gated by ``[egress].allowed_http``. Put secrets in ``env()``
+    (``bearer_token``/``basic_*``), never in ``headers``. The FHIR server operation **must be idempotent**
+    (delivery is at-least-once) — the conditional knobs are the native lever. ADR 0022."""
+    return ConnectionSpec(
+        ConnectorType.FHIR,
+        {
+            "url": url,  # stored under "url" (NOT base_url) so the §3.4 egress gate reads the same key
+            "fhir_version": fhir_version,
+            "format": format,
+            "interaction": interaction,
+            "conditional": conditional,
+            "conditional_query": conditional_query,
+            "headers": headers or {},
+            "bearer_token": bearer_token,
+            "basic_user": basic_user,
+            "basic_password": basic_password,
+            "timeout_seconds": timeout_seconds,
+            "verify_tls": verify_tls,
+            "encoding": encoding,
+            "capture_response": capture_response,
+            "reingress_to": reingress_to,
+        },
+    )
+
+
+def DICOM(
+    *,
+    ae_title: str
+    | EnvRef,  # this engine's AE Title (the SCP's, or the SCU's calling AE in Phase 2)
+    host: str | EnvRef | None = None,  # OUTBOUND SCU peer (Phase 2). INBOUND SCP: omit (bind is
+    # [inbound].bind_host, like MLLP/X12 — not authored here).
+    port: int | EnvRef = 104,  # standard DICOM port
+    called_ae_title: str | EnvRef | None = None,  # the peer's AE Title (Phase-2 SCU destination)
+    presentation_contexts: list[str] | None = None,  # SOP class UIDs to negotiate (None → SR + the
+    # common image storage classes + Verification); transfer syntaxes default to the standard set
+    calling_ae_allowlist: list[str]
+    | None = None,  # SCP: only these calling AE Titles may associate
+    # (None → any AE the peer-IP allowlist admits — the [inbound].source_ip_allowlist is the IP gate)
+    require_called_ae_title: bool = True,  # SCP: a peer must address THIS engine's ae_title as called AE
+    tls: bool = False,  # DICOM-over-TLS off-loopback (§9); a non-loopback cleartext SCP is refused
+    # fail-closed unless `serve --allow-insecure-bind` (the generalized bind-guard)
+    tls_cert_file: str | EnvRef | None = None,  # SCP server identity (required when tls=True)
+    tls_key_file: str | EnvRef | None = None,  # the cert's private key (PEM)
+    tls_ca_file: str
+    | EnvRef
+    | None = None,  # opt-in mTLS: require + verify a calling peer's client cert
+    max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
+    # failure BEFORE the durable commit (the X12 max_interchange_bytes analog; OOM/DoS guard, §9)
+    max_associations: int = 10,  # cap concurrent associations (connection-flood guard)
+    max_pdu_size: int = 16384,  # cap one PDU's bytes (0 = unbounded); DoS guard
+    timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout
+    connect_timeout: float = 10.0,  # outbound SCU: association-request timeout (Phase 2)
+) -> ConnectionSpec:
+    """A **DICOM DIMSE** endpoint (ADR 0025). **Phase 1 (built): the inbound C-STORE SCP** — pair it
+    with ``content_type="dicom"`` on ``inbound(...)`` so a received object is base64-carried (ADR 0028)
+    and routed as a ``RawMessage`` a Router/Handler parses on demand via ``messagefoundry.parsing.dicom``.
+    Like ``X12``, the inbound takes **no** ``host`` (the bind interface is ``[inbound].bind_host``); it
+    runs a ``pynetdicom`` AE C-STORE SCP **off the event loop**, commits each object durably to the
+    ingress stage **before** returning C-STORE Success (commit-before-SUCCESS), accepts only the
+    ``calling_ae_allowlist`` AE Titles (when set) from the ``[inbound].source_ip_allowlist`` peers, and
+    rejects an object over ``max_object_bytes`` with a DIMSE failure before the commit. A non-loopback
+    cleartext SCP (no ``tls``) is refused at startup unless ``serve --allow-insecure-bind`` (PHI on the
+    wire, §9).
+
+    **Phase 2 (designed, not built):** the same family backs the outbound **C-STORE SCU** + **C-ECHO**
+    destination — ``host``/``called_ae_title``/``connect_timeout`` configure dialing a downstream PACS;
+    egress is gated by ``[egress].allowed_tcp`` (a raw socket, like X12). Authoring an ``outbound(...)``
+    DICOM connection raises until the SCU destination lands."""
+    return ConnectionSpec(
+        ConnectorType.DIMSE,
+        {
+            "ae_title": ae_title,
+            "host": host,
+            "port": port,
+            "called_ae_title": called_ae_title,
+            "presentation_contexts": presentation_contexts,
+            "calling_ae_allowlist": calling_ae_allowlist,
+            "require_called_ae_title": require_called_ae_title,
+            "tls": tls,
+            "tls_cert_file": tls_cert_file,
+            "tls_key_file": tls_key_file,
+            "tls_ca_file": tls_ca_file,
+            "max_object_bytes": max_object_bytes,
+            "max_associations": max_associations,
+            "max_pdu_size": max_pdu_size,
+            "timeout_seconds": timeout_seconds,
+            "connect_timeout": connect_timeout,
         },
     )
 
@@ -1399,16 +1528,17 @@ def build_inbound_connection(
     raw string can't reach the pipeline and crash later."""
     content_type = _coerce_content_type(name, content_type)
     if (
-        spec.type in (ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.X12)
+        spec.type in (ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.X12, ConnectorType.DIMSE)
         and spec.settings.get("host") is not None
     ):
         # The bind interface is an environment/service decision (which NIC this instance exposes),
         # not a per-connection one — and exposing an unauthenticated raw listener on 0.0.0.0 must be
         # an admin choice, not a developer default. Set it service-side via [inbound].bind_host.
         kind = spec.type.value.upper()
+        factory = "DICOM" if spec.type is ConnectorType.DIMSE else kind.title()
         raise WiringError(
             f"inbound connection {name!r}: {kind} inbound takes no host; the bind interface is a "
-            f"service setting ([inbound].bind_host). Declare it as {kind.title()}(port=...)."
+            f"service setting ([inbound].bind_host). Declare it as {factory}(port=...)."
         )
     if ack_after == AckAfter.DELIVERED:
         # Deferred-until-delivered ACK needs the listener to hold/replay the ACK from the delivery
@@ -1445,12 +1575,14 @@ def build_inbound_connection(
                 "ack_mode must be NONE"
             )
     _check_metadata(name, metadata)
-    listens = spec.type in (ConnectorType.MLLP, ConnectorType.TCP)
+    # Listen sources bind an interface and can carry a per-connection bind_address + peer-IP allowlist.
+    # DIMSE (the C-STORE SCP) is a listener like MLLP/TCP (X12 binds but omits these per-conn knobs).
+    listens = spec.type in (ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.DIMSE)
     if bind_address is not None:
         if not listens:
-            # Only a listen source (MLLP/TCP) binds an interface; File/DB/etc. have nothing to bind.
+            # Only a listen source (MLLP/TCP/DIMSE) binds an interface; File/DB/etc. have nothing to bind.
             raise WiringError(
-                f"inbound connection {name!r}: bind_address is only valid for an MLLP/TCP "
+                f"inbound connection {name!r}: bind_address is only valid for an MLLP/TCP/DIMSE "
                 "listen source"
             )
         if not bind_address.strip():

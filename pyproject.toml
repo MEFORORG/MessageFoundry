@@ -28,6 +28,8 @@ dependencies = [
     "pyspnego>=0.10",       # SPNEGO/Kerberos negotiate for Windows SSO
     "tomlkit>=0.12",        # comment/format-preserving TOML writer for connections.toml (ADR 0007)
     "tzdata>=2024.1",       # IANA tz database for stdlib zoneinfo (Windows has no system tzdata)
+    "prometheus-client>=0.20",  # Prometheus /metrics exposition (BACKLOG #21)
+    "defusedxml>=0.7.1",    # hardened XML parse for RawMessage.xml() — XXE/DTD/entity-expansion safe (ADR 0004, BACKLOG #31)
 ]
 
 [project.optional-dependencies]
@@ -44,9 +46,26 @@ postgres = ["asyncpg>=0.29"]
 # SFTP (SSH) transport for the REMOTEFILE connector. FTP/FTPS use the stdlib (ftplib), no dep.
 # Lazy-imported, so installs that never use SFTP skip paramiko.
 sftp = ["paramiko>=3.4"]
+# Optional OpenTelemetry metrics export (BACKLOG #21). Off by default; the /metrics Prometheus path
+# needs none of this. otel imports are function-local, so SQLite-only installs skip these entirely.
+otel = ["opentelemetry-sdk>=1.20", "opentelemetry-exporter-otlp>=1.20"]
+# FHIR (R5/R4B/STU3) typed-model + FHIRPath codec for parsing/fhir/ (ADR 0022, BACKLOG #20). Lazy-imported,
+# so SQLite-only installs skip it. fhir.resources>=7.1.0 is the pydantic-v2 floor (it dropped plain-R4 in
+# 7.0.0 and pydantic-v1 in 7.1.0); it drags fhir-core (BSD-3, the pydantic-v2 base model) + pydantic-core
+# (compiled). fhirpathpy is pure-Python (antlr4 runtime + python-dateutil). FHIR-XML rides fhir.resources'
+# optional lxml extra and is deferred (JSON-only MVP) — never bare-parsed (ADR 0022 §6, Options #5).
+fhir = ["fhir.resources>=7.1.0", "fhirpathpy>=2.2.0"]
+# DICOM (DIMSE C-STORE SCP/SCU) connectors + codec for parsing/dicom/ (ADR 0025, BACKLOG #24). Lazy-imported,
+# so SQLite-only installs skip it. pynetdicom (the DIMSE upper-layer) drags pydicom (the DICOM dataset/SR codec);
+# both pure-Python — HEADERS/SR ONLY, so NO numpy (numpy is pydicom's optional pixel-data dep, never used here).
+# Floors per dep-vet (2026-06-20): pydicom>=3.0.2 excludes CVE-2026-32711 (2.4.0–2.4.4 FileSet/DICOMDIR path
+# traversal); pynetdicom>=3.0.4 requires pydicom>=3,<4 (the 3.x lines pair cleanly). dicomweb-client (DICOMweb
+# STOW-RS, Phase-2) is a SEPARATE extra — it drags numpy+pillow+requests, so it is added in the Phase-2 PR, never
+# folded into [dicom].
+dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<4"]
 dev = [
     "pytest>=8.0",
-    "pytest-asyncio>=0.23",
+    "pytest-asyncio>=0.26",  # >=0.26 adds asyncio_default_test_loop_scope (BACKLOG #17 shared-loop fix)
     "pytest-timeout>=2.3",  # per-test watchdog: a hung test (py3.11 flake, BACKLOG #17) dumps stacks + fails fast, never wedges the leg
     "ruff>=0.4",
     "mypy>=1.10",
@@ -56,6 +75,13 @@ dev = [
 [project.scripts]
 messagefoundry = "messagefoundry.__main__:main"
 
+# Windowed launcher for the admin console (CONSOLE-UX). gui-scripts produces a pythonw-backed
+# messagefoundry-console.exe in <venv>\Scripts, so double-clicking it (or a shortcut) opens the GUI
+# with no flashing console window — unlike [project.scripts]. install-console-shortcut.ps1 drops a
+# Desktop/Start-Menu .lnk pointing at this exe so operators never touch a command line.
+[project.gui-scripts]
+messagefoundry-console = "messagefoundry.console.__main__:main"
+
 # The offline common-password screening corpus (messagefoundry/auth/data/, loaded via
 # importlib.resources) ships in the wheel automatically: hatchling packages every file under the
 # messagefoundry/ package, data included. (A previous force-include of that dir double-added the files
@@ -64,6 +90,21 @@ messagefoundry = "messagefoundry.__main__:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# BACKLOG #17 ROOT FIX — run the whole suite on ONE shared asyncio event loop. The intermittent
+# py3.11 hang was a mid-test asyncio<->aiosqlite CROSS-LOOP lost wakeup: with pytest-asyncio's default
+# fresh-loop-per-test, a function-scoped async fixture's aiosqlite connection lived on one loop while
+# the test (or its fixture teardown) ran on another, so a completed query's result was delivered to a
+# loop nobody was awaiting and the await hung (proven by two CI thread dumps; see tests/conftest.py).
+# A single session-scoped loop for tests AND fixtures removes the per-test loop churn, so there is no
+# cross-loop window. BOTH keys are required and must match: setting only the *test* scope leaves
+# fixtures function-scoped — still cross-loop, it merely *looks* clean on py3.13 (which silently
+# tolerates cross-loop aiosqlite; py3.11 does not). A shared loop also matches production topology —
+# the engine runs on one long-lived asyncio.run() loop (the py311-store-soak CI job proves that clean).
+# REQUIRES pytest-asyncio>=0.26 (the release that added asyncio_default_test_loop_scope; the fixture key
+# needs >=0.24). The dev floor below is now >=0.26 to match (lifted from the >=0.23 #414 shipped with, the
+# coordinated dep-lane follow-up #414 deferred); the lock pins the exact 1.4.0.
+asyncio_default_test_loop_scope = "session"
+asyncio_default_fixture_loop_scope = "session"
 testpaths = ["tests"]
 # Per-test watchdog (BACKLOG #17): a single hung await/socket — seen as an intermittent py3.11 wedge —
 # is killed at 60s with a full thread-stack dump naming the culprit, instead of burning the CI job's
@@ -81,5 +122,5 @@ strict = true
 
 # Third-party libraries that ship no type stubs / py.typed marker.
 [[tool.mypy.overrides]]
-module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*"]
+module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "defusedxml", "defusedxml.*"]
 ignore_missing_imports = true

@@ -30,7 +30,7 @@ links to it rather than repeating it.
 11. [Staged rollout plan with go/no-go gates](#11-staged-rollout-plan-with-gono-go-gates)
 12. [Day-2 operations & monitoring](#12-day-2-operations--monitoring)
 13. [Upgrade & rollback](#13-upgrade--rollback)
-14. [High availability & scale-out — setting expectations](#14-high-availability--scale-out--setting-expectations)
+14. [High availability — setting expectations](#14-high-availability--setting-expectations)
 15. [Getting help & reporting bugs](#15-getting-help--reporting-bugs)
 16. [Decommissioning a pilot](#16-decommissioning-a-pilot)
 
@@ -57,17 +57,17 @@ operate it over a localhost HTTP API. See [ARCHITECTURE.md](ARCHITECTURE.md) for
 **Who should pilot it now.** Teams who want a Python-native, open-source alternative to Mirth/Corepoint
 and who are comfortable validating a pre-1.0 tool against their own traffic before trusting it. A single
 engine node on a trusted network is the simplest pilot; **native TLS** (API + MLLP) and an opt-in
-**active-passive failover** cluster on a shared PostgreSQL store are both built when you need them (see
-§2/§6/§14). What is genuinely *not* there yet is MFA, off-box log shipping, a de-identification
-framework, and horizontal *active-active* scale-out — track those items (§2) and pilot the parts that
-are ready.
+**active-passive failover** cluster on a shared server-DB store (PostgreSQL or SQL Server) are both built when you need them (see
+§2/§6/§14). What is genuinely *not* there yet is MFA, off-box log shipping, and a de-identification
+framework — track those items (§2) and pilot the parts that are ready. (Horizontal *active-active*
+scale-out was dropped and is not a planned milestone; active-passive HA is the supported HA model.)
 
 ---
 
 ## 2. Maturity & honest limitations — read before you plan
 
 MessageFoundry is solid for single-node production, and now also supports **opt-in active-passive
-failover** (a leader/standby cluster on a shared PostgreSQL store; §14). The authoritative
+failover** (a leader/standby cluster on a shared server-DB store — PostgreSQL or SQL Server; §14). The authoritative
 built-vs-roadmap references are [ARCHITECTURE.md](ARCHITECTURE.md) and the README "Roadmap" section —
 use the table below alongside them when planning.
 
@@ -86,13 +86,12 @@ use the table below alongside them when planning.
 | Validation & load tooling (`generate`, `check`, `dryrun`, the test harness, the load harness) | ✅ Built — see §8/§9 and [LOAD-TESTING.md](LOAD-TESTING.md) |
 | Windows-service deployment via NSSM | ✅ Built — see [SERVICE.md](SERVICE.md) |
 | **Native transport TLS** (API + MLLP) | ✅ Built — in-process API TLS (HTTPS/WSS) + per-connection MLLP-over-TLS, ≥TLS 1.2, opt-in mTLS, and a **fail-closed off-loopback bind guard** (a non-loopback bind without TLS is refused). Raw TCP/X12 stay plaintext (loopback/proxy). See [DEPLOYMENT.md](DEPLOYMENT.md). |
-| **Active-passive HA / failover** | ✅ Built (Track B) — opt-in leader/standby cluster on a **shared PostgreSQL** store: only the leader runs the graph, self-fencing leadership lease, immediate on-promotion recovery. Single-node stays the byte-identical default. See [CLUSTERING.md](CLUSTERING.md) + §14. |
+| **Active-passive HA / failover** | ✅ Built (Track B) — opt-in leader/standby cluster on a **shared server-DB** store (PostgreSQL or SQL Server): only the leader runs the graph, self-fencing leadership lease, immediate on-promotion recovery. Single-node stays the byte-identical default. See [CLUSTERING.md](CLUSTERING.md) + §14. |
 
 ### Experimental or not yet built — **do not depend on these for a production pilot**
 
 | Capability | Status & implication |
 |---|---|
-| **Horizontal active-active scale-out** | ⚠️ Experimental. *Active-passive* failover is built (§14); the multi-node **active-active** path (concurrent processing on all nodes) remains experimental and Postgres-only. For a pilot, run single-node or active-passive. See §14. |
 | **Transport TLS for raw TCP / X12** | ❌ Not built — those two connectors are plaintext-only; keep them on loopback or front with a TLS-terminating proxy. (API + MLLP **do** have native TLS — see §6/[DEPLOYMENT.md](DEPLOYMENT.md).) |
 | **MFA / off-box log shipping** | ❌ Not built (0.2 items that pair with off-loopback exposure). The engine's account lockout covers local accounts; logs stay on-box. |
 | **`ack_after=delivered`** (defer the ACK until downstream delivery) | ❌ Not built — requesting it is rejected at config load. Only **ACK-on-receipt** exists, so a routing/transform/delivery failure happens **after** the sender was already told `AA` and will **not** NAK back. Operators rely on the message disposition + alerts, not the ACK. |
@@ -102,9 +101,8 @@ use the table below alongside them when planning.
 
 **The early-adopter bargain, stated plainly:** you get a durable engine with native TLS, real auth,
 opt-in active-passive failover, and a real validation toolchain, in exchange for validating capacity on
-your own hardware, supplying the operational pieces that aren't built yet (MFA, off-box logs,
-de-identification), and accepting that horizontal *active-active* scale-out is still experimental. If
-that trade is acceptable, the rest of this guide is your playbook.
+your own hardware and supplying the operational pieces that aren't built yet (MFA, off-box logs,
+de-identification). If that trade is acceptable, the rest of this guide is your playbook.
 
 ---
 
@@ -126,9 +124,9 @@ Consolidate these before you install anything:
       single-node pilot, or a server DB — **PostgreSQL** (`messagefoundry[postgres]`, pure-Python) or
       **SQL Server** (`messagefoundry[sqlserver]` + OS-level ODBC Driver 18) — if you want a server
       store or a path toward DB-tier HA. See §2.
-- [ ] If you will run the **cluster** path (active-passive failover, or the experimental active-active):
+- [ ] If you will run the **cluster** path (active-passive failover):
       **NTP time sync** across nodes is a hard prerequisite, every node needs the **same config dir**, and
-      `[store].backend = "postgres"`. (Single-node pilots skip this entirely; see §14.)
+      `[store].backend = "postgres"` or `"sqlserver"`. (Single-node pilots skip this entirely; see §14.)
 - [ ] A **PHI encryption key** plan (§6) and a **backup target + key-escrow** plan (§10) decided
       before any real data flows.
 
@@ -604,7 +602,7 @@ as a **separate, later** step so you retain a fallback.
 - [ ] DR (backup/restore) rehearsed and scheduled.
 - [ ] On-call + the failure-drill runbook (§12) in place.
 - [ ] If you require HA: either the built **active-passive** cluster (leader/standby on a shared
-      PostgreSQL store, §14) or operational HA at the DB tier / via a VIP — decided and rehearsed.
+      server-DB store — PostgreSQL or SQL Server, §14) or operational HA at the DB tier / via a VIP — decided and rehearsed.
 
 ---
 
@@ -681,15 +679,15 @@ upgrades **small and frequent** rather than large and rare.
 
 ---
 
-## 14. High availability & scale-out — setting expectations
+## 14. High availability — setting expectations
 
 **Single-node is the default and is genuinely reliable** — the durable staged queue (§7), not
 clustering, is what guarantees no message is lost on one node. When you need failover, MessageFoundry now
-ships an **opt-in active-passive cluster** (Track B); horizontal *active-active* scale-out remains
-experimental. Full topology + config: **[CLUSTERING.md](CLUSTERING.md)**.
+ships an **opt-in active-passive cluster** (Track B) — the supported HA model. Full topology + config:
+**[CLUSTERING.md](CLUSTERING.md)**.
 
-**Active-passive failover (built).** Run N identical engine processes against **one shared PostgreSQL**
-store with `[cluster].enabled = true`:
+**Active-passive failover (built).** Run N identical engine processes against **one shared server database**
+(PostgreSQL or SQL Server) with `[cluster].enabled = true`:
 - **Leader/standby model.** Only the **leader** runs the message graph — all listeners *and* the
   router/transform/delivery workers. Every other node is a **warm standby** that contends for leadership
   only (membership heartbeat + cache convergence); it binds no listeners and runs no workers until it
@@ -698,16 +696,13 @@ store with `[cluster].enabled = true`:
   `leader_fence_timeout_seconds` **self-fences** (a split-brain guard); a standby acquires leadership only
   once the lease has expired. On promotion the new leader **immediately** recovers the prior leader's
   in-flight rows (owner-scoped), so failover recovery does not wait on the background lease-reclaim sweep.
-- **Requirements (enforced at config load):** `[store].backend = "postgres"` (SQLite/SQL Server are
+- **Requirements (enforced at config load):** `[store].backend = "postgres"` or `"sqlserver"` (SQLite is
   rejected for clustering), `[store].pool_size` **≥ 2** (≥ 3 recommended — the leader holds a dedicated
   connection), the **same config dir on every node**, and **NTP-synced clocks**. Config changes need a
   **coordinated (non-rolling) restart**.
 - **Front it** with a floating VIP / load-balancer health check so senders follow the active leader, and
-  keep HA at the **DB tier** too (PostgreSQL replication / managed-Postgres HA) — the engine coordinates
+  keep HA at the **DB tier** too (PostgreSQL replication / managed-Postgres HA, or SQL Server Always On) — the engine coordinates
   the *processing* leader, it does not make your database highly available.
-
-**Active-active (experimental — not for production).** The concurrent-processing-on-all-nodes path is
-still experimental and Postgres-only; for a pilot use single-node or active-passive.
 
 **For throughput on a single node, scale intra-node:** one independent delivery worker per outbound
 connection (a slow/failing lane never blocks siblings), and keep retry policies finite where head-of-line

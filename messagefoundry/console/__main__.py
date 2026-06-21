@@ -13,10 +13,13 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from importlib.resources import files
 
 from PySide6.QtCore import QSettings
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import QApplication, QDialog
 
+from messagefoundry.console import theme
 from messagefoundry.console.change_password import ChangePasswordDialog
 from messagefoundry.console.client import ApiError, EngineClient
 from messagefoundry.console.login import LoginDialog
@@ -32,6 +35,28 @@ _DEFAULT_SIZE = (2560, 1440)
 # valid for the server-side session lifetime. It lives in the OS keyring (Windows Credential
 # Manager) and is re-validated against /auth/me on startup, so a stale/revoked one is discarded.
 _KEYRING_SERVICE = "MessageFoundry"
+
+
+def _app_icon() -> QIcon:
+    """The MessageFoundry badge for the window title bar / Windows taskbar.
+
+    Ships in the wheel at ``messagefoundry/console/resources/app.ico`` (a multi-resolution
+    icon) and is the same artwork the Desktop/Start-Menu shortcut uses. A missing or unreadable
+    icon must never stop the console from opening, so every failure degrades to a null QIcon.
+    """
+    try:
+        resource = files("messagefoundry.console") / "resources" / "app.ico"
+        # A normal pip install exposes the resource as a real on-disk path, so QIcon reads the
+        # .ico directly and keeps every embedded size (Qt picks the best per request).
+        icon = QIcon(str(resource))
+        if not icon.isNull():
+            return icon
+        # Zip/odd install where the path isn't real: fall back to the bytes (single best frame).
+        pixmap = QPixmap()
+        pixmap.loadFromData(resource.read_bytes(), b"ICO")
+        return QIcon(pixmap)
+    except (OSError, ModuleNotFoundError):
+        return QIcon()
 
 
 def _load_token(base_url: str) -> str | None:
@@ -215,6 +240,9 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(sys.argv[:1])
     app.setOrganizationName("MessageFoundry")
     app.setApplicationName("Console")
+    app.setWindowIcon(_app_icon())  # title bar + Windows taskbar branding
+    # Apply the console's light theme before any window/dialog is built so sign-in inherits it too.
+    theme.apply_theme(app)
 
     try:
         client = EngineClient(

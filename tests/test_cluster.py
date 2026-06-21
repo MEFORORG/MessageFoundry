@@ -63,14 +63,6 @@ class _NotLeaderCoordinator:
     def is_leader(self) -> bool:
         return False
 
-    def owns_lane(self, lane_key: str) -> bool:
-        return False
-
-    def lane_owner(self) -> str | None:
-        # A clustered stand-in: gate FIFO claims by this node's identity (so the runner threads it
-        # through to claim_next_fifo). Distinct from the null coordinator's None.
-        return self.node_id
-
     def reclaims_inflight(self) -> bool:
         return False
 
@@ -118,13 +110,6 @@ async def test_null_coordinator_gates_always_true() -> None:
     coord = NullCoordinator()
     assert _NODE_ID_RE.match(coord.node_id)
     assert coord.is_leader() is True
-    assert coord.owns_lane("anything") is True
-    assert coord.owns_lane("") is True
-
-
-def test_null_coordinator_lane_owner_is_none() -> None:
-    # Single-node: no lane leasing — claim_next_fifo takes its byte-identical no-owner path. (Step 5.)
-    assert NullCoordinator().lane_owner() is None
 
 
 async def test_null_coordinator_cluster_members_is_single_self_leader() -> None:
@@ -139,24 +124,6 @@ async def test_null_coordinator_cluster_members_is_single_self_leader() -> None:
     assert m.is_leader is True
     assert m.status == "active"
     assert m.started_at is None and m.last_seen is None
-
-
-def test_db_coordinator_lane_owner_is_node_id() -> None:
-    # Clustered: gate FIFO claims by this node's identity so claim_next_fifo leases the lane to us.
-    # Construction-only (no pool touched). (Track B Step 5.)
-    assert DbCoordinator(None, "node-x").lane_owner() == "node-x"
-
-
-def test_db_coordinator_owns_lane_reads_cached_set() -> None:
-    # owns_lane() is a cheap, eventually-consistent HINT over the per-tick lane-lease cache (NOT the
-    # correctness gate — the claim-time atomic lease is). A freshly-built coordinator holds no lanes;
-    # after the maintenance loop refreshes the cache it reports membership. Construction-only here:
-    # drive the cache directly (the live refresh against Postgres is in the gated PG suite).
-    coord = DbCoordinator(None, "n")
-    assert coord.owns_lane("outbound:OB1") is False  # empty cache
-    coord._owned_lanes = {"outbound:OB1"}
-    assert coord.owns_lane("outbound:OB1") is True
-    assert coord.owns_lane("outbound:OB2") is False
 
 
 def test_null_coordinator_does_not_reclaim_inflight() -> None:
@@ -198,13 +165,13 @@ def test_db_coordinator_starts_not_leader() -> None:
 
 
 def test_db_coordinator_logs_cluster_enabled_once(monkeypatch, caplog) -> None:
-    # Track B Step 7: the scale-out feature set is COMPLETE, so the one-time cluster-enabled banner is
-    # now an INFO (not a WARNING) that states the feature set is built and summarizes the operational
-    # assumptions operators must honor. Lock that it: (1) fires exactly once at INFO level, (2) NO LONGER
-    # calls the cluster feature "experimental", (3) still credits Steps 4/4b/5/6/6b AND now Step 7, and
-    # (4) names the NTP / identical-config / coordinated-restart assumptions + points at the docs. A
-    # regression that reverts it to the old experimental WARNING, drops a step, or drops the assumptions
-    # is caught. The banner is process-global one-time, so reset the guard for a fresh emit.
+    # Track B Step 7: the active-passive HA feature set is COMPLETE, so the one-time cluster-enabled
+    # banner is now an INFO (not a WARNING) that states the feature set is built and summarizes the
+    # operational assumptions operators must honor. Lock that it: (1) fires exactly once at INFO level,
+    # (2) NO LONGER calls the cluster feature "experimental", (3) still credits Steps 4/4b/6/6b AND now
+    # Step 7, and (4) names the NTP / identical-config / coordinated-restart assumptions + points at the
+    # docs. A regression that reverts it to the old experimental WARNING, drops a step, or drops the
+    # assumptions is caught. The banner is process-global one-time, so reset the guard for a fresh emit.
     import logging
 
     import messagefoundry.pipeline.cluster as cluster_mod
@@ -220,9 +187,9 @@ def test_db_coordinator_logs_cluster_enabled_once(monkeypatch, caplog) -> None:
     msg = enabled[0].getMessage()
     # The cluster feature is no longer called experimental anywhere in the banner.
     assert "experimental" not in msg.lower()
-    # Still credits the full built feature set, now including the Step-7 observability API.
+    # Still credits the full built active-passive HA feature set, including the Step-7 observability API.
+    assert "active-passive" in msg.lower()
     assert "Step 4b" in msg and "poll-source" in msg.lower()
-    assert "Step 5" in msg and "preserved" in msg.lower()
     assert "Step 6" in msg and "convergence" in msg.lower()
     assert "Step 6b" in msg and "Step 7" in msg
     assert "/cluster/status" in msg and "/cluster/nodes" in msg
@@ -536,19 +503,19 @@ async def test_follower_file_source_does_not_ingest(tmp_path: Path) -> None:
         await eng.stop()
 
 
-# --- Step 5: the runner threads coordinator.lane_owner() into every FIFO claim ----
+# --- the FIFO workers claim each lane without an owner kwarg (active-active excised) ----
 
 
-class _FifoOwnerSpyStore:
-    """A store stand-in whose ``claim_next_fifo`` records the ``owner`` kwarg the runner passed, then
-    stops the worker loop and returns ``None``. Lets a test prove each FIFO worker threads
-    ``coordinator.lane_owner()`` through (None single-node, node_id clustered) without a real store."""
+class _FifoClaimSpyStore:
+    """A store stand-in whose ``claim_next_fifo`` records the args it was called with, then stops the
+    worker loop and returns ``None``. Lets a test prove each FIFO worker still claims its lane after the
+    active-active ``owner`` kwarg was removed (no owner threading remains)."""
 
     supports_ingest_stage = True
 
     def __init__(self, stop: asyncio.Event) -> None:
         self._stop = stop
-        self.owners: list[str | None] = []
+        self.calls: list[tuple[str, str]] = []
 
     async def claim_next_fifo(
         self,
@@ -556,16 +523,15 @@ class _FifoOwnerSpyStore:
         now: float | None = None,
         *,
         stage: str = "outbound",
-        owner: str | None = None,
     ) -> None:
-        self.owners.append(owner)
+        self.calls.append((name, stage))
         self._stop.set()  # one claim then break the worker loop
         return None
 
 
-async def _run_one_claim(coordinator: ClusterCoordinator, worker: str) -> list[str | None]:
+async def _run_one_claim(coordinator: ClusterCoordinator, worker: str) -> list[tuple[str, str]]:
     """Drive a single FIFO worker through exactly one claim against the spy store and return the
-    recorded owner kwargs."""
+    recorded (name, stage) calls."""
     from messagefoundry.pipeline.wiring_runner import RegistryRunner
 
     # poll_interval=0 so the post-claim _wait_for_work returns instantly (the spy already set _stop, so
@@ -573,35 +539,32 @@ async def _run_one_claim(coordinator: ClusterCoordinator, worker: str) -> list[s
     runner = RegistryRunner(
         Registry(), store=_NullStore(), coordinator=coordinator, poll_interval=0.0
     )  # type: ignore[arg-type]
-    spy = _FifoOwnerSpyStore(runner._stop)
+    spy = _FifoClaimSpyStore(runner._stop)
     runner.store = spy  # type: ignore[assignment]
     await getattr(runner, worker)("LANE")
-    return spy.owners
+    return spy.calls
 
 
-async def test_delivery_worker_threads_lane_owner_single_node() -> None:
-    # NullCoordinator → lane_owner() None → the byte-identical no-owner FIFO claim.
-    owners = await _run_one_claim(NullCoordinator(), "_delivery_worker")
-    assert owners == [None]
+async def test_fifo_workers_claim_lane_single_node() -> None:
+    # NullCoordinator (single node): each FIFO worker claims its lane by name + stage with no owner
+    # kwarg (active-active lane ownership was excised).
+    expected = {
+        "_delivery_worker": ("LANE", "outbound"),
+        "_router_worker": ("LANE", "ingress"),
+        "_transform_worker": ("LANE", "routed"),
+    }
+    for worker, call in expected.items():
+        calls = await _run_one_claim(NullCoordinator(), worker)
+        assert calls == [call]
 
 
-async def test_router_worker_threads_lane_owner_single_node() -> None:
-    owners = await _run_one_claim(NullCoordinator(), "_router_worker")
-    assert owners == [None]
-
-
-async def test_transform_worker_threads_lane_owner_single_node() -> None:
-    owners = await _run_one_claim(NullCoordinator(), "_transform_worker")
-    assert owners == [None]
-
-
-async def test_fifo_workers_thread_lane_owner_when_clustered() -> None:
-    # A clustered coordinator → lane_owner() == node_id → every FIFO worker passes it to claim_next_fifo
-    # so the store leases the lane to this node (single-owner-per-lane → strict FIFO across nodes).
+async def test_fifo_workers_claim_lane_when_clustered() -> None:
+    # A clustered (active-passive) coordinator: the workers still claim their lane the same way — there
+    # is no per-node owner threading anymore (the graph runs on the leader only).
     fake = _NotLeaderCoordinator()
     for worker in ("_delivery_worker", "_router_worker", "_transform_worker"):
-        owners = await _run_one_claim(fake, worker)
-        assert owners == [fake.node_id]
+        calls = await _run_one_claim(fake, worker)
+        assert len(calls) == 1
 
 
 class _NullStore:

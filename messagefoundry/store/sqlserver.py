@@ -44,6 +44,7 @@ from messagefoundry.store.store import (
     DbStatus,
     DestinationMetrics,
     InboundMetrics,
+    LatencyHistogram,
     CapturedResponse,
     MessageStatus,
     MessageStore,
@@ -1753,15 +1754,13 @@ class SqlServerStore:
         now: float | None = None,
         *,
         stage: str = Stage.OUTBOUND.value,
-        owner: str | None = None,
     ) -> OutboxItem | None:
         """Claim the single oldest *due* pending row for one lane at ``stage`` (strict FIFO — the head
         blocks the lane while it backs off, via the WHERE on the UPDATE). The lane key is stage-aware
         (``destination_name`` outbound, ``channel_id`` ingress/routed); ordering is ``created_at, seq``
-        (the IDENTITY tiebreak preserving same-txn insertion order — NOT the random uuid ``id``).
-        ``owner`` (Track B lane ownership) is accepted for protocol uniformity and IGNORED: this backend
-        is single-node (one worker per lane), so owner/lease stay NULL and the runner never passes a
-        non-None owner.
+        (the IDENTITY tiebreak preserving same-txn insertion order — NOT the random uuid ``id``). This
+        backend runs active-passive HA with one active node (the leader), so owner/lease stay NULL on
+        the FIFO claim and the runner never owns lanes.
 
         NB: the head SELECT takes ``(UPDLOCK, ROWLOCK)`` but deliberately **NOT** ``READPAST``. With one
         serial consumer per lane, the only transaction that can hold a lock on the FIFO head is the
@@ -3012,3 +3011,40 @@ class SqlServerStore:
                 last_done_at=r["last_done_at"],
             )
         return ConnectionMetrics(inbound=inbound, destinations=destinations)
+
+    async def delivery_latency_histogram(
+        self, *, buckets: Sequence[float], now: float | None = None
+    ) -> Sequence[LatencyHistogram]:
+        """Per-(channel_id, destination_name) delivery-latency histogram over outbound rows that
+        reached status='done'. Latency = updated_at - created_at (seconds), clamped to >= 0 (clock-
+        skew guard). bucket_counts are CUMULATIVE (Prometheus le semantics). Read-only; runs off the
+        event loop."""
+        # Only the NUMBER of CASE clauses (len(buckets)) is generated; each boundary is a BOUND
+        # parameter (never string-interpolated), so this is injection-safe.
+        bucket_cols = ", ".join(
+            f"SUM(CASE WHEN (updated_at - created_at) <= ? THEN 1 ELSE 0 END) AS b{i}"
+            for i in range(len(buckets))
+        )
+        select_cols = f"{bucket_cols}, " if bucket_cols else ""
+        sql = (
+            "SELECT channel_id, destination_name, "
+            f"{select_cols}"
+            "SUM(CASE WHEN updated_at >= created_at THEN updated_at - created_at ELSE 0 END)"
+            " AS sum_seconds,"
+            " COUNT(*) AS cnt"
+            " FROM queue WHERE stage=? AND status=?"
+            " GROUP BY channel_id, destination_name"
+            " ORDER BY channel_id, destination_name"
+        )
+        params: tuple[Any, ...] = (*buckets, Stage.OUTBOUND.value, OutboxStatus.DONE.value)
+        rows = await self._fetchall(sql, params)
+        return [
+            LatencyHistogram(
+                channel_id=r["channel_id"],
+                destination_name=r["destination_name"],
+                bucket_counts=tuple(int(r[f"b{i}"] or 0) for i in range(len(buckets))),
+                sum_seconds=float(r["sum_seconds"] or 0),
+                count=int(r["cnt"] or 0),
+            )
+            for r in rows
+        ]

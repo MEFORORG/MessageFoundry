@@ -134,6 +134,21 @@ async def _forward_once(
     return outcome, code, detail
 
 
+class _WorkerStop:
+    """Singleton sentinel queued by :meth:`TeeRelay.stop` so the MEFOR shadow worker exits cleanly
+    out of its ``Queue.get()`` instead of being cancelled mid-wait.
+
+    BACKLOG #17: on CPython 3.11, ``task.cancel()`` of a task parked in ``asyncio.Queue.get()``
+    intermittently fails to complete — the getter future stays pending, the task stays in the
+    ``cancelling`` state, and ``await self._mefor_worker`` in :meth:`stop` wedges until the test
+    watchdog fires. (Reproduced on a py3.11 container; fixed in CPython 3.12, which is why py3.13 is
+    clean and production — a single long-lived loop — never hits it.) Stopping via a queued sentinel
+    sidesteps the cancellation path entirely."""
+
+
+_WORKER_STOP = _WorkerStop()
+
+
 class TeeRelay:
     """An MLLP tee relay. Build with a :class:`RelayConfig`, then ``start()`` / ``stop()`` (or
     ``serve_forever()`` for the CLI)."""
@@ -146,7 +161,7 @@ class TeeRelay:
         self._epic_server: asyncio.Server | None = None
         self._copy_server: asyncio.Server | None = None
         self._epic_writers: set[asyncio.StreamWriter] = set()
-        self._mefor_queue: asyncio.Queue[_MeforItem] = asyncio.Queue()
+        self._mefor_queue: asyncio.Queue[_MeforItem | _WorkerStop] = asyncio.Queue()
         self._mefor_worker: asyncio.Task[None] | None = None
 
     # -- properties ----------------------------------------------------------
@@ -232,7 +247,16 @@ class TeeRelay:
             with suppress(OSError):
                 await writer.wait_closed()
         if self._mefor_worker is not None:
-            self._mefor_worker.cancel()
+            # Stop the shadow worker by queueing a sentinel so it returns cleanly from its
+            # Queue.get(), rather than cancel()-ing a task parked in get() — which intermittently
+            # deadlocks on CPython 3.11 (BACKLOG #17, see _WorkerStop). put_nowait succeeds whenever
+            # the worker is actually parked in get() (an empty queue is never full); the QueueFull
+            # fallback only fires when the queue is non-empty, i.e. the worker is NOT in get(), so
+            # cancel() is safe there.
+            try:
+                self._mefor_queue.put_nowait(_WORKER_STOP)
+            except asyncio.QueueFull:
+                self._mefor_worker.cancel()
             with suppress(asyncio.CancelledError):
                 await self._mefor_worker
         if self.store is not None:
@@ -416,7 +440,7 @@ class TeeRelay:
         try:
             dropped = self._mefor_queue.get_nowait()
             self._mefor_queue.task_done()
-            dropped_id = dropped.control_id
+            dropped_id = dropped.control_id if isinstance(dropped, _MeforItem) else None
         except asyncio.QueueEmpty:
             pass
         try:
@@ -437,6 +461,9 @@ class TeeRelay:
         cfg = self.config
         while True:
             item = await self._mefor_queue.get()
+            if isinstance(item, _WorkerStop):  # clean shutdown signal from stop() (BACKLOG #17)
+                self._mefor_queue.task_done()
+                return
             try:
                 try:
                     outcome, code, detail = await _forward_once(

@@ -7,11 +7,10 @@ Server store's pool is aioodbc (cursor-based, ``?`` params, tuple rows). This cl
 sibling: it implements the same :class:`~messagefoundry.pipeline.cluster.ClusterCoordinator` contract so
 a hot standby can take over when the primary dies, but on aioodbc + T-SQL.
 
-**Scope = active-passive ONLY.** It provides leader election (the self-fencing ``leader_lease``) +
-membership/observability + the cross-node config-version token. It does NOT provide the active-active
-per-lane row leases — :meth:`lane_owner` returns ``None`` and :meth:`owns_lane` returns ``True`` (the
-single active node, the leader, drains every lane on the unchanged no-owner claim path). Per-lane FIFO
-ownership across many active nodes stays Postgres-only (0.2 scale-out).
+**Scope = active-passive ONLY** (the only HA model MessageFoundry ships; active-active per-lane row
+leases were never shipped and are not built on any backend). It provides leader election (the
+self-fencing ``leader_lease``) + membership/observability + the cross-node config-version token. The
+single active node (the leader) drains every lane on the unchanged FIFO claim path.
 
 The leadership lease, self-fence watchdog, and cached cheap/synchronous gates are identical in *design*
 to :class:`DbCoordinator` (see that module's docstring) — the in-memory pieces (fence math, ``is_leader``
@@ -75,7 +74,7 @@ _logged_cluster_enabled = False
 class SqlServerCoordinator:
     """Active-passive leader election + membership on the SQL Server store (aioodbc + T-SQL).
 
-    Mirrors :class:`~messagefoundry.pipeline.cluster.DbCoordinator` minus the active-active lane leases.
+    Mirrors :class:`~messagefoundry.pipeline.cluster.DbCoordinator`.
     On :meth:`start` it idempotently creates the ``nodes`` / ``leader_lease`` / ``cluster_config`` tables
     (under the store's ``sp_getapplock`` DDL guard), upserts this node, and spawns a **maintenance** task
     (heartbeat + lease acquire/renew + config-version refresh each tick) and a DB-free **fence watchdog**
@@ -160,12 +159,6 @@ class SqlServerCoordinator:
 
     def is_leader(self) -> bool:
         return self._is_leader  # cached; no DB. The active-passive gate.
-
-    def owns_lane(self, lane_key: str) -> bool:
-        return True  # active-passive: the single active node (leader) owns every lane.
-
-    def lane_owner(self) -> str | None:
-        return None  # no per-lane leasing → claim_next_fifo takes its unchanged no-owner path.
 
     def reclaims_inflight(self) -> bool:
         # OPEN (deferred to wiring): a standby is promoted WITHOUT a restart, so startup

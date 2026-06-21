@@ -56,7 +56,7 @@ Python/asyncio service; the console is a separate desktop application.
 > The embedded SQLite store needs no setup and suits pilots and single-node deployments. A
 > **server database is greenfield-only** — there is no in-place migration from a populated SQLite
 > store; drain and cut over. The DB tier owns its own backup, HA, and (SQL Server) TDE / purge
-> maintenance. A server database is also the **horizontal scale path** — see below.
+> maintenance. A server database is also the **concurrency / scale substrate** — see below.
 
 ## Administration clients
 
@@ -98,12 +98,15 @@ So per-process throughput is governed, in order, by:
    committed transaction. In-process **SQLite is fastest per write**; a **server DB is slower per
    single write** (network + MVCC) but is the concurrency substrate (next point).
 
-**To exceed one core**, the current architecture scales **horizontally**: run **multiple engine
-processes sharded by inbound connection**, each on its own core, all draining **one shared server
-database** (PostgreSQL or SQL Server) via `SELECT ... FOR UPDATE SKIP LOCKED` with per-lane FIFO
-ownership preserved across processes. Throughput then scales with worker processes until the
-**database's commit capacity** is the wall. (SQLite is single-writer and does **not** scale this way —
-it is the single-process / single-node store.)
+**To exceed one core today**, scale **intra-node** on a server DB: many connections / lanes / delivery
+workers draining **one shared server database** (PostgreSQL or SQL Server) concurrently via
+`SELECT ... FOR UPDATE SKIP LOCKED` + row leases. Throughput scales with workers until the **database's
+commit capacity** is the wall. (SQLite is single-writer and does **not** scale this way — it is the
+single-process / single-node store.) Engine HA is **single-leader active-passive** — the graph runs on
+the leader only. A **multi-process, sharded-by-inbound** scale-out (multiple engines, each owning a
+disjoint set of inbounds, on the shared DB) is a **future direction, not a built capability**: the
+per-lane ownership that would have made concurrent same-lane multi-process draining safe was part of the
+**dropped active-active feature and its code was removed (2026-06-18)**.
 
 ### Tiers
 
@@ -112,22 +115,24 @@ it is the single-process / single-node store.)
 | **Pilot / light** | up to ~50 msg/s | up to ~1–4 M/day | 1 process, single node | SQLite | 2 cores / 4 GB |
 | **Standard single-node** | ~50–200 msg/s | ~4–15 M/day | 1 process, single node | SQLite, or PostgreSQL / SQL Server | 4 cores / 8 GB |
 | **High single-node** | ~200–500 msg/s | ~15–40 M/day | 1 process, tuned (lean transforms; finite-retry on hot lanes) | Server DB recommended (PostgreSQL / SQL Server) | 4–8 cores / 16 GB |
-| **Scale-out (single box, multi-process)** | ~500 – low-thousands msg/s | ~40 M+/day | **N processes sharded by inbound**, shared store via `SKIP LOCKED` | **PostgreSQL / SQL Server** (required — not SQLite) | 8+ cores / 32 GB + a dedicated DB host sized to the commit load |
+| **High single-node, concurrent** | up to ~500 – low-thousands msg/s | up to ~40 M+/day | 1 process, many connections / lanes draining concurrently via `SKIP LOCKED` | **PostgreSQL / SQL Server** (required — not SQLite) | 8+ cores / 32 GB + a dedicated DB host sized to the commit load |
 
 **Reading the tiers**
 
 - *Peak sustained* is a **per-second** capacity estimate. Healthcare feeds are bursty; real **average**
   rate (and therefore daily volume) is typically a fraction of peak, so the *indicative daily volume*
   columns assume a realistic duty cycle, not `peak × 86,400`.
-- The **single-process ceiling** is roughly the "High single-node" row — a few hundred msg/s with real
-  transforms, approaching ~1000 msg/s only for light/pass-through work. Past that you are over one
-  core's budget and must scale out.
-- The **estimated maximum as currently architected** is the **scale-out** row: multiply the per-core
-  rate by the number of engine processes you can run, bounded by the shared database's commit ceiling.
-  There is no fixed published cap — on a well-provisioned box with a tuned server DB this lands in the
-  **low thousands of msg/s**, beyond which you are **database-bound** and scale the DB tier (and, if
-  needed, add nodes behind it). Group-commit and a lazy MSH-only routing peek are identified 0.2
-  levers to raise the per-core ceiling ([THROUGHPUT-IMPROVEMENTS.md](THROUGHPUT-IMPROVEMENTS.md)).
+- The **single-stream / single-core ceiling** is roughly the "High single-node" row — a few hundred
+  msg/s with real transforms, approaching ~1000 msg/s only for light/pass-through work. Past that on one
+  feed you are over one core's budget.
+- The **estimated maximum as currently architected** is the **"High single-node, concurrent"** row: one
+  engine process, many connections / lanes draining the shared server DB concurrently via `SKIP LOCKED`,
+  bounded by the database's commit ceiling. There is no fixed published cap — on a well-provisioned box
+  with a tuned server DB this lands in the **low thousands of msg/s**, beyond which you are
+  **database-bound** and scale the DB tier. (A multi-process, sharded-by-inbound scale-out beyond one
+  engine is a **future direction, not built** — the active-active lane-ownership it would have needed was
+  dropped and its code removed, 2026-06-18.) Group-commit and a lazy MSH-only routing peek are identified
+  0.2 levers to raise the per-core ceiling ([THROUGHPUT-IMPROVEMENTS.md](THROUGHPUT-IMPROVEMENTS.md)).
 
 > **Single-stream server-DB caveat.** Because each staged handoff is a committed round-trip, a single
 > delivery worker against a *remote* server DB drains far slower than in-process SQLite (the SQL Server
@@ -143,7 +148,10 @@ it is the single-process / single-node store.)
   **zero-loss reconciliation** as the headline gate — throughput is meaningless if messages were lost.
 - The embedded store has ~3× write amplification and a single-writer ceiling; move to PostgreSQL or
   SQL Server when that becomes the bottleneck.
-- Scale **intra-node first** (one delivery worker per outbound; keep retry policies finite where
-  head-of-line blocking on a shared FIFO lane would otherwise stall a lane), then **multi-process /
-  scale-out** on a server DB. Engine-native multi-node HA/failover is not a v0.1 capability — provide
-  HA operationally at the DB tier + a load-balancer VIP if required.
+- Scale **intra-node** on a server DB (one delivery worker per outbound; many connections / lanes
+  draining concurrently via `SKIP LOCKED`; keep retry policies finite where head-of-line blocking on a
+  shared FIFO lane would otherwise stall a lane). A multi-process scale-out beyond one engine is a
+  **future direction, not built** (the active-active lane-ownership it would need was dropped + removed,
+  2026-06-18). Engine **HA** is **active-passive failover** (opt-in leader/standby cluster on shared
+  PostgreSQL — see [CLUSTERING.md](CLUSTERING.md)); delegate **DB-tier** HA to the database + a
+  load-balancer VIP.

@@ -22,6 +22,12 @@ from pathlib import Path
 
 import messagefoundry
 
+# sc.exe is a console program; launched from the GUI process (pythonw has no console) each call
+# would briefly pop a console window — on the Status page's state poll that means a terminal
+# flashing every few seconds. CREATE_NO_WINDOW suppresses it (Windows-only flag; 0/no-op elsewhere,
+# and via getattr so it type-checks on non-Windows where the attribute doesn't exist).
+_NO_WINDOW: int = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 __all__ = [
     "service_state",
     "control_service",
@@ -79,7 +85,13 @@ def service_state(name: str) -> str:
         return "unavailable"  # never let an unsafe name enable the (elevated) control buttons
     try:
         # nosec: fixed system tool (sc), no shell; `name` is validated above (low-16).
-        proc = subprocess.run(["sc", "query", name], capture_output=True, text=True, timeout=5)  # nosec B603 B607
+        proc = subprocess.run(
+            ["sc", "query", name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=_NO_WINDOW,  # don't flash a console window from the GUI process
+        )  # nosec B603 B607
     except (OSError, subprocess.SubprocessError):
         return "unavailable"
     if proc.returncode != 0:

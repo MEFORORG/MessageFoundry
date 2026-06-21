@@ -17,10 +17,9 @@ copy. (A migration tool is out of scope for v0.1.)
 
 Both server backends are **production-supported** (no "experimental" label):
 
-- **PostgreSQL** — full staged pipeline, advisory-lock concurrency, row leases; backs both active-passive
-  HA and the 0.2 active-active scale-out.
-- **SQL Server** — full staged pipeline + query/response capture; **active-passive only** (no per-lane
-  row leases — the leader-gate + self-fence keep a single active processor).
+- **PostgreSQL** — full staged pipeline, advisory-lock concurrency, row leases; backs active-passive HA.
+- **SQL Server** — full staged pipeline + query/response capture; **active-passive too** — the
+  leader-gate + self-fence keep a single active processor.
 
 ---
 

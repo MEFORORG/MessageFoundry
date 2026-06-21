@@ -1,7 +1,7 @@
 name: Security
 
-# Security gate: Python SAST (bandit), dependency audit (pip-audit), secret scan (gitleaks), and
-# project SAST rules (semgrep).
+# Security gate: Python SAST (bandit), Python dependency audit (pip-audit), npm dependency audit
+# (npm-audit, for the ide/ extension), secret scan (gitleaks), and project SAST rules (semgrep).
 #   All four are BLOCKING — their first CI run was clean (bandit: 0; gitleaks: 0; semgrep: 0 across
 #   5 rules; pip-audit: no known CVEs), so each now fails the build on a regression rather than
 #   merging unnoticed. To temporarily downgrade one, add `continue-on-error: true` back to its job.
@@ -53,6 +53,27 @@ jobs:
           # Audit the committed, pinned set — reproducible (vs auditing a fresh latest-resolve).
           pip-audit -r requirements.lock --desc
 
+  npm-audit:
+    name: npm-audit (ide dependency vulnerabilities)
+    runs-on: ubuntu-latest
+    # BLOCKING: the ide/ npm tree (the VS Code extension's build-time toolchain) audits clean today, so a
+    # newly-disclosed advisory in a pinned npm dep now turns CI red — the same forcing function as
+    # pip-audit, extended to the extension's supply chain (previously only pip + github-actions were
+    # watched). `overrides` in ide/package.json is where a triaged transitive advisory gets pinned out.
+    defaults:
+      run:
+        working-directory: ide
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "24"
+      - name: Audit the locked npm dependencies (install-free)
+        # --package-lock-only audits straight from the committed package-lock.json (no install needed) —
+        # fast and reproducible. Default level fails on ANY severity, matching pip-audit's strict posture.
+        run: npm audit --package-lock-only
+
   sbom:
     name: SBOM (CycloneDX)
     runs-on: ubuntu-latest
@@ -101,7 +122,10 @@ jobs:
           #   B110 try/except/pass — best-effort resource cleanup
           #   B608 hardcoded SQL — f-strings interpolate only literal column names; values are bound
           #                        params (verified — see security review STORE-4)
-          bandit -r messagefoundry --skip B101,B110,B311,B404,B608
+          # `tee/` is in-tree vendored SOUP (a standalone relay) — scanned to the SAME bar as the
+          # engine. Its one urllib GET (tee/mefor_api.py) is per-line `# nosec B310`: the URL scheme is
+          # fixed by operator config (default localhost), never message-derived.
+          bandit -r messagefoundry tee --skip B101,B110,B311,B404,B608
 
   gitleaks:
     name: gitleaks (secret scan)
@@ -135,7 +159,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip "semgrep~=1.90"
           # --error: any finding fails the step — and the job, now that this gate is blocking.
-          semgrep --config .semgrep --error --metrics off messagefoundry
+          # Includes `tee/` (in-tree vendored SOUP) so the standalone relay is held to the same
+          # dangerous-sink rules as the engine.
+          semgrep --config .semgrep --error --metrics off messagefoundry tee
 
   crypto-inventory:
     name: crypto-inventory (ASVS 11.1.3 discovery gate)

@@ -27,10 +27,16 @@ import re
 from typing import TYPE_CHECKING, Any
 
 import hl7
+from defusedxml.ElementTree import fromstring as _xml_fromstring
 
+import messagefoundry.parsing.binary as _binary
 from messagefoundry.parsing.peek import normalize, parse_path
 
 if TYPE_CHECKING:  # the SegmentGroup view imports Message back; keep the cycle out of runtime
+    from xml.etree.ElementTree import (  # nosec B405 — type-only import; all XML parsing goes through defusedxml
+        Element,
+    )
+
     from messagefoundry.parsing.groups import SegmentGroup
 
 # A segment id is exactly three chars: an upper-case letter then two alphanumerics (HL7 §2.5),
@@ -435,6 +441,15 @@ class RawMessage:
         self.raw = raw
         self.content_type = content_type
 
+    @classmethod
+    def from_bytes(cls, data: bytes, content_type: str) -> RawMessage:
+        """Carry raw ``data`` over the ``str``/TEXT ingress+store as base64 (ADR 0028 §3 — **the one
+        encode**). A SourceConnector handling a byte-oriented payload builds the ``RawMessage`` through
+        this factory, so :attr:`raw` is the self-describing ``mfb64:v1:<base64>`` carriage form that
+        survives the TEXT columns and the store cipher unchanged. Recover the bytes via
+        :attr:`raw_bytes`."""
+        return cls(_binary.encode(data), content_type)
+
     @property
     def text(self) -> str:
         """The body as text (alias for :attr:`raw`)."""
@@ -444,6 +459,43 @@ class RawMessage:
         """Parse the body as JSON. Raises ``json.JSONDecodeError`` on malformed input — a Handler can
         return ``None`` (FILTERED) or let it raise (ERROR / dead-letter)."""
         return json.loads(self.raw)
+
+    def xml(self) -> Element:
+        """Parse the body as XML, **hardened against XXE / entity-expansion** (ADR 0004, BACKLOG #31).
+
+        Backed by ``defusedxml`` with ``forbid_dtd`` / ``forbid_entities`` / ``forbid_external`` all
+        **ON** — the same no-DTD, external-entities-OFF posture as
+        :func:`messagefoundry.transports.soap._assert_well_formed_fragment`. Inbound XML is
+        attacker-influenceable, PHI-bearing data, so a DOCTYPE is **rejected, not parsed**: a
+        billion-laughs or external-entity (``file://`` / ``http://``) payload **raises** instead of
+        expanding entities or fetching a resource. The forbidden-construct errors subclass
+        ``ValueError`` (``defusedxml.common.DefusedXmlException``), and malformed XML raises
+        ``xml.etree.ElementTree.ParseError`` — so a Handler can return ``None`` (FILTERED) or let it
+        raise (ERROR / dead-letter), symmetric with :meth:`json`."""
+        parsed: Element = _xml_fromstring(
+            self.raw, forbid_dtd=True, forbid_entities=True, forbid_external=True
+        )
+        return parsed
+
+    @property
+    def is_binary(self) -> bool:
+        """Whether :attr:`raw` is a base64 carriage value (ADR 0028) — i.e. :attr:`raw_bytes` will
+        decode it. Lets the console/replay/dead-letter raw-view detect a binary body without a
+        ``content_type`` registry (symmetric with the store cipher's ``is_encrypted``)."""
+        return _binary.is_marked(self.raw)
+
+    @property
+    def raw_bytes(self) -> bytes:
+        """The carried bytes (ADR 0028 §3 — **the one decode**): strips the ``mfb64:v1:`` marker and
+        base64-decodes :attr:`raw`. A binary codec (e.g. DICOM) calls this, **never** ``base64``
+        itself. Raises :class:`~messagefoundry.parsing.binary.BinaryCarriageError` if :attr:`raw` is
+        not a carriage value or its base64 is corrupt — so the message dead-letters (``ERROR``) rather
+        than yielding a silently-truncated body."""
+        return _binary.decode(self.raw)
+
+    def binary(self) -> bytes:
+        """The carried bytes — method form of :attr:`raw_bytes`, symmetric with :meth:`json`/:meth:`xml`."""
+        return self.raw_bytes
 
     def encode(self) -> str:
         """The body verbatim — symmetry with :meth:`Message.encode` so a pass-through ``Send`` works."""

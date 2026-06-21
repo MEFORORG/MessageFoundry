@@ -54,7 +54,7 @@ async def coords() -> AsyncIterator[tuple[Callable[..., DbCoordinator], object]]
     seed = DbCoordinator(store._pool, "seed", db_schema=settings.db_schema)
     await seed._ensure_nodes_table()
     async with store._pool.acquire() as conn:
-        await conn.execute("TRUNCATE nodes, leader_lease, lane_leases RESTART IDENTITY CASCADE")
+        await conn.execute("TRUNCATE nodes, leader_lease RESTART IDENTITY CASCADE")
 
     def make(node_id: str, **kw: object) -> DbCoordinator:
         c = DbCoordinator(

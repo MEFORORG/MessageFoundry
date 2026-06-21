@@ -4,7 +4,7 @@
   order §7.1) is being built now, the non-HL7 *source* (§7.2) follows as a separate PR. The *direction*
   was already chosen in [ADR 0003](0003-non-hl7-transports-database-rest-soap.md) §5 (option B). The four
   §"To resolve" leans are taken as the answers: **DB-IN first**; `RawMessage` = `.raw`/`.text`/`.json()`
-  (`.xml()` later); a **callable** summary hook; a small `content_type` **enum**. (Proposed → Accepted
+  (`.xml()` shipped #31); a **callable** summary hook; a small `content_type` **enum**. (Proposed → Accepted
   same day.)
 - **Built:** Nothing here yet. It builds on the **already-shipped** non-HL7 *destinations* (REST/DATABASE/
   SOAP, ADR 0003) and on a reliability core that is **already format-agnostic**: the staged queue +
@@ -141,6 +141,11 @@ inbound records `ERROR` (as today) and the source decides its wire response.
 1. **`RawMessage` surface** — exactly `.raw` / `.text` / `.content_type` / `.json()`? Add `.xml()` (needs
    a safe parser — `defusedxml`, a new dep) now or later? (lean: `.raw`/`.text`/`.json()` now; `.xml()`
    when the first XML source needs it.)
+   **Resolved (BACKLOG #31):** `.xml()` shipped, backed by `defusedxml` with `forbid_dtd` /
+   `forbid_entities` / `forbid_external` all ON (raise-don't-parse on a DOCTYPE so a Handler routes the
+   message to FILTERED/ERROR; mirrors `transports/soap.py::_assert_well_formed_fragment`). The
+   `lxml`/XSD/`[xml]`-extra `XmlMessage` layer stays **deferred** to a real namespace-heavy SOAP/CDA feed
+   (`defusedxml` does not cover `lxml`).
 2. **First non-HL7 source** — **REST-IN webhook** or **DB-IN poll** first? (lean: DB-IN — it reuses the
    File polling template and needs no new listener; the migration's "Data Point DBs" want it.)
 3. **Summary/id hook shape** — an optional per-inbound callable vs a declarative path expression. (lean:

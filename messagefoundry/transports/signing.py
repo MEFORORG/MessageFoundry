@@ -20,9 +20,14 @@ WS-Security timestamp/nonce (ADR 0015 §1): a re-run/retry re-mints the signatur
 transforms stay pure and the at-least-once invariant holds even for the randomized algorithms (PS256/
 ES256 produce a fresh signature per call — fine here, never in a transform).
 
-**Crypto.** Core ``cryptography`` only — **no new dependency** (ADR 0018). RSA (``RS256`` PKCS1-v1_5,
-``PS256`` PSS) or ECDSA (``ES256`` P-256), all SHA-256. ECDSA's DER signature is converted to the JOSE
-fixed-width ``r||s`` form (and back on verify), as JWS requires.
+**Crypto.** Core ``cryptography`` only — **no new dependency** (ADR 0018/0024). RSA (``RS256``/``RS384``
+PKCS1-v1_5, ``PS256`` PSS) or ECDSA (``ES256`` P-256, ``ES384`` P-384); SHA-256 except ``RS384``/``ES384``
+which are SHA-384. ECDSA's DER signature is converted to the JOSE fixed-width ``r||s`` form (and back on
+verify), as JWS requires.
+
+**Compact JWT.** Beside the detached JWS, :class:`CompactJwtSigner` mints an **attached** compact
+JWS/JWT (``header.payload.signature`` — a populated payload segment) for the SMART Backend Services
+``client_assertion`` (ADR 0024), reusing the same key-load + sign primitives.
 
 **Key management.** The private key is operator-supplied as inline PEM (via ``env()``) or a PEM file
 path (OS-protected, like a TLS key); it never leaves the box — only the public-verifiable signature
@@ -33,7 +38,7 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
@@ -52,11 +57,12 @@ from messagefoundry.config.models import (
 if (
     TYPE_CHECKING
 ):  # only for the with_signing() annotation — avoid importing the heavy wiring module
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
 
     from messagefoundry.config.wiring import ConnectionSpec
 
 __all__ = [
+    "CompactJwtSigner",
     "MessageSigner",
     "SigningError",
     "signer_from_destination",
@@ -70,6 +76,8 @@ _PublicKey = rsa.RSAPublicKey | ec.EllipticCurvePublicKey
 
 # ES256 = ECDSA on P-256: each of r and s is a fixed 32-byte big-endian integer in the JOSE encoding.
 _P256_COORD_BYTES = 32
+# ES384 = ECDSA on P-384: each of r and s is a fixed 48-byte big-endian integer (ADR 0024).
+_P384_COORD_BYTES = 48
 
 
 class SigningError(ValueError):
@@ -124,62 +132,83 @@ def _load_private_key(private_key: str, password: str | None) -> _PrivateKey:
     return key
 
 
+# The ECDSA algorithms and their (curve name, friendly name, JOSE coordinate width, hash) — keeps
+# _sign/_verify and _require_key_for_alg consistent about P-256/SHA-256 vs P-384/SHA-384.
+_EC_PARAMS: dict[SignatureAlgorithm, tuple[str, str, int, type[hashes.HashAlgorithm]]] = {
+    SignatureAlgorithm.ES256: ("secp256r1", "P-256", _P256_COORD_BYTES, hashes.SHA256),
+    SignatureAlgorithm.ES384: ("secp384r1", "P-384", _P384_COORD_BYTES, hashes.SHA384),
+}
+# RSA algorithms that use PKCS1-v1_5 padding, and the hash each one signs with.
+_RSA_PKCS1_HASH: dict[SignatureAlgorithm, type[hashes.HashAlgorithm]] = {
+    SignatureAlgorithm.RS256: hashes.SHA256,
+    SignatureAlgorithm.RS384: hashes.SHA384,
+}
+
+
 def _require_key_for_alg(key: _PrivateKey, alg: SignatureAlgorithm) -> None:
     """Reject a key that can't produce ``alg`` — loud at construction, not a wire-time surprise."""
-    if alg in (SignatureAlgorithm.RS256, SignatureAlgorithm.PS256):
+    if alg in _EC_PARAMS:  # ES256 / ES384 — ECDSA on a specific curve
+        curve_name, friendly, _, _ = _EC_PARAMS[alg]
+        if not isinstance(key, ec.EllipticCurvePrivateKey):
+            raise SigningError(f"{alg.value} requires an EC private key, got {type(key).__name__}")
+        if key.curve.name != curve_name:
+            raise SigningError(
+                f"{alg.value} requires a {friendly} ({curve_name}) key, got curve {key.curve.name!r}"
+            )
+    else:  # RS256 / RS384 / PS256 — RSA
         if not isinstance(key, rsa.RSAPrivateKey):
             raise SigningError(f"{alg.value} requires an RSA private key, got {type(key).__name__}")
-    else:  # ES256
-        if not isinstance(key, ec.EllipticCurvePrivateKey):
-            raise SigningError(f"ES256 requires an EC private key, got {type(key).__name__}")
-        if key.curve.name != "secp256r1":
-            raise SigningError(
-                f"ES256 requires a P-256 (secp256r1) key, got curve {key.curve.name!r}"
-            )
 
 
 def _sign(key: _PrivateKey, alg: SignatureAlgorithm, data: bytes) -> bytes:
     """The raw JOSE signature bytes for ``data`` under ``alg`` (ECDSA DER → fixed-width ``r||s``)."""
-    if alg is SignatureAlgorithm.ES256:
+    if alg in _EC_PARAMS:
         if not isinstance(
             key, ec.EllipticCurvePrivateKey
         ):  # defensive — guaranteed by construction
-            raise SigningError("ES256 requires an EC key")
-        der = key.sign(data, ec.ECDSA(hashes.SHA256()))
+            raise SigningError(f"{alg.value} requires an EC key")
+        _, _, coord, hash_cls = _EC_PARAMS[alg]
+        der = key.sign(data, ec.ECDSA(hash_cls()))
         r, s = decode_dss_signature(der)
-        return r.to_bytes(_P256_COORD_BYTES, "big") + s.to_bytes(_P256_COORD_BYTES, "big")
+        return r.to_bytes(coord, "big") + s.to_bytes(coord, "big")
     if not isinstance(key, rsa.RSAPrivateKey):  # defensive — guaranteed by construction
-        raise SigningError("RS256/PS256 require an RSA key")
+        raise SigningError("RS256/RS384/PS256 require an RSA key")
     if alg is SignatureAlgorithm.PS256:
         return key.sign(
             data,
             padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
             hashes.SHA256(),
         )
-    return key.sign(data, padding.PKCS1v15(), hashes.SHA256())
+    return key.sign(data, padding.PKCS1v15(), _RSA_PKCS1_HASH[alg]())
 
 
 def _verify(public_key: _PublicKey, alg: SignatureAlgorithm, data: bytes, signature: bytes) -> None:
     """Verify ``signature`` over ``data`` under ``alg``; raises
     :class:`cryptography.exceptions.InvalidSignature` on mismatch, :class:`SigningError` on a
     structurally wrong signature/key."""
-    if alg is SignatureAlgorithm.ES256:
+    if alg in _EC_PARAMS:
         if not isinstance(public_key, ec.EllipticCurvePublicKey):
-            raise SigningError(f"ES256 needs an EC public key, got {type(public_key).__name__}")
-        if len(signature) != 2 * _P256_COORD_BYTES:
-            raise SigningError("ES256 signature must be 64 bytes (r||s)")
-        r = int.from_bytes(signature[:_P256_COORD_BYTES], "big")
-        s = int.from_bytes(signature[_P256_COORD_BYTES:], "big")
-        public_key.verify(encode_dss_signature(r, s), data, ec.ECDSA(hashes.SHA256()))
+            raise SigningError(
+                f"{alg.value} needs an EC public key, got {type(public_key).__name__}"
+            )
+        _, _, coord, hash_cls = _EC_PARAMS[alg]
+        if len(signature) != 2 * coord:
+            raise SigningError(f"{alg.value} signature must be {2 * coord} bytes (r||s)")
+        r = int.from_bytes(signature[:coord], "big")
+        s = int.from_bytes(signature[coord:], "big")
+        public_key.verify(encode_dss_signature(r, s), data, ec.ECDSA(hash_cls()))
         return
     if not isinstance(public_key, rsa.RSAPublicKey):
         raise SigningError(f"{alg.value} needs an RSA public key, got {type(public_key).__name__}")
-    pad: padding.AsymmetricPadding = (
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH)
-        if alg is SignatureAlgorithm.PS256
-        else padding.PKCS1v15()
-    )
-    public_key.verify(signature, data, pad, hashes.SHA256())
+    if alg is SignatureAlgorithm.PS256:
+        pad: padding.AsymmetricPadding = padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH
+        )
+        rsa_hash: hashes.HashAlgorithm = hashes.SHA256()
+    else:
+        pad = padding.PKCS1v15()
+        rsa_hash = _RSA_PKCS1_HASH[alg]()
+    public_key.verify(signature, data, pad, rsa_hash)
 
 
 class MessageSigner:
@@ -222,6 +251,52 @@ class MessageSigner:
     def verify(self, jws: str, payload: bytes) -> None:
         """Verify a JWS this signer produced against ``payload`` (the self-verify / round-trip path)."""
         verify_detached_jws(jws, payload, self.public_key, allowed_algorithms=(self.algorithm,))
+
+
+class CompactJwtSigner:
+    """Mints an **attached compact JWS/JWT** (``header.payload.signature``) for an OAuth2
+    ``client_assertion`` — the SMART Backend Services credential (ADR 0024).
+
+    Unlike :class:`MessageSigner` (a *detached* JWS over an HTTP body, with an **empty** payload
+    segment), this carries the base64url-encoded **claim set** in the payload segment, as a JWT
+    requires. Built once — the key is loaded + validated here (a bad key/curve fails loud at
+    construction), then :meth:`sign` is called per token request with fresh claims (``jti``/``exp``).
+    Core ``cryptography`` only; SMART **SHALL** support ``RS384``/``ES384`` (SHA-384), but any
+    :class:`SignatureAlgorithm` works."""
+
+    def __init__(
+        self,
+        *,
+        private_key: str,
+        algorithm: SignatureAlgorithm,
+        private_key_password: str | None = None,
+        key_id: str | None = None,
+    ) -> None:
+        self.algorithm = algorithm
+        self.key_id = key_id
+        self._key: _PrivateKey = _load_private_key(private_key, private_key_password)
+        _require_key_for_alg(self._key, algorithm)
+
+    @property
+    def public_key(self) -> _PublicKey:
+        """The verifying (public) key — for tests / round-trips / exporting to the auth server."""
+        return self._key.public_key()
+
+    def sign(self, claims: Mapping[str, Any]) -> str:
+        """The compact-JWT serialization ``BASE64URL(header).BASE64URL(claims).BASE64URL(sig)`` over
+        ``claims``. The signature covers ``ASCII(header_b64 + '.' + claims_b64)`` (RFC 7515 §3)."""
+        header: dict[str, str] = {"alg": self.algorithm.value, "typ": "JWT"}
+        if self.key_id:
+            header["kid"] = self.key_id
+        header_b64 = _b64u_encode(
+            json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        )
+        claims_b64 = _b64u_encode(
+            json.dumps(dict(claims), separators=(",", ":"), sort_keys=True).encode("utf-8")
+        )
+        signing_input = f"{header_b64}.{claims_b64}".encode("ascii")
+        signature = _sign(self._key, self.algorithm, signing_input)
+        return f"{header_b64}.{claims_b64}.{_b64u_encode(signature)}"
 
 
 def verify_detached_jws(

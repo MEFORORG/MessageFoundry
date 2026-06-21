@@ -15,8 +15,10 @@ use an O(1) ring and the sink can reverse the id trivially.
 from __future__ import annotations
 
 import bisect
+import json
 import random
 from dataclasses import dataclass
+from pathlib import Path
 
 from messagefoundry.generators import _core
 from messagefoundry.generators import all_types as _all_types  # noqa: F401  (registers message types)
@@ -125,6 +127,34 @@ def _pairs_for_profile(profile: LoadProfile) -> set[tuple[str, str]]:
             for trigger in _core.triggers_for(key):
                 pairs.add((key, trigger))
     return pairs
+
+
+def corpus_from_file(path: str | Path, ids: ControlIds) -> Corpus:
+    """Build a replay :class:`Corpus` from a **committed, de-identified dataset** (ADR 0030 §6) —
+    the JSONL the anonymizer / capture sink writes (``{"control_id", "raw", ...}`` per line, ``raw``
+    being a whole HL7 message). Each message is parsed and indexed by ``(code, trigger)`` from its
+    MSH-9, so the harness can replay a PHI-free corpus of **real-shaped** traffic instead of synthetic
+    generation — the point of the anonymizer. ``next()``'s MSH-10 restamp applies unchanged.
+
+    Raises :class:`~harness.load.profile.LoadProfileError` if the file is empty or a line is not a
+    JSON record carrying a parseable ``raw`` message.
+    """
+    by_ct: dict[tuple[str, str], list[Message]] = {}
+    text = Path(path).read_text(encoding="utf-8")
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)["raw"]
+            msg = Message.parse(raw)
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise LoadProfileError(f"{path}:{lineno}: not a valid dataset record: {exc}") from exc
+        code = msg.field("MSH-9.1") or "UNK"
+        trigger = msg.field("MSH-9.2") or ""
+        by_ct.setdefault((code, trigger), []).append(msg)
+    if not by_ct:
+        raise LoadProfileError(f"dataset file {path} contained no messages")
+    return Corpus(ids, by_ct, str(path))
 
 
 def build_corpus(profile: LoadProfile, ids: ControlIds) -> Corpus:

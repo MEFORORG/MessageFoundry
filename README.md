@@ -80,11 +80,30 @@ renders on GitHub and in the VS Code preview). The prose source of truth is
 - [x] **Native transport TLS** — in-process API TLS (HTTPS/WSS) and MLLP-over-TLS, with an off-loopback
       bind guard and a certificate-expiry monitor
 - [x] Published throughput + active-passive failover **baseline** ([docs/benchmarks/TUNING-BASELINE.md](docs/benchmarks/TUNING-BASELINE.md))
+- [x] **SMART Backend Services token provider** — OAuth2 `client_credentials` + signed-JWT
+      `client_assertion` (RS384/ES384) authenticating the FHIR/REST outbound against real SMART-secured
+      servers (Epic, Oracle Health); a `with_smart_backend()` composer over `FHIR()`/`Rest()` that mints,
+      caches, and re-mints (on 401) a short-lived bearer, token endpoint gated by `[egress].allowed_http`
+      ([ADR 0024](docs/adr/0024-smart-backend-services-token-provider.md))
+- [x] **base64 binary-carriage codec** — an `mfb64:v1:` marker carries arbitrary NUL-safe **bytes** over
+      the str/TEXT ingress + store (`RawMessage.from_bytes()`/`.raw_bytes`/`.binary()`/`.is_binary`), plus
+      HL7 OBX-5 ED (Encapsulated Data) embedding helpers ([ADR 0028](docs/adr/0028-base64-binary-carriage-codec.md))
+- [x] **DICOM codec + C-STORE SCP** (Phase 1) — a pure codec (routing peek, headers/Structured Report,
+      code-first SR→HL7 mapping helpers; **headers + SR only, no pixel data**) on `content_type=dicom`
+      payload-agnostic ingress, plus an inbound C-STORE SCP listener (`DICOM()`) ([ADR 0025](docs/adr/0025-dicom-codec-store-connectors.md))
+- [x] **Anonymizer / de-identification** — builds PHI-free test datasets from real traffic with
+      deterministic secret-per-dataset pseudonymization, field-anchored site-code scrub, and fail-closed
+      emission (never an un-scrubbed body), via a `tee anonymize-captures` subcommand and test-harness
+      hooks ([ADR 0030](docs/adr/0030-anonymization-test-harness-tee.md))
 
-**Later** — horizontal **active-active** scale-out (the experimental multi-node cluster path);
-higher-throughput delivery (a pooled/persistent MLLP connector); a read-only **component SDK**
-(fork-to-customize); a **de-identification** framework; MFA and off-box log shipping. See
-[docs/EARLY-ADOPTER-GUIDE.md](docs/EARLY-ADOPTER-GUIDE.md) §2 for the current built-vs-experimental map.
+**Later** — higher-throughput delivery (a pooled/persistent MLLP connector); a read-only **component
+SDK** (fork-to-customize); DICOM Phase 2 (C-STORE SCU + C-ECHO + DICOMweb STOW-RS, designed); MFA and
+off-box log shipping. See [docs/EARLY-ADOPTER-GUIDE.md](docs/EARLY-ADOPTER-GUIDE.md) §2 for the current
+built-vs-experimental map.
+
+Horizontal **active-active** scale-out (the multi-node cluster path) was **dropped on 2026-06-18 and
+its code removed** — it is not a planned milestone; single-leader **active-passive** HA (above) is the
+supported HA model.
 
 ## Installing & rolling out
 
@@ -108,6 +127,7 @@ pip install "messagefoundry[postgres]==0.1.0"    # PostgreSQL store backend (pro
 pip install "messagefoundry[sqlserver]==0.1.0"   # SQL Server store backend (+ OS-level ODBC Driver 18)
 pip install "messagefoundry[console]==0.1.0"     # PySide6 admin console
 pip install "messagefoundry[sftp]==0.1.0"        # SFTP transport for the REMOTEFILE connector
+pip install "messagefoundry[dicom]==0.1.0"       # DICOM codec + C-STORE SCP (pydicom + pynetdicom)
 ```
 
 > **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow,

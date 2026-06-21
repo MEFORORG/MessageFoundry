@@ -43,11 +43,13 @@ from PySide6.QtWidgets import (
 from messagefoundry.api.models import MessageDetail, MessageList
 from messagefoundry.console._async import AsyncRunner
 from messagefoundry.console.client import ApiError, EngineClient
+from messagefoundry.console.theme import ERROR_TEXT
 from messagefoundry.parsing import HL7PeekError, parse_tree
 
 #: Shared "error red" for inline error text — the message-detail error, the auth dialogs'
 #: error labels, and the heart's stopped state — so the palette can't drift across modules.
-ERROR_COLOR = "#c62828"
+#: Sourced from the theme so there is a single source of truth for console colours.
+ERROR_COLOR = ERROR_TEXT
 
 __all__ = [
     "ParseTreeView",
@@ -78,6 +80,13 @@ def fill_table(table: QTableWidget, headers: list[str], *, multi: bool = False) 
     table.setSelectionMode(mode)
     table.verticalHeader().setVisible(False)
     table.horizontalHeader().setStretchLastSection(True)
+    # Modern table chrome (purely visual): zebra striping instead of a hard grid, a touch more row
+    # height, and a single-pixel-thin selection. The harsh default gridlines are dropped — the
+    # alternating rows + theme borders carry the structure.
+    table.setAlternatingRowColors(True)
+    table.setShowGrid(False)
+    table.verticalHeader().setDefaultSectionSize(30)
+    table.horizontalHeader().setHighlightSections(False)
 
 
 class ConfigurableTable(QTableWidget):

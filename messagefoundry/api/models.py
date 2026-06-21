@@ -224,7 +224,7 @@ class ConnectionRow(BaseModel):
     channel_name: str
     destination: str | None  # destination name; None for the source row
     name: str  # display name
-    status: str  # "running" | "stopped"
+    status: str  # "running" | "stopped" | "failed" (start failed, ADR 0031) | "draining"
     direction: str  # "in" (source) | "out" (destination)
     method: str  # connection method/protocol, e.g. MLLP / File / TCP / REST
     peer: str | None  # MLLP host or file directory
@@ -238,6 +238,9 @@ class ConnectionRow(BaseModel):
     backlog_seconds: float | None  # destination only; None = unknown/stalled
     delivered_age_seconds: float | None  # destination only; age of oldest queued item
     simulated: bool | None = None  # destination only; True = egress-suppressed shadow lane (#15)
+    error: str | None = (
+        None  # set when status == "failed": why the connection failed to start (ADR 0031)
+    )
 
 
 class StatsResponse(BaseModel):
@@ -358,6 +361,36 @@ class ConnectionMetadata(BaseModel):
     metadata: dict[str, Any] | None = None  # operator labels
     settings: dict[str, Any]  # secret-scrubbed view
     simulated: bool | None = None  # outbound only; True = egress-suppressed shadow lane (#15)
+    error: str | None = None  # why this connection failed to start, if it did (ADR 0031)
+
+
+class AlertRuleInfo(BaseModel):
+    """One operator-authored alert rule (ADR 0014), read-only. Pure routing/threshold data — no secrets."""
+
+    event_type: str
+    connection: str
+    min_depth: int | None = None
+    min_oldest_seconds: float | None = None
+    severity: str
+    transports: list[str] | None = None
+    cooldown_seconds: float | None = None
+
+
+class AlertsConfig(BaseModel):
+    """Read-only view of the loaded [alerts] config (ADR 0014, BACKLOG #22b). Transports are reported
+    present-or-not; NO secrets (webhook URL, SMTP password/username) or recipient addresses are ever
+    included."""
+
+    webhook_configured: bool
+    webhook_timeout: float
+    webhook_allowed_hosts: list[str]
+    email_configured: bool
+    email_smtp_port: int
+    email_use_tls: bool
+    email_recipient_count: int
+    smtp_allowed_hosts: list[str]
+    realert_seconds: float
+    rules: list[AlertRuleInfo]
 
 
 class ConnectionTestResult(BaseModel):

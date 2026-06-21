@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from messagefoundry.transports import (  # noqa: F401  (import = registration)
     database,
+    dicom,
+    fhir,
     file,
     loopback,
     mllp,

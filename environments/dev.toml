@@ -21,3 +21,12 @@ payer_rte_host = "127.0.0.1"
 payer_rte_port = 2731
 rte_result_host = "127.0.0.1"
 rte_result_port = 2732
+
+# FHIR server BASE url for OB_FHIR_SERVER (samples/config/IB_FHIR_INTAKE.py): a local test server in DEV.
+# A SMART/OAuth bearer token (if any) is a secret from MEFOR_VALUE_FHIR_BEARER_TOKEN, never this file.
+fhir_base_url = "http://127.0.0.1:8480/fhir"
+
+# Downstream dictation/reporting system (PowerScribe analog) for OB_POWERSCRIBE
+# (samples/config/IB_RADIOLOGY_SR.py): a local test MLLP receiver in DEV (ADR 0025).
+powerscribe_host = "127.0.0.1"
+powerscribe_port = 2761

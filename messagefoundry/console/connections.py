@@ -28,8 +28,10 @@ from PySide6.QtWidgets import (
 )
 
 from messagefoundry.api.models import ConnectionRow
+from messagefoundry.console import theme
 from messagefoundry.console._async import AsyncRunner
 from messagefoundry.console.client import ApiError, EngineClient
+from messagefoundry.console.delegates import StatusBadgeDelegate
 from messagefoundry.console.widgets import ConfigurableTable
 
 _COLUMNS = [
@@ -50,6 +52,10 @@ _COLUMNS = [
     "Delivered Age",
 ]
 _LOGS_COL = 4
+_STATUS_COL = 1
+_ERRORED_COL = 8
+# Numeric counts and durations are right-aligned so the column reads as a clean number gutter.
+_RIGHT_ALIGN_COLS = frozenset({5, 6, 7, 8, 9, 10, 12, 13, 14})
 
 # (role, channel_id, destination) identifies a row across refreshes for selection + actions.
 _RowKey = tuple[str, str, str]
@@ -57,6 +63,11 @@ _RowKey = tuple[str, str, str]
 
 def _fmt_int(n: int | None) -> str:
     return "—" if n is None else str(n)
+
+
+def _fmt_count(n: int | None) -> str:
+    """Like ``_fmt_int`` but thousands-grouped (15676 → "15,676") for high-volume counters."""
+    return "—" if n is None else f"{n:,}"
 
 
 def _fmt_secs(s: float | None) -> str:
@@ -72,8 +83,8 @@ def _fmt_secs(s: float | None) -> str:
 
 
 def _style_link(item: QTableWidgetItem) -> None:
-    """Make a cell look like a clickable link (blue, underlined)."""
-    item.setForeground(QBrush(QColor("#1a73e8")))
+    """Make a cell look like a clickable link (accent-coloured, underlined)."""
+    item.setForeground(QBrush(QColor(theme.active_tokens().accent)))
     font = item.font()
     font.setUnderline(True)
     item.setFont(font)
@@ -106,6 +117,7 @@ class ConnectionsPage(QWidget):
         self._pending: bool | None = None
 
         self._start = QPushButton("Start")
+        self._start.setProperty("primary", True)  # themed as the accent (primary) action
         self._stop = QPushButton("Stop")
         self._actions = QToolButton()
         self._actions.setText("Actions ▾")
@@ -133,6 +145,9 @@ class ConnectionsPage(QWidget):
         self._table = ConfigurableTable(
             _COLUMNS, settings_key="connections/header_state", multi=True
         )
+        # Render the Status column as coloured pill badges (paint-only; the cell text is unchanged
+        # so sorting/selection still work). Logical column index is stable under user reordering.
+        self._table.setItemDelegateForColumn(_STATUS_COL, StatusBadgeDelegate(self._table))
         self._table.itemSelectionChanged.connect(self._sync_toolbar)
         self._table.cellClicked.connect(self._on_cell_clicked)
         self._loaded = False  # autosize columns on the first (and user-initiated) loads
@@ -203,23 +218,36 @@ class ConnectionsPage(QWidget):
                 row.direction,
                 row.method,
                 "Logs",  # clickable cell -> open_logs (see _on_cell_clicked)
-                _fmt_int(row.queue_depth),
+                _fmt_count(row.queue_depth),
                 _fmt_secs(row.idle_seconds),
-                _fmt_int(row.alerts_active),
-                _fmt_int(row.errored),
-                _fmt_int(row.read),
-                _fmt_int(row.written),
+                _fmt_count(row.alerts_active),
+                _fmt_count(row.errored),
+                _fmt_count(row.read),
+                _fmt_count(row.written),
                 row.peer or "",
                 _fmt_int(row.port),
                 _fmt_secs(row.backlog_seconds),
                 _fmt_secs(row.delivered_age_seconds),
             ]
+            tokens = theme.active_tokens()
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if c == 0:
                     item.setData(Qt.ItemDataRole.UserRole, key)
                 elif c == _LOGS_COL:
                     _style_link(item)
+                elif c == _STATUS_COL and row.status == "failed":
+                    # A connection that failed to start (ADR 0031): surface the reason on hover so a
+                    # degraded lane is unmissable. The status badge already colours it red.
+                    item.setToolTip(row.error or "failed to start")
+                if c in _RIGHT_ALIGN_COLS:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
+                if c == _ERRORED_COL and (row.errored or 0) > 0:
+                    item.setForeground(QBrush(QColor(tokens.danger)))  # draw attention to errors
+                elif text == "—":
+                    item.setForeground(QBrush(QColor(tokens.text_muted)))  # de-emphasise empties
                 self._table.setItem(r, c, item)
         self._table.end_populate(autosize=autosize or not self._loaded)
         self._loaded = True

@@ -62,7 +62,8 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   through your Router/Handler under the Python debugger (`debugpy`). The load dialog opens to
   `messagefoundry.messageSetsDir`.
 - **`@messagefoundry` chat participant** — ask MessageFoundry questions in VS Code's Chat view
-  (`@messagefoundry`, with `/explain`, `/transform`, `/review`). **Provider-agnostic**: it uses
+  (`@messagefoundry`, with `/explain`, `/transform`, `/router`, `/review`, `/migrate`, `/test`).
+  **Provider-agnostic**: it uses
   whichever model you've selected in Chat (e.g. GitHub Copilot — which can run under your org's
   HIPAA BAA — or Claude). The extension never bundles a model or ships keys, and only ever sends the
   model **code + the config graph** — never message bodies / PHI. Requires a Chat provider

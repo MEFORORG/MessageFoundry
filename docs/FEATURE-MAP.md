@@ -34,9 +34,12 @@ IDE are separate surfaces over the localhost API.
 | DATABASE destination + DB-IN poll source | ✅ | Production (aioodbc/SQL Server); live round-trip CI-tested (#233) |
 | REST destination | ✅ | ADR 0003 |
 | SOAP destination | ✅ | ADR 0003 |
+| FHIR REST destination | ✅ | ADR 0022 (#20) — R4B default (R5/STU3); create/update/transaction + 3 conditional knobs; reuses rest.py |
 | Payload-agnostic ingress (`content_type` / `RawMessage`) | ✅ | ADR 0004 — non-HL7 bodies skip HL7 parsing |
+| X12 EDI raw-TCP connector (ISA/IEA-framed) | ✅ | ADR 0012 — `X12()` source/destination; pairs with the `parsing/x12` codec (§3) |
+| DICOM C-STORE SCP source (inbound DIMSE) | ✅ | ADR 0025 Phase 1 (#439) — `DICOM()` inbound C-STORE listener over `pynetdicom`, off-loop + commit-before-SUCCESS; `[dicom]` extra; `content_type=dicom` → `RawMessage`. Phase 2 (C-STORE SCU / C-ECHO / DICOMweb STOW-RS) designed-not-built |
 | MLLP-over-TLS | ✅ | Gate #4 (WP-13b) |
-| REST-IN / SOAP-IN inbound HTTP-listener sources | ⏭️ | Destinations exist; inbound listeners deferred |
+| REST-IN / SOAP-IN / FHIR-IN inbound HTTP-listener sources | ⏭️ | Destinations exist; inbound listeners deferred (FHIR server facade → ADR 0023) |
 | MLLP persistent connection pooling | ⏭️ | Throughput optimization |
 
 ## 2. Routing & Handling (code-first)
@@ -59,6 +62,11 @@ IDE are separate surfaces over the localhost API.
 | hl7apy strict validation (opt-in per inbound) | ✅ | `validation.strict`; slow path, off routing |
 | Parse-tree model + viewer | ✅ | Console + IDE render it |
 | MSH-driven encoding-character awareness | ✅ | No hardcoded separators |
+| FHIR codec (`parsing/fhir`: FhirPeek + FhirResource) | ✅ | ADR 0022 (#20) — `[fhir]` extra; JSON; R4B/R5/STU3; FHIRPath; pure/console-importable |
+| X12 EDI tolerant codec (`parsing/x12`: X12Peek + X12Message + interchange splitter) | ✅ | ADR 0012 — on-demand against `RawMessage`; never pushed through the pipeline |
+| Hardened `RawMessage.xml()` (defusedxml, XXE-safe) | ✅ | #31 / PR #422 — DOCTYPE / external-entity / billion-laughs **raise**, not parse |
+| base64 binary-carriage codec (`parsing/binary`: `mfb64:v1:` + `RawMessage.from_bytes`/`.raw_bytes`/`.binary()`/`.is_binary`) | ✅ | ADR 0028 (#437) — NUL-safe arbitrary bytes over the str/TEXT ingress+store; HL7 OBX-5 ED embedding helpers; pure stdlib, no new dep |
+| DICOM codec (`parsing/dicom`: DicomPeek + DicomDataset + SR→HL7 helpers) | ✅ | ADR 0025 Phase 1 (#439) — `[dicom]` extra (pydicom); headers + Structured Report only (no pixel data → no numpy); pure/console-importable; on-demand against `RawMessage` |
 
 ## 4. Pipeline & Reliability
 
@@ -87,7 +95,7 @@ IDE are separate surfaces over the localhost API.
 | SQLite → server-DB data migration | ⏭️ | v0.1 is **greenfield-only** (drain SQLite before cut-over) |
 | MySQL / Oracle backends | 🧭 | Long-term |
 
-## 6. High Availability & Scale-out
+## 6. High Availability
 
 | Feature | Status | Notes |
 |---------|:--:|-------|
@@ -98,7 +106,7 @@ IDE are separate surfaces over the localhost API.
 | **Active-passive engine HA** (primary/failover) | ✅ | v0.1 HA model — leader-gates the whole graph; both PostgreSQL + SQL Server |
 | Leadership lease + **self-fencing** (split-brain guard) | ✅ | The one core HA correctness item |
 | `GET /cluster/status` | ✅ | Read-only observability for a cluster |
-| **Active-active horizontal scale-out** (lane ownership, `renew_leases` heartbeat, cross-node FIFO) | ⏭️ | **0.2 headline**; code parked, run in active-passive mode for v0.1 |
+| **Active-active horizontal scale-out** (lane ownership, `renew_leases` heartbeat, cross-node FIFO) | — | **Dropped (2026-06-18) — code removed.** The active-active-specific code (per-lane ownership `lane_owner()`/`owns_lane()`, the `lane_leases` table, the `renew_leases` per-row heartbeat) was deleted and a `DROP TABLE IF EXISTS lane_leases` migration added. Not a planned milestone. Active-passive HA (above) is the supported HA model. |
 | DB-tier HA (replication / Always On) | — | Delegated to the DB admins; not built by MF |
 
 ## 7. Security & Authentication
@@ -118,8 +126,9 @@ IDE are separate surfaces over the localhost API.
 | TOTP MFA (local users) | ⏭️ | 0.2 (WP-14); off-loopback v0.1 leans on AD/Entra IdP-MFA or an MFA-terminating proxy |
 | Federated SSO — OAuth 2.0 / OIDC / SAML (Entra) | ⏭️ | 0.2 — admin browser SSO + service-to-service OAuth2; a dedicated federated-SSO ADR precedes the build |
 | mTLS client/peer auth (console/IDE→API; MLLP partner) | ⏭️ | 0.2 — v0.1 native TLS is server-identity only |
-| SMART on FHIR | 🧭 | Later — OAuth2 authZ profile for FHIR REST; needs a FHIR transport first (none today) |
-| OWASP ASVS L3 posture | ✅ | Self-assessed against **Level 3** (345 reqs): **192 Pass / 20 Partial / 0 Fail / 133 N-A** (post-sec-offbox-log off-box log+audit forwarding #357/#363, which closed 16.4.3 + 16.2.4; was 187/21/4/133 after WP-L3-13 admin defense, 186/21/5/133 after WP-14 MFA, 178/20/6/141 after WP-L3-16 step-up, 155/40/9/141 at the re-target). 0 open Fails — the former three (4.1.5, 12.1.4, 13.3.3) are now built controls with documented residuals (4.1.5 opt-in detached-JWS outbound signing #378; 12.1.4 VERIFY_X509_STRICT chains + org-PKI-delegated revocation #376; 13.3.3 operator-activated KeyProvider HSM/KMS/Vault seam #377); MFA (6.3.3), admin defense (8.4.2) + off-box logs (16.4.3) are now built |
+| SMART Backend Services (FHIR **client** OAuth2) | ✅ | **ADR 0024 (Accepted) — #432.** OAuth2 `client_credentials` + signed-JWT `client_assertion` (`RS384`/`ES384`) authenticating the FHIR/REST **outbound** (ADR 0022) against real SMART-secured servers (Epic, Oracle Health). `with_smart_backend()` composer over `FHIR()`/`Rest()` extends the ADR 0018 signer; mints + expiry-caches a short-lived bearer, re-mints on 401, injects per request; token endpoint gated by `[egress].allowed_http`; secrets via `env()`; no new dependency. Client-only (App Launch / authZ-server out of lane → next row) |
+| SMART App Launch / authorization server (FHIR **server** facade) | 🧭 | Out of an engine's lane / deferred — browser authorization-code + PKCE, EHR/standalone launch context, OIDC (`fhirUser`), scope **enforcement**, `.well-known/smart-configuration` publishing. Presupposes a human user (App Launch) or the system-of-record role (authZ/resource server); the latter also needs the unbuilt inbound FHIR facade (ADR 0023) |
+| OWASP ASVS L3 posture | ✅ | Self-assessed against **Level 3** (345 reqs): **212 Pass / 0 Partial / 0 Fail / 133 N-A** — **0 open Partials and 0 open Fails; every control is built or documented-residual** (per [`ASVS-L3-ASSESSMENT.md`](security/ASVS-L3-ASSESSMENT.md) §2 — a *conditional-Pass-with-documented-residual* is scored Pass, not Partial; a point-in-time self-assessment, not a certification). Lineage: 155/40/9/141 at the L3 re-target → 178/20/6/141 (step-up WP-L3-16) → 186/21/5/133 (MFA WP-14) → 187/21/4/133 (admin defense WP-L3-13) → 192/20/0/133 (off-box log+audit #357/#363, closed 16.4.3 + 16.2.4) → **212/0/0/133** (partials sweep flipped the last 20 Partials — 18 L1+L2 + L3-only 12.3.5 intra-service mTLS & 15.2.5 runtime sandbox — to conditional Passes with explicit residual lines; heaviest residual = no hard in-process sandbox). Former Fails now built-with-residual: 4.1.5 opt-in detached-JWS signing #378; 12.1.4 VERIFY_X509_STRICT chains + org-PKI-delegated revocation #376; 13.3.3 operator-activated KeyProvider HSM/KMS/Vault seam #377. MFA (6.3.3), admin defense (8.4.2), off-box logs (16.4.3) all built |
 
 ## 8. PHI / Compliance
 
@@ -130,7 +139,7 @@ IDE are separate surfaces over the localhost API.
 | **Full PHI log redaction** (chained-exception traceback scrubbing + proof test) | ✅ | **Gate #1** — safe to run above DEBUG with PHI |
 | `serve` prod-DEBUG guard | ✅ | Gate #1 |
 | structlog / JSON logs / off-box (SIEM) forwarding | ⏭️ | Gate #1 closes without structlog |
-| De-identification framework | 🧭 | Planned; centralize when built |
+| De-identification framework (test harness + tee) | ✅ | ADR 0030 (#440) — `messagefoundry/anon/` (vendored byte-identical to `tee/anon/`); deterministic **secret-per-dataset** pseudonymization (width/shape-preserving), **field-anchored** site-code scrub, **fail-closed** leak gate (no un-scrubbed body ever emitted); `tee anonymize-captures` + harness hooks build PHI-free test datasets from real traffic; pure stdlib. Rules centralized — no inline ad-hoc de-id |
 
 ## 9. Observability & Alerting
 
@@ -142,8 +151,8 @@ IDE are separate surfaces over the localhost API.
 | `connection_stopped` + `queue_buildup` alerts | ✅ | Ordering Phase 1 Layer 4 |
 | Load-test harness (profiles, governor, report/SLO verdict) | ✅ (PR #201) | Already caught a store concurrency bug (#200) |
 | **Published throughput numbers + tuning baseline** | 🔨 | **Gate #3** — SQLite + PG + SQL Server + failover run |
-| Metrics export (Prometheus/OpenTelemetry) | 🧭 | |
-| Alerts management page (console) | ⏭️ | |
+| Metrics export (Prometheus/OpenTelemetry) | ✅ | #21 / PR #407 — `/metrics` exporter (`MONITORING_READ`-gated); `[otel]` extra |
+| Alerts management page (console) | ✅ | #22 / PR #420 — read-only view over `GET /alerts/rules` (#22b / PR #415) |
 
 ## 10. Surfaces — Admin Console (PySide6)
 
@@ -151,10 +160,12 @@ IDE are separate surfaces over the localhost API.
 |---------|:--:|-------|
 | Connection dashboard, message browser, parse-tree viewer | ✅ | |
 | Delivery/audit trail + replay | ✅ | |
-| Dead-letter list + replay (via API/CLI) | ✅ | Console **Dead Letters page** is ⏭️ 0.2 |
+| Dead-letter list + replay (via API/CLI) | ✅ | Console **Dead Letters page** shipped — #22a / PR #413 |
 | Cluster/leader status surface | 🔨 | Consumes `GET /cluster/status` |
 | Off-thread API polling (no UI freeze on a slow node) | 🔨 | BACKLOG #2 / M-25 |
-| Dead Letters page · Alerts page · multi-engine switcher | ⏭️ | CLI/API equivalents exist |
+| Dead Letters page (list + replay) | ✅ | #22a / PR #413 |
+| Alerts page (rules view over `GET /alerts/rules`) | ✅ | #22 / PR #420 |
+| Multi-engine switcher | ⏭️ | CLI/API equivalents exist |
 
 ## 11. Surfaces — VS Code IDE
 
@@ -197,5 +208,8 @@ IDE are separate surfaces over the localhost API.
 
 ---
 
-*Maintenance: update marks as features land. When `0.1.0` ships, flip its 🔨 rows to ✅ and promote
-the 0.2 headline (active-active scale-out) per the [release plan](releases/v0.1-PLAN.md).*
+*Maintenance: update marks as features land. (`0.1.0` shipped 2026-06-18; **active-active scale-out was
+dropped and its code removed** — see §6. **v0.2 wave on `main` (2026-06-19/20):** Prometheus `/metrics`
+(#407), FHIR codec + REST destination (#416), console **Dead Letters** (#413) + **Alerts** (#420) pages,
+`GET /alerts/rules` (#415), hardened `RawMessage.xml()` (#422), USER-GUIDE (#412); ADR 0021 §7
+connection-error log + ADR 0026 update-check **Accepted**, on-trigger to build. **v0.3 connector wave on `main` (2026-06-20):** SMART Backend Services token provider (#432, ADR 0024), base64 binary-carriage codec (#437, ADR 0028), DICOM codec + C-STORE SCP Phase 1 (#439, ADR 0025), anonymizer / de-identification (#440, ADR 0030) — all four ADRs Accepted + shipped.)*

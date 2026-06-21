@@ -55,7 +55,7 @@ from messagefoundry.config.wiring import (
     WiringError,
     resolve_env_settings,
 )
-from messagefoundry.parsing import HL7PeekError, Peek, normalize, summarize, validate
+from messagefoundry.parsing import HL7PeekError, Peek, RawMessage, normalize, summarize, validate
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import safe_exc, safe_text
@@ -144,10 +144,9 @@ class RegistryRunner:
         # correlation depth still routes; the next hop (depth+1) dead-letters its work-row and ERRORs the
         # origin. Coarse by design (bounds total work, not topology). From [pipeline] max_correlation_depth.
         self._max_correlation_depth = max_correlation_depth
-        # Cluster coordination seam (Track B Step 3). Threaded in + held so Steps 4/5 can consult the
-        # cheap, synchronous gates (is_leader / owns_lane) on the hot path — this step adds NO call
-        # sites; the object is only stored + exposed. None → the no-op NullCoordinator (every gate
-        # True), so single-node operation is byte-identical to before this seam existed.
+        # Cluster coordination seam (Track B Step 3). Threaded in + held so Step 4 can consult the
+        # cheap, synchronous is_leader() gate. None → the no-op NullCoordinator (always leader), so
+        # single-node operation is byte-identical to before this seam existed.
         self._coordinator: ClusterCoordinator = coordinator or NullCoordinator()
         # The active environment name ([ai].environment / serve --env), published around each
         # router/transform run so a Handler's current_environment() resolves (ADR 0006-style per-face
@@ -206,6 +205,13 @@ class RegistryRunner:
         self._buildup: dict[str, BuildupThreshold] = {}
         # Effective per-connection egress-suppression (#15): per-connection simulate= OR simulate_all.
         self._simulate: dict[str, bool] = {}
+        # Connections that FAILED to build/bind at start (name → reason). A failed connection is
+        # isolated, never fatal — the rest of the graph still comes up (a failed connection must not
+        # crash the engine, ADR 0031). A failed OUTBOUND still gets its delivery worker, but with no
+        # connector in _destinations, so rows routed to it are retried + alerted (never silently
+        # dropped) and a reload/restart that builds it self-heals the lane; a failed INBOUND simply
+        # isn't listening. Cleared when the connection later builds/binds (reload, start_inbound).
+        self._failed: dict[str, str] = {}
         # Per-connection re-alert throttle: the earliest time a queue_buildup alert may fire again.
         self._next_buildup_alert: dict[str, float] = {}
         # Live-lookup executor (db_lookup, ADR 0010): built from registry.lookups at start/reload, None
@@ -235,8 +241,8 @@ class RegistryRunner:
 
     @property
     def coordinator(self) -> ClusterCoordinator:
-        """The cluster coordinator threaded in by the engine (Track B Step 3). Steps 4/5 consume its
-        cheap, synchronous gates (``is_leader`` / ``owns_lane``); this step only exposes the object."""
+        """The cluster coordinator threaded in by the engine (Track B Step 3). Step 4 consumes its
+        cheap, synchronous ``is_leader`` gate; this exposes the object."""
         return self._coordinator
 
     def notify_work(self) -> None:
@@ -286,6 +292,17 @@ class RegistryRunner:
 
     def inbound_running(self, name: str) -> bool:
         return name in self._sources
+
+    def connection_failed(self, name: str) -> str | None:
+        """The failure reason if this connection failed to build/bind at start, else None. A failed
+        connection is isolated, not fatal (ADR 0031): the engine starts the rest of the graph and an
+        operator recovers it (fix the cause, then reload or — for an inbound — restart it)."""
+        return self._failed.get(name)
+
+    def degraded_connections(self) -> dict[str, str]:
+        """Snapshot of ``{connection: reason}`` for connections that failed to start (ADR 0031).
+        Empty when every connection came up — the API/console use it to flag a degraded engine."""
+        return dict(self._failed)
 
     def outbound_simulated(self, name: str) -> bool:
         """Whether the named outbound is in **simulate** mode — egress suppressed (#15). The *effective*
@@ -370,8 +387,10 @@ class RegistryRunner:
             )
         source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
         check_source_allowed(source_cfg, ic.name, self._egress)  # fail-closed connect allowlist
-        # Exposed-gate (ADR 0002 §0): refuse a non-loopback MLLP listener without TLS at start.
+        # Exposed-gate (ADR 0002 §0 / ADR 0025 §9): refuse a non-loopback MLLP or DICOM SCP listener
+        # without TLS at start (cleartext PHI on the wire). Each guard no-ops for the other's type.
         check_mllp_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
+        check_dimse_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
         source = build_source(source_cfg)
         # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
         # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/
@@ -383,6 +402,9 @@ class RegistryRunner:
         # _sources, where inbound_running() would report True and a retry would no-op (review M-9).
         await source.start(self._make_handler(ic), leader_gate=self._coordinator.is_leader)
         self._sources[name] = source
+        self._failed.pop(
+            name, None
+        )  # bound successfully — clear any prior start failure (ADR 0031)
         # Once the source is live, note (start-time only, never per-tick) that a poll source's intake
         # is leader-gated, so an operator reading the log knows only the leader polls this resource.
         if getattr(source, "polls_shared_resource", False):
@@ -405,6 +427,64 @@ class RegistryRunner:
         if source is not None:
             await source.stop()
 
+    def _record_failed(self, name: str, exc: BaseException, *, kind: str) -> None:
+        """Isolate a connection that failed to build/bind (ADR 0031): record the reason, log it
+        loudly, and alert — the engine keeps the rest of the graph running. Reuses the AlertSink
+        ``connection_stopped`` signal: its meaning ("this connection is down until an operator
+        intervenes") fits a startup failure exactly, so no new sink method is needed."""
+        reason = safe_exc(exc)
+        self._failed[name] = reason
+        log.error(
+            "%s connection %r failed to start — ISOLATED, engine continues (fix the cause, then "
+            "reload%s): %s",
+            kind,
+            name,
+            " or restart it" if kind == "inbound" else "",
+            reason,
+            exc_info=exc,
+        )
+        try:
+            self._alert_sink.connection_stopped(name, detail=f"failed to start: {reason}")
+        except Exception:
+            log.exception("alert sink raised on connection_stopped for %r", name)
+
+    def _start_outbound(self, name: str, oc: OutboundConnection) -> None:
+        """Build one outbound connector + spawn its delivery worker. A build failure (unresolvable
+        ``env()`` / cert, an egress-allowlist refusal, a capture/backend mismatch) is ISOLATED
+        (ADR 0031): the connection is recorded failed and the worker is STILL spawned, but with no
+        connector — so rows routed to it are retried + buildup-alerted (never silently dropped,
+        preserving the count-and-log + at-least-once invariants) and a later reload/restart that builds
+        the connector self-heals the lane. retry/ordering/etc. are set regardless of build outcome
+        because the worker reads them live per item (a reload can swap a working connector under the
+        already-spawned worker)."""
+        self._retry[name] = oc.retry or self._delivery_defaults
+        self._ordering[name] = oc.ordering or self._ordering_default
+        self._internal_error[name] = oc.internal_error or self._internal_error_default
+        self._buildup[name] = oc.buildup or self._buildup_default
+        self._simulate[name] = self._resolve_simulate(name, oc)
+        try:
+            dest = _dest_config(oc, self._env_values)
+            check_egress_allowed(dest, self._egress)  # fail-closed egress allowlist (WP-11c)
+            connector = build_destination(dest)
+            # ADR 0013: a capturing outbound on a backend that can't persist captures must not deliver
+            # — but (ADR 0031) degrade THIS lane, don't crash the engine. Rows routed here are retried,
+            # not dropped, so the ADR 0013 "never silently drop replies" intent is preserved.
+            if getattr(connector, "capture_response", False) and not getattr(
+                self.store, "supports_response_capture", True
+            ):
+                raise RuntimeError(
+                    f"outbound {name!r} sets capture_response=True but the store backend does not "
+                    "support request/response capture (ADR 0013); use the SQLite or Postgres backend"
+                )
+        except Exception as exc:
+            self._destinations.pop(name, None)  # no live connector for a failed lane
+            self._record_failed(name, exc, kind="outbound")
+            self._spawn_worker(name)  # drains→retries routed rows via the connector-None path
+            return
+        self._destinations[name] = connector
+        self._failed.pop(name, None)
+        self._spawn_worker(name)
+
     async def start(self) -> None:
         async with self._reload_lock:
             if self._running:
@@ -413,51 +493,53 @@ class RegistryRunner:
             # Capture the engine loop so a handler's worker thread can bridge a db_lookup back onto it.
             self._loop = asyncio.get_running_loop()
             try:
+                # Per-connection fault isolation (ADR 0031): a single outbound build / inbound bind
+                # failure no longer aborts startup — it is recorded + alerted and the rest of the graph
+                # still comes up (a failed connection must not crash the engine). The outer except below
+                # stays a backstop for genuinely fatal, graph-wide startup errors (the store, the
+                # lookup executor), which still unwind + raise.
                 for name, oc in self.registry.outbound.items():
-                    dest = _dest_config(oc, self._env_values)
-                    check_egress_allowed(
-                        dest, self._egress
-                    )  # fail-closed egress allowlist (WP-11c)
-                    self._destinations[name] = build_destination(dest)
-                    # ADR 0013: fail closed at start if a capturing outbound is wired on a backend that
-                    # can't persist captures (the SQL Server preview) — never silently drop replies.
-                    if getattr(self._destinations[name], "capture_response", False) and not getattr(
-                        self.store, "supports_response_capture", True
-                    ):
-                        raise RuntimeError(
-                            f"outbound {name!r} sets capture_response=True but the store backend does "
-                            "not support request/response capture (ADR 0013); use the SQLite or "
-                            "Postgres backend"
-                        )
-                    self._retry[name] = oc.retry or self._delivery_defaults
-                    self._ordering[name] = oc.ordering or self._ordering_default
-                    self._internal_error[name] = oc.internal_error or self._internal_error_default
-                    self._buildup[name] = oc.buildup or self._buildup_default
-                    self._simulate[name] = self._resolve_simulate(name, oc)
-                    self._spawn_worker(name)
+                    self._start_outbound(name, oc)
                 # Build the live-lookup executor from the graph (env-resolved + egress-checked here);
-                # None when no DatabaseLookup is declared, keeping the transform path byte-identical.
+                # None when no DatabaseLookup is declared, keeping the transform path byte-identical. A
+                # failure here is graph-wide (not one connection), so let it hit the backstop below.
                 self._lookup_executor = self._build_lookup_executor()
                 for ic in self.registry.inbound.values():
-                    await self._start_inbound_unsafe(ic.name)
-                # A router + transform worker per inbound — spawned after the sources bind, so a bind
-                # failure above unwinds before any inbound worker exists. They drain ingress→routed→
-                # outbound, independently of the source's listen state.
+                    try:
+                        await self._start_inbound_unsafe(ic.name)
+                    except Exception as exc:
+                        # Isolate this inbound (bad bind / port in use / cleartext-exposure refusal /
+                        # bad env): record it failed and continue. It never binds insecurely — the
+                        # guard still refused; we just don't also kill the engine over it.
+                        self._record_failed(ic.name, exc, kind="inbound")
+                # A router + transform worker per inbound — spawned even for an inbound whose source
+                # failed to bind, so any crash-recovered ingress/routed backlog still drains (the source
+                # just isn't listening). They drain ingress→routed→outbound, independent of listen state.
                 for name in self.registry.inbound:
                     self._ensure_inbound_workers(name)
             except Exception:
-                # A partial start (typically an inbound bind failure) must not leave half the graph
-                # wired with _running still False — unwind everything we started so the listeners are
-                # released and a retry can rebind the same ports (review M-8).
+                # A truly fatal startup error (store / lookup executor — NOT a single connection, which
+                # is isolated above) must not leave half the graph wired with _running still False:
+                # unwind everything we started so the listeners are released and a retry can rebind (M-8).
                 log.exception("wiring start failed; unwinding the partial start")
                 await self._teardown_unsafe()
                 raise
             self._running = True
-            log.info(
-                "wiring started: %d inbound, %d outbound connection(s)",
-                len(self.registry.inbound),
-                len(self.registry.outbound),
-            )
+            if self._failed:
+                log.warning(
+                    "wiring started DEGRADED: %d inbound, %d outbound connection(s); "
+                    "%d failed to start (isolated, engine running): %s",
+                    len(self.registry.inbound),
+                    len(self.registry.outbound),
+                    len(self._failed),
+                    ", ".join(f"{n} ({r})" for n, r in self._failed.items()),
+                )
+            else:
+                log.info(
+                    "wiring started: %d inbound, %d outbound connection(s)",
+                    len(self.registry.inbound),
+                    len(self.registry.outbound),
+                )
 
     async def stop(self) -> None:
         async with self._reload_lock:  # serialize against an in-flight reload (no torn-down state)
@@ -610,17 +692,24 @@ class RegistryRunner:
             self._buildup[name] = oc.buildup or self._buildup_default
             self._simulate[name] = self._resolve_simulate(name, oc)
             worker = self._workers.get(name)
+            failed = name in self._failed  # ADR 0031: live worker, but no connector (start failed)
             if worker is None or worker.done():
                 # added (or replacing a crashed worker): close any stale connector, build + spawn.
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
                 self._destinations[name] = build_destination(_dest_config(oc, self._env_values))
+                self._failed.pop(name, None)
                 self._spawn_worker(name)
-            elif old.outbound.get(name) is None or old.outbound[name].spec != oc.spec:
-                # live worker, connector type/settings changed → swap in place, close the old one.
+            elif failed or old.outbound.get(name) is None or old.outbound[name].spec != oc.spec:
+                # live worker but a missing/mismatched connector → (re)build it in place, close any old
+                # one. `failed` covers an outbound that failed to build at START (ADR 0031): its worker
+                # is alive with no connector, so a reload once the cause is fixed self-heals the lane
+                # (build_check above already re-validated the whole new registry, so this build can't
+                # fail here — a still-broken connector would have raised before any quiesce).
                 old_conn = self._destinations.get(name)
                 self._destinations[name] = build_destination(_dest_config(oc, self._env_values))
+                self._failed.pop(name, None)
                 if old_conn is not None:
                     await old_conn.aclose()
             # else: unchanged & live → leave the worker/connector as-is.
@@ -718,6 +807,23 @@ class RegistryRunner:
         reply = ack_mode is not AckMode.NONE
         src = ic.spec.type.value
         hl7v2 = ic.content_type is ContentType.HL7V2
+
+        if not hl7v2 and ic.content_type.is_binary:
+            # Binary ingress (ADR 0028): a byte-oriented content type carries raw bytes that cannot
+            # ride the str/TEXT store as text — a NUL/non-UTF-8 body is rejected (Postgres) or
+            # truncated (SQLite/SQL Server). Base64-carry them at the source boundary via
+            # RawMessage.from_bytes (the one encode); never attempt a text decode. The router/transform
+            # workers route the carriage form as a RawMessage and a codec recovers bytes via .raw_bytes.
+            await self.store.enqueue_ingress(
+                channel_id=ic.name,
+                raw=RawMessage.from_bytes(raw, ic.content_type.value).raw,
+                control_id=None,
+                message_type=ic.content_type.value,
+                source_type=src,
+                summary=None,
+            )
+            self._ingress_work.set()
+            return None
 
         # Decode with the connection's configured charset. A genuine decode failure means the bytes
         # aren't valid in the declared encoding — record ERROR (preserving the exact bytes via a
@@ -843,11 +949,10 @@ class RegistryRunner:
                 # (head-of-line), so order is preserved. UNORDERED: claim a batch and rotate past a
                 # backing-off row to drain others. Resolved live so a reload can retune it.
                 if self._ordering.get(name, self._ordering_default) is OrderingMode.FIFO:
-                    # lane_owner() gates the claim to a single owner per lane (Track B Step 5) so strict
-                    # FIFO holds ACROSS nodes; it's None single-node (byte-identical no-owner claim).
-                    head = await self.store.claim_next_fifo(
-                        name, owner=self._coordinator.lane_owner()
-                    )
+                    # FIFO: claim only the due head; the head blocks the lane while it backs off. Under
+                    # active-passive HA the graph runs on the leader ONLY, so one node drains this lane;
+                    # the Postgres claim also reclaims a prior leader's stranded head for failover FIFO.
+                    head = await self.store.claim_next_fifo(name)
                     items = [head] if head is not None else []
                 else:
                     # UNORDERED lanes are intentionally NOT lane-owned — concurrent draining across
@@ -865,9 +970,18 @@ class RegistryRunner:
                     retry = self._retry.get(name) or RetryPolicy()
                     connector = self._destinations.get(name)
                     if connector is None:
-                        # No connector for a claimed row (extremely unlikely mid-reconcile).
-                        # Reschedule it rather than strand the claimed row, then move on.
-                        await self.store.mark_failed(item.id, "outbound reloading", retry)
+                        # No connector for a claimed row: either a brief mid-reconcile window, or this
+                        # outbound failed to build at start (ADR 0031) and its lane is degraded. Either
+                        # way RETRY the row (never strand/drop it) — it self-heals when a reload/restart
+                        # builds the connector — and alert on the growing backlog of a failed lane.
+                        failure = self._failed.get(name)
+                        detail = (
+                            f"outbound failed to start: {failure}"
+                            if failure
+                            else "outbound reloading"
+                        )
+                        await self.store.mark_failed(item.id, detail, retry)
+                        await self._maybe_alert_buildup(name)
                         continue
                     try:
                         if self._simulate.get(name, False):
@@ -985,12 +1099,9 @@ class RegistryRunner:
         while not self._stop.is_set():
             try:
                 # FIFO per inbound: claim only the due head (ingress rows never back off, so this is
-                # effectively the oldest pending row for this inbound). lane_owner() gates the claim to a
-                # single owner per lane (Track B Step 5) so strict FIFO holds across nodes; None
-                # single-node (byte-identical).
-                item = await self.store.claim_next_fifo(
-                    name, stage=Stage.INGRESS.value, owner=self._coordinator.lane_owner()
-                )
+                # effectively the oldest pending row for this inbound). Under active-passive HA the graph
+                # runs on the leader ONLY, so a single node drains this lane.
+                item = await self.store.claim_next_fifo(name, stage=Stage.INGRESS.value)
                 if item is None:
                     await self._wait_for_work(self._ingress_work)
                     continue
@@ -1085,14 +1196,12 @@ class RegistryRunner:
         ``Stage.RESPONSE`` token, peek the reply body for the loopback's ``content_type``, and hand it
         off **atomically** via :meth:`~messagefoundry.store.base.QueueStore.ingress_handoff` (which
         produces the re-ingressed message + ingress row, depth-caps it, or errors a non-peekable body).
-        Mirrors :meth:`_router_worker`'s claim / missing-inbound / backoff supervision. Re-ingress is a
-        single-owner internal stage: the per-lane claim owner is the only leader gate (``LoopbackSource``
-        is inert, so there is no source-level gate)."""
+        Mirrors :meth:`_router_worker`'s claim / missing-inbound / backoff supervision. Re-ingress is an
+        internal stage with no source of its own (``LoopbackSource`` is inert); under active-passive HA
+        the whole graph (and thus this worker) runs on the leader ONLY, so a single node drains it."""
         while not self._stop.is_set():
             try:
-                item = await self.store.claim_next_fifo(
-                    name, stage=Stage.RESPONSE.value, owner=self._coordinator.lane_owner()
-                )
+                item = await self.store.claim_next_fifo(name, stage=Stage.RESPONSE.value)
                 if item is None:
                     await self._wait_for_work(self._response_work)
                     continue
@@ -1148,11 +1257,9 @@ class RegistryRunner:
         last_buildup_check = 0.0
         while not self._stop.is_set():
             try:
-                # lane_owner() gates the claim to a single owner per lane (Track B Step 5) so strict
-                # FIFO holds across nodes; None single-node (byte-identical no-owner claim).
-                item = await self.store.claim_next_fifo(
-                    name, stage=Stage.ROUTED.value, owner=self._coordinator.lane_owner()
-                )
+                # FIFO per inbound at the routed stage. Under active-passive HA the graph runs on the
+                # leader ONLY, so a single node drains this lane.
+                item = await self.store.claim_next_fifo(name, stage=Stage.ROUTED.value)
                 if item is None:
                     await self._wait_for_work(self._routed_work)
                     continue
@@ -1365,7 +1472,12 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
     # and other inbounds have no host and ignore this. A peer-IP allowlist rides into the connector's
     # settings so the listener can reject a non-allowlisted peer at accept time. (bind_address and the
     # allowlist are MLLP/TCP-only at wiring, so for X12 both fields are None here = unchanged behaviour.)
-    if ic.spec.type in (ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.X12):
+    if ic.spec.type in (
+        ConnectorType.MLLP,
+        ConnectorType.TCP,
+        ConnectorType.X12,
+        ConnectorType.DIMSE,
+    ):
         settings["host"] = ic.bind_address or bind_host
         if ic.source_ip_allowlist:
             settings["source_ip_allowlist"] = list(ic.source_ip_allowlist)
@@ -1444,16 +1556,16 @@ def build_check_registry(
 
 
 def _allowlist_for(conn_type: ConnectorType, egress: EgressSettings) -> list[str]:
-    """The ``[egress]`` allowlist that governs a connector type (X12 shares TCP's; REST/SOAP share the
-    HTTP list). Returns ``[]`` for a type with no egress list — which under ``deny_by_default`` means
+    """The ``[egress]`` allowlist that governs a connector type (X12 shares TCP's; REST/SOAP/FHIR share
+    the HTTP list). Returns ``[]`` for a type with no egress list — which under ``deny_by_default`` means
     'nothing is configured to permit it', so the destination is refused."""
     if conn_type is ConnectorType.MLLP:
         return egress.allowed_mllp
-    if conn_type in (ConnectorType.TCP, ConnectorType.X12):
-        return egress.allowed_tcp
+    if conn_type in (ConnectorType.TCP, ConnectorType.X12, ConnectorType.DIMSE):
+        return egress.allowed_tcp  # DIMSE is a raw socket (the Phase-2 C-STORE SCU dials it out)
     if conn_type is ConnectorType.FILE:
         return egress.allowed_file_dirs
-    if conn_type in (ConnectorType.REST, ConnectorType.SOAP):
+    if conn_type in (ConnectorType.REST, ConnectorType.SOAP, ConnectorType.FHIR):
         return egress.allowed_http
     if conn_type is ConnectorType.DATABASE:
         return egress.allowed_db
@@ -1566,6 +1678,35 @@ def check_mllp_tls_exposure(source: Source, name: str, *, allow_insecure_bind: b
     )
 
 
+def check_dimse_tls_exposure(source: Source, name: str, *, allow_insecure_bind: bool) -> None:
+    """Exposed-gate (ADR 0025 §9, DIMSE side): refuse a **non-loopback DICOM C-STORE SCP without TLS** —
+    it would put DICOM header + pixel-data PHI on the wire in cleartext. The DIMSE sibling of
+    :func:`check_mllp_tls_exposure` (the shipped guard is MLLP-only; TCP/X12/DIMSE listeners were not
+    covered, so this is **net-new** security work, not a fold-in). Set ``tls=true`` (+ cert) on the
+    ``DICOM(...)`` connection, or pass ``serve --allow-insecure-bind`` to accept the risk on a trusted
+    segment (then warn). Loopback binds and TLS-on binds pass unconditionally."""
+    if source.type is not ConnectorType.DIMSE:
+        return
+    host = str(source.settings.get("host", "127.0.0.1"))
+    if host in _LOOPBACK_HOSTS or source.settings.get("tls"):
+        return
+    if allow_insecure_bind:
+        log.warning(
+            "inbound %r binds non-loopback host %r without DICOM-over-TLS (--allow-insecure-bind); "
+            "DICOM PHI (header + pixel data) crosses the network in cleartext — set tls=true "
+            "(+ tls_cert_file/tls_key_file) on the DICOM connection.",
+            name,
+            host,
+        )
+        return
+    raise WiringError(
+        f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; DICOM PHI (header "
+        "+ pixel data) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
+        "tls_key_file) on the DICOM connection, or pass `serve --allow-insecure-bind` to accept the "
+        "cleartext risk on a trusted, firewalled network."
+    )
+
+
 def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
     """Fail-closed: refuse (raise :class:`WiringError`) an outbound destination not on the ``[egress]``
     allowlist (WP-11c — ASVS 13.2.4/13.2.5/14.2.3), so a fat-fingered or hostile destination can't
@@ -1628,6 +1769,23 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
                 f"outbound {dest.name!r}: X12 destination {host}:{port} is not in the "
                 "[egress].allowed_tcp allowlist"
             )
+    elif dest.type is ConnectorType.DIMSE and egress.allowed_tcp:
+        # DIMSE (the Phase-2 C-STORE SCU destination) dials a raw socket, so it shares the
+        # [egress].allowed_tcp allowlist (same host[:port] matching as X12). Gated now so a future SCU
+        # destination is never fail-open (ADR 0025 §6.4).
+        host = str(dest.settings.get("host", "127.0.0.1"))
+        port = dest.settings.get("port")
+        if not _mllp_egress_allowed(host, port, egress.allowed_tcp):
+            log.warning(
+                "egress denied: outbound %r DIMSE %s:%s not in [egress].allowed_tcp",
+                dest.name,
+                host,
+                port,
+            )
+            raise WiringError(
+                f"outbound {dest.name!r}: DIMSE destination {host}:{port} is not in the "
+                "[egress].allowed_tcp allowlist"
+            )
     elif dest.type is ConnectorType.FILE and egress.allowed_file_dirs:
         directory = dest.settings.get("directory")
         if directory is None or not _dir_egress_allowed(str(directory), egress.allowed_file_dirs):
@@ -1640,7 +1798,10 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
                 f"outbound {dest.name!r}: File directory {directory!r} is not under any "
                 "[egress].allowed_file_dirs entry"
             )
-    elif dest.type in (ConnectorType.REST, ConnectorType.SOAP) and egress.allowed_http:
+    elif (
+        dest.type in (ConnectorType.REST, ConnectorType.SOAP, ConnectorType.FHIR)
+        and egress.allowed_http
+    ):
         url = str(dest.settings.get("url", ""))
         if not _http_egress_allowed(url, egress.allowed_http):
             host = urllib.parse.urlsplit(url).hostname or ""
@@ -1652,6 +1813,22 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
             )
             raise WiringError(
                 f"outbound {dest.name!r}: {dest.type.value} host {host!r} is not in the "
+                "[egress].allowed_http allowlist"
+            )
+        # ADR 0024: the SMART Backend Services token endpoint is a SECOND egress host — the connector
+        # POSTs the signed client_assertion there — so gate it too. Left ungated, a crafted
+        # smart_token_url would exfiltrate the assertion to an unlisted host (a fail-open hole). Only
+        # REST/FHIR carry it; an unset value is a no-op.
+        token_url = str(dest.settings.get("smart_token_url", ""))
+        if token_url and not _http_egress_allowed(token_url, egress.allowed_http):
+            host = urllib.parse.urlsplit(token_url).hostname or ""
+            log.warning(
+                "egress denied: outbound %r SMART token endpoint host %r not in [egress].allowed_http",
+                dest.name,
+                host,
+            )
+            raise WiringError(
+                f"outbound {dest.name!r}: SMART token endpoint host {host!r} is not in the "
                 "[egress].allowed_http allowlist"
             )
     elif dest.type is ConnectorType.DATABASE and egress.allowed_db:

@@ -25,3 +25,15 @@ Per-file copyright and license notices use SPDX identifiers; see the header of
 each source file (SPDX-License-Identifier: AGPL-3.0-or-later). Third-party
 dependencies are distributed under their own licenses; see each project's own
 distribution and the project's generated SBOM.
+
+Third-party attribution — pydicom (optional [dicom] extra, ADR 0025)
+--------------------------------------------------------------------
+pydicom is MIT-licensed, but it vendors DICOM data-dictionary files of GDCM
+(Grassroots DICOM) / CREATIS origin that are licensed under BSD-3-Clause; the
+distribution license of pydicom is therefore "MIT AND BSD-3-Clause" (PEP 639).
+When MessageFoundry is installed with the optional `[dicom]` extra, that
+BSD-3-Clause material is redistributed as part of pydicom. BSD-3-Clause requires
+retaining the original copyright notice, the license conditions, and the
+no-endorsement disclaimer; the authoritative copyright and full license text
+ship in the pydicom distribution (its LICENSE and the bundled data-dictionary
+source). pynetdicom and (Phase-2) dicomweb-client are MIT-licensed.

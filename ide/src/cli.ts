@@ -61,6 +61,17 @@ export function messageSetsDir(): string {
   return config().get<string>("messageSetsDir", "samples/messages");
 }
 
+/**
+ * Max characters of active-editor code attached to a `@messagefoundry` AI chat request
+ * (`messagefoundry.ai.contextCharLimit`, default 8000). Bounds how much of the user's own code
+ * egresses to their chosen model provider. A non-numeric/negative value (which the settings schema
+ * already discourages) falls back to the default; `0` means "graph names only, no editor code".
+ */
+export function aiContextCharLimit(): number {
+  const v = config().get<number>("ai.contextCharLimit", 8000);
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 8000;
+}
+
 export function workspaceDir(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }

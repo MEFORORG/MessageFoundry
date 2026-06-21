@@ -50,7 +50,12 @@ def make_getter(
             url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout, context=ssl_context) as resp:
+            # `base_url` is operator config (default localhost), so the URL scheme is fixed by the
+            # operator and never derived from message/HL7 content — B310's non-http(s)-scheme concern
+            # does not apply (a few authenticated GETs to the local engine API).
+            with urllib.request.urlopen(  # nosec B310
+                req, timeout=timeout, context=ssl_context
+            ) as resp:
                 payload = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             raise MeforApiError(f"GET {path} -> HTTP {exc.code} {exc.reason}") from exc

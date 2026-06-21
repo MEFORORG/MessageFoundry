@@ -5,7 +5,9 @@ choice, and its consequences. They are append-only history — supersede an ADR 
 than rewriting it.
 
 **Status** values: `Proposed` (drafted, awaiting sign-off — no code yet) → `Accepted` (ratified;
-build may start) → `Superseded by NNNN` / `Rejected`.
+build may start) → `Superseded by NNNN` / `Rejected`. A `Reserved` row is a **number allocation**
+for a not-yet-authored ADR — recorded here (coordinator-owned) so parallel sessions don't collide on
+ADR numbers; the row gets a title/file/link when the ADR is authored.
 
 | ADR | Title | Status |
 |---|---|---|
@@ -28,5 +30,16 @@ build may start) → `Superseded by NNNN` / `Rejected`.
 | [0017](0017-consumer-deployment-model.md) | Consumer deployment model — engine as a read-only installed dependency + org-owned config repo across multiple instances | Accepted (2026-06-16) |
 | [0018](0018-per-message-signatures-accepted-risk.md) | Per-message digital signatures (ASVS 4.1.5) — accepted risk / deferred-by-design | Accepted (2026-06-16) |
 | [0019](0019-pluggable-keyprovider-hsm-kms-vault.md) | Pluggable KeyProvider seam (HSM/KMS/Vault envelope decryption) for store-key material (ASVS 13.3.3) | Proposed |
-| [0020](0020-protocol-diagnostic-capture.md) | Protocol-level diagnostic capture (Corepoint "Protocol Data" + "Protocol Text") — per-connection RAM ring + on-error/snapshot flush to a `protocol_trace` table | Proposed |
-| [0021](0021-inbound-ack-nak-capture-response-sent.md) | Inbound ACK/NAK capture ("Response Sent") — ADR 0013 Increment 3: a `kind` discriminator on the `response` table | Proposed |
+| [0020](0020-protocol-diagnostic-capture.md) | Protocol-level diagnostic capture (Corepoint "Protocol Data" + "Protocol Text") — per-connection RAM ring + on-error/snapshot flush to a `protocol_trace` table | **Dropped (Plan-3 §G)** — raw-PHI-at-rest tier, no demand; superseded by ADR 0021 §7's metadata-only connection-error log |
+| [0021](0021-inbound-ack-nak-capture-response-sent.md) | Inbound ACK/NAK capture ("Response Sent") — ADR 0013 Increment 3: a `kind` discriminator on the `response` table; **§7** adds a metadata-only `connection_event` log for pre-ingress listener failures | Accepted (2026-06-19) |
+| [0022](0022-fhir-resource-codec-rest-client.md) | FHIR resource codec (pure `parsing/fhir/`, two-tier `FhirPeek`/`FhirResource` over `fhir.resources`+`fhirpathpy`) + FHIR REST **destination** — outbound client only; inbound server facade gated on a future ADR 0023 | Accepted (2026-06-19) |
+| 0023 | Inbound HTTP listener (+ FHIR server facade) — **reserved** (#7); not yet authored | **Reserved** |
+| [0024](0024-smart-backend-services-token-provider.md) | SMART Backend Services token provider — OAuth2 `client_credentials` + signed-JWT client assertion (`RS384`/`ES384`) for the FHIR/REST outbound; extends the ADR 0018 signer, injects a short-lived bearer per request. Client-only (App Launch + authZ-server out of lane) | Accepted (2026-06-20) |
+| [0025](0025-dicom-codec-store-connectors.md) | DICOM codec + C-STORE store connectors — pure `parsing/dicom/` codec (`pydicom`; two-tier `DicomPeek`/`DicomDataset` + SR→HL7 helpers), `content_type=dicom` over payload-agnostic ingress, inbound C-STORE SCP source; Phase-2 SCU/C-ECHO/DICOMweb STOW-RS destinations. Code-first SR→HL7 Handler (binary carriage via ADR 0028, not latin-1) | Accepted (2026-06-20) |
+| [0026](0026-off-box-egress-update-check.md) | Off-box egress posture for the MEFOR version update-check (#30): a no-network "pinned-vs-current lock diff" as the default + only MVP build (zero egress); a future live-egress check defined as a constrained, off-by-default, env-clamped, https-only/no-redirect/host-allowlisted, advisory-only opt-in (not built); the auto dep-vuln-scan half dropped (§G) | Accepted (2026-06-19) |
+| 0027 | Per-connection retention — **reserved** (#34); not yet authored | **Reserved** |
+| [0028](0028-base64-binary-carriage-codec.md) | base64 binary-carriage codec (+ HL7 OBX-5 ED embedding) — carry arbitrary bytes over the str/TEXT ingress+store as `mfb64:v1:` unbroken base64; pure stdlib `parsing/binary.py` + `RawMessage.from_bytes`/`.raw_bytes`. Supersedes ADR 0025's latin-1 round-trip (NUL-unsafe across the store) | Accepted (2026-06-20) |
+| 0029 | Email/SMTP destination — **reserved** (#23); not yet authored (was earmarked 0024 before SMART claimed it) | **Reserved** |
+| [0030](0030-anonymization-test-harness-tee.md) | Anonymizer / de-identification for the test harness + tee (`messagefoundry.anon`) — build PHI-free test datasets from real traffic; pure-stdlib surrogate pools/encoders (lifted from `generators/_hl7data.py`); tee + harness hooks | Accepted (2026-06-20) |
+| [0031](0031-startup-connection-fault-isolation.md) | Startup connection fault isolation — a single connection that fails to build/bind at startup is isolated (logged + alerted + reported `failed`), not fatal: the engine starts the rest of the graph and serves the API; a failed outbound retries (never drops) and self-heals on reload/restart. Reload stays fail-fast | Accepted (2026-06-21) |
+| [0032](0032-console-desktop-launch.md) | Console desktop launch — a windowed `gui-script` (`messagefoundry-console`) + window/taskbar icon + Desktop/Start-Menu shortcut installer (Phase A, built); a frozen zero-Python installer deferred (Phase B, BACKLOG #39) | Accepted (2026-06-20) |

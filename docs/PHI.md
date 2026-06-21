@@ -87,6 +87,19 @@ write/read — **AES-256-GCM when `MEFOR_STORE_ENCRYPTION_KEY` is set, identity 
 encryption is transparent to callers. Existing plaintext rows are migrated in place on first start
 with a key. See [§3](#3-encryption-at-rest).
 
+**Body format is irrelevant to the at-rest tier — they all ride the same cipher.** The `raw`/`payload`
+rows above are payload-agnostic, so non-HL7 PHI bodies are stored through the **same encrypting store
+path** (no separate at-rest tier):
+
+- **DICOM objects `[BUILT]` (ADR 0025).** A received DICOM object is **PHI** — the header carries
+  PatientName / MRN / DOB — and is stored through the store cipher like any other body, never logged at
+  INFO+, egress-allowlisted, and TLS off-loopback. Logs/errors carry only **routing-safe identifiers**
+  (SOPClassUID / Modality / UIDs / AE title), never the dataset or element values. (Pixel data can carry
+  *burned-in* PHI, but **pixel-data handling is out of scope.**)
+- **Base64-carried binary bodies `[BUILT]` (ADR 0028).** A base64-encoded body is **still PHI** —
+  encoding is not obfuscation — so the never-log rules (§7) apply unchanged. Base64 inflates size by
+  ~33%, so **size/retention budgets (§8) measure the encoded size.**
+
 **File permissions `[BUILT]`.** `MessageStore.open()` restricts the DB and its `-wal`/`-shm` siblings
 to the owner on create — POSIX `chmod 0600`, Windows owner-only DACL via `icacls` (inheritance off) —
 through `_secure_file()` ([store/store.py](../messagefoundry/store/store.py)). It is best-effort and
@@ -382,12 +395,33 @@ Agent purge/shrink job); the engine's retention task targets the SQLite store.
 
 ## 9. De-identification
 
-**`[ROADMAP]`**
+**`[BUILT]`** (HL7 v2 first; ADR 0030, PR #440)
 
-There is **no de-identification framework in the repo**, and this doc does not reference one as if it
-existed. When built, the rules will be **centralized**, not inlined ad-hoc. Note: encryption-at-rest
-(§3) and log redaction (§7) are **not** de-identification — do not conflate "we encrypt" or "we
-redact logs" with "we de-identify."
+The de-identification framework is **built** and **centralized** — do **not** inline ad-hoc de-id
+logic; route it through the framework. It lives in [`messagefoundry/anon/`](../messagefoundry/anon/)
+(vendored **byte-identical** to `tee/anon/` for the standalone tee relay) and exists to build
+**PHI-free test datasets from real traffic**. Pure stdlib — it adds no new dependency.
+
+Properties of the anonymizer:
+
+- **Deterministic, salted keying.** A real value maps to a surrogate under a **secret, per-dataset
+  salt**: the same real value yields the same surrogate **within a dataset** (referential integrity
+  preserved), **different datasets use different salts** (no cross-dataset linkage), and the salt is
+  secret (re-identification-resistant).
+- **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
+  scrubbed dataset stays structurally realistic.
+- **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
+  loose string search.
+- **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
+  `AnonError`) — it never emits an un-scrubbed body.
+
+Surfaces: the **`messagefoundry tee anonymize-captures`** subcommand and the test-harness
+`CaptureSink`/corpus hooks. [`scripts/publish/scan_forbidden.py`](../scripts/publish/scan_forbidden.py)
+is now the **single leak-token source-of-truth** (a fail-closed leak gate). HL7 v2 is supported first;
+X12/FHIR seams come later.
+
+Note: encryption-at-rest (§3) and log redaction (§7) are **not** de-identification — do not conflate
+"we encrypt" or "we redact logs" with "we de-identify."
 
 ### AI coding assistance
 
@@ -399,8 +433,8 @@ path carries an explicit guard against attaching anything more, **regardless of 
 No patient data leaves the workstation through the assistant.
 
 The `phi` scope is **future** and only reachable over the planned **engine broker** with a **BAA +
-zero-data-retention** provider connection; the `deidentified` scope depends on the **unbuilt** de-id
-framework above. The assistant is RBAC-gated (`ai:assist`) and governed by a central,
+zero-data-retention** provider connection; the `deidentified` scope builds on the de-id framework
+above (§9). The assistant is RBAC-gated (`ai:assist`) and governed by a central,
 environment-clamped policy — full model in [AI.md](AI.md), permission in [SECURITY.md](SECURITY.md).
 
 ---
@@ -494,7 +528,8 @@ WP-6c); structured (JSON) logging + off-box (syslog/SIEM) forwarding + the cross
 searchable `summary` column stays outside the encryption seam by design (volume encryption covers it;
 `error`/`last_error`/`detail` are now ciphered — WP-5) · a fail-closed outbound/egress allowlist is
 enforced (`[egress]`, WP-11c) but **MLLP is still plaintext** (MLLP-over-TLS is Phase 2) · no
-strict-parse time budget · de-identification not built. Each is tracked in
+strict-parse time budget · de-identification is **built** for HL7 v2 (the anonymizer, §9, ADR 0030)
+with X12/FHIR seams still to come. Each is tracked in
 [§11](#11-hardening-roadmap).
 
 ---

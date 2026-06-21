@@ -304,3 +304,50 @@ def test_health_poll_reads_off_main_thread(qapp, monkeypatch) -> None:
     _drain(qapp)
     assert client.status_thread is not None and client.status_thread != main
     window.close()
+
+
+# --- #38: a problem engine connection must not wedge the console — it recovers cleanly -------------
+# The console reaches the engine ONLY over HTTP (no WebSocket — it polls /stats); these assert the
+# "(c) reconnects/recovers cleanly once the engine returns" clause, which the other console tests
+# (which cover the single-error half: unreachable/401/malformed-body/off-thread) don't exercise.
+
+
+def test_health_poll_recovers_after_engine_returns(qapp, monkeypatch) -> None:
+    # A transient unreachable poll turns the nav heart red and the shell owns the reachability error;
+    # the very NEXT routine poll, once the engine is back, clears both with no operator action.
+    monkeypatch.setattr(shell_mod.service_control, "service_state", lambda _n: "not installed")
+    client = FakeStatusClient()
+    window = shell_mod.AppWindow(client)  # type: ignore[arg-type]
+
+    window._apply_health(window._fetch_health())  # engine healthy
+    assert window._heart._state == "green"
+
+    client._status_error = ApiError("connection refused", status=503)  # engine drops mid-session
+    window._apply_health(window._fetch_health())
+    assert window._heart._state == "red"
+    assert "connection refused" in window._status.text()
+    assert window._health_error  # the poll owns this reachability error
+
+    client._status_error = None  # engine returns
+    window._apply_health(window._fetch_health())  # the next routine poll auto-recovers
+    assert window._heart._state == "green"
+    assert window._status.text() == "" and window._health_error == ""  # error auto-cleared
+    window.close()
+
+
+def test_status_page_recovers_after_engine_returns(qapp, monkeypatch) -> None:
+    # Page layer: an unreachable poll renders "Reachable: no" + emits the error (a visible, recoverable
+    # state — not a crash); once the engine returns the next fetch renders healthy again.
+    monkeypatch.setattr(status_mod.service_control, "service_state", lambda _n: "running")
+    client = FakeStatusClient(status_error=ApiError("down", status=503))
+    page = EngineStatusPage(client)  # type: ignore[arg-type]
+    errs: list[str] = []
+    page.error.connect(errs.append)
+
+    page._apply(page._fetch())
+    assert page._engine["Reachable"].text() == "no" and errs == ["down"]
+
+    client._status_error = None  # engine returns
+    page._apply(page._fetch())
+    assert page._engine["Reachable"].text() == "yes"  # recovered cleanly, no leftover error state
+    page.stop()

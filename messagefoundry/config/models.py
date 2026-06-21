@@ -34,9 +34,13 @@ class ConnectorType(str, Enum):
     TIMER = "timer"  # clock-driven source — emits a configured body on a schedule (source only, ADR 0011)
     X12 = "x12"  # raw-TCP X12 EDI — ISA/IEA-framed (no transport sentinel), source + destination (ADR 0012)
     LOOPBACK = "loopback"  # inert inbound — messages arrive only via ingress_handoff (re-ingress, ADR 0013)
+    FHIR = "fhir"  # FHIR REST destination — POST/PUT a resource or transaction Bundle to a server (ADR 0022)
+    DIMSE = "dimse"  # raw DICOM upper-layer — C-STORE SCP source (ADR 0025 Phase 1); SCU/C-ECHO dest (Phase 2)
     # DATABASE also has an inbound poll source (DatabasePoll, ADR 0003 §3 + 0004); REMOTEFILE is both
     # source and destination. TIMER is source-only (it generates, never delivers). REST/SOAP sources
-    # (HTTP listeners) and TCP/FHIR are future.
+    # (HTTP listeners) and TCP are future. (FHIR is destination-only here; its inbound facade is ADR 0023.)
+    # DIMSE is the C-STORE SCP source (Phase 1, gated by the TCP egress arm as a raw socket); the C-STORE
+    # SCU destination + the DICOMWEB (STOW-RS over HTTP) destination are Phase 2 (ADR 0025).
 
 
 class ContentType(str, Enum):
@@ -53,6 +57,24 @@ class ContentType(str, Enum):
     XML = "xml"
     TEXT = "text"
     X12 = "x12"  # ASC X12 EDI, relayed opaquely (no structured parse) — routes as RawMessage
+    FHIR = (
+        "fhir"  # HL7 FHIR JSON — routed as RawMessage; parsed on demand via parsing/fhir (ADR 0022)
+    )
+    BINARY = "binary"  # opaque byte payload — base64-carried over the str/TEXT substrate (ADR 0028)
+    DICOM = "dicom"  # DICOM Part-10 object (binary) — base64-carried; parsed on demand via parsing/dicom (ADR 0025)
+
+    @property
+    def is_binary(self) -> bool:
+        """Whether an inbound of this type carries **raw bytes** that must be base64-carried at the
+        source boundary (ADR 0028) rather than decoded as text — a ``NUL``/non-UTF-8 body would be
+        rejected (Postgres) or silently truncated (SQLite/SQL Server) by the ``str``/TEXT store.
+        Byte-oriented codecs (DICOM, …) join this set; everything else routes as decoded text."""
+        return self in _BINARY_CONTENT_TYPES
+
+
+#: Content types whose inbound bodies are raw bytes, carried as base64 per ADR 0028. Kept as a set so
+#: a byte-oriented codec (e.g. DICOM) opts in by adding its member — see :attr:`ContentType.is_binary`.
+_BINARY_CONTENT_TYPES: frozenset[ContentType] = frozenset({ContentType.BINARY, ContentType.DICOM})
 
 
 class AckMode(str, Enum):
@@ -147,16 +169,21 @@ class BuildupThreshold(BaseModel):
 
 
 class SignatureAlgorithm(str, Enum):
-    """JWS algorithm for opt-in per-connection outbound message signing (ASVS 4.1.5, ADR 0018).
+    """JWS algorithm for opt-in per-connection outbound message signing (ASVS 4.1.5, ADR 0018) and for
+    the SMART Backend Services ``client_assertion`` JWT (ADR 0024).
 
-    All three are produced with the **core** ``cryptography`` dependency (no new package). ``RS256``
-    (RSASSA-PKCS1-v1_5) is **deterministic** — the same key + payload always yields the same signature;
-    ``PS256`` (RSASSA-PSS) and ``ES256`` (ECDSA P-256) are **randomized** (a fresh signature per call,
-    like the WS-Security nonce, ADR 0015) — all SHA-256."""
+    All are produced with the **core** ``cryptography`` dependency (no new package). ``RS256``/``RS384``
+    (RSASSA-PKCS1-v1_5) are **deterministic** — the same key + payload always yields the same signature;
+    ``PS256`` (RSASSA-PSS) and ``ES256``/``ES384`` (ECDSA) are **randomized** (a fresh signature per
+    call, like the WS-Security nonce, ADR 0015). ``RS384``/``ES384`` (SHA-384) are the two algorithms
+    SMART Backend Services **SHALL** support for the client-assertion JWT (ADR 0024); the rest are
+    SHA-256."""
 
     RS256 = "RS256"  # RSASSA-PKCS1-v1_5 + SHA-256 (RSA key; deterministic)
     PS256 = "PS256"  # RSASSA-PSS + SHA-256 (RSA key; randomized)
     ES256 = "ES256"  # ECDSA P-256 (secp256r1) + SHA-256 (EC key; randomized)
+    RS384 = "RS384"  # RSASSA-PKCS1-v1_5 + SHA-384 (RSA key; deterministic) — SMART Backend Services (ADR 0024)
+    ES384 = "ES384"  # ECDSA P-384 (secp384r1) + SHA-384 (EC key; randomized) — SMART Backend Services (ADR 0024)
 
 
 class OutboundSigning(BaseModel):

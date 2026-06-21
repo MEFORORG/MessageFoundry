@@ -21,7 +21,7 @@ import asyncio
 import contextlib
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TextIO
 
@@ -43,6 +43,7 @@ class CaptureSink:
         host: str = "127.0.0.1",
         ports: Sequence[int] = (2800,),
         ack_mode: AckMode = AckMode.ORIGINAL,
+        anonymizer: Callable[[str], str] | None = None,
     ) -> None:
         if not ports:
             raise ValueError("the capture sink needs at least one port")
@@ -50,11 +51,16 @@ class CaptureSink:
         self._host = host
         self._ports = tuple(ports)
         self._ack_mode = ack_mode
+        # Optional de-identifier (ADR 0030 §6): when set, each captured message is anonymized at the
+        # single _write choke point so the persisted JSONL carries PHI-free bodies. Wire it as e.g.
+        # ``anonymizer=lambda raw: anonymize_checked(raw, salt=salt)``.
+        self._anonymizer = anonymizer
         self._servers: list[asyncio.Server] = []
         self._writers: set[asyncio.StreamWriter] = set()
         self._file: TextIO | None = None
         self.captured = 0
         self.unparseable = 0
+        self.anon_failed = 0
 
     async def start(self) -> None:
         self._out.parent.mkdir(parents=True, exist_ok=True)
@@ -124,6 +130,16 @@ class CaptureSink:
 
     def _write(self, control_id: str | None, raw: str) -> None:
         assert self._file is not None, "CaptureSink.start() must be called before messages arrive"
+        if self._anonymizer is not None:
+            try:
+                raw = self._anonymizer(raw)
+            except Exception:
+                # Fail closed on ANY anonymizer error at this PHI choke point: an anonymization
+                # failure must NEVER write the un-anonymized body (PHI). Drop it and count it — a
+                # finding to reconcile, not a silent leak (CLAUDE.md §9). Broad on purpose: the engine
+                # path can raise a parser exception that is not a ValueError/RuntimeError.
+                self.anon_failed += 1
+                return
         json.dump(
             {"control_id": control_id, "raw": raw, "received_at": time.time()},
             self._file,

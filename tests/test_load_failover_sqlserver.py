@@ -37,7 +37,6 @@ _RESET_TABLES = (
     "queue",
     "outbox",
     "response",
-    "lane_leases",
     "leader_lease",
     "nodes",
     "cluster_config",

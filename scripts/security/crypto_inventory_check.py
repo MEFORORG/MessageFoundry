@@ -31,6 +31,9 @@ CRYPTO_MODULES = frozenset({"hashlib", "secrets", "hmac", "ssl", "argon2", "cryp
 # Keep this in sync with docs/security/ASVS-L2-PHASE0-CHANGES.md §4. To add an entry, document *why*
 # the new crypto usage is needed there, then list it here.
 INVENTORY: dict[str, frozenset[str]] = {
+    # ADR 0030: keyed BLAKE2b derives the deterministic, salt-keyed seed that picks a surrogate, so
+    # the anonymizer's pseudonymization is consistent-within-a-dataset yet one-way (re-id-resistant).
+    "messagefoundry/anon/keying.py": frozenset({"hashlib"}),
     "messagefoundry/api/tls.py": frozenset({"ssl"}),
     "messagefoundry/auth/ldap.py": frozenset({"ssl"}),
     "messagefoundry/auth/passwords.py": frozenset({"argon2"}),
@@ -44,9 +47,14 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/crypto.py": frozenset({"hashlib", "cryptography"}),
     "messagefoundry/store/postgres.py": frozenset({"ssl"}),
     "messagefoundry/store/store.py": frozenset({"hashlib"}),
+    # ADR 0025: the DICOM C-STORE SCP's server SSLContext for DICOM-over-TLS (the MLLP-inbound posture).
+    "messagefoundry/transports/dicom.py": frozenset({"ssl"}),
     "messagefoundry/transports/mllp.py": frozenset({"ssl"}),
     "messagefoundry/transports/rest.py": frozenset({"ssl"}),
     "messagefoundry/transports/signing.py": frozenset({"cryptography"}),
+    # ADR 0024: a random `jti` for the SMART Backend Services client_assertion JWT (the JWT signing
+    # itself reuses signing.py's `cryptography`).
+    "messagefoundry/transports/smart.py": frozenset({"secrets"}),
     "messagefoundry/transports/soap.py": frozenset({"hashlib", "ssl"}),
 }
 

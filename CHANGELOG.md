@@ -6,7 +6,14 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0] — 2026-06-16 — Early Access
+### Added
+- **One-click console launch** — a windowed `messagefoundry-console` launcher (`[project.gui-scripts]`, no
+  flashing console window) carrying the MessageFoundry badge as the window/taskbar icon, plus
+  `scripts/console/install-console-shortcut.ps1` to drop Desktop / Start-Menu shortcuts (per-user, or
+  `-AllUsers` for machine-wide). Operators open the admin console by double-clicking an icon instead of
+  running a Python command. See [ADR 0032](docs/adr/0032-console-desktop-launch.md).
+
+## [0.1.0] — 2026-06-18 — Early Access
 
 First public **Early Access** release: the feature set is complete and validated by the project's own
 tests, but the external code review + penetration test (the bar for a security-certified **v1.0**) happen

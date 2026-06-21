@@ -612,7 +612,7 @@ def test_app_window_builds_nav_and_default_page(qapp) -> None:
     from messagefoundry.console.shell import AppWindow
 
     window = AppWindow(StubClient(), poll_seconds=2.0)
-    assert window._nav.count() == 4
+    assert window._nav.count() == 5  # Connections, Alerts, Dead Letters, Log Search, Engine Status
     assert window._timer.isActive() and window._timer.interval() == 2000
     _settle(qapp, window.connections._runner)  # the default page reloads its rows off-thread
     assert window.connections._table.rowCount() == 2  # default page rendered
@@ -673,7 +673,7 @@ def test_app_window_open_logs_navigates_and_filters(qapp) -> None:
 
     window = AppWindow(StubClient())
     window.connections.open_logs.emit("ch1")
-    assert window._nav.currentRow() == 2  # Log Search
+    assert window._nav.currentRow() == 3  # Log Search (after Connections, Alerts, Dead Letters)
     assert window.log_search.messages._channel_filter.text() == "ch1"
 
 

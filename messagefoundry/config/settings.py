@@ -1032,19 +1032,20 @@ class AlertsSettings(_Section):
 
 
 class ClusterSettings(_Section):
-    """``[cluster]`` — horizontal scale-out coordination (Track B Steps 3-7).
+    """``[cluster]`` — active-passive HA coordination (Track B Steps 3-7).
 
     The multi-node coordination seam (a ``nodes`` table + per-node heartbeat + leader election) without
     changing single-node behavior: with ``enabled = false`` (the default) the engine uses the no-op
     :class:`~messagefoundry.pipeline.cluster.NullCoordinator` and runs byte-identically to before.
-    With ``enabled = true`` on Postgres, the scale-out feature set is COMPLETE: leader election (Step 4),
-    leader-gated poll-source intake (Step 4b), per-lane FIFO ownership (Step 5), cross-node reference +
-    config-reload + transform-state convergence (Steps 6/6b), and the read-only observability API
-    (Step 7 — ``/cluster/status`` + ``/cluster/nodes``). Exactly one node runs the leader-only WRITE
-    singletons (retention, the lease-reclaim sweep) and re-reads each reference source while followers
-    read-through the shared snapshot; an operator config reload propagates cluster-wide via a version
-    token; and operators can see membership + leadership over the API. Operators must keep node clocks
-    synced (NTP — leases are wall-clock), run identical config dirs on every node, and apply config
+    With ``enabled = true`` on a shared server-DB store, the active-passive HA feature set is COMPLETE:
+    leader election (Step 4 — exactly one node drains the graph; a standby takes over on failover),
+    leader-gated poll-source intake (Step 4b), cross-node reference + config-reload + transform-state
+    convergence (Steps 6/6b), and the read-only observability API (Step 7 — ``/cluster/status`` +
+    ``/cluster/nodes``). Exactly one node runs the leader-only WRITE singletons (retention, the
+    lease-reclaim sweep) and re-reads each reference source while followers read-through the shared
+    snapshot; an operator config reload propagates cluster-wide via a version token; and operators can
+    see membership + leadership over the API. Operators must keep node clocks synced (NTP — the
+    failover-recovery leases are wall-clock), run identical config dirs on every node, and apply config
     changes via a coordinated (not rolling) restart — see ``docs/CLUSTERING.md``. Leadership itself is a
     **self-fencing lease** (Workstream A2): the leader renews a ``leader_lease`` row every
     ``heartbeat_seconds`` to ``DB_now + leader_lease_ttl_seconds``, a standby acquires only once that
@@ -1218,23 +1219,22 @@ class ServiceSettings(BaseModel):
         """Cluster coordination needs a shared **server-DB** store to back the ``nodes`` + leadership-
         lease tables. SQLite is single-file/single-node, so it cannot. **Postgres** and **SQL Server**
         both can: each runs the active-passive leadership lease (one leader drains the graph; a standby
-        takes over on failure). Postgres additionally backs the active-active per-lane row leases (0.2
-        horizontal scale-out); SQL Server is **active-passive only** (no row leases — the leader-gate +
-        self-fence keep a single active processor at a time). This spans two sections, so it lives here
-        (not on :class:`ClusterSettings`, which can't see ``[store]``)."""
+        takes over on failure). The leader-gate + self-fence keep a single active processor at a time on
+        either backend. This spans two sections, so it lives here (not on :class:`ClusterSettings`,
+        which can't see ``[store]``)."""
         if self.cluster.enabled:
             if self.store.backend not in (StoreBackend.POSTGRES, StoreBackend.SQLSERVER):
                 raise ValueError(
                     "[cluster].enabled requires [store].backend in {'postgres', 'sqlserver'} "
                     f"(got {self.store.backend.value!r}); SQLite is single-node — cluster coordination "
-                    "needs a shared server-DB store (Postgres active-active/active-passive, or SQL "
-                    "Server active-passive)"
+                    "needs a shared server-DB store (Postgres active-passive, or SQL Server "
+                    "active-passive)"
                 )
             if self.store.pool_size < 2:
                 # A clustered node runs concurrent background work against the pool — the maintenance
-                # loop (heartbeat + lease renew + lane/config refresh), the leader-gated reclaim sweep,
-                # and the per-stage workers — alongside request traffic. A pool of 1 would serialize all
-                # of it behind a single connection, so require headroom.
+                # loop (heartbeat + leadership-lease renew + config-version refresh), the leader-gated
+                # reclaim sweep, and the per-stage workers — alongside request traffic. A pool of 1 would
+                # serialize all of it behind a single connection, so require headroom.
                 raise ValueError(
                     "[cluster].enabled requires [store].pool_size >= 2 "
                     f"(got {self.store.pool_size}); a clustered node drives concurrent background work "

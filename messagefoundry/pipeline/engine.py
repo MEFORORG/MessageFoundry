@@ -92,10 +92,10 @@ class Engine:
     ) -> None:
         self.store = store
         # Cluster coordination seam (Track B Step 3). None → the no-op NullCoordinator, so single-node
-        # (SQLite and single-node Postgres) is byte-identical: is_leader()/owns_lane() are always True
-        # and start()/stop() do nothing. A DbCoordinator (built by build_coordinator on an enabled
-        # [cluster] Postgres store) registers the node + heartbeats and (Step 4) elects a leader; its
-        # owns_lane() still reports True until Step 5. Threaded into every runner this engine builds.
+        # (SQLite and single-node Postgres) is byte-identical: is_leader() is always True and
+        # start()/stop() do nothing. A DbCoordinator (built by build_coordinator on an enabled [cluster]
+        # Postgres store) registers the node + heartbeats and (Step 4) elects a leader for active-passive
+        # HA — exactly one node drains the graph. Threaded into every runner this engine builds.
         self._coordinator: ClusterCoordinator = coordinator or NullCoordinator()
         # [cluster] knobs (Track B Step 4). Only reclaim_interval_seconds is read here (the cadence of
         # the leader's lease-reclaim sweep); the rest drive build_coordinator upstream. None → the
@@ -170,8 +170,8 @@ class Engine:
         # processing. NEVER spawned single-node (NullCoordinator is always leader, so the graph is
         # brought up directly at start() — byte-identical). The lock serializes reconciles; the event
         # stops the loop. NOTE the hard guarantee against concurrent double-processing of any given row
-        # is NOT this gate — it is the store's row/lane leases (a standby's reclaim only takes EXPIRED
-        # leases, so it can never claim a row the old leader still holds; Track B Step 2/5). This gate
+        # is NOT this gate — it is the store's per-row leases (a standby's reclaim only takes EXPIRED
+        # leases, so it can never claim a row the old leader still holds; Track B Step 2). This gate
         # promptly stops a demoted/fenced node from accepting NEW inbound work and initiating NEW
         # processing; the poll interval is bounded (at start()) to keep that stop prompt.
         self._graph_supervisor: asyncio.Task[None] | None = None
@@ -417,7 +417,8 @@ class Engine:
         # so single-node / SQLite never spawns it. It is itself leader-gated each pass, so a follower's
         # runner ticks but no-ops; the current leader recovers crashed nodes' expired-lease rows.
         if self._coordinator.reclaims_inflight() and hasattr(self.store, "reclaim_expired_leases"):
-            # Postgres active-active: per-row lease reclaim recovers crashed nodes' EXPIRED-lease rows.
+            # Postgres active-passive: the leader's per-row lease reclaim recovers a crashed/fenced prior
+            # leader's EXPIRED-lease rows (the standby never claims while a live leader holds the lease).
             self._leader_maintenance = LeaderMaintenanceRunner(
                 self.store,  # type: ignore[arg-type]  # reclaim_expired_leases guarded above (Postgres)
                 self._coordinator,
@@ -456,7 +457,7 @@ class Engine:
         # It polls leadership and starts/stops the graph so only the leader binds listeners + runs
         # workers. The poll interval is kept short (relative to the fence/TTL margin) so a demoted/fenced
         # node stops accepting + initiating new work promptly; concurrent double-processing of a given
-        # row is independently prevented by the store's row/lane leases (see __init__). Single-node
+        # row is independently prevented by the store's per-row leases (see __init__). Single-node
         # never spawns it (the graph is already running, brought up directly above).
         if self._coordinator.is_clustered() and self._registry_runner is not None:
             ttl = self._cluster_settings.leader_lease_ttl_seconds
@@ -482,12 +483,12 @@ class Engine:
         against the runner's own ``running`` guard."""
         if self._registry_runner is None:
             return
-        # A4 — on promotion (clustered Postgres), recover the prior leader's stranded in-flight rows AND
-        # take over its lane leases IMMEDIATELY (owner-scoped, lease-blind), instead of waiting out the
-        # ~[store].lease_ttl_seconds per-row/lane lease TTL — which was the dominant failover-recovery
-        # delay (#293: ~60s on PG vs ~7s on SQL Server). This brings Postgres to parity with the SQL
-        # Server reset_stale_inflight path; the periodic, lease-GATED sweep keeps running in the
-        # background (clock-skew / future active-active recovery). Single-node has no leader maintenance
+        # A4 — on promotion (clustered Postgres), recover the prior leader's stranded in-flight rows
+        # IMMEDIATELY (owner-scoped, lease-blind), instead of waiting out the ~[store].lease_ttl_seconds
+        # per-row lease TTL — which was the dominant failover-recovery delay (#293: ~60s on PG vs ~7s on
+        # SQL Server). This brings Postgres to parity with the SQL Server reset_stale_inflight path; the
+        # periodic, lease-GATED sweep keeps running in the background (recovers a crashed prior leader's
+        # expired-lease residue / tolerates clock skew). Single-node has no leader maintenance
         # (_leader_maintenance is None), and its own crash residue was already recovered by the
         # unconditional reset_stale_inflight in start().
         if self._leader_maintenance is not None:

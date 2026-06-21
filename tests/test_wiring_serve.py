@@ -30,8 +30,9 @@ def test_sample_config_loads_and_routes() -> None:
     )  # bind interface is service-set
     assert "FILE-OUT_Test_ADT" in reg.outbound
     # samples/config ships: the ADT archive route, the ACME env()-driven route, the X12 EDI route
-    # (IB_PARTNER_X12, ADR 0012), the WS-* SOAP submit (IB_IMMUNIZATION_VXU, ADR 0015), and the X12
-    # real-time-eligibility route (IB_RTE_ELIGIBILITY, ADR 0016).
+    # (IB_PARTNER_X12, ADR 0012), the WS-* SOAP submit (IB_IMMUNIZATION_VXU, ADR 0015), the X12
+    # real-time-eligibility route (IB_RTE_ELIGIBILITY, ADR 0016), the FHIR intake route
+    # (IB_FHIR_INTAKE, ADR 0022), and the DICOM SR→ORU route (IB_RADIOLOGY_SR, ADR 0025).
     assert set(reg.routers) == {
         "adt_router",
         "acme_adt_router",
@@ -39,6 +40,8 @@ def test_sample_config_loads_and_routes() -> None:
         "immunization_router",
         "rte_request_router",
         "rte_response_router",
+        "fhir_router",
+        "sr_router",
     }
     assert set(reg.handlers) == {
         "archive",
@@ -47,6 +50,8 @@ def test_sample_config_loads_and_routes() -> None:
         "immunization_submit_handler",
         "rte_query_handler",
         "rte_result_handler",
+        "fhir_handler",
+        "sr_to_oru",
     }
     assert reg.inbound["IB_PARTNER_X12"].spec.settings["port"] == 2710
     assert reg.inbound["IB_PARTNER_X12"].content_type.value == "x12"

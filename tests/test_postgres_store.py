@@ -34,7 +34,6 @@ RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
 _TABLES = (
     "message_events",
     "audit_log",
-    "lane_leases",
     "cluster_config",
     "queue",
     "response",
@@ -91,6 +90,19 @@ async def test_enqueue_with_no_delivery_is_unrouted(store) -> None:
     msg = await store.get_message(mid)
     assert msg is not None and msg["status"] == MessageStatus.UNROUTED.value
     assert await store.outbox_for(mid) == []
+
+
+async def test_binary_carriage_round_trips_nul_bearing(store) -> None:
+    # ADR 0028: base64 carriage carries NUL-bearing bytes through the TEXT body column, where the
+    # latin-1 round-trip it supersedes would be REJECTED at psycopg bind ("cannot contain NUL").
+    from messagefoundry.parsing import RawMessage
+
+    data = bytes(range(256)) * 4
+    carried = RawMessage.from_bytes(data, "binary").raw
+    mid = await store.enqueue_ingress(channel_id="IB", raw=carried, message_type="binary")
+    msg = await store.get_message(mid)
+    assert msg is not None and "\x00" not in msg["raw"]
+    assert RawMessage(msg["raw"], "binary").raw_bytes == data
 
 
 async def test_record_received_filtered_and_error(store) -> None:
@@ -803,52 +815,16 @@ async def test_claim_next_fifo_stamps_owner_and_lease(store) -> None:
     assert row["lease_expires_at"] == pytest.approx(200.0 + _ttl(store))
 
 
-async def test_renew_leases_extends_own_inflight_rows(store) -> None:
-    """renew_leases extends lease_expires_at for this owner's inflight rows, returns the count, and
-    leaves a non-inflight row and a different owner's row untouched."""
-    # This owner's inflight row.
-    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
-    mine = (await store.claim_ready(now=200.0, destination_name="OB1"))[0]
-    # A done (non-inflight) row owned by this store.
-    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB2", "p")], now=100.0)
-    done = (await store.claim_ready(now=200.0, destination_name="OB2"))[0]
-    await store.mark_done(done.id, now=205.0)
-
-    # A second store instance (distinct owner) claims its own inflight row.
-    from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.postgres import PostgresStore
-
-    other = await PostgresStore.open(load_settings(environ=os.environ).store)
-    try:
-        assert other._owner != store._owner
-        await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB3", "p")], now=100.0)
-        theirs = (await other.claim_ready(now=200.0, destination_name="OB3"))[0]
-        theirs_before = (await _queue_row(store, theirs.id))["lease_expires_at"]
-
-        renewed = await store.renew_leases([mine.id, done.id, theirs.id], now=300.0)
-        assert renewed == 1  # only this owner's still-inflight row
-        assert (await _queue_row(store, mine.id))["lease_expires_at"] == pytest.approx(
-            300.0 + _ttl(store)
-        )
-        # The done row (terminal) and the other owner's row are unchanged.
-        assert (await _queue_row(store, done.id))["status"] == OutboxStatus.DONE.value
-        assert (await _queue_row(store, theirs.id))["lease_expires_at"] == theirs_before
-    finally:
-        await other.close()
-
-
 async def test_reclaim_expired_leases_only_reclaims_expired(store) -> None:
-    """reclaim_expired_leases reclaims only rows whose lease is in the past; a fresh/renewed lease is
-    left in flight; it sets the row pending with owner/lease cleared and next_attempt_at=now."""
+    """reclaim_expired_leases reclaims only rows whose lease is in the past; a fresh lease is left in
+    flight; it sets the row pending with owner/lease cleared and next_attempt_at=now."""
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
     expired = (await store.claim_ready(now=200.0, destination_name="OB1"))[0]
+    # A second row claimed LATER, so its lease expires later than `expired`'s.
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB2", "p")], now=100.0)
-    fresh = (await store.claim_ready(now=200.0, destination_name="OB2"))[0]
+    fresh = (await store.claim_ready(now=250.0, destination_name="OB2"))[0]
 
-    # Sweep at a time after `expired`'s lease but before `fresh`'s would be only fair if equal — both
-    # were claimed at 200 with the same ttl, so renew `fresh` to push its lease out.
-    await store.renew_leases([fresh.id], now=250.0)
-    sweep_at = 200.0 + _ttl(store) + 1.0  # past expired's lease, before fresh's renewed lease
+    sweep_at = 200.0 + _ttl(store) + 1.0  # past expired's lease, before fresh's (claimed at 250)
     assert sweep_at < 250.0 + _ttl(store)
 
     reclaimed = await store.reclaim_expired_leases(now=sweep_at)
@@ -863,37 +839,36 @@ async def test_reclaim_expired_leases_only_reclaims_expired(store) -> None:
     assert again is not None and again.id == expired.id
 
 
-async def test_recover_inflight_on_promotion_owner_scoped_and_takes_lanes(store) -> None:
+async def test_recover_inflight_on_promotion_owner_scoped(store) -> None:
     # #293: on promotion the new leader recovers the PRIOR leader's stranded inflight rows (owner-scoped,
-    # lease-BLIND) AND takes over its lane leases — WITHOUT waiting out the ~ttl per-row/lane lease, and
-    # WITHOUT touching its own freshly-claimed rows (no self-theft). Both gates (queue row + lane lease)
-    # must clear, or real failover still hangs ~ttl on the lane.
+    # lease-BLIND) WITHOUT waiting out the ~ttl per-row lease, and WITHOUT touching its own freshly-
+    # claimed rows (no self-theft).
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.postgres import PostgresStore
 
-    # The PRIOR leader = a distinct store instance + cluster node, claiming via the clustered FIFO path
-    # (→ inflight under a FUTURE row lease + a lane lease owned by its node_id).
+    # The PRIOR leader = a distinct store instance (→ inflight under a FUTURE row lease, owned by its
+    # distinct store-instance id).
     other = await PostgresStore.open(load_settings(environ=os.environ).store)
     try:
         assert other._owner != store._owner
         await store.enqueue_message(
             channel_id="IB", raw=RAW, deliveries=[("OB_OLD", "p")], now=100.0
         )
-        old = await other.claim_next_fifo("OB_OLD", now=200.0, owner="old-node")
+        old = await other.claim_next_fifo("OB_OLD", now=200.0)
         assert old is not None
-        # The SURVIVOR claims its OWN row via the clustered FIFO path (queue owner=store._owner, lane
-        # owner="new-node"). A future lease, so nothing can recover it on lease-expiry grounds.
+        # The SURVIVOR claims its OWN row (queue owner=store._owner). A future lease, so nothing can
+        # recover it on lease-expiry grounds.
         await store.enqueue_message(
             channel_id="IB", raw=RAW, deliveries=[("OB_NEW", "p")], now=100.0
         )
-        mine = await store.claim_next_fifo("OB_NEW", now=200.0, owner="new-node")
+        mine = await store.claim_next_fifo("OB_NEW", now=200.0)
         assert mine is not None
         # Recover at t=210, while BOTH leases (claimed at 200, ttl=60 → expire at 260) are still in the
         # FUTURE — so the recovery is provably lease-BLIND, not merely an early expired-lease sweep.
         recover_at = 210.0
         assert (await _queue_row(store, old.id))["lease_expires_at"] > recover_at  # not yet expired
 
-        recovered = await store.recover_inflight_on_promotion(lane_owner="new-node", now=recover_at)
+        recovered = await store.recover_inflight_on_promotion(now=recover_at)
         assert recovered == 1  # ONLY the prior leader's row (owner-scoped)
 
         old_row = await _queue_row(store, old.id)
@@ -905,13 +880,8 @@ async def test_recover_inflight_on_promotion_owner_scoped_and_takes_lanes(store)
         )  # OUR row untouched (no self-theft)
         assert mine_row["owner"] == store._owner
 
-        # The prior leader's lane lease is gone (survivor can claim it now); the survivor's is kept.
-        async with store._pool.acquire() as conn:
-            owners = [r["owner"] for r in await conn.fetch("SELECT owner FROM lane_leases")]
-        assert owners and all(o == "new-node" for o in owners)  # only the survivor's lane remains
-
-        # End-to-end: the re-pended head is claimable again at once — both gates cleared.
-        again = await store.claim_next_fifo("OB_OLD", now=211.0, owner="new-node")
+        # End-to-end: the re-pended head is claimable again at once.
+        again = await store.claim_next_fifo("OB_OLD", now=211.0)
         assert again is not None and again.id == old.id
     finally:
         await other.close()
@@ -962,138 +932,45 @@ async def test_two_owner_no_theft(store) -> None:
         await owner_b.close()
 
 
-# --- Track B Step 5: per-lane FIFO ownership (atomic lane leases) ----------------
+# --- failover FIFO safety: stranded-head reclaim folded into the no-owner claim ----
 
 
-async def _lane_lease(store, lane: str):
-    """Read a lane_leases row directly (owner + expiry)."""
-    async with store._pool.acquire() as conn:
-        return await conn.fetchrow(
-            "SELECT owner, lease_expires_at FROM lane_leases WHERE lane=$1", lane
-        )
-
-
-async def test_fifo_lane_mutual_exclusion(store) -> None:
-    """With an owner set, claiming a FIFO lane leases it to that node; a concurrent claim by a
-    DIFFERENT owner returns None (it does not own the lane) even though rows remain."""
-    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0)
-    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p2")], now=101.0)
-
-    a = await store.claim_next_fifo("OB1", now=200.0, owner="A")
-    assert a is not None and a.payload == "p1"  # A claims the head and now holds the lane
-    # B does not own the lane → no claim, even though p2 is still pending.
-    assert await store.claim_next_fifo("OB1", now=200.0, owner="B") is None
-
-    lease = await _lane_lease(store, "outbound:OB1")
-    assert lease is not None and lease["owner"] == "A"
-    assert lease["lease_expires_at"] == pytest.approx(200.0 + _ttl(store))  # unexpired
-
-
-async def test_fifo_strict_order_under_contention(store) -> None:
-    """Two owners A/B alternately poll one lane with rows R1,R2,R3; only the lane owner ever claims, so
-    the rows come out in strict order R1,R2,R3 and never two at once."""
-    for i, t in enumerate((100.0, 101.0, 102.0)):
-        await store.enqueue_message(
-            channel_id="IB", raw=RAW, deliveries=[("OB1", f"R{i + 1}")], now=t
-        )
-    claimed: list[str] = []
-    now = 200.0
-    for _ in range(3):
-        # Both nodes poll; the non-owner gets None (lane is owned), the owner claims the single head.
-        a = await store.claim_next_fifo("OB1", now=now, owner="A")
-        b = await store.claim_next_fifo("OB1", now=now, owner="B")
-        got = [x for x in (a, b) if x is not None]
-        assert len(got) == 1  # exactly one node claims — never two at once
-        item = got[0]
-        claimed.append(item.payload)
-        await store.mark_done(item.id, now=now + 0.5)  # advance the head for the next round
-        now += 1.0
-    assert claimed == ["R1", "R2", "R3"]  # strict FIFO across the contending nodes
-
-
-async def test_fifo_lane_handoff_on_expiry(store) -> None:
-    """A lane held by owner A whose lease has expired can be taken over by owner B atomically — a freed
-    lane moves to another node, still one owner at a time."""
-    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0)
-    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p2")], now=101.0)
-
-    a = await store.claim_next_fifo("OB1", now=200.0, owner="A")
-    assert a is not None and a.payload == "p1"
-    await store.mark_done(a.id, now=201.0)
-    # Before A's lane lease expires, B cannot claim.
-    assert await store.claim_next_fifo("OB1", now=200.0, owner="B") is None
-
-    # Age the lane lease out (now past 200 + ttl): B can now take over the freed lane and claim p2.
-    expired_at = 200.0 + _ttl(store) + 1.0
-    b = await store.claim_next_fifo("OB1", now=expired_at, owner="B")
-    assert b is not None and b.payload == "p2"
-    lease = await _lane_lease(store, "outbound:OB1")
-    assert lease is not None and lease["owner"] == "B"  # ownership transferred atomically
-
-
-async def test_fifo_crash_mid_delivery_preserves_order(store) -> None:
-    """A node that crashes holding the lane head leaves N inflight under an expired ROW lease. When the
-    next node takes over the (expired) lane lease, it must NOT skip past the stranded N and deliver N+1
-    first — the owned claim reclaims this lane's expired-lease inflight rows in the SAME txn before the
-    head SELECT, so the recovered head N blocks the lane and is the one delivered. This is the strict
-    cross-node FIFO invariant under crash (the row-lease reclaim must not be decoupled from the lane
-    handoff)."""
+async def test_fifo_claim_recovers_stranded_head_after_failover(store) -> None:
+    """Active-passive failover FIFO safety: a crashed/fenced prior leader leaves the lane HEAD N inflight
+    under an EXPIRED row lease. The next leader claims this lane via the ordinary (no-owner) FIFO claim,
+    which reclaims this lane's expired-lease inflight rows in the SAME txn BEFORE the head SELECT — so it
+    gets the RECOVERED head N, never N+1 ahead of it. Without that fold the PENDING-only head SELECT
+    would skip the still-inflight N and deliver N+1 first (a per-lane FIFO break across failover)."""
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "N")], now=100.0)
     await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "Np1")], now=101.0)
 
-    # A claims the head N and then "crashes": N stays inflight (no mark_done/mark_failed), and A stops
-    # renewing both its lane lease and N's row lease.
-    a = await store.claim_next_fifo("OB1", now=200.0, owner="A")
-    assert a is not None and a.payload == "N"  # N is now inflight under A
+    # The prior leader claims the head N and then "crashes": N stays inflight (no mark_done/mark_failed)
+    # and its row lease is left to age out. (A single store instance models the prior leader here; the
+    # graph runs on the leader only, so the new leader is the same store reopened / a promoted standby.)
+    head = await store.claim_next_fifo("OB1", now=200.0)
+    assert head is not None and head.payload == "N"  # N is now inflight under an expiring lease
 
-    # Past the TTL: A's lane lease AND N's row lease have both expired. B takes over the lane.
+    # Past the TTL: N's row lease has expired. The new leader claims the lane via the ordinary FIFO path.
     expired_at = 200.0 + _ttl(store) + 1.0
-    b = await store.claim_next_fifo("OB1", now=expired_at, owner="B")
-    # B must get the RECOVERED head N, never N+1 ahead of it — strict order survives the crash.
-    assert b is not None and b.payload == "N"
+    recovered = await store.claim_next_fifo("OB1", now=expired_at)
+    # It must get the RECOVERED head N, never N+1 ahead of it — strict order survives the failover.
+    assert recovered is not None and recovered.payload == "N"
+    assert recovered.id == head.id
 
 
-async def test_fifo_strict_order_under_contention_either_owner_wins(store) -> None:
-    """Symmetric to the A-first contention test: when B polls the empty-lane FIRST it becomes the single
-    owner and A is the one blocked, proving the winner is whoever acquires first regardless of identity
-    (not a hard-coded A-always-wins)."""
-    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0)
-    # B polls first this round → B wins the lane; A then gets None.
-    b = await store.claim_next_fifo("OB1", now=200.0, owner="B")
-    assert b is not None and b.payload == "p1"
-    assert await store.claim_next_fifo("OB1", now=200.0, owner="A") is None
-    lease = await _lane_lease(store, "outbound:OB1")
-    assert lease is not None and lease["owner"] == "B"
-
-
-async def test_fifo_owner_none_parity_no_lane_lease(store) -> None:
-    """Without an owner, claim_next_fifo behaves exactly as the existing single-node FIFO claim and
-    creates NO lane_leases row (the byte-identical path)."""
-    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0)
-    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p2")], now=101.0)
-
-    first = await store.claim_next_fifo("OB1", now=200.0)
-    assert first is not None and first.payload == "p1"
-    await store.mark_done(first.id, now=201.0)
-    second = await store.claim_next_fifo("OB1", now=202.0)
-    assert second is not None and second.payload == "p2"
-    # No lane lease was ever taken on the no-owner path.
-    assert await _lane_lease(store, "outbound:OB1") is None
-
-
-async def test_fifo_ingress_lane_owned_by_channel(store) -> None:
-    """Ingress lanes are keyed by channel_id, so the lane key is ``ingress:<channel>`` — proving the
-    lane key is stage-aware for the routing/transform stages too."""
-    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
-    item = await store.claim_next_fifo("IB", now=200.0, stage=Stage.INGRESS.value, owner="A")
-    assert item is not None
-    lease = await _lane_lease(store, "ingress:IB")
-    assert lease is not None and lease["owner"] == "A"
-    # A different node cannot claim the same ingress lane while A holds it.
-    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=101.0)
-    assert (
-        await store.claim_next_fifo("IB", now=200.0, stage=Stage.INGRESS.value, owner="B")
-    ) is None
+async def test_fifo_claim_leaves_live_head_untouched(store) -> None:
+    """The stranded-head reclaim is scoped to EXPIRED leases, so a live head (lease still in the future)
+    is NOT re-pended/re-claimed by a second poll — head-of-line blocking holds on the active node."""
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "N")], now=100.0)
+    head = await store.claim_next_fifo("OB1", now=200.0)
+    assert head is not None and head.payload == "N"
+    # A second poll well before the lease expires: nothing reclaimed, nothing re-claimed (the inflight
+    # head still holds its future lease, so the expired-lease reclaim matches nothing).
+    again = await store.claim_next_fifo("OB1", now=200.0 + _ttl(store) - 1.0)
+    assert again is None
+    row = await _queue_row(store, head.id)
+    assert row["status"] == OutboxStatus.INFLIGHT.value  # still held by the live node
+    assert row["owner"] == store._owner
 
 
 async def _queue_columns(store) -> set[str]:
@@ -1154,17 +1031,6 @@ async def test_reset_stale_inflight_still_unconditional(store) -> None:
     assert row["status"] == OutboxStatus.PENDING.value
     # The recovery transition clears the stale owner/lease (parity with reclaim_expired_leases).
     assert row["owner"] is None and row["lease_expires_at"] is None
-
-
-async def test_renew_leases_empty_and_no_match_return_zero(store) -> None:
-    """The zero-row command-tag path: renew_leases([]) and a renew that matches no owned inflight row
-    both return 0 (a worker timer will hit the empty case routinely)."""
-    assert await store.renew_leases([], now=300.0) == 0
-    # A row owned by THIS store but already done — no inflight match, so 0.
-    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
-    done = (await store.claim_ready(now=200.0))[0]
-    await store.mark_done(done.id, now=205.0)
-    assert await store.renew_leases([done.id], now=300.0) == 0
 
 
 async def test_reclaim_expired_leases_no_expired_returns_zero(store) -> None:
@@ -1274,9 +1140,6 @@ async def test_db_coordinator_registers_heartbeats_and_deregisters(store) -> Non
 
         # Leader election (Step 4): the sole node acquires leadership on its maintenance tick.
         await _wait_leader(coord, want=True)
-        # owns_lane() is real in Step 5: this node has claimed no lane, so it owns none (the cached
-        # set is empty). A lane only becomes owned after claim_next_fifo(owner=...) acquires its lease.
-        assert coord.owns_lane("any-lane") is False
     finally:
         await coord.stop()
         # After stop() the node has released the leader lock and dropped its dedicated connection.

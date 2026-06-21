@@ -199,11 +199,12 @@ resolved policy in the IDE.
 ## PHI guarantee (MVP)
 
 In the MVP the assistant **only ever attaches `code_only` context** — the graph's connection/router/
-handler names and the active editor's code (capped at 8000 chars), nothing more. **No message
-bodies, no patient data, are ever sent — regardless of mode or provider.** Scopes above `code_only`
-(`synthetic`, `deidentified`, `phi`) are not wired into the IDE; the resolver caps them and the chat
-path carries an explicit guard against attaching anything beyond code. See
-[PHI.md](PHI.md#ai-coding-assistance).
+handler names and the active editor's code (capped by the `messagefoundry.ai.contextCharLimit` VS
+Code setting, **default 8000 chars**; oversized files are cut on a line boundary and a marker is
+appended so the truncation is never silent), nothing more. **No message bodies, no patient data, are
+ever sent — regardless of mode, provider, or that limit.** Scopes above `code_only` (`synthetic`,
+`deidentified`, `phi`) are not wired into the IDE; the resolver caps them and the chat path carries
+an explicit guard against attaching anything beyond code. See [PHI.md](PHI.md#ai-coding-assistance).
 
 ---
 

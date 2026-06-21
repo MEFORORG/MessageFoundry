@@ -35,6 +35,7 @@ from messagefoundry.store.store import (
     CapturedResponse,
     ConnectionMetrics,
     DbStatus,
+    LatencyHistogram,
     MessageStatus,
     MessageStore,
     OutboxItem,
@@ -80,8 +81,9 @@ class QueueStore(StoreLifecycle, Protocol):
     """
 
     #: Whether this backend implements the staged ingress pipeline (``enqueue_ingress``/``handoff``).
-    #: ``False`` backends (e.g. SQL Server, gated on BACKLOG #1) are rejected at engine start rather
-    #: than trapping the first received message in a ``NotImplementedError``.
+    #: ``False`` backends are rejected at engine start rather than trapping the first received message in
+    #: a ``NotImplementedError``. Today SQLite, Postgres, and SQL Server all set this ``True`` (each ships
+    #: the full staged pipeline); the flag guards a future staging-incapable backend.
     supports_ingest_stage: bool
 
     #: Whether this backend can capture request/response replies (ADR 0013: the ``response`` table +
@@ -259,16 +261,15 @@ class QueueStore(StoreLifecycle, Protocol):
         now: float | None = None,
         *,
         stage: str = Stage.OUTBOUND.value,
-        owner: str | None = None,
     ) -> OutboxItem | None:
         """Claim the single oldest *due* pending row for one lane at ``stage`` (strict FIFO; the head
         blocks the lane while it backs off). The lane key is stage-aware: ``destination_name`` for
         outbound, ``channel_id`` for ingress. ``None`` when nothing is pending or the head isn't due.
 
-        ``owner`` is this node's cluster identity (Track B Step 5 lane ownership): ``None`` single-node
-        (the byte-identical path; SQLite/SQL Server always ignore it), or the coordinator's node_id
-        when clustered, gating the claim by an atomic per-lane lease so a FIFO lane is processed by
-        exactly one node at a time and strict per-lane FIFO holds across nodes."""
+        On the Postgres backend (active-passive HA) the claim also reclaims this lane's stranded head —
+        a crashed/fenced prior leader's expired-lease ``inflight`` row — in the same transaction before
+        the head SELECT, so per-lane FIFO order survives failover. SQLite/SQL Server are single active
+        node and have no such residue."""
         ...
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None: ...
@@ -476,6 +477,15 @@ class QueueStore(StoreLifecycle, Protocol):
     async def connection_metrics(
         self, *, since: float, now: float | None = None, rate_window: float = 60.0
     ) -> ConnectionMetrics: ...
+
+    async def delivery_latency_histogram(
+        self, *, buckets: Sequence[float], now: float | None = None
+    ) -> Sequence[LatencyHistogram]:
+        """Per-(channel_id, destination_name) delivery-latency histogram over outbound rows that
+        reached status='done'. Latency = updated_at - created_at (seconds), clamped to >= 0 (clock-
+        skew guard). bucket_counts are CUMULATIVE (Prometheus le semantics). Read-only; runs off the
+        event loop."""
+        ...
 
 
 class AuditStore(Protocol):

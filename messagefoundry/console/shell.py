@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """App shell: a persistent left nav over stacked pages, with the auto-refresh timer driving
-whichever page is active. Pages: Connections, Alerts (stub), Log Search, Engine Status.
+whichever page is active. Pages: Connections, Alerts, Dead Letters, Log Search, Engine Status.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol, cast
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QIcon, QKeySequence, QShortcut
+from PySide6.QtSvgWidgets import QSvgWidget
 from PySide6.QtWidgets import (
     QApplication,
     QGraphicsOpacityEffect,
@@ -25,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from messagefoundry.console import service_control
 from messagefoundry.console._async import AsyncRunner
+from messagefoundry.console.alerts_page import AlertsPage
 from messagefoundry.console.change_password import ChangePasswordDialog
 from messagefoundry.console.mfa import manage_mfa
 from messagefoundry.console.sessions import SessionsDialog
@@ -32,12 +35,47 @@ from messagefoundry.console.client import ApiError, EngineClient
 from messagefoundry.console.connections import ConnectionsPage
 from messagefoundry.console.search import LogSearchPage
 from messagefoundry.console.status import EngineStatusPage
+from messagefoundry.console.dead_letters_page import DeadLettersPage
 from messagefoundry.console.users_page import UsersPage
 from messagefoundry.console.widgets import ERROR_COLOR, RefreshSettingsDialog
 
-_NAV = ["Connections", "Alerts", "Log Search", "Engine Status"]
+_NAV = ["Connections", "Alerts", "Dead Letters", "Log Search", "Engine Status"]
 _HEALTH_INTERVAL_MS = 5000  # heart polls health on its own timer (independent of auto-refresh)
 _LOW_DISK_BYTES = 1024**3  # < 1 GiB free on the DB drive => "running out of space"
+
+# Bundled line icons for the left nav, keyed by nav label (Users is permission-gated). A missing
+# file simply yields a null icon — the nav still works text-only.
+_ICONS_DIR = Path(__file__).resolve().parent / "icons"
+_NAV_ICONS = {
+    "Connections": "connections.svg",
+    "Alerts": "alerts.svg",
+    "Dead Letters": "dead-letters.svg",
+    "Log Search": "log-search.svg",
+    "Engine Status": "engine-status.svg",
+    "Users": "users.svg",
+}
+
+_LOGO_LOCKUP = _ICONS_DIR / "logo-lockup.svg"
+_WORDMARK_HEIGHT = 30  # header lockup height in logical px (width follows the SVG aspect ratio)
+
+
+def _make_wordmark() -> QWidget:
+    """The brand lockup shown at the top-left of the header.
+
+    Renders the bundled SVG lockup at a fixed header height — vector, so it stays crisp at any
+    DPI/zoom and keeps its aspect ratio. Falls back to a styled text label if the asset is absent
+    (e.g. a stripped install), so the header is never empty."""
+    if _LOGO_LOCKUP.exists():
+        logo = QSvgWidget(str(_LOGO_LOCKUP))
+        logo.setObjectName("wordmark")
+        size = logo.renderer().defaultSize()
+        width = round(_WORDMARK_HEIGHT * size.width() / max(1, size.height()))
+        logo.setFixedSize(width, _WORDMARK_HEIGHT)
+        logo.setToolTip("MessageFoundry")
+        return logo
+    label = QLabel("MessageFoundry")
+    label.setObjectName("wordmark")  # styled bold + accent by the theme
+    return label
 
 
 class HeartIndicator(QLabel):
@@ -131,12 +169,15 @@ class AppWindow(QWidget):
         self._interval = max(0.0, poll_seconds)
 
         self.connections = ConnectionsPage(client, poll_client=self._poll_client)
+        self.alerts = AlertsPage(client, poll_client=self._poll_client)
+        self.dead_letters = DeadLettersPage(client, poll_client=self._poll_client)
         self.log_search = LogSearchPage(client, poll_client=self._poll_client)
         self.engine_status = EngineStatusPage(self._poll_client, service_name=service_name)
         nav_items = list(_NAV)
         self._pages: list[QWidget] = [
             self.connections,
-            PlaceholderPage("Alerts"),
+            self.alerts,
+            self.dead_letters,
             self.log_search,
             self.engine_status,
         ]
@@ -150,12 +191,20 @@ class AppWindow(QWidget):
             self._stack.addWidget(page)
 
         self._nav = QListWidget()
+        self._nav.setObjectName("nav")  # styled by the theme (active-item accent bar, hover)
         self._nav.addItems(nav_items)
-        self._nav.setFixedWidth(160)
+        self._nav.setFixedWidth(190)
+        self._nav.setIconSize(QSize(18, 18))
+        for i, label in enumerate(nav_items):
+            icon_file = _NAV_ICONS.get(label)
+            if icon_file:
+                self._nav.item(i).setIcon(QIcon(str(_ICONS_DIR / icon_file)))
         self._nav.currentRowChanged.connect(self._on_nav)
 
         self.connections.open_logs.connect(self._open_logs)
         self.connections.error.connect(self._show_error)
+        self.alerts.error.connect(self._show_error)
+        self.dead_letters.error.connect(self._show_error)
         self.log_search.error.connect(self._show_error)
         self.engine_status.error.connect(self._show_error)
 
@@ -170,7 +219,8 @@ class AppWindow(QWidget):
         self._user_label: QLabel | None = None  # header username label (None if signed out)
         self._user_menu: QMenu | None = None  # account overflow menu (Change password / Sign out)
         topbar = QHBoxLayout()
-        topbar.addWidget(QLabel("<b>MessageFoundry</b>"))
+        topbar.setContentsMargins(12, 8, 12, 8)
+        topbar.addWidget(_make_wordmark())
         topbar.addStretch(1)
         signed_in = client.current_user
         if signed_in is not None:
@@ -205,25 +255,45 @@ class AppWindow(QWidget):
             topbar.addWidget(QLabel(" | "))
         topbar.addWidget(self._refresh_link)
 
+        # The top bar lives in a styled #header container (background + bottom border) that spans the
+        # window width; WA_StyledBackground lets the QSS background paint on a plain QWidget.
+        header = QWidget()
+        header.setObjectName("header")
+        header.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        header.setLayout(topbar)
+
         self._heart = HeartIndicator()
         heart_row = QHBoxLayout()
+        heart_row.setContentsMargins(14, 8, 14, 8)
         heart_row.addWidget(self._heart)
         heart_row.addWidget(QLabel("Engine"))
         heart_row.addStretch(1)
+        # The heart + label sit in a styled #footer strip under the nav (top border, surface fill).
+        footer = QWidget()
+        footer.setObjectName("footer")
+        footer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        footer.setLayout(heart_row)
 
         left = QVBoxLayout()
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(0)
         left.addWidget(self._nav, stretch=1)
-        left.addLayout(heart_row)
+        left.addWidget(footer)
 
         body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
         body.addLayout(left)
         body.addWidget(self._stack, stretch=1)
 
         self._status = QLabel("")
+        self._status.setObjectName("statusline")  # themed (danger-coloured error text)
         self._health_error = ""  # the reachability error the poll currently owns (low-14)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(topbar)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(header)
         layout.addLayout(body)
         layout.addWidget(self._status)
 
@@ -256,8 +326,8 @@ class AppWindow(QWidget):
         self._timer.stop()
         self._health_timer.stop()
         self._health_runner.stop()
-        # Stop every page that runs a background runner (Connections, Log Search, Engine Status,
-        # Users); the PlaceholderPage has no stop() and is skipped.
+        # Stop every page that runs a background runner (Connections, Alerts, Dead Letters, Log
+        # Search, Engine Status, Users); a page without a stop() (e.g. a PlaceholderPage) is skipped.
         for page in self._pages:
             stop = getattr(page, "stop", None)
             if callable(stop):

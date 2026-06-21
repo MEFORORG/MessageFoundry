@@ -66,6 +66,7 @@ from messagefoundry.store.store import (
     DbStatus,
     DestinationMetrics,
     InboundMetrics,
+    LatencyHistogram,
     CapturedResponse,
     MessageStatus,
     MessageStore,
@@ -272,20 +273,6 @@ _SCHEMA: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS ix_sessions_user ON sessions(user_id)",
     "CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at)",
-    # Track B Step 5: per-lane FIFO ownership. A FIFO lane (one stage+name) is owned by exactly ONE
-    # node at a time; only the owner may claim that lane's rows, so head-of-line blocking restores
-    # strict per-lane order ACROSS nodes (without ownership the FOR UPDATE SKIP LOCKED head claim lets a
-    # second node skip a sibling's locked head and claim row 2 ahead of row 1). The lane key is
-    # f"{stage}:{name}" (stage + destination_name|channel_id); the PK on `lane` covers every lookup.
-    # Acquire/renew/take-over-on-expiry happens ATOMICALLY in the same txn as the head claim
-    # (claim_next_fifo, owner != None), so there is ZERO reorder window. CREATE TABLE IF NOT EXISTS is
-    # safe on a fresh OR existing DB (no ALTER/migration) and lands in db_schema via the pool's
-    # search_path like every other table.
-    """CREATE TABLE IF NOT EXISTS lane_leases (
-        lane             TEXT PRIMARY KEY,
-        owner            TEXT NOT NULL,
-        lease_expires_at DOUBLE PRECISION NOT NULL
-    )""",
     # Track B Step 6: the cluster-wide CONFIG-RELOAD version token. A single-row table (id always 1)
     # holding a monotonically-increasing config_version: an operator reload on one node bumps it, and
     # every other node's config-convergence loop sees the higher version and reloads its OWN (identically
@@ -373,9 +360,9 @@ class PostgresStore:
         self._cipher: Cipher = cipher or IdentityCipher()
         self.path = f"{settings.server}/{settings.database}"  # descriptor for db_status
         # Track B Step 2: the identity stamped on a row's lease when THIS instance claims it (host:pid
-        # + a short random suffix so two stores in one process still differ). renew_leases/
-        # reclaim_expired_leases use it to extend only our own leases and to never steal a live
-        # sibling's in-flight row.
+        # + a short random suffix so two stores in one process still differ). reclaim_expired_leases /
+        # recover_inflight_on_promotion use it to recover only OTHER (prior-leader) instances' rows and
+        # never steal a live node's own in-flight row.
         self._owner = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
         # Read-through caches (loaded at open; updated only after the owning txn commits) — mirror the
         # SQLite store's _state_cache / _reference_cache so a Handler's synchronous state_get(...) /
@@ -505,6 +492,11 @@ class PostgresStore:
         )
         if not sessions_has_mfa:
             await conn.execute("ALTER TABLE sessions ADD COLUMN mfa_verified_at DOUBLE PRECISION")
+        # Active-active scale-out was dropped: drop the retired per-lane FIFO-ownership table from any DB
+        # that was opened by an earlier build. Failover FIFO safety no longer depends on a lane lease —
+        # claim_next_fifo reclaims a stranded head from the queue table directly. IF EXISTS is a no-op on
+        # a fresh DB / a DB already migrated; runs under the schema advisory lock alongside the CREATEs.
+        await conn.execute("DROP TABLE IF EXISTS lane_leases")
 
     async def close(self) -> None:
         await self._pool.close()
@@ -1462,7 +1454,6 @@ class PostgresStore:
         now: float | None = None,
         *,
         stage: str = Stage.OUTBOUND.value,
-        owner: str | None = None,
     ) -> OutboxItem | None:
         """Claim the single oldest *due* pending row for one lane at ``stage`` (strict FIFO — the head
         blocks the lane while it backs off). Lane key is stage-aware (``destination_name`` outbound,
@@ -1470,74 +1461,19 @@ class PostgresStore:
         that preserves same-txn insertion order). ``FOR UPDATE SKIP LOCKED`` on the head keeps
         concurrent pollers non-blocking. ``None`` when nothing is pending or the head isn't due.
 
-        ``owner`` is THIS node's cluster identity (the coordinator's node_id) when clustered, ``None``
-        single-node. ``None`` → the byte-identical single-node path (no ``lane_leases`` touch — SQLite
-        parity). When set (Track B Step 5), the claim is gated by an atomic per-lane lease so a FIFO
-        lane is processed by exactly ONE node at a time → strict per-lane FIFO holds across nodes (see
-        :meth:`_claim_next_fifo_owned`)."""
-        now = time.time() if now is None else now
-        if owner is not None:
-            return await self._claim_next_fifo_owned(name, now, stage, owner)
-        lease_until = now + self._settings.lease_ttl_seconds  # Track B Step 2: stamp the lease
-        lane_col = self._lane_col(stage)  # code-controlled literal
-        sql = (
-            "WITH head AS ("
-            f" SELECT id, next_attempt_at FROM queue WHERE stage=$1 AND {lane_col}=$2 AND status=$3"
-            " ORDER BY created_at, seq LIMIT 1 FOR UPDATE SKIP LOCKED"
-            ")"
-            " UPDATE queue q SET status=$4, attempts=attempts+1, updated_at=$5,"
-            " owner=$6, lease_expires_at=$7"
-            " FROM head WHERE q.id=head.id AND head.next_attempt_at<=$5 RETURNING q.*"
-        )
-        row = await self._fetchone(
-            sql,
-            stage,
-            name,
-            OutboxStatus.PENDING.value,
-            OutboxStatus.INFLIGHT.value,
-            now,
-            self._owner,
-            lease_until,
-        )
-        return await self._fifo_item_or_dead_letter(row)
-
-    async def _claim_next_fifo_owned(
-        self, name: str, now: float, stage: str, owner: str
-    ) -> OutboxItem | None:
-        """The clustered FIFO claim (Track B Step 5): acquire-or-verify the lane lease, recover the
-        crashed predecessor's stranded head, and claim the head — all in ONE transaction so ownership +
-        head recovery + claim commit atomically.
-
-        Claim-time DB-authoritative ownership means two nodes can NEVER claim the same lane
-        concurrently. Even an alive-but-partitioned node whose lease expired fails the ``ON CONFLICT``
-        ``WHERE`` (the DB row shows another live owner / a not-yet-expired lease), so there is ZERO
-        reorder window — unlike a cached gate, which could be stale at the instant of a claim. A lane
-        whose active processor goes idle simply lets its lease expire and the next node with work for
-        that lane re-acquires it (atomically, one at a time), so head-of-line blocking is preserved
-        across the handoff.
-
-        Crash-during-delivery recovery: a node that dies holding the lane leaves its claimed head
-        ``inflight`` under an expired ROW lease, and the lane lease + that row lease expire on the SAME
-        TTL but are recovered by INDEPENDENT mechanisms — the lane lease is taken over instantly here,
-        while the inflight row is otherwise only returned to ``pending`` by the LEADER's periodic
-        ``reclaim_expired_leases`` sweep (a separate, later cadence). In the window between the lane
-        handoff and that sweep, the head SELECT (status=PENDING) would skip the still-inflight head N
-        and claim N+1 → N+1 delivered before N → FIFO broken across a crash. So the new owner reclaims
-        THIS lane's expired-lease inflight rows back to ``pending`` in the SAME txn, BEFORE the head
-        SELECT, restoring head-of-line blocking: the recovered N is reconsidered as the (due) head and
-        blocks the lane until it is delivered. Scoped to ``lease_expires_at < now`` so it never disturbs
-        OUR own actively-processed rows (their leases are kept in the future by the worker's renew
-        timer) — only a crashed predecessor's stranded rows. The wall-clock lease shares Track B
+        FAILOVER FIFO SAFETY (active-passive HA): the claim runs in ONE transaction that FIRST reclaims
+        this lane's stranded head — a crashed/fenced prior leader's claimed rows are still ``inflight``
+        under an expired ROW lease, and the PENDING-only head SELECT would skip them and reorder past
+        the true head N. So before the head SELECT, this lane's expired-lease ``inflight`` rows are
+        returned to ``pending`` (scoped to ``lease_expires_at < now`` so it never disturbs a live
+        node's actively-processed rows — their leases are kept in the future by the worker's renew
+        timer), restoring head-of-line blocking: the recovered N is reconsidered as the (due) head and
+        blocks the lane until delivered. Without this, after a promotion the new leader would deliver
+        N+1 before N (a per-lane FIFO break across failover). The wall-clock lease shares Track B
         Step 2's NTP assumption: set ``lease_ttl_seconds`` comfortably above clock skew + the claim
         cadence."""
-        lane_key = f"{stage}:{name}"
-        # The lane lease and the queue ROW lease (Step 2) deliberately share ONE TTL
-        # (lease_ttl_seconds): they are renewed together (the worker's renew timer keeps the row lease
-        # alive while the lane lease is renewed on each claim), and the crash-recovery reclaim below
-        # relies on both expiring together so a freed lane's stranded head is recoverable as soon as the
-        # lane is re-acquired. Two distinct names, identical expression — not a copy-paste bug.
-        lane_until = now + self._settings.lease_ttl_seconds  # the per-LANE lease (Step 5)
-        lease_until = now + self._settings.lease_ttl_seconds  # the queue ROW lease (Step 2)
+        now = time.time() if now is None else now
+        lease_until = now + self._settings.lease_ttl_seconds  # Track B Step 2: stamp the lease
         lane_col = self._lane_col(stage)  # code-controlled literal
         head_sql = (
             "WITH head AS ("
@@ -1550,27 +1486,12 @@ class PostgresStore:
         )
         async with self._pool.acquire() as conn:
             async with conn.transaction():
-                # FIRST atomically acquire-or-verify the lane lease. The ON CONFLICT WHERE only takes the
-                # lane when WE already hold it (renew) or its lease has EXPIRED (take over a freed lane).
-                held = await conn.fetchval(
-                    "INSERT INTO lane_leases (lane, owner, lease_expires_at) VALUES ($1,$2,$3)"
-                    " ON CONFLICT (lane) DO UPDATE SET owner=$2, lease_expires_at=$3"
-                    "  WHERE lane_leases.owner=$2 OR lane_leases.lease_expires_at < $4"
-                    " RETURNING owner",
-                    lane_key,
-                    owner,
-                    lane_until,
-                    now,
-                )
-                # held is None when the ON CONFLICT WHERE was false → another LIVE node owns the lane.
-                # Back off exactly like an empty lane (the worker waits / re-polls).
-                if held != owner:
-                    return None
-                # THEN recover this lane's stranded head: a crashed predecessor's claimed rows are still
-                # inflight under an expired ROW lease, and the PENDING-only head SELECT would skip them
-                # and reorder past N. Return them to pending IN THIS TXN before the head SELECT so the
-                # oldest recovered row is reconsidered as the (now-due) head and blocks the lane. Bounded
-                # to this single lane and to already-expired leases, so it never steals our own live rows.
+                # FIRST recover this lane's stranded head: a crashed/fenced predecessor's claimed rows
+                # are still inflight under an expired ROW lease, and the PENDING-only head SELECT below
+                # would skip them and reorder past N. Return them to pending IN THIS TXN before the head
+                # SELECT so the oldest recovered row is reconsidered as the (now-due) head and blocks the
+                # lane. Bounded to this single lane and to already-expired leases, so it never steals a
+                # live node's own actively-leased rows.
                 await conn.execute(
                     f"UPDATE queue SET status=$3, owner=NULL, lease_expires_at=NULL,"
                     f" next_attempt_at=$4, updated_at=$4"
@@ -1583,11 +1504,6 @@ class PostgresStore:
                     OutboxStatus.INFLIGHT.value,
                 )
                 # THEN claim the head in the SAME txn, stamping the queue row's own owner + row lease.
-                # The lane lease is keyed by the passed `owner` (= coordinator node_id) while the row's
-                # owner column is `self._owner` (the store-instance id). These are INDEPENDENT identities
-                # — single-owner-per-lane is enforced entirely inside lane_leases via `owner`, so the row
-                # owner need not equal it (they coincide by build_coordinator's default node_id=store._owner,
-                # but pinning [cluster].node_id to a different value stays correct and harmless).
                 row = await conn.fetchrow(
                     head_sql,
                     stage,
@@ -2047,14 +1963,14 @@ class PostgresStore:
         every stage in one pass (the right startup behavior).
 
         This is the **unconditional** single-node recovery: it reclaims *every* inflight row, ignoring
-        the lease columns, which is correct today (one node, so any inflight row at startup is this
-        node's own crash residue). The additive multi-node mechanism is the lease columns + the
-        owner-aware :meth:`renew_leases` / :meth:`reclaim_expired_leases`: a later coordination step
-        will, in clustered mode, STOP calling this unconditional startup reset (which would steal a live
-        sibling's in-flight rows) and instead run :meth:`reclaim_expired_leases` periodically on the
-        leader, recovering only rows whose lease has actually expired. Expiry-gating this startup reset
-        now — without that periodic sweep wired up — would strand a just-crashed single node's in-flight
-        rows until their leases expire, so the gating is deferred on purpose."""
+        the lease columns, which is correct on a single node (any inflight row at startup is this node's
+        own crash residue). The additive multi-node mechanism is the lease columns + the owner-aware
+        :meth:`reclaim_expired_leases`: in active-passive clustered mode the engine does NOT call this
+        unconditional startup reset (which would steal a live sibling's in-flight rows) and instead runs
+        :meth:`reclaim_expired_leases` periodically on the leader (recovering only rows whose lease has
+        actually expired), plus the one-shot lease-blind :meth:`recover_inflight_on_promotion` on
+        promotion. Expiry-gating this unconditional reset would strand a just-crashed single node's
+        in-flight rows until their leases expire, so single-node keeps the unconditional path."""
         now = time.time() if now is None else now
         sql = (
             "UPDATE queue SET status=$1, next_attempt_at=$2, updated_at=$2,"
@@ -2068,26 +1984,9 @@ class PostgresStore:
 
     # --- multi-node row leases (Track B Step 2; additive, Postgres-only) ------
     # These are NOT on the Store protocol and NOT on the SQLite backend: SQLite is single-node, so its
-    # unconditional reset_stale_inflight remains correct. A later coordination step wires a worker timer
-    # onto renew_leases and a leader sweep onto reclaim_expired_leases (see reset_stale_inflight).
-
-    async def renew_leases(self, ids: Sequence[str], *, now: float | None = None) -> int:
-        """Extend the lease on THIS owner's still-inflight rows (a worker calls this on a timer to keep
-        rows it is actively processing from being reclaimed). Only touches rows this instance owns and
-        that are still ``inflight`` — a row already completed, dead-lettered, or reclaimed by another
-        node is left alone. Returns the number of leases extended."""
-        now = time.time() if now is None else now
-        lease_until = now + self._settings.lease_ttl_seconds
-        result = await self._pool.execute(
-            "UPDATE queue SET lease_expires_at=$2, updated_at=$3"
-            " WHERE id = ANY($1::text[]) AND owner=$4 AND status=$5",
-            list(ids),
-            lease_until,
-            now,
-            self._owner,
-            OutboxStatus.INFLIGHT.value,
-        )
-        return _rowcount(result)
+    # unconditional reset_stale_inflight remains correct. In active-passive mode the leader runs the
+    # lease-gated reclaim_expired_leases sweep (see reset_stale_inflight); a freshly-promoted leader
+    # additionally runs the one-shot recover_inflight_on_promotion.
 
     async def reclaim_expired_leases(
         self, now: float | None = None, *, stage: str | None = None
@@ -2116,33 +2015,24 @@ class PostgresStore:
         )
         return _rowcount(result)
 
-    async def recover_inflight_on_promotion(
-        self, *, lane_owner: str | None, now: float | None = None
-    ) -> int:
+    async def recover_inflight_on_promotion(self, *, now: float | None = None) -> int:
         """On active-passive promotion: recover the PRIOR leader's stranded work IMMEDIATELY, without
-        waiting out the per-row/lane lease TTL — the dominant ~``[store].lease_ttl_seconds`` failover-
-        recovery delay on Postgres (#293; SQL Server already recovers at once via its on-promotion
-        ``reset_stale_inflight``). Two parts, ONE transaction:
+        waiting out the per-row lease TTL — the dominant ~``[store].lease_ttl_seconds`` failover-recovery
+        delay on Postgres (#293; SQL Server already recovers at once via its on-promotion
+        ``reset_stale_inflight``).
 
-        1. **Owner-scoped queue-row reclaim** — return INFLIGHT rows owned by ANY OTHER store instance
-           (the prior leader) to PENDING, **ignoring** lease expiry. Scoped to ``owner IS DISTINCT FROM
-           self._owner``, so it is STRUCTURALLY incapable of re-pending THIS node's own freshly-claimed
-           rows (no self-theft); at promotion this node has not claimed anything yet, so the set is
-           exactly the prior leader's residue. Re-pending the stranded lane HEAD restores per-lane
-           head-of-line blocking (no N+1-before-N reorder).
-        2. **Lane-lease takeover** — delete the prior coordinator's ``lane_leases`` (``owner <>
-           lane_owner``) so the new leader can claim those lanes at once instead of waiting
-           ~``lease_ttl_seconds`` for them to expire. ``reset_stale_inflight`` / ``reclaim_expired_leases``
-           touch only the ``queue`` table, so without this the LANE lease independently blocks the new
-           leader for the full TTL — both gates must be cleared.
+        **Owner-scoped queue-row reclaim** — return INFLIGHT rows owned by ANY OTHER store instance
+        (the prior leader) to PENDING, **ignoring** lease expiry. Scoped to ``owner IS DISTINCT FROM
+        self._owner``, so it is STRUCTURALLY incapable of re-pending THIS node's own freshly-claimed
+        rows (no self-theft); at promotion this node has not claimed anything yet, so the set is exactly
+        the prior leader's residue. Re-pending the stranded lane HEAD restores per-lane head-of-line
+        blocking (no N+1-before-N reorder).
 
         **Safe ONLY in active-passive** (the wired graph runs on the leader ONLY): the prior leader
         self-fenced and its LEADERSHIP lease expired on the DB clock before this node could acquire it
         (``heartbeat < fence < leader_lease_ttl`` is validator-enforced), so there is no live processor
-        whose rows/lanes this could steal — the SAME interlock the shipping SQL Server on-promotion
-        ``reset_stale_inflight`` relies on. A future **active-active** build (parked for 0.2) MUST NOT
-        call this — with multiple live processors it would steal a live sibling's rows; that model uses
-        only the lease-gated :meth:`reclaim_expired_leases`. Returns the number of queue rows re-pended."""
+        whose rows this could steal — the SAME interlock the shipping SQL Server on-promotion
+        ``reset_stale_inflight`` relies on. Returns the number of queue rows re-pended."""
         now = time.time() if now is None else now
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -2155,12 +2045,6 @@ class PostgresStore:
                     OutboxStatus.INFLIGHT.value,
                     self._owner,
                 )
-                # lane_owner is the coordinator node_id (always set in clustered mode, where this runs);
-                # None defensively clears all lanes (single-node never calls this).
-                if lane_owner is None:
-                    await conn.execute("DELETE FROM lane_leases")
-                else:
-                    await conn.execute("DELETE FROM lane_leases WHERE owner <> $1", lane_owner)
         return _rowcount(result)
 
     async def dead_letter_missing_destinations(
@@ -3368,6 +3252,44 @@ class PostgresStore:
                 last_done_at=r["last_done_at"],
             )
         return ConnectionMetrics(inbound=inbound, destinations=destinations)
+
+    async def delivery_latency_histogram(
+        self, *, buckets: Sequence[float], now: float | None = None
+    ) -> Sequence[LatencyHistogram]:
+        """Per-(channel_id, destination_name) delivery-latency histogram over outbound rows that
+        reached status='done'. Latency = updated_at - created_at (seconds), clamped to >= 0 (clock-
+        skew guard). bucket_counts are CUMULATIVE (Prometheus le semantics). Read-only; runs off the
+        event loop."""
+        # Only the NUMBER of CASE clauses (len(buckets)) is generated; each boundary is a BOUND
+        # parameter ($n, never string-interpolated), so this is injection-safe. Bucket boundaries
+        # bind to $1..$n, then stage and status take the trailing placeholders.
+        n = len(buckets)
+        bucket_cols = ", ".join(
+            f"SUM(CASE WHEN (updated_at - created_at) <= ${i + 1} THEN 1 ELSE 0 END) AS b{i}"
+            for i in range(n)
+        )
+        select_cols = f"{bucket_cols}, " if bucket_cols else ""
+        sql = (
+            "SELECT channel_id, destination_name, "
+            f"{select_cols}"
+            "SUM(CASE WHEN updated_at >= created_at THEN updated_at - created_at ELSE 0 END)"
+            " AS sum_seconds,"
+            " COUNT(*) AS cnt"
+            f" FROM queue WHERE stage=${n + 1} AND status=${n + 2}"
+            " GROUP BY channel_id, destination_name"
+            " ORDER BY channel_id, destination_name"
+        )
+        rows = await self._fetchall(sql, *buckets, Stage.OUTBOUND.value, OutboxStatus.DONE.value)
+        return [
+            LatencyHistogram(
+                channel_id=r["channel_id"],
+                destination_name=r["destination_name"],
+                bucket_counts=tuple(int(r[f"b{i}"] or 0) for i in range(n)),
+                sum_seconds=float(r["sum_seconds"] or 0),
+                count=int(r["cnt"] or 0),
+            )
+            for r in rows
+        ]
 
     # --- internals -----------------------------------------------------------
 

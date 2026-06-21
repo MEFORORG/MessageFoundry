@@ -10,7 +10,7 @@ estate tokens, so synthetic-only stays enforced, not just intended.
 
 from __future__ import annotations
 
-import re
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -124,34 +124,30 @@ def test_invalid_transform_mode_fails_loud(monkeypatch: pytest.MonkeyPatch) -> N
 
 # --- "don't bake Corepoint in" denylist guard --------------------------------
 
+
 # Real estate tokens that must never appear in the shipped load graph or profiles. The site-code
 # pattern catches 6-digit 54xxxx codes; the rest are partner/product/customer substrings drawn from
 # the (git-ignored) real migration estate. NOTE: the generic product name "Corepoint" is deliberately
 # NOT here — it's the competitor named all over the repo's own docs; the guard targets real customer/
 # partner/site identifiers, not the product name.
 #
-# The tokens are assembled from fragments on purpose: spelling them out as literals would make THIS
-# guard file itself trip the repo's forbidden-content scanner (scripts/publish/scan_forbidden.py /
-# the pre-commit hook), which would block the commit. The joined runtime values are the real words.
-_FORBIDDEN_SUBSTRINGS = [
-    a + b
-    for a, b in (
-        ("mer", "cy"),
-        ("cb", "ord"),
-        ("olym", "pus"),
-        ("well", "mark"),
-        ("exp", "erian"),
-        ("omni", "cell"),
-        ("am", "bra"),
-        ("tel", "cor"),
-        ("intele", "pacs"),
-        ("inter", "connect"),
-        ("cync", "health"),
-        ("ready", "set"),
-        ("clar", "ity"),
-    )
-]
-_SITE_CODE = re.compile(r"54\d{4}")
+# These estate tokens + the site-code pattern now live in the publish guard
+# (scripts/publish/scan_forbidden.py) as the SINGLE source of truth (ADR 0030 §5), shared with the
+# anonymizer's leak-check; this test imports them instead of keeping a divergent copy (the drift
+# BACKLOG #36 recorded). The scanner lives under scripts/ (not an installed package), so it is loaded
+# by path — mirroring tests/test_scan_forbidden.py.
+def _load_scan_forbidden() -> object:
+    path = Path(__file__).resolve().parents[1] / "scripts" / "publish" / "scan_forbidden.py"
+    spec = importlib.util.spec_from_file_location("scan_forbidden", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_SF = _load_scan_forbidden()
+_FORBIDDEN_SUBSTRINGS = list(_SF.ESTATE_TOKENS)  # type: ignore[attr-defined]
+_SITE_CODE = _SF.SITE_CODE_RE  # type: ignore[attr-defined]
 _SCANNED_DIRS = ["harness/config/load", "harness/load/profiles"]
 _SCANNED_SUFFIXES = {".py", ".toml", ".md"}
 

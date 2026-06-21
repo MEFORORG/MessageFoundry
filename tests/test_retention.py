@@ -242,12 +242,6 @@ class _FollowerCoordinator:
     def is_leader(self) -> bool:
         return False
 
-    def owns_lane(self, lane_key: str) -> bool:
-        return True
-
-    def lane_owner(self) -> str | None:
-        return self.node_id
-
     def reclaims_inflight(self) -> bool:
         return True
 

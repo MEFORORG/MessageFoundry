@@ -86,8 +86,8 @@ flowchart TB
 
   subgraph ENGINE["Engine — headless asyncio service (no GUI imports)"]
     PIPE["pipeline/ — RegistryRunner<br/>listener · router · transform · delivery workers"]:::engine
-    TRANS["transports/ — connector registry<br/>MLLP · File · X12 (TCP/HTTP/DB planned)"]:::engine
-    PARSE["parsing/ — pure HL7/X12 library<br/>python-hl7 · hl7apy · X12 codec"]:::engine
+    TRANS["transports/ — connector registry<br/>MLLP · File · X12 · DICOM C-STORE SCP (TCP/HTTP/DB planned)"]:::engine
+    PARSE["parsing/ — pure HL7/X12/DICOM library<br/>python-hl7 · hl7apy · X12 codec · DICOM codec · base64 binary codec"]:::engine
     STORE[("store/ — staged queue<br/>SQLite WAL · SQL Server · AES-256-GCM")]:::engine
     CFG["config/ — code-first wiring<br/>Connections · Routers · Handlers · environments/"]:::engine
   end
@@ -215,6 +215,14 @@ crash in one is isolated (a crashed worker is respawned; the router/transform wo
 inbound's already-ACKed messages even while the source is stopped). Each worker class has its own wake
 event, so a producer wakes only its downstream consumer (no cross-class lost wakeups).
 
+That isolation now extends to **startup wiring** (ADR 0031): a single connection that fails to
+build/bind at start (unresolvable `env()`/cert, an egress refusal, a port in use, a cleartext-exposure
+refusal) is recorded `failed` + logged + alerted, and the engine **starts the rest of the graph and
+serves the API** instead of aborting. A failed outbound still gets its delivery worker, so rows routed
+to it are **retried, never dropped**, and a reload/restart that builds it self-heals the lane; a failed
+inbound just isn't listening. Reload itself stays fail-fast (it `build_check`s the whole new registry
+before quiescing a healthy graph) — only startup degrades.
+
 ## Parsing: tolerant-first, strict-on-demand
 
 - **`python-hl7`** parses tolerantly and powers field *peek* for routing. Hot path.
@@ -285,9 +293,10 @@ for transport, and **retention/purge** enforcement.
 | Package / module | Responsibility |
 |---|---|
 | `messagefoundry.config` | Connector models (`models.py`) + code-first wiring registry/loader (`wiring.py`) + service settings (`settings.py`) |
-| `messagefoundry.parsing` | Tolerant peek (python-hl7) + strict validate (hl7apy); parse tree (`tree.py`) and the `Message` transform model (`message.py`) |
+| `messagefoundry.parsing` | Tolerant peek (python-hl7) + strict validate (hl7apy); parse tree (`tree.py`) and the `Message` transform model (`message.py`); pure non-HL7 codecs — X12 EDI (`x12/`), DICOM headers/SR over pydicom (`dicom/`, ADR 0025), and the base64 binary-carriage codec (`binary.py`, ADR 0028) |
 | `messagefoundry.store` | Durable message store / **staged queue** (one `queue` table, `stage` = ingress\|outbound), SQLite WAL; every receipt logged with a disposition that flows with the message. `Store` protocol + `open_store` factory in `base.py`; production SQL Server backend in `sqlserver.py` |
-| `messagefoundry.transports` | Inbound & outbound connections (MLLP, file, …), resolved through a registry (`base.py`) — never special-cased in `pipeline/` |
+| `messagefoundry.transports` | Inbound & outbound connections (MLLP, file, X12 raw-TCP, DICOM C-STORE SCP inbound over pynetdicom — ADR 0025, …), resolved through a registry (`base.py`) — never special-cased in `pipeline/` |
+| `messagefoundry.anon` | Deterministic, secret-per-dataset pseudonymization / de-identification (fail-closed; ADR 0030) — exposed to the tee (`anonymize-captures`) and the test harness |
 | `messagefoundry.pipeline` | Per-message routing/handling (`RegistryRunner` in `wiring_runner.py`) + per-inbound-connection supervision (`engine.py`); offline `dryrun.py` |
 | `messagefoundry.api` | Localhost FastAPI surface for the console (`app.py` + response `models.py`) — the engine's only external interface |
 | `messagefoundry.auth` | Authn + RBAC core (no FastAPI): permissions/roles, `Identity`, password hashing, opaque session tokens, LDAP/Kerberos (`service.py`) — enforced by `api` |
@@ -327,6 +336,8 @@ hashed resolution lives in the committed **`uv.lock`** / **`requirements.lock`**
 - `console` → `PySide6` (LGPL — chosen so the OSS console is distributable; not PyQt)
 - `sqlserver` → `aioodbc` (production SQL Server store; also needs the OS-level Microsoft ODBC
   Driver 18 for SQL Server, which is not pip-installable; lazy-imported so SQLite-only installs skip it)
+- `dicom` → `pydicom` + `pynetdicom` (DICOM codec — headers/SR only, no numpy — and the C-STORE SCP
+  inbound connector; ADR 0025; lazy-imported so non-DICOM installs skip it)
 - `dev` → `pytest`, `pytest-asyncio`, `httpx` (ASGI test client for the API), `ruff`, `mypy`
 
 **Build / tooling** — `hatchling` (build backend), Ruff (format + lint, no Black), mypy (strict),

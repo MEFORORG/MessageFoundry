@@ -47,6 +47,8 @@ from messagefoundry import __version__
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.api.models import (
     AiPolicy,
+    AlertRuleInfo,
+    AlertsConfig,
     ApprovalDecisionResult,
     ApprovalList,
     CapturedResponseInfo,
@@ -84,6 +86,7 @@ from messagefoundry.api.models import (
 )
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.field_authz import count_exposed, redact_unauthorized
+from messagefoundry.api.metrics import METRICS_CONTENT_TYPE, render_metrics
 from messagefoundry.api.security import (
     authorize_ws,
     optional_identity,
@@ -385,6 +388,7 @@ def create_app(
     auth: AuthService | None = None,
     ai_settings: AiSettings | None = None,
     approvals: ApprovalsSettings | None = None,
+    alerts_settings: AlertsSettings | None = None,
     expose_docs: bool = False,
     allow_no_auth: bool = False,
     ws_allowed_origins: Sequence[str] = (),
@@ -409,6 +413,9 @@ def create_app(
         app.state.ai = ai_settings
     # Fail-closed when no auth is attached unless explicitly opted out (embedding/dev) — SYS-1.
     app.state.allow_no_auth = allow_no_auth
+    # Loaded [alerts] config for the read-only /alerts/rules view (independent of engine; may be None,
+    # in which case the route falls back to all-off defaults). The lifespan path sets the live value.
+    app.state.alerts_settings = alerts_settings
     app.state.ws_count = 0  # live /ws/stats connection count (API-WS cap)
     app.state.ws_allowed_origins = tuple(
         ws_allowed_origins
@@ -572,6 +579,7 @@ def create_app(
             for iname, ic in reg.inbound.items():
                 inb = metrics.inbound.get(iname)
                 speer, sport = _peer_port(ic.spec.type.value, ic.spec.settings)
+                ifail = rr.connection_failed(iname)  # ADR 0031: start failed → not listening
                 rows.append(
                     ConnectionRow(
                         role="source",
@@ -579,7 +587,11 @@ def create_app(
                         channel_name=iname,
                         destination=None,
                         name=f"{iname} ▸ in",
-                        status="running" if rr.inbound_running(iname) else "stopped",
+                        status=(
+                            "failed"
+                            if ifail
+                            else ("running" if rr.inbound_running(iname) else "stopped")
+                        ),
                         direction="in",
                         method=_method_label(ic.spec.type.value),
                         peer=speer,
@@ -592,19 +604,23 @@ def create_app(
                         written=None,
                         backlog_seconds=None,
                         delivered_age_seconds=None,
+                        error=ifail,
                     )
                 )
+            emitted_dests: set[str] = set()
             for (cid, dname), dm in metrics.destinations.items():
                 if cid not in reg.inbound:
                     continue  # a declarative-channel edge, already emitted above
+                emitted_dests.add(dname)
                 oc = reg.outbound.get(dname)
+                dfail = rr.connection_failed(dname)  # ADR 0031: built? or degraded?
                 # An outbound the live graph no longer declares (removed by a reload) keeps draining
                 # its queued rows — report it honestly as "draining" with an unknown method, rather
                 # than mislabeling it as a running File connector.
                 if oc is not None:
                     dmethod = _method_label(oc.spec.type.value)
                     dpeer, dport = _peer_port(oc.spec.type.value, oc.spec.settings)
-                    dstatus = rstatus
+                    dstatus = "failed" if dfail else rstatus
                 else:
                     dmethod, dpeer, dport, dstatus = "—", None, None, "draining"
                 rows.append(
@@ -632,6 +648,40 @@ def create_app(
                         # Effective simulate flag — queried even for a draining (removed) outbound,
                         # whose suppression persists in the runner until full shutdown (#15).
                         simulated=rr.outbound_simulated(dname),
+                        error=dfail if oc is not None else None,
+                    )
+                )
+            # ADR 0031: an outbound that failed to build at start has no metrics edge until traffic is
+            # routed to it, so it would be invisible above. Emit a standalone row for every still-failed
+            # outbound not already shown, so a degraded lane is never silently hidden from the dashboard.
+            for dname, reason in rr.degraded_connections().items():
+                oc = reg.outbound.get(dname)
+                if oc is None or dname in emitted_dests:
+                    continue  # inbound failures appear as their source row; shown dests are covered
+                dmethod = _method_label(oc.spec.type.value)
+                dpeer, dport = _peer_port(oc.spec.type.value, oc.spec.settings)
+                rows.append(
+                    ConnectionRow(
+                        role="destination",
+                        channel_id=dname,
+                        channel_name=dname,
+                        destination=dname,
+                        name=f"{dname} ▸ out",
+                        status="failed",
+                        direction="out",
+                        method=dmethod,
+                        peer=dpeer,
+                        port=dport,
+                        queue_depth=None,
+                        idle_seconds=None,
+                        alerts_active=0,
+                        errored=None,
+                        read=None,
+                        written=None,
+                        backlog_seconds=None,
+                        delivered_age_seconds=None,
+                        simulated=rr.outbound_simulated(dname),
+                        error=reason,
                     )
                 )
         return rows
@@ -705,6 +755,7 @@ def create_app(
                 router=ic.router,
                 metadata=dict(ic.metadata) if ic.metadata else None,
                 settings=redacted_settings(ic.spec.settings),
+                error=rr.connection_failed(name),  # ADR 0031
             )
         oc = rr.registry.outbound.get(name)
         if oc is not None:
@@ -723,6 +774,7 @@ def create_app(
                 metadata=dict(oc.metadata) if oc.metadata else None,
                 settings=redacted_settings(oc.spec.settings),
                 simulated=rr.outbound_simulated(name),
+                error=rr.connection_failed(name),  # ADR 0031
             )
         raise HTTPException(404, f"no such connection: {name}")
 
@@ -1252,6 +1304,53 @@ def create_app(
             in_pipeline=await engine.store.in_pipeline_depth(),
         )
 
+    @app.get("/metrics")
+    async def metrics_endpoint(
+        engine: Engine = Depends(_get_engine),
+        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+    ) -> Response:
+        """Prometheus exposition (text/plain). Gated by monitoring:read like /stats — a scraper
+        authenticates with a service token. Contains only aggregate counts/latency keyed by
+        connection name + status — no PHI."""
+        return Response(content=await render_metrics(engine), media_type=METRICS_CONTENT_TYPE)
+
+    # --- alerts config (read-only) -------------------------------------------
+
+    @app.get("/alerts/rules", response_model=AlertsConfig)
+    async def alerts_rules(
+        request: Request,
+        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+    ) -> AlertsConfig:
+        """Read-only view of the loaded [alerts] rules + transport config (ADR 0014). No engine/DB
+        access. No secrets: the webhook URL, SMTP password and username are never returned —
+        transports are reported present-or-not. Gated by monitoring:read like /stats."""
+        alerts: AlertsSettings = (
+            getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
+        )
+        return AlertsConfig(
+            webhook_configured=bool(alerts.webhook_url),
+            webhook_timeout=alerts.webhook_timeout,
+            webhook_allowed_hosts=list(alerts.webhook_allowed_hosts),
+            email_configured=bool(alerts.email_smtp_host and alerts.email_from and alerts.email_to),
+            email_smtp_port=alerts.email_smtp_port,
+            email_use_tls=alerts.email_use_tls,
+            email_recipient_count=len(alerts.email_to),
+            smtp_allowed_hosts=list(alerts.smtp_allowed_hosts),
+            realert_seconds=alerts.realert_seconds,
+            rules=[
+                AlertRuleInfo(
+                    event_type=r.event_type,
+                    connection=r.connection,
+                    min_depth=r.min_depth,
+                    min_oldest_seconds=r.min_oldest_seconds,
+                    severity=r.severity.value,
+                    transports=r.transports,
+                    cooldown_seconds=r.cooldown_seconds,
+                )
+                for r in alerts.rules
+            ],
+        )
+
     # --- engine + DB status --------------------------------------------------
 
     @app.get("/status", response_model=SystemStatus)
@@ -1530,6 +1629,7 @@ def create_managed_app(
             engine.add_registry(load_config(config_dir))
         await engine.start()
         app.state.engine = engine
+        app.state.alerts_settings = alerts_settings
         app.state.approval_gate = _build_approval_gate(
             engine, approvals_settings or ApprovalsSettings()
         )

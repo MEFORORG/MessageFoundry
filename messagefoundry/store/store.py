@@ -178,6 +178,24 @@ class DestinationMetrics:
 
 
 @dataclass(frozen=True)
+class LatencyHistogram:
+    """Per-(channel, destination) delivery-latency histogram over ``done`` outbound rows.
+
+    ``bucket_counts`` are **cumulative** (Prometheus ``le`` semantics): ``bucket_counts[i]`` is the
+    number of done outbound rows whose latency (``updated_at - created_at``, clamped to ``>= 0``) is
+    ``<= buckets[i]``. ``count`` is the total number of done rows (== the ``+Inf`` bucket) and
+    ``sum_seconds`` is the SUM of clamped latency over those rows.
+    """
+
+    channel_id: str
+    destination_name: str
+    # cumulative: count of done outbound rows with latency <= buckets[i]
+    bucket_counts: tuple[int, ...]
+    sum_seconds: float  # SUM of clamped latency over done outbound rows
+    count: int  # total done outbound rows (== the +Inf bucket)
+
+
+@dataclass(frozen=True)
 class ConnectionMetrics:
     inbound: dict[str, InboundMetrics]  # by channel_id
     destinations: dict[tuple[str, str], DestinationMetrics]  # by (channel_id, destination_name)
@@ -1797,14 +1815,12 @@ class MessageStore:
         now: float | None = None,
         *,
         stage: str = Stage.OUTBOUND.value,
-        owner: str | None = None,
     ) -> OutboxItem | None:
         """Claim the **single oldest** pending row for one lane at ``stage`` — strict FIFO by enqueue
         time — but only if it is **due**.
 
-        ``owner`` (Track B Step 5 lane ownership) is accepted for protocol uniformity and IGNORED:
-        SQLite is single-node so there are no lane leases — it always runs the single-node claim, and
-        the runner only passes a non-``None`` owner on a clustered Postgres store.
+        SQLite is single-node so there are no lane leases / failover residue — it always runs the
+        single-node claim.
 
         The lane key is **stage-aware**: outbound lanes are keyed by ``destination_name`` (per-outbound
         FIFO across all inbounds); ingress **and routed** lanes by ``channel_id`` (per-inbound FIFO —
@@ -3725,6 +3741,46 @@ class MessageStore:
                 last_done_at=r["last_done_at"],
             )
         return ConnectionMetrics(inbound=inbound, destinations=destinations)
+
+    async def delivery_latency_histogram(
+        self, *, buckets: Sequence[float], now: float | None = None
+    ) -> Sequence[LatencyHistogram]:
+        """Per-(channel_id, destination_name) delivery-latency histogram over outbound rows that
+        reached status='done'. Latency = updated_at - created_at (seconds), clamped to >= 0 (clock-
+        skew guard). bucket_counts are CUMULATIVE (Prometheus le semantics). Read-only; runs off the
+        event loop on a pooled read-only connection (lockfree-reads; see :meth:`stats`)."""
+        # Only the NUMBER of CASE clauses (len(buckets)) is generated; each boundary is a BOUND
+        # parameter (never string-interpolated), so this is injection-safe and the count is
+        # caller-fixed, not attacker-controlled.
+        bucket_cols = ", ".join(
+            f"SUM(CASE WHEN (updated_at - created_at) <= ? THEN 1 ELSE 0 END) AS b{i}"
+            for i in range(len(buckets))
+        )
+        select_cols = f"{bucket_cols}, " if bucket_cols else ""
+        sql = (
+            "SELECT channel_id, destination_name, "
+            f"{select_cols}"
+            "SUM(CASE WHEN updated_at >= created_at THEN updated_at - created_at ELSE 0 END)"
+            " AS sum_seconds,"
+            " COUNT(*) AS cnt"
+            " FROM queue WHERE stage=? AND status=?"
+            " GROUP BY channel_id, destination_name"
+            " ORDER BY channel_id, destination_name"
+        )
+        params: tuple[Any, ...] = (*buckets, Stage.OUTBOUND.value, OutboxStatus.DONE.value)
+        async with self._read() as db:
+            cur = await db.execute(sql, params)
+            rows = await cur.fetchall()
+        return [
+            LatencyHistogram(
+                channel_id=r["channel_id"],
+                destination_name=r["destination_name"],
+                bucket_counts=tuple(int(r[f"b{i}"] or 0) for i in range(len(buckets))),
+                sum_seconds=float(r["sum_seconds"] or 0),
+                count=int(r["cnt"] or 0),
+            )
+            for r in rows
+        ]
 
     # --- internals -----------------------------------------------------------
 

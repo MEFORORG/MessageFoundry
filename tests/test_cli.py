@@ -70,6 +70,8 @@ def test_graph_of_sample(capsys: pytest.CaptureFixture[str]) -> None:
         "immunization_router",
         "rte_request_router",
         "rte_response_router",
+        "fhir_router",
+        "sr_router",
     }
     assert {h["name"] for h in g["handlers"]} == {
         "archive",
@@ -78,6 +80,8 @@ def test_graph_of_sample(capsys: pytest.CaptureFixture[str]) -> None:
         "immunization_submit_handler",
         "rte_query_handler",
         "rte_result_handler",
+        "fhir_handler",
+        "sr_to_oru",
     }
     # env()-driven settings serialize JSON-safely as {"env": key}, never a raw EnvRef object
     acme_out = next(c for c in g["outbound"] if c["name"] == "OB_ACME_ADT")

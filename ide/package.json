@@ -182,8 +182,20 @@
             "description": "Draft a Handler transform for what you describe"
           },
           {
+            "name": "router",
+            "description": "Draft a Router for the routing policy you describe"
+          },
+          {
             "name": "review",
             "description": "Review the active Router/Handler for PHI leaks and bugs"
+          },
+          {
+            "name": "migrate",
+            "description": "Convert pasted Mirth/Corepoint logic to a Router/Handler"
+          },
+          {
+            "name": "test",
+            "description": "Generate a synthetic HL7 sample for the active code"
           }
         ]
       }
@@ -238,6 +250,12 @@
           "type": "boolean",
           "default": true,
           "description": "Offer to set up version control + commit-time checks when a config project has no git repo yet."
+        },
+        "messagefoundry.ai.contextCharLimit": {
+          "type": "integer",
+          "default": 8000,
+          "minimum": 0,
+          "markdownDescription": "Maximum characters of the active editor's code attached to a `@messagefoundry` AI chat request. The assistant only ever sends code + your config graph's names — never message bodies/PHI — so this bounds how much of your *own* code leaves to your chosen model provider. Files larger than the limit are truncated on a line boundary with a visible marker; `0` sends only the graph names (no editor code)."
         }
       }
     }

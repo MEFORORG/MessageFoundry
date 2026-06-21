@@ -855,7 +855,9 @@ def test_ack_after_delivered_rejected_at_wiring() -> None:
 async def test_ack_after_delivered_global_default_rejected_at_start(tmp_path: Path) -> None:
     # A connection inheriting a global [inbound].ack_after='delivered' (its own ack_after=None) is
     # NOT caught at wiring (ack_after is None there) — only the runtime resolve+guard catches it.
-    # This is the sole defense for that path, so it gets a test.
+    # This is the sole defense for that path, so it gets a test. Per ADR 0031 the guard still fires
+    # loud, but start() now ISOLATES the offending inbound (degraded + alerted) instead of crashing
+    # the whole engine; a direct start_inbound() call still raises so the operator sees the error.
     from messagefoundry.config.wiring import InboundConnection
     from messagefoundry.pipeline.wiring_runner import RegistryRunner
 
@@ -869,8 +871,17 @@ async def test_ack_after_delivered_global_default_rejected_at_start(tmp_path: Pa
         )
         reg.add_router("r", lambda m: [])
         runner = RegistryRunner(reg, s, ack_after_default=AckAfter.DELIVERED)
-        with pytest.raises(WiringError, match="not yet implemented"):
-            await runner.start()
+        await runner.start()  # does NOT crash — the offending inbound is isolated
+        try:
+            assert runner.running
+            assert not runner.inbound_running("IB")
+            reason = runner.connection_failed("IB")
+            assert reason and "not yet implemented" in reason
+            # the guard is still the sole defense and still fires loud for a direct caller:
+            with pytest.raises(WiringError, match="not yet implemented"):
+                await runner.start_inbound("IB")
+        finally:
+            await runner.stop()
     finally:
         await s.close()
 

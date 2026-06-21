@@ -40,9 +40,6 @@ class _Coordinator:
     def is_leader(self) -> bool:
         return self._leader
 
-    def owns_lane(self, lane_key: str) -> bool:
-        return True
-
     def reclaims_inflight(self) -> bool:
         return self._reclaims
 
@@ -61,9 +58,6 @@ class _Coordinator:
     async def bump_config_version(self) -> int:
         return 0
 
-    def lane_owner(self) -> str | None:
-        return self.node_id if self._reclaims else None
-
 
 class _ReclaimSpyStore:
     """A store stand-in recording reclaim_expired_leases + recover_inflight_on_promotion calls."""
@@ -71,7 +65,7 @@ class _ReclaimSpyStore:
     def __init__(self) -> None:
         self.reclaim_calls: list[float | None] = []
         self.to_reclaim = 0
-        self.promotion_calls: list[tuple[str | None, float | None]] = []
+        self.promotion_calls: list[float | None] = []
         self.to_recover = 0
 
     async def reclaim_expired_leases(
@@ -80,10 +74,8 @@ class _ReclaimSpyStore:
         self.reclaim_calls.append(now)
         return self.to_reclaim
 
-    async def recover_inflight_on_promotion(
-        self, *, lane_owner: str | None, now: float | None = None
-    ) -> int:
-        self.promotion_calls.append((lane_owner, now))
+    async def recover_inflight_on_promotion(self, *, now: float | None = None) -> int:
+        self.promotion_calls.append(now)
         return self.to_recover
 
 
@@ -111,18 +103,16 @@ async def test_leader_sweep_no_ops_on_follower() -> None:
     assert store.reclaim_calls == []  # follower → no store write at all
 
 
-async def test_recover_on_promotion_runs_when_leader_with_lane_owner() -> None:
-    # #293: the one-shot on-promotion recovery fires when leader, threading the coordinator's lane_owner
-    # (= node_id) so the store can scope the lane-lease takeover.
+async def test_recover_on_promotion_runs_when_leader() -> None:
+    # #293: the one-shot on-promotion recovery fires when leader, re-pending the prior leader's stranded
+    # in-flight rows (owner-scoped, lease-blind) immediately.
     store = _ReclaimSpyStore()
     store.to_recover = 4
     coord = _Coordinator(leader=True, reclaims=True)
     runner = LeaderMaintenanceRunner(store, coord, interval_seconds=10.0)
     recovered = await runner.recover_on_promotion(now=200.0)
     assert recovered == 4
-    assert store.promotion_calls == [
-        (coord.node_id, 200.0)
-    ]  # leader → one call, with the lane owner
+    assert store.promotion_calls == [200.0]  # leader → one call with our injected clock
     assert store.reclaim_calls == []  # promotion recovery is distinct from the periodic sweep
 
 
@@ -168,7 +158,7 @@ class _RecordingStore:
     async def reclaim_expired_leases(
         self, now: float | None = None, *, stage: str | None = None
     ) -> int:
-        # Present so this spy models a reclaim-capable (Postgres active-active) clustered store: the
+        # Present so this spy models a reclaim-capable (Postgres) active-passive clustered store: the
         # engine only spawns the LeaderMaintenanceRunner when the store has this method (a SQL Server
         # active-passive store does not, and recovers via on-promotion reset_stale_inflight instead).
         return 0

@@ -169,6 +169,20 @@ class RestDestination(DestinationConnector):
         # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
         # dry-run/start), like a bad TLS cert; the per-request signature is minted in _post (off-loop).
         self._signer: MessageSigner | None = signer_from_destination(config)
+        # ADR 0024: opt-in SMART Backend Services token provider. None = off (byte-identical). Lazy
+        # import breaks the rest <-> smart cycle (smart reuses rest's opener); built here so a bad
+        # key/curve/token_url fails loud. The minted bearer is injected per-request in _post.
+        from messagefoundry.transports.smart import token_provider_from_destination
+
+        self._token_provider = token_provider_from_destination(config)
+        if self._token_provider is not None:
+            # The SMART bearer is injected per-request in _post, so the static-header cleartext check
+            # above can't see it. Re-run the check treating the connection as credential-bearing, so a
+            # SMART access token never ships over cleartext http (the detached-JWS signature, by
+            # contrast, is public-verifiable and needs no such guard).
+            refuse_cleartext_credentials(
+                scheme, {**self._headers, "Authorization": "Bearer"}, self.url
+            )
         if bool(s.get("verify_tls", True)):
             self._opener = _NO_REDIRECT_OPENER
         else:
@@ -222,8 +236,16 @@ class RestDestination(DestinationConnector):
         # the host answered, so a 405 (HEAD not allowed on a POST endpoint) is still a pass — but a 401/
         # 403 means the configured credentials would be rejected, which a real delivery dead-letters, so
         # surface it as a failure. Connection/DNS/TLS/timeout is always a fail.
+        headers = self._headers
+        if self._token_provider is not None:
+            # Acquire a real SMART token so reachability reflects the actual credentials (a token-
+            # endpoint failure raises DeliveryError, surfaced as unreachable).
+            headers = {
+                **self._headers,
+                "Authorization": f"Bearer {self._token_provider.access_token()}",
+            }
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
-            self.url, headers=self._headers, method="HEAD"
+            self.url, headers=headers, method="HEAD"
         )
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
@@ -242,11 +264,17 @@ class RestDestination(DestinationConnector):
     def _post(self, payload: str) -> tuple[str, int]:
         data = payload.encode(self.encoding)
         headers = self._headers
-        if self._signer is not None:
-            # ASVS 4.1.5 (ADR 0018): mint a detached JWS over the exact body bytes and carry it in a
-            # per-request header. Minted here in send()'s off-loop worker, past the queue boundary, so
-            # a retry re-mints it (re-run purity holds, like the WS-Security nonce — ADR 0015).
-            headers = {**self._headers, **self._signer.signature_headers(data)}
+        if self._token_provider is not None or self._signer is not None:
+            headers = dict(self._headers)
+            if self._token_provider is not None:
+                # ADR 0024: a fresh SMART bearer per request, acquired off-loop past the queue boundary
+                # (a retry re-mints — re-run purity holds). Overrides any static bearer_token.
+                headers["Authorization"] = f"Bearer {self._token_provider.access_token()}"
+            if self._signer is not None:
+                # ASVS 4.1.5 (ADR 0018): mint a detached JWS over the exact body bytes and carry it in a
+                # per-request header. Minted here in send()'s off-loop worker, past the queue boundary, so
+                # a retry re-mints it (re-run purity holds, like the WS-Security nonce — ADR 0015).
+                headers.update(self._signer.signature_headers(data))
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self.url,
             data=data,
@@ -263,6 +291,14 @@ class RestDestination(DestinationConnector):
                 return body, status
         except urllib.error.HTTPError as exc:
             status = exc.code
+            if self._token_provider is not None and status == 401:
+                # ADR 0024: the SMART token may have expired between mint and use — drop it and retry
+                # with a fresh one (transient). A 403 is left permanent (an authz/scope denial a re-mint
+                # won't fix). PHI/secret-safe: no body, redacted URL only.
+                self._token_provider.invalidate()
+                raise DeliveryError(
+                    f"REST {_redact_url(self.url)} returned HTTP 401; refreshing SMART token"
+                ) from exc
             if status in _RETRYABLE_4XX or 500 <= status < 600:
                 raise DeliveryError(f"REST {_redact_url(self.url)} returned HTTP {status}") from exc
             # Other 4xx (and a refused 3xx) — the endpoint won't accept this request as-is; fail fast

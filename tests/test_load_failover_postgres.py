@@ -38,7 +38,6 @@ _RESET_TABLES = (
     "response",
     "leader_lease",
     "nodes",
-    "lane_leases",
     "cluster_config",
 )
 

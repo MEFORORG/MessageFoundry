@@ -1,7 +1,10 @@
 # ADR 0008 — Read-only cluster observability API (`/cluster/status` + `/cluster/nodes`)
 
 - **Status:** Proposed (2026-06-14) — drafted on the owner's go; ratified-on-build. Closes the last
-  Track B scale-out step: the coordination built in Steps 3–6b had no operator-visible surface.
+  Track B HA-clustering step: the coordination built in Steps 3–6b had no operator-visible surface.
+  *(Update 2026-06-18: the horizontal **active-active** scale-out feature was dropped and its code
+  removed — per-lane FIFO ownership / Step 5 below is gone, see the note there. The cluster is the
+  supported **active-passive** HA model; the observability API in this ADR remains.)*
 - **Built:** Yes — shipped with this ADR (Track B Step 7).
 - **Decision in one line:** expose cluster membership, leadership, and config-sync **read-only** over
   the engine HTTP API as two endpoints — **`/cluster/status`** (this node's posture) and
@@ -16,9 +19,11 @@
 
 ## Context
 
-Track B built horizontal scale-out incrementally: leader election (Step 4), leader-gated WRITE
-singletons + poll-source intake (Step 4b), per-lane FIFO ownership (Step 5), and cross-node
-reference / config-reload / transform-state convergence (Steps 6/6b). All of it runs **invisibly** —
+Track B built active-passive HA clustering incrementally: leader election (Step 4), leader-gated WRITE
+singletons + poll-source intake (Step 4b), per-lane FIFO ownership (Step 5 — **since removed** with the
+active-active drop, 2026-06-18; failover-safe per-lane FIFO is now the stranded-head reclaim in the
+ordinary FIFO claim), and cross-node reference / config-reload / transform-state convergence
+(Steps 6/6b). All of it runs **invisibly** —
 the coordinator's state (who is leader, which nodes are alive, what config version the cluster is on)
 lives in cached in-memory gates and a Postgres `nodes` table that no API exposes. An operator running
 N engine processes against one Postgres has no way to answer "which node is the leader?", "are all my
@@ -85,7 +90,7 @@ advisory lock: `ALTER TABLE nodes ADD COLUMN IF NOT EXISTS is_leader ...`. The
 
 ### Experimental → complete
 
-With the observability API the scale-out feature set is complete, so the one-time cluster-enabled
+With the observability API the HA-clustering feature set is complete, so the one-time cluster-enabled
 banner becomes an **INFO** (renamed `_log_cluster_enabled_once`) that states the feature set is built
 and summarizes the operational assumptions operators must honor (below), pointing at
 `docs/CLUSTERING.md`. The `[cluster]` docstring and `cluster.py` docs no longer call the **cluster**
@@ -94,7 +99,7 @@ unchanged; the DATABASE connector is now production, promoted on its own track.)
 
 ## Operational assumptions (called out so operators honor them)
 
-1. **Clock sync (NTP).** Lane leases and row leases are wall-clock; skew between nodes can mis-time a
+1. **Clock sync (NTP).** Row leases are wall-clock; skew between nodes can mis-time a
    lease expiry. Keep node clocks reasonably synced.
 2. **Homogeneous config.** All nodes must run **identical config dirs** — the graph, routers, and
    handlers are loaded from each node's own dir; convergence coordinates the *reload version*, not the
@@ -114,8 +119,9 @@ unchanged; the DATABASE connector is now production, promoted on its own track.)
 ## Alternatives rejected
 
 - **A `/cluster/lanes` endpoint** (per-lane ownership). Owner-declined for this step: the owns-lane
-  cache is an eventually-consistent hint, not the correctness gate, and adds surface without a current
-  operator need. Membership + leadership + config-version cover the asked-for visibility.
+  cache was an eventually-consistent hint, not the correctness gate, and adds surface without a current
+  operator need. Membership + leadership + config-version cover the asked-for visibility. *(Moot since
+  2026-06-18: per-lane ownership was removed with the active-active drop.)*
 - **A dedicated `cluster:read` permission.** Rejected — the data is non-PHI operational telemetry in
   the same class as `/status`; a new permission would force a roles migration for no security gain.
 - **Deriving leadership from the advisory lock at request time** (e.g. `pg_locks`). Brittle and

@@ -1,38 +1,32 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Cluster coordination seam (Track B Steps 3-7).
+"""Cluster coordination seam (active-passive HA — Track B Steps 3-7).
 
-Horizontal scale-out runs the engine as several nodes against one shared server-DB store. Two
-coordination questions arise once there is more than one node: (1) which node runs the **singleton**
-tasks that must not double-execute (retention purges, the lease-reclaim sweep — *leader election*,
-Step 4), and (2) which node may **claim a given FIFO lane** so per-lane order survives across nodes
-(*lane ownership*, Step 5). This module answers both. Single-node operation (SQLite and single-node
-Postgres alike) stays byte-identical: :class:`NullCoordinator` reports leader ``True`` and
-``lane_owner()`` ``None``, so the claim path takes its unchanged no-owner branch.
+Active-passive HA runs the engine as a leader plus one or more hot standbys against one shared
+server-DB store: exactly one node ("the leader") binds listeners and drains the graph, and a standby
+takes over on failover. The coordination question is which node runs the **singleton** work that must
+not double-execute (the wired graph itself, retention purges, the lease-reclaim sweep — *leader
+election*, Step 4). This module answers it. Single-node operation (SQLite and single-node Postgres
+alike) stays byte-identical: :class:`NullCoordinator` reports leader ``True``, so the engine runs the
+graph directly.
 
-The contract is deliberately tiny and the hot-path gates (:meth:`ClusterCoordinator.is_leader` /
-:meth:`ClusterCoordinator.owns_lane` / :meth:`ClusterCoordinator.lane_owner`) are **synchronous and
-cheap** — they read cached in-memory state / a plain attribute so a per-message gate check adds no
+The contract is deliberately tiny and the hot-path gate (:meth:`ClusterCoordinator.is_leader`) is
+**synchronous and cheap** — it reads cached in-memory state so a per-message gate check adds no
 ``await``. :class:`NullCoordinator` is the default used everywhere on a single node; :class:`DbCoordinator`
 is the Postgres-backed implementation that registers the node in a ``nodes`` table, heartbeats, runs
 (Step 4) **real leader election** via a **self-fencing leadership lease** (a single ``leader_lease``
 row with a DB-clock TTL) so exactly one node reports ``is_leader()`` at a time — and, for active-passive
-HA (Workstream A2), a partitioned old leader **self-fences** before a standby can acquire it — and
-(Step 5) maintains a cached owned-lane set. :func:`build_coordinator`
-picks between them defensively — a non-Postgres or not-``[cluster].enabled`` store always gets the
-:class:`NullCoordinator`.
+HA (Workstream A2), a partitioned old leader **self-fences** before a standby can acquire it.
+:func:`build_coordinator` picks between them defensively — a non-Postgres or not-``[cluster].enabled``
+store always gets the :class:`NullCoordinator`.
 
-**Steps 4 + 4b + 5 add leader election, leader-gated poll-source intake, and per-lane FIFO ownership:**
-``is_leader()`` reflects the held leadership lease, the engine gates its leader-only WRITE singletons
-(retention, the lease-reclaim sweep) on it, and the runner threads ``is_leader`` as a plain predicate
-into each source so only the leader polls a **shared external resource** (a directory / DB table /
-remote dir) — listen sources (MLLP/TCP) ignore it and run on every node. For ordering, the runner
-threads :meth:`lane_owner` into each FIFO claim so :meth:`Store.claim_next_fifo` atomically leases the
-lane to a single node at claim time — a FIFO lane is processed by exactly one node at a time, so strict
-per-lane FIFO holds ACROSS nodes with **zero reorder window** (the claim, not the cached
-:meth:`owns_lane` hint, is the authority). Single-node operation stays byte-identical because
-:class:`NullCoordinator`'s ``is_leader()`` is always ``True`` and its ``lane_owner()`` is always
-``None`` (no lane leasing → the claim takes its unchanged no-owner path).
+**Steps 4 + 4b add leader election and leader-gated poll-source intake:** ``is_leader()`` reflects the
+held leadership lease, the engine gates its leader-only WRITE singletons (retention, the lease-reclaim
+sweep) on it, and the runner threads ``is_leader`` as a plain predicate into each source so only the
+leader polls a **shared external resource** (a directory / DB table / remote dir) — listen sources
+(MLLP/TCP) ignore it and run on every node, but only the leader binds them (the graph runs on the
+leader only). Single-node operation stays byte-identical because :class:`NullCoordinator`'s
+``is_leader()`` is always ``True``.
 
 **Step 6 / 6b add cross-node CONVERGENCE.** :meth:`is_clustered` (``True`` on :class:`DbCoordinator`,
 ``False`` on :class:`NullCoordinator`) gates the engine's config-convergence loop and whether an
@@ -45,8 +39,8 @@ clustered write bumps a per-namespace ``state_version`` token in-txn and every n
 ``StateConvergenceRunner`` read-throughs newer namespaces into its own state cache, so a sibling's
 transform-state write reaches all nodes.
 
-**Step 7 adds the read-only OBSERVABILITY API.** The scale-out feature set is now complete, so the
-coordinator no longer hides behind an "experimental" banner. :meth:`cluster_members` returns one
+**Step 7 adds the read-only OBSERVABILITY API.** The active-passive HA feature set is now complete, so
+the coordinator no longer hides behind an "experimental" banner. :meth:`cluster_members` returns one
 :class:`ClusterMember` per known node (liveness + derived leadership) for the engine's ``/cluster/nodes``
 endpoint; ``/cluster/status`` reads the cheap in-memory gates (:meth:`node_id` / :meth:`is_clustered` /
 :meth:`is_leader` / :meth:`config_version_cached`). Cluster-wide leadership is derived from a per-node
@@ -109,7 +103,7 @@ _LOCK_CLASS_CLUSTER = 4
 def default_node_id() -> str:
     """This node's stable identity: ``host:pid:hex`` — the same shape as
     :attr:`PostgresStore._owner`, so when the factory reuses ``store._owner`` the cluster node-id and
-    the row-lease owner-id are one value (a useful invariant for Steps 4/5)."""
+    the row-lease owner-id are one value (a useful invariant for Step 4 / failover recovery)."""
     return f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
 
 
@@ -138,9 +132,8 @@ class ClusterCoordinator(Protocol):
     """The coordination contract every backend (null today, DB-backed later) implements.
 
     :attr:`node_id` is this node's stable identity. :meth:`start`/:meth:`stop` own any background
-    membership task (idempotent — safe to call twice). :meth:`is_leader` and :meth:`owns_lane` are the
-    **cheap, synchronous** gates Steps 4/5 will consult on the hot path — they must read cached state
-    and never block or ``await``.
+    membership task (idempotent — safe to call twice). :meth:`is_leader` is the **cheap, synchronous**
+    gate Step 4 consults on the hot path — it must read cached state and never block or ``await``.
     """
 
     node_id: str
@@ -150,24 +143,9 @@ class ClusterCoordinator(Protocol):
     async def stop(self) -> None: ...
 
     def is_leader(self) -> bool:
-        """Whether this node runs the leader-only singletons (retention, lease reclaim). Cheap/cached
-        — never an ``await`` or a DB round-trip. Always ``True`` until Step 4 builds election."""
-        ...
-
-    def owns_lane(self, lane_key: str) -> bool:
-        """Whether this node currently holds the FIFO lane ``lane_key`` (a stage:destination/channel
-        lease). Cheap/cached. **An eventually-consistent HINT for observability/reporting, NOT the
-        correctness gate** — the authoritative single-owner-per-lane enforcement is the claim-time
-        atomic lease acquire in :meth:`Store.claim_next_fifo` (Track B Step 5, Deliverable 2). On
-        :class:`DbCoordinator` it reflects a per-tick cache refresh; ``True`` everywhere on
-        :class:`NullCoordinator` (single-node owns every lane)."""
-        ...
-
-    def lane_owner(self) -> str | None:
-        """The owner identity to gate a FIFO claim by (Track B Step 5): this node's ``node_id`` when
-        clustered (so :meth:`Store.claim_next_fifo` atomically leases the lane to this node), or
-        ``None`` single-node (no lane leasing → the byte-identical claim path). The runner threads this
-        into every FIFO claim. Cheap/synchronous — a plain attribute read, no DB."""
+        """Whether this node runs the leader-only singletons (the wired graph, retention, lease
+        reclaim). Cheap/cached — never an ``await`` or a DB round-trip. Always ``True`` on
+        :class:`NullCoordinator` (single-node)."""
         ...
 
     def reclaims_inflight(self) -> bool:
@@ -252,14 +230,6 @@ class NullCoordinator:
     def is_leader(self) -> bool:
         return True
 
-    def owns_lane(self, lane_key: str) -> bool:
-        # Single-node owns every lane (and there are no lane leases). Byte-identical to before.
-        return True
-
-    def lane_owner(self) -> str | None:
-        # Single-node: no lane leasing — claim_next_fifo runs its byte-identical no-owner path.
-        return None
-
     def reclaims_inflight(self) -> bool:
         # Single-node: the engine keeps the unconditional startup reset (immediate self-recovery of
         # this node's own crash residue). Byte-identical to before this seam existed.
@@ -303,16 +273,16 @@ class NullCoordinator:
         return (self.node_id, None)
 
 
-# One-time-per-process info guard: the scale-out feature set is COMPLETE — election (Step 4),
-# leader-gated WRITE singletons, leader-gated poll-source intake (Step 4b), per-lane FIFO ownership
-# (Step 5), cross-node convergence (Step 6 — leader-materialized reference sets read-through by
-# followers + a config-reload version token; Step 6b — transform-STATE writes read-through by followers
-# via a per-namespace version token), and the read-only observability API (Step 7 — /cluster/status +
-# /cluster/nodes). So a cluster no longer double-runs singletons, double-ingests a shared poll source,
-# interleaves a FIFO lane across nodes, or leaves followers on stale reference/config/state, and an
-# operator can now SEE membership + leadership. The banner is therefore a one-time INFO (not a WARNING)
-# that states the feature set is built and summarizes the operational assumptions operators must honor.
-# Logged once so the log isn't spammed when several stores/coordinators open in one process (e.g. tests).
+# One-time-per-process info guard: the active-passive HA feature set is COMPLETE — election (Step 4),
+# leader-gated WRITE singletons, leader-gated poll-source intake (Step 4b), cross-node convergence
+# (Step 6 — leader-materialized reference sets read-through by followers + a config-reload version
+# token; Step 6b — transform-STATE writes read-through by followers via a per-namespace version token),
+# and the read-only observability API (Step 7 — /cluster/status + /cluster/nodes). So a standby no
+# longer double-runs singletons, double-ingests a shared poll source, or starts on stale reference/
+# config/state when it takes over, and an operator can SEE membership + leadership. The banner is
+# therefore a one-time INFO (not a WARNING) that states the feature set is built and summarizes the
+# operational assumptions operators must honor. Logged once so the log isn't spammed when several
+# stores/coordinators open in one process (e.g. tests).
 _logged_cluster_enabled = False
 
 
@@ -330,23 +300,19 @@ class DbCoordinator:
     :meth:`is_leader` ``True``. :meth:`stop` releases the lease, cancels both tasks, and marks this node
     left.
 
-    Lane ownership (Track B Step 5) IS built: :meth:`lane_owner` returns this node's identity, the
-    runner threads it into each FIFO claim, and :meth:`Store.claim_next_fifo` atomically leases the
-    lane to a single node at claim time — so cross-node per-lane FIFO order is preserved with zero
-    reorder window. :meth:`owns_lane` is the eventually-consistent observability hint over a per-tick
-    cache of the lanes this node holds (NOT the correctness gate — the claim is). Leader-gated
-    poll-source intake (Step 4b) IS built: the runner threads :meth:`is_leader` into each source as a
-    plain predicate and the poll sources skip their scan on a follower, so a shared directory / DB table
-    / remote dir is ingested by exactly one node. Cross-node CONVERGENCE (Steps 6 + 6b) IS built:
-    :meth:`is_clustered` gates the engine's config-convergence loop, :meth:`config_version` /
-    :meth:`config_version_cached` / :meth:`bump_config_version` carry the ``cluster_config`` version token so
-    an operator reload on one node propagates cluster-wide, and transform-STATE writes bump a per-namespace
-    ``state_version`` token that every node's ``StateConvergenceRunner`` read-throughs into its own cache. The
-    read-only OBSERVABILITY API (Step 7) IS built: a per-node ``is_leader`` flag is folded into the
-    ``nodes`` heartbeat (one column, zero extra writes) and :meth:`cluster_members` reads the table and
-    derives the **single live** leader (the freshest fresh-flagged node) for the engine's
-    ``/cluster/nodes`` endpoint — so the scale-out feature set is complete and a one-time INFO (not a
-    warning) records the operational assumptions operators must honor.
+    Leader-gated poll-source intake (Step 4b) IS built: the runner threads :meth:`is_leader` into each
+    source as a plain predicate and the poll sources skip their scan on a follower, so a shared
+    directory / DB table / remote dir is ingested by exactly one node (and the graph runs on the leader
+    only). Cross-node CONVERGENCE (Steps 6 + 6b) IS built: :meth:`is_clustered` gates the engine's
+    config-convergence loop, :meth:`config_version` / :meth:`config_version_cached` /
+    :meth:`bump_config_version` carry the ``cluster_config`` version token so an operator reload on one
+    node propagates cluster-wide, and transform-STATE writes bump a per-namespace ``state_version`` token
+    that every node's ``StateConvergenceRunner`` read-throughs into its own cache. The read-only
+    OBSERVABILITY API (Step 7) IS built: a per-node ``is_leader`` flag is folded into the ``nodes``
+    heartbeat (one column, zero extra writes) and :meth:`cluster_members` reads the table and derives the
+    **single live** leader (the freshest fresh-flagged node) for the engine's ``/cluster/nodes``
+    endpoint — so the active-passive HA feature set is complete and a one-time INFO (not a warning)
+    records the operational assumptions operators must honor.
 
     Backend-agnostic: it holds a raw asyncpg ``pool`` (duck-typed ``Any``) and never imports the
     concrete store, so this module imports cleanly without the optional ``asyncpg`` extra.
@@ -409,11 +375,6 @@ class DbCoordinator:
         # The monotonic time of the last CONFIRMED lease hold (acquire or successful renew), or None if
         # this node has never held the lease. The fence watchdog demotes when now - this > fence_timeout.
         self._last_renew_ok: float | None = None
-        # Cached set of FIFO lanes this node currently holds, read by the cheap/synchronous owns_lane()
-        # HINT (Track B Step 5). Refreshed once per maintenance tick from lane_leases; it is NOT the
-        # correctness gate (the claim-time atomic lease acquire in claim_next_fifo is) — just an
-        # eventually-consistent observability signal, so a tick of staleness is harmless.
-        self._owned_lanes: set[str] = set()
         # Cached cluster-wide config-reload version (Track B Step 6), read by the cheap/synchronous
         # config_version_cached() the engine's convergence loop polls. Refreshed once per maintenance
         # tick and updated immediately by bump_config_version() (so the node that bumps sees its own new
@@ -474,17 +435,6 @@ class DbCoordinator:
         # Cheap + synchronous: read the cached state the maintenance loop + fence watchdog maintain (no
         # DB round-trip on the hot path). True only while this node holds the leadership lease.
         return self._is_leader
-
-    def owns_lane(self, lane_key: str) -> bool:
-        # Cheap + synchronous set membership on the per-tick lane-lease cache (no DB on the call). This
-        # is an eventually-consistent HINT for observability — the AUTHORITATIVE single-owner-per-lane
-        # enforcement is the claim-time atomic lease acquire in claim_next_fifo (Track B Step 5).
-        return lane_key in self._owned_lanes
-
-    def lane_owner(self) -> str | None:
-        # Clustered: gate FIFO claims by this node's identity so claim_next_fifo atomically leases the
-        # lane to us (one node per lane → strict FIFO across nodes). Cheap + synchronous attribute read.
-        return self.node_id
 
     def reclaims_inflight(self) -> bool:
         # Clustered: the leader's periodic reclaim_expired_leases sweep recovers crashed nodes' in-
@@ -607,20 +557,19 @@ class DbCoordinator:
             return
         _logged_cluster_enabled = True
         log.info(
-            "cluster coordination is ENABLED ([cluster].enabled); the scale-out feature set is BUILT: "
-            "leader election (Track B Step 4), the leader-gated WRITE singletons (retention, lease "
-            "reclaim), leader-gated poll-source intake (Step 4b — only the leader polls a shared "
-            "directory / DB table / remote dir), per-lane FIFO ownership (Step 5 — a FIFO lane is "
-            "claimed by exactly one node at a time via an atomic claim-time lane lease, so cross-node "
-            "per-lane FIFO ORDER is PRESERVED), cross-node CONVERGENCE (Step 6 — the leader materializes "
-            "each reference set from its source and followers read-through the shared snapshot; an "
-            "operator config reload propagates cluster-wide via a version token; Step 6b — transform-"
-            "STATE writes bump a per-namespace version token and every node read-throughs newer "
+            "cluster coordination is ENABLED ([cluster].enabled); the active-passive HA feature set is "
+            "BUILT: leader election (Track B Step 4 — exactly one node holds the leadership lease and "
+            "drains the graph; a standby takes over on failover), the leader-gated WRITE singletons "
+            "(retention, lease reclaim), leader-gated poll-source intake (Step 4b — only the leader polls "
+            "a shared directory / DB table / remote dir), cross-node CONVERGENCE (Step 6 — the leader "
+            "materializes each reference set from its source and followers read-through the shared "
+            "snapshot; an operator config reload propagates cluster-wide via a version token; Step 6b — "
+            "transform-STATE writes bump a per-namespace version token and every node read-throughs newer "
             "namespaces into its own state cache), and the read-only observability API (Step 7 — "
             "/cluster/status + /cluster/nodes). OPERATIONAL ASSUMPTIONS to honor: (a) keep node clocks "
-            "reasonably synced (NTP) — lane/row leases are wall-clock; (b) run IDENTICAL config dirs on "
-            "every node; (c) apply config changes via a COORDINATED (not rolling) restart. See "
-            "docs/CLUSTERING.md."
+            "reasonably synced (NTP) — the row leases used for failover recovery are wall-clock; (b) run "
+            "IDENTICAL config dirs on every node; (c) apply config changes via a COORDINATED (not "
+            "rolling) restart. See docs/CLUSTERING.md."
         )
 
     async def _ensure_nodes_table(self) -> None:
@@ -739,18 +688,6 @@ class DbCoordinator:
                     safe_exc(exc),
                 )
             try:
-                await self._refresh_owned_lanes()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # The owned-lane cache feeds the owns_lane() HINT only (not the correctness gate, which
-                # is the claim-time atomic lease) — a stale tick is harmless, so log and retry.
-                log.warning(
-                    "cluster: owned-lane refresh failed for node %s; will retry: %s",
-                    self.node_id,
-                    safe_exc(exc),
-                )
-            try:
                 # Track B Step 6: refresh the cached cluster-wide config version so the engine's
                 # convergence loop polls it cheaply (config_version_cached) without a DB round-trip. A
                 # stale tick just delays a follower's reload by one interval (harmless), so log + retry.
@@ -769,20 +706,6 @@ class DbCoordinator:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._heartbeat_seconds)
             except asyncio.TimeoutError:
                 continue  # interval elapsed — beat again
-
-    # --- lane-ownership cache (Track B Step 5) -------------------------------
-
-    async def _refresh_owned_lanes(self) -> None:
-        """Refresh the cached set of lanes this node currently holds (unexpired), read by owns_lane().
-        Once per maintenance tick (bounded, off the message hot path). This is the eventually-consistent
-        observability HINT only — the AUTHORITATIVE single-owner-per-lane enforcement is the claim-time
-        atomic lane-lease acquire in :meth:`PostgresStore.claim_next_fifo`."""
-        rows = await self._pool.fetch(
-            "SELECT lane FROM lane_leases WHERE owner=$1 AND lease_expires_at > $2",
-            self.node_id,
-            time.time(),
-        )
-        self._owned_lanes = {r["lane"] for r in rows}
 
     # --- leader election: self-fencing lease (Track B Step 4 / Workstream A2) ----
 
@@ -913,7 +836,7 @@ def build_coordinator(store: Any, cluster_settings: Any) -> ClusterCoordinator:
         return NullCoordinator()
     # Reuse store._owner as the node-id so the cluster node-id == the row-lease owner-id (Track B
     # Step 2's identity), unless the operator pinned [cluster].node_id (stable identity / tests). That
-    # shared id lets Steps 4/5 correlate a node's membership row with the leases it holds.
+    # shared id lets Step 4 / failover recovery correlate a node's membership row with the leases it holds.
     node_id = (
         getattr(cluster_settings, "node_id", None)
         or getattr(store, "_owner", None)

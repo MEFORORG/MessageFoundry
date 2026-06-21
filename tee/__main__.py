@@ -34,6 +34,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
 import ssl
 import sys
@@ -42,6 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tee import __version__, mefor_api
+from tee.anon import anonymize_checked
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
 from tee.report import build_report
@@ -280,6 +282,39 @@ def _build_parser() -> argparse.ArgumentParser:
         help="canonicalise a Corepoint destination (MSH-5/6) to its MEFOR equivalent; repeatable",
     )
 
+    anon = sub.add_parser(
+        "anonymize-captures",
+        help="write a PHI-free dataset from captured bodies (de-identified, #36)",
+    )
+    anon.add_argument("--db", required=True, metavar="PATH", help="tee SQLite DB (captured bodies)")
+    anon.add_argument(
+        "--out", required=True, metavar="FILE", help="output JSONL of de-identified messages"
+    )
+    anon.add_argument(
+        "--direction",
+        default="corepoint_copy",
+        metavar="DIR",
+        help="which capture direction to read (default: corepoint_copy)",
+    )
+    anon.add_argument(
+        "--salt-env",
+        default="MEFOR_ANON_SALT",
+        metavar="VAR",
+        help="env var holding the secret per-dataset salt (never committed; ADR 0030 §4)",
+    )
+    anon.add_argument(
+        "--overlay", default=None, metavar="FILE", help="optional anon.toml rule overlay"
+    )
+    anon.add_argument(
+        "--since", type=_parse_age, default=None, metavar="AGE|DATE", help="only captures at/after"
+    )
+    anon.add_argument(
+        "--before", type=_parse_age, default=None, metavar="AGE|DATE", help="only captures before"
+    )
+    anon.add_argument(
+        "--limit", type=int, default=None, metavar="N", help="cap to the most recent N"
+    )
+
     return parser
 
 
@@ -446,6 +481,65 @@ def _compare(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _anonymize_captures(args: argparse.Namespace) -> int:
+    """Read captured bodies, de-identify them, and write a PHI-free JSONL dataset (#36, ADR 0030).
+
+    Fail-closed: the salt must come from the environment (never a flag/commit), and if ANY message
+    still carries a forbidden token after anonymization the whole dataset is refused — a partial,
+    possibly-leaky file is never written. Never echoes a body to stdout/stderr (only counts).
+    """
+    salt = os.environ.get(args.salt_env, "")
+    if not salt:
+        print(
+            f"error: set {args.salt_env} to a secret per-dataset salt (env-supplied, never "
+            "committed; ADR 0030 §4)",
+            file=sys.stderr,
+        )
+        return 2
+    store = await RelayStore.open(args.db)
+    try:
+        rows = await store.captures(
+            direction=args.direction, since=args.since, before=args.before, limit=args.limit
+        )
+    finally:
+        await store.close()
+    if not rows:
+        print(
+            f"error: no captured bodies for direction={args.direction!r} in {args.db} — run the "
+            "relay with --capture-bodies or --capture-corepoint-copy",
+            file=sys.stderr,
+        )
+        return 1
+
+    overlay = Path(args.overlay) if args.overlay else None
+    lines: list[str] = []
+    failed = 0
+    for row in rows:
+        text = row.raw.decode("latin-1")  # lossless byte<->char, matches the capture sink
+        try:
+            anon = anonymize_checked(text, salt=salt, overlay=overlay)
+        except Exception:  # fail closed on ANY anonymizer error — never surface/emit the body
+            failed += 1  # it is a count, not a leak (LeakError, AnonError, or anything else)
+            continue
+        lines.append(
+            json.dumps(
+                {"control_id": row.control_id, "raw": anon, "received_at": row.at},
+                ensure_ascii=False,
+            )
+        )
+    if failed:
+        print(
+            f"error: {failed} of {len(rows)} message(s) failed anonymization or still carried a "
+            "forbidden token — refusing to write a dataset (fail closed). Extend the rule map via "
+            "an anon.toml overlay, then retry.",
+            file=sys.stderr,
+        )
+        return 1
+    Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    print(f"wrote {len(lines)} de-identified message(s) to {args.out}", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "run":
@@ -465,6 +559,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_purge(args))
     if args.command == "compare":
         return _compare(args)
+    if args.command == "anonymize-captures":
+        return asyncio.run(_anonymize_captures(args))
     return 2  # unreachable: subparsers are required
 
 

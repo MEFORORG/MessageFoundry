@@ -235,20 +235,6 @@ async def test_pending_depth_counts_and_reports_oldest(store: MessageStore) -> N
     assert await store.pending_depth("d1") == (1, 20.0)
 
 
-async def test_claim_next_fifo_ignores_owner_single_node(store: MessageStore) -> None:
-    # Track B Step 5: SQLite is single-node (no lane leases), so claim_next_fifo accepts an `owner`
-    # kwarg for protocol uniformity but IGNORES it — passing a node id behaves identically to the
-    # no-owner claim (claims the same head, same FIFO order). The runner only passes a non-None owner
-    # on a clustered Postgres store, never here.
-    await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=10.0)
-    await store.enqueue_message(channel_id="c1", raw="y", deliveries=[("d1", "p2")], now=20.0)
-    first = await store.claim_next_fifo("d1", now=30.0, owner="node-A")
-    assert first is not None and first.payload == "p1"  # oldest head, owner ignored
-    await store.mark_done(first.id, now=31.0)
-    second = await store.claim_next_fifo("d1", now=32.0, owner="node-B")
-    assert second is not None and second.payload == "p2"  # next head, different owner — still FIFO
-
-
 async def test_reset_stale_inflight_recovers_after_crash(store: MessageStore) -> None:
     await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=100.0)
     await store.claim_ready(now=100.0)  # now inflight; simulate crash before delivery

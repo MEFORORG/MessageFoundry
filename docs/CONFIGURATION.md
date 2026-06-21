@@ -556,22 +556,25 @@ severity = "critical"
 transports = ["webhook"]
 ```
 
-### `[cluster]` — multi-node coordination (Track B)
+### `[cluster]` — active-passive HA coordination (Track B)
 **Server-DB-backed.** Introduces the multi-node coordination seam — a `nodes` table, a per-node
-heartbeat, (Track B Step 4) **leader election**, (Step 5) **per-lane FIFO ownership**, and (Step 6)
-**cross-node reference + config-reload convergence** — *without changing single-node behavior*. With
+heartbeat, (Track B Step 4) **leader election**, and (Step 6) **cross-node reference + config-reload
+convergence** — *without changing single-node behavior*. It runs as **active-passive** HA: one leader
+runs the whole graph, a standby takes over on failure. (The horizontal **active-active** scale-out path
+— per-lane ownership running the graph on every node — was **dropped (2026-06-18) and its code removed**;
+it is not a planned milestone.) With
 `enabled = false` (the default) the engine uses a no-op coordinator and runs **byte-identically** to
 before. Enabling it requires a **server-DB** store **and** `[store].pool_size >= 2` — a clustered node
 drives concurrent background work (the membership/lease-renewal maintenance loop + the per-stage workers)
 against the pool, so a pool of 1 would serialize everything (prefer `>= 3`). A cross-section validator
 refuses either violation at config load. Two backends qualify:
 
-- **`postgres`** — the full coordinator: leader election **plus** the active-active per-lane row leases
-  and the leader reclaim sweep (run in active-passive mode for v0.1; full active-active is 0.2).
-- **`sqlserver`** — **active-passive only**: the same self-fencing leadership lease (one leader drains
-  the graph; a standby takes over on failure), but **no per-lane row leases** — a single active node
-  (the leader) processes at a time, so the per-lane-ownership and `reclaim_expired_leases` machinery
-  below is Postgres-only and does not apply.
+- **`postgres`** — the full coordinator: leader election, the row leases, and the leader reclaim sweep,
+  run as active-passive HA (the leader runs the graph; a standby takes over on failure).
+- **`sqlserver`** — **active-passive too**: the same self-fencing leadership lease (one leader drains
+  the graph; a standby takes over on failure). A single active node (the leader) processes at a time, so
+  the `reclaim_expired_leases` background sweep below applies on Postgres; on-promotion recovery covers
+  both backends.
 
 SQLite remains single-node (cluster coordination is refused on it).
 
@@ -595,12 +598,11 @@ the next tick):
 **Poll-source intake is leader-gated (Track B Step 4b).** A **poll** source — `file` (a watched
 directory), `database` (a polled table), `remote-file` (an SFTP/FTP directory) — reads a **shared
 external resource**: if more than one node polled it, the same file/row would be ingested twice. So
-only the **leader** polls a poll source; a follower's poll loop keeps ticking but **skips** the
-scan/select (it neither reads nor moves files / marks rows), and resumes on the tick after it becomes
-leader (reactive-by-polling, no restart). **Listen** sources — `mllp`, `tcp` — are **not** gated: each
-node binds its own endpoint (distribute inbound connections with a load balancer or per-node ports),
-so they run on every node, as do all the **staged-queue workers** (router / transform / delivery),
-which share the queue via `FOR UPDATE SKIP LOCKED` + row leases. The brief overlap during a leadership
+only the **leader** polls a poll source. Under active-passive HA the whole graph — **listen** sources
+(`mllp`, `tcp`) and all the **staged-queue workers** (router / transform / delivery) alike — runs on the
+**leader only**; a standby binds no listeners and runs no workers (so poll-source gating is
+belt-and-suspenders, and the queue's `FOR UPDATE SKIP LOCKED` + row leases serve intra-node concurrency
+and failover recovery rather than concurrent multi-node draining). The brief overlap during a leadership
 transition (the old leader's last in-flight poll vs. the new leader's first) is bounded by the same
 at-least-once guarantees that cover a crash mid-poll — the file-rename / row-claim atomicity and the
 downstream queue's idempotent handoff make a re-read a tolerated duplicate, never data loss. The
@@ -617,27 +619,17 @@ crashes or is partitioned, the lease ages out and a follower acquires after at m
 leader, so every poll source always scans, runs the unconditional startup reset, and spawns no leader
 sweep).
 
-**Per-lane FIFO ownership preserves order across nodes (Track B Step 5).** The staged-queue workers
-(router / transform / delivery) run on **every** node, so without coordination two nodes draining the
-**same** FIFO lane would interleave it: node A's `FOR UPDATE SKIP LOCKED` locks the head (row 1) and
-node B's `SKIP LOCKED` skips the locked head and claims row 2 — so row 2 could deliver before row 1.
-To prevent that, a FIFO lane is **owned by exactly one node at a time** via a `lane_leases` table, and
-ownership is enforced **atomically at claim time**: each FIFO claim, in one transaction, first
-acquires-or-renews the lane lease (`INSERT ... ON CONFLICT ... WHERE owner = me OR lease expired`) and
-only then claims the head — so only the lane's owner ever claims its rows, head-of-line blocking is
-restored, and strict per-lane FIFO holds across nodes with a **zero reorder window** (the claim itself
-is the authority, not a cached gate). An idle lane's lease simply expires and the next node with work
-for it re-acquires it (one node at a time). **Crash mid-delivery stays ordered, too**: a node that dies
-holding the head leaves it `inflight` under an expired row lease, so the next node taking over the lane
-reclaims that lane's expired-lease inflight rows back to pending **in the same claim transaction, before
-the head select** — the stranded head is recovered and blocks the lane rather than being skipped, so a
-later row can never deliver ahead of it (the recovery does not wait on the leader's periodic sweep). The
-wall-clock lease shares the row-lease NTP assumption:
-keep `[store].lease_ttl_seconds` comfortably above clock skew + the claim cadence. **UNORDERED**
-lanes are intentionally **not** lane-owned — concurrent draining across nodes is fine there.
-**Single-node is byte-identical**: the no-op coordinator's lane owner is `None`, so the claim takes its
-unchanged no-owner path (no `lane_leases` touch). SQLite and SQL Server (single-node) accept and ignore
-the owner.
+**Per-lane FIFO survives failover.** Because the graph runs on the **leader only**, per-lane FIFO is
+naturally serialized by that single processor — there is no concurrent multi-node draining of a lane to
+reorder. Across a failover the order still has to be preserved for a lane whose head was in flight on the
+crashed/fenced prior leader: the ordinary FIFO claim (`claim_next_fifo`) reclaims that **stranded head**
+— this lane's expired-lease inflight row, back to pending **in the same transaction, before the head
+SELECT** — so the recovered head blocks the lane rather than being skipped, and a later row can never
+deliver ahead of it (the recovery does not wait on the leader's periodic sweep). This **replaced** the
+dropped active-active per-lane lease mechanism (the removed `lane_leases` table / per-lane ownership). The
+wall-clock row lease carries the NTP assumption: keep `[store].lease_ttl_seconds` comfortably above clock
+skew + the claim cadence. **Single-node is byte-identical** (the no-op coordinator is always leader);
+SQLite and SQL Server behave the same single-active-processor way.
 
 **Cross-node convergence is built (Track B Step 6).** Two shared-state concerns now converge across
 nodes automatically:
@@ -657,14 +649,14 @@ nodes automatically:
   the dead-letter-missing-destinations/handlers startup sweeps.
 
 > The coordination seam is **built**: leader election (self-fencing lease), leader-gated singletons +
-> poll-source intake, per-lane FIFO order across nodes, cross-node reference + config convergence,
-> transform-STATE cross-node read-through (Step 6b), and the read-only `/cluster` ops API (Step 7) — a
-> one-time startup `INFO` summarizes the operational assumptions. For **v0.1 this runs in active-passive
-> mode** (one leader drains the graph; a standby takes over on failure), on **Postgres or SQL Server**;
-> full active-active horizontal scale-out (many nodes processing concurrently behind the per-lane row
-> leases) is the 0.2 target. SQL Server is active-passive only (no per-row leases): failover recovers the
-> prior leader's in-flight rows on promotion, safe because the old leader self-fences before its lease
-> expires.
+> poll-source intake, failover-safe per-lane FIFO (the stranded-head reclaim above), cross-node reference
+> + config convergence, transform-STATE cross-node read-through (Step 6b), and the read-only `/cluster`
+> ops API (Step 7) — a one-time startup `INFO` summarizes the operational assumptions. This is the
+> supported **active-passive** HA model (one leader drains the graph; a standby takes over on failure),
+> on **Postgres or SQL Server**. The horizontal **active-active** scale-out path (many nodes processing
+> concurrently) was **dropped (2026-06-18) and its code removed** — it is not a planned milestone. On
+> both backends, failover recovers the prior leader's in-flight rows on promotion, safe because the old
+> leader self-fences before its lease expires.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|

@@ -228,6 +228,25 @@ messagefoundry serve --config config --env test --project-root C:\srv\mefor\my-c
   startup**. See [DEPLOYMENT.md](DEPLOYMENT.md).
 - For production, run the engine as a **Windows service via NSSM** — see [SERVICE.md](SERVICE.md).
 
+### Launching the admin console (no command line)
+
+Operators monitor and run an instance from the **PySide6 admin console** — a separate desktop app that
+talks to the engine over its localhost API. Install the console extra, then drop a Desktop / Start-Menu
+shortcut so it opens with a double-click, no terminal:
+
+```powershell
+pip install "messagefoundry[console]==0.1.0"     # PySide6 + keyring, into the same venv
+.\scripts\console\install-console-shortcut.ps1   # per-user icon (add -AllUsers, elevated, for machine-wide)
+```
+
+The shortcut launches `messagefoundry-console.exe` — a **windowed** launcher (no flashing console
+window) carrying the MessageFoundry badge. Double-click it: the console connects to the engine
+(`http://127.0.0.1:8765` by default — typically the boot-start [service](SERVICE.md)) and prompts for
+sign-in, so nothing else is needed for the local case. Point it at a different engine with
+`-Url https://engine.internal:8765` (off-loopback requires TLS), and remove the icons with
+`uninstall-console-shortcut.ps1`. (A shell still works too: `messagefoundry-console` or
+`python -m messagefoundry.console`.)
+
 ---
 
 ## 8. Multiple instances from one repo (Test, Production, POC…)

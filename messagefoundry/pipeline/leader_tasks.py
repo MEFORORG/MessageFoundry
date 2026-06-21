@@ -46,9 +46,7 @@ class ReclaimingStore(Protocol):
         self, now: float | None = ..., *, stage: str | None = ...
     ) -> int: ...
 
-    async def recover_inflight_on_promotion(
-        self, *, lane_owner: str | None, now: float | None = ...
-    ) -> int: ...
+    async def recover_inflight_on_promotion(self, *, now: float | None = ...) -> int: ...
 
 
 class LeaderMaintenanceRunner:
@@ -136,10 +134,10 @@ class LeaderMaintenanceRunner:
 
     async def recover_on_promotion(self, now: float | None = None) -> int:
         """One-shot on-promotion recovery (#293): IF this node is the leader, IMMEDIATELY re-pend the
-        prior leader's stranded in-flight rows (owner-scoped, lease-blind) AND take over its lane leases,
-        so failover delivery resumes promptly instead of waiting ~``[store].lease_ttl_seconds`` for the
-        periodic expired-lease sweep + lane-lease expiry. No-op on a follower (the gate short-circuits
-        before any write). Safe only in active-passive — see the store method's contract.
+        prior leader's stranded in-flight rows (owner-scoped, lease-blind), so failover delivery resumes
+        promptly instead of waiting ~``[store].lease_ttl_seconds`` for the periodic expired-lease sweep.
+        No-op on a follower (the gate short-circuits before any write). Safe only in active-passive —
+        see the store method's contract.
 
         Distinct from :meth:`sweep_once` (the recurring background sweep, which stays lease-gated and
         multi-node-safe): this runs ONCE on promotion and is lease-BLIND but owner-scoped, recovering the
@@ -147,9 +145,7 @@ class LeaderMaintenanceRunner:
         if not self._coordinator.is_leader():
             return 0
         now = self._clock() if now is None else now
-        recovered = await self._store.recover_inflight_on_promotion(
-            lane_owner=self._coordinator.lane_owner(), now=now
-        )
+        recovered = await self._store.recover_inflight_on_promotion(now=now)
         if recovered:
             log.info(
                 "cluster: on promotion recovered %d stranded in-flight row(s) from the prior leader",

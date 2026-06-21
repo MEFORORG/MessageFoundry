@@ -258,7 +258,7 @@ async def test_postgres_promotion_uses_recover_on_promotion_not_sweep(tmp_path: 
     eng = await Engine.create(tmp_path / "pg_ap.db", poll_interval=0.05, coordinator=coord)
     eng.add_registry(load_config(cfgdir))
 
-    promotion_calls: list[str | None] = []
+    promotion_calls: list[float | None] = []
     reset_calls: list[int] = []
 
     async def _reclaim(now: float | None = None, *, stage: str | None = None) -> int:
@@ -266,8 +266,8 @@ async def test_postgres_promotion_uses_recover_on_promotion_not_sweep(tmp_path: 
             0  # a no-op sweep, just so hasattr → _leader_maintenance is spawned (Postgres profile)
         )
 
-    async def _recover(*, lane_owner: str | None, now: float | None = None) -> int:
-        promotion_calls.append(lane_owner)
+    async def _recover(*, now: float | None = None) -> int:
+        promotion_calls.append(now)
         return 0
 
     orig_reset = eng.store.reset_stale_inflight
@@ -286,7 +286,7 @@ async def test_postgres_promotion_uses_recover_on_promotion_not_sweep(tmp_path: 
         coord.leader = True
         await eng._reconcile_graph()  # promotion
         assert eng._registry_runner is not None and eng._registry_runner.running is True
-        assert len(promotion_calls) == 1  # the owner-scoped on-promotion recovery ran exactly once
+        assert len(promotion_calls) == 1  # the on-promotion recovery ran exactly once
         assert reset_calls == []  # NOT the SQL Server reset_stale_inflight branch
     finally:
         await eng.stop()

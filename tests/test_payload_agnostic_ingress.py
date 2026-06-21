@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from defusedxml.common import DefusedXmlException
 
 from messagefoundry.config.models import ConnectorType, ContentType
 from messagefoundry.config.wiring import (
@@ -43,6 +44,43 @@ def test_rawmessage_accessors() -> None:
 def test_rawmessage_bad_json_raises() -> None:
     with pytest.raises(_json.JSONDecodeError):
         RawMessage("not json", "json").json()
+
+
+def test_rawmessage_xml_parses_well_formed() -> None:
+    el = RawMessage("<obs><mrn>100</mrn></obs>", "xml").xml()
+    assert el.tag == "obs"
+    assert el.findtext("mrn") == "100"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "<!DOCTYPE foo><foo/>",  # bare DOCTYPE — rejected outright, never parsed
+        (  # XXE external entity (file://) — must NOT resolve the URL
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE r [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
+            "<r>&xxe;</r>"
+        ),
+        (  # XXE external entity (http://) — must NOT fetch the network resource
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE r [<!ENTITY xxe SYSTEM "http://127.0.0.1:9/x">]>'
+            "<r>&xxe;</r>"
+        ),
+        (  # billion laughs — must NOT expand entities
+            "<!DOCTYPE lolz ["
+            '<!ENTITY lol "lol">'
+            '<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">'
+            '<!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">'
+            "]><lolz>&lol3;</lolz>"
+        ),
+    ],
+)
+def test_rawmessage_xml_rejects_dangerous_payloads(payload: str) -> None:
+    # forbid_dtd/forbid_entities/forbid_external are ON: every DTD-bearing attack RAISES at the
+    # DOCTYPE before any entity expansion or external fetch, so a Handler routes it to FILTERED/
+    # ERROR. DefusedXmlException subclasses ValueError — asserting it proves the *hardening* fired.
+    with pytest.raises(DefusedXmlException):
+        RawMessage(payload, "xml").xml()
 
 
 def test_message_content_type_symmetry() -> None:

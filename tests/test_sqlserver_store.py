@@ -75,6 +75,19 @@ async def test_enqueue_with_no_delivery_is_unrouted(store) -> None:
     assert await store.outbox_for(mid) == []
 
 
+async def test_binary_carriage_round_trips_nul_bearing(store) -> None:
+    # ADR 0028: base64 carriage carries NUL-bearing bytes through the NVARCHAR(MAX) body column, where
+    # the latin-1 round-trip it supersedes would be SILENTLY TRUNCATED at the first NUL.
+    from messagefoundry.parsing import RawMessage
+
+    data = bytes(range(256)) * 4
+    carried = RawMessage.from_bytes(data, "binary").raw
+    mid = await store.enqueue_ingress(channel_id="IB", raw=carried, message_type="binary")
+    msg = await store.get_message(mid)
+    assert msg is not None and "\x00" not in msg["raw"]
+    assert RawMessage(msg["raw"], "binary").raw_bytes == data
+
+
 async def test_record_received_filtered_and_error(store) -> None:
     f = await store.record_received(channel_id="IB", raw=RAW, status=MessageStatus.FILTERED)
     e = await store.record_received(

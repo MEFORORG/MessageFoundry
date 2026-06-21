@@ -141,7 +141,7 @@ re-deliveries are reported as a derived count (`sink_received − engine_written
 | 2 | setup error (bad profile, engine unreachable at preflight, sink bind failed, `--load`+`--scenario`) |
 | 3 | aborted mid-flight (interrupt) |
 
-## Comparing store backends (single-node ceiling vs scale-out)
+## Comparing store backends (single-node ceiling vs server-DB concurrency)
 
 The harness is **store-agnostic** — it speaks only MLLP + the HTTP API, so it drives whatever backend
 the engine was served with. Run the same profile against each backend (swap `--db`) and compare with
@@ -152,7 +152,7 @@ the engine was served with. Run the same profile against each backend (swap `--d
 python -m messagefoundry serve --config harness/config/load --db ./load.db --env dev
 python -m harness --load fanout-baseline --engine ... --db-backend sqlite --report-json out/load/sqlite.json
 
-# Postgres (Track B scale-out — full staged-pipeline parity)
+# Postgres (server-DB backend — full staged-pipeline parity)
 python -m messagefoundry serve --config harness/config/load --db "postgresql://..."
 python -m harness --load fanout-baseline --engine ... --db-backend postgres \
   --baseline out/load/sqlite.json --report-json out/load/postgres.json

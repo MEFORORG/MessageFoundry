@@ -39,7 +39,7 @@ DB shaves the constant, it doesn't change the curve.
 | Backend | What it's for | Throughput story |
 |---|---|---|
 | **SQLite (WAL)** | Single-node default | Fastest *per-write* (in-process, no network hop). The single-writer ceiling is the limit — and the lever is **group-commit**, not the engine. |
-| **PostgreSQL** | Track B scale-out (built) | Usually *slower* per write (network + MVCC). Wins by `SKIP LOCKED` letting **N nodes/processes** drain one shared store concurrently — throughput scales with workers, not DB speed. |
+| **PostgreSQL** | Server-DB backend (built) | Usually *slower* per write (network + MVCC). The win is concurrency: `SKIP LOCKED` + row leases let many connections / lanes / delivery workers drain the shared store in parallel within one engine, so throughput scales with workers, not DB speed. (Engine HA is single-leader active-passive — the graph runs on the leader only; horizontal active-active multi-node draining was dropped and its code removed.) |
 | **SQL Server** | Epic-shop requirement (promotion in progress) | Same class as Postgres — chosen for the customer ops stack, not for raw speed. |
 
 ### What about InterSystems Caché / IRIS?
@@ -87,7 +87,7 @@ latency isolation, not throughput.
 
 | Approach | Fit | Verdict |
 |---|---|---|
-| **Multiple engine processes, sharded by inbound** | Each process = own loop + own core, all draining the shared store via `claim_next_fifo` / `SKIP LOCKED`; lane-owner gating (`coordinator.lane_owner()`) already preserves FIFO-per-lane across workers. The Track-B scale-out infra **already supports this** on Postgres/SQL Server. | **Best.** Lowest new risk; reuses built machinery. The scale-out model applied on one box. |
+| **Multiple engine processes, sharded by inbound** | Each process = own loop + own core, with **disjoint inbound ownership** (each process owns a distinct set of inbounds, so no two processes drain the same lane) against the shared server-DB store via `claim_next_fifo` / `SKIP LOCKED`. *(Note: this is a future direction, not built machinery — the per-lane lane-owner gating that would have made concurrent same-lane multi-node draining safe was part of the dropped active-active feature and its code was removed; engine HA today is single-leader active-passive, the graph runs on the leader only.)* | **Promising**, but needs a design: shard inbounds across processes without relying on the removed lane-ownership infra. |
 | **`ProcessPoolExecutor` for heavy transforms** | Transforms are *required to be pure* (re-run-safe for at-least-once) → embarrassingly parallel → ideal pool candidates. | Workable, but per-message serialization cost + `db_lookup` (which bridges back to the loop) complicate it. Use only for genuinely heavy transforms. |
 | **Free-threaded Python 3.13+ (no-GIL, PEP 703)** | Would make the existing `to_thread` / thread-pool path *actually* parallel with minimal code change. | Promising; **dependency-compat risk** (hl7apy, python-hl7, pydantic, PySide6). Track it, don't bet a release on it. |
 
@@ -134,8 +134,9 @@ peek. High payoff, but only after confirming parsing is the bottleneck.
    binding axis per representative feed.
 2. **Lazy MSH-only peek** (§3b) — cheap code change, immediate per-message win.
 3. **Group-commit** (§2) — the single-node durable-write win; stays on existing backends.
-4. **Multi-process sharding by inbound** (§3a) — the real core-axis ceiling-breaker; reuses the
-   Track-B lane-owner / `SKIP LOCKED` machinery.
+4. **Multi-process sharding by inbound** (§3a) — the real core-axis ceiling-breaker; a future direction
+   (disjoint inbound ownership over the shared store's `SKIP LOCKED`), now that the active-active
+   lane-owner machinery has been removed — needs its own design.
 5. Author-side transform discipline (§3c) as standing guidance.
 6. Park PyPy/Cython (§3d) and free-threaded Python (§3a) as "if parse-bound" / "when the ecosystem
    catches up."

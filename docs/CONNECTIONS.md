@@ -40,8 +40,10 @@ Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sa
 | `REST-OUT` | outbound | HTTP client | HTTP Sender | ✅ |
 | `DB-IN` | inbound | DB poll | Database Reader | ✅ (SQL Server, exp.) |
 | `DB-OUT` | outbound | DB write | Database Writer | ✅ |
-| `FHIR-IN` / `FHIR-OUT` | in/out | FHIR endpoint/client | (FHIR connector) | ⏳ planned |
-| `DICOM-IN` / `DICOM-OUT` | in/out | DICOM listener/sender | DICOM Listener/Sender | ⏳ planned |
+| `FHIR-IN` | inbound | FHIR REST endpoint (server facade) | (FHIR Listener) | ⏳ planned (ADR 0023) |
+| `FHIR-OUT` | outbound | FHIR REST client | (FHIR Sender) | ✅ |
+| `DICOM-IN` | inbound | DICOM C-STORE SCP listener | DICOM Listener | ✅ (ADR 0025 Phase 1) |
+| `DICOM-OUT` | outbound | DICOM C-STORE SCU / C-ECHO / DICOMweb STOW-RS | DICOM Sender | ⏳ planned (ADR 0025 Phase 2) |
 | `JMS-IN` / `JMS-OUT` | in/out | JMS queue consumer/producer | JMS Listener/Sender | ⏳ planned |
 | `MAIL-IN` | inbound | POP3/IMAP mailbox poll | Email Reader | ⏳ planned |
 | `SMTP-OUT` | outbound | SMTP email send | SMTP Sender | ⏳ planned |
@@ -653,6 +655,215 @@ outbound(
 # The Handler returns ONLY the <Body> fragment, e.g. "<submitSingleMessage>…HL7…</submitSingleMessage>".
 ```
 
+### FHIR — `FHIR(...)`
+
+An **outbound** FHIR REST client ([ADR 0022](adr/0022-fhir-resource-codec-rest-client.md)) that delivers a
+FHIR resource (or transaction/batch `Bundle`) to a FHIR server. It **reuses the REST connector's HTTP
+client exactly as SOAP does** (same no-redirect, `http`/`https`-only opener and the `[egress].allowed_http`
+host gate) — it is **not** a wrapper around `Rest(...)`. The Handler produces a **FHIR-JSON** body; this
+sets the `application/fhir+json` media type (Content-Type + Accept) and POSTs/PUTs it per the configured
+interaction. The pure `messagefoundry.parsing.fhir` codec — `FhirPeek` to route (cheap, no `[fhir]` extra),
+`FhirResource` to validate/transform (the `[fhir]` extra) — is called **on demand in Routers/Handlers**,
+never pushed through the pipeline. There is **no FHIR source yet** (the inbound FHIR server facade is gated
+on a future ADR 0023); `content_type="fhir"` routes a FHIR body received over any source (File, a `Loopback`
+re-ingress) as a `RawMessage`.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `url` | — (required) | the FHIR service **base** URL (e.g. `https://host/fhir`); `http`/`https` only. Use `env()`. |
+| `fhir_version` | `R4B` | `R4B` (default) / `R5` / `STU3` — explicit (no plain-R4 on pydantic-v2 wheels) |
+| `format` | `json` | `json` only; FHIR-XML is deferred to a hardened-`lxml` path |
+| `interaction` | `create` | `create` (`POST {base}/{ResourceType}`) / `update` (`PUT {base}/{ResourceType}/{id}`) / `transaction` / `batch` (`POST {base}` with a `Bundle`) |
+| `conditional` | — | opt-in: `if-none-exist` (conditional create) / `conditional-update` (search-based PUT) / `if-match` (version-aware PUT) |
+| `conditional_query` | — | FHIR search params for `if-none-exist` / `conditional-update` (e.g. `identifier=sys\|val`) |
+| `headers` | `{}` | extra **static** headers (no secrets — not `env()`-resolved) |
+| `bearer_token` | — | `Authorization: Bearer …` (SMART/OAuth — a **secret**, via `env()`) |
+| `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
+| `timeout_seconds` | `30` | per-request timeout |
+| `verify_tls` | `true` | TLS cert verification; `false` (dev only) needs `MEFOR_ALLOW_INSECURE_TLS` |
+| `encoding` | `utf-8` | body charset |
+| `capture_response` | `false` | capture the server reply (assigned resource / `OperationOutcome`) as a response artifact (ADR 0013) |
+| `reingress_to` | — | route the captured reply into this `Loopback` inbound (implies capture) |
+
+**Interactions.** The `interaction` plus the `ResourceType`/`id` (read from the outgoing body with the cheap
+`FhirPeek`, no typed parse) derive the method + path off the base `url`. A `transaction`/`batch` POSTs the
+`Bundle` to the base — the FHIR **server** applies it (transaction = all-or-nothing, batch = independent per
+entry); the engine never orchestrates cross-entry atomicity.
+
+**Conditional knobs (idempotency / concurrency).** FHIR's native answer to the at-least-once duplicate
+problem — opt-in, off by default: `if-none-exist` (create only if no match; the search rides the
+`If-None-Exist` **header**), `conditional-update` (the server resolves which resource to update; the search
+is in the **URL** query), and `if-match` (optimistic lock on a known id via an `If-Match` ETag derived from
+the resource's `meta.versionId`).
+
+**OperationOutcome & delivery semantics.** A 2xx is **delivered** (a returned `OperationOutcome` is captured,
+never an error). On an error status the HTTP code decides, refined by the `OperationOutcome`: 5xx → retry; a
+4xx whose `issue.code` is in the FHIR **transient** IssueType group (`lock-error`/`throttled`/`timeout`/
+`incomplete`), or `408`/`429` → retry; any other 4xx / refused 3xx → **dead-letter**. The HTTP status wins
+when in doubt (a 5xx stays transient). `OperationOutcome`/reply bodies are **not** echoed into errors/logs
+(they may carry PHI) — only the HTTP status + a redacted URL.
+
+**Security & idempotency.** Same hardening as REST (redirects refused, scheme constrained, host gated by
+`[egress].allowed_http`, cleartext-credential refusal, optional detached-JWS signing, secrets via `env()`).
+Delivery is **at-least-once**, so a retry **re-sends** — the FHIR server operation **must be idempotent**
+(the conditional knobs are the native lever). HL7 v2 ↔ FHIR mapping stays in **code-first Handlers**.
+
+```python
+from messagefoundry import FHIR, ContentType, File, Send, env, handler, inbound, outbound, router
+from messagefoundry.parsing.fhir import FhirPeek, FhirResource
+
+inbound("FHIR-IN_INTAKE", File(directory="./in/fhir", pattern="*.json"),
+        router="fhir_router", content_type=ContentType.FHIR)        # FHIR body routes as a RawMessage
+outbound("FHIR-OUT_SERVER", FHIR(url=env("fhir_base_url"), interaction="create"))
+
+
+@router("fhir_router")
+def route(msg):
+    # cheap routing peek — no [fhir] extra needed
+    return ["fhir_handler"] if FhirPeek.parse(msg.raw).resource_type == "Patient" else []
+
+
+@handler("fhir_handler")
+def handle(msg):
+    # validate (R4B) then deliver the canonical JSON; a non-conformant resource dead-letters
+    return Send("FHIR-OUT_SERVER", FhirResource.parse(msg.raw, version="R4B").encode())
+```
+
+See `samples/config/IB_FHIR_INTAKE.py` for a runnable route. The typed codec needs the `[fhir]` extra
+(`pip install 'messagefoundry[fhir]'`); the `FhirPeek` routing tier does not.
+
+### SMART Backend Services auth — `with_smart_backend(...)` (FHIR/REST client OAuth2, ADR 0024)
+
+A real **SMART-secured** FHIR server (Epic, Oracle Health) does **not** accept a long-lived static
+`bearer_token`: it requires **SMART Backend Services** authorization — OAuth2 `client_credentials` with an
+**asymmetric, signed `client_assertion` JWT** (`RS384`/`ES384`), which it exchanges for a **short-lived**
+bearer (~5 min, no refresh token). Compose `with_smart_backend(...)` over a `FHIR(...)` or `Rest(...)`
+spec ([ADR 0024](adr/0024-smart-backend-services-token-provider.md)) and the connector mints the
+assertion, exchanges it at the **token endpoint**, caches the bearer with expiry-awareness, and injects it
+**per request** (re-minting on a `401`). No new dependency — the JWT is signed by the ADR 0018 core-
+`cryptography` signer. The minted bearer **overrides** any static `bearer_token` on the spec.
+
+| `with_smart_backend(...)` arg | Default | Notes |
+|---|---|---|
+| `token_url` | — (required) | the authorization server's token endpoint (`https`; `env()`). **Also gated by `[egress].allowed_http`** — it is a second egress host. |
+| `client_id` | — (required) | the registered client id (`iss`/`sub` of the assertion; `env()`) |
+| `private_key` | — (required) | the assertion signing key as inline PEM (via `env()`) or a PEM file path |
+| `algorithm` | `RS384` | `RS384` (RSA) or `ES384` (ECDSA P-384) — the two SMART **SHALL**-support algorithms |
+| `scope` | `None` | the requested scopes, e.g. `system/*.rs` (SMART v2 system scopes — no human) |
+| `key_id` | `None` | the JWT `kid` → the public key registered with the server (for rotation) |
+| `audience` | = `token_url` | the assertion `aud`, if the server documents a different audience |
+| `private_key_password` | `None` | passphrase for an encrypted key (secret — use `env()`) |
+| `expiry_skew_seconds` | `60` | re-mint this many seconds before the server's stated expiry |
+
+```python
+from messagefoundry import FHIR, env, outbound
+from messagefoundry.transports.smart import with_smart_backend
+
+# Push FHIR to a SMART-secured server (Epic / Oracle Health).
+outbound("FHIR-OUT_EPIC", with_smart_backend(
+    FHIR(url=env("epic_fhir_base"), interaction="create"),
+    token_url=env("epic_token_url"),     # add this host to [egress].allowed_http too
+    client_id=env("epic_client_id"),
+    scope="system/*.rs",
+    private_key=env("epic_smart_key"),   # inline PEM via env(), or a PEM file path
+    algorithm="RS384",
+    key_id="epic-2026",
+))
+```
+
+Put **every** secret in `env()` (`token_url`/`client_id`/`private_key`/`private_key_password`); the minted
+access token and `client_assertion` are runtime-only — never logged or persisted. (The signing key comes
+from `MEFOR_VALUE_*`, so a SMART outbound isn't shipped as a loaded `samples/config` route — adapt the
+snippet above into your own config dir.) **Out of scope (ADR 0024):** SMART **App Launch** (the human-user
+browser flow), the SMART **authorization/resource server** facade (the system-of-record's role; gated on
+ADR 0023), JWKS hosting, `.well-known` discovery, and Bulk Data `$export`.
+
+### DICOM — `DICOM(...)` (inbound C-STORE SCP, ADR 0025 Phase 1)
+
+An **inbound** DICOM connector (`ConnectorType.DIMSE`) — a **C-STORE SCP** listener that accepts stored
+DICOM objects over DIMSE/`pynetdicom` ([ADR 0025](adr/0025-dicom-codec-store-connectors.md) Phase 1). It
+carries the object **opaquely** — pair an inbound `DICOM(...)` with `content_type="dicom"` so each received
+object routes as a `RawMessage` ([ADR 0004](adr/0004-payload-agnostic-ingress.md)); a Router/Handler parses
+it on demand via `messagefoundry.parsing.dicom` (a cheap `DicomPeek` for routing, `DicomDataset` +
+SR→HL7 helpers for transform). The codec is **headers and Structured Report only — no pixel data**. The
+connector needs the **`[dicom]` optional extra** (`pip install 'messagefoundry[dicom]'`:
+`pydicom>=3.0.2,<4` + `pynetdicom>=3.0.4,<4`, pure-Python, no numpy), lazily imported. There is **no DICOM
+*outbound* yet** — the C-STORE SCU, C-ECHO, and DICOMweb STOW-RS are **Phase 2** (designed, not built).
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `ae_title` | — (required) | this engine's Application Entity title — the SCP AE a peer C-STOREs to |
+| `port` | `104` | bind port (104 is the registered DICOM port; use e.g. `11112` for a non-privileged dev bind) |
+| `presentation_contexts` | `None` → SR + common image storage + Verification | the SOP classes the SCP negotiates (transfer syntaxes default to the standard set) |
+| `calling_ae_allowlist` | `None` → any (subject to the IP gate) | only these calling AE titles may associate (fail-closed when set) |
+| `require_called_ae_title` | `True` | a peer must address this engine's `ae_title` as the called AE |
+| `max_object_bytes` | `134217728` (128 MiB) | reject a single C-STORE object larger than this **before** the durable commit (OOM/DoS guard) |
+| `max_associations` | `10` | cap on concurrent inbound associations (connection-flood guard) |
+| `max_pdu_size` | `16384` | cap one PDU's bytes (`0` = unbounded); DoS guard |
+| `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
+| `tls` | `false` | wrap the association in **DICOM-over-TLS** (required for a non-loopback bind — see below) |
+| `tls_cert_file` / `tls_key_file` | — | the SCP's server-identity cert + private key (required when `tls=true`) |
+| `tls_ca_file` | — | opt-in **mTLS**: require + verify a calling peer's client certificate |
+
+The **bind interface** is the service-level `[inbound].bind_host` and the **peer-IP gate** is `[inbound].source_ip_allowlist` (the same inbound settings MLLP/TCP use) — not `DICOM()` arguments. A non-loopback cleartext SCP is **refused at startup** unless `tls=true` or `serve --allow-insecure-bind` (the generalized bind-guard). (`host` / `called_ae_title` / `connect_timeout` on `DICOM()` are for the **Phase-2 outbound SCU** and are unused by the inbound SCP.)
+
+```python
+from messagefoundry import DICOM, ContentType, Message, Send, handler, inbound, router
+from messagefoundry.parsing.dicom import DicomDataset, DicomPeek, hl7_map
+
+# Receive stored DICOM objects (C-STORE SCP); each is base64-carried (ADR 0028) and routed as a RawMessage.
+inbound("IB_RADIOLOGY_SR",
+        DICOM(ae_title="MEFOR_SR_SCP", port=11112, calling_ae_allowlist=["RAD_MODALITY"]),
+        router="sr_router", content_type=ContentType.DICOM)
+
+
+@router("sr_router")
+def route(msg):
+    if not msg.is_binary:            # a non-carried body → UNROUTED (counted + logged)
+        return []
+    peek = DicomPeek.parse(msg)      # cheap shallow tag read (recovers the bytes via .raw_bytes)
+    return ["sr_to_oru"] if peek.is_structured_report() else []
+
+
+@handler("sr_to_oru")
+def handle(msg):
+    ds = DicomDataset.parse(msg)     # headers + SR ContentSequence only — no pixel data
+    measurements = ds.measurements()
+    if not measurements:
+        return None                  # nothing to deliver → FILTERED (counted + logged)
+    oru = Message.parse(
+        "MSH|^~\\&|MEFOR|RADIOLOGY|POWERSCRIBE|FACILITY|"
+        f"{ds.study_date or ''}||ORU^R01|{ds.sop_instance_uid or 'UNKNOWN'}|P|2.5.1"
+    )
+    oru.add_segment(hl7_map.pid_from_dataset(ds))   # SR→HL7: code-first, HL7-escaped, CR/LF-guarded
+    oru.add_segment(hl7_map.obr_from_dataset(ds))
+    for set_id, m in enumerate(measurements, start=1):
+        oru.add_segment(hl7_map.obx_from_measurement(set_id, m))
+    return Send("OB_POWERSCRIBE", oru.encode())
+```
+
+The full worked route (with the outbound MLLP + `env()` wiring) ships at
+[`samples/config/IB_RADIOLOGY_SR.py`](../samples/config/IB_RADIOLOGY_SR.py).
+
+- **No DICOM ACK to mint.** The connector returns the DIMSE **C-STORE response status** (SUCCESS) to the
+  peer; an HL7-style ACK does not apply.
+- **Off-loop + commit-before-SUCCESS.** `pynetdicom`'s blocking handlers run **off the asyncio event
+  loop**; the received object is bridged onto the loop (`run_coroutine_threadsafe`) and **durably committed
+  to the ingress stage before the C-STORE SUCCESS status is returned** — so a SUCCESS means the object is
+  persisted, never accepted-and-dropped. A peer that times out and re-sends is idempotent against this.
+- **SR → HL7 mapping is a code-first Handler.** `parsing/dicom` supplies `DicomPeek` (tolerant routing
+  peek: SOPClassUID, Modality, study/series/instance UIDs, AE titles), `DicomDataset` (headers + an SR
+  ContentSequence walk → measurements), and `hl7_map` (SR→HL7 `OBX`/`PID`/`OBR` builders, HL7-escaped and
+  CR/LF-guarded) — never pushed through the pipeline; a Handler calls them on demand against the
+  `RawMessage`.
+- **Security.** A calling-AE + peer-IP allowlist (fail-closed when set), a `max_object_bytes` per-object
+  cap and association/DoS caps, a generalized non-loopback **bind-guard** (a non-loopback listener is a
+  deliberate operator decision, as with MLLP/TCP), and **DICOM-over-TLS**. The codec reads **headers/SR
+  only** — no pixel-data surface.
+- **Deferred follow-ups (Phase 2, designed-not-built):** the **C-STORE SCU** + **C-ECHO** outbound and a
+  **DICOMweb STOW-RS** client. **MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling are
+  out of scope.**
+
 ### Loopback — `Loopback()` + `reingress_to=` (request → response → route, ADR 0013)
 
 A **request/response** feed sends a query to a partner and **routes the partner's answer**. The capturing
@@ -736,8 +947,8 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **JMS** (Java messaging) | ✅ | ❌ | ✅ | ❌ | `JMS-IN/OUT` planned |
 | **IBM MQ / MSMQ** | ~ | ❌ | ✅ | ❌ | not on roadmap |
 | **Kafka / streaming** | ~ | ❌ | ✅ | ❌ | not on roadmap |
-| **DICOM** (imaging) | ✅ | ~ | ✅ | ❌ | `DICOM-IN/OUT` planned |
-| **Serial (RS‑232)** + X/Y‑Modem/Kermit | ~ | ❌ | ✅ | ❌ | not on roadmap (legacy/niche) |
+| **DICOM** (imaging) | ✅ | ~ | ✅ | ~ | `DICOM-IN` C-STORE SCP shipped (ADR 0025 Phase 1); `DICOM-OUT` SCU/C-ECHO/STOW-RS planned (Phase 2) |
+| **Serial (RS‑232)** + X/Y‑Modem/Kermit + **ASTM E1381/E1394/E1318** | ~ | ❌ | ✅ | ❌ | **declined-by-design (v0.2+)** — legacy/niche lab-instrument connectivity, no feed demand ([BACKLOG.md](BACKLOG.md) #27) |
 | **FHIR** endpoint/client | ✅ | ✅ | ✅ | ❌ | `FHIR-IN/OUT` planned |
 | **Internal channel‑to‑channel** | ✅ | ✅ | ✅ | ✅ | the routing graph (wired by name) — not a transport |
 | Printer / command‑line / screen‑scrape | ~ | ❌ | ✅ | ❌ | not on roadmap (niche) |
@@ -747,7 +958,9 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 - **Tier 1 — table stakes (all three have these):** raw TCP, HTTP/REST, SOAP, Database, SFTP, plus
   File remote schemes (FTP/FTPS/SMB/S3). `SFTP-*`/`SOAP-*`/`REST-*`/`DB-*` are already designed; raw
   TCP closes the MLLP‑only gap. **FHIR** belongs here too — all three now ship it.
-- **Tier 2 — present in 2 of 3:** DICOM and JMS (Mirth + Rhapsody), Email (SMTP send + POP3/IMAP read).
+- **Tier 2 — present in 2 of 3:** DICOM (the `DICOM-IN` C-STORE SCP is shipped, ADR 0025 Phase 1; the
+  `DICOM-OUT` SCU/STOW-RS is the remaining Phase 2 gap) and JMS (Mirth + Rhapsody), Email (SMTP send +
+  POP3/IMAP read).
 - **Tier 3 — Rhapsody‑only, lower priority:** Kafka/streaming (worth adding for modern credibility),
   IBM MQ/MSMQ, Serial, printer/command‑line.
 
@@ -767,9 +980,11 @@ Formats are **orthogonal to transports**: any format can ride any connector (an 
 C‑CDA over a file, a FHIR bundle over HTTP). This section is the **format/standard** parity story; the
 catalog above is the **transport** one.
 
-**Where MF stands today:** **HL7 v2.x only.** [`parsing/`](../messagefoundry/parsing/) is python‑hl7
-(tolerant peek, hot path) + hl7apy (opt‑in strict) — there is no XML, FHIR, X12, NCPDP, or DICOM model
-anywhere in the engine. The competitors are format‑agnostic and cover the full clinical catalog.
+**Where MF stands today:** HL7 v2.x is the default, with **X12 EDI**, **FHIR**, and (Phase 1) **DICOM**
+modeled lanes now shipped. [`parsing/`](../messagefoundry/parsing/) is python‑hl7 (tolerant peek, hot
+path) + hl7apy (opt‑in strict) for v2, plus pure codecs for X12 (`parsing/x12`), FHIR (`parsing/fhir`),
+and DICOM headers/SR (`parsing/dicom`); there is still no C‑CDA, NCPDP, or HL7 v3 model in the engine.
+The competitors are format‑agnostic and cover the full clinical catalog.
 
 A useful split, because it sets the cost:
 
@@ -793,7 +1008,7 @@ Legend: ✅ native · ~ partial / via generic XML/JSON · ❌ none.
 | **C‑CDA / CDA / CCD** (HL7 v3 XML doc) | ✅ | ✅ | ✅ | ❌ | modeled lane — **Tier 1** |
 | **X12 / EDI** (270/271, 834, 835, 837…) | ✅ | ✅ | ✅ | ❌ | modeled lane — **Tier 2** |
 | **NCPDP** (SCRIPT, Telecom) | ✅ | ~ | ✅ | ❌ | modeled lane — **Tier 2** |
-| **DICOM** object / SR | ✅ | ~ | ✅ | ❌ | modeled lane — **Tier 3** (pairs w/ `DICOM-*` transport) |
+| **DICOM** object / SR | ✅ | ~ | ✅ | ~ | headers/SR codec shipped (`parsing/dicom`, ADR 0025 Phase 1, pairs w/ `DICOM-IN`); no pixel data |
 | **HL7 v3 messaging** (non‑CDA XML) | ✅ | ✅ | ~ | ❌ | modeled lane — **Tier 3** (low demand) |
 | **IHE profiles** (XDS/PIX/PDQ) | ~ | ~ | ✅ | ❌ | transport+format combo — later |
 
@@ -805,8 +1020,9 @@ Legend: ✅ native · ~ partial / via generic XML/JSON · ❌ none.
   bytes — the lane adds *understanding* it). See the CCD phasing note below.
 - **Tier 2 — X12/EDI and NCPDP.** Eligibility/claims (X12) and pharmacy (NCPDP); needed for payer and
   e‑prescribing integrations, lower frequency than FHIR/CDA in a pure clinical shop.
-- **Tier 3 — DICOM object/SR and HL7 v3 messaging.** DICOM pairs with the imaging transport; v3
-  messaging (as distinct from CDA) sees little real‑world demand.
+- **Tier 3 — DICOM object/SR and HL7 v3 messaging.** DICOM (headers/SR, no pixel data) is **shipped
+  (ADR 0025 Phase 1)** and pairs with the `DICOM-IN` C-STORE SCP transport; v3 messaging (as distinct
+  from CDA) sees little real‑world demand.
 
 **C‑CDA phasing (representative of how a modeled lane lands):**
 1. *Pass‑through (today):* route/store a CCD as opaque bytes — as a file, or base64 in v2 `OBX-5`.
@@ -814,8 +1030,9 @@ Legend: ✅ native · ~ partial / via generic XML/JSON · ❌ none.
    extract — enough to route on and validate.
 3. *Transform:* v2 ↔ C‑CDA helpers (the high‑value, high‑effort part).
 
-**Dependency note.** A modeled lane means a new parser/validator dependency (candidates to *evaluate*,
-not yet chosen: `lxml` for XML/CDA, a FHIR resource library, an X12/EDI parser, `pydicom`/`pynetdicom`
-for DICOM). Per the project guardrails, each must be **verified as real and reputable, added to
-`pyproject.toml`, and re‑locked** before use — no ad‑hoc installs. Each modeled lane is a substantial
-architectural addition, so it follows the **plan‑first** rule (a written plan before code).
+**Dependency note.** A modeled lane means a new parser/validator dependency. The DICOM lane ships under
+the `[dicom]` optional extra — `pydicom>=3.0.2,<4` + `pynetdicom>=3.0.4,<4` (pure‑Python, no numpy). Still
+to be *evaluated*, not yet chosen for the unbuilt lanes: `lxml` for XML/CDA and an NCPDP parser. Per the
+project guardrails, each must be **verified as real and reputable, added to `pyproject.toml`, and
+re‑locked** before use — no ad‑hoc installs. Each modeled lane is a substantial architectural addition,
+so it follows the **plan‑first** rule (a written plan before code).

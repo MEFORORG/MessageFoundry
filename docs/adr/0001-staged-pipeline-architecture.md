@@ -146,6 +146,10 @@ into separate stages **only if a workload needs independent router-vs-transform 
 **SQL Server backend is the scale path**, but it is **gated on BACKLOG #1** (its concurrency bugs must
 be fixed first) — staging would compound them.
 
+> **Update (2026-06-20):** the SQL Server **and** Postgres staged backends have since shipped — each sets
+> ``supports_ingest_stage = True`` and runs the full `ingress → routed → outbound` pipeline (see
+> [FEATURE-MAP §5](../FEATURE-MAP.md)). This paragraph is retained as the original decision record.
+
 ### 6. Incremental build order — one boundary first
 
 Do **not** restructure all at once. Prove the durable-queue + transactional-handoff pattern at a single

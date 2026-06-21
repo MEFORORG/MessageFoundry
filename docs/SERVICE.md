@@ -228,6 +228,21 @@ icacls "C:\ProgramData\MessageFoundry\logs" /inheritance:r `
   /grant "Administrators:(OI)(CI)F" "NT SERVICE\MessageFoundry:(OI)(CI)M"
 ```
 
+## Admin console (optional desktop shortcut)
+
+This service is **headless**. Operators watch and run it from the **PySide6 admin console** — a
+separate desktop app (not part of the service) that connects over the localhost API. Give them a
+double-click icon instead of a command line:
+
+```powershell
+pip install "messagefoundry[console]"            # into the engine venv
+.\scripts\console\install-console-shortcut.ps1   # Desktop + Start-Menu icon (per-user; -AllUsers for machine-wide)
+```
+
+It launches the windowed `messagefoundry-console.exe`, connects to this service on
+`http://127.0.0.1:8765`, and prompts for sign-in. See
+[INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console".
+
 ## Uninstall
 
 ```powershell

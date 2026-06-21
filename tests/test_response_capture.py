@@ -417,19 +417,27 @@ def test_wiring_rejects_invalid_capture(spec: ConnectionSpec) -> None:
 # --- runner-start fail-closed capture-support gate ---------------------------
 
 
-async def test_runner_start_rejects_capture_on_unsupporting_backend(
+async def test_runner_start_isolates_capture_on_unsupporting_backend(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Simulate a backend that can't persist captures (the SQL Server preview): the runner must refuse a
-    # capturing outbound at start (fail-closed) rather than silently dropping replies.
+    # Simulate a backend that can't persist captures (the SQL Server preview). The runner must not
+    # deliver via a capturing outbound it can't capture for (ADR 0013 fail-closed lane), but per
+    # ADR 0031 it ISOLATES that one lane instead of crashing the engine: start() succeeds, the lane is
+    # reported failed (so rows routed to it retry, never silently dropped), and the engine runs.
     monkeypatch.setattr(store, "supports_response_capture", False, raising=False)
     reg = Registry()
     reg.add_outbound(
         build_outbound_connection("OB_Q", MLLP(host="h", port=1, capture_response=True))
     )
     runner = RegistryRunner(reg, store)
-    with pytest.raises(RuntimeError, match="capture"):
-        await runner.start()  # start() unwinds its own partial start before re-raising
+    try:
+        await runner.start()  # does NOT raise — the capturing lane is isolated, not fatal
+        assert runner.running
+        reason = runner.connection_failed("OB_Q")
+        assert reason and "capture" in reason
+        assert "OB_Q" not in runner._destinations  # no live connector → routed rows retry, not drop
+    finally:
+        await runner.stop()
 
 
 # --- API read surface: RBAC body-gating + audit ------------------------------

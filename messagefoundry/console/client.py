@@ -41,6 +41,7 @@ from messagefoundry.api.auth_models import (
     UserSummary,
 )
 from messagefoundry.api.models import (
+    AlertsConfig,
     ChannelInfo,
     ClusterNodeList,
     ClusterStatus,
@@ -395,6 +396,11 @@ class EngineClient:
 
     def stats(self) -> StatsResponse:
         return _decode(self._get("/stats"), StatsResponse)
+
+    def alerts_rules(self) -> AlertsConfig:
+        """Read-only view of the loaded ``[alerts]`` transports + rule set (ADR 0014, BACKLOG #22b).
+        No secrets/recipients are returned. Gated by ``monitoring:read`` like :meth:`stats`."""
+        return _decode(self._get("/alerts/rules"), AlertsConfig)
 
     def status(self) -> SystemStatus:
         return _decode(self._get("/status"), SystemStatus)
