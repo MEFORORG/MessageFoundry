@@ -40,7 +40,7 @@ Python/asyncio service; the console is a separate desktop application.
 
 | Component | Requirement |
 |---|---|
-| **Python** | **3.11 or later**, 64-bit (3.11, 3.12, 3.13 supported; 3.11 and 3.13 are CI-validated) |
+| **Python** | **3.11 or later**, 64-bit (3.11–3.14 supported; 3.11, 3.13 and 3.14 are CI-validated — 3.13 and 3.14 on Windows Server 2022 + 2025, the primary deploy target) |
 | Service manager (Windows) | **NSSM** (auto-provisioned, SHA-256-pinned, by the installer; or pre-staged). Requires administrator / elevation to register the service. |
 | C compiler | Not required for the default install (runtime dependencies ship as wheels) |
 
@@ -49,8 +49,8 @@ Python/asyncio service; the console is a separate desktop application.
 | Database | Status | Driver / prerequisite |
 |---|---|---|
 | **SQLite (WAL)** | ✅ Default, bundled — single-node | None (`aiosqlite`, in-process) |
-| **PostgreSQL 13+** | ✅ Production | `messagefoundry[postgres]` extra (`asyncpg`, pure-Python — no OS dependency) |
-| **Microsoft SQL Server 2019 / 2022** | ✅ Production | `messagefoundry[sqlserver]` extra (`aioodbc`) **plus the OS-level Microsoft ODBC Driver 18 for SQL Server**. Read-Committed Snapshot Isolation (RCSI) recommended. |
+| **PostgreSQL 13+** | ✅ Production | `messagefoundry[postgres]` extra (`asyncpg` — no OS dependency; ships compiled wheels) |
+| **Microsoft SQL Server 2022 / 2025** | ✅ Production | `messagefoundry[sqlserver]` extra (`aioodbc`) **plus the OS-level Microsoft ODBC Driver 18 for SQL Server** (18.5+ covers both majors). Read-Committed Snapshot Isolation (RCSI) recommended. SQL Server 2025 requires an AVX-capable CPU. |
 | MySQL / Oracle | ⛔ Not supported (roadmap) | — |
 
 > The embedded SQLite store needs no setup and suits pilots and single-node deployments. A

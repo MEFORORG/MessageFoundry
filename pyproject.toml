@@ -20,7 +20,8 @@ dependencies = [
     "hl7>=0.4.5",           # python-hl7: fast, tolerant parsing for routing
     "pydantic>=2.6",        # channel config models / validation
     "aiosqlite>=0.20",      # async SQLite for the message store/queue
-    "fastapi>=0.137.1",     # localhost engine API (floor pulls starlette>=1.3.1: CVE-2026-54282/54283)
+    "fastapi>=0.137.1",     # localhost engine API
+    "starlette>=1.3.1",     # explicit floor — fastapi's own pin allows an older Starlette; >=1.3.1 fixes the Host/path + form-DoS CVEs (CVE-2026-48710 @1.0.1, CVE-2026-54282 @1.3.0, CVE-2026-54283 @1.3.1)
     "uvicorn[standard]>=0.29",
     "argon2-cffi>=23.1",    # argon2id password hashing (OWASP-recommended)
     "cryptography>=48.0.1", # AES-256-GCM PHI-at-rest encryption for the store (>=48.0.1: GHSA-537c-gmf6-5ccf)
@@ -36,16 +37,20 @@ dependencies = [
 console = [
     "PySide6>=6.6",         # admin console (LGPL — OSS-distributable)
     "keyring>=24.0",        # OS-keyring storage for the console's auth token
+    "httpx>=0.27",          # the console's runtime HTTP client to the engine API (console/client.py) — a [console]-only install needs it
+    "truststore>=0.10",     # verify the engine's TLS cert against the OS trust store (enterprise/AD-CS roots) so a remote console needs no per-PC CA wrangling (console/client.py)
 ]
 # EXPERIMENTAL SQL Server store backend. Also needs the Microsoft ODBC Driver 18 for SQL Server
 # installed at the OS level (not pip-installable). Lazy-imported, so SQLite-only installs skip it.
 sqlserver = ["aioodbc>=0.5"]
-# PostgreSQL store backend (production server-DB with single-node parity). Pure-Python driver, no
-# OS-level dependency. Lazy-imported, so SQLite-only installs skip it.
+# PostgreSQL store backend (production server-DB with single-node parity). No OS-level dependency
+# (ships compiled C/Cython wheels). Lazy-imported, so SQLite-only installs skip it.
 postgres = ["asyncpg>=0.29"]
 # SFTP (SSH) transport for the REMOTEFILE connector. FTP/FTPS use the stdlib (ftplib), no dep.
 # Lazy-imported, so installs that never use SFTP skip paramiko.
-sftp = ["paramiko>=3.4"]
+# Floor >=5.0: 5.0 removed SHA-1 entirely, excluding CVE-2026-44405 (rsakey.py SHA-1 permitted); >=3.4
+# already excluded Terrapin (CVE-2023-48795). The lock resolves 5.0.0 — the floor makes the spec match.
+sftp = ["paramiko>=5.0"]
 # Optional OpenTelemetry metrics export (BACKLOG #21). Off by default; the /metrics Prometheus path
 # needs none of this. otel imports are function-local, so SQLite-only installs skip these entirely.
 otel = ["opentelemetry-sdk>=1.20", "opentelemetry-exporter-otlp>=1.20"]
@@ -64,12 +69,13 @@ fhir = ["fhir.resources>=7.1.0", "fhirpathpy>=2.2.0"]
 # folded into [dicom].
 dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<4"]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.0.3",        # >=9.0.3 fixes CVE-2025-71176 (insecure /tmp dir perms, CWE-379; dev/UNIX-only)
     "pytest-asyncio>=0.26",  # >=0.26 adds asyncio_default_test_loop_scope (BACKLOG #17 shared-loop fix)
     "pytest-timeout>=2.3",  # per-test watchdog: a hung test (py3.11 flake, BACKLOG #17) dumps stacks + fails fast, never wedges the leg
+    "pytest-rerunfailures>=16.0",  # in-run auto-retry for the known harness-monitor timing flake (BACKLOG #17): a single flake occurrence self-heals instead of reding the whole matrix + blocking auto-merge
     "ruff>=0.4",
     "mypy>=1.10",
-    "httpx>=0.27",          # ASGI test client for the localhost API
+    "httpx>=0.27",          # ASGI test client for the API + harness/load polling (console ships its own copy via [console])
 ]
 
 [project.scripts]
@@ -111,6 +117,9 @@ testpaths = ["tests"]
 # wall-clock. `thread` method works cross-platform (no SIGALRM) and fires even when the main thread is
 # blocked in a C call. Individual tests run well under 60s (the whole suite is ~2–5 min).
 addopts = "--timeout=60 --timeout-method=thread"
+markers = [
+    "win2025_acceptance: Windows Server 2025 on-server acceptance probes (env-gated; skip off-server).",
+]
 
 [tool.ruff]
 line-length = 100

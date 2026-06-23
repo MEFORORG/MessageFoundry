@@ -12,7 +12,10 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    - cron: "0 6 * * 1" # weekly, so a freshly-disclosed CVE is caught even without a push
+    # Daily, so a CVE freshly disclosed against an UNCHANGED pinned dep (no push/PR to trigger a scan)
+    # is caught within ~24h instead of up to 7 days — a weekly cadence can't meet a 72h-class remediation
+    # clock. pip-audit/npm-audit here are a second detector independent of GitHub's advisory-review lag.
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -26,7 +29,7 @@ jobs:
     # red (the intended forcing function) — bump the lockfile, or `pip-audit --ignore-vuln <ID>` to
     # accept a triaged advisory.
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.13"
@@ -38,7 +41,12 @@ jobs:
           # Re-export to the same path and fail if it differs from what's committed (keeps the
           # hashed requirements.lock in sync with uv.lock; same -o name = deterministic header).
           uv export --all-extras --no-emit-project --format requirements.txt -o requirements.lock
-          git diff --exit-code -- requirements.lock
+          # The container image installs from SCOPED, per-profile locks (not the all-extras lock above,
+          # which drags PySide6/dev/etc. into a slim runtime image) — keep them in sync too. The -o paths
+          # match the header recorded in each committed file, so re-export is byte-identical when in sync.
+          uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
+          uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock
       - name: Install from the hashed lockfile (DEP-1)
         run: |
           # --require-hashes enforces a hash for every requirement (the lockfile carries them): a
@@ -64,7 +72,7 @@ jobs:
       run:
         working-directory: ide
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
@@ -83,7 +91,7 @@ jobs:
     # the SBOM can't be produced, so a lockfile that won't render is caught.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.13"
@@ -104,7 +112,7 @@ jobs:
     # BLOCKING: the baseline is clean, so any NEW insecure pattern (that isn't a reviewed per-line
     # `# nosec`) fails the build instead of merging unnoticed.
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.13"
@@ -132,7 +140,7 @@ jobs:
     runs-on: ubuntu-latest
     # BLOCKING: full-history scan came back clean; a newly-introduced secret now fails the build.
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0 # full history so the scan also covers earlier commits, not just the tip
       - name: Install gitleaks (pinned)
@@ -151,7 +159,7 @@ jobs:
     runs-on: ubuntu-latest
     # BLOCKING: the first run was 0 findings; a new match for any rule now fails the build.
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.13"
@@ -171,7 +179,7 @@ jobs:
     # companion to docs/security/ASVS-L2-PHASE0-CHANGES.md §4). A new/moved/undocumented crypto usage —
     # or a stale inventory entry — fails the build, so the inventory can't silently drift (WP-L3-02).
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.13"
@@ -189,7 +197,7 @@ jobs:
     # brought forward to PR/push-to-main time so a token can't ride a squash-merge onto main and sit there
     # until the next publish catches it. See docs/security/PUBLISHING.md.
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.13"

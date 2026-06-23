@@ -1565,8 +1565,13 @@ def _allowlist_for(conn_type: ConnectorType, egress: EgressSettings) -> list[str
         return egress.allowed_tcp  # DIMSE is a raw socket (the Phase-2 C-STORE SCU dials it out)
     if conn_type is ConnectorType.FILE:
         return egress.allowed_file_dirs
-    if conn_type in (ConnectorType.REST, ConnectorType.SOAP, ConnectorType.FHIR):
-        return egress.allowed_http
+    if conn_type in (
+        ConnectorType.REST,
+        ConnectorType.SOAP,
+        ConnectorType.FHIR,
+        ConnectorType.DICOMWEB,
+    ):
+        return egress.allowed_http  # DICOMWEB is STOW-RS over HTTP (gated like REST/SOAP/FHIR)
     if conn_type is ConnectorType.DATABASE:
         return egress.allowed_db
     if conn_type is ConnectorType.REMOTEFILE:
@@ -1799,9 +1804,17 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
                 "[egress].allowed_file_dirs entry"
             )
     elif (
-        dest.type in (ConnectorType.REST, ConnectorType.SOAP, ConnectorType.FHIR)
+        dest.type
+        in (
+            ConnectorType.REST,
+            ConnectorType.SOAP,
+            ConnectorType.FHIR,
+            ConnectorType.DICOMWEB,
+        )
         and egress.allowed_http
     ):
+        # DICOMWEB (STOW-RS) folds into the HTTP host-check branch: it stores its endpoint under "url"
+        # (the same key Rest()/FHIR() use), so the host gate reads it unchanged (ADR 0025 §6.4).
         url = str(dest.settings.get("url", ""))
         if not _http_egress_allowed(url, egress.allowed_http):
             host = urllib.parse.urlsplit(url).hostname or ""

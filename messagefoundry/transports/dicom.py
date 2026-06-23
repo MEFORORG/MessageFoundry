@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""DICOM DIMSE transport (ADR 0025) — **Phase 1: the inbound C-STORE SCP source**.
+"""DICOM DIMSE transport (ADR 0025) — the inbound **C-STORE SCP source** (Phase 1) and the outbound
+**C-STORE SCU destination** + **C-ECHO** verification (Phase 2).
 
 ``DicomScpSource`` runs a ``pynetdicom`` Application Entity (AE) **C-STORE SCP** so modalities/PACS can
 *send* image and SR objects to MessageFoundry. ``pynetdicom``'s AE server is **blocking/threaded, not
@@ -33,8 +34,15 @@ cleartext SCP is refused at startup by the generalized bind-guard (see
 **routing-safe identifiers** (SOP class/instance UID, calling AE, peer IP) — **never** the dataset or
 pixel data (PHI rule, ADR 0025 §1).
 
-**Phase 2 (designed, not built):** the outbound C-STORE SCU + C-ECHO destination and the DICOMweb
-STOW-RS destination — see ADR 0025.
+``DicomScuDestination`` is the outbound mirror (Phase 2): it **forwards** a DICOM object to a downstream
+PACS over a C-STORE association (Mirth-sender parity) and verifies reachability with **C-ECHO**
+(``test_connection``). ``pynetdicom``'s association is likewise blocking, so the SCU runs it **off the
+event loop** (``asyncio.to_thread``) — the delivery worker awaits ``send``. It recovers the outgoing
+object's bytes from the base64 carriage (ADR 0028 ``.raw_bytes``), classifies the C-STORE status onto the
+engine's retry model (Out-of-Resources → transient :class:`DeliveryError`; any hard refusal → permanent
+:class:`NegativeAckError` → dead-letter), and applies the same PHI-no-log rule (routing-safe identifiers
+only). Egress is gated by ``[egress].allowed_tcp`` (a raw socket, like X12). The modern HTTP imaging lane
+— the DICOMweb STOW-RS destination — is the sibling :mod:`messagefoundry.transports.dicomweb`.
 """
 
 from __future__ import annotations
@@ -47,17 +55,25 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import BytesIO
 from typing import Any, cast
 
-from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import harden_kex_groups, harden_verify_flags
+from messagefoundry.parsing.binary import BinaryCarriageError
+from messagefoundry.parsing.binary import decode as _carriage_decode
+from messagefoundry.parsing.dicom._deps import load_dcmread
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
+    DeliveryError,
+    DeliveryResponse,
+    DestinationConnector,
     InboundHandler,
+    NegativeAckError,
     SourceConnector,
     peer_ip_allowed,
+    register_destination,
     register_source,
 )
 
-__all__ = ["DicomScpSource", "DEFAULT_MAX_OBJECT_BYTES"]
+__all__ = ["DicomScpSource", "DicomScuDestination", "DEFAULT_MAX_OBJECT_BYTES"]
 
 logger = logging.getLogger(__name__)
 
@@ -286,4 +302,240 @@ class DicomScpSource(SourceConnector):
         self._ae = None
 
 
+def _client_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
+    """Build the SCU's **client** ``SSLContext`` for DICOM-over-TLS dialing a downstream PACS, or
+    ``None`` when ``tls`` is off. Built via :func:`ssl.create_default_context` (like MLLP/REST) so it
+    verifies the peer's server cert (hostname + chain) and — crucially — loads the **system trust
+    store** when ``tls_ca_file`` is unset (a bare ``SSLContext(PROTOCOL_TLS_CLIENT)`` would have an empty
+    store and reject every cert). ``tls_ca_file`` pins a private trust anchor instead; ``tls_cert_file``/
+    ``tls_key_file`` opt into mTLS. Verification is never disabled (a downstream is a PHI egress). TLS
+    1.2+ floor. Built once at construction so a bad cert/key fails at build (dry-run/``check``), not at
+    the first delivery — the client mirror of :func:`_server_ssl_context`."""
+    if not s.get("tls"):
+        return None
+    ca = s.get("tls_ca_file")
+    # cafile=None → load_default_certs() (the OS trust store); cafile=path → pin that anchor only.
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(ca) if ca else None)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    cert, key = s.get("tls_cert_file"), s.get("tls_key_file")
+    if cert:  # opt-in mTLS: present a client cert to the peer SCP
+        ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None)
+    harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    harden_verify_flags(ctx)  # strict RFC 5280 validation of the peer's server cert (ASVS 12.1.4)
+    return ctx
+
+
+def recover_dicom_object_bytes(payload: str, *, label: str) -> bytes:
+    """Recover the outgoing DICOM object's bytes from the base64 carriage ``payload`` (ADR 0028 §3 — the
+    one decode). A non-carriage / corrupt body is a Handler bug, not a transient fault, so it raises a
+    **permanent** :class:`NegativeAckError` (a retry would re-send the identical bad body). PHI-safe: it
+    names neither the body nor any element value. Shared by the DIMSE SCU and the DICOMweb destinations."""
+    try:
+        return _carriage_decode(payload)
+    except BinaryCarriageError as exc:
+        raise NegativeAckError(
+            f"{label}: outgoing body is not a base64-carried DICOM object (no retry)",
+            code="bad-carriage",
+            permanent=True,
+        ) from exc
+
+
+class DicomScuDestination(DestinationConnector):
+    """Outbound **C-STORE SCU** (ADR 0025 Phase 2): forward a DICOM object to a downstream PACS over a
+    C-STORE association, and verify reachability with **C-ECHO** (``test_connection``). The blocking
+    ``pynetdicom`` association runs **off the event loop** (``asyncio.to_thread``); the C-STORE status is
+    classified onto the retry model (Out-of-Resources → transient :class:`DeliveryError`; any hard
+    refusal → permanent :class:`NegativeAckError` → dead-letter). PHI rule: logs carry only routing-safe
+    identifiers (SOP class/instance UID, peer host) — never the dataset or pixel data."""
+
+    def __init__(self, config: Destination) -> None:
+        s = config.settings
+        host = s.get("host")
+        if not host:
+            raise ValueError(
+                "DICOM C-STORE SCU (outbound) requires a 'host' setting (the downstream PACS); "
+                "declare it as DICOM(host=..., called_ae_title=...)"
+            )
+        self._host = str(host)
+        self._port = int(s.get("port", 104))
+        self._calling_ae_title = str(s["ae_title"])
+        called = s.get("called_ae_title")
+        # pynetdicom's accept-any token when the peer AE title is left unset.
+        self._called_ae_title = str(called) if called else "ANY-SCP"
+        mob = s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES)
+        self._max_object_bytes: int | None = int(mob) if mob else None
+        self._max_pdu_size = int(s.get("max_pdu_size", 16384))
+        self._timeout = float(s.get("timeout_seconds", 30.0))
+        self._connect_timeout = float(s.get("connect_timeout", 10.0))
+        # Build the client TLS context now so a bad cert/key fails at construction (check/dry-run), not
+        # at the first delivery (like the SCP / MLLP / REST).
+        self._ssl = _client_ssl_context(s)
+
+    async def send(self, payload: str) -> DeliveryResponse | None:
+        object_bytes = recover_dicom_object_bytes(payload, label="DICOM C-STORE SCU")
+        if self._max_object_bytes is not None and len(object_bytes) > self._max_object_bytes:
+            # Over the configured cap — a config/Handler issue a retry of the same object won't fix.
+            raise NegativeAckError(
+                f"DICOM C-STORE object {len(object_bytes)} bytes over max_object_bytes "
+                f"{self._max_object_bytes} (no retry)",
+                code="over-max-object-bytes",
+                permanent=True,
+            )
+        # The pynetdicom association is blocking — keep it off the event loop (the worker awaits this).
+        await asyncio.to_thread(self._c_store, object_bytes)
+        return None  # one-way DIMSE delivery (the C-STORE status is the only reply; no body to capture)
+
+    def _build_ae(self) -> Any:
+        from pynetdicom import AE
+
+        ae = AE(ae_title=self._calling_ae_title)
+        ae.acse_timeout = self._timeout
+        ae.dimse_timeout = self._timeout
+        ae.network_timeout = self._timeout
+        ae.connection_timeout = self._connect_timeout
+        return ae
+
+    def _associate(self, ae: Any) -> Any:
+        """Open a blocking association to the peer (DICOM-over-TLS when configured). Caller releases it."""
+        return ae.associate(
+            self._host,
+            self._port,
+            ae_title=self._called_ae_title,
+            max_pdu=self._max_pdu_size,
+            tls_args=(self._ssl, self._host) if self._ssl is not None else None,
+        )
+
+    def _c_store(self, object_bytes: bytes) -> None:
+        """Blocking: parse → associate → C-STORE → classify. Runs on a worker thread (``to_thread``),
+        never the loop. ``load_dcmread`` is called first (outside the try) so a missing ``[dicom]`` extra
+        surfaces as a deploy ``RuntimeError`` (internal error), not a per-message data ``ERROR``."""
+        dcmread = load_dcmread()
+        try:
+            dataset = dcmread(BytesIO(object_bytes))
+            transfer_syntax = dataset.file_meta.TransferSyntaxUID
+            sop_class = str(dataset.SOPClassUID)
+        except Exception as exc:  # noqa: BLE001 - untrusted/forwarded object; never escape as internal
+            raise NegativeAckError(
+                "DICOM C-STORE SCU: outgoing object is not a parseable DICOM Part-10 object (no retry)",
+                code="bad-object",
+                permanent=True,
+            ) from exc
+        sop_instance = str(getattr(dataset, "SOPInstanceUID", "") or "")
+        ae = self._build_ae()
+        ae.add_requested_context(sop_class, transfer_syntax)
+        assoc = self._associate(ae)
+        if not assoc.is_established:
+            # A peer that **answered** but accepted no presentation context for this object (rejected the
+            # SOP class / transfer syntax — the only one we proposed) is a **deterministic** failure: a
+            # retry re-proposes the identical context and is rejected again, so it must dead-letter rather
+            # than wedge the FIFO lane forever. A bare connect/abort with no context decision is transient.
+            rejected = list(getattr(assoc, "rejected_contexts", []) or [])
+            accepted = list(getattr(assoc, "accepted_contexts", []) or [])
+            if rejected and not accepted:
+                raise NegativeAckError(
+                    f"DICOM C-STORE SCU: {self._host}:{self._port} accepted no presentation context for "
+                    f"SOP class {sop_class} (peer does not support it)",
+                    code="no-accepted-context",
+                    permanent=True,
+                )
+            raise DeliveryError(
+                f"DICOM C-STORE SCU could not associate with {self._host}:{self._port} "
+                f"(AE {self._called_ae_title!r})"
+            )
+        try:
+            status_ds = assoc.send_c_store(dataset)
+        except ValueError as exc:
+            # pynetdicom raises ValueError when the peer accepted the association but not a usable context
+            # for this object, or when the dataset cannot be encoded for the negotiated transfer syntax —
+            # both **deterministic** for the same object+peer, so a retry repeats them. Permanent (no retry)
+            # so the lane is never head-blocked. PHI-safe: routing identifiers only, never the dataset.
+            raise NegativeAckError(
+                f"DICOM C-STORE SCU to {self._host}:{self._port} could not send SOP class {sop_class} "
+                "(no accepted context or unencodable dataset)",
+                code="cstore-unsendable",
+                permanent=True,
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - a genuine DIMSE/transport error mid-store is transient
+            raise DeliveryError(
+                f"DICOM C-STORE SCU to {self._host}:{self._port} failed: {safe_exc(exc)}"
+            ) from exc
+        finally:
+            assoc.release()
+        self._classify(status_ds, sop_class=sop_class, sop_instance=sop_instance)
+
+    def _classify(self, status_ds: Any, *, sop_class: str, sop_instance: str) -> None:
+        """Map the C-STORE response status onto the retry model. PHI-safe: only the status + routing
+        identifiers are logged/raised, never the dataset."""
+        status = getattr(status_ds, "Status", None)
+        if status is None:
+            # An empty status dataset means the association aborted / timed out with no response —
+            # transient (the peer may recover); the SCU re-sends.
+            raise DeliveryError(
+                f"DICOM C-STORE SCU to {self._host}:{self._port} got no response status "
+                "(aborted/timeout)"
+            )
+        code = int(status)
+        if code == _STATUS_SUCCESS:
+            logger.info(
+                "DICOM C-STORE delivered to %s:%s (SOP class %s, instance %s)",
+                self._host,
+                self._port,
+                sop_class,
+                sop_instance,
+            )
+            return
+        if 0xB000 <= code <= 0xBFFF:
+            # Warning family (coercion of data elements, elements discarded, …): the peer STORED the
+            # object — delivered, with a logged caveat.
+            logger.warning(
+                "DICOM C-STORE to %s:%s stored with warning 0x%04X (SOP instance %s)",
+                self._host,
+                self._port,
+                code,
+                sop_instance,
+            )
+            return
+        if 0xA700 <= code <= 0xA7FF:
+            # Refused: Out of Resources — the peer is up but momentarily unable. Transient → retry.
+            raise DeliveryError(
+                f"DICOM C-STORE to {self._host}:{self._port} refused out-of-resources (0x{code:04X})"
+            )
+        # Any other failure (Cannot Understand 0xCxxx, Dataset-does-not-match-SOP 0xA9xx, Not Authorized
+        # 0x0124, SOP-class-not-supported 0x0122, …) is a hard rejection a retry of the identical object
+        # won't fix → permanent dead-letter.
+        raise NegativeAckError(
+            f"DICOM C-STORE to {self._host}:{self._port} rejected with status 0x{code:04X}",
+            code=f"0x{code:04X}",
+            permanent=True,
+        )
+
+    async def test_connection(self) -> None:
+        # C-ECHO is DICOM's connectivity ping (the probe_tcp_reachable analog for DIMSE). Blocking — run
+        # it off the loop so the API's "Test Connection" never stalls the event loop.
+        await asyncio.to_thread(self._c_echo)
+
+    def _c_echo(self) -> None:
+        from pynetdicom.sop_class import Verification  # type: ignore[attr-defined]  # generated SOP-class const
+
+        ae = self._build_ae()
+        ae.add_requested_context(Verification)
+        assoc = self._associate(ae)
+        if not assoc.is_established:
+            raise DeliveryError(
+                f"DICOM C-ECHO could not associate with {self._host}:{self._port} "
+                f"(AE {self._called_ae_title!r})"
+            )
+        try:
+            status_ds = assoc.send_c_echo()
+        finally:
+            assoc.release()
+        status = getattr(status_ds, "Status", None)
+        if status is None or int(status) != _STATUS_SUCCESS:
+            shown = "none" if status is None else f"0x{int(status):04X}"
+            raise DeliveryError(
+                f"DICOM C-ECHO to {self._host}:{self._port} failed (status {shown})"
+            )
+
+
 register_source(ConnectorType.DIMSE, DicomScpSource)
+register_destination(ConnectorType.DIMSE, DicomScuDestination)

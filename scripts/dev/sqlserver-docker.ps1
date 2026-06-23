@@ -4,10 +4,10 @@
     gated SQL Server store suite.
 
 .DESCRIPTION
-    Brings up a SQL Server 2022 container (Evaluation edition is the image default;
-    MSSQL_PID=Evaluation makes it explicit), waits for it to accept connections, and
-    creates the MessageFoundry database. Idempotent: re-running starts an existing
-    stopped container and only creates the database if it is missing.
+    Brings up a SQL Server container (default image: 2022; pass -Image for 2025 — see the
+    EXAMPLES). Evaluation edition is the image default; MSSQL_PID=Evaluation makes it explicit.
+    Waits for it to accept connections, then creates the MessageFoundry database. Idempotent:
+    re-running starts an existing stopped container and only creates the database if it is missing.
 
     This stands up exactly what scripts\dev\sqlserver.ps1 expects: sa @ 127.0.0.1:1433
     with the MessageFoundry database. After it succeeds, run:
@@ -39,6 +39,13 @@
     # already exists - SQL Server honors the SA password only on the volume's first init)
 
 .EXAMPLE
+    scripts\dev\sqlserver-docker.ps1 -Image mcr.microsoft.com/mssql/server:2025-latest `
+        -ContainerName mefor-mssql-2025 -Volume mefor-mssql-2025-data -Port 1434
+    # run SQL Server 2025 (17.x) alongside the default 2022 container (distinct name/volume/port so
+    # both coexist), then point the suite at it: scripts\dev\sqlserver.ps1 -Password '<pw>' -Port 1434
+    # NB: SQL Server 2025 requires an AVX-capable CPU.
+
+.EXAMPLE
     scripts\dev\sqlserver-docker.ps1 -Down -PurgeData
     # stop + remove the container AND delete its data volume
 #>
@@ -58,7 +65,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# sqlcmd lives here in the 2022 image; Driver 18 requires -C to trust the self-signed cert.
+# sqlcmd lives at this path in both the 2022 and 2025 images; Driver 18 requires -C to trust the self-signed cert.
 $sqlcmd = "/opt/mssql-tools18/bin/sqlcmd"
 
 # Captured stdout+stderr of the last Invoke-Docker call, for diagnostics on failure.

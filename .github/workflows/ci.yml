@@ -11,10 +11,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Lint + type-check + unit tests. The Python-version matrix runs on Linux
-  # (cheap); Windows Server 2022 + 2025 are added for OS coverage on the exact
-  # versions we deploy to (one Python each to keep Windows minutes down — they
-  # bill at 2x on a private repo).
+  # Lint + type-check + unit tests. Linux carries the cheap breadth — the 3.11
+  # floor plus a fast early-fail leg on the newest 3.14 (1x minutes). Windows
+  # Server 2022 + 2025 is the primary deployment target, so it covers BOTH the
+  # current (3.13) and the new (3.14) deploy Python on each Server SKU, even
+  # though Windows bills at 2x — testing the version we ship on the OS we ship it
+  # on is worth the minutes.
   test:
     name: test (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
@@ -36,14 +38,17 @@ jobs:
         include:
           - { os: ubuntu-latest, python-version: "3.11" }
           - { os: ubuntu-latest, python-version: "3.13" }
+          - { os: ubuntu-latest, python-version: "3.14" }
           - { os: windows-2022, python-version: "3.13" }
+          - { os: windows-2022, python-version: "3.14" }
           - { os: windows-2025, python-version: "3.13" }
+          - { os: windows-2025, python-version: "3.14" }
     defaults:
       run:
         shell: bash  # available on all runners (Git Bash on Windows) -> one set of commands
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
@@ -95,7 +100,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Set up Python 3.11
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
@@ -132,7 +137,7 @@ jobs:
       run:
         working-directory: ide
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Node
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
@@ -163,24 +168,34 @@ jobs:
   # switch to an always-run job whose heavy steps are step-gated, since the service container starts
   # before steps.)
   changes:
-    name: detect server-DB changes
+    name: detect server-DB + docker changes
     runs-on: ubuntu-latest
     outputs:
       serverdb: ${{ steps.f.outputs.serverdb }}
+      docker: ${{ steps.f.outputs.docker }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
       - id: f
         run: |
           if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "serverdb=true" >> "$GITHUB_OUTPUT"; exit 0
+            echo "serverdb=true" >> "$GITHUB_OUTPUT"
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           changed=$(git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD")
           if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/cluster|messagefoundry/transports/database|tests/test_(sqlserver|postgres|cluster|database_connector)|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The container image smoke runs on PRs that touch the image, the per-profile locks, packaging,
+          # or this workflow (engine-wide regressions are already covered by the `test` job + push-to-main).
+          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|pyproject\.toml|requirements\.lock|\.github/workflows/ci\.yml)'; then
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docker=false" >> "$GITHUB_OUTPUT"
           fi
 
   # SQL Server service-container leg: runs the gated suites that need a real SQL Server (Linux, so 1x
@@ -191,13 +206,23 @@ jobs:
   # in branch protection so a T-SQL regression can't merge. Exercises the T-SQL + the live aioodbc
   # round-trip the SQLite / faked-driver tests can't.
   sqlserver-store:
-    name: sql server (store + connector)
+    name: sql server (store + connector) ${{ matrix.label }}
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.serverdb == 'true'
     runs-on: ubuntu-latest
+    # Matrix the gated suite across every supported SQL Server major (2022 = 16.x, 2025 = 17.x) so a
+    # version-specific T-SQL / engine regression can't merge. fail-fast: false keeps a 2025-only hiccup
+    # from cancelling the 2022 leg (and vice-versa). The `changes` path-filter still gates this on PRs, so
+    # matrixing only doubles the (rate-limited) mcr pulls on server-DB PRs + pushes to main.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "mcr.microsoft.com/mssql/server:2022-latest", label: "2022" }
+          - { image: "mcr.microsoft.com/mssql/server:2025-latest", label: "2025" }
     services:
       mssql:
-        image: mcr.microsoft.com/mssql/server:2022-latest
+        image: ${{ matrix.image }}
         env:
           ACCEPT_EULA: "Y"
           MSSQL_SA_PASSWORD: "Str0ng_P@ssw0rd!"
@@ -205,7 +230,7 @@ jobs:
           - 1433:1433
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
@@ -224,7 +249,7 @@ jobs:
       - name: Wait for SQL Server and create the database
         run: |
           sqlcmd=/opt/mssql-tools18/bin/sqlcmd
-          for i in $(seq 1 40); do
+          for i in $(seq 1 60); do  # ~120s cap: 2025's first boot can run slower than 2022's
             if "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1; then
               echo "SQL Server is up"; break
             fi
@@ -349,7 +374,7 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
@@ -407,7 +432,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
@@ -459,19 +484,27 @@ jobs:
   # profile (correctness SLOs strict; drain bound sized for a server DB). Skipped on PRs to save spend —
   # runs on push to main + on-demand (workflow_dispatch). Heavier SQL Server profiles run manually.
   load-test-sqlserver:
-    name: load test (smoke, sqlserver)
+    name: load test (smoke, sqlserver) ${{ matrix.label }}
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    # Smoke the end-to-end SQL Server store path on every supported major (2022/2025). Push/dispatch-only,
+    # so no PR cost; fail-fast: false keeps the two legs independent.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "mcr.microsoft.com/mssql/server:2022-latest", label: "2022" }
+          - { image: "mcr.microsoft.com/mssql/server:2025-latest", label: "2025" }
     services:
       mssql:
-        image: mcr.microsoft.com/mssql/server:2022-latest
+        image: ${{ matrix.image }}
         env:
           ACCEPT_EULA: "Y"
           MSSQL_SA_PASSWORD: "Str0ng_P@ssw0rd!"
         ports:
           - 1433:1433
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
@@ -490,7 +523,7 @@ jobs:
       - name: Wait for SQL Server and create the database (RCSI on, like the store suite)
         run: |
           sqlcmd=/opt/mssql-tools18/bin/sqlcmd
-          for i in $(seq 1 40); do
+          for i in $(seq 1 60); do  # ~120s cap: 2025's first boot can run slower than 2022's
             if "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1; then
               echo "SQL Server is up"; break
             fi
@@ -551,24 +584,30 @@ jobs:
   # confirm it was recorded -> stop -> uninstall. Skipped on PRs to save Windows
   # minutes; runs on push to main and on-demand (workflow_dispatch).
   windows-service-smoke:
-    name: windows service smoke (${{ matrix.os }})
+    name: windows service smoke (${{ matrix.os }}, py${{ matrix.python-version }})
     if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022, windows-2025]
+        # Windows Server 2022 + 2025 on the current deploy Python (3.13); plus the new 3.14 deploy
+        # target on 2025 (newest Server) so the real NSSM install->serve->MLLP path is validated on
+        # the version we will ship. This job is push/dispatch-only, so the extra leg costs no PR time.
+        include:
+          - { os: windows-2022, python-version: "3.13" }
+          - { os: windows-2025, python-version: "3.13" }
+          - { os: windows-2025, python-version: "3.14" }
     defaults:
       run:
         shell: pwsh
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install the engine (fhir + dicom extras)
         run: |
@@ -668,6 +707,7 @@ jobs:
           "messages.total = $($msgs.total)"
 
       - name: Stop the service (graceful)
+        if: always()
         run: nssm stop MessageFoundry
 
       - name: Show service logs
@@ -689,6 +729,125 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: service-logs-${{ matrix.os }}
+          name: service-logs-${{ matrix.os }}-py${{ matrix.python-version }}
           path: C:\ProgramData\MessageFoundry\logs\
           if-no-files-found: ignore
+
+  # Container image smoke (the engine's FIRST non-Windows runtime target — it is Windows-service/NSSM
+  # first today). Builds the slim engine image, builds a test-only image that bakes a minimal ADT->file
+  # config + a self-contained MLLP sender (config baked, not mounted, so it is owned by the engine's UID
+  # and not group/world-writable — _assert_safe_config_source refuses otherwise), serves it loopback +
+  # auth-off, sends one synthetic ADT^A01 over the in-container MLLP listener, and asserts it FINALIZES
+  # to PROCESSED (not merely RECEIVED — that distinguishes ACK-on-receipt from final disposition). Then
+  # it verifies a graceful `docker stop`: tini forwards SIGTERM -> uvicorn lifespan -> engine.stop().
+  # Runs on push to main + dispatch always; on PRs only when the image/locks/packaging/this workflow
+  # change (gated by `changes`), so docs/unrelated PRs don't pay the build.
+  docker-smoke:
+    name: docker image smoke (slim, linux)
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build the slim engine image
+        run: docker build -f docker/Dockerfile -t messagefoundry:ci .
+
+      - name: Build the -sqlserver variant (ODBC apt layer + sqlserver lock must resolve)
+        # Build-only: it pulls the Microsoft ODBC repo + installs from requirements-sqlserver.lock, so a
+        # broken hashed dep or the Debian/MS-key issue the Dockerfile warns about turns the job red here.
+        run: docker build -f docker/Dockerfile --target runtime-sqlserver -t messagefoundry:sqlserver-ci .
+
+      - name: Build the test smoke image (baked minimal config + MLLP sender)
+        run: docker build -f docker/smoke/Dockerfile --build-arg BASE=messagefoundry:ci -t messagefoundry:smoke .
+
+      - name: Serve (loopback, auth off) and assert an MLLP message reaches PROCESSED
+        run: |
+          set -euo pipefail
+          # Bind the API + MLLP to loopback INSIDE the container and drive the test from inside it
+          # (docker exec). A non-loopback bind without TLS would be refused by the startup bind guard
+          # (and auth-off is refused off-loopback regardless of --allow-insecure-bind), so loopback +
+          # in-container traffic is the correct posture for an auth-disabled smoke — no insecure override.
+          docker run -d --name mefor -e MEFOR_AUTH_ENABLED=false messagefoundry:smoke \
+            serve --config /config --env dev --host 127.0.0.1 --port 8765
+          # Readiness: /health is tokenless and always 200 once the listener is up.
+          for _ in $(seq 1 60); do
+            docker exec mefor curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && break || sleep 0.5
+          done
+          docker exec mefor curl -fsS http://127.0.0.1:8765/health
+          # Send one synthetic ADT^A01 over the in-container MLLP listener (loopback:2575); fails on a non-AA ACK.
+          docker exec mefor python /smoke/send_adt.py 127.0.0.1 2575
+          # Poll the disposition via the container's own python (stdlib urllib — no host python/jq needed).
+          total() { docker exec mefor python -c "import urllib.request,json;print(json.load(urllib.request.urlopen('http://127.0.0.1:8765/messages?status=$1'))['total'])"; }
+          processed=0
+          for _ in $(seq 1 60); do
+            # `|| processed=0`: a transient non-zero before the row finalizes must NOT abort the loop under set -e.
+            processed=$(total processed) || processed=0
+            [ "$processed" -ge 1 ] && break || sleep 0.5
+          done
+          received=$(total received) || received=0
+          echo "processed=$processed received=$received"
+          # The whole point of the assert: confirm it FINALIZED, not just that it was acknowledged-on-receipt.
+          if [ "$processed" -lt 1 ]; then
+            echo "FAIL: message did not finalize to PROCESSED (received=$received) — stuck at ACK-on-receipt"
+            exit 1
+          fi
+
+      - name: Verify graceful shutdown (tini -> SIGTERM -> engine.stop drains)
+        run: |
+          set -euo pipefail
+          docker stop --time 30 mefor
+          code=$(docker inspect -f '{{.State.ExitCode}}' mefor)
+          echo "container exit code: $code"
+          # A fully graceful shutdown exits 0 (uvicorn handles SIGTERM, runs the lifespan, returns); 143
+          # (128+SIGTERM) is acceptable too. 137 = SIGKILL after the grace expired = ungraceful.
+          if [ "$code" = "137" ]; then echo "FAIL: ungraceful shutdown (SIGKILL after grace)"; exit 1; fi
+          docker logs mefor 2>&1 | grep -q "Application shutdown complete" \
+            || { echo "FAIL: no clean-shutdown marker (lifespan shutdown did not complete)"; exit 1; }
+          echo "graceful shutdown verified"
+
+      - name: Engine log (always)
+        if: always()
+        run: docker logs mefor 2>&1 | tail -60 || true
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f mefor || true
+
+  # Single STABLE required status check standing in for the conditional / matrix heavy legs (SQL
+  # Server, Postgres, load, Windows-service smoke). Those legs CANNOT be required directly:
+  #   * the push-only legs (`postgres-store`, `load-test`, `load-test-sqlserver`,
+  #     `windows-service-smoke`) report `skipped` on every PR — never the required context a PR waits
+  #     on — so requiring them either no-ops or wedges; and
+  #   * the matrix legs report an UNEXPANDED name when skipped (`... ${{ matrix.label }}`) but
+  #     EXPANDED names when they run (`... 2022`/`2025`, `(windows-2022, py3.13)`), so no single
+  #     context string matches both the skipped and the run state.
+  # This gate ALWAYS runs (if: always()), so it reports ONE fixed context ("CI gate") regardless of
+  # which legs ran, and fails iff a gated leg actually FAILED or was cancelled — a `skipped` leg
+  # counts as a pass. Require "CI gate" in branch protection INSTEAD of the individual legs; a leg
+  # that does run on a PR (e.g. `sqlserver-store` on a server-DB PR) thus still blocks the merge.
+  # NB: `docker-smoke` is intentionally NOT gated here (out of the named set) — add it to `needs`
+  # below to make a container-smoke failure block merge too.
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs:
+      - changes
+      - sqlserver-store
+      - postgres-store
+      - load-test
+      - load-test-sqlserver
+      - windows-service-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any gated leg failed or was cancelled
+        if: >-
+          contains(needs.*.result, 'failure') ||
+          contains(needs.*.result, 'cancelled')
+        run: |
+          echo "::error::A gated CI leg failed or was cancelled."
+          echo '${{ toJSON(needs) }}'
+          exit 1
+
+      - name: Gated legs OK
+        run: echo "All gated CI legs succeeded or were skipped."

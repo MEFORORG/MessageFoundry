@@ -8,7 +8,10 @@ the same end-to-end behavior the GUI relies on."""
 
 from __future__ import annotations
 
+import datetime
+import ipaddress
 import socket
+import ssl
 import threading
 import time
 from pathlib import Path
@@ -16,10 +19,15 @@ from typing import Iterator
 
 import httpx
 import pytest
+import truststore
 import uvicorn
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
 from messagefoundry.api import create_managed_app
-from messagefoundry.console.client import ApiError, EngineClient
+from messagefoundry.console.client import ApiError, EngineClient, _build_verify_context
 
 ADT = "MSH|^~\\&|APP|FAC|RAPP|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 
@@ -76,6 +84,74 @@ def server(tmp_path: Path) -> Iterator[tuple[str, Path]]:
             raise RuntimeError("server did not start")
     try:
         yield f"http://127.0.0.1:{port}", inbox
+    finally:
+        uv.should_exit = True
+        thread.join(timeout=10)
+
+
+def _self_signed_tls(tmp_path: Path) -> tuple[Path, Path]:
+    """Write a self-signed cert+key with SAN for localhost/127.0.0.1 (so hostname verification can
+    pass once trust is established) and return (cert_path, key_path)."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    san = x509.SubjectAlternativeName(
+        [x509.DNSName("localhost"), x509.IPAddress(ipaddress.IPv4Address("127.0.0.1"))]
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(san, critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_path, key_path = tmp_path / "tls-cert.pem", tmp_path / "tls-key.pem"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return cert_path, key_path
+
+
+@pytest.fixture
+def tls_server(tmp_path: Path) -> Iterator[tuple[str, Path]]:
+    """The same managed app as ``server``, but served over **https** with a self-signed cert — the
+    remote-console transport. Yields (https_base_url, cert_path)."""
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    _write_config(tmp_path / "config", inbox, outdir)
+    cert_path, key_path = _self_signed_tls(tmp_path)
+    app = create_managed_app(
+        db_path=tmp_path / "console-tls.db",
+        config_dir=tmp_path / "config",
+        poll_interval=0.05,
+    )
+    port = _free_port()
+    config = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=port,
+        log_level="warning",
+        ssl_certfile=str(cert_path),
+        ssl_keyfile=str(key_path),
+    )
+    uv = uvicorn.Server(config)
+    thread = threading.Thread(target=uv.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 10
+    while not uv.started:
+        time.sleep(0.05)
+        if time.time() > deadline:
+            raise RuntimeError("tls server did not start")
+    try:
+        yield f"https://127.0.0.1:{port}", cert_path
     finally:
         uv.should_exit = True
         thread.join(timeout=10)
@@ -244,3 +320,74 @@ def test_for_polling_is_a_distinct_readonly_client() -> None:
     finally:
         poll.close()
         client.close()
+
+
+# --- TLS trust for a remote console (CONSOLE-3 follow-up) --------------------------------------
+
+
+def test_verify_context_default_uses_os_trust_store() -> None:
+    # With no cacert the console verifies against the OS trust store (truststore), so an enterprise/
+    # AD-CS cert is trusted with no per-PC config — NOT httpx's certifi-only default.
+    ctx = _build_verify_context(None, None, None)
+    assert isinstance(ctx, truststore.SSLContext)
+
+
+def test_verify_context_cacert_pins_the_bundle(tmp_path: Path) -> None:
+    # A cacert pins trust to exactly that PEM (a plain stdlib context, not the OS store), so a
+    # self-signed / internal-CA engine cert verifies.
+    cert, _ = _self_signed_tls(tmp_path)
+    ctx = _build_verify_context(str(cert), None, None)
+    assert not isinstance(ctx, truststore.SSLContext)  # stdlib context, OS store not consulted
+    # The PEM is loaded as the sole trust anchor. get_ca_certs() only lists certs flagged CA:TRUE, so a
+    # self-signed *leaf* engine cert won't show up there even though it IS an anchor (the happy path
+    # test_cacert_client_accepts_self_signed_engine proves verification succeeds). Count the loaded cert
+    # store instead — it includes non-CA anchors and is portable across OpenSSL builds.
+    assert ctx.cert_store_stats()["x509"] >= 1, (
+        "the supplied cacert must be loaded as a trust anchor"
+    )
+
+
+def test_verify_context_loads_client_cert(tmp_path: Path) -> None:
+    # An opt-in client cert (mTLS) is loaded onto the context regardless of the trust source — this is
+    # also what replaces httpx 0.28's deprecated cert= keyword. Build succeeds with the key in the PEM.
+    cert, key = _self_signed_tls(tmp_path)
+    bundle = tmp_path / "client-bundle.pem"
+    bundle.write_bytes(cert.read_bytes() + key.read_bytes())
+    ctx = _build_verify_context(None, str(bundle), None)  # default OS-store + client cert
+    assert isinstance(ctx, ssl.SSLContext)
+
+
+def test_default_client_rejects_self_signed_engine(tls_server: tuple[str, Path]) -> None:
+    # The crux of the fix's safety: a remote console must NOT silently trust an unknown self-signed
+    # cert. The OS-store default has no anchor for it, so verification fails (no accept-by-default).
+    url, _ = tls_server
+    with EngineClient(url, timeout=5.0) as client:
+        with pytest.raises(ApiError) as excinfo:
+            client.health()
+    # The safety property is that verification is REFUSED (ApiError raised); the wording is platform-
+    # specific: OpenSSL says "certificate verify failed", the Windows OS verifier (truststore) says the
+    # root "is not trusted by the trust provider". Accept either rather than pinning to one platform.
+    msg = str(excinfo.value).lower()
+    assert any(s in msg for s in ("certificate verif", "not trusted", "trust provider")), msg
+
+
+def test_cacert_client_accepts_self_signed_engine(tls_server: tuple[str, Path]) -> None:
+    # The remote-console happy path: point --cacert at the engine's self-signed cert and the console
+    # connects over https. This is the burden-removing capability the change exists to provide.
+    url, cert = tls_server
+    with EngineClient(url, cacert=str(cert), timeout=5.0) as client:
+        assert client.health().status == "ok"
+
+
+def test_for_polling_preserves_cacert_trust(tls_server: tuple[str, Path]) -> None:
+    # The background poll client must inherit the SAME TLS trust as the main client — otherwise the
+    # nav health poll / auto-refresh would fail TLS while the main client succeeds (the latent
+    # for_polling drop this change fixes).
+    url, cert = tls_server
+    with EngineClient(url, cacert=str(cert), timeout=5.0) as client:
+        poll = client.for_polling()
+        try:
+            assert poll._cacert == str(cert)
+            assert poll.health().status == "ok"
+        finally:
+            poll.close()

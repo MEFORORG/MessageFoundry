@@ -182,6 +182,24 @@ jobs:
       # (those tools aren't in requirements.txt); add them and drop --no-lint to lint your config too.
       - name: Validate config (validate + dryrun)
         run: messagefoundry check --config config --messages messages/sets --no-lint
+
+  # Adopter-side "your pin is now vulnerable" tripwire (MessageFoundry dependency fast-response C3):
+  # audit the pinned engine + its resolved dependency closure against published advisories, so a CVE
+  # disclosed against the version you're pinned to turns YOUR CI red — your remediation clock starts
+  # automatically, without waiting to read an advisory email. Remediate by bumping the engine pin in
+  # requirements.txt to a release that fixed it; accept a triaged advisory with
+  # `pip-audit --ignore-vuln <ID>` (record why, per your own change control).
+  audit-pin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Audit the pinned engine + deps against advisories
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --desc
 """
 
 _GITIGNORE = """\
@@ -190,6 +208,8 @@ _GITIGNORE = """\
 *.db-shm
 *.db-wal
 *.log
+# the one-time bootstrap admin credential the engine writes next to the store
+bootstrap-admin.txt
 .env
 .env.*
 /out/
@@ -252,6 +272,12 @@ them*. The gate is **fail-closed by default**. If your package index strips atte
 mirrors do), set the repository variable **`MEFOR_VERIFY_ENGINE=off`** (Settings → Secrets and variables →
 Actions → Variables) to skip it; the `check` job still runs. See the engine's INSTALL-GUIDE for the
 matching manual verify-before-install recipe.
+
+A second supply-chain job, **`audit-pin`**, runs `pip-audit` against your pinned engine and its
+dependency closure, so a vulnerability **disclosed against the version you're pinned to** turns *your*
+CI red automatically — your remediation clock starts without waiting to read an advisory. Remediate by
+bumping the engine pin in `requirements.txt` to a release that fixed it (accept a triaged advisory with
+`pip-audit --ignore-vuln <ID>`, recorded per your own change control).
 
 ## Environments & posture
 The active environment is **required** and **free-form** — name instances `dev`/`staging`/`test`/`prod`/`poc`/…

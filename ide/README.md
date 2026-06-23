@@ -15,9 +15,11 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   module); **New Connection** opens a form (pick a type → fill key fields → it generates a config
   module, auto-named `[TYPE]_[PARTNER]_[MESSAGE]`); **Set Up Version Control & Checks** (see below);
   **Generate Samples** (pick a message type → triggers → count; writes a synthetic, conformant corpus
-  into `messageSetsDir` via `messagefoundry generate` — no PHI); plus New Router/Handler, Open Test
-  Bench, Validate, **Stage → Promote** (see below), and a stub for New Alert (coming soon). (Engine
-  run/stop and monitoring live in the Console, not here.)
+  into `messageSetsDir` via `messagefoundry generate` — no PHI); **New Alert** opens an editor for the
+  operator alert rules (ADR 0014) in the service-settings TOML's `[[alerts.rules]]` — add/remove
+  first-match-wins routing/threshold rules (pure data; takes effect on the next engine restart); plus
+  New Router/Handler, Open Test Bench, Validate, and **Stage → Promote** (see below). (Engine run/stop
+  and monitoring live in the Console, not here.)
 - **Set Up Version Control & Checks** (Home → *Operate*, or the command palette) — a guided, **offline,
   provider-agnostic** flow that puts a code-first project under git and runs MessageFoundry checks on
   every commit. It finds your git (or guides you to install it — `winget`/`git-scm.com`, never

@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
-from messagefoundry.config.wiring import WiringError
+from messagefoundry.config.wiring import MLLP, WiringError, redacted_settings
 from messagefoundry.pipeline.wiring_runner import check_mllp_tls_exposure
 from messagefoundry.transports.mllp import (
     MLLPDestination,
@@ -227,3 +227,96 @@ def test_exposed_gate_ignores_non_mllp() -> None:
     # TCP/X12/FILE listeners aren't MLLP, so this gate doesn't touch them (out of ADR-0002 scope).
     src = Source(type=ConnectorType.FILE, settings={"directory": "x"})
     check_mllp_tls_exposure(src, "IB", allow_insecure_bind=False)  # no raise
+
+
+# --- tls_key_password: passphrase-encrypted private keys (container parity with the API) -----------
+
+
+def _encrypted_cert(tmp_path: Path, passphrase: str) -> tuple[str, str]:
+    """A self-signed EC cert + a private key PEM **encrypted** with ``passphrase`` (PKCS#8)."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc))
+        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.timezone.utc))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+            critical=False,
+        )
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    cp, kp = tmp_path / "enc-c.pem", tmp_path / "enc-k.pem"
+    cp.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    kp.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.BestAvailableEncryption(passphrase.encode("utf-8")),
+        )
+    )
+    return str(cp), str(kp)
+
+
+def test_server_loads_encrypted_key_with_password(tmp_path: Path) -> None:
+    cert, key = _encrypted_cert(tmp_path, "s3cr3t-pass")
+    ctx = _mllp_ssl_context(
+        {
+            "tls": True,
+            "tls_cert_file": cert,
+            "tls_key_file": key,
+            "tls_key_password": "s3cr3t-pass",
+        },
+        server=True,
+    )
+    assert ctx is not None
+    assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2
+
+
+def test_server_encrypted_key_wrong_password_fails(tmp_path: Path) -> None:
+    # Proves the passphrase is actually applied: a WRONG password can't decrypt the key → ssl.SSLError.
+    cert, key = _encrypted_cert(tmp_path, "s3cr3t-pass")
+    with pytest.raises(ssl.SSLError):
+        _mllp_ssl_context(
+            {"tls": True, "tls_cert_file": cert, "tls_key_file": key, "tls_key_password": "WRONG"},
+            server=True,
+        )
+
+
+def test_server_encrypted_key_missing_password_raises_not_prompts(tmp_path: Path) -> None:
+    # An encrypted key with NO tls_key_password must fail deterministically (ssl.SSLError), NOT fall back
+    # to OpenSSL's blocking TTY prompt — there is no TTY under a service account / in a container. The
+    # empty-bytes password callback guarantees a raise here (this test would HANG without that guard).
+    cert, key = _encrypted_cert(tmp_path, "s3cr3t-pass")
+    with pytest.raises(ssl.SSLError):
+        _mllp_ssl_context({"tls": True, "tls_cert_file": cert, "tls_key_file": key}, server=True)
+
+
+def test_outbound_mtls_loads_encrypted_client_key_with_password(tmp_path: Path) -> None:
+    # The same passphrase path on the OUTBOUND client-identity (mTLS) cert.
+    cert, key = _encrypted_cert(tmp_path, "client-pass")
+    ctx = _mllp_ssl_context(
+        {
+            "tls": True,
+            "tls_ca_file": cert,  # verify the peer against this anchor
+            "tls_cert_file": cert,  # present a client identity (mTLS)
+            "tls_key_file": key,
+            "tls_key_password": "client-pass",
+        },
+        server=False,
+    )
+    assert ctx is not None and ctx.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_factory_carries_tls_key_password_and_redacts_it() -> None:
+    spec = MLLP(
+        port=2575, tls=True, tls_cert_file="c.pem", tls_key_file="k.pem", tls_key_password="pw"
+    )
+    assert spec.settings["tls_key_password"] == "pw"
+    # Defence in depth: an inline passphrase is scrubbed from the /metadata view (it should be an env() ref).
+    assert redacted_settings(spec.settings)["tls_key_password"] == "***"

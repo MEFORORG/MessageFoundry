@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+#
+# Topology A — in-process TLS (the default shipped posture; see docs/CONTAINER-EXPOSURE-EVALUATION.md).
+# The engine terminates TLS itself (WP-13a) on 8443 and runs MLLP-over-TLS (WP-13b) on 2575. This is a
+# TEMPLATE: supply your own cert/key, store-encryption key, and an adopter config repo. Read
+# docker/README.md before running in anger — especially the config-OWNERSHIP requirement and the
+# "secrets via env are visible in `docker inspect`" caveat.
+
+services:
+  engine:
+    # Build locally:  docker build -f docker/Dockerfile -t messagefoundry:latest ..
+    # (Use messagefoundry:sqlserver — built with `--target runtime-sqlserver` — for the SQL Server
+    # store or the DATABASE/db_lookup connectors.)
+    image: messagefoundry:latest
+
+    # serve loads the config modules from /config and runs the 'prod' environment (production posture:
+    # PHI-at-rest fail-closed, deny-by-default egress, MFA-for-local-admins). env() value files resolve
+    # under /config/environments/ (MEFOR_ENVIRONMENTS_BASE_DIR is /config in the image).
+    command: ["serve", "--config", "/config", "--env", "prod"]
+
+    environment:
+      # --- exposure (Topology A) ---
+      MEFOR_API_HOST: "0.0.0.0"        # off-loopback in the container so the published port is reachable
+      MEFOR_API_PORT: "8443"
+      MEFOR_API_TLS_CERT_FILE: "/etc/mefor/tls/api.crt"   # paths (not secrets) — mounted read-only below
+      MEFOR_API_TLS_KEY_FILE: "/etc/mefor/tls/api.key"
+      MEFOR_INBOUND_BIND_HOST: "0.0.0.0"   # MLLP listener off-loopback; each MLLP() MUST set tls=True (gate)
+      # --- production guardrails (the engine refuses to start off-loopback without these) ---
+      MEFOR_AUTH_ENABLED: "true"
+      MEFOR_AUTH_REQUIRE_MFA: "true"        # required for local Administrator accounts on an exposed PHI bind
+      MEFOR_STORE_REQUIRE_ENCRYPTION: "true"  # fail closed if no store key (PHI at rest must not be plaintext)
+      # --- deny-by-default egress (prod posture) — list YOUR graph's outbound destinations ---
+      MEFOR_EGRESS_DENY_BY_DEFAULT: "true"
+      # MEFOR_EGRESS_ALLOWED_MLLP: "partner-a.example.org:6661"
+      # MEFOR_EGRESS_ALLOWED_FILE_DIRS: "/var/lib/mefor/out"
+      # NOTE: never set MEFOR_ALLOW_INSECURE_TLS here — it is a CI-only switch and disables TLS verification.
+
+    # Secrets via env_file (gitignored). Each line: MEFOR_STORE_ENCRYPTION_KEY=..., MEFOR_API_TLS_KEY_PASSWORD=...
+    # Plain env is visible in `docker inspect` + image-less but on the host — for stricter handling use a
+    # secrets manager or the k8s manifests (secretKeyRef). Mint the store key with `messagefoundry gen-key`.
+    env_file:
+      - path: ./secrets.env       # copy docker/secrets.env.example -> docker/secrets.env and fill it in
+        required: false
+
+    ports:
+      - "8443:8443"     # API + WSS (TLS)
+      - "2575:2575"     # MLLP data plane (MLLP-over-TLS)
+      # Do NOT publish raw-TCP / X12 ports without TLS: those listeners have NO startup transport guard
+      # (MLLP and the DICOM C-STORE SCP are guarded — a non-loopback bind without tls=true is refused).
+
+    volumes:
+      # PHI store — a NAMED VOLUME (never the ephemeral layer) so at-least-once survives restarts. WAL
+      # writes -wal/-shm siblings, so this must be the writable DIRECTORY that holds messagefoundry.db.
+      - mefor-store:/var/lib/mefor
+      # Adopter config repo, READ-ONLY. It must be owned by uid 10001 and NOT group/world-writable, or the
+      # engine refuses to load it (it executes the *.py as the service account). On Linux:
+      #   chown -R 10001:10001 ./config && chmod -R go-w ./config
+      # The robust production alternative is to BAKE config into a derived image (see docker/README.md);
+      # a Docker-Desktop-on-Windows bind mount surfaces as 0o777 and will be refused.
+      - ./config:/config:ro
+      # TLS material, read-only. The MLLP key must be UNENCRYPTED unless the MLLP() sets tls_key_password
+      # (env-sourced); the API key may be encrypted (MEFOR_API_TLS_KEY_PASSWORD).
+      - ./tls:/etc/mefor/tls:ro
+
+    # Hardening: non-root is the image default (uid 10001); lock the rest down.
+    read_only: true            # root fs read-only; the store volume + tmpfs below are the only writable paths
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # Cover the ordered teardown: graph quiesce ≈10s + ~5s PER MLLP listener (drained serially) +
+    # store.close margin, so `docker stop` lets engine.stop() finish instead of being SIGKILLed. Raise
+    # this for many-listener graphs (the per-listener drains are additive, not bounded).
+    stop_grace_period: 30s
+
+    restart: unless-stopped
+    # The image HEALTHCHECK already probes https://127.0.0.1:8443/health (-k) then http://...:8765/health.
+
+volumes:
+  mefor-store:

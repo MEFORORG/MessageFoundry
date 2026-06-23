@@ -226,6 +226,13 @@ def main(argv: list[str] | None = None) -> int:
         help="allow plaintext http to a non-loopback engine (trusted-network dev only; no TLS yet)",
     )
     parser.add_argument(
+        "--cacert",
+        default=None,
+        help="PEM CA bundle (or the engine's self-signed cert) to trust for https. Omit to verify "
+        "against the OS trust store (an enterprise/AD-CS-issued cert then needs no flag on a "
+        "domain-joined PC); set this only for a self-signed or non-domain engine.",
+    )
+    parser.add_argument(
         "--client-cert",
         default=None,
         help="PEM client certificate to present for mutual TLS (ASVS 12.3.5; opt-in, https only)",
@@ -248,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         client = EngineClient(
             args.url,
             allow_insecure=args.insecure,
+            cacert=args.cacert,
             tls_client_cert=args.client_cert,
             tls_client_key=args.client_key,
         )

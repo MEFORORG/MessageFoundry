@@ -1,0 +1,38 @@
+# Release-sync tripwire: assert the git tag, the PyPI wheel, and the public mirror agree on one
+# version (scripts/publish/check_release_sync.py). release.yml already locks tag == PyPI and
+# publish.ps1's version guard locks tag == mirror at publish time; this catches drift that appears
+# AFTER publish (a mirror republished from the wrong ref, a PyPI yank, a deleted tag). Read-only:
+# two HTTPS GETs (PyPI JSON + the mirror's raw __init__.py) + `git tag`. No secrets, no writes.
+#
+# A real desync (PyPI version with no source tag; mirror ahead of PyPI) fails the build (exit 1);
+# tolerable states (mirror lagging, a release in flight, pre-launch with nothing on PyPI) print a
+# WARN and stay green.
+name: release-sync
+
+on:
+  schedule:
+    # Weekly — version sync only changes at release time, so a daily cadence would be noise. The
+    # release flow can also run the script directly as a post-publish step for immediate confirmation.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-sync:
+    name: tag / PyPI / mirror version agreement
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # need the vX.Y.Z tags (the private-tag side of the check)
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+      - name: Check tag / PyPI / mirror are in sync
+        run: |
+          # `packaging` gives canonical version normalization (so a "0.1.0-rc1" tag and PyPI's
+          # "0.1.0rc1" compare equal); the script falls back to a naive form if it's absent.
+          python -m pip install --upgrade pip packaging
+          python scripts/publish/check_release_sync.py

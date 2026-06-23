@@ -40,6 +40,35 @@ window to ship a fix before any public detail, and we publish details (and credi
 a fix is available**. We'll keep you updated on progress and agree the disclosure timing with you.
 These windows trace to the project's Secure Development Standards (§4.4 RV.2, Appendix A.5).
 
+## Dependency (third-party) vulnerabilities
+
+The table above is for vulnerabilities in **MessageFoundry's own code**, clocked from our triage. A
+vulnerability in a **third-party dependency** is a different clock and a different priority signal, so
+it has its own targets (this is deliberately distinct — the dependency fast lane below is ≤72h, which
+is *not* a contradiction of the ≤7-day own-code window above):
+
+- **Clock starts at upstream-fix availability**, not our triage — we generally cannot patch someone
+  else's library, so the SLA measures how fast we adopt the fix once it exists.
+- **Exploitation pressure sets priority, not CVSS alone.** We triage **KEV-first** (on CISA's
+  Known-Exploited-Vulnerabilities list → patch now), then **EPSS** (≥ 0.7 = imminent), with **CVSS only
+  as a tiebreaker**, and we weigh **reachability** (is the package installed in a shipped profile, wired
+  into a running graph, and egress-reachable? — see
+  [`docs/security/SOUP-DEPENDENCY-HANDLING.md`](../docs/security/SOUP-DEPENDENCY-HANDLING.md)).
+
+| Class | Trigger | Target (from upstream-fix availability) |
+|---|---|---|
+| **Tier-0 fast lane** | CISA **KEV** *or* **EPSS ≥ 0.7**, and reachable in a shipped profile | **≤ 72 hours** |
+| Critical | CVSS critical, reachable | ≤ 14 days |
+| High | CVSS high, reachable | ≤ 30 days |
+| Medium | CVSS medium | ≤ 60–90 days |
+| Low / unreachable | — | Best-effort; recorded with rationale |
+
+**No upstream fix yet?** We apply a documented **compensating control** — pin the transitive dep out,
+leave the affected extra uninstalled, or tighten the egress allow-list — and track to the fix. Detection
+feeds this lane automatically: blocking `pip-audit`/`npm-audit` against the hash-locked tree, a **daily**
+`security.yml` cron (a CVE against an unchanged pin is caught in ~24h), and grouped Dependabot security
+PRs. The step-by-step response is [`docs/security/DEP-CVE-RUNBOOK.md`](../docs/security/DEP-CVE-RUNBOOK.md).
+
 ## Scope notes
 
 - The engine binds `127.0.0.1` by default and requires authentication; the documented threat

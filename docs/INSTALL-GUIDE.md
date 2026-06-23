@@ -63,7 +63,8 @@ pip install "messagefoundry==0.1.0"          # pin the exact version (core runti
 
 Add extras only for what a host actually runs — `messagefoundry[postgres]` (PostgreSQL store),
 `messagefoundry[sqlserver]` (SQL Server store + the DATABASE connectors, needs OS-level ODBC Driver 18),
-`messagefoundry[console]` (desktop admin console), `messagefoundry[sftp]` (SFTP connectors).
+`messagefoundry[console]` (desktop admin console), `messagefoundry[sftp]` (SFTP connectors),
+`messagefoundry[fhir]` (FHIR codec + FHIR outbound), `messagefoundry[dicom]` (DICOM C-STORE SCP + codec).
 
 Key properties this install model gives you:
 
@@ -227,6 +228,11 @@ messagefoundry serve --config config --env test --project-root C:\srv\mefor\my-c
   terminator; MLLP inbound: per-connection `tls = true`) — a non-loopback bind without TLS is **refused at
   startup**. See [DEPLOYMENT.md](DEPLOYMENT.md).
 - For production, run the engine as a **Windows service via NSSM** — see [SERVICE.md](SERVICE.md).
+- For **multi-node high availability** (active-passive failover of a single instance), see
+  [CLUSTERING.md](CLUSTERING.md) — note it requires an operator-provided **floating VIP / L4 load
+  balancer** (a TCP-connect health check per inbound listener port) so senders follow the primary across
+  a failover. MEFOR ships the clustering + the `/cluster/*` health-check endpoints, but **not** the load
+  balancer itself; single-node deployments need none of this.
 
 ### Launching the admin console (no command line)
 
@@ -314,7 +320,7 @@ There is simply no developer workflow that routes through engine source — by c
 | Network exposure / TLS | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | Security / auth / RBAC / audit | [SECURITY.md](SECURITY.md) |
 | PHI handling / encryption | [PHI.md](PHI.md) |
-| Multi-node high availability | [CLUSTERING.md](CLUSTERING.md) |
+| Multi-node high availability (needs a floating VIP / L4 LB) | [CLUSTERING.md](CLUSTERING.md) |
 
 ---
 

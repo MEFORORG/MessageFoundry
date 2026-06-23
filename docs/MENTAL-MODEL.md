@@ -328,9 +328,9 @@ Keep the message store on a fast *local* disk, not a network share — the stage
 
 - **OS.** Windows Server 2022/2025 is the primary supported platform (Windows-service deploy via NSSM); Windows Server 2019 and Windows 10/11 are supported; the engine also runs on modern Linux (under systemd — no bundled installer); macOS is development/console only.
 
-- **Runtime.** Python 3.11+ (64-bit; 3.11–3.13). No C compiler needed for the default install. The Windows service uses NSSM (registering it needs admin rights).
+- **Runtime.** Python 3.11+ (64-bit; 3.11–3.14). No C compiler needed for the default install. The Windows service uses NSSM (registering it needs admin rights).
 
-- **Store.** SQLite (WAL) is the bundled, zero-setup default for single-node; **PostgreSQL 13+** or **SQL Server 2019/2022** for production (run the server DB on its own host; SQL Server also needs the OS-level ODBC Driver 18, RCSI recommended). MySQL/Oracle aren’t supported.
+- **Store.** SQLite (WAL) is the bundled, zero-setup default for single-node; **PostgreSQL 13+** or **SQL Server 2022/2025** for production (run the server DB on its own host; SQL Server also needs the OS-level ODBC Driver 18, RCSI recommended). MySQL/Oracle aren’t supported.
 
 - **Clients.** The PySide6 desktop console (not browser-based) and the VS Code extension; no web browser is needed to operate the engine.
 
@@ -447,7 +447,7 @@ The runtime needs about a dozen packages; everything past the core is an **opt-i
 |----|----|----|
 | **Core runtime** | hl7apy, python-hl7, pydantic, aiosqlite, fastapi, uvicorn, argon2-cffi, cryptography, ldap3, pyspnego, tomlkit, tzdata | HL7 validate/parse, config models, the SQLite store, the API, password hashing + AES-256-GCM PHI-at-rest, AD/Kerberos auth, TOML writing, tz data. Always installed. |
 | \[console\] | PySide6, keyring | The admin console GUI + OS-keyring storage for its auth token. |
-| \[postgres\] | asyncpg | PostgreSQL store backend (pure-Python driver, no OS dependency). |
+| \[postgres\] | asyncpg | PostgreSQL store backend (no OS dependency; ships compiled wheels). |
 | \[sqlserver\] | aioodbc *+ OS ODBC Driver 18* | SQL Server store backend (the ODBC driver installs at the OS level, not via pip). |
 | \[sftp\] | paramiko | SFTP transport for the REMOTEFILE connector (FTP/FTPS use the stdlib). |
 | \[dev\] | pytest, ruff, mypy, httpx | Tests, lint/format, strict type-checking, and the ASGI API test client. |

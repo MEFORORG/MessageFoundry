@@ -1,0 +1,40 @@
+name: vuln-metrics
+
+# Weekly dependency-vulnerability program metrics (NIST SSDF RV.2 evidence). Runs
+# scripts/security/vuln_metrics.py against REAL repo data (Dependabot PRs, GITHUB_TOKEN-readable) plus
+# the public CISA KEV + FIRST EPSS feeds, uploads the CSV as an artifact, and renders the table to the
+# run summary. Read-only; no secrets beyond the default GITHUB_TOKEN.
+#
+# The CSV is an ARTIFACT, not a commit: `main` is branch-protected (a workflow push would be blocked),
+# and these KPIs are slow-moving evidence, not alerting — the per-run artifacts + run-summary snapshot
+# are sufficient. (A committed time-series on a dedicated unprotected `metrics` branch is a later option.)
+on:
+  schedule:
+    - cron: "0 8 * * 1" # Mondays — weekly is plenty; this is RV.2 evidence, not a detector
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  metrics:
+    name: Dependency-vulnerability KPIs (RV.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+      - name: Compute the metrics (real Dependabot PRs + CISA KEV + FIRST EPSS)
+        env:
+          GH_TOKEN: ${{ github.token }} # gh auth for the read-only Dependabot-PR query
+        run: |
+          # Stdlib + gh only — no install. Writes the CSV + appends the table to the run summary.
+          python scripts/security/vuln_metrics.py --csv vuln-metrics.csv --summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload the metrics CSV
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vuln-metrics
+          path: vuln-metrics.csv
+          if-no-files-found: error

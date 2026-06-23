@@ -26,6 +26,33 @@ startup* unless TLS is configured (or, for the API, an upstream TLS terminator i
 
 ---
 
+## Container deployment (Docker / Kubernetes)
+
+The **headless engine** ships as an OCI image (ADR 0017 "container fast-follow") — a complement to the
+Windows-service/NSSM path ([`SERVICE.md`](SERVICE.md)), not a replacement. A container is just another
+way to bind off-loopback, so it inherits the controls above unchanged. The PySide6 **console is not in
+the image** (it is a host-side GUI client over the API). Full build/run/ops guide:
+[`../docker/README.md`](../docker/README.md); the scoping analysis is in
+[`CONTAINER-EXPOSURE-EVALUATION.md`](CONTAINER-EXPOSURE-EVALUATION.md).
+
+Container-specific essentials (all detailed in [`../docker/README.md`](../docker/README.md)):
+
+- **Two variants:** slim default (core + SQLite) and `-sqlserver` (adds the OS-level MS ODBC Driver 18
+  for the SQL Server store / `db_lookup`). Non-root uid 10001; read-only root fs; per-profile hash-locked deps.
+- **Config is executed code:** mount it owned by **uid 10001** and not group/world-writable, or — the
+  robust path, and the only clean one on Kubernetes — **bake it into a derived image**
+  (`FROM messagefoundry; COPY --chown=10001:10001 config /config`).
+- **Store volume must persist** (named volume / PVC, never the ephemeral layer) or the at-least-once
+  invariant is void across a restart; enable the at-rest cipher (`MEFOR_STORE_ENCRYPTION_KEY` +
+  `MEFOR_STORE_REQUIRE_ENCRYPTION=true`).
+- **Exposure:** Topology A (in-process TLS, the default) or Topology B (reverse-proxy / same-pod sidecar).
+  Reaching a published port means binding off-loopback in the container, so the bind guard requires TLS —
+  exactly as on bare metal. Don't publish raw-TCP/X12 ports without TLS — those two have no startup
+  transport guard (MLLP and the DICOM SCP are guarded).
+- **Signals:** PID 1 is `tini`; `SIGTERM` → graceful `engine.stop()`. Allow a stop grace of ≥30s.
+
+---
+
 ## Trust boundary — inside your organization's private network
 
 **MessageFoundry's supported deployment is *inside a single healthcare organization's private, trusted
@@ -57,10 +84,10 @@ deployment-conditional OWASP ASVS items ([ASVS-L3-REMEDIATION-PLAN.md](security/
 | Control (ASVS) | Delegate to your environment | Or build into the engine |
 |---|---|---|
 | **Transport encryption** (12.x) | — *enable* the shipped native API/WSS TLS + MLLP-over-TLS | already built (Gate #4) |
-| **MFA / multi-layer admin** (6.3.3 / 8.4.2) | your **directory (AD / Entra)** — healthcare orgs are now *required* to enforce MFA there; MEFOR authenticates against it (see note below) | native TOTP MFA is a 0.2 item (ADR 0002 WP-14) |
+| **MFA / multi-layer admin** (6.3.3 / 8.4.2) | your **directory (AD / Entra)** — healthcare orgs are now *required* to enforce MFA there; MEFOR authenticates against it (see note below) | **native TOTP MFA is built** (ADR 0002 WP-14) — RFC 6238 for local accounts, enforced for local Administrators via `[auth].require_mfa` + the step-up gate; AD/Entra MFA stays delegated |
 | **TLS client-cert / mTLS** (12.3.5) | your **PKI**; MF's API mTLS is built (`tls_client_ca_file`, opt-in) | enable mTLS + a console client cert |
 | **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) | document the delegation, or add OCSP/CRL to the TLS contexts |
-| **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | a 0.2 forwarding integration |
+| **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | **built** — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector (residual: the syslog transport is plaintext — front it with a local TLS-forwarding agent) |
 
 **Write the delegation into your deployment runbook.** "We run MEFOR inside our network behind
 \<perimeter / IdP / PKI / SIEM\>" is what turns these from open gaps into *addressed-by-environment* —
@@ -71,8 +98,9 @@ your policy — which healthcare organizations are now **required** to do — so
 it. One accuracy point for a security reviewer: a back-channel **LDAP simple-bind validates the password
 but does not itself prompt the second factor**, so MFA applies through **Kerberos / Windows SSO** (the
 workstation logon was already MFA'd), your **Conditional Access on a federated-SSO front**, or an
-**MFA-terminating reverse proxy**. The **local-user fallback is single-factor** — prefer AD / SSO for an
-MFA-required deployment.
+**MFA-terminating reverse proxy**. Local accounts now have a **native second factor** — RFC 6238 TOTP
+(`[auth].require_mfa`, WP-14) — so enable it for local Administrators; AD / SSO remains preferable where
+your IdP already enforces and manages MFA centrally.
 
 ### Caveat — accepting inbound web-service calls
 
@@ -83,6 +111,30 @@ backlog item), it is a **distinct network surface even inside your LAN**: it mus
 authentication, TLS, and ingress allow-list, and it lives in the connector layer with its own
 bind/host/port, **separate** from the management API. Do not assume "we accept web-service calls" is
 safe until that listener exists and is hardened for it.
+
+---
+
+## High availability — clients reach the engine through a floating VIP / L4 LB
+
+MessageFoundry's HA model is **active-passive clustering** (N engine processes against one shared
+server DB; one leader runs the graph, the rest are warm standbys) — full setup in
+[CLUSTERING.md](CLUSTERING.md). It changes the network picture in one way that belongs in your
+deployment plan:
+
+- **Only the primary binds the inbound listener ports.** So senders must reach "the engine" through an
+  operator-provided **floating VIP / L4 load balancer**, not a fixed node. Use **one VIP per inbound
+  port with a TCP-connect health check on that port** — the check passes only on the primary, so the VIP
+  lands inbound traffic on it and follows the primary across a failover. MLLP/TCP senders see a
+  connection drop and reconnect through the VIP (make partners reconnect-on-drop).
+- **The engine API is up on every node** (it's a control/read plane over the shared DB), so an API VIP
+  can health-check the unauthenticated **`GET /health`** for liveness, or pin operations to the primary
+  via **`GET /cluster/status`** (`role`) / **`GET /cluster/nodes`** (`leader_node_id`).
+- **DB-tier HA is delegated to the database** (PostgreSQL streaming replication / SQL Server Always On)
+  — MEFOR does not replicate the store itself.
+
+MEFOR designs for the VIP and exposes the health-check/role endpoints, but **does not ship a load
+balancer** — you stand it up (keepalived, HAProxy, F5, a cloud NLB, …). Single-node deployments need
+none of this.
 
 ---
 
@@ -100,8 +152,10 @@ safe until that listener exists and is hardened for it.
    [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
 5. **Lock down egress** — populate the relevant `[egress].allowed_*` allow-lists so a transform can only
    send to approved destinations (see [egress allow-lists](#egress-allow-lists)).
-6. **Off-box logs + MFA** — both are 0.2 items that pair with off-loopback exposure; track them before a
-   production cutover (see [`releases/v0.1-PLAN.md`](releases/v0.1-PLAN.md) *Security posture*).
+6. **Off-box logs + MFA** — **both are built** and pair with off-loopback exposure: enable
+   `[logging].forward_*` to ship logs + (PHI-redacted) audit to your SIEM (front the plaintext syslog
+   hop with a local TLS agent), and set `[auth].require_mfa = true` for local Administrators (AD/Entra
+   MFA stays delegated to the IdP).
 
 ---
 

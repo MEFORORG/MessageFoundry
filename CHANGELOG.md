@@ -6,12 +6,34 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-23 — Early Access
+
 ### Added
 - **One-click console launch** — a windowed `messagefoundry-console` launcher (`[project.gui-scripts]`, no
   flashing console window) carrying the MessageFoundry badge as the window/taskbar icon, plus
   `scripts/console/install-console-shortcut.ps1` to drop Desktop / Start-Menu shortcuts (per-user, or
   `-AllUsers` for machine-wide). Operators open the admin console by double-clicking an icon instead of
   running a Python command. See [ADR 0032](docs/adr/0032-console-desktop-launch.md).
+- **SQL Server 2025 support** — the SQL Server store + Database connector are now validated against SQL
+  Server 2025 (17.x) in addition to 2022 (16.x): both majors are exercised by the gated CI legs (store,
+  coordinator, failover, and load smoke). No schema or T-SQL change was needed — ODBC Driver 18 (18.5+)
+  covers both. The supported-version matrix moves from 2019/2022 to **2022/2025**. Note: SQL Server 2025
+  requires an AVX-capable CPU.
+
+### Security
+- **Dependency fast-response program** — a KEV→EPSS→CVSS triage policy with a **≤72h fast lane** for
+  actively-exploited dependency CVEs ([`.github/SECURITY.md`](.github/SECURITY.md),
+  [`docs/security/DEP-CVE-RUNBOOK.md`](docs/security/DEP-CVE-RUNBOOK.md)); a **daily** SCA cron;
+  Dependabot moved to the native `uv` ecosystem with **automatic hashed-lock re-export**; **scoped
+  auto-merge** of safe patches with a **supply-chain cooldown**; weekly **RV.2 metrics**
+  ([`docs/security/DEPENDENCY-METRICS.md`](docs/security/DEPENDENCY-METRICS.md)); and an adopter
+  remediation SLA + advisory process ([`docs/SUPPORT-POLICY.md`](docs/SUPPORT-POLICY.md),
+  [`docs/security/ADVISORY-PROCESS.md`](docs/security/ADVISORY-PROCESS.md)).
+- **Adopter "vulnerable pin" tripwire** — `messagefoundry init`'s scaffolded CI gains an `audit-pin` job
+  that reds an adopter's build when their pinned engine or its dependencies have a known published
+  advisory ([`docs/ADOPTER-CI.md`](docs/ADOPTER-CI.md)).
+- **Release-sync drift guard** — a tag/PyPI/public-mirror version-consistency tripwire + a publish-time
+  version guard, so the git tag, the PyPI wheel, and the OSS mirror can't silently diverge.
 
 ## [0.1.0] — 2026-06-18 — Early Access
 

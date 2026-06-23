@@ -109,6 +109,26 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--no-lint", action="store_true", help="skip the advisory ruff/mypy checks")
     check.add_argument("--json", action="store_true", help="emit JSON")
 
+    adr_analyze = sub.add_parser(
+        "adr-analyze",
+        help="advisory spec-driven ADR coverage: acceptance-criteria→test links, missing criteria, "
+        "open clarifications (Secure Development Standards §5)",
+    )
+    adr_analyze.add_argument(
+        "--adr-dir", default="docs/adr", help="ADR directory (default: docs/adr)"
+    )
+    adr_analyze.add_argument(
+        "--repo-root",
+        default=None,
+        help="root for resolving test/fixture refs (default: adr-dir/../..)",
+    )
+    adr_analyze.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 1 if any acceptance-criterion test ref is missing",
+    )
+    adr_analyze.add_argument("--json", action="store_true", help="emit JSON")
+
     connection = sub.add_parser(
         "connection",
         help="manage connections.toml — list / upsert / remove (ADR 0007; the VS Code editor shells this)",
@@ -126,6 +146,23 @@ def main(argv: list[str] | None = None) -> int:
         "--data", default=None, help="connection JSON for upsert (default: read from stdin)"
     )
     connection.add_argument("--json", action="store_true", help="emit JSON")
+
+    alert = sub.add_parser(
+        "alert",
+        help="manage [[alerts.rules]] in the service-settings TOML — list / add / remove "
+        "(ADR 0014; the VS Code 'New Alert' editor shells this)",
+    )
+    alert.add_argument("action", choices=["list", "add", "remove"])
+    alert.add_argument(
+        "--service-config",
+        default="messagefoundry.toml",
+        help="service settings TOML the rules live in (created on `add` if absent)",
+    )
+    alert.add_argument(
+        "--data", default=None, help="alert-rule JSON for add (default: read from stdin)"
+    )
+    alert.add_argument("--index", type=int, default=None, help="rule ordinal (for remove)")
+    alert.add_argument("--json", action="store_true", help="emit JSON")
 
     generate = sub.add_parser(
         "generate", help="generate conformant synthetic HL7 messages (no real PHI)"
@@ -209,6 +246,39 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     ai_policy.add_argument("--json", action="store_true", help="emit JSON only (parsed by the IDE)")
+
+    verify = sub.add_parser(
+        "verify",
+        help="on-box deployment acceptance: host checks + store connectivity + end-to-end smoke",
+    )
+    verify.add_argument(
+        "--config", default="samples/config", help="config modules dir (for the self smoke)"
+    )
+    verify.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    verify.add_argument(
+        "--section",
+        default=None,
+        help="comma-separated sections to run: host,store,smoke,manual (default: all)",
+    )
+    verify.add_argument(
+        "--smoke",
+        default="self",
+        choices=["self", "live", "none"],
+        help="self = dry-run through the config (safe anywhere); live = MLLP to a running engine; none",
+    )
+    verify.add_argument("--engine-host", default="127.0.0.1", help="live smoke: engine host")
+    verify.add_argument("--mllp-port", type=int, default=2575, help="live smoke: inbound MLLP port")
+    verify.add_argument(
+        "--inbound",
+        default=None,
+        help="self smoke: inbound connection name (if config has several)",
+    )
+    verify.add_argument("--report-md", default=None, help="also write the Markdown report here")
+    verify.add_argument("--report-json", default=None, help="also write the JSON report here")
 
     args = parser.parse_args(argv)
     return _DISPATCH[args.command](args)
@@ -1047,6 +1117,30 @@ def _check(args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
+def _adr_analyze(args: argparse.Namespace) -> int:
+    """Advisory spec-driven ADR coverage (Secure Development Standards §5). Reports acceptance-
+    criteria→test link coverage, Accepted ADRs missing criteria, and open ``- [ ]`` clarifications.
+    Exits 0 unless ``--strict`` and a linked test/fixture is missing — no new blocking gate by default."""
+    from messagefoundry.adr_analyze import analyze_adrs
+
+    result = analyze_adrs(args.adr_dir, repo_root=args.repo_root)
+    if args.json:
+        _print_json(result.to_json(), compact=True)
+    else:
+        with_criteria = sum(1 for r in result.reports if r.has_criteria)
+        _safe_print(
+            f"ADRs analyzed: {len(result.reports)} ({with_criteria} with acceptance criteria)"
+        )
+        for adr in result.accepted_without_criteria:
+            _safe_print(f"  recommend: {adr} is Accepted with no acceptance-criteria block")
+        for adr, ref in result.coverage_gaps:
+            _safe_print(f"  COVERAGE GAP: {adr} links a missing test/fixture: {ref}")
+        for adr, item in result.open_clarifications:
+            _safe_print(f"  clarify: {adr} - open item: {item}")
+        _safe_print("ok" if result.ok else "coverage gaps found (advisory)")
+    return 1 if args.strict and not result.ok else 0
+
+
 def _connection(args: argparse.Namespace) -> int:
     """Manage the data-authored ``connections.toml`` (ADR 0007): ``list`` to populate the VS Code
     editor, ``upsert``/``remove`` to save (a developer can also hand-edit the file). ``upsert``/
@@ -1121,6 +1215,104 @@ def _connection(args: argparse.Namespace) -> int:
     return 0
 
 
+def _verify(args: argparse.Namespace) -> int:
+    """On-box deployment acceptance (ADR: wheel-only verifier). Host/store/smoke/manual checks; exits
+    0 iff none FAIL/ERROR (MANUAL/SKIP don't fail). The self smoke is side-effect-free (dry-run); the
+    live smoke MLLP-sends one synthetic message to a running engine."""
+    from pathlib import Path
+
+    from messagefoundry.verify.report import (
+        exit_code,
+        render_console,
+        render_json,
+        render_markdown,
+    )
+    from messagefoundry.verify.runner import ALL_SECTIONS, run_verify
+
+    sections = None
+    if args.section:
+        sections = [s.strip().lower() for s in args.section.split(",") if s.strip()]
+        unknown = [s for s in sections if s not in ALL_SECTIONS]
+        if unknown:
+            print(
+                f"unknown section(s): {', '.join(unknown)}; choices: {', '.join(ALL_SECTIONS)}",
+                file=sys.stderr,
+            )
+            return 2
+
+    results = run_verify(
+        config_dir=args.config,
+        service_config=args.service_config,
+        sections=sections,
+        smoke_mode=args.smoke,
+        engine_host=args.engine_host,
+        mllp_port=args.mllp_port,
+        inbound=args.inbound,
+    )
+    print(render_console(results))
+    if args.report_md:
+        Path(args.report_md).write_text(render_markdown(results), encoding="utf-8")
+    if args.report_json:
+        Path(args.report_json).write_text(render_json(results), encoding="utf-8")
+    return exit_code(results)
+
+
+def _alert(args: argparse.Namespace) -> int:
+    """Manage the operator-authored ``[[alerts.rules]]`` in the service-settings TOML (ADR 0014):
+    ``list`` to populate the VS Code editor, ``add``/``remove`` to save (a developer can also hand-
+    edit the file). ``add``/``remove`` re-load the whole settings file BEFORE persisting and roll
+    back on failure. Offline: touches no network, starts no server. Rules apply on engine restart
+    (the settings TOML is read at startup, not by ``POST /config/reload``)."""
+    from pathlib import Path
+
+    from pydantic import ValidationError
+
+    from messagefoundry.config import alerts_edit
+    from messagefoundry.config.settings import AlertRule, load_settings
+
+    path = args.service_config
+
+    if args.action == "list":
+        try:
+            rules = alerts_edit.list_rules(path)
+        except (OSError, alerts_edit.AlertRuleError) as exc:
+            return _emit_error(str(exc), as_json=args.json)
+        _print_json(rules, compact=args.json)
+        return 0
+
+    def validate(settings_path: Path) -> None:
+        # Re-load the file exactly as the engine does, so a structurally-broken write (or a rule the
+        # full model rejects) fails at edit time and rolls back rather than at next startup.
+        load_settings(config_path=settings_path)
+
+    try:
+        if args.action == "add":
+            raw = args.data if args.data is not None else sys.stdin.read()
+            obj = json.loads(raw)
+            try:
+                AlertRule.model_validate(obj)  # precise per-field error before we touch the file
+            except ValidationError as exc:
+                return _emit_error(f"invalid alert rule: {exc}", as_json=args.json)
+            result = alerts_edit.add_rule(path, obj, validate=validate)
+        else:  # remove
+            if args.index is None:
+                return _emit_error("--index is required for `alert remove`", as_json=args.json)
+            result = alerts_edit.remove_rule(path, args.index, validate=validate)
+    except json.JSONDecodeError as exc:
+        return _emit_error(f"invalid alert rule JSON: {exc}", as_json=args.json)
+    except (alerts_edit.AlertRuleError, FileNotFoundError, ValueError, OSError) as exc:
+        return _emit_error(str(exc), as_json=args.json)
+    _print_json(result, compact=args.json)
+    return 0
+
+
+def _safe_print(line: str) -> None:
+    """Print a line, re-encoding to stdout's codec with replacement so a non-cp1252 character (an
+    ADR's em-dash or ``≥``) never crashes the human output on a legacy Windows console."""
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    sys.stdout.write(line.encode(enc, "replace").decode(enc) + "\n")
+
+
 def _print_json(data: object, *, compact: bool) -> None:
     print(json.dumps(data) if compact else json.dumps(data, indent=2))
 
@@ -1140,7 +1332,9 @@ _DISPATCH = {
     "graph": _graph,
     "dryrun": _dryrun,
     "check": _check,
+    "adr-analyze": _adr_analyze,
     "connection": _connection,
+    "alert": _alert,
     "generate": _generate,
     "hl7schema": _hl7schema,
     "gen-key": _gen_key,
@@ -1148,6 +1342,7 @@ _DISPATCH = {
     "audit-verify": _audit_verify,
     "rotate-key": _rotate_key,
     "ai-policy": _ai_policy,
+    "verify": _verify,
 }
 
 

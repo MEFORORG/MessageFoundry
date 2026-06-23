@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Config/wiring tests for the DICOM DIMSE connector (ADR 0025) — the DICOM() factory, the binary
+"""Config/wiring tests for the DICOM connectors (ADR 0025) — the DICOM()/DICOMweb() factories, the binary
 content type, the inbound host-rejection + peer-IP allowlist, the generalized non-loopback bind-guard
-(check_dimse_tls_exposure), and the fail-closed egress arm. These need NO [dicom] extra (they exercise
-the config layer; pydicom is only imported when the SCP actually starts), so they run on every CI leg."""
+(check_dimse_tls_exposure), and the fail-closed egress arms (DIMSE→allowed_tcp, DICOMWEB→allowed_http).
+These need NO [dicom] extra (they exercise the config layer; pydicom is only imported when the SCP/SCU
+actually opens an association), so they run on every CI leg."""
 
 from __future__ import annotations
 
+import ssl
+
 import pytest
 
-from messagefoundry import DICOM
+from messagefoundry import DICOM, DICOMweb
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import WiringError, build_inbound_connection
@@ -18,6 +21,7 @@ from messagefoundry.pipeline.wiring_runner import (
     check_dimse_tls_exposure,
     check_egress_allowed,
 )
+from messagefoundry.transports import build_destination
 
 
 def _dimse_source(host: str, *, tls: bool = False) -> Source:
@@ -29,6 +33,12 @@ def _dimse_source(host: str, *, tls: bool = False) -> Source:
 def _dimse_dest(host: str, port: int = 104) -> Destination:
     return Destination(
         name="OB", type=ConnectorType.DIMSE, settings={"ae_title": "X", "host": host, "port": port}
+    )
+
+
+def _dicomweb_dest(url: str) -> Destination:
+    return Destination(
+        name="OB_DCMWEB", type=ConnectorType.DICOMWEB, settings=DICOMweb(url=url).settings
     )
 
 
@@ -127,3 +137,84 @@ def test_dimse_egress_deny_by_default_refuses_unlisted_transport() -> None:
     egress = EgressSettings(deny_by_default=True)  # no allowed_tcp → DIMSE refused fail-closed
     with pytest.raises(WiringError):
         check_egress_allowed(_dimse_dest("pacs.partner.org", 104), egress)
+
+
+# --- outbound DIMSE SCU now builds (Phase 2 registered the destination) ------
+
+
+def test_outbound_dimse_scu_builds() -> None:
+    # Before Phase 2 an outbound DICOM connection raised (no destination registered); now it builds.
+    from messagefoundry.transports.dicom import DicomScuDestination
+
+    dest = build_destination(
+        Destination(
+            name="OB_SCU",
+            type=ConnectorType.DIMSE,
+            settings=DICOM(
+                ae_title="MEFOR", host="192.0.2.20", port=11112, called_ae_title="PACS"
+            ).settings,
+        )
+    )
+    assert isinstance(dest, DicomScuDestination)
+
+
+def test_outbound_dimse_scu_requires_host() -> None:
+    # The SCU dials out, so a host is mandatory (an inbound SCP omits it — bind_host is service-side).
+    with pytest.raises(ValueError, match="requires a 'host'"):
+        build_destination(
+            Destination(
+                name="OB_SCU", type=ConnectorType.DIMSE, settings=DICOM(ae_title="MEFOR").settings
+            )
+        )
+
+
+# --- DICOMweb (STOW-RS) factory + HTTP egress arm ----------------------------
+
+
+def test_dicomweb_factory_builds_spec() -> None:
+    spec = DICOMweb(url="https://pacs.example.org/dicom-web", study_uid="1.2.3")
+    assert spec.type is ConnectorType.DICOMWEB
+    assert (
+        spec.settings["url"] == "https://pacs.example.org/dicom-web"
+    )  # stored under "url" for the gate
+    assert spec.settings["study_uid"] == "1.2.3"
+
+
+def test_allowlist_for_dicomweb_is_allowed_http() -> None:
+    egress = EgressSettings(allowed_http=["pacs.example.org"])
+    assert _allowlist_for(ConnectorType.DICOMWEB, egress) is egress.allowed_http
+
+
+def test_dicomweb_egress_allows_listed_and_refuses_unlisted() -> None:
+    egress = EgressSettings(allowed_http=["pacs.partner.org"])
+    check_egress_allowed(_dicomweb_dest("https://pacs.partner.org/dicom-web"), egress)
+    with pytest.raises(WiringError):
+        check_egress_allowed(_dicomweb_dest("https://evil.example/dicom-web"), egress)
+
+
+def test_dicomweb_egress_deny_by_default_refuses_unlisted_transport() -> None:
+    egress = EgressSettings(deny_by_default=True)  # no allowed_http → DICOMWEB refused fail-closed
+    with pytest.raises(WiringError):
+        check_egress_allowed(_dicomweb_dest("https://pacs.partner.org/dicom-web"), egress)
+
+
+# --- SCU client TLS context (no [dicom] extra needed — pure ssl) -------------
+
+
+def test_scu_tls_context_loads_system_trust_store() -> None:
+    # tls=true with NO tls_ca_file must load the OS trust store (a bare SSLContext would be empty and
+    # reject every server cert); verification stays fail-closed (hostname + CERT_REQUIRED).
+    from messagefoundry.transports.dicom import _client_ssl_context
+
+    ctx = _client_ssl_context({"tls": True})
+    assert ctx is not None
+    assert ctx.cert_store_stats()["x509_ca"] > 0  # system CAs loaded
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+    assert ctx.minimum_version >= ssl.TLSVersion.TLSv1_2
+
+
+def test_scu_tls_off_returns_none() -> None:
+    from messagefoundry.transports.dicom import _client_ssl_context
+
+    assert _client_ssl_context({"tls": False}) is None

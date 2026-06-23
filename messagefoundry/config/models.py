@@ -35,12 +35,14 @@ class ConnectorType(str, Enum):
     X12 = "x12"  # raw-TCP X12 EDI — ISA/IEA-framed (no transport sentinel), source + destination (ADR 0012)
     LOOPBACK = "loopback"  # inert inbound — messages arrive only via ingress_handoff (re-ingress, ADR 0013)
     FHIR = "fhir"  # FHIR REST destination — POST/PUT a resource or transaction Bundle to a server (ADR 0022)
-    DIMSE = "dimse"  # raw DICOM upper-layer — C-STORE SCP source (ADR 0025 Phase 1); SCU/C-ECHO dest (Phase 2)
+    DIMSE = "dimse"  # raw DICOM upper-layer — C-STORE SCP source + C-STORE SCU/C-ECHO destination (ADR 0025)
+    DICOMWEB = "dicomweb"  # DICOMweb STOW-RS over HTTP — outbound store/send destination (ADR 0025 Phase 2)
     # DATABASE also has an inbound poll source (DatabasePoll, ADR 0003 §3 + 0004); REMOTEFILE is both
     # source and destination. TIMER is source-only (it generates, never delivers). REST/SOAP sources
     # (HTTP listeners) and TCP are future. (FHIR is destination-only here; its inbound facade is ADR 0023.)
-    # DIMSE is the C-STORE SCP source (Phase 1, gated by the TCP egress arm as a raw socket); the C-STORE
-    # SCU destination + the DICOMWEB (STOW-RS over HTTP) destination are Phase 2 (ADR 0025).
+    # DIMSE is the C-STORE SCP source (gated by the TCP egress arm as a raw socket) AND the C-STORE SCU
+    # destination; DICOMWEB is the STOW-RS destination (gated by the HTTP egress arm, like REST/SOAP/FHIR).
+    # An inbound DICOMweb (STOW-RS) receiver is destination-only here — it awaits the HTTP listener (ADR 0023).
 
 
 class ContentType(str, Enum):

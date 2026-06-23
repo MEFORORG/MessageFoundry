@@ -1,13 +1,15 @@
 # ADR 0025 — DICOM codec + C-STORE store connectors
 
-- **Status:** **Accepted (2026-06-20) — ratified on the owner's go.** Build may start (0028 is Accepted on main; per the land-order base64's carriage code + `RawMessage` additions merge first, then the DICOM codec/SCP build on `.raw_bytes`). Design-only (no code yet). **Ratified in lockstep
+- **Status:** **Accepted (2026-06-20) — ratified on the owner's go. Phases 1 + 2 BUILT.** Phase 1 (codec + inbound C-STORE SCP + worked SR→ORU Handler) shipped via PR #439; Phase 2 (outbound C-STORE SCU + C-ECHO and the DICOMweb STOW-RS destination — `rest.py` reuse, no new dependency) is now built. (0028 is Accepted on main; per the land-order base64's carriage code + `RawMessage` additions merged first, then the DICOM codec/SCP/SCU built on `.raw_bytes`.) **Ratified in lockstep
   with [ADR 0028](0028-base64-binary-carriage-codec.md)** (the base64 binary-carriage contract this ADR consumes for
   its binary payload — neither flips to Accepted until both are reconciled; this revision drops the original latin-1
   round-trip and cites 0028 §3, satisfying that hard prerequisite). The "To resolve on acceptance" confirmations are
   recommended at the positions stated below; on acceptance they are taken as the answers (the analog of
   [ADR 0012](0012-x12-edi-codec.md)'s `## Resolved` and [ADR 0022](0022-fhir-resource-codec-rest-client.md)'s
   `## Decision (proposed)` staying captioned "(proposed)" after the status bullet flips).
-- **Built (this ADR):** Nothing here yet. It layers DICOM semantics over **already-shipped** substrate the way
+- **Built (this ADR):** **Phases 1 + 2 are built** (see the Status bullet and §Phasing). The design below stands as
+  authored; the build followed it (Phase-2 chose the `rest.py`-reuse option for DICOMweb, so `dicomweb-client` was
+  not added). It layers DICOM semantics over **already-shipped** substrate the way
   FHIR ([ADR 0022](0022-fhir-resource-codec-rest-client.md)) and X12 ([ADR 0012](0012-x12-edi-codec.md)) did — **with
   one substrate caveat those two did not have:** DICOM is a **binary** payload, and the shipped non-HL7 ingress path
   is **`str`-only**. That impedance is handled by **consuming the base64 binary-carriage contract**
@@ -767,10 +769,12 @@ the SR→PowerScribe flow the practice runs on Corepoint's DICOM Gear, authored 
   bounded-grace `stop`); the §6 wiring (`ContentType.DICOM`, `ConnectorType.DIMSE`, the `DICOM()` factory, exports,
   the §6.4 DIMSE egress arm + the `_source_config` tuple edit + the generalized bind-guard); and the §8 worked
   SR→ORU sample.
-- **Phase 2 — design now, build later:** outbound **C-STORE SCU** (`DicomScuDestination`, Mirth-sender parity);
-  **C-ECHO** verification (SCU `test_connection` + SCP Verification SOP Class); the **DICOMweb STOW-RS**
-  `DicomWebDestination` (sibling of `rest.py`, `ConnectorType.DICOMWEB`, the `DICOMweb()` factory, the §6.4
-  `allowed_http` egress fold); and `capture_response`/re-ingress for the STOW-RS response if a Handler needs it.
+- **Phase 2 — BUILT:** outbound **C-STORE SCU** (`DicomScuDestination`, Mirth-sender parity, off-loop association,
+  status→retry classification — a peer that accepts no presentation context / an unencodable dataset dead-letters,
+  not retries); **C-ECHO** verification (SCU `test_connection` + the SCP Verification SOP Class accepted in Phase 1);
+  the **DICOMweb STOW-RS** `DicomWebDestination` (sibling of `rest.py` — **`rest.py` reuse chosen**, no
+  `dicomweb-client`; `ConnectorType.DICOMWEB`, the `DICOMweb()` factory, the §6.4 `allowed_http` egress fold,
+  a per-request random multipart boundary); and `capture_response`/re-ingress for the STOW-RS response.
 
 ## To resolve on acceptance
 

@@ -37,6 +37,12 @@ export function configDir(): string {
   return config().get<string>("configDir", "samples/config");
 }
 
+/** Service-settings TOML the engine loads (`[alerts].rules` live here — ADR 0014). Workspace-relative;
+ *  the `alert` CLI creates it on first `add` if absent. */
+export function serviceConfig(): string {
+  return config().get<string>("serviceConfig", "messagefoundry.toml");
+}
+
 export function engineUrl(): string {
   return config().get<string>("engineUrl", "http://127.0.0.1:8765");
 }

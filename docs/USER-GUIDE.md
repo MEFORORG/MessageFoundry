@@ -49,7 +49,7 @@ This guide serves two audiences: **operators** who install, run, and monitor the
 | The staged pipeline / reliability; payload-agnostic ingress; the read-only `db_lookup`; X12 | [ADR 0001](adr/0001-staged-pipeline-architecture.md), [ADR 0004](adr/0004-payload-agnostic-ingress.md), [ADR 0010](adr/0010-handler-callable-db-lookup.md), [ADR 0012](adr/0012-x12-edi-codec.md) |
 | What's built vs. planned | [FEATURE-MAP.md](FEATURE-MAP.md), [README.md](../README.md) |
 
-A note on PHI before you run anything: this engine carries PHI, and a few commands (notably `dryrun` and `generate`) print **full message bodies** to stdout. Use **synthetic HL7 only** in examples, and never redirect that output to a committed file, ticket, or CI log. See [PHI.md](PHI.md) for the hard rules.
+A note on PHI before you run anything: this engine carries PHI, and a few commands (notably `dryrun` and `generate`) print **full message bodies** to stdout. Use **synthetic HL7 only** in examples, and never redirect that output to a committed file, ticket, or CI log. To build *realistic* test data from real traffic without ever handling PHI, use the built de-identification framework via `messagefoundry tee anonymize-captures` (fail-closed; [ADR 0030](adr/0030-anonymization-test-harness-tee.md)) rather than hand-writing synthetic messages. See [PHI.md](PHI.md) for the hard rules.
 
 ### How the rest of this guide is laid out
 
@@ -74,7 +74,7 @@ This section takes you from a clean machine to a running engine and an attached 
 
 ### 1. Check prerequisites
 
-- **Python 3.11+** (64-bit; 3.11, 3.12, 3.13 supported). Everything else (the SQLite store, NSSM for the service) is auto-provisioned or bundled.
+- **Python 3.11+** (64-bit; 3.11–3.14 supported). Everything else (the SQLite store, NSSM for the service) is auto-provisioned or bundled.
 - **git** if you are cloning the checkout or standing up a config repo.
 - **Administrator/elevation** only for the Windows service step (6).
 
@@ -103,6 +103,9 @@ pip install -e ".[console]"      # PySide6 admin console (step 5)
 pip install -e ".[postgres]"     # PostgreSQL store backend
 pip install -e ".[sqlserver]"    # SQL Server store backend — also needs the OS-level Microsoft ODBC Driver 18
 pip install -e ".[sftp]"         # SFTP transport for the REMOTEFILE connector
+pip install -e ".[fhir]"         # FHIR codec (R5/R4B/STU3) + FHIR() outbound (ADR 0022)
+pip install -e ".[dicom]"        # DICOM C-STORE SCP + codec — headers/SR only, no pixels (ADR 0025)
+pip install -e ".[otel]"         # OpenTelemetry/OTLP export seam (the /metrics endpoint itself needs no extra)
 ```
 
 (For a deployment wheel, the same extras apply: `pip install "messagefoundry[console]==0.1.0"`, etc.) SQLite is the zero-dependency default — you need no extra to run the sample config.
@@ -236,7 +239,7 @@ MSA|AA|MSG00001
 ...
 ```
 
-An `MSA|AA` is a positive acknowledgement (`AA` = Application Accept). Under the staged pipeline the ACK means **received and durably persisted** (status `RECEIVED` at the ingress stage), *not* final delivery — see the ACK-on-receipt model in [ARCHITECTURE.md](ARCHITECTURE.md). A moment later the message is routed and delivered: because `adt_a01.hl7` is an `ADT^A01`, the Router forwards it to the `archive` Handler, the Handler stamps the facility mnemonic and sends it on, and the file outbound writes it under `./out/adt/`. Its disposition advances `RECEIVED` → `ROUTED` → `PROCESSED`. (A non-`ADT` message would be logged `UNROUTED`; an `ADT` event the Handler drops would be `FILTERED` — nothing is silently discarded.)
+An `MSA|AA` is a positive acknowledgement (`AA` = Application Accept). Under the staged pipeline the ACK means **received and durably persisted** (status `RECEIVED` at the ingress stage), *not* final delivery — see the ACK-on-receipt model in [ARCHITECTURE.md](ARCHITECTURE.md). A moment later the message is routed and delivered: because `adt_a01.hl7` is an `ADT^A01`, the Router forwards it to the `archive` Handler, the Handler stamps a downstream facility mnemonic *if one is mapped for the sending facility* (none is for this sample, so its MSH-4 is left unchanged) and sends it on, and the file outbound writes it under `./out/adt/`. Its disposition advances `RECEIVED` → `ROUTED` → `PROCESSED`. (A non-`ADT` message would be logged `UNROUTED`; an `ADT` event the Handler drops would be `FILTERED` — nothing is silently discarded.)
 
 Confirm the delivered file landed (its name is the message's MSH-10 control ID, `MSG00001`):
 
@@ -252,10 +255,10 @@ Two complementary ways to inspect what happened:
 - **A dryrun preview (no engine needed).** To see exactly how the config *would* route and transform a message without sending it anywhere, run:
 
   ```
-  python -m messagefoundry dryrun --config samples/config --messages samples/messages/adt_a01.hl7
+  python -m messagefoundry dryrun --config samples/config --messages samples/messages/adt_a01.hl7 --inbound IB_Test_ADT
   ```
 
-  Dryrun prints the resolved inbound, disposition, selected handlers, and would-send payloads. **Its output is PHI-bearing** — message bodies are redacted by default and only included with `--show-phi`. The samples here are synthetic, but never pipe `dryrun` (or `generate`) output to a committed file or a CI log.
+  Dryrun prints the resolved inbound, disposition, selected handlers, and would-send payloads (`--inbound` names which inbound to evaluate — required here because the sample config wires several). **Its output is PHI-bearing** — message bodies are redacted by default and only included with `--show-phi`. The samples here are synthetic, but never pipe `dryrun` (or `generate`) output to a committed file or a CI log.
 
 ### Now change what it does
 
@@ -294,7 +297,8 @@ Key points the sample demonstrates:
 
 - **Inbound MLLP takes only a `port`** — passing `host` is a wiring error. The listen interface is the service-level `[inbound].bind_host` (loopback in DEV, a specific NIC in PROD), an operator setting, not authored here.
 - **Outbound MLLP needs a `host` and `port`.** Anything that differs by environment (a downstream peer, a credential) uses `env("key")`, resolved per instance from `environments/<env>.toml` (and `MEFOR_VALUE_<KEY>` for secrets) — so one module runs unchanged in every environment. A referenced-but-undefined value fails loud at load, never a silent blank host.
-- For a **File** endpoint, use `File(directory="./out/adt")` (in) / `File(directory=..., filename="{MSH-10}.hl7")` (out). For non-HL7 bodies, declare `inbound(..., content_type="x12")` so the body routes as a `RawMessage` — see [samples/config/IB_PARTNER_X12.py](../samples/config/IB_PARTNER_X12.py).
+- For a **File** endpoint, use `File(directory="./out/adt")` (in) / `File(directory=..., filename="{MSH-10}.hl7")` (out). For non-HL7 bodies, set the inbound's `content_type` so the body routes as a `RawMessage` instead of being HL7-parsed — the shipped set is `hl7v2` (default), `json`, `xml`, `text`, `x12`, `fhir`, `binary`, and `dicom`. `x12` rides any transport (see [samples/config/IB_PARTNER_X12.py](../samples/config/IB_PARTNER_X12.py)); `fhir` ([ADR 0022](adr/0022-fhir-resource-codec-rest-client.md)) and `dicom` ([ADR 0025](adr/0025-dicom-codec-store-connectors.md)) add their own on-demand codecs, and arbitrary bytes carry NUL-safely over the base64 `binary` path ([ADR 0028](adr/0028-base64-binary-carriage-codec.md)). Two of the newer connectors are direction-specific: `FHIR()` is **outbound-only** and the `DICOM()` C-STORE listener is **inbound-only**.
+- An **outbound `FHIR()`/`Rest()` destination to a SMART-secured server** (e.g. Epic, Oracle Health) can be wrapped with `with_smart_backend(...)` for OAuth2 client-credentials + signed-JWT authentication ([ADR 0024](adr/0024-smart-backend-services-token-provider.md)). Import it as `from messagefoundry.transports.smart import with_smart_backend` — it is not re-exported from the top-level package.
 
 The complete per-connector settings (TLS, retry, DoS guards, ACK mode, `simulate`, etc.) are documented in [CONNECTIONS.md](CONNECTIONS.md#settings--whats-supported-today); each factory in [messagefoundry/config/wiring.py](../messagefoundry/config/wiring.py) **is the schema** for its transport.
 
@@ -397,7 +401,7 @@ Routers and Handlers work against the mutable HL7 `Message` in [messagefoundry/p
 - **Read MSH separators** — never hardcode `|^~\&`. The repeating-segment rebuild in [samples/results_relay/results_relay.py](../samples/results_relay/results_relay.py) reads them from MSH-1/MSH-2 (its `_separators` helper) before joining components.
 - **Re-encode** — `msg.encode()` (or just pass `msg` to a `Send`, which encodes for you).
 
-A non-HL7 inbound (`content_type` other than `hl7v2`) delivers a `RawMessage` instead — read `.raw` / `.text` / `.json()` and `Send` a built string. For cross-field business-rule checks beyond what schema validation catches, compose the primitives in `parsing/consistency.py`, as [samples/consistency/validated_adt.py](../samples/consistency/validated_adt.py) does (raise `ConsistencyError` → dead-letter, or `return None` → filter). The three validation tiers are laid out in [HL7-VALIDATION.md](HL7-VALIDATION.md).
+A non-HL7 inbound (`content_type` other than `hl7v2`) delivers a `RawMessage` instead — read `.raw` / `.text` / `.json()` / `.xml()` (the XML accessor is XXE-safe via defusedxml: DOCTYPE, external-entity, and billion-laughs payloads raise) and `Send` a built string. For cross-field business-rule checks beyond what schema validation catches, compose the primitives in `parsing/consistency.py`, as [samples/consistency/validated_adt.py](../samples/consistency/validated_adt.py) does (raise `ConsistencyError` → dead-letter, or `return None` → filter). The three validation tiers are laid out in [HL7-VALIDATION.md](HL7-VALIDATION.md).
 
 ### 4. Purity rule (don't break this)
 
@@ -418,7 +422,8 @@ python -m messagefoundry graph --config samples/config
 
 # Run real messages through Routers/Handlers WITHOUT sending — shows the disposition,
 # selected handlers, and would-send payloads. Bodies are redacted unless you pass --show-phi.
-python -m messagefoundry dryrun --config samples/config --messages samples/messages/adt_a01.hl7
+# (--inbound selects which inbound to evaluate; it's required when the config wires more than one.)
+python -m messagefoundry dryrun --config samples/config --messages samples/messages/adt_a01.hl7 --inbound IB_Test_ADT
 
 # The commit/CI gate: validate + dryrun (+ advisory ruff/mypy). Exit 0 only if every required check passes.
 python -m messagefoundry check --config samples/config --messages samples/messages
@@ -457,9 +462,9 @@ On success the session token is stored in your OS keyring (Windows Credential Ma
 
 ### A tour of the console pages
 
-The left nav holds **Connections, Alerts, Log Search, Engine Status**, and **Users** (the last only if you hold `users:manage`). A heart glyph in the lower-left reflects overall health (green healthy, orange low disk, red engine/DB stopped), and an auto-refresh interval (top-right) drives the active page.
+The left nav holds **Connections, Alerts, Dead Letters, Log Search, Engine Status**, and **Users** (the last only if you hold `users:manage`). A heart glyph in the lower-left reflects overall health (green healthy, orange low disk, red engine/DB stopped), and an auto-refresh interval (top-right) drives the active page.
 
-- **Connections** — one row per endpoint (each inbound + each outbound). Select inbound (source) rows and use **Start / Stop / Restart**; select outbound (destination) rows and use the **Actions ▾** menu to **Purge Top Message** or **Purge All Queued Messages** (a confirmed, irreversible drain that cancels queued deliveries — they will not retry). Each row's **Logs** link jumps to Log Search filtered to that connection. Columns show live counts (# Read / # Written / # Errored), queue depth, idle time, and delivery backlog.
+- **Connections** — one row per endpoint (each inbound + each outbound). Select inbound (source) rows and use **Start / Stop / Restart**; select outbound (destination) rows and use the **Actions ▾** menu to **Purge Top Message** or **Purge All Queued Messages** (a confirmed, irreversible drain that cancels queued deliveries — they will not retry). Each row's **Logs** link jumps to Log Search filtered to that connection. Columns show live counts (# Read / # Written / # Errored), queue depth, idle time, and delivery backlog. A connection that failed to build or bind at startup shows a degraded **`failed`** status rather than taking the engine down ([ADR 0031](adr/0031-startup-connection-fault-isolation.md) — recovery is in [troubleshooting](#monitoring-dispositions-and-troubleshooting)).
 
 - **Log Search** — browse the message store and inspect one message at a time. The detail panel has four tabs: **Parse tree** (the structured HL7 view, rendered client-side), **Raw** (exactly what arrived — preserved alongside the transformed form), **Deliveries** (per-destination status, attempts, next-attempt time, last error), and **Audit / events**. This is also where you **Replay** a message: select it and click **Replay** to re-run delivery for a failed/dead-lettered message. Viewing raw bodies is PHI access and is audited server-side with your username.
 
@@ -467,9 +472,9 @@ The left nav holds **Connections, Alerts, Log Search, Engine Status**, and **Use
 
 - **Users** (gated by `users:manage`) — RBAC administration: **Add user…**, **Set roles…**, **Set scope…** (per-channel scope), **Delete**, and **Revoke sessions**. Every operation is audited server-side. Role definitions live in [SECURITY.md](SECURITY.md).
 
-- **Alerts** — a placeholder surface ("coming soon"); alert routing today runs through the engine's AlertSink rather than this page (see [Monitoring dispositions and troubleshooting](#monitoring-dispositions-and-troubleshooting)).
+- **Alerts** — a **read-only view** of the engine's loaded `[alerts]` configuration ([ADR 0014](adr/0014-alerting-rules-engine.md)): which transports are configured (webhook / email — secrets omitted), the global re-alert interval, and the ordered, first-match-wins rule list (event type, connection, min depth, min age, severity, transports, cooldown). Rule editing stays config-file driven and the page never authors or acknowledges alerts; the events themselves still fan out through the engine's AlertSink (see [Monitoring dispositions and troubleshooting](#monitoring-dispositions-and-troubleshooting)).
 
-**Dead letters and replay.** There is no surfaced Dead Letters page in the console nav — a failed or dead-lettered message surfaces in **Log Search** (filter by status, or open it from a connection's **Logs** link), where the **Deliveries** tab shows the per-destination error and the **Replay** button re-drives it. For diagnosing and clearing stuck deliveries, see the troubleshooting guidance in [EARLY-ADOPTER-GUIDE.md](EARLY-ADOPTER-GUIDE.md).
+**Dead letters and replay.** The nav's **Dead Letters** page lists dead-lettered deliveries — one row per message → destination that exhausted its retries — with **Replay selected…** and **Replay all…** actions (columns: *Failed at / Inbound / Destination / Type / Control ID / Attempts / Last error / Summary*). Viewing the list needs `messages:read`; replay needs `messages:replay` and is step-up (re-auth) gated server-side. The same failed message also surfaces in **Log Search** (filter by status, or open it from a connection's **Logs** link), where the **Deliveries** tab shows the per-destination error and a per-message **Replay** — a second route to the same action. For diagnosing and clearing stuck deliveries, see the troubleshooting guidance in [EARLY-ADOPTER-GUIDE.md](EARLY-ADOPTER-GUIDE.md).
 
 ### The VS Code extension (for config authors)
 
@@ -510,7 +515,7 @@ The key operator shift under the staged pipeline: **an `AA` ACK means "received 
 
 - **Console -> Log Search.** The message browser ([console/search.py](../messagefoundry/console/search.py)) has a **status** filter — type a disposition (e.g. `unrouted`, `error`) to narrow the list, then open a message to see its raw body, parse tree, deliveries, and audit trail. The Connections page has a per-connection **Logs** link that opens Log Search pre-filtered to that channel.
 - **Console -> Connections.** The dashboard ([console/connections.py](../messagefoundry/console/connections.py)) shows each connection's live status plus per-connection counts, including an **errored** column, so a climbing error count on one feed is visible at a glance.
-- **API.** `GET /messages?status=error` (and `&channel_id=`, `&message_type=`) is the filter the console uses; `GET /stats` returns outbox-by-status + in-pipeline depth; `GET /status` returns engine uptime, running/stopped channel counts, and DB size/free-disk. All require the `monitoring:read` (stats/status) or `messages:read` (Log Search) permission — see [SECURITY.md](SECURITY.md).
+- **API.** `GET /messages?status=error` (and `&channel_id=`, `&message_type=`) is the filter the console uses; `GET /stats` returns outbox-by-status + in-pipeline depth; `GET /status` returns engine uptime, running/stopped channel counts, and DB size/free-disk; `GET /metrics` exposes a Prometheus exposition (aggregate counts/latency keyed by connection + status, no PHI) for an external scraper — it works on a base install, and the `[otel]` extra adds only the optional OpenTelemetry/OTLP export seam. All require the `monitoring:read` (stats/status/metrics) or `messages:read` (Log Search) permission — see [SECURITY.md](SECURITY.md).
 
 ### The ERROR / dead-letter path: inspect and replay
 
@@ -523,7 +528,7 @@ To recover:
 
 1. **Find the dead-letters.** Console: open the message in Log Search and read its delivery row's **Last error**. API: `GET /dead-letters` (optionally `?channel_id=&destination_name=`) lists dead deliveries newest-first; each row carries `last_error`.
 2. **Fix the cause** (the downstream endpoint, the transform, the config).
-3. **Replay.** `POST /dead-letters/replay` re-queues the dead deliveries (optionally scoped by `channel_id` / `destination_name`); each affected message reverts from `error` to `received` and re-drains. Already-delivered rows are left alone. Replay requires the `messages:replay` permission and is **step-up (re-auth) gated**, and may be held for a second approver when `[approvals]` is configured. (A surfaced console **Dead Letters page** is not yet in the nav — drive replay via the API/CLI; see the [Feature Map](FEATURE-MAP.md).)
+3. **Replay.** `POST /dead-letters/replay` re-queues the dead deliveries (optionally scoped by `channel_id` / `destination_name`); each affected message reverts from `error` to `received` and re-drains. Already-delivered rows are left alone. Replay requires the `messages:replay` permission and is **step-up (re-auth) gated**, and may be held for a second approver when `[approvals]` is configured. (In the console, the **Dead Letters** page lists these and offers **Replay selected…** / **Replay all…** directly; this API path is the equivalent for scripting and automation.)
 
 > Replaying re-transmits real message bodies — it is audited per acting user. Treat it like any PHI action ([PHI.md](PHI.md)).
 
@@ -548,13 +553,14 @@ transports = ["webhook"]
 
 The SMTP password is a secret — supply it via `MEFOR_ALERTS_EMAIL_PASSWORD`, never the file. Per-event severity, transport routing, thresholds, suppression, and cooldown are tuned with ordered `[[alerts.rules]]` tables ([ADR 0014](adr/0014-alerting-rules-engine.md)); an event matching no rule notifies every configured transport at `warning`.
 
-**Important:** alerts are **fire-and-forward notifications**, not a queryable history. There is no alerts API endpoint and no surfaced console Alerts page yet — once configured, you rely on your webhook/email target to see them. Payloads carry only the connection name and queue shape, never message content (no PHI).
+**Important:** alerts are **fire-and-forward notifications**, not a queryable history. A read-only `GET /alerts/rules` endpoint and a console **Alerts** page let you inspect the *loaded* transport config and rule set (secrets and recipients omitted) — but there is no record of *fired* alerts, so for the events themselves you rely on your webhook/email target. Payloads carry only the connection name and queue shape, never message content (no PHI).
 
 ### Common problems
 
 - **Sender got a NAK (AE/AR).** A decode/parse/strict-validate failure rejects *synchronously* at the listener and records `ERROR` **before** any ingress row — the message never entered the pipeline. Fix the inbound HL7 (or relax `validation.strict` on that connection). Treat the message body as untrusted data, not a malformed instruction.
 - **Sender got AA but nothing was delivered.** Expected under ACK-on-receipt: routing/transform/delivery failures happen *after* the ACK. Look at the message's disposition (`UNROUTED`/`FILTERED`/`ERROR`) and the AlertSink — **not** the ACK — for the outcome.
 - **A lane stopped processing.** A `connection_stopped` alert means an outbound's worker halted on an internal/code error (`internal_error = stop`). The messages are preserved for replay; fix the cause, then reload/restart the connection.
+- **A connection shows `failed`.** A connection that can't build or bind **at startup** (bad settings, a port already in use) is isolated as a degraded `failed` status instead of taking the engine down — every other lane keeps running ([ADR 0031](adr/0031-startup-connection-fault-isolation.md)). Fix the config/bind, then recover it: restart an inbound (`POST /connections/{name}/start`), or reload to rebuild a failed outbound. (Reload itself stays fail-fast — a broken config is rejected whole, never partially applied.)
 - **Backlog growing.** A `queue_buildup` alert usually means a retry-forever head is blocking its FIFO lane, or the downstream is down. Check the destination, then inspect/purge or replay the blocking row.
 - **Console can't reach the engine.** The API binds `127.0.0.1:8765` by default and requires auth; confirm the engine is serving (`python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev`) and that the console points at the right host/port.
 - **Low disk / store growing.** `GET /status` reports DB size and free disk; a `storage_threshold` alert fires past `[retention].max_db_mb`. Tune retention in `[retention]` ([CONFIGURATION.md](CONFIGURATION.md)) — purges null PHI bodies while keeping the metadata/disposition rows, so counts and audit stay intact.

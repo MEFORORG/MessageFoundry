@@ -10,7 +10,16 @@ checks). Two checks are **required** (they can block a commit):
 * ``dryrun`` — *only when* a fixtures dir with ``*.hl7`` is given (searched recursively): each message
   routes through its inbound's Router/Handler(s) without erroring. A fixture under a
   ``<messages>/<inbound_name>/`` subdir is dry-run **only** against that feed (#11); a fixture not under
-  such a subdir runs against **every** inbound. Absent fixtures → skipped (never blocks).
+  such a subdir runs against **every** inbound. A fixture may also declare its expected dry-run
+  disposition in a sibling ``<fixture>.expect`` file (``RECEIVED``/``UNROUTED``/``FILTERED``/``ERROR``)
+  — an executable acceptance-criteria check (Secure Development Standards §5); without one the default
+  is "must not ERROR". Absent fixtures → skipped (never blocks).
+
+A third required check, ``posture``, is **best-effort**: when a ``messagefoundry.toml`` is present
+(searched from ``config_dir`` upward + the CWD) it loads the service settings and — if an active
+environment is set whose security posture is unresolved (a *custom* name with no ``[ai].data_class``
+/ ``[ai].production``) — it FAILS, mirroring ``serve``'s fail-closed ``require_posture()`` so the
+foot-gun is caught at commit/CI time instead of at runtime. No ``messagefoundry.toml`` → SKIP.
 
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. Exit-code policy lives in the CLI
@@ -76,7 +85,11 @@ def run_checks(
 ) -> CheckReport:
     """Run the gate against ``config_dir``; ``messages_dir`` enables the dry-run check when it has
     fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass."""
-    results = [_check_validate(config_dir), _check_dryrun(config_dir, messages_dir)]
+    results = [
+        _check_validate(config_dir),
+        _check_dryrun(config_dir, messages_dir),
+        _check_posture(config_dir),
+    ]
     if run_lint:
         results.append(_run_tool("ruff", ["ruff", "check", str(config_dir)]))
         results.append(_run_tool("mypy", ["mypy", str(config_dir)]))
@@ -93,6 +106,43 @@ def _check_validate(config_dir: str | Path) -> CheckResult:
         )
         return CheckResult("validate", ok=False, required=True, detail=detail)
     return CheckResult("validate", ok=True, required=True, detail="no problems")
+
+
+# Executable acceptance criteria for dry-run fixtures (Secure Development Standards §5): a fixture may
+# declare its expected dry-run disposition in a sibling ``<fixture>.expect`` file. ``dry_run`` reports
+# ``RECEIVED`` (would route + deliver), ``UNROUTED`` (no handler matched), ``FILTERED`` (a handler ran
+# but delivered nothing), or ``ERROR`` (parse/validate/router-handler failure). ``PROCESSED``/``ROUTED``
+# are live-only post-delivery states, so they alias to ``RECEIVED`` for authoring ergonomics.
+_DRYRUN_DISPOSITIONS = frozenset({"RECEIVED", "UNROUTED", "FILTERED", "ERROR"})
+_DISPOSITION_ALIASES = {
+    "PROCESSED": "RECEIVED",
+    "ROUTED": "RECEIVED",
+    "DELIVERED": "RECEIVED",
+    "DELIVERS": "RECEIVED",
+}
+
+
+def _expected_disposition(fixture_path: str | Path) -> str | None:
+    """Read an optional ``<fixture>.expect`` sidecar declaring the expected dry-run disposition.
+
+    Returns the normalized disposition name (``RECEIVED``/``UNROUTED``/``FILTERED``/``ERROR``), or
+    ``None`` when no sidecar exists — then the fixture keeps the default "must not ERROR" semantics.
+    Raises ``ValueError`` for an unreadable or unrecognized declaration (a fixture-authoring mistake).
+    """
+    sidecar = Path(f"{fixture_path}.expect")
+    if not sidecar.is_file():
+        return None
+    try:
+        raw = sidecar.read_text(encoding="utf-8").strip().upper()
+    except OSError as exc:
+        raise ValueError(f"cannot read {sidecar.name}: {exc}") from exc
+    normalized = _DISPOSITION_ALIASES.get(raw, raw)
+    if normalized not in _DRYRUN_DISPOSITIONS:
+        valid = ", ".join(sorted(_DRYRUN_DISPOSITIONS))
+        raise ValueError(
+            f"invalid .expect disposition {raw!r} (use one of {valid}; PROCESSED/ROUTED alias RECEIVED)"
+        )
+    return normalized
 
 
 def _check_dryrun(config_dir: str | Path, messages_dir: str | Path | None) -> CheckResult:
@@ -137,21 +187,101 @@ def _check_dryrun(config_dir: str | Path, messages_dir: str | Path | None) -> Ch
     errors: list[str] = []
     total = 0
     pinned = 0
-    for label, _path, raw, target in message_sets:
+    asserted = (
+        0  # runs checked against a declared .expect disposition (executable acceptance criteria)
+    )
+    for label, path, raw, target in message_sets:
+        try:
+            expected = _expected_disposition(path)
+        except ValueError as exc:
+            errors.append(f"{label}: {exc}")
+            continue
         targets = [target] if target is not None else inbound_names
         if target is not None:
             pinned += 1
         for ic_name in targets:
             total += 1
             result = dry_run(reg, raw, inbound=ic_name)
-            if result.error or result.disposition is MessageStatus.ERROR:
+            if expected is not None:
+                asserted += 1
+                actual = result.disposition.name
+                if actual != expected:
+                    errors.append(
+                        f"{label} @ {ic_name}: expected {expected}, got {result.error or actual}"
+                    )
+            elif result.error or result.disposition is MessageStatus.ERROR:
                 errors.append(f"{label} @ {ic_name}: {result.error or result.disposition.value}")
     if errors:
-        detail = f"{len(errors)}/{total} run(s) errored: " + "; ".join(errors[:5])
+        detail = f"{len(errors)}/{total} run(s) failed: " + "; ".join(errors[:5])
         return CheckResult("dryrun", ok=False, required=True, detail=detail)
     pin_note = f", {pinned} feed-pinned" if pinned else ""
-    detail = f"{total} run(s) clean across {len(message_sets)} message(s){pin_note}"
+    exp_note = f", {asserted} expectation-checked" if asserted else ""
+    detail = f"{total} run(s) clean across {len(message_sets)} message(s){pin_note}{exp_note}"
     return CheckResult("dryrun", ok=True, required=True, detail=detail)
+
+
+def _find_service_toml(config_dir: str | Path) -> Path | None:
+    """Best-effort locate this instance's ``messagefoundry.toml`` for the posture check.
+
+    A config repo (ADR 0017) keeps the service toml at its root and the modules under ``config/``,
+    so we search ``config_dir`` and each parent (then the CWD) for ``messagefoundry.toml`` and return
+    the first hit. Absent → ``None`` (the posture check then skips, never errors)."""
+    seen: set[Path] = set()
+    candidates = [Path(config_dir).resolve(), *Path(config_dir).resolve().parents, Path.cwd()]
+    for base in candidates:
+        if base in seen:
+            continue
+        seen.add(base)
+        toml = base / "messagefoundry.toml"
+        if toml.is_file():
+            return toml
+    return None
+
+
+def _check_posture(config_dir: str | Path) -> CheckResult:
+    """Catch the ADR-0017 foot-gun at commit/CI time: a CUSTOM active-environment name (not
+    dev/staging/prod) with no explicit ``[ai].data_class`` / ``[ai].production`` makes ``serve`` fail
+    closed at runtime (``settings.ai.require_posture()``). Mirror that fail-closed check here.
+
+    Best-effort: no ``messagefoundry.toml`` → SKIP (this gate also runs against a bare config dir).
+    No active environment set → SKIP (``serve`` reports that separately; not this check's concern).
+    Settings that won't load → SKIP (don't double-report a config error the operator hits at serve)."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import load_settings
+
+    toml = _find_service_toml(config_dir)
+    if toml is None:
+        return CheckResult(
+            "posture", ok=True, required=True, skipped=True, detail="no messagefoundry.toml"
+        )
+    try:
+        settings = load_settings(config_path=toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        return CheckResult(
+            "posture", ok=True, required=True, skipped=True, detail=f"settings did not load: {exc}"
+        )
+
+    if settings.ai.environment is None:
+        # No active environment is a serve-time error of its own; don't conflate it with posture.
+        return CheckResult(
+            "posture", ok=True, required=True, skipped=True, detail="no active environment set"
+        )
+    try:
+        data_class, production = settings.ai.require_posture()
+    except ValueError as exc:
+        # A custom env name with no explicit posture: serve refuses to start. Fail the gate now,
+        # naming the missing keys exactly as serve's error does.
+        return CheckResult("posture", ok=False, required=True, detail=str(exc))
+    return CheckResult(
+        "posture",
+        ok=True,
+        required=True,
+        detail=(
+            f"environment {settings.ai.environment!r}: "
+            f"data_class={data_class.value}, production={production}"
+        ),
+    )
 
 
 def _run_tool(name: str, cmd: list[str]) -> CheckResult:

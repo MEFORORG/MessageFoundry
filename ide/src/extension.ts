@@ -6,6 +6,7 @@
 // (Engine run/stop + monitoring deliberately live in the Console, not the IDE. To run a local
 //  engine for dev, use `messagefoundry serve` or the Console.)
 import * as vscode from "vscode";
+import { openAlertEditor } from "./alertEditor";
 import { showAiPolicy } from "./aiPolicy";
 import { workspaceDir } from "./cli";
 import { registerCompletion } from "./completion";
@@ -122,10 +123,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("messagefoundry.setupSourceControl", () =>
       setupSourceControl(context),
     ),
-    // Stubs for not-yet-built actions surfaced on the Home page (each is queued in the backlog).
-    vscode.commands.registerCommand("messagefoundry.newAlert", () =>
-      vscode.window.showInformationMessage("MessageFoundry: Alerts authoring is coming soon."),
-    ),
+    // Author a [[alerts.rules]] entry in the service-settings TOML (ADR 0014; webview shells the CLI).
+    vscode.commands.registerCommand("messagefoundry.newAlert", () => openAlertEditor(context)),
     vscode.commands.registerCommand("messagefoundry.generateSamples", () => generateSamples()),
     vscode.commands.registerCommand("messagefoundry.promote", () => promote(context)),
     vscode.commands.registerCommand("messagefoundry.showAiPolicy", () => showAiPolicy()),

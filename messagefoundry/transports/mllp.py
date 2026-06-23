@@ -321,16 +321,27 @@ def _mllp_ssl_context(s: Mapping[str, Any], *, server: bool) -> ssl.SSLContext |
     ``tls_ca_file`` opts into mTLS (require + verify a client cert). **Outbound** (``server=False``):
     verify the peer's cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
     and optionally present ``tls_cert_file`` for mTLS. ``tls_verify=False`` (outbound) is MITM-able and
-    refused unless ``insecure_tls_allowed()``, with a loud warning — exactly as LDAPS / SQL Server."""
+    refused unless ``insecure_tls_allowed()``, with a loud warning — exactly as LDAPS / SQL Server.
+
+    ``tls_key_password`` decrypts a passphrase-encrypted private key (``env()``-sourced, mirroring the
+    API listener's ``MEFOR_API_TLS_KEY_PASSWORD``); ``None`` (the default) loads an unencrypted key
+    exactly as before."""
     if not s.get("tls"):
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
+    # Passphrase for an encrypted private key (both directions). None => unencrypted key, the prior behavior.
+    # An encrypted key with NO passphrase must fail deterministically, not fall back to OpenSSL's blocking
+    # TTY prompt — there is no TTY under a service account / in a container. The empty-bytes callback is
+    # never invoked for an unencrypted key (prior behavior preserved) and yields a clear ssl.SSLError
+    # at build time (surfaced by dry-run / `check`) for an encrypted key that was given no passphrase.
+    key_password = s.get("tls_key_password")
+    pw_arg = key_password if key_password is not None else (lambda: b"")
     if server:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         if not cert:
             raise ValueError("MLLP inbound tls=true requires tls_cert_file (the server identity)")
-        ctx.load_cert_chain(certfile=cert, keyfile=key)
+        ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
         if ca:  # opt-in mTLS: require + verify a client cert against this trust anchor
             ctx.load_verify_locations(cafile=ca)
             ctx.verify_mode = ssl.CERT_REQUIRED
@@ -356,7 +367,7 @@ def _mllp_ssl_context(s: Mapping[str, Any], *, server: bool) -> ssl.SSLContext |
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     if cert:  # optional client identity for mTLS
-        ctx.load_cert_chain(certfile=cert, keyfile=key)
+        ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert

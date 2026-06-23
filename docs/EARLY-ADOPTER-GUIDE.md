@@ -30,7 +30,7 @@ links to it rather than repeating it.
 11. [Staged rollout plan with go/no-go gates](#11-staged-rollout-plan-with-gono-go-gates)
 12. [Day-2 operations & monitoring](#12-day-2-operations--monitoring)
 13. [Upgrade & rollback](#13-upgrade--rollback)
-14. [High availability — setting expectations](#14-high-availability--setting-expectations)
+14. [High availability — rollout & VIP standup runbook](#14-high-availability--rollout--vip-standup-runbook)
 15. [Getting help & reporting bugs](#15-getting-help--reporting-bugs)
 16. [Decommissioning a pilot](#16-decommissioning-a-pilot)
 
@@ -86,6 +86,8 @@ use the table below alongside them when planning.
 | Validation & load tooling (`generate`, `check`, `dryrun`, the test harness, the load harness) | ✅ Built — see §8/§9 and [LOAD-TESTING.md](LOAD-TESTING.md) |
 | Windows-service deployment via NSSM | ✅ Built — see [SERVICE.md](SERVICE.md) |
 | **Native transport TLS** (API + MLLP) | ✅ Built — in-process API TLS (HTTPS/WSS) + per-connection MLLP-over-TLS, ≥TLS 1.2, opt-in mTLS, and a **fail-closed off-loopback bind guard** (a non-loopback bind without TLS is refused). Raw TCP/X12 stay plaintext (loopback/proxy). See [DEPLOYMENT.md](DEPLOYMENT.md). |
+| **Native MFA** (TOTP, local accounts) | ✅ Built — RFC 6238 TOTP + single-use recovery codes; `[auth].require_mfa` enforces a second factor for local Administrators at the step-up boundary. AD/Entra users' MFA stays delegated to the IdP. See [SECURITY.md](SECURITY.md). |
+| **Off-box log + audit forwarding** | ✅ Built — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector. Residual: the syslog transport is plaintext — front it with a local TLS-forwarding agent. See [PHI.md](PHI.md) §7. |
 | **Active-passive HA / failover** | ✅ Built (Track B) — opt-in leader/standby cluster on a **shared server-DB** store (PostgreSQL or SQL Server): only the leader runs the graph, self-fencing leadership lease, immediate on-promotion recovery. Single-node stays the byte-identical default. See [CLUSTERING.md](CLUSTERING.md) + §14. |
 
 ### Experimental or not yet built — **do not depend on these for a production pilot**
@@ -93,7 +95,6 @@ use the table below alongside them when planning.
 | Capability | Status & implication |
 |---|---|
 | **Transport TLS for raw TCP / X12** | ❌ Not built — those two connectors are plaintext-only; keep them on loopback or front with a TLS-terminating proxy. (API + MLLP **do** have native TLS — see §6/[DEPLOYMENT.md](DEPLOYMENT.md).) |
-| **MFA / off-box log shipping** | ❌ Not built (0.2 items that pair with off-loopback exposure). The engine's account lockout covers local accounts; logs stay on-box. |
 | **`ack_after=delivered`** (defer the ACK until downstream delivery) | ❌ Not built — requesting it is rejected at config load. Only **ACK-on-receipt** exists, so a routing/transform/delivery failure happens **after** the sender was already told `AA` and will **not** NAK back. Operators rely on the message disposition + alerts, not the ACK. |
 | **De-identification framework** | ❌ Not built. The AI assistant's `deidentified` scope falls back to `code_only`. |
 | **In-place SQLite → server-DB migration** | ❌ Not built. Server-DB deployments are **greenfield only** — there is no automatic carry-over of SQLite history. Drain and cut over deliberately (§13). |
@@ -201,7 +202,7 @@ host.
 
 | Extra | Pulls in | When |
 |---|---|---|
-| `postgres` | `asyncpg` (pure-Python, no OS dep) | Using the PostgreSQL backend (recommended prod path) |
+| `postgres` | `asyncpg` (no OS dep; ships compiled wheels) | Using the PostgreSQL backend (recommended prod path) |
 | `console` | PySide6 + keyring | Running the desktop admin console |
 | `sftp` | paramiko | SFTP connectors |
 | `sqlserver` | `aioodbc` **+ OS-level Microsoft ODBC Driver 18** | The SQL Server *store* backend (`backend=sqlserver`, production) and the DATABASE connector family. |
@@ -378,7 +379,9 @@ Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DE
       delete `bootstrap-admin.txt`.
 - [ ] **For Active Directory:** use **LDAPS** with a trusted CA, never set `MEFOR_ALLOW_INSECURE_TLS`
       in production, and configure the directory's lockout/complexity policy (the engine's account
-      lockout covers local accounts only). Note: MFA is not built.
+      lockout covers local accounts only). AD/Entra MFA is enforced by your directory; **local
+      accounts** use the engine's **native TOTP MFA** (`[auth].require_mfa`, WP-14) — enable it before
+      an off-loopback PHI exposure.
 - [ ] **Populate the fail-closed `[egress]` allowlist** (it defaults to unrestricted) for REST/Database
       destinations.
 - [ ] **Keep logging at `INFO` or above** and `expose_docs` off in production. Full payloads are never
@@ -601,8 +604,10 @@ as a **separate, later** step so you retain a fallback.
 - [ ] Sustained-load SLO met on production hardware.
 - [ ] DR (backup/restore) rehearsed and scheduled.
 - [ ] On-call + the failure-drill runbook (§12) in place.
-- [ ] If you require HA: either the built **active-passive** cluster (leader/standby on a shared
-      server-DB store — PostgreSQL or SQL Server, §14) or operational HA at the DB tier / via a VIP — decided and rehearsed.
+- [ ] If you require HA: stand up the built **active-passive** cluster (leader/standby on a shared
+      server-DB store — PostgreSQL or SQL Server) via the **§14 HA rollout runbook** — VIP standup +
+      both failover drills passed — and keep HA at the DB tier too. Decided and rehearsed before you
+      depend on it.
 
 ---
 
@@ -679,34 +684,122 @@ upgrades **small and frequent** rather than large and rare.
 
 ---
 
-## 14. High availability — setting expectations
+## 14. High availability — rollout & VIP standup runbook
 
 **Single-node is the default and is genuinely reliable** — the durable staged queue (§7), not
-clustering, is what guarantees no message is lost on one node. When you need failover, MessageFoundry now
-ships an **opt-in active-passive cluster** (Track B) — the supported HA model. Full topology + config:
+clustering, is what guarantees no message is lost on one node. Reach for HA only when you need
+**failover** (an unattended node loss must not stop intake), **not** for throughput (for that, scale
+intra-node — see the end of this section). When you do need it, MessageFoundry ships an **opt-in
+active-passive cluster** (Track B) — the supported HA model. This section is the operational runbook;
+the authoritative topology, lease semantics, and full settings catalog are in
 **[CLUSTERING.md](CLUSTERING.md)**.
 
-**Active-passive failover (built).** Run N identical engine processes against **one shared server database**
-(PostgreSQL or SQL Server) with `[cluster].enabled = true`:
-- **Leader/standby model.** Only the **leader** runs the message graph — all listeners *and* the
-  router/transform/delivery workers. Every other node is a **warm standby** that contends for leadership
-  only (membership heartbeat + cache convergence); it binds no listeners and runs no workers until it
-  acquires leadership, and tears the graph down if it loses it.
-- **Self-fencing leadership lease.** A leader that cannot renew its lease within
-  `leader_fence_timeout_seconds` **self-fences** (a split-brain guard); a standby acquires leadership only
-  once the lease has expired. On promotion the new leader **immediately** recovers the prior leader's
-  in-flight rows (owner-scoped), so failover recovery does not wait on the background lease-reclaim sweep.
-- **Requirements (enforced at config load):** `[store].backend = "postgres"` or `"sqlserver"` (SQLite is
-  rejected for clustering), `[store].pool_size` **≥ 2** (≥ 3 recommended — the leader holds a dedicated
-  connection), the **same config dir on every node**, and **NTP-synced clocks**. Config changes need a
-  **coordinated (non-rolling) restart**.
-- **Front it** with a floating VIP / load-balancer health check so senders follow the active leader, and
-  keep HA at the **DB tier** too (PostgreSQL replication / managed-Postgres HA, or SQL Server Always On) — the engine coordinates
-  the *processing* leader, it does not make your database highly available.
+**The model in one paragraph.** Run N identical engine processes against **one shared server database**
+(PostgreSQL or SQL Server) with `[cluster].enabled = true`. Exactly one node — the **leader/primary** —
+runs the whole message graph (every listener *and* the router/transform/delivery workers); the rest are
+**warm standbys** that only contend for leadership (heartbeat + cache convergence), binding no listeners
+and running no workers until they win it. A **self-fencing leadership lease** in the shared DB elects the
+one primary and guarantees a partitioned old primary stops before a standby takes over. There is no
+separate broker and no node-to-node socket — coordination rides the shared `[store]` connection.
 
-**For throughput on a single node, scale intra-node:** one independent delivery worker per outbound
+### 14.1 Stand up the cluster
+
+1. **Pick a server-DB backend and make the DB tier itself HA.** `[store].backend = "postgres"` or
+   `"sqlserver"` (SQLite is rejected for clustering). MEFOR coordinates the *processing* leader; it does
+   **not** replicate your store — delegate store HA to the database (**PostgreSQL streaming replication /
+   managed-Postgres HA**, or **SQL Server Always On**) and rehearse a DB failover separately.
+2. **Provision every node identically.** Same installed engine version, the **same config dir**, and the
+   **same `[store]` target** (server/database/schema) on each host. Set `[store].pool_size ≥ 2`
+   (**≥ 3 recommended** — the leader drives the maintenance loop + reclaim sweep + workers concurrently).
+3. **Enable the cluster** in the shared `messagefoundry.toml`:
+   ```toml
+   [cluster]
+   enabled = true
+   heartbeat_seconds            = 10.0   # keep the invariant: heartbeat < fence < ttl
+   leader_fence_timeout_seconds = 20.0   # a leader that can't renew self-fences here (split-brain guard)
+   leader_lease_ttl_seconds     = 30.0   # a standby may acquire only once the lease has expired
+   ```
+   The defaults trade a ~30 s crash-failover for margin; lower all three **proportionally** for faster
+   failover at the cost of tolerance for a slow DB / GC pause.
+4. **Sync clocks (NTP).** Row leases use node wall-clock — keep nodes synced so a lease expiry isn't
+   mistimed. (Leadership is evaluated on the *DB* clock, so it's skew-immune; the row leases are not.)
+5. **Start the same `serve` command on every node** (run each as its own NSSM service — see
+   [SERVICE.md](SERVICE.md)). Confirm membership: `GET /cluster/nodes` lists every node and names exactly
+   one `leader_node_id`; each node's `GET /cluster/status` reports `role: "primary"` on one and
+   `"standby"` on the rest.
+
+### 14.2 Stand up the VIP / load balancer (required)
+
+Like Rhapsody/Corepoint, senders must reach "the engine" through a **floating VIP / L4 load balancer**,
+never a fixed node — because **only the primary binds the inbound listener ports**, the VIP is what makes
+a failover transparent (modulo a reconnect). **MEFOR ships the bind behavior and the `/cluster/*`
+endpoints, but does not ship a load balancer** — you stand one up (keepalived + IPVS, HAProxy in `tcp`
+mode, an F5, a cloud **L4 / network** LB, …).
+
+**Data plane (MLLP / raw-TCP / X12 inbound) — one VIP per listener port:**
+
+- [ ] **Mode = L4 / TCP pass-through.** These are byte streams — do **not** front them with an HTTP/L7 LB.
+- [ ] **Health check = a plain TCP connect to that exact listener port** on each backend node. Because
+      only the primary binds the port, exactly one backend is ever healthy, so the VIP routes there
+      automatically; on failover the old primary's port closes (goes unhealthy) and the new primary's
+      opens (goes healthy) and the VIP follows. An application-level (MLLP-message) probe is unnecessary —
+      a TCP connect is the correct, sufficient signal.
+- [ ] **Tune the probe to your failover budget.** The VIP repoints in roughly
+      `check_interval × unhealthy_threshold`; size it well under your acceptable outage and above your
+      DB/GC jitter (a 2–5 s interval is typical).
+- [ ] **If MLLP-over-TLS is on, keep TLS end-to-end** (TCP pass-through) so the engine's own cert is
+      presented; don't terminate TLS at the VIP unless you re-encrypt to the backends.
+- [ ] **Don't let the LB reap long-lived MLLP sockets** — set TCP idle timeouts generous enough for
+      persistent connections.
+- [ ] **Verify every partner reconnects-on-drop.** On failover, connections to the old primary drop and
+      senders must redial the VIP. This is standard MLLP client behavior — confirm it per partner.
+
+**Management plane (console / IDE → engine API) — optional VIP:**
+
+- [ ] The API is a control/read plane over the shared DB and is **up on every node**, so an API VIP can
+      health-check the unauthenticated **`GET /health`** (liveness); you can point the console at any node.
+- [ ] To pin operators to the active leader, read **`GET /cluster/status`** → `role`
+      (`primary`/`standby`) or **`GET /cluster/nodes`** → `leader_node_id` / `lease_owner` (the console
+      already surfaces the live primary). Both endpoints need only `MONITORING_READ` (VIEWER and up; no PHI).
+
+### 14.3 Rehearse & validate failover (before real traffic)
+
+Failover is **not instantaneous** — quantify *your* window from these drills; don't assume zero-downtime.
+
+- [ ] **Clean switchover** (planned): gracefully stop the primary's service. It **expires its lease**, so
+      a standby promotes on its next heartbeat (**≈ one `heartbeat_seconds`**). Watch `leader_node_id`
+      move on `/cluster/nodes`, watch the VIP repoint, and keep synthetic traffic flowing throughout.
+- [ ] **Crash** (unplanned): hard-kill / power off the primary. Its lease **ages out**, so a standby
+      promotes after **up to `leader_lease_ttl_seconds`** (~30 s default); a partitioned old primary
+      **self-fences within `leader_fence_timeout_seconds`** so it can't double-process. Confirm the new
+      primary's **owner-scoped on-promotion recovery** re-pends the dead primary's in-flight rows
+      immediately (delivery resumes without waiting out the per-row lease TTL).
+- [ ] **Zero-loss across the failover.** At-least-once means a row interrupted mid-delivery is
+      **re-delivered** after its lease expires — so confirm your downstream connectors **dedupe / are
+      idempotent**, then reconcile sent-vs-delivered across the drill.
+- [ ] **Record the measured window** and, if needed, tune `heartbeat < fence < ttl` down proportionally
+      and re-drill.
+
+### 14.4 HA go-live checklist
+
+- [ ] Server-DB backend; **DB-tier HA configured and its own failover rehearsed**.
+- [ ] Identical engine version + config dir + `[store]` target on every node; `pool_size ≥ 3`; **clocks
+      NTP-synced**.
+- [ ] `/cluster/nodes` shows all nodes and exactly one `leader_node_id`.
+- [ ] **VIP per inbound port** with a **TCP-connect health check**; partner **reconnect-on-drop** verified.
+- [ ] **Clean-switchover drill** passed (≈ one heartbeat, VIP follows, zero loss).
+- [ ] **Crash drill** passed (failover within the TTL, no double-processing, in-flight rows recovered,
+      zero loss).
+- [ ] Measured failover window documented; lease timings tuned to your network.
+- [ ] **Config changes applied as a coordinated (non-rolling) restart** — all nodes restart together so
+      they never run divergent graphs across the change window.
+- [ ] `/cluster/status` + `/cluster/nodes` monitored (alert on **no live leader** beyond a failover
+      window) alongside the §12 surfaces.
+
+**For throughput (not failover), scale intra-node:** one independent delivery worker per outbound
 connection (a slow/failing lane never blocks siblings), and keep retry policies finite where head-of-line
-blocking on a shared FIFO lane would otherwise stall throughput.
+blocking on a shared FIFO lane would otherwise stall throughput. Adding cluster nodes does **not** raise
+throughput — only the leader processes.
 
 ---
 

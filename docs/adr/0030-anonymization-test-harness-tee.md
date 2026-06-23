@@ -1,9 +1,8 @@
 # ADR 0030 — Anonymizer / de-identification for the test harness + tee (`messagefoundry.anon`)
 
-- **Status:** **Accepted (2026-06-20) — ratified on the owner's go.** Build may start (in a dedicated `anon` worktree); **no code yet**. The forks below
-  (module home, rules model, surrogate strategy, leak-gate reconciliation) are the things to ratify
-  before a build starts.
-- **Built (this ADR):** Nothing here yet. It layers on already-shipped substrate: the pure HL7 model
+- **Status:** **Accepted (2026-06-20) — ratified on the owner's go; built and shipped (PR #440).** The forks below
+  (module home, rules model, surrogate strategy, leak-gate reconciliation) were ratified before the build.
+- **Built (this ADR):** **shipped (PR #440)** — the pure-stdlib `messagefoundry.anon` package (`hl7.py`/`keying.py`/`rules.py`/`surrogates.py`/`leak.py`, vendored byte-identical to `tee/anon/`) plus the tee `anonymize-captures` subcommand. It layers on already-shipped substrate: the pure HL7 model
   [`parsing/message.py`](../../messagefoundry/parsing/message.py) (`Message.set`/`encode`, MSH-derived
   `_encoding_chars`, repetition handling) and [`parsing/peek.py`](../../messagefoundry/parsing/peek.py)
   (tolerant python-hl7 peek); the surrogate pools + datatype encoders in
@@ -252,7 +251,7 @@ blocks the whole output). The mechanism, spelled out so the SoT claim is honest:
 
 **Two coexisting match modes, not one replacing the other.** A **new, separate** case-insensitive
 **substring** match mode is invoked **only by the anonymizer's `leak_check` over message bodies** — where
-fail-closed-on-false-positive is acceptable and safer than missing `^MERCYHOSP^` inside a field (which the
+fail-closed-on-false-positive is acceptable and safer than missing `^ACMEHOSP^` inside a field (which the
 publish-prose `\b…\b` word-boundary form misses). The existing **publish/pre-commit path keeps its `\b`
 word-boundary regexes** over staged source/config files — substring matching is **not** a global change to
 the publish guard. (Caveat for the owner pass: a bare `54\d{4}` substring over HL7 bodies — dense with

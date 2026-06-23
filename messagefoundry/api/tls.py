@@ -32,10 +32,14 @@ def build_api_ssl_context(api: ApiSettings) -> ssl.SSLContext:
         raise ValueError("build_api_ssl_context requires [api].tls_cert_file")
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = _MIN_VERSION[api.tls_min_version]
+    # An encrypted key with no passphrase must fail deterministically, not fall back to OpenSSL's blocking
+    # TTY prompt (no TTY under a service account / in a container). The empty-bytes callback is never
+    # invoked for an unencrypted key (prior behavior preserved) and raises ssl.SSLError otherwise.
+    pw_arg = api.tls_key_password if api.tls_key_password is not None else (lambda: b"")
     ctx.load_cert_chain(
         certfile=api.tls_cert_file,
         keyfile=api.tls_key_file,
-        password=api.tls_key_password,
+        password=pw_arg,
     )
     if api.tls_ciphers:
         ctx.set_ciphers(api.tls_ciphers)

@@ -1,7 +1,6 @@
 // "Home" — a webview view at the top of the MessageFoundry sidebar: grouped action cards that run
-// extension commands. Authoring/test actions are live; not-yet-built ones (Generate, Promote, Alert)
-// run stub commands that say "coming soon". Monitoring + engine run/stop deliberately live in the
-// Console, not here.
+// extension commands. Every action is live; the `soon` flag renders a "soon" badge for any action
+// still queued in the backlog. Monitoring + engine run/stop deliberately live in the Console, not here.
 import * as vscode from "vscode";
 
 interface Action {
@@ -18,7 +17,7 @@ const GROUPS: { title: string; actions: Action[] }[] = [
       { id: "messagefoundry.newConnection", label: "New Connection" },
       { id: "messagefoundry.newRouter", label: "New Router" },
       { id: "messagefoundry.newHandler", label: "New Handler" },
-      { id: "messagefoundry.newAlert", label: "New Alert", soon: true },
+      { id: "messagefoundry.newAlert", label: "New Alert" },
     ],
   },
   {

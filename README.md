@@ -113,21 +113,21 @@ supported production artifact, with no source checkout required. Install it as a
 dependency**, then scaffold your own config repo ([ADR 0017](docs/adr/0017-consumer-deployment-model.md)):
 
 ```bash
-pip install "messagefoundry==0.1.0"   # pin the exact engine version (core runtime, SQLite store)
+pip install "messagefoundry==0.2.0"   # pin the exact engine version (core runtime, SQLite store)
 messagefoundry init ./my-config-repo     # scaffold a standalone config repo
 cd ./my-config-repo
 messagefoundry serve --config config --env dev
 ```
 
-`0.1.0` is the current **Early Access** release on PyPI. Always **pin the exact version** so
+`0.2.0` is the current **Early Access** release on PyPI. Always **pin the exact version** so
 upgrades stay deliberate. Add the extras your deployment needs (each is opt-in and lazy-imported):
 
 ```bash
-pip install "messagefoundry[postgres]==0.1.0"    # PostgreSQL store backend (production server DB)
-pip install "messagefoundry[sqlserver]==0.1.0"   # SQL Server store backend (+ OS-level ODBC Driver 18)
-pip install "messagefoundry[console]==0.1.0"     # PySide6 admin console
-pip install "messagefoundry[sftp]==0.1.0"        # SFTP transport for the REMOTEFILE connector
-pip install "messagefoundry[dicom]==0.1.0"       # DICOM codec + C-STORE SCP (pydicom + pynetdicom)
+pip install "messagefoundry[postgres]==0.2.0"    # PostgreSQL store backend (production server DB)
+pip install "messagefoundry[sqlserver]==0.2.0"   # SQL Server store backend (+ OS-level ODBC Driver 18)
+pip install "messagefoundry[console]==0.2.0"     # PySide6 admin console
+pip install "messagefoundry[sftp]==0.2.0"        # SFTP transport for the REMOTEFILE connector
+pip install "messagefoundry[dicom]==0.2.0"       # DICOM codec + C-STORE SCP (pydicom + pynetdicom)
 ```
 
 > **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow,

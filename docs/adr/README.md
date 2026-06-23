@@ -9,6 +9,12 @@ build may start) → `Superseded by NNNN` / `Rejected`. A `Reserved` row is a **
 for a not-yet-authored ADR — recorded here (coordinator-owned) so parallel sessions don't collide on
 ADR numbers; the row gets a title/file/link when the ADR is authored.
 
+**Authoring a new ADR.** Start from [`TEMPLATE.md`](TEMPLATE.md). Capture behavioural **Acceptance
+Criteria** in EARS form, each linked (`→`) to the test or fixture that verifies it, and resolve the
+**To resolve on acceptance** items before flipping to `Accepted` — the spec-driven practices
+recommended in [Secure Development Standards §5](../Secure_Development_Standards.md). Run
+`messagefoundry adr-analyze` for an advisory report of criteria→test coverage and open clarifications.
+
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-staged-pipeline-architecture.md) | Staged pipeline — per-stage durable queues | Accepted |

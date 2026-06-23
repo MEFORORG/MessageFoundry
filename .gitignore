@@ -27,6 +27,10 @@ bootstrap-admin.txt
 *.pfx
 secrets/
 
+# Container deployment secrets + TLS material — never commit (the *.example templates ARE tracked)
+/docker/secrets.env
+/docker/tls/
+
 # Generated, regenerable test corpus (build with: python -m messagefoundry.generators.adt)
 /samples/messages/adt/
 
@@ -52,3 +56,11 @@ TRANSCRIPTS.md
 # (docs/DUAL_LICENSING_PLAN.md is now a committed artifact — see ADR 0017 / #13 licensing)
 /docs/marketing/
 /docs/security/CISO-REVIEW.md
+/docs/security/DEPENDENCY-POSTURE-REVIEW.md
+/docs/security/DEPENDENCY-RESPONSE-PLAN.md
+/docs/security/DEPENDENCY-CUSTOMER-OFFERINGS.md
+/docs/security/DEPENDENCY-RESPONSE-HANDOFF.md
+/docs/security/DEPENDENCY-RESPONSE-A3-HANDOFF.md
+/docs/security/DEPENDENCY-RESPONSE-A4-HANDOFF.md
+# vuln_metrics.py local CSV output (the CI run uploads it as an artifact; not committed)
+/docs/security/metrics/

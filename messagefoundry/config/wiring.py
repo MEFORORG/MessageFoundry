@@ -73,6 +73,7 @@ __all__ = [
     "Rest",
     "FHIR",
     "DICOM",
+    "DICOMweb",
     "Database",
     "DatabasePoll",
     "Soap",
@@ -493,6 +494,7 @@ _SECRET_SETTING_KEYS = frozenset(
         "basic_password",
         "basic_user",
         "key_password",
+        "tls_key_password",  # MLLP-over-TLS encrypted-key passphrase (WP-13b)
         "private_key",
         "api_key",
         "token",
@@ -558,6 +560,9 @@ def MLLP(
     tls_cert_file: str
     | None = None,  # inbound: SERVER cert (required when tls); outbound: CLIENT cert (mTLS)
     tls_key_file: str | None = None,  # private key for tls_cert_file
+    tls_key_password: str
+    | EnvRef
+    | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str
     | None = None,  # trust anchor — inbound: verify client certs (mTLS); outbound: verify server
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
@@ -583,9 +588,12 @@ def MLLP(
     **TLS (WP-13b).** ``tls=True`` wraps the connection: inbound presents ``tls_cert_file``/``tls_key_file``
     (a server identity; ``tls_ca_file`` adds opt-in mTLS — require + verify a client cert); outbound
     verifies the server cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
-    and may present ``tls_cert_file`` for mTLS. ``tls_verify=False`` (outbound) is MITM-able and refused
-    unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning) — exactly like LDAPS / SQL Server. TLS is
-    TLS 1.2+ and composes with the ``[egress].allowed_mllp`` allowlist (both enforced)."""
+    and may present ``tls_cert_file`` for mTLS. ``tls_key_password`` decrypts a passphrase-encrypted
+    ``tls_key_file`` (supply it via ``env()`` so the secret stays out of config — mirrors the API
+    listener's ``MEFOR_API_TLS_KEY_PASSWORD``); omit it for an unencrypted key. ``tls_verify=False``
+    (outbound) is MITM-able and refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning) —
+    exactly like LDAPS / SQL Server. TLS is TLS 1.2+ and composes with the ``[egress].allowed_mllp``
+    allowlist (both enforced)."""
     return ConnectionSpec(
         ConnectorType.MLLP,
         {
@@ -603,6 +611,7 @@ def MLLP(
             "tls": tls,
             "tls_cert_file": tls_cert_file,
             "tls_key_file": tls_key_file,
+            "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
             "tls_verify": tls_verify,
             "tls_check_hostname": tls_check_hostname,
@@ -937,10 +946,14 @@ def DICOM(
     cleartext SCP (no ``tls``) is refused at startup unless ``serve --allow-insecure-bind`` (PHI on the
     wire, §9).
 
-    **Phase 2 (designed, not built):** the same family backs the outbound **C-STORE SCU** + **C-ECHO**
-    destination — ``host``/``called_ae_title``/``connect_timeout`` configure dialing a downstream PACS;
-    egress is gated by ``[egress].allowed_tcp`` (a raw socket, like X12). Authoring an ``outbound(...)``
-    DICOM connection raises until the SCU destination lands."""
+    **Phase 2 (built): the outbound C-STORE SCU + C-ECHO destination.** Pair the same ``DICOM(...)`` with
+    ``outbound(...)`` to **forward** a DICOM object to a downstream PACS over a C-STORE association —
+    ``host``/``called_ae_title``/``connect_timeout`` configure dialing the peer; egress is gated by
+    ``[egress].allowed_tcp`` (a raw socket, like X12). The destination recovers the outgoing object's
+    bytes from the base64 carriage (ADR 0028), runs the blocking association **off the event loop**, and
+    classifies the C-STORE status onto the retry model (out-of-resources → retry; a hard refusal →
+    dead-letter). ``test_connection`` issues a **C-ECHO** (the DIMSE reachability ping). The modern HTTP
+    imaging lane is the sibling :func:`DICOMweb` STOW-RS destination."""
     return ConnectionSpec(
         ConnectorType.DIMSE,
         {
@@ -960,6 +973,57 @@ def DICOM(
             "max_pdu_size": max_pdu_size,
             "timeout_seconds": timeout_seconds,
             "connect_timeout": connect_timeout,
+        },
+    )
+
+
+def DICOMweb(
+    *,
+    url: str | EnvRef,  # the DICOMweb STOW-RS BASE url, e.g. https://host/dicom-web (may be env())
+    study_uid: str | EnvRef | None = None,  # POST to {base}/studies (server assigns) or, when set,
+    # {base}/studies/{study_uid} (store into a known study)
+    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    bearer_token: str
+    | EnvRef
+    | None = None,  # Authorization: Bearer … (OAuth; use env() for the secret)
+    basic_user: str
+    | EnvRef
+    | None = None,  # HTTP Basic (with basic_password); use env() for secrets
+    basic_password: str | EnvRef | None = None,
+    timeout_seconds: float = 30.0,
+    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    encoding: str = "utf-8",
+    capture_response: bool = False,  # capture the STOW-RS dicom+json response as a reply (ADR 0013)
+    reingress_to: str
+    | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
+) -> ConnectionSpec:
+    """A **DICOMweb STOW-RS** endpoint (ADR 0025 Phase 2 — **outbound destination only**; an inbound
+    STOW-RS receiver awaits the HTTP listener, ADR 0023). The Handler produces (or forwards) a DICOM
+    Part-10 object — carried base64 over the str/store substrate (ADR 0028) — and this **stores** it to
+    the DICOMweb service ``url`` (the **base**, e.g. ``https://host/dicom-web``) via a STOW-RS
+    ``POST {base}/studies`` (or ``{base}/studies/{study_uid}`` when ``study_uid`` is set), framing the
+    object as ``multipart/related; type="application/dicom"``. It is a **sibling of the REST destination**
+    — it reuses the hardened HTTP plumbing (no-redirect TLS-verifying opener, cleartext-credential
+    refusal, the retry/dead-letter classification, the ``[egress].allowed_http`` gate) and adds only the
+    STOW-RS multipart framing + the ``application/dicom+json`` response classification (a per-instance
+    ``FailedSOPSequence`` → permanent dead-letter; 5xx/408/429/connection errors → retry). This is the
+    modern HTTP imaging lane that **exceeds** both Mirth's and Corepoint's DICOM options. Put secrets in
+    ``env()`` (``bearer_token``/``basic_*``), never in ``headers``. The DICOMweb server **must be
+    idempotent** (delivery is at-least-once; a re-store of the same SOPInstanceUID is the native lever)."""
+    return ConnectionSpec(
+        ConnectorType.DICOMWEB,
+        {
+            "url": url,  # stored under "url" (NOT base_url) so the §6.4 HTTP egress gate reads the same key
+            "study_uid": study_uid,
+            "headers": headers or {},
+            "bearer_token": bearer_token,
+            "basic_user": basic_user,
+            "basic_password": basic_password,
+            "timeout_seconds": timeout_seconds,
+            "verify_tls": verify_tls,
+            "encoding": encoding,
+            "capture_response": capture_response,
+            "reingress_to": reingress_to,
         },
     )
 

@@ -93,8 +93,8 @@ backend that consumes the server-DB keys lands incrementally (the settings + val
 > **MLLP-over-TLS** is built too (WP-13b — per-connection `tls`/`tls_*` on the `MLLP(...)` connector,
 > see [CONNECTIONS.md](CONNECTIONS.md)), and the §0 **exposed-gate is enforced**: a non-loopback
 > *plaintext* MLLP listener is refused at startup unless `serve --allow-insecure-bind`. Gate #4's
-> transport-TLS subset is complete; MFA (WP-14) is 0.2. See
-> [ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md).
+> transport-TLS subset is complete, and **native TOTP MFA (WP-14) is also built** (`[auth].require_mfa`,
+> local accounts). See [ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md).
 
 ### `[inbound]` — inbound listener defaults
 | Key | Type | Default | Notes |

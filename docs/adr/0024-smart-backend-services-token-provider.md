@@ -1,10 +1,10 @@
 # ADR 0024 — SMART Backend Services token provider (OAuth2 client-credentials, signed-JWT client assertion) for the FHIR/REST outbound
 
-- **Status:** **Accepted (2026-06-20)** — design-only (no code yet); build may start. It is the bounded **client-side** OAuth2 layer that ADR
+- **Status:** **Accepted (2026-06-20); built and shipped (PR #432).** It is the bounded **client-side** OAuth2 layer that ADR
   0022's "Out of scope — SMART-on-FHIR OAuth2 flows" line deferred, and the concrete shape of the remaining
   [FEATURE-MAP.md](../FEATURE-MAP.md) §7 SMART item. Build may start once this ADR is **Accepted**; it depends
   **only** on the already-shipped ADR 0022 transport + ADR 0018 signing core.
-- **Built (this ADR):** nothing. It layers a token-acquisition step onto **already-shipped** substrate:
+- **Built (this ADR):** **shipped (PR #432)** — the SMART Backend Services token provider in [transports/smart.py](../../messagefoundry/transports/smart.py) (`with_smart_backend`). It layers a token-acquisition step onto **already-shipped** substrate:
   - the FHIR/REST outbound destinations ([transports/fhir.py](../../messagefoundry/transports/fhir.py),
     [transports/rest.py](../../messagefoundry/transports/rest.py)) that already POST/PUT FHIR over hardened,
     TLS-verifying, no-redirect, egress-gated HTTP — and already carry an `Authorization` header (static

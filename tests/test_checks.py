@@ -272,3 +272,170 @@ def test_check_json_shape(capsys: pytest.CaptureFixture[str]) -> None:
     assert set(report.keys()) == {"ok", "checks"}
     for c in report["checks"]:  # type: ignore[union-attr]
         assert set(c.keys()) == {"name", "ok", "required", "skipped", "detail"}
+
+
+# --- executable acceptance criteria: <fixture>.expect (Secure Development Standards §5 / R2) -------
+
+
+def _delivering_config(tmp_path: Path) -> Path:
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, File, Send\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        "outbound('OB_X', File(directory='out'))\n"
+        "@router('r')\n"
+        "def r(m): return ['h']\n"
+        "@handler('h')\n"
+        "def h(m): return Send('OB_X', m)\n",
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def _unrouted_config(tmp_path: Path) -> Path:
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, router, File\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        "@router('r')\n"
+        "def r(m): return []\n",
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def _run_dryrun(cfg: Path, msgs: Path) -> checks.CheckResult:
+    results = run_checks(cfg, messages_dir=msgs, run_lint=False).results
+    return next(r for r in results if r.name == "dryrun")
+
+
+def _feed_fixture(tmp_path: Path, body: bytes, expect: str | None) -> Path:
+    msgs = tmp_path / "messages" / "IB_X"
+    msgs.mkdir(parents=True)
+    (msgs / "a.hl7").write_bytes(body)
+    if expect is not None:
+        (msgs / "a.hl7.expect").write_text(expect, encoding="utf-8")
+    return tmp_path / "messages"
+
+
+def test_expect_received_matches_delivering_fixture(tmp_path: Path) -> None:
+    cfg = _delivering_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "RECEIVED\n")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and dr.required, dr.detail
+    assert "expectation-checked" in dr.detail
+
+
+def test_expect_mismatch_fails(tmp_path: Path) -> None:
+    cfg = _delivering_config(tmp_path)  # actually RECEIVED
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "FILTERED\n")
+    dr = _run_dryrun(cfg, msgs)
+    assert not dr.ok and dr.required
+    assert "expected FILTERED" in dr.detail and "RECEIVED" in dr.detail
+
+
+def test_expect_error_passes_for_malformed_message(tmp_path: Path) -> None:
+    # A fixture that should dead-letter: assert ERROR, and the malformed HL7 makes it so → passes.
+    cfg = _delivering_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, b"NOT-AN-HL7-MESSAGE\r", "ERROR")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and dr.required, dr.detail
+
+
+def test_expect_unrouted_is_case_insensitive(tmp_path: Path) -> None:
+    cfg = _unrouted_config(tmp_path)  # router returns [] → UNROUTED
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "unrouted\n")
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and dr.required, dr.detail
+
+
+def test_expect_processed_aliases_received(tmp_path: Path) -> None:
+    cfg = _delivering_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "PROCESSED\n")  # alias → RECEIVED
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok, dr.detail
+
+
+def test_expect_invalid_value_fails(tmp_path: Path) -> None:
+    cfg = _delivering_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "BOGUS")
+    dr = _run_dryrun(cfg, msgs)
+    assert not dr.ok and dr.required
+    assert "invalid .expect" in dr.detail
+
+
+def test_no_expect_keeps_default_semantics(tmp_path: Path) -> None:
+    # Without a .expect sidecar a delivering fixture passes and is NOT expectation-checked.
+    cfg = _delivering_config(tmp_path)
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), None)
+    dr = _run_dryrun(cfg, msgs)
+    assert dr.ok and "expectation-checked" not in dr.detail
+
+
+# --- posture check (#5): catch a custom env with no explicit posture at check time ----------------
+
+
+def _config_repo(tmp_path: Path, toml_body: str) -> Path:
+    """A minimal ADR-0017-shaped config repo: messagefoundry.toml at the root, modules under config/."""
+    repo = tmp_path / "repo"
+    cfg = repo / "config"
+    cfg.mkdir(parents=True)
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, router, File\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        "@router('r')\n"
+        "def r(m): return []\n",
+        encoding="utf-8",
+    )
+    (repo / "messagefoundry.toml").write_text(toml_body, encoding="utf-8")
+    return cfg
+
+
+def test_posture_fails_custom_env_without_posture(tmp_path: Path) -> None:
+    # A CUSTOM env name (not dev/staging/prod) with no [ai].data_class/[ai].production is exactly the
+    # serve-time foot-gun: require_posture() raises, so the check must FAIL and name the missing keys.
+    cfg = _config_repo(tmp_path, '[ai]\nenvironment = "poc"\n')
+    report = run_checks(cfg, run_lint=False)
+    posture = next(r for r in report.results if r.name == "posture")
+    assert posture.required and not posture.ok and not posture.skipped
+    assert "data_class" in posture.detail and "production" in posture.detail
+    assert report.ok is False  # a required check failed -> the gate fails
+
+
+def test_posture_ok_builtin_env(tmp_path: Path) -> None:
+    # A built-in env name (dev) derives its posture, so the check passes without explicit keys.
+    cfg = _config_repo(tmp_path, '[ai]\nenvironment = "dev"\n')
+    report = run_checks(cfg, run_lint=False)
+    posture = next(r for r in report.results if r.name == "posture")
+    assert posture.required and posture.ok and not posture.skipped
+    assert "dev" in posture.detail
+
+
+def test_posture_ok_custom_env_with_explicit_posture(tmp_path: Path) -> None:
+    # A custom name is fine once posture is set explicitly (decoupled from the name, ADR 0017).
+    cfg = _config_repo(
+        tmp_path, '[ai]\nenvironment = "poc"\ndata_class = "synthetic"\nproduction = false\n'
+    )
+    report = run_checks(cfg, run_lint=False)
+    posture = next(r for r in report.results if r.name == "posture")
+    assert posture.required and posture.ok and not posture.skipped
+
+
+def test_posture_skips_without_service_toml(tmp_path: Path) -> None:
+    # No messagefoundry.toml in the config tree (or CWD) -> skip gracefully, never error. The bare
+    # samples/config dir has no service toml above it, so this also covers the common standalone case.
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, router, File\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        "@router('r')\n"
+        "def r(m): return []\n",
+        encoding="utf-8",
+    )
+    report = run_checks(cfg, run_lint=False)
+    posture = next(r for r in report.results if r.name == "posture")
+    assert posture.required and posture.ok and posture.skipped
+    assert report.ok is True  # a skip never blocks

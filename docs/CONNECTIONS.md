@@ -43,7 +43,8 @@ Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sa
 | `FHIR-IN` | inbound | FHIR REST endpoint (server facade) | (FHIR Listener) | ⏳ planned (ADR 0023) |
 | `FHIR-OUT` | outbound | FHIR REST client | (FHIR Sender) | ✅ |
 | `DICOM-IN` | inbound | DICOM C-STORE SCP listener | DICOM Listener | ✅ (ADR 0025 Phase 1) |
-| `DICOM-OUT` | outbound | DICOM C-STORE SCU / C-ECHO / DICOMweb STOW-RS | DICOM Sender | ⏳ planned (ADR 0025 Phase 2) |
+| `DICOM-OUT` | outbound | DICOM C-STORE SCU + C-ECHO sender | DICOM Sender | ✅ (ADR 0025 Phase 2) |
+| `DICOMWEB-OUT` | outbound | DICOMweb STOW-RS store/send | (DICOMweb Sender) | ✅ (ADR 0025 Phase 2) |
 | `JMS-IN` / `JMS-OUT` | in/out | JMS queue consumer/producer | JMS Listener/Sender | ⏳ planned |
 | `MAIL-IN` | inbound | POP3/IMAP mailbox poll | Email Reader | ⏳ planned |
 | `SMTP-OUT` | outbound | SMTP email send | SMTP Sender | ⏳ planned |
@@ -778,17 +779,20 @@ snippet above into your own config dir.) **Out of scope (ADR 0024):** SMART **Ap
 browser flow), the SMART **authorization/resource server** facade (the system-of-record's role; gated on
 ADR 0023), JWKS hosting, `.well-known` discovery, and Bulk Data `$export`.
 
-### DICOM — `DICOM(...)` (inbound C-STORE SCP, ADR 0025 Phase 1)
+### DICOM — `DICOM(...)` (inbound C-STORE SCP + outbound C-STORE SCU/C-ECHO) and `DICOMweb(...)` (STOW-RS), ADR 0025
 
-An **inbound** DICOM connector (`ConnectorType.DIMSE`) — a **C-STORE SCP** listener that accepts stored
-DICOM objects over DIMSE/`pynetdicom` ([ADR 0025](adr/0025-dicom-codec-store-connectors.md) Phase 1). It
-carries the object **opaquely** — pair an inbound `DICOM(...)` with `content_type="dicom"` so each received
-object routes as a `RawMessage` ([ADR 0004](adr/0004-payload-agnostic-ingress.md)); a Router/Handler parses
-it on demand via `messagefoundry.parsing.dicom` (a cheap `DicomPeek` for routing, `DicomDataset` +
-SR→HL7 helpers for transform). The codec is **headers and Structured Report only — no pixel data**. The
-connector needs the **`[dicom]` optional extra** (`pip install 'messagefoundry[dicom]'`:
-`pydicom>=3.0.2,<4` + `pynetdicom>=3.0.4,<4`, pure-Python, no numpy), lazily imported. There is **no DICOM
-*outbound* yet** — the C-STORE SCU, C-ECHO, and DICOMweb STOW-RS are **Phase 2** (designed, not built).
+A **DICOM** connector (`ConnectorType.DIMSE`) is both an **inbound C-STORE SCP** listener and an
+**outbound C-STORE SCU** sender over DIMSE/`pynetdicom` ([ADR 0025](adr/0025-dicom-codec-store-connectors.md));
+`DICOMweb(...)` (`ConnectorType.DICOMWEB`) is the modern HTTP imaging lane — an **outbound STOW-RS** store/send
+destination. All three carry the object **opaquely** — pair an inbound `DICOM(...)` with `content_type="dicom"`
+so each received object routes as a `RawMessage` ([ADR 0004](adr/0004-payload-agnostic-ingress.md)); a
+Router/Handler parses it on demand via `messagefoundry.parsing.dicom` (a cheap `DicomPeek` for routing,
+`DicomDataset` + SR→HL7 helpers for transform), and a forwarding Handler re-emits the carried bytes to a SCU
+or STOW-RS destination. The codec is **headers and Structured Report only — no pixel data**. The DIMSE
+connectors need the **`[dicom]` optional extra** (`pip install 'messagefoundry[dicom]'`:
+`pydicom>=3.0.2,<4` + `pynetdicom>=3.0.4,<4`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
+extra** (it stores the object as opaque bytes over the shared `rest.py` HTTP plumbing). Still out of scope:
+MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -860,9 +864,84 @@ The full worked route (with the outbound MLLP + `env()` wiring) ships at
   cap and association/DoS caps, a generalized non-loopback **bind-guard** (a non-loopback listener is a
   deliberate operator decision, as with MLLP/TCP), and **DICOM-over-TLS**. The codec reads **headers/SR
   only** — no pixel-data surface.
-- **Deferred follow-ups (Phase 2, designed-not-built):** the **C-STORE SCU** + **C-ECHO** outbound and a
-  **DICOMweb STOW-RS** client. **MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling are
+- **Outbound is built (Phase 2).** The **C-STORE SCU** + **C-ECHO** sender and the **DICOMweb STOW-RS**
+  destination ship below. **MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling remain
   out of scope.**
+
+#### `DICOM(...)` outbound — C-STORE SCU + C-ECHO (ADR 0025 Phase 2)
+
+Pair the **same** `DICOM(...)` factory with `outbound(...)` to **forward** a DICOM object to a downstream
+PACS over a C-STORE association (full Mirth-sender parity). A forwarding Handler returns the carried object
+bytes (`Send("OB_PACS", msg.encode())` for a pass-through, or a re-built object); the SCU recovers the bytes
+from the base64 carriage (ADR 0028), runs the blocking association **off the event loop**, and classifies
+the C-STORE status onto the retry model. `test_connection` issues a **C-ECHO** (the DIMSE reachability ping
+behind the console's "Test Connection"). Egress is gated by `[egress].allowed_tcp` (a raw socket, like X12).
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `ae_title` | — (required) | this engine's **calling** AE title |
+| `host` | — (required for outbound) | the downstream PACS host (`env()`-able) |
+| `port` | `104` | the peer's DIMSE port |
+| `called_ae_title` | `None` → `ANY-SCP` | the peer SCP's AE title to address |
+| `max_object_bytes` | `134217728` (128 MiB) | reject an over-cap object **before** dialing (permanent — no retry) |
+| `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
+| `connect_timeout` | `10.0` | association-request (TCP connect) timeout |
+| `tls` / `tls_ca_file` / `tls_cert_file` / `tls_key_file` | `false` / — | **DICOM-over-TLS**: verify the peer's server cert (`tls_ca_file` pins the anchor); `tls_cert_file`/`tls_key_file` opt into **mTLS** |
+
+**Status → retry classification.** C-STORE **Success** (`0x0000`) / a **Warning** (`0xB0xx`, stored with a
+caveat) → delivered; **Out of Resources** (`0xA7xx`) or an association/transport failure → transient
+`DeliveryError` (retried with backoff); any other hard refusal (Cannot Understand, dataset-does-not-match-SOP,
+Not Authorized, SOP-class-not-supported) → permanent `NegativeAckError` → dead-letter. **Idempotency:**
+delivery is at-least-once, so a retry re-sends the same object — the receiving PACS must be idempotent on
+`SOPInstanceUID`. **PHI:** logs carry only routing-safe identifiers (SOP class/instance UID, peer host).
+
+```python
+from messagefoundry import DICOM, Send, env, handler, inbound, outbound, router
+
+# Forward received SR objects unchanged to a downstream PACS (C-STORE SCU).
+outbound("OB_PACS",
+         DICOM(ae_title="MEFOR_SCU", host=env("PACS_HOST"), port=11112, called_ae_title="REMOTE_PACS"))
+
+
+@handler("forward_sr")
+def forward(msg):
+    return Send("OB_PACS", msg.encode())   # re-emit the base64-carried object bytes verbatim
+```
+
+#### `DICOMweb(...)` outbound — STOW-RS store/send (ADR 0025 Phase 2)
+
+The modern HTTP imaging lane — a **STOW-RS** `POST {base}/studies` (or `{base}/studies/{study_uid}`) that
+**exceeds** both Mirth's and Corepoint's DICOM options (neither ships DICOMweb send out of the box). It is a
+**sibling of the REST destination**: it reuses the hardened HTTP plumbing (no-redirect TLS-verifying opener,
+cleartext-credential refusal, the retry/dead-letter classification, the `[egress].allowed_http` gate) and
+adds only the `multipart/related; type="application/dicom"` framing + `application/dicom+json` response
+handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `url` | — (required) | the DICOMweb service **base** URL, e.g. `https://host/dicom-web` (`env()`-able) |
+| `study_uid` | `None` → `POST {base}/studies` | when set, store into a known study (`POST {base}/studies/{study_uid}`) |
+| `bearer_token` / `basic_user` / `basic_password` | — | OAuth bearer or HTTP Basic (put secrets in `env()`) |
+| `headers` | `{}` | static extra headers (no secrets — not `env()`-resolved) |
+| `timeout_seconds` | `30.0` | request timeout |
+| `verify_tls` | `true` | `false` (dev only) needs `MEFOR_ALLOW_INSECURE_TLS` |
+| `capture_response` | `false` | capture the STOW-RS `dicom+json` response as a reply (ADR 0013) |
+
+**Status classification.** A 2xx whose `dicom+json` body carries a per-instance **FailedSOPSequence**
+(`00081198`) → the instance was rejected → permanent dead-letter; a 409 (all instances failed) / other 4xx /
+a refused 3xx → permanent; 5xx / 408 / 429 / connection-timeout → transient retry. **PHI:** the response can
+name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
+
+```python
+from messagefoundry import DICOMweb, Send, env, handler, outbound
+
+outbound("OB_DICOMWEB", DICOMweb(url=env("DICOMWEB_BASE"), bearer_token=env("DICOMWEB_TOKEN")))
+
+
+@handler("stow_sr")
+def stow(msg):
+    return Send("OB_DICOMWEB", msg.encode())   # STOW-RS the carried object bytes
+```
 
 ### Loopback — `Loopback()` + `reingress_to=` (request → response → route, ADR 0013)
 
@@ -947,7 +1026,7 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **JMS** (Java messaging) | ✅ | ❌ | ✅ | ❌ | `JMS-IN/OUT` planned |
 | **IBM MQ / MSMQ** | ~ | ❌ | ✅ | ❌ | not on roadmap |
 | **Kafka / streaming** | ~ | ❌ | ✅ | ❌ | not on roadmap |
-| **DICOM** (imaging) | ✅ | ~ | ✅ | ~ | `DICOM-IN` C-STORE SCP shipped (ADR 0025 Phase 1); `DICOM-OUT` SCU/C-ECHO/STOW-RS planned (Phase 2) |
+| **DICOM** (imaging) | ✅ | ~ | ✅ | ✅ | `DICOM-IN` C-STORE SCP (Phase 1) + `DICOM-OUT` C-STORE SCU/C-ECHO + `DICOMWEB-OUT` STOW-RS all shipped (ADR 0025); DICOMweb send exceeds both incumbents |
 | **Serial (RS‑232)** + X/Y‑Modem/Kermit + **ASTM E1381/E1394/E1318** | ~ | ❌ | ✅ | ❌ | **declined-by-design (v0.2+)** — legacy/niche lab-instrument connectivity, no feed demand ([BACKLOG.md](BACKLOG.md) #27) |
 | **FHIR** endpoint/client | ✅ | ✅ | ✅ | ❌ | `FHIR-IN/OUT` planned |
 | **Internal channel‑to‑channel** | ✅ | ✅ | ✅ | ✅ | the routing graph (wired by name) — not a transport |
@@ -958,9 +1037,9 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 - **Tier 1 — table stakes (all three have these):** raw TCP, HTTP/REST, SOAP, Database, SFTP, plus
   File remote schemes (FTP/FTPS/SMB/S3). `SFTP-*`/`SOAP-*`/`REST-*`/`DB-*` are already designed; raw
   TCP closes the MLLP‑only gap. **FHIR** belongs here too — all three now ship it.
-- **Tier 2 — present in 2 of 3:** DICOM (the `DICOM-IN` C-STORE SCP is shipped, ADR 0025 Phase 1; the
-  `DICOM-OUT` SCU/STOW-RS is the remaining Phase 2 gap) and JMS (Mirth + Rhapsody), Email (SMTP send +
-  POP3/IMAP read).
+- **Tier 2 — present in 2 of 3:** JMS (Mirth + Rhapsody) and Email (SMTP send + POP3/IMAP read). **DICOM
+  is now full-lane** — the `DICOM-IN` C-STORE SCP (Phase 1) plus the `DICOM-OUT` C-STORE SCU/C-ECHO and the
+  `DICOMWEB-OUT` STOW-RS sender (Phase 2, ADR 0025) ship; the DICOMweb send path **exceeds** both incumbents.
 - **Tier 3 — Rhapsody‑only, lower priority:** Kafka/streaming (worth adding for modern credibility),
   IBM MQ/MSMQ, Serial, printer/command‑line.
 

@@ -43,12 +43,20 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/totp.py": frozenset({"hashlib", "hmac", "secrets"}),
     "messagefoundry/config/tls_policy.py": frozenset({"ssl"}),
     "messagefoundry/config/wiring.py": frozenset({"hashlib"}),
+    # CONSOLE-3: the console verifies the engine API server cert — the OS trust store
+    # (truststore.SSLContext) by default, or a pinned PEM via --cacert (ssl.create_default_context),
+    # plus opt-in client-cert mTLS (load_cert_chain). Builds the client-side TLS verification context.
+    "messagefoundry/console/client.py": frozenset({"ssl"}),
     "messagefoundry/pipeline/cert_expiry.py": frozenset({"cryptography"}),
     "messagefoundry/store/crypto.py": frozenset({"hashlib", "cryptography"}),
     "messagefoundry/store/postgres.py": frozenset({"ssl"}),
     "messagefoundry/store/store.py": frozenset({"hashlib"}),
-    # ADR 0025: the DICOM C-STORE SCP's server SSLContext for DICOM-over-TLS (the MLLP-inbound posture).
+    # ADR 0025: the DICOM C-STORE SCP's server SSLContext (Phase 1) + the C-STORE SCU's client SSLContext
+    # (Phase 2) for DICOM-over-TLS (the MLLP inbound/outbound posture).
     "messagefoundry/transports/dicom.py": frozenset({"ssl"}),
+    # ADR 0025 Phase 2: a per-request random multipart boundary (secrets.token_hex) for the DICOMweb
+    # STOW-RS body, generated absent from the object bytes (RFC 2046 §5.1.1) — framing, not a secret.
+    "messagefoundry/transports/dicomweb.py": frozenset({"secrets"}),
     "messagefoundry/transports/mllp.py": frozenset({"ssl"}),
     "messagefoundry/transports/rest.py": frozenset({"ssl"}),
     "messagefoundry/transports/signing.py": frozenset({"cryptography"}),

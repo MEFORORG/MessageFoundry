@@ -214,6 +214,11 @@
           "default": "samples/config",
           "description": "Config modules directory (relative to the workspace)."
         },
+        "messagefoundry.serviceConfig": {
+          "type": "string",
+          "default": "messagefoundry.toml",
+          "description": "Service-settings TOML the engine loads (relative to the workspace). The New Alert editor reads/writes its [[alerts.rules]] (ADR 0014); created on first add if absent."
+        },
         "messagefoundry.engineUrl": {
           "type": "string",
           "default": "http://127.0.0.1:8765",

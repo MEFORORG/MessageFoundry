@@ -14,6 +14,7 @@ Kept free of any Qt import so it can be unit-tested on its own against a real se
 from __future__ import annotations
 
 import logging
+import ssl
 from collections.abc import Callable
 from json import JSONDecodeError
 from types import TracebackType
@@ -99,9 +100,10 @@ def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:
 def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> None:
     """Refuse plaintext ``http`` to a non-loopback host (CONSOLE-3).
 
-    There is no transport TLS yet, so a remote ``http://`` URL would put the bearer token and PHI on
-    the wire in cleartext. Loopback http and any https are fine; a non-loopback http URL requires an
-    explicit ``allow_insecure`` opt-in (trusted-network dev only), which is then loudly warned."""
+    A remote ``http://`` URL would put the bearer token and PHI on the wire in cleartext, so a
+    remote engine must be reached over the engine's built-in TLS (``https://``, WP-13a). Loopback
+    http and any https are fine; a non-loopback http URL requires an explicit ``allow_insecure``
+    opt-in (trusted-network dev only), which is then loudly warned."""
     parts = urlsplit(base_url)
     if parts.scheme == "https":
         return
@@ -120,6 +122,45 @@ def _assert_safe_transport(base_url: str, *, allow_insecure: bool) -> None:
     )
 
 
+def _build_verify_context(
+    cacert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+) -> ssl.SSLContext:
+    """Build the TLS verification context the console uses to reach an ``https`` engine (CONSOLE-3).
+
+    Trust model designed to keep a *remote* console low-burden:
+
+    * **No ``cacert`` (default)** — verify the engine cert against the **operating-system trust store**
+      (``truststore``). On a domain-joined PC an enterprise/AD-CS-issued cert is then trusted with no
+      per-machine configuration, and public-CA certs still verify (the OS store ships the public roots).
+      This replaces httpx's certifi-only default, which trusted neither an internal CA nor a self-signed
+      cert and offered no override.
+    * **``cacert`` set** — pin trust to exactly that PEM (a CA bundle *or* a self-signed engine cert).
+      The escape hatch for a self-signed / non-domain deployment: the OS verifier won't treat a
+      ``load_verify_locations`` cert as a trust anchor (verified on Windows), so we build a stdlib
+      context whose only anchors are the supplied file.
+
+    An opt-in **client** certificate (mTLS, ASVS 12.3.5) is loaded onto whichever context is built — this
+    is also what replaces httpx 0.28's deprecated ``cert=`` keyword. Plaintext ``http`` never reaches
+    this context (the ``_assert_safe_transport`` gate runs first and httpx ignores TLS settings for http).
+    """
+    if cacert is not None:
+        ctx: ssl.SSLContext = ssl.create_default_context(cafile=cacert)
+    else:
+        # Function-local: truststore is a [console]-extra dep. Importing it at module top made
+        # `import messagefoundry.console.client` hard-require it, which broke every non-console
+        # install that imports EngineClient (e.g. the CI store/load test jobs that install only
+        # [dev,sqlserver]) — matching the lazy-import convention used for every other extra dep.
+        import truststore
+
+        ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    if client_cert is not None:
+        # keyfile=None is valid: the private key may be bundled in the client cert PEM.
+        ctx.load_cert_chain(client_cert, client_key)
+    return ctx
+
+
 class EngineClient:
     """Blocking client for the MessageFoundry localhost API.
 
@@ -132,22 +173,29 @@ class EngineClient:
         *,
         timeout: float = 5.0,
         allow_insecure: bool = False,
+        cacert: str | None = None,
         tls_client_cert: str | None = None,
         tls_client_key: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._allow_insecure = allow_insecure
+        # Retained so for_polling() can build its background client with the SAME TLS posture (a CA
+        # pin / client cert that the main client trusted must not silently drop on the poll client).
+        self._cacert = cacert
+        self._tls_client_cert = tls_client_cert
+        self._tls_client_key = tls_client_key
         _assert_safe_transport(self.base_url, allow_insecure=allow_insecure)
-        # Optional client certificate for mutual TLS (ASVS 12.3.5): when the engine API requires a
-        # client cert (api.tls_client_ca_file → CERT_REQUIRED), the console presents this PEM cert
-        # (plus a separate key file when the key isn't bundled in the cert PEM) so it authenticates to
-        # the API by certificate, not only the bearer token. Off by default; meaningful only over https
-        # (the server, not the console, decides whether the cert is required).
-        cert: str | tuple[str, str] | None = None
-        if tls_client_cert is not None:
-            cert = (tls_client_cert, tls_client_key) if tls_client_key else tls_client_cert
-        self._http = httpx.Client(base_url=self.base_url, timeout=timeout, cert=cert)
+        # How the engine's server cert is trusted (OS store by default; `cacert` to pin a self-signed /
+        # internal-CA PEM) plus an optional client cert for mutual TLS (ASVS 12.3.5) when the engine
+        # requires one (api.tls_client_ca_file → CERT_REQUIRED). See _build_verify_context.
+        # Built ONLY for an https engine: httpx ignores `verify` for http (the gate above already ran),
+        # and building the default context imports the [console]-extra `truststore` — so an http client
+        # (the load harness, any non-[console] install) must NOT need it just to construct a client.
+        verify: ssl.SSLContext | bool = True
+        if self.base_url.lower().startswith("https"):
+            verify = _build_verify_context(cacert, tls_client_cert, tls_client_key)
+        self._http = httpx.Client(base_url=self.base_url, timeout=timeout, verify=verify)
         self._token: str | None = None
         self._user: CurrentUser | None = None
         #: Invoked when the engine demands step-up re-verification (403 + X-Step-Up-Required); the GUI
@@ -188,7 +236,12 @@ class EngineClient:
         (sign-out/expiry quits the app), so this snapshot can't drift out from under a live window.
         """
         poll = EngineClient(
-            self.base_url, timeout=self._timeout, allow_insecure=self._allow_insecure
+            self.base_url,
+            timeout=self._timeout,
+            allow_insecure=self._allow_insecure,
+            cacert=self._cacert,
+            tls_client_cert=self._tls_client_cert,
+            tls_client_key=self._tls_client_key,
         )
         poll._token = self._token
         poll._user = self._user

@@ -1,0 +1,58 @@
+name: Dependabot auto-merge
+
+# Scoped auto-merge for Dependabot PRs (A4 of the dependency fast-response plan).
+#
+# SAFE because main's required status checks are the gate: the full pytest suite, pip-audit, the
+# DEP-1 lock-sync check (incl. the A3 lock-resync commit), bandit/semgrep/gitleaks all must pass
+# before GitHub completes the merge. A bad bump turns CI red and never merges — auto-merge only
+# removes the human-latency on the safe, common case, not the safety net.
+#
+# IN SCOPE (auto-merged):
+#   - any PATCH update (incl. security patches — most security fixes are patches)
+#   - MINOR updates of DEV-only dependencies
+# OUT OF SCOPE (left for human review, surfaced same-day by the daily security cron + alerts):
+#   - MINOR/MAJOR updates of runtime deps, and ALL MAJOR updates
+#
+# Fresh-release supply-chain poisoning is handled upstream by the dependabot.yml `cooldown`
+# (routine updates age before a PR opens); SECURITY updates bypass cooldown by design, so a real
+# advisory fix still arrives immediately and (if a patch) auto-merges.
+#
+# Why `pull_request` (not pull_request_target): a Dependabot `pull_request` run gets a read-only
+# GITHUB_TOKEN by default, which the `permissions:` block below elevates to exactly what the merge
+# API needs — no untrusted-code-with-secrets exposure, no GitHub App required. This is the pattern
+# GitHub documents for Dependabot auto-merge.
+
+on: pull_request
+
+permissions:
+  contents: write # complete the merge
+  pull-requests: write # enable auto-merge on the PR
+
+concurrency:
+  group: dependabot-automerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    # Only Dependabot's own PRs. pull_request.user.login is the immutable PR author, so an A3
+    # lock-resync `synchronize` (pushed by the App) still satisfies this — the author stays
+    # dependabot[bot] even though the triggering actor is the App.
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    timeout-minutes: 10
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge for in-scope updates
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          (steps.meta.outputs.update-type == 'version-update:semver-minor' &&
+           steps.meta.outputs.dependency-type == 'direct:development')
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
