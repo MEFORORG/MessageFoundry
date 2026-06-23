@@ -202,5 +202,12 @@ jobs:
         with:
           python-version: "3.13"
       - name: Scan the publishable subset for forbidden content
-        # Stdlib-only scanner (no install). Exits non-zero — failing the build — on any hit.
-        run: python scripts/publish/scan_forbidden.py --published
+        # Stdlib-only scanner (no install). Exits non-zero — failing the build — on any hit. The scanner
+        # lives under the deny-listed scripts/publish/, so it is ABSENT on the OSS mirror — there's
+        # nothing to gate there (everything is already the published subset); skip rather than error.
+        run: |
+          if [ -f scripts/publish/scan_forbidden.py ]; then
+            python scripts/publish/scan_forbidden.py --published
+          else
+            echo "scripts/publish/scan_forbidden.py absent (OSS mirror) — skipping the publish leak-gate."
+          fi

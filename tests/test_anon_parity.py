@@ -38,6 +38,11 @@ _REFUSED = ["", "PID|1||9^^^H^MR||DOE^JOHN", "MSH|^~|A|B", "not hl7 at all"]
 
 def _load_scan_forbidden() -> object:
     path = _ROOT / "scripts" / "publish" / "scan_forbidden.py"
+    if not path.exists():
+        # Private-only (scripts/publish/ is deny-listed in the OSS mirror); skip where it's absent.
+        pytest.skip(
+            "scan_forbidden.py is private-only (OSS-mirror deny-list)", allow_module_level=True
+        )
     spec = importlib.util.spec_from_file_location("scan_forbidden", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)

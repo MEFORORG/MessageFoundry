@@ -32,6 +32,12 @@ jobs:
           python-version: "3.13"
       - name: Check tag / PyPI / mirror are in sync
         run: |
+          # The script lives under the deny-listed scripts/publish/, so it is ABSENT on the OSS mirror;
+          # the sync check only runs on the private repo (the publish source). Skip where it's absent.
+          if [ ! -f scripts/publish/check_release_sync.py ]; then
+            echo "scripts/publish/check_release_sync.py absent (OSS mirror) — skipping the release-sync check."
+            exit 0
+          fi
           # `packaging` gives canonical version normalization (so a "0.1.0-rc1" tag and PyPI's
           # "0.1.0rc1" compare equal); the script falls back to a naive form if it's absent.
           python -m pip install --upgrade pip packaging

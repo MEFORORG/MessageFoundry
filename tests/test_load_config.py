@@ -138,6 +138,13 @@ def test_invalid_transform_mode_fails_loud(monkeypatch: pytest.MonkeyPatch) -> N
 # by path — mirroring tests/test_scan_forbidden.py.
 def _load_scan_forbidden() -> object:
     path = Path(__file__).resolve().parents[1] / "scripts" / "publish" / "scan_forbidden.py"
+    if not path.exists():
+        # Private-only: scripts/publish/ is deny-listed in the OSS mirror, so the estate-token
+        # assertions this module feeds don't apply there. Skip the whole module rather than error at
+        # collection (the scanner is the single source of truth only where it exists).
+        pytest.skip(
+            "scan_forbidden.py is private-only (OSS-mirror deny-list)", allow_module_level=True
+        )
     spec = importlib.util.spec_from_file_location("scan_forbidden", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
