@@ -5,6 +5,8 @@ fail-closed leak-check — engine side."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from messagefoundry.anon import (
@@ -21,6 +23,15 @@ from messagefoundry.anon import (
     load_rules,
 )
 from messagefoundry.anon.surrogates import Seps, scrub_site_codes, surrogate_field
+
+# The leak-check delegates to scripts/publish/scan_forbidden.py (the owner-managed publish guard — a
+# dev/source-checkout tool, not in the wheel and deny-listed in the OSS mirror). Skip the two tests that
+# exercise it where it's absent; the engine raises LeakCheckUnavailable there by design.
+_LEAK_SCANNER = Path(__file__).resolve().parents[1] / "scripts" / "publish" / "scan_forbidden.py"
+_NO_SCANNER = pytest.mark.skipif(
+    not _LEAK_SCANNER.exists(),
+    reason="leak-check needs scripts/publish/scan_forbidden.py (private-only; OSS-mirror deny-list)",
+)
 
 _SALT = "unit-salt-0123456789abcdef"
 _SEPS = Seps()
@@ -184,6 +195,7 @@ def test_anonymize_reads_custom_separators_from_msh() -> None:
 # --- leak-check -----------------------------------------------------------------------------------
 
 
+@_NO_SCANNER
 def test_leak_check_clean_and_dirty() -> None:
     assert leak_check(anonymize(_SAMPLE, salt=_SALT)) == []
     hits = leak_check("note mentioning OMNICELL and 540099")
@@ -191,6 +203,7 @@ def test_leak_check_clean_and_dirty() -> None:
     assert any("54" in h for h in hits)
 
 
+@_NO_SCANNER
 def test_anonymize_checked_fails_closed_and_is_phi_safe() -> None:
     # estate token in a KEPT field (MSH-3) survives surrogation -> must raise
     dirty = _msg(
