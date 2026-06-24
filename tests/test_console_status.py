@@ -298,10 +298,23 @@ def test_health_poll_reads_off_main_thread(qapp, monkeypatch) -> None:
     client = FakeStatusClient()
     window = shell_mod.AppWindow(client)  # type: ignore[arg-type]
     main = threading.get_ident()
-    client.status_thread = None  # reset (the constructor's initial poll may have set it)
-    window._poll_health()
+    # The constructor kicks an INITIAL poll (shell.py: self._poll_health() at the end of __init__)
+    # that arms the single-flight guard (_health_loading=True). Fully drain it FIRST — waitForDone
+    # lets worker #1 finish and _drain delivers its queued _apply_health, which clears the guard — so
+    # OUR poll below is guaranteed to submit a fresh worker instead of being coalesced away.
     window._health_runner._pool.waitForDone(5000)
     _drain(qapp)
+    # guard now cleared, so our _poll_health() below submits a fresh worker (not coalesced)
+    assert window._health_loading is False
+    client.status_thread = None  # reset AFTER the initial poll is fully settled
+    window._poll_health()
+    window._health_runner._pool.waitForDone(5000)
+    # Wait on the fetch ACTUALLY completing (bounded condition-poll, no fixed sleep): _apply_health is
+    # delivered via a queued signal, so pump events until the worker's status() write lands.
+    for _ in range(50):
+        _drain(qapp)
+        if client.status_thread is not None:
+            break
     assert client.status_thread is not None and client.status_thread != main
     window.close()
 

@@ -8,6 +8,7 @@ raises, the smoke/store paths behave, the report renders, and the CLI wires up +
 
 from __future__ import annotations
 
+import asyncio
 import socket
 import threading
 from pathlib import Path
@@ -16,6 +17,8 @@ import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import StoreSettings
+from messagefoundry.store.base import open_store
+from messagefoundry.store.store import MessageStatus
 from messagefoundry.verify import checks, smoke
 from messagefoundry.verify.model import CheckResult, Status
 from messagefoundry.verify.report import exit_code, render_console, render_json, render_markdown
@@ -255,3 +258,74 @@ def test_cli_verify_rejects_unknown_section(capsys: pytest.CaptureFixture[str]) 
 
 def test_all_sections_constant() -> None:
     assert set(ALL_SECTIONS) == {"host", "store", "smoke", "manual"}
+
+
+# ---- disposition (--check-disposition) --------------------------------------------------------
+
+_RAW_ADT = (
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|X|P|2.5.1\rEVN|A01|20260101\rPID|1||1^^^H^MR||DOE^J\r"
+)
+
+
+async def _seed_message(settings: StoreSettings, *, control_id: str, status: MessageStatus) -> str:
+    handle = await open_store(settings)
+    try:
+        return await handle.record_received(
+            channel_id="verify-test", raw=_RAW_ADT, status=status, control_id=control_id
+        )
+    finally:
+        await handle.close()
+
+
+def test_classify_disposition() -> None:
+    ok = smoke._classify_disposition("processed", control_id="X", timeout=5)
+    assert ok.status is Status.PASS and ok.id == "smoke.disposition"
+    err = smoke._classify_disposition("error", control_id="X", timeout=5)
+    assert err.status is Status.FAIL and "ERROR" in err.detail
+    assert smoke._classify_disposition("unrouted", control_id="X", timeout=5).status is Status.FAIL
+    assert smoke._classify_disposition("filtered", control_id="X", timeout=5).status is Status.FAIL
+    inflight = smoke._classify_disposition("routed", control_id="X", timeout=5)
+    assert (
+        inflight.status is Status.FAIL and "ROUTED" in inflight.detail
+    )  # still in flight at timeout
+    none = smoke._classify_disposition(None, control_id="X", timeout=5)
+    assert none.status is Status.FAIL and "no NEW stored message" in none.detail
+
+
+def test_store_connectivity_detail_names_calling_user(tmp_path: Path) -> None:
+    settings = StoreSettings(path=str(tmp_path / "verify.db"))
+    r = smoke.check_store_connectivity(settings)
+    assert r.status is Status.PASS
+    assert "calling user" in r.detail and "service account" in r.detail
+
+
+def test_check_smoke_disposition_processed(tmp_path: Path) -> None:
+    settings = StoreSettings(path=str(tmp_path / "d.db"))
+    asyncio.run(_seed_message(settings, control_id="CID-OK", status=MessageStatus.PROCESSED))
+    r = smoke.check_smoke_disposition(settings, control_id="CID-OK", baseline_id=None, timeout=3)
+    assert r.status is Status.PASS and r.id == "smoke.disposition"
+
+
+def test_check_smoke_disposition_dead_letter_fails(tmp_path: Path) -> None:
+    settings = StoreSettings(path=str(tmp_path / "d.db"))
+    asyncio.run(_seed_message(settings, control_id="CID-BAD", status=MessageStatus.ERROR))
+    r = smoke.check_smoke_disposition(settings, control_id="CID-BAD", baseline_id=None, timeout=3)
+    assert r.status is Status.FAIL and "ERROR" in r.detail
+
+
+def test_check_smoke_disposition_ignores_baseline(tmp_path: Path) -> None:
+    # A pre-existing message with the same control id (the baseline) must NOT satisfy the check — only
+    # a NEWER message counts, so a re-used synthetic id can't pass on a prior run's result.
+    settings = StoreSettings(path=str(tmp_path / "d.db"))
+    old = asyncio.run(_seed_message(settings, control_id="CID-DUP", status=MessageStatus.PROCESSED))
+    r = smoke.check_smoke_disposition(settings, control_id="CID-DUP", baseline_id=old, timeout=1)
+    assert r.status is Status.FAIL and "no NEW stored message" in r.detail
+
+
+def test_run_verify_check_disposition_skips_without_settings() -> None:
+    # check_disposition with no --service-config: the disposition row SKIPs (no store to poll).
+    results = run_verify(
+        sections=["smoke"], smoke_mode="live", mllp_port=59999, check_disposition=True
+    )
+    disp = [r for r in results if r.id == "smoke.disposition"]
+    assert disp and disp[0].status is Status.SKIP

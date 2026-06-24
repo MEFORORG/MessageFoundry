@@ -292,6 +292,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="self smoke: inbound connection name (if config has several)",
     )
+    verify.add_argument(
+        "--check-disposition",
+        action="store_true",
+        help="live smoke: after the ACK, poll the store for the message's FINAL disposition (PASS "
+        "only if it reached PROCESSED — catches post-ACK dead-letters); needs --service-config",
+    )
+    verify.add_argument(
+        "--disposition-timeout",
+        type=float,
+        default=15.0,
+        help="seconds to wait for the live-smoke message to reach a terminal disposition (default 15)",
+    )
     verify.add_argument("--report-md", default=None, help="also write the Markdown report here")
     verify.add_argument("--report-json", default=None, help="also write the JSON report here")
 
@@ -1263,6 +1275,8 @@ def _verify(args: argparse.Namespace) -> int:
         engine_host=args.engine_host,
         mllp_port=args.mllp_port,
         inbound=args.inbound,
+        check_disposition=args.check_disposition,
+        disposition_timeout=args.disposition_timeout,
     )
     print(render_console(results))
     if args.report_md:

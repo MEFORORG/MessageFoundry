@@ -171,5 +171,114 @@ def check_store_connectivity(store: StoreSettings) -> CheckResult:
         "store.connect",
         "Store connectivity",
         Status.PASS,
-        f"{store.backend.value} store opened and closed cleanly",
+        f"{store.backend.value} store opened and closed cleanly as the calling user "
+        "(NOT proof the NSSM service account can connect — confirm the service-identity grants)",
     )
+
+
+def newest_message_id(store: StoreSettings, control_id: str) -> str | None:
+    """Id of the most-recent stored message with ``control_id`` (the pre-send baseline for the
+    disposition check), or ``None``. Lets a re-used synthetic control id not match a prior run's
+    message — the disposition poll waits for one NEWER than this baseline. Read-only."""
+    import asyncio
+
+    from messagefoundry.store.base import open_store
+
+    async def _newest() -> str | None:
+        handle = await open_store(store)
+        try:
+            rows = await handle.list_messages(control_id=control_id, limit=1)
+            return str(rows[0]["id"]) if rows else None
+        finally:
+            await handle.close()
+
+    return asyncio.run(_newest())
+
+
+def _classify_disposition(status: str | None, *, control_id: str, timeout: float) -> CheckResult:
+    """Map a polled message status to the ``smoke.disposition`` result (pure — unit-tested)."""
+    from messagefoundry.store.store import MessageStatus
+
+    rid, title = "smoke.disposition", "Live smoke disposition"
+    if status is None:
+        return CheckResult(
+            rid,
+            title,
+            Status.FAIL,
+            f"no NEW stored message with control id {control_id} within {timeout:.0f}s "
+            "(is the engine running and pointed at this same store?)",
+        )
+    if status == MessageStatus.PROCESSED.value:
+        return CheckResult(rid, title, Status.PASS, f"control id {control_id} reached PROCESSED")
+    if status in {
+        MessageStatus.ERROR.value,
+        MessageStatus.FILTERED.value,
+        MessageStatus.UNROUTED.value,
+    }:
+        return CheckResult(
+            rid,
+            title,
+            Status.FAIL,
+            f"control id {control_id} ended {status.upper()}, not PROCESSED — a post-ACK failure "
+            "(dead-letter / handler / delivery; e.g. the service-identity db-grant trap)",
+        )
+    return CheckResult(
+        rid,
+        title,
+        Status.FAIL,
+        f"control id {control_id} still {status.upper()} after {timeout:.0f}s "
+        "(did not reach a terminal disposition)",
+    )
+
+
+def check_smoke_disposition(
+    store: StoreSettings, *, control_id: str, baseline_id: str | None, timeout: float = 15.0
+) -> CheckResult:
+    """Poll the store for the live-smoke message's FINAL disposition.
+
+    ``smoke.live`` only proves the listener ACKed; this proves the message actually *processed* —
+    catching a **post-ACK dead-letter** (a bad transform, a delivery failure, or the service-identity
+    db-grant trap), which a headless/CI acceptance run would otherwise miss. Correlates by MSH-10
+    control id, waiting for a message NEWER than ``baseline_id`` (so a re-used synthetic id can't match
+    a prior run). Read-only; opens the store as the calling user.
+    """
+    import asyncio
+
+    from messagefoundry.store.base import open_store
+    from messagefoundry.store.store import MessageStatus
+
+    terminal = {
+        MessageStatus.PROCESSED.value,
+        MessageStatus.ERROR.value,
+        MessageStatus.FILTERED.value,
+        MessageStatus.UNROUTED.value,
+    }
+
+    async def _poll() -> str | None:
+        handle = await open_store(store)
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            last: str | None = None
+            while True:
+                rows = await handle.list_messages(control_id=control_id, limit=1)
+                if rows and str(rows[0]["id"]) != baseline_id:
+                    last = str(rows[0]["status"])
+                    if last in terminal:
+                        return last
+                if loop.time() >= deadline:
+                    return last
+                await asyncio.sleep(0.25)
+        finally:
+            await handle.close()
+
+    try:
+        status = asyncio.run(_poll())
+    except Exception as exc:  # any driver/connection failure — surface, never crash the verify run
+        return CheckResult(
+            "smoke.disposition",
+            "Live smoke disposition",
+            Status.ERROR,
+            f"could not read the store disposition: {exc}",
+        )
+    return _classify_disposition(status, control_id=control_id, timeout=timeout)

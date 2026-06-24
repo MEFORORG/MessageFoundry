@@ -12,7 +12,6 @@ from messagefoundry.verify.checks import run_host_checks
 from messagefoundry.verify.model import CheckResult, Status
 from messagefoundry.verify.smoke import (
     check_store_connectivity,
-    smoke_live,
     smoke_self,
     synthetic_message,
 )
@@ -66,6 +65,69 @@ def _manual_rows() -> list[CheckResult]:
     return [CheckResult(rid, title, Status.MANUAL, detail) for rid, title, detail in _MANUAL_ROWS]
 
 
+def _run_live_smoke(
+    message: str,
+    *,
+    host: str,
+    port: int,
+    settings: ServiceSettings | None,
+    check_disposition: bool,
+    disposition_timeout: float,
+) -> list[CheckResult]:
+    """Live MLLP smoke (ACK), plus the opt-in store-disposition follow-up.
+
+    The disposition follow-up snapshots the store *before* sending (so a re-used synthetic control id
+    can't match a prior run), then — only if the ACK passed — polls for the message reaching a terminal
+    disposition. It is the real "did it process" check; ``smoke.live`` alone proves only the ACK.
+    """
+    from messagefoundry.parsing.peek import HL7PeekError, Peek
+    from messagefoundry.verify.smoke import (
+        check_smoke_disposition,
+        newest_message_id,
+        smoke_live,
+    )
+
+    control_id: str | None = None
+    baseline_id: str | None = None
+    if check_disposition and settings is not None:
+        try:
+            control_id = Peek.parse(message).control_id
+        except HL7PeekError:
+            control_id = None
+        if control_id:
+            baseline_id = newest_message_id(settings.store, control_id)
+
+    results = [smoke_live(host=host, port=port, message=message)]
+    if not check_disposition:
+        return results
+
+    rid, title = "smoke.disposition", "Live smoke disposition"
+    if settings is None:
+        results.append(
+            CheckResult(
+                rid, title, Status.SKIP, "no service settings — pass --service-config to poll"
+            )
+        )
+    elif not control_id:
+        results.append(
+            CheckResult(rid, title, Status.SKIP, "no MSH-10 control id in the synthetic message")
+        )
+    elif results[0].status is not Status.PASS:
+        results.append(
+            CheckResult(rid, title, Status.SKIP, "live smoke did not ACK — disposition not polled")
+        )
+    else:
+        results.append(
+            check_smoke_disposition(
+                settings.store,
+                control_id=control_id,
+                baseline_id=baseline_id,
+                timeout=disposition_timeout,
+            )
+        )
+    return results
+
+
 def run_verify(
     *,
     config_dir: str = "samples/config",
@@ -75,6 +137,8 @@ def run_verify(
     engine_host: str = "127.0.0.1",
     mllp_port: int = 2575,
     inbound: str | None = None,
+    check_disposition: bool = False,
+    disposition_timeout: float = 15.0,
 ) -> list[CheckResult]:
     """Run the selected verify sections and return one :class:`CheckResult` per check.
 
@@ -119,7 +183,14 @@ def run_verify(
                     )
                 )
             else:
-                results.append(smoke_live(host=engine_host, port=mllp_port, message=msg))
+                results += _run_live_smoke(
+                    msg,
+                    host=engine_host,
+                    port=mllp_port,
+                    settings=settings,
+                    check_disposition=check_disposition,
+                    disposition_timeout=disposition_timeout,
+                )
         # smoke_mode == "none": nothing to run
 
     if "manual" in selected:
