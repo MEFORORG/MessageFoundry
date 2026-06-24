@@ -340,7 +340,7 @@ def _current_user() -> str | None:
         return None
 
 
-def _secure_file(path: Path) -> None:
+def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
     """Restrict a store file to its owner — it holds PHI at rest.
 
     Best-effort and non-fatal: failing to tighten permissions must never stop the engine from
@@ -348,6 +348,11 @@ def _secure_file(path: Path) -> None:
     POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so we set
     an owner-only DACL via ``icacls`` (inheritance disabled) instead. A skipped or failed
     restriction is **logged** (STORE-2) so it isn't silently world-readable.
+
+    ``extra_read_grants`` (Windows only) names additional principals — a name like
+    ``NT SERVICE\\MessageFoundry`` or a SID like ``*S-1-5-18`` — to grant **read** on the file. The
+    DPAPI key file needs this so the engine's *service account* (not just the admin who minted it) can
+    read the key at startup; the generic store DB/WAL files pass nothing and stay owner-only.
     """
     try:
         if os.name == "nt":
@@ -359,9 +364,11 @@ def _secure_file(path: Path) -> None:
                     path,
                 )
                 return
-            # icacls is a fixed system tool, invoked without a shell; argv carries no user input (low-27).
+            # icacls is a fixed system tool, invoked without a shell; an extra-grant principal (if any)
+            # is a single argv token, never a shell word, so it can't inject a flag (low-27/STORE-5).
+            grants = [f"{user}:F", *(f"{p}:R" for p in extra_read_grants or ())]
             result = subprocess.run(  # nosec B603 B607
-                ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+                ["icacls", str(path), "/inheritance:r", "/grant:r", *grants],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -413,8 +420,8 @@ CREATE TABLE IF NOT EXISTS messages (
     raw          TEXT NOT NULL,    -- inbound body (encoded)
     status       TEXT NOT NULL,
     error        TEXT,
-    summary      TEXT,             -- ingest-derived (MRN/name/order); kept out of raw for fast search
-    metadata     TEXT              -- code/operator-attached values (mechanism TBD)
+    summary      TEXT,             -- ingest-derived (MRN/name/order) — PHI, cipher-encrypted at rest (EF-3)
+    metadata     TEXT              -- code/operator-attached values — PHI, cipher-encrypted at rest (EF-3)
 );
 CREATE INDEX IF NOT EXISTS ix_messages_channel  ON messages(channel_id, received_at);
 CREATE INDEX IF NOT EXISTS ix_messages_control  ON messages(channel_id, control_id);
@@ -834,13 +841,16 @@ class MessageStore:
                 await self._db.commit()
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
-    #: columns (error/last_error/detail) added in WP-5. Used by the on-open migration and rotate-key.
+    #: columns (error/last_error/detail) added in WP-5, and summary/metadata (MRN + patient name +
+    #: operator-attached values) added in EF-3. Used by the on-open migration and rotate-key.
     _CIPHER_COLUMNS = (
         ("messages", "raw"),
         ("queue", "payload"),
         ("messages", "error"),
         ("queue", "last_error"),
         ("message_events", "detail"),
+        ("messages", "summary"),  # EF-3: ingest-derived MRN/name — PHI, not just metadata
+        ("messages", "metadata"),  # EF-3: code/operator-attached values
         (
             "users",
             "totp_secret",
@@ -1697,8 +1707,8 @@ class MessageStore:
                 self._cipher.encrypt(raw),
                 status,
                 self._enc(error),
-                summary,
-                metadata,
+                self._enc(summary),  # EF-3: MRN/name is PHI — ciphered at rest like the body
+                self._enc(metadata),
             ),
         )
 
@@ -2121,8 +2131,9 @@ class MessageStore:
                 )
                 mrow = await cur.fetchone()
                 origin_meta: dict[str, Any] = {}
-                if mrow and mrow["metadata"]:
-                    loaded = json.loads(mrow["metadata"])
+                meta_json = self._dec(mrow["metadata"]) if mrow else None  # EF-3: ciphered at rest
+                if meta_json:
+                    loaded = json.loads(meta_json)
                     if isinstance(loaded, dict):
                         origin_meta = loaded
                 child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
@@ -2621,6 +2632,8 @@ class MessageStore:
         record = dict(row)
         record["raw"] = self._cipher.decrypt(record["raw"])  # decrypt the body for display
         record["error"] = self._dec(record["error"])  # error may embed raw HL7 fragments (WP-5)
+        record["summary"] = self._dec(record["summary"])  # EF-3: MRN/name PHI, ciphered at rest
+        record["metadata"] = self._dec(record["metadata"])  # EF-3
         return record
 
     async def list_messages(
@@ -2652,7 +2665,9 @@ class MessageStore:
                 " ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset),
             )
-            return [self._decode_row(r, "error") for r in await cur.fetchall()]
+            return [
+                self._decode_row(r, "error", "summary", "metadata") for r in await cur.fetchall()
+            ]
 
     async def count_messages(
         self,
@@ -2695,7 +2710,7 @@ class MessageStore:
                 " ORDER BY o.updated_at DESC, o.id DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset),
             )
-            return [self._decode_row(r, "last_error") for r in await cur.fetchall()]
+            return [self._decode_row(r, "last_error", "summary") for r in await cur.fetchall()]
 
     async def count_dead(
         self,

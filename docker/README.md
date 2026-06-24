@@ -21,7 +21,7 @@ establishes that the off-loopback security controls are already built; this is p
 
 Both are multi-stage, run as **non-root uid 10001**, install from per-profile **hash-locked**
 requirements (`docker/locks/*.lock`, kept in sync with `uv.lock` by the DEP-1 step in
-`.github/workflows/security.yml`), and are based on `python:3.11-slim-bookworm`. The slim default omits
+`.github/workflows/security.yml`), and are based on `python:3.14-slim-bookworm`. The slim default omits
 PySide6, dev tools, and ODBC; the SQL Server layer (a Microsoft-EULA apt repo) is only in the variant.
 
 ## Configuration — bake it in (recommended) or mount it carefully

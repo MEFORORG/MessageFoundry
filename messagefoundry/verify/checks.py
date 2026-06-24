@@ -31,18 +31,18 @@ def _can_import(module: str) -> bool:
 
 
 def check_python_runtime() -> CheckResult:
-    """Python 3.11+ and the engine package importable at a known version."""
+    """Python 3.14+ and the engine package importable at a known version."""
     ver = sys.version_info
-    if ver < (3, 11):
+    if ver < (3, 14):
         return CheckResult(
             "host.python",
-            "Python 3.11+",
+            "Python 3.14+",
             Status.FAIL,
-            f"Python {ver.major}.{ver.minor} < 3.11 (engine requires 3.11+)",
+            f"Python {ver.major}.{ver.minor} < 3.14 (engine requires 3.14+)",
         )
     return CheckResult(
         "host.python",
-        "Python 3.11+ and engine import",
+        "Python 3.14+ and engine import",
         Status.PASS,
         f"Python {ver.major}.{ver.minor}.{ver.micro}, messagefoundry {__version__}",
     )

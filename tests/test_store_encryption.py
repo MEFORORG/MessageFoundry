@@ -253,6 +253,93 @@ async def test_null_and_purged_blank_values_are_not_ciphered(tmp_path: Path) -> 
         await store.close()
 
 
+# --- EF-3: summary + metadata (MRN + patient name) encrypted at rest ---------
+
+# Stand-ins for the MRN + patient name + operator-attached values the listener derives and attaches.
+# These are DIRECT identifiers, so EF-3 ciphers them at rest like the body — they are not left cleartext
+# "for fast search" (no SQL search on summary exists). Sentinels chosen to be unmistakable in a blob.
+EF3_SUMMARY = "MRN=999001 NAME=DOE^JANE ORDER=A01"
+EF3_METADATA = '{"priority": "STAT", "site": "WESTWING"}'
+
+
+async def test_summary_and_metadata_encrypted_at_rest_and_decrypt(tmp_path: Path) -> None:
+    db = tmp_path / "enc.db"
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key()))
+    try:
+        mid = await store.enqueue_message(
+            channel_id="ch",
+            raw=ADT,
+            deliveries=[("d", ADT)],
+            summary=EF3_SUMMARY,
+            metadata=EF3_METADATA,
+        )
+        # ...ciphertext on disk (no MRN/name/site visible)...
+        sm = _raw_at_rest(db, column="summary")
+        md = _raw_at_rest(db, column="metadata")
+        assert sm.startswith(PREFIX) and "999001" not in sm and "DOE" not in sm
+        assert md.startswith(PREFIX) and "WESTWING" not in md
+        # ...and decrypt on the detail + tracking-list read paths.
+        rec = await store.get_message(mid)
+        assert rec is not None and rec["summary"] == EF3_SUMMARY and rec["metadata"] == EF3_METADATA
+        listed = await store.list_messages()
+        assert any(m["summary"] == EF3_SUMMARY and m["metadata"] == EF3_METADATA for m in listed)
+    finally:
+        await store.close()
+
+
+async def test_summary_in_dead_letter_view_decrypts(tmp_path: Path) -> None:
+    db = tmp_path / "enc.db"
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key()))
+    try:
+        mid = await store.enqueue_message(
+            channel_id="ch", raw=ADT, deliveries=[("d", "P")], summary=EF3_SUMMARY
+        )
+        [row] = await store.outbox_for(mid)
+        await store.claim_ready()
+        await store.dead_letter_now(row["id"], "boom")
+        dead = await store.list_dead()
+        assert dead and dead[0]["summary"] == EF3_SUMMARY  # dead-letter view decrypts summary
+    finally:
+        await store.close()
+
+
+async def test_migration_encrypts_existing_summary_metadata(tmp_path: Path) -> None:
+    db = tmp_path / "mig.db"
+    plain = await MessageStore.open(db)  # plaintext first (no key)
+    try:
+        await plain.enqueue_message(
+            channel_id="ch", raw=ADT, deliveries=[], summary=EF3_SUMMARY, metadata=EF3_METADATA
+        )
+    finally:
+        await plain.close()
+    assert _raw_at_rest(db, column="summary") == EF3_SUMMARY  # cleartext at rest before migration
+
+    encrypted = await MessageStore.open(db, cipher=make_cipher(generate_key()))  # reopen → migrate
+    try:
+        assert _raw_at_rest(db, column="summary").startswith(PREFIX)  # migrated on disk
+        assert _raw_at_rest(db, column="metadata").startswith(PREFIX)
+        [m] = await encrypted.list_messages()
+        assert m["summary"] == EF3_SUMMARY and m["metadata"] == EF3_METADATA  # still readable
+    finally:
+        await encrypted.close()
+
+
+async def test_null_summary_and_metadata_are_not_ciphered(tmp_path: Path) -> None:
+    # A message with no summary/metadata: NULL stays NULL, never ciphertext-of-empty.
+    db = tmp_path / "enc.db"
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key()))
+    try:
+        await store.enqueue_message(channel_id="ch", raw=ADT, deliveries=[])
+        con = sqlite3.connect(db)
+        try:
+            sm, md = con.execute("SELECT summary, metadata FROM messages").fetchone()
+        finally:
+            con.close()
+        assert sm is None and md is None  # NULL stays NULL
+    finally:
+        await store.close()
+
+
 # --- WP-5: keyring fingerprint + legacy key_id + rotation --------------------
 
 

@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Compute the metrics (real Dependabot PRs + CISA KEV + FIRST EPSS)
         env:
           GH_TOKEN: ${{ github.token }} # gh auth for the read-only Dependabot-PR query

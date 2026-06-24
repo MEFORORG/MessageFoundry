@@ -341,14 +341,16 @@ class PostgresStore:
     supports_response_capture = True
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
-    #: columns (error/last_error/detail). Used by the on-open migration and rotate-key (mirrors
-    #: MessageStore._CIPHER_COLUMNS).
+    #: columns (error/last_error/detail), and summary/metadata (MRN + patient name) added in EF-3.
+    #: Used by the on-open migration and rotate-key (mirrors MessageStore._CIPHER_COLUMNS).
     _CIPHER_COLUMNS = (
         ("messages", "raw"),
         ("queue", "payload"),
         ("messages", "error"),
         ("queue", "last_error"),
         ("message_events", "detail"),
+        ("messages", "summary"),  # EF-3: ingest-derived MRN/name — PHI, not just metadata
+        ("messages", "metadata"),  # EF-3: code/operator-attached values
         ("users", "totp_secret"),  # MFA secret (WP-14) — id-keyed, rides the migration + rotation
         # NB: the `response` table (ADR 0013) is cipher-covered (body, detail) but has a COMPOSITE PK,
         # so it rides the composite helpers below, not this id-keyed list (like state/reference).
@@ -948,8 +950,8 @@ class PostgresStore:
             self._cipher.encrypt(raw),
             status,
             self._enc(error),
-            summary,
-            metadata,
+            self._enc(summary),  # EF-3: MRN/name is PHI — ciphered at rest like the body
+            self._enc(metadata),
         )
 
     async def _fifo_created_at(
@@ -1746,8 +1748,9 @@ class PostgresStore:
                         "SELECT metadata FROM messages WHERE id=$1", origin_id
                     )
                     origin_meta: dict[str, Any] = {}
-                    if mrow and mrow["metadata"]:
-                        loaded = json.loads(mrow["metadata"])
+                    meta_json = self._dec(mrow["metadata"]) if mrow else None  # EF-3: ciphered
+                    if meta_json:
+                        loaded = json.loads(meta_json)
                         if isinstance(loaded, dict):
                             origin_meta = loaded
                     child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
@@ -2283,6 +2286,8 @@ class PostgresStore:
         d = dict(record)
         d["raw"] = self._cipher.decrypt(d["raw"])  # decrypt the body for display
         d["error"] = self._dec(d["error"])  # error may embed raw HL7 fragments (WP-5)
+        d["summary"] = self._dec(d["summary"])  # EF-3: MRN/name PHI, ciphered at rest
+        d["metadata"] = self._dec(d["metadata"])  # EF-3
         return d
 
     async def list_messages(
@@ -2313,7 +2318,7 @@ class PostgresStore:
             limit,
             offset,
         )
-        return [self._decode_record(r, "error") for r in rows]
+        return [self._decode_record(r, "error", "summary", "metadata") for r in rows]
 
     async def count_messages(
         self,
@@ -2353,7 +2358,7 @@ class PostgresStore:
             limit,
             offset,
         )
-        return [self._decode_record(r, "last_error") for r in rows]
+        return [self._decode_record(r, "last_error", "summary") for r in rows]
 
     async def count_dead(
         self,

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import os
 import struct
-import sys
 from importlib.resources import files
 from pathlib import Path
 
@@ -61,10 +60,7 @@ def test_app_icon_loads_into_a_non_null_qicon() -> None:
 
 
 def test_gui_script_entry_point_is_declared() -> None:
-    if sys.version_info >= (3, 11):
-        import tomllib
-    else:  # pragma: no cover - the project targets 3.11+
-        pytest.skip("tomllib requires Python 3.11+")
+    import tomllib
 
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
     if not pyproject.exists():  # installed (non-editable) layout: nothing to assert against

@@ -41,7 +41,7 @@ maintainer.)
    to `main` are blocked. Keep commits coherent (one logical layer per commit) with clear messages.
 2. **Set up the environment** (Windows/PowerShell shown; adapt for your OS):
    ```powershell
-   py -3.11 -m venv .venv
+   py -3.14 -m venv .venv
    .\.venv\Scripts\Activate.ps1
    pip install -e ".[dev,console]"
    ```

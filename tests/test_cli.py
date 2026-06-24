@@ -571,3 +571,46 @@ def test_serve_loopback_never_trips_mfa_advisory_in_prod(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"]) == 0
     assert "require_mfa" not in capsys.readouterr().err
+
+
+def _stub_protect_key(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Stub out real DPAPI + the icacls call; capture the read-grants protect-key passes through."""
+    import messagefoundry.secrets_dpapi as dpapi_mod
+    import messagefoundry.store.store as store_mod
+
+    monkeypatch.setattr(dpapi_mod, "protect_key_to_file", lambda *a, **k: None)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        store_mod,
+        "_secure_file",
+        lambda path, *, extra_read_grants=None: captured.update(grants=extra_read_grants),
+    )
+    return captured
+
+
+def test_protect_key_grants_system_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # SYSTEM is always read-granted so a LocalSystem service can read the key at startup (BACKLOG #44).
+    captured = _stub_protect_key(monkeypatch)
+    assert main(["protect-key", "--out", str(tmp_path / "k.dpapi"), "--generate"]) == 0
+    assert captured["grants"] == ["*S-1-5-18"]
+
+
+def test_protect_key_grants_named_service_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --grant-account adds the virtual / gMSA principal alongside SYSTEM.
+    captured = _stub_protect_key(monkeypatch)
+    rc = main(
+        [
+            "protect-key",
+            "--out",
+            str(tmp_path / "k.dpapi"),
+            "--generate",
+            "--grant-account",
+            "NT SERVICE\\MessageFoundry",
+        ]
+    )
+    assert rc == 0
+    assert captured["grants"] == ["*S-1-5-18", "NT SERVICE\\MessageFoundry"]

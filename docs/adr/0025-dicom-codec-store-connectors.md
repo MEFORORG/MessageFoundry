@@ -403,12 +403,11 @@ count-and-log invariant), **carrying only routing-safe identifiers in the log/er
 (§1 PHI rule, §9).
 
 **summary is left empty (`summary=None`) — a deliberate PHI boundary.** DICOM ingress passes `summary=None`
-(consistent with the non-HL7 branch), so operators get **no** searchable patient/study identifier for a DICOM
-message in the store/console. This is PHI-conservative: the `messages.summary` column is **plaintext,
-volume-encryption-only** (PHI.md §3 residual — it is *not* routed through the store cipher), so keeping it empty
-keeps `PatientName`/MRN out of the one PHI column not individually encrypted. **If** a study/patient summary is ever
-surfaced for DICOM search, it lands in that plaintext column and must be treated accordingly (and audited via
-`messages:view_summary`); the MVP keeps `summary=None`.
+(consistent with the non-HL7 branch), so operators get **no** patient/study identifier for a DICOM
+message in the store/console. (Since EF-3, `messages.summary` *is* routed through the store cipher when a key is
+set — so even if populated it is encrypted at rest, not plaintext — but the MVP still keeps it empty as
+defense-in-depth.) **If** a study/patient summary is ever surfaced for DICOM, it lands in that column and must be
+treated accordingly (and audited via `messages:view_summary`); the MVP keeps `summary=None`.
 
 ### 5. Purity is enforced by two tests (mirroring FHIR/X12)
 

@@ -972,3 +972,67 @@ async def test_reencrypt_skips_null_response_detail(store) -> None:
         assert r.body == "reply-body" and r.detail is None
     finally:
         await rotated.close()
+
+
+# --- EF-3: summary + metadata (MRN + patient name) encrypted at rest ---------
+
+
+async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
+    """EF-3: summary/metadata (direct MRN + patient name) ciphered at rest on SQL Server and
+    decrypt on the detail + tracking-list read paths — parity with the SQLite/PG suites."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import PREFIX, AesGcmCipher
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    settings = load_settings(environ=os.environ).store
+    summary, metadata = "MRN=999001 NAME=DOE^JANE", '{"site": "WESTWING"}'
+    s = await SqlServerStore.open(settings, cipher=AesGcmCipher(b"k" * 32))
+    try:
+        mid = await s.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB", "p")], summary=summary, metadata=metadata
+        )
+        # at rest: ciphertext, with no MRN/name/site visible in the blob.
+        row = (await s._fetchall("SELECT summary, metadata FROM messages WHERE id=?", (mid,)))[0]
+        assert row["summary"].startswith(PREFIX) and "999001" not in row["summary"]
+        assert row["metadata"].startswith(PREFIX) and "WESTWING" not in row["metadata"]
+        # decrypt on the read paths.
+        rec = await s.get_message(mid)
+        assert rec["summary"] == summary and rec["metadata"] == metadata
+        assert any(
+            m["summary"] == summary and m["metadata"] == metadata for m in await s.list_messages()
+        )
+    finally:
+        await s.close()
+
+
+async def test_reencrypt_rotates_summary_and_metadata(store) -> None:
+    """EF-3: summary/metadata are rotated under the active key like the body — not stranded under a
+    retired key (which a later retired-key drop would make undecryptable)."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    settings = load_settings(environ=os.environ).store
+    k1, k2 = b"k" * 32, b"K" * 32
+    summary, metadata = "MRN=42 NAME=ROE^RICH", '{"site": "EAST"}'
+    old = await SqlServerStore.open(settings, cipher=AesGcmCipher(k1))
+    try:
+        await old.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[], summary=summary, metadata=metadata
+        )
+    finally:
+        await old.close()
+
+    active_id = AesGcmCipher(k2).active_key_id
+    rotated = await SqlServerStore.open(settings, cipher=AesGcmCipher(k2, retired_keys=[k1]))
+    try:
+        await rotated.reencrypt_to_active()
+        row = (await rotated._fetchall("SELECT summary, metadata FROM messages"))[0]
+        assert row["summary"].split(":", 3)[2] == active_id  # mfenc:v1:<active_id>:<blob>
+        assert row["metadata"].split(":", 3)[2] == active_id
+        [m] = await rotated.list_messages()
+        assert (
+            m["summary"] == summary and m["metadata"] == metadata
+        )  # still decrypts under the new key
+    finally:
+        await rotated.close()

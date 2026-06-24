@@ -74,7 +74,7 @@ This section takes you from a clean machine to a running engine and an attached 
 
 ### 1. Check prerequisites
 
-- **Python 3.11+** (64-bit; 3.11–3.14 supported). Everything else (the SQLite store, NSSM for the service) is auto-provisioned or bundled.
+- **Python 3.14+** (64-bit). Everything else (the SQLite store, NSSM for the service) is auto-provisioned or bundled.
 - **git** if you are cloning the checkout or standing up a config repo.
 - **Administrator/elevation** only for the Windows service step (6).
 

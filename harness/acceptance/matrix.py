@@ -108,7 +108,7 @@ MATRIX: tuple[MatrixRow, ...] = (
     # ---- A. Environment & prerequisites -----------------------------------------------------------
     _row(
         "A1",
-        "Python 3.11+ + project .venv + requirements.lock present",
+        "Python 3.14+ + project .venv + requirements.lock present",
         ONCE,
         Coverage.PROBE,
         ("python_runtime",),
@@ -475,8 +475,11 @@ MATRIX: tuple[MatrixRow, ...] = (
         "Throughput baseline under load harness",
         PER_DB,
         Coverage.HARNESS,
-        ("python -m harness --load steady --db-backend <backend>",),
-        "Run once per reachable backend against a live engine.",
+        (
+            "python -m harness --load fanout-baseline --db-backend <backend> --report-json out/load/baseline-<backend>.json",
+            "python -m harness --load closed-loop --db-backend <backend> --report-json out/load/ceiling-<backend>.json",
+        ),
+        "Run once per reachable backend against a live engine: fanout-baseline = realistic-mix baseline, closed-loop = max-throughput ceiling.",
     ),
     _row(
         "H2",

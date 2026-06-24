@@ -21,8 +21,8 @@
 # Pinned to Debian 12 "bookworm": a mature base whose Microsoft ODBC repo (the -sqlserver variant) is
 # well-supported. Debian 13 "trixie" signs its MS repo with a key absent from the legacy microsoft.asc
 # bundle, which trixie's strict `sqv` then rejects — bookworm avoids that. Bump deliberately, not by
-# floating the tag. (For stronger supply-chain integrity, pin by digest: python:3.11-slim-bookworm@sha256:…)
-ARG PYTHON_VERSION=3.11
+# floating the tag. (For stronger supply-chain integrity, pin by digest: python:3.14-slim-bookworm@sha256:…)
+ARG PYTHON_VERSION=3.14
 ARG DEBIAN_RELEASE=bookworm
 
 # ---- builder-base: build the engine wheel from source (shared by both profiles) ------------------

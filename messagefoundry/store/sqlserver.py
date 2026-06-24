@@ -199,7 +199,8 @@ _SCHEMA: list[str] = [
     # mark_failed / dead_letter_now / _event) so HL7-shaped content can't land, and on read they gate on
     # messages:view_summary. Encrypting them at rest on this backend too is a tracked defense-in-depth
     # follow-up (docs/PHI.md); until then the read gate + the "no PHI in exceptions" convention are the
-    # controls for any residual invented free-text.
+    # controls for any residual invented free-text. (Distinct from those detail-class columns,
+    # messages.summary/metadata — direct MRN + patient name — ARE ciphered at rest on this backend, EF-3.)
     """IF OBJECT_ID('response','U') IS NULL CREATE TABLE response (
         message_id NVARCHAR(64) NOT NULL, destination_name NVARCHAR(256) NOT NULL,
         response_seq INT NOT NULL, body NVARCHAR(MAX) NULL, outcome NVARCHAR(64) NOT NULL,
@@ -279,6 +280,20 @@ class SqlServerStore:
         # Serializes audit-chain appends in-process (the store is the single audit writer per engine
         # process; active-passive = one active node) — see record_audit.
         self._audit_lock = asyncio.Lock()
+
+    # --- PHI-at-rest cipher seam for nullable text columns (mirrors MessageStore._enc/_dec) -----
+    # Used for summary/metadata (EF-3). null/empty-safe: a NULL or purged '' stays as-is, never turns
+    # into ciphertext-of-empty; decrypt passes legacy plaintext / '' through unchanged on read.
+
+    def _enc(self, value: str | None) -> str | None:
+        if not value:  # None or "" → leave blank (covers purged/empty values)
+            return value
+        return self._cipher.encrypt(value)
+
+    def _dec(self, value: str | None) -> str | None:
+        if value is None:
+            return value
+        return self._cipher.decrypt(value)  # '' and legacy plaintext pass through unchanged
 
     @classmethod
     async def open(
@@ -379,6 +394,31 @@ class SqlServerStore:
                             await cur.execute(
                                 f"UPDATE {table} SET {column}=? WHERE id=?",
                                 (self._cipher.encrypt(r[column]), r["id"]),
+                            )
+                        await conn.commit()
+                    except Exception:
+                        await conn.rollback()
+                        raise
+                total += len(rows)
+        # messages.summary/metadata (id PK, nullable PHI — EF-3): MRN + patient name. Own pass with the
+        # nullable `<> '' AND IS NOT NULL` guard so a blank/purged '' is never turned into ciphertext-of-
+        # empty (the id-keyed loop above omits that guard because raw/payload are never legitimately '').
+        for mcol in ("summary", "metadata"):
+            while True:
+                rows = await self._fetchall(
+                    f"SELECT TOP (500) id, {mcol} AS v FROM messages"
+                    f" WHERE {mcol} NOT LIKE ? AND {mcol} <> '' AND {mcol} IS NOT NULL",
+                    (like,),
+                )
+                if not rows:
+                    break
+                async with self._acquire() as conn:
+                    cur = await conn.cursor()
+                    try:
+                        for r in rows:
+                            await cur.execute(
+                                f"UPDATE messages SET {mcol}=? WHERE id=?",
+                                (self._cipher.encrypt(r["v"]), r["id"]),
                             )
                         await conn.commit()
                     except Exception:
@@ -699,8 +739,8 @@ class SqlServerStore:
                         self._cipher.encrypt(raw),
                         status,
                         None,
-                        summary,
-                        metadata,
+                        self._enc(summary),  # EF-3: MRN/name is PHI — ciphered at rest
+                        self._enc(metadata),
                     ),
                 )
                 for dest_name, payload in deliveries:
@@ -822,8 +862,8 @@ class SqlServerStore:
                         self._cipher.encrypt(raw),
                         MessageStatus.RECEIVED.value,
                         None,
-                        summary,
-                        metadata,
+                        self._enc(summary),  # EF-3: MRN/name is PHI — ciphered at rest
+                        self._enc(metadata),
                     ),
                 )
                 created_at = await self._fifo_created_at(
@@ -1188,7 +1228,8 @@ class SqlServerStore:
                 # (4) Correlation lineage from the origin's metadata (parse once).
                 await cur.execute("SELECT metadata FROM messages WHERE id=?", (origin_id,))
                 mrow = await cur.fetchone()
-                loaded = json.loads(mrow[0]) if (mrow and mrow[0]) else {}
+                meta_json = self._dec(mrow[0]) if mrow else None  # EF-3: metadata ciphered at rest
+                loaded = json.loads(meta_json) if meta_json else {}
                 origin_meta = loaded if isinstance(loaded, dict) else {}
                 child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
                 root = origin_meta.get("correlation_root_id") or origin_id
@@ -1240,8 +1281,8 @@ class SqlServerStore:
                             if peek_failed
                             else MessageStatus.RECEIVED.value,
                             "re-ingress body failed HL7 peek" if peek_failed else None,
-                            summary,
-                            child_meta,
+                            self._enc(summary),  # EF-3: MRN/name is PHI — ciphered at rest
+                            self._enc(child_meta),
                         ),
                     )
                     if not peek_failed:
@@ -1433,7 +1474,15 @@ class SqlServerStore:
             return 0
         active_like = f"{_ENC_PREFIX}{self._cipher.active_key_id}:%"
         total = 0
-        for table, column in (("messages", "raw"), ("queue", "payload"), ("users", "totp_secret")):
+        # summary/metadata (EF-3): MRN/name PHI on messages — rotated like raw. The `<> ''` + NOT LIKE
+        # guard is null/empty-safe (NULL excluded by NOT LIKE; '' by <> '').
+        for table, column in (
+            ("messages", "raw"),
+            ("queue", "payload"),
+            ("users", "totp_secret"),
+            ("messages", "summary"),
+            ("messages", "metadata"),
+        ):
             while True:
                 rows = await self._fetchall(
                     f"SELECT TOP (?) id, {column} AS v FROM {table}"
@@ -1659,8 +1708,8 @@ class SqlServerStore:
                         self._cipher.encrypt(raw),
                         status.value,
                         error,
-                        summary,
-                        metadata,
+                        self._enc(summary),  # EF-3: MRN/name is PHI — ciphered at rest
+                        self._enc(metadata),
                     ),
                 )
                 await self._event(cur, mid, event, None, error, now)
@@ -2156,6 +2205,8 @@ class SqlServerStore:
         record = await self._fetchone("SELECT * FROM messages WHERE id=?", (message_id,))
         if record is not None:
             record["raw"] = self._cipher.decrypt(record["raw"])  # decrypt the body for display
+            record["summary"] = self._dec(record["summary"])  # EF-3: MRN/name PHI, ciphered at rest
+            record["metadata"] = self._dec(record["metadata"])  # EF-3
         return record
 
     async def list_messages(
@@ -2172,7 +2223,7 @@ class SqlServerStore:
         where, params = self._message_filter(
             channel_id, status, message_type, control_id, allowed_channels
         )
-        return await self._fetchall(
+        rows = await self._fetchall(
             "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
             " status, error, summary, metadata,"
             " (SELECT TOP 1 event FROM message_events e WHERE e.message_id = messages.id"
@@ -2181,6 +2232,10 @@ class SqlServerStore:
             " ORDER BY received_at DESC, id DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             (*params, offset, limit),
         )
+        for r in rows:  # EF-3: summary/metadata ciphered at rest
+            r["summary"] = self._dec(r["summary"])
+            r["metadata"] = self._dec(r["metadata"])
+        return rows
 
     async def count_messages(
         self,
@@ -2207,7 +2262,7 @@ class SqlServerStore:
         allowed_channels: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         where, params = self._dead_filter(channel_id, destination_name, allowed_channels)
-        return await self._fetchall(
+        rows = await self._fetchall(
             "SELECT o.id AS outbox_id, o.message_id, o.channel_id, o.destination_name,"
             " o.attempts, o.last_error, o.updated_at,"
             " m.control_id, m.message_type, m.received_at, m.summary"
@@ -2215,6 +2270,9 @@ class SqlServerStore:
             " ORDER BY o.updated_at DESC, o.id DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             (*params, offset, limit),
         )
+        for r in rows:  # EF-3: summary ciphered at rest
+            r["summary"] = self._dec(r["summary"])
+        return rows
 
     async def count_dead(
         self,

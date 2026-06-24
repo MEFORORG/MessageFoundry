@@ -40,7 +40,7 @@ Python/asyncio service; the console is a separate desktop application.
 
 | Component | Requirement |
 |---|---|
-| **Python** | **3.11 or later**, 64-bit (3.11–3.14 supported; 3.11, 3.13 and 3.14 are CI-validated — 3.13 and 3.14 on Windows Server 2022 + 2025, the primary deploy target) |
+| **Python** | **3.14**, 64-bit (the only supported runtime; CI-validated on Linux + Windows Server 2022 + 2025, the primary deploy target) |
 | Service manager (Windows) | **NSSM** (auto-provisioned, SHA-256-pinned, by the installer; or pre-staged). Requires administrator / elevation to register the service. |
 | C compiler | Not required for the default install (runtime dependencies ship as wheels) |
 

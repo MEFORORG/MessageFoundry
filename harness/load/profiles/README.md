@@ -10,6 +10,10 @@ pass/fail. Run `python -m harness --list-profiles` to list the built-ins.
 | `smoke`             | Tiny zero-loss wiring check — proves the pipeline, not performance.      | CI gate     |
 | `fanout-baseline`   | ADT-dominant mixed feed at high fan-out; characterizes a realistic mix.  | On-demand   |
 | `soak`              | Long steady-state run; watches DB/WAL growth + dead-letter accumulation. | On-demand   |
+| `spike-burst`       | Burst above the ceiling, then a measured recovery/drain (W2025 plan S4.3). | On-demand |
+| `writeamp`          | Thin lane; serve-side fan-out is the write-amplification stress (S4.5).  | On-demand   |
+| `sustained-overload`| Hold offered rate above the ceiling, then drain — backpressure (S4.7).   | On-demand   |
+| `malformed-load`    | Well-formed background load; bad input GUI-injected concurrently (S4.8). | On-demand   |
 
 ## Phases and loop models
 - **Phase kinds:** `warmup`, `ramp`, `sustained`, `spike`, `soak`. Only `sustained`/`soak` phases are

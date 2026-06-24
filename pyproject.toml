@@ -12,7 +12,7 @@ name = "messagefoundry"
 dynamic = ["version"]  # single-sourced from messagefoundry/__init__.py (see [tool.hatch.version])
 description = "Open-source healthcare integration engine — route, transform, and validate messages across many formats and connection types"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE", "NOTICE"]  # ship the license + copyright/attribution NOTICE in sdist+wheel (PEP 639)
 dependencies = [
@@ -71,8 +71,8 @@ dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<4"]
 dev = [
     "pytest>=9.0.3",        # >=9.0.3 fixes CVE-2025-71176 (insecure /tmp dir perms, CWE-379; dev/UNIX-only)
     "pytest-asyncio>=0.26",  # >=0.26 adds asyncio_default_test_loop_scope (BACKLOG #17 shared-loop fix)
-    "pytest-timeout>=2.3",  # per-test watchdog: a hung test (py3.11 flake, BACKLOG #17) dumps stacks + fails fast, never wedges the leg
-    "pytest-rerunfailures>=16.0",  # in-run auto-retry for the known harness-monitor timing flake (BACKLOG #17): a single flake occurrence self-heals instead of reding the whole matrix + blocking auto-merge
+    "pytest-timeout>=2.3",  # per-test watchdog: a hung test dumps stacks + fails fast in 60s, never wedges the leg
+    "pytest-rerunfailures>=16.0",  # in-run auto-retry for the known harness-monitor timing flake: a single flake occurrence self-heals instead of reding the whole matrix + blocking auto-merge
     "ruff>=0.4",
     "mypy>=1.10",
     "httpx>=0.27",          # ASGI test client for the API + harness/load polling (console ships its own copy via [console])
@@ -96,26 +96,21 @@ messagefoundry-console = "messagefoundry.console.__main__:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-# BACKLOG #17 ROOT FIX — run the whole suite on ONE shared asyncio event loop. The intermittent
-# py3.11 hang was a mid-test asyncio<->aiosqlite CROSS-LOOP lost wakeup: with pytest-asyncio's default
-# fresh-loop-per-test, a function-scoped async fixture's aiosqlite connection lived on one loop while
-# the test (or its fixture teardown) ran on another, so a completed query's result was delivered to a
-# loop nobody was awaiting and the await hung (proven by two CI thread dumps; see tests/conftest.py).
-# A single session-scoped loop for tests AND fixtures removes the per-test loop churn, so there is no
-# cross-loop window. BOTH keys are required and must match: setting only the *test* scope leaves
-# fixtures function-scoped — still cross-loop, it merely *looks* clean on py3.13 (which silently
-# tolerates cross-loop aiosqlite; py3.11 does not). A shared loop also matches production topology —
-# the engine runs on one long-lived asyncio.run() loop (the py311-store-soak CI job proves that clean).
-# REQUIRES pytest-asyncio>=0.26 (the release that added asyncio_default_test_loop_scope; the fixture key
-# needs >=0.24). The dev floor below is now >=0.26 to match (lifted from the >=0.23 #414 shipped with, the
-# coordinated dep-lane follow-up #414 deferred); the lock pins the exact 1.4.0.
+# Run the whole suite on ONE shared asyncio event loop (tests AND fixtures). pytest-asyncio's default
+# fresh-loop-per-test puts a function-scoped async fixture's aiosqlite connection on one loop while the
+# test (or its teardown) runs on another — a cross-loop split where a completed query's result is
+# delivered to a loop nobody is awaiting. A single session-scoped loop removes that churn entirely and
+# also matches production topology (the engine runs on one long-lived asyncio.run() loop). BOTH keys
+# are required and must match: setting only the *test* scope leaves fixtures function-scoped (still
+# cross-loop). REQUIRES pytest-asyncio>=0.26 (the release that added asyncio_default_test_loop_scope;
+# the fixture key needs >=0.24); the dev floor below is >=0.26 to match, and the lock pins 1.4.0.
 asyncio_default_test_loop_scope = "session"
 asyncio_default_fixture_loop_scope = "session"
 testpaths = ["tests"]
-# Per-test watchdog (BACKLOG #17): a single hung await/socket — seen as an intermittent py3.11 wedge —
-# is killed at 60s with a full thread-stack dump naming the culprit, instead of burning the CI job's
-# wall-clock. `thread` method works cross-platform (no SIGALRM) and fires even when the main thread is
-# blocked in a C call. Individual tests run well under 60s (the whole suite is ~2–5 min).
+# Per-test watchdog: a single hung await/socket is killed at 60s with a full thread-stack dump naming
+# the culprit, instead of burning the CI job's wall-clock. `thread` method works cross-platform (no
+# SIGALRM) and fires even when the main thread is blocked in a C call. Individual tests run well under
+# 60s (the whole suite is ~2–5 min).
 addopts = "--timeout=60 --timeout-method=thread"
 markers = [
     "win2025_acceptance: Windows Server 2025 on-server acceptance probes (env-gated; skip off-server).",
@@ -123,10 +118,14 @@ markers = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+# The project requires 3.14 (see requires-python + mypy below), but ruff's formatter is held to py313
+# idioms deliberately: a py314 target makes it apply PEP 758 and strip the parens from every
+# `except (A, B):` (-> `except A, B:`) repo-wide. We keep the parenthesized form for readability; bump
+# this to py314 if/when we choose to adopt the unparenthesized style in a dedicated formatting pass.
+target-version = "py313"
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 strict = true
 
 # Third-party libraries that ship no type stubs / py.typed marker.

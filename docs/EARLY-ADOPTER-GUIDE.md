@@ -111,7 +111,7 @@ de-identification). If that trade is acceptable, the rest of this guide is your 
 
 Consolidate these before you install anything:
 
-- [ ] **Python 3.11+** on the engine host.
+- [ ] **Python 3.14+** on the engine host.
 - [ ] **OS:** Windows is the primary supported/serviced platform (NSSM); the engine itself is
       cross-platform Python.
 - [ ] **Administrator/elevation** on the host if you will install the Windows service.

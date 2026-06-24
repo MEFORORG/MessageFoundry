@@ -73,6 +73,20 @@ async def _wait_pending(store: MessageStore, name: str, timeout: float = 10.0) -
             raise AssertionError(f"no pending outbound row for {name!r} within timeout")
 
 
+async def _wait_processed(store: MessageStore, channel_id: str, timeout: float = 10.0) -> None:
+    # The finalizer flips a message to PROCESSED just AFTER the outbound delivery writes its file, so a
+    # file-existence wait can win the race while the store has not finalized yet. Poll the store for the
+    # asserted disposition instead of checking it the instant the file appears (slow-runner flake).
+    elapsed = 0.0
+    while not await store.list_messages(
+        channel_id=channel_id, status=MessageStatus.PROCESSED.value
+    ):
+        await asyncio.sleep(0.02)
+        elapsed += 0.02
+        if elapsed > timeout:
+            raise AssertionError(f"no PROCESSED message for channel {channel_id!r} within timeout")
+
+
 def _file_inbound(inbox: Path) -> InboundConnection:
     return InboundConnection(
         "file_in",
@@ -145,11 +159,13 @@ async def test_failed_outbound_isolated_retries_and_recovers(
         assert runner.degraded_connections() == {}
         assert "bad_out" in runner._destinations  # connector built in place
 
-        # The previously-stuck message now DELIVERS — proving the queued row was retried, not lost.
+        # The previously-stuck message now DELIVERS — proving the queued row was retried, not lost. The
+        # store finalizes to PROCESSED just AFTER delivery writes the file, so poll the store for the
+        # asserted disposition rather than checking it the instant the file appears (slow-runner race).
         await _until(lambda: (outdir / "MSG1.hl7").exists())
-        assert await store.list_messages(
-            channel_id="file_in", status=MessageStatus.PROCESSED.value
-        )  # finalized PROCESSED once the recovered lane delivered it
+        await _wait_processed(
+            store, "file_in"
+        )  # finalized PROCESSED once the recovered lane delivered
     finally:
         await runner.stop()
 

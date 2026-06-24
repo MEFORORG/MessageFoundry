@@ -12,7 +12,7 @@ dimension is the spine of this exercise since the box has all three.
 
 | # | Test item | Notes / Win 2025 specifics |
 |---|---|---|
-| A1 | Python 3.11+ present; project `.venv` builds; `requirements.lock` installs hash-verified | Confirm interpreter arch (x64) matches DB drivers |
+| A1 | Python 3.14+ present; project `.venv` builds; `requirements.lock` installs hash-verified | Confirm interpreter arch (x64) matches DB drivers; engine requires Python >=3.14 |
 | A2 | Optional extras install cleanly: `[postgres]`, `[sqlserver]`, `[dicom]` | `[sqlserver]` pulls ODBC stack; `[dicom]` pulls pydicom/pynetdicom |
 | A3 | SQL Server ODBC Driver (18) installed & discoverable | OS-level driver, not pip — verify version on Server 2025 |
 | A4 | PostgreSQL client (`asyncpg`) imports & reports a version | asyncpg speaks the wire protocol directly — no libpq/psycopg needed |

@@ -1411,3 +1411,34 @@ async def test_db_coordinator_config_version_bump_and_round_trip(store) -> None:
     async with store._pool.acquire() as conn:
         rows = await conn.fetch("SELECT id, config_version FROM cluster_config")
     assert len(rows) == 1 and rows[0]["id"] == 1 and rows[0]["config_version"] == 2
+
+
+# --- EF-3: summary + metadata (MRN + patient name) encrypted at rest ---------
+
+
+async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
+    """EF-3: summary/metadata (direct MRN + patient name) are ciphered at rest on Postgres and
+    decrypt on the detail + tracking-list read paths — parity with the SQLite suite."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import PREFIX, AesGcmCipher
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+    summary, metadata = "MRN=999001 NAME=DOE^JANE", '{"site": "WESTWING"}'
+    s = await PostgresStore.open(settings, cipher=AesGcmCipher(b"k" * 32))
+    try:
+        mid = await s.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB", "p")], summary=summary, metadata=metadata
+        )
+        # at rest: ciphertext, with no MRN/name/site visible in the blob.
+        row = await s._fetchone("SELECT summary, metadata FROM messages WHERE id=$1", mid)
+        assert row["summary"].startswith(PREFIX) and "999001" not in row["summary"]
+        assert row["metadata"].startswith(PREFIX) and "WESTWING" not in row["metadata"]
+        # decrypt on the read paths.
+        rec = await s.get_message(mid)
+        assert rec["summary"] == summary and rec["metadata"] == metadata
+        assert any(
+            m["summary"] == summary and m["metadata"] == metadata for m in await s.list_messages()
+        )
+    finally:
+        await s.close()

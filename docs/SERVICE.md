@@ -147,8 +147,11 @@ The key is a base64 32-byte secret. Two ways to supply it:
   machine*, so a copied file is useless elsewhere and no plaintext key is in the environment:
 
   ```powershell
-  # mint + protect a fresh key (machine scope, so the service account can read it at startup):
+  # mint + protect a fresh key (machine scope, so the service account can read it at startup).
+  # SYSTEM is granted read automatically (covers a LocalSystem service); for a virtual / gMSA service
+  # account add --grant-account '<that account>' so the service — not just you — can read the key:
   messagefoundry protect-key --generate --out "C:\ProgramData\MessageFoundry\store.key.dpapi"
+  #   (virtual account example: ... --grant-account "NT SERVICE\MessageFoundry")
   #   -> prints the base64 key ONCE to stderr; back it up offline (the file is machine-bound and
   #      unrecoverable if the host is lost), then point the engine at it:
   ```
@@ -158,10 +161,12 @@ The key is a base64 32-byte secret. Two ways to supply it:
   ```
   Then **unset** `MEFOR_STORE_ENCRYPTION_KEY` (the env key takes precedence when both are set). The
   service account `CryptUnprotectData`s the file at startup; a missing/foreign/unreadable file makes
-  `serve` fail closed rather than store PHI unencrypted. `protect-key` already restricts the file to
-  its owner; keep it under the data dir so the data-dir ACL covers it too. To rotate, `protect-key` a
-  new key to the file and run `messagefoundry rotate-key` with the prior key in
-  `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3).
+  `serve` fail closed rather than store PHI unencrypted. `protect-key` locks the file to the minting
+  admin **plus** the service principal it grants read — SYSTEM by default, or `--grant-account` for a
+  virtual / gMSA account. It sets an explicit DACL with inheritance **disabled**, so the file does
+  **not** inherit the data-dir ACL — grant the right service account at mint time (above) rather than
+  relying on the directory. To rotate, `protect-key` a new key to the file and run `messagefoundry
+  rotate-key` with the prior key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` (see [PHI.md](PHI.md) §3).
 
 > **External vault / managed identity.** DPAPI is the built-in on-box option. To source the key (or
 > SQL/AD credentials) from an external secrets manager — Windows Credential Manager, HashiCorp Vault,

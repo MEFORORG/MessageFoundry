@@ -12,7 +12,7 @@ What sets it apart: **you can set it up visually** — guided wizards scaffold c
 
 > **The pitch in one line:** *The best of the legacy interface engines — their proven reliability, deep connector catalogs, and battle-tested handling of HL7 v2 plus JSON, X12, and other formats — with none of the lock-in: configuration you own and version-control (set up with guided wizards or in Python), a durable, broker-free queue (SQLite by default, or Postgres/SQL Server), and auth, RBAC, audit, and encryption-at-rest built in rather than bolted on.*
 
-**Stack:** python-hl7 (tolerant parsing) + hl7apy (strict validation), FastAPI/uvicorn (localhost engine API), SQLite/aiosqlite (message store; Postgres & SQL Server also supported), PySide6 (admin console). Python 3.11+, asyncio core.
+**Stack:** python-hl7 (tolerant parsing) + hl7apy (strict validation), FastAPI/uvicorn (localhost engine API), SQLite/aiosqlite (message store; Postgres & SQL Server also supported), PySide6 (admin console). Python 3.14+, asyncio core.
 
 ## 2. The core model: a graph of four building blocks
 
@@ -328,7 +328,7 @@ Keep the message store on a fast *local* disk, not a network share — the stage
 
 - **OS.** Windows Server 2022/2025 is the primary supported platform (Windows-service deploy via NSSM); Windows Server 2019 and Windows 10/11 are supported; the engine also runs on modern Linux (under systemd — no bundled installer); macOS is development/console only.
 
-- **Runtime.** Python 3.11+ (64-bit; 3.11–3.14). No C compiler needed for the default install. The Windows service uses NSSM (registering it needs admin rights).
+- **Runtime.** Python 3.14+ (64-bit). No C compiler needed for the default install. The Windows service uses NSSM (registering it needs admin rights).
 
 - **Store.** SQLite (WAL) is the bundled, zero-setup default for single-node; **PostgreSQL 13+** or **SQL Server 2022/2025** for production (run the server DB on its own host; SQL Server also needs the OS-level ODBC Driver 18, RCSI recommended). MySQL/Oracle aren’t supported.
 

@@ -55,11 +55,11 @@ def _can_import(module: str) -> bool:
 
 
 def probe_python_runtime() -> ProbeResult:
-    """A1 — Python 3.11+, a project virtualenv, and the hash-locked requirements present."""
+    """A1 — Python 3.14+, a project virtualenv, and the hash-locked requirements present."""
     ver = sys.version_info
-    if ver < (3, 11):
+    if ver < (3, 14):
         return ProbeResult(
-            Status.FAIL, f"Python {ver.major}.{ver.minor} < 3.11 (project targets 3.11+)"
+            Status.FAIL, f"Python {ver.major}.{ver.minor} < 3.14 (project targets 3.14+)"
         )
     lock = _REPO_ROOT / "requirements.lock"
     bits = [f"Python {ver.major}.{ver.minor}.{ver.micro}"]

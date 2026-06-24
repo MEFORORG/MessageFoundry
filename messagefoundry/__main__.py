@@ -229,6 +229,14 @@ def main(argv: list[str] | None = None) -> int:
         help="protect under the current USER only (default: machine scope, so the low-privilege "
         "service account can read the key at startup)",
     )
+    protect_key.add_argument(
+        "--grant-account",
+        default=None,
+        metavar="PRINCIPAL",
+        help="also grant READ on the key file to this service principal — a name like "
+        "'NT SERVICE\\MessageFoundry' or a SID. SYSTEM is always granted read (so a LocalSystem "
+        "service starts); pass this for a virtual / gMSA service account.",
+    )
 
     audit_verify = sub.add_parser(
         "audit-verify", help="verify the audit-log hash chain (tamper-evidence)"
@@ -400,7 +408,8 @@ def _serve(args: argparse.Namespace) -> int:
             print(
                 f"error: no MEFOR_STORE_ENCRYPTION_KEY (or [store].encryption_key_file) set on a "
                 f"production PHI instance ({env_name!r}); refusing to start — PHI bodies and the "
-                "error/last_error/detail columns would be stored UNENCRYPTED at rest. Generate a key "
+                "summary/metadata (MRN + patient name) and error/last_error/detail columns would be "
+                "stored UNENCRYPTED at rest. Generate a key "
                 "with `messagefoundry gen-key` (or protect one to a file with `messagefoundry "
                 "protect-key`) and configure it before starting a production store.",
                 file=sys.stderr,
@@ -411,7 +420,8 @@ def _serve(args: argparse.Namespace) -> int:
         if data_class is DataClass.PHI:
             print(
                 f"warning: no MEFOR_STORE_ENCRYPTION_KEY set in a PHI-carrying environment "
-                f"({env_name!r}) — PHI bodies and the error/last_error/detail columns are stored "
+                f"({env_name!r}) — PHI bodies and the summary/metadata (MRN + patient name) and "
+                "error/last_error/detail columns are stored "
                 "UNENCRYPTED at rest (only volume encryption protects them). Generate a key with "
                 "`messagefoundry gen-key` (or protect one to a file with `messagefoundry "
                 "protect-key`), or set [store].require_encryption.",
@@ -870,7 +880,9 @@ def _protect_key(args: argparse.Namespace) -> int:
 
     Source: ``--generate`` mints a fresh key (also printed once to stderr so it can be backed up
     offline — the machine-bound file is unrecoverable if the host is lost); otherwise the key is read
-    from ``MEFOR_STORE_ENCRYPTION_KEY``. The file is written with an owner-only DACL on top of DPAPI.
+    from ``MEFOR_STORE_ENCRYPTION_KEY``. The file is written with a tight DACL — the minting owner plus
+    READ for the engine's service principal (SYSTEM by default, or ``--grant-account``) — atop DPAPI, so
+    the service account (not just the minting admin) can read the key at startup.
     """
     import base64
     import os
@@ -921,10 +933,21 @@ def _protect_key(args: argparse.Namespace) -> int:
     except DpapiError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    _secure_file(out)  # owner-only DACL — defence in depth atop the DPAPI binding
+    # Lock the key file down, but keep it readable by the engine's service principal: SYSTEM by default
+    # (a LocalSystem service) plus an explicit --grant-account for a virtual / gMSA account. Machine-scope
+    # DPAPI already lets any host principal decrypt; without these read grants the owner-only DACL would
+    # lock the file to the minting admin and the service would fail closed at startup (DpapiError). The
+    # generic _secure_file (store DB/WAL) passes no grants and stays owner-only.
+    grants = ["*S-1-5-18"]  # NT AUTHORITY\SYSTEM — well-known SID, robust on non-English Windows
+    if args.grant_account:
+        grants.append(args.grant_account)
+    _secure_file(out, extra_read_grants=grants)
+    granted = "SYSTEM" + (f" + {args.grant_account!r}" if args.grant_account else "")
     print(
-        f"Wrote DPAPI-protected key to {out}.\nNext: set [store].encryption_key_file = {str(out)!r} "
-        "and unset MEFOR_STORE_ENCRYPTION_KEY."
+        f"Wrote DPAPI-protected key to {out} (read-granted to {granted}).\n"
+        f"Next: set [store].encryption_key_file = {str(out)!r} and unset MEFOR_STORE_ENCRYPTION_KEY. "
+        "If the engine runs as a virtual / gMSA account (not LocalSystem), re-run with "
+        "--grant-account '<that account>' so the service can read the key at startup."
     )
     return 0
 

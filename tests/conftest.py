@@ -2,129 +2,22 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Shared pytest fixtures.
 
-Holds the secondary teardown-logging guards for BACKLOG #17. The #17 ROOT cause — a mid-test
-asyncio<->aiosqlite cross-loop lost wakeup from per-test event-loop churn — is fixed in pyproject.toml
+Holds teardown-window logging guards. A background-component logger (the asyncio loop, the aiosqlite
+worker, the engine/store/pipeline, the tee relay, uvicorn) can emit a record AFTER pytest has begun
+tearing per-test capture down, raising 'I/O operation on closed file' inside logging.Handler.emit. The
+fixtures below drop such a late emit at its source and make any straggler fail fast-and-silent.
+
+The related mid-test asyncio<->aiosqlite cross-loop concern is handled in pyproject.toml — not here —
 by running tests AND their async fixtures on one shared session loop (asyncio_default_test_loop_scope +
-asyncio_default_fixture_loop_scope = "session"); these fixtures address a distinct manifestation only.
+asyncio_default_fixture_loop_scope = "session"), which removes the per-test event-loop churn.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import sys
 from collections.abc import Iterator
 
 import pytest
-
-# --------------------------------------------------------------------------------------------------
-# BACKLOG #17 — the py3.11 pytest hang. SCOPE OF THIS FILE (after CI falsified the simple fixes,
-# 2026-06-19; full history in docs/BACKLOG.md §17):
-#
-# The CORE py3.11 hang is a MID-TEST asyncio<->aiosqlite CROSS-LOOP lost wakeup: under pytest's
-# per-test event-loop churn, a completed aiosqlite query's result is delivered to a different loop than
-# the one awaiting it, so a coroutine awaiting a DB op hangs in `run_until_complete -> _run_once ->
-# selector.select()` (proven by two CI thread dumps on PR #409 — the aiosqlite worker idle in
-# `tx.get()`, the loop idle in the selector). It does NOT reproduce on py3.13, and the production store
-# soak (one long-lived loop, no pytest) is clean, so it is a TEST-HARNESS fault, not a product bug.
-# That core hang is ADDRESSED in pyproject.toml, not here: the suite runs on ONE shared session loop
-# (asyncio_default_test_loop_scope + asyncio_default_fixture_loop_scope = "session"), so tests and their
-# async fixtures share a loop and the per-test churn that delivered an aiosqlite result cross-loop is
-# gone. (Earlier in-conftest attempts — a teardown-ordering finalizer and a bounded-selector loop
-# self-wake — were each CI-falsified: the self-wake's clamp was active in the dump yet it still hung,
-# confirming cross-loop delivery, not a recoverable lost selector wake. Removing the *churn* closes it.)
-#
-# DO NOT add a per-test `loop_scope="function"` exemption (e.g. via pytest_collection_modifyitems for
-# test_api_reload::test_reload_endpoint_applies_config). Under the shared session loop that test passes
-# on its own; forcing it back onto a fresh function loop while its fixtures stay on the session loop
-# REINTRODUCES the cross-loop split — which only *looks* fine on py3.13 (it tolerates cross-loop
-# aiosqlite) and would hang again on py3.11. The whole point is one loop for tests and fixtures alike.
-#
-# What the fixtures below DO fix is a DISTINCT, real manifestation: a late log emit into a CLOSING
-# capture stream at teardown. A background-component logger (the asyncio loop, the aiosqlite worker, the
-# engine/store/pipeline, the tee relay, uvicorn) can emit a record AFTER pytest has begun tearing
-# per-test capture down; it propagates to a StreamHandler over capture-swapped sys.stdout/stderr (a
-# per-item temp file closed at the item boundary), and 'ValueError: I/O operation on closed file' is
-# raised INSIDE the synchronous logging.Handler.emit (which holds the per-handler lock) — under py3.11 +
-# background threads that can flood/wedge. The PRIMARY guard (_quiesce_background_loggers_at_teardown)
-# drops such a late emit at its SOURCE logger during the teardown window so it never reaches the closing
-# handler; the SECONDARY backstop (_tolerate_logging_on_closed_capture_streams) makes any straggler fail
-# fast-and-silent. Both are scoped to the pytest session only; production logging is untouched. This
-# removes the LOGGING vector of #17 (a genuine CI-noise improvement) but is NOT a claim the hang is gone.
-#
-# RESIDUAL STATUS (Lane X.2, 2026-06-19). The shared session loop + the logging finalizer REDUCED but did
-# not provably ELIMINATE the intermittent py3.11 wedge, and it cannot be settled from here: it reproduces
-# only on a real py3.11 box (this dev/CI box that runs the suite green is py3.13, which tolerates the
-# cross-loop delivery py3.11 deadlocks on). So `test (ubuntu-latest, py3.11)` stays **ADVISORY**, not a
-# required gate: the required coverage is py3.13 x {ubuntu, win-2022, win-2025}, and the production-path
-# `py311-store-soak` CI job (one long-lived loop, no pytest — clean on py3.11) is the meanwhile regression
-# guard. The CI marker that encodes "advisory" lives in `.github/workflows/ci.yml` (`continue-on-error` on
-# the py3.11 leg), NOT here, and the leg is re-promoted to required ONLY once it is provably green across
-# repeated runs on a real py3.11 env — never flipped blind. The `pytest_collection_modifyitems` lever just
-# below is the conftest half of the residual fix: an OFF-BY-DEFAULT, py3.11-only quarantine of the modules
-# with hard evidence of wedging, for use when the advisory `continue-on-error` is eventually removed (so a
-# known-flaky module can still be deselected on py3.11 without editing the test bodies — scope is conftest
-# + CI config only). It is off by default precisely so a real-py3.11-box validation run exercises the full
-# suite and proves whether the residual is gone.
-# --------------------------------------------------------------------------------------------------
-
-# Modules with HARD evidence (the two PR #409 CI thread dumps; BACKLOG #17 (2)(3)) of wedging the py3.11
-# `test` leg on the aiosqlite<->asyncio lost wakeup — the late-emit roamed between these two async,
-# store/engine-driven modules. This list is the operator-editable quarantine set: add a file stem here
-# only when CI proves another module wedges on py3.11 (do NOT speculatively pad it — over-skipping silently
-# erodes py3.11 coverage, and the `continue-on-error` advisory marker already absorbs a roaming wedge).
-_PY311_QUARANTINE_MODULES: frozenset[str] = frozenset(
-    {
-        "test_tee_relay",  # (2) test_capture_corepoint_copy_only — first dump (tee/relay start-banner emit)
-        "test_harness_monitor",  # (3) test_monitor_observes_engine — second dump (engine/store late-emit)
-    }
-)
-
-# Opt-in switch. Unset/anything-but-"1" => this hook is a no-op and the full suite runs (the default
-# everywhere, including a real-py3.11 validation run). Set to "1" only on the advisory py3.11 CI leg if
-# `continue-on-error` is later dropped and the quarantine is still needed.
-_PY311_QUARANTINE_ENV = "MEFOR_PY311_QUARANTINE"
-
-
-def pytest_report_header(config: pytest.Config) -> list[str] | None:
-    """Surface the quarantine state at the top of the run so a green py3.11 leg is never silently partial.
-
-    Reports BEFORE collection (so it lists the static quarantine set, not a post-collection count) and only
-    when the lever is actually active — on py3.13 or with the env unset it returns None and adds no noise.
-    """
-    if sys.version_info < (3, 12) and os.environ.get(_PY311_QUARANTINE_ENV) == "1":
-        modules = ", ".join(sorted(_PY311_QUARANTINE_MODULES))
-        return [
-            f"BACKLOG #17: py3.11 quarantine ACTIVE ({_PY311_QUARANTINE_ENV}=1) — deselecting: {modules}"
-        ]
-    return None
-
-
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """OFF-BY-DEFAULT, py3.11-only quarantine lever for BACKLOG #17 (rationale in the top-of-file write-up).
-
-    No-op unless BOTH hold, so it changes nothing on the required py3.13 legs and nothing on a default
-    py3.11 run (the validation path): (1) the interpreter is py3.11 (``sys.version_info < (3, 12)``), and
-    (2) ``MEFOR_PY311_QUARANTINE=1``. When active it attaches a ``skip`` marker to every collected item
-    whose test file stem is in ``_PY311_QUARANTINE_MODULES`` — deselecting the known-wedging modules so the
-    advisory leg stays green WITHOUT touching the test bodies (scope = conftest + CI config only). This is
-    deliberately NOT a ``loop_scope="function"`` exemption (those reintroduce the cross-loop split — see the
-    top-of-file DO-NOT note); a plain skip removes the module from the py3.11 run entirely.
-    """
-    if sys.version_info >= (3, 12):
-        return
-    if os.environ.get(_PY311_QUARANTINE_ENV) != "1":
-        return
-    skip = pytest.mark.skip(
-        reason=(
-            f"BACKLOG #17 py3.11 aiosqlite<->asyncio lost-wakeup quarantine "
-            f"({_PY311_QUARANTINE_ENV}=1; advisory leg only). Unset it to run + validate the residual fix."
-        )
-    )
-    for item in items:
-        if item.path.stem in _PY311_QUARANTINE_MODULES:
-            item.add_marker(skip)
-
 
 # Minimal source-logger set: every background-component child reaches one of these by propagation, so
 # quiescing these five drops a late teardown-window emit at its source. Chosen from the suite's actual
@@ -201,8 +94,8 @@ class _QuiesceNullHandler(logging.NullHandler):
 def _quiesce_background_loggers_at_teardown(
     _quiesce_baseline: dict[str, _Baseline],
 ) -> Iterator[None]:
-    """PRIMARY guard for the #17 teardown-LOGGING manifestation: quiesce background-component loggers
-    in the per-test TEARDOWN window. (This does not fix the core mid-test cross-loop hang — see top.)
+    """PRIMARY guard for the teardown-LOGGING race: quiesce background-component loggers in the per-test
+    TEARDOWN window. (The mid-test cross-loop concern is handled by the shared session loop in pyproject.)
 
     This function-scoped autouse fixture is the version-robust hook point (GROUND A): its post-yield
     body runs inside ``LoggingPlugin``'s teardown ``catching_logs`` window — i.e. WHILE pytest's
@@ -259,10 +152,9 @@ def _tolerate_logging_on_closed_capture_streams() -> Iterator[None]:
     Even with source-logger quiescing in place (the primary fix above), a record can in principle reach
     a closed capture stream during the brief teardown window. ``logging.Handler.emit`` then raises
     ``ValueError: I/O operation on closed file`` and routes it to ``Handler.handleError``, which — while
-    ``logging.raiseExceptions`` is the default ``True`` — writes a traceback to ``sys.stderr``. Under
-    py3.11 + background threads that error-handling path can flood output and wedge the event-loop
-    thread *inside the synchronous* ``emit`` (it holds the handler lock) until the per-test
-    ``--timeout`` fires.
+    ``logging.raiseExceptions`` is the default ``True`` — writes a traceback to ``sys.stderr``.
+    Background threads can make that error-handling path flood output and wedge the event-loop thread
+    *inside the synchronous* ``emit`` (it holds the handler lock) until the per-test ``--timeout`` fires.
 
     Setting ``logging.raiseExceptions = False`` makes ``handleError`` a no-op, so any straggler fails
     fast and silently instead of flooding / deadlocking. It is the stdlib's documented production-mode

@@ -6,6 +6,15 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING — Python 3.14 is now the only supported runtime.** `requires-python` is raised to `>=3.14`
+  (was `>=3.11`), and the ruff/mypy targets, CI matrix (Linux + Windows Server 2022/2025, all on 3.14),
+  Docker base image, lockfiles, and adopter scaffold move with it. **Adopters and engine hosts must be on
+  Python 3.14** — a 3.11/3.12/3.13 host will refuse to install the wheel. The 3.11/3.12/3.13-specific test
+  apparatus is retired with this change (the `MEFOR_PY311_QUARANTINE` conftest lever, the `py3.11 store
+  soak` CI job, and `scripts/soak/store_soak.py`; the underlying BACKLOG #17 asyncio↔aiosqlite concern is
+  still mitigated by the shared session loop in `pyproject.toml`).
+
 ## [0.2.1] — 2026-06-23 — Early Access
 
 ### Fixed

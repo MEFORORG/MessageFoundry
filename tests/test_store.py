@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 
 import pytest
 
@@ -53,6 +54,60 @@ async def test_open_restricts_db_file_to_owner(tmp_path) -> None:
             assert stat.S_IMODE(db.stat().st_mode) == 0o600
     finally:
         await s.close()
+
+
+# The icacls DACL is Windows-only (POSIX uses chmod). Run these where os.name == "nt" is REAL —
+# forcing it via monkeypatch would make pathlib instantiate WindowsPath and crash pytest on Linux.
+_windows_only = pytest.mark.skipif(sys.platform != "win32", reason="icacls DACL is Windows-only")
+
+
+def _capture_icacls(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Capture the icacls argv _secure_file would run (no real icacls), as the user 'minter'."""
+    import messagefoundry.store.store as store_mod
+
+    captured: list[list[str]] = []
+
+    class _R:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    monkeypatch.setenv("USERNAME", "minter")
+    monkeypatch.setattr(
+        store_mod.subprocess, "run", lambda argv, **kw: (captured.append(argv), _R())[1]
+    )
+    return captured
+
+
+@_windows_only
+def test_secure_file_grants_extra_read_principals(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The DPAPI key file must stay readable by the engine's service principal (SYSTEM + any
+    # --grant-account), not just the minting admin (BACKLOG #44). The icacls grant must carry them.
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+
+    captured = _capture_icacls(monkeypatch)
+    store_mod._secure_file(
+        Path("key.dpapi"), extra_read_grants=["*S-1-5-18", "NT SERVICE\\MessageFoundry"]
+    )
+    argv = captured[0]
+    assert argv[0] == "icacls" and "/inheritance:r" in argv and "/grant:r" in argv
+    assert "minter:F" in argv  # owner keeps full control
+    assert "*S-1-5-18:R" in argv  # SYSTEM read
+    assert "NT SERVICE\\MessageFoundry:R" in argv  # service account read
+
+
+@_windows_only
+def test_secure_file_default_is_owner_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The generic store DB/WAL path passes no extra grants -> owner-only DACL, unchanged.
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+
+    captured = _capture_icacls(monkeypatch)
+    store_mod._secure_file(Path("store.db"))
+    assert captured[0] == ["icacls", "store.db", "/inheritance:r", "/grant:r", "minter:F"]
 
 
 async def test_enqueue_creates_message_and_outbox_rows(store: MessageStore) -> None:

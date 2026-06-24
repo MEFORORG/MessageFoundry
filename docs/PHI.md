@@ -47,7 +47,7 @@ documented per deployment — see [DEPLOYMENT.md](DEPLOYMENT.md) and [§11](#11-
 |---|---|---|
 | Operator using the console/API | Yes | Auth + RBAC + audit (built — [SECURITY.md](SECURITY.md)); step-up re-verification on sensitive ops (ASVS 7.5.3) |
 | Local user reading the DB file directly | Yes | Owner-only file ACL (built) + at-rest body encryption when a key is set (built — §3); volume encryption for the rest |
-| Stolen DB file / backup | Yes | At-rest body encryption (built — §3) + required volume encryption for `summary`/WAL/temp |
+| Stolen DB file / backup | Yes | At-rest body + `summary`/`metadata` encryption (built — §3) + required volume encryption for WAL/temp |
 | PHI in logs / CI output / shell redirects | **Yes** | "Never log bodies" rule + global log redaction (`RedactionFilter`) + `safe_exc()` chokepoint + prod-DEBUG startup guard (built — §7) |
 | Eavesdropper on the **internal LAN** (MLLP / API) | Yes | **API/WSS TLS + MLLP-over-TLS built** (Gate #4, §4) — *enable them*; the bind-guard refuses non-loopback plaintext; + your network segmentation |
 | Compromised internal host / lateral movement | Partly | Network segmentation + TLS + required auth + at-rest encryption; off-box log shipping (delegate to your SIEM — §11) for evidence beyond the host |
@@ -74,9 +74,9 @@ PHI is persisted in the SQLite message store ([store/store.py](../messagefoundry
 | `queue.payload` (stage=`ingress`/`routed`) | **Yes** — the raw body, **transient** | **Yes, when a key is set** — AES-256-GCM | A second copy of the raw, held only across the route→transform window: the `ingress` row is consumed at `route_handoff`, each `routed` row at `transform_handoff` (deleted, never kept). A stalled router/transform stage can hold several briefly — surfaced by the `queue_buildup` alert |
 | `queue.payload` (stage=`outbound`) | **Yes** — transformed outbound body | **Yes, when a key is set** — AES-256-GCM | One row per destination; the persistent footprint |
 | `queue.handler_name` (stage=`routed`) | No — a handler name, not a body | No (metadata, deliberately not ciphered) | The handler the transform worker runs |
-| `messages.summary` | **Yes** — MRN / patient name / order | No (**not** routed through the cipher) | Ingest-derived, indexed for fast search; relies on volume encryption (see §3) |
-| `messages.error`, `queue.last_error`, `message_events.detail` | **Possibly** — may embed raw fragments from exceptions | **Yes, when a key is set** — AES-256-GCM (WP-5) | Routed through the store cipher like `raw`/`payload`; NULL/blank values stay as-is. See [§3](#3-encryption-at-rest), [§7](#7-logging--phi-redaction) |
-| `messages.control_id`, `message_type` | Low (MSH-10/MSH-9) | No | Needed plaintext for dedup/routing/indexes |
+| `messages.summary`, `messages.metadata` | **Yes** — MRN / patient name / order; operator-attached values | **Yes, when a key is set** — AES-256-GCM (EF-3) | Ingest-derived; routed through the store cipher like `raw` (no SQL search/index exists on `summary`, so encrypting it costs nothing). NULL/blank stay as-is |
+| `messages.error`, `queue.last_error`, `message_events.detail` | **Possibly** — may embed raw fragments from exceptions | **Yes, when a key is set** — AES-256-GCM (WP-5); **SQL Server backend keeps these plaintext** (read-gated + `safe_exc()`-redacted, a tracked follow-up) | Routed through the store cipher like `raw`/`payload`; NULL/blank values stay as-is. See [§3](#3-encryption-at-rest), [§7](#7-logging--phi-redaction) |
+| `messages.control_id`, `message_type` | Low (MSH-10/MSH-9) | No | Needed plaintext for dedup/routing/indexes (`ix_messages_control`) |
 | `audit_log.detail` | Low — exposed IDs/counts, not bodies | No | JSON metadata about PHI *access*, not the PHI itself |
 | SQLite file + `-wal` / `-shm` siblings | **Yes** (mirror the above) | No | WAL/shm hold recently-written PHI outside any app-level encryption |
 | File-connector output / spill dirs (`.hl7`, `.processed`, `.error`) | **Yes** — plaintext on disk | No | Written by the File transport; treat the directory as PHI |
@@ -163,14 +163,16 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    residual (see the in-use limitation below). The cloud/HSM SDKs are optional extras — the base install
    pulls **zero** of them; external providers land per-provider in follow-on PRs.
 4. **Required volume encryption.** App-level AEAD **cannot** encrypt the `-wal`/`-shm`/temp files or
-   the searchable `summary`/index columns. **BitLocker (Windows) / LUKS (Linux) on the data volume is
-   a documented deployment prerequisite** to cover those at rest. App-level + volume together close
-   both the "stolen file from a powered-off host" and the "live-host file copy" cases.
+   the indexed `control_id`/`message_type` columns. **BitLocker (Windows) / LUKS (Linux) on the data
+   volume is a documented deployment prerequisite** to cover those at rest. App-level + volume together
+   close both the "stolen file from a powered-off host" and the "live-host file copy" cases.
 
-**Accepted residual:** `summary`, `control_id`, and `message_type` stay plaintext in the DB (they
-must be searchable/indexable); volume encryption is what protects them at rest. If that residual is
-unacceptable for a deployment, **SQLCipher** (whole-DB, including WAL) is the documented alternative —
-at the cost of a native dependency and replacing the connect path.
+**Accepted residual:** `control_id` and `message_type` (MSH-10/MSH-9, low-sensitivity) stay plaintext
+in the DB for dedup/routing/indexing; volume encryption is what protects them at rest. (`summary` and
+`metadata` — the direct MRN/patient-name identifiers — are **no longer** in this residual: EF-3 routes
+them through the store cipher like `raw`, since nothing SQL-searches `summary`.) If even that residual
+is unacceptable, **SQLCipher** (whole-DB, including WAL) is the documented alternative — at the cost of
+a native dependency and replacing the connect path.
 
 **SQL Server backend:** `encrypt = true` secures the DB *connection* (TLS in transit),
 **not** data at rest — at-rest there means SQL Server TDE, configured at the database, not by
@@ -188,8 +190,9 @@ PHI is exposed for the **minimum window and surface** needed to route and transf
   pipeline stage; the store cipher re-encrypts every PHI column the moment it is written back
   ([store/crypto.py](../messagefoundry/store/crypto.py)), so persisted data never lingers in plaintext
   at rest and the staged queue carries the message forward rather than holding it open.
-- **Searchable `summary` residual `[by design]`.** The `summary` (MRN/name) stays plaintext so it is
-  indexable (accepted residual above); volume encryption covers it at rest.
+- **`summary`/`metadata` ciphered like the body (EF-3).** The `summary` (MRN/name) and `metadata` are
+  routed through the store cipher on write/read — there is no SQL search or index on `summary`, so
+  encrypting it costs nothing — and decrypt only at the audited, RBAC-gated read paths.
 
 **Honest limitation:** decrypted PHI is ordinary Python heap for the processing window and is **not
 zeroized after use** — CPython strings/bytes are immutable and not reliably wipeable, and full in-use

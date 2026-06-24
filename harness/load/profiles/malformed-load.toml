@@ -1,0 +1,44 @@
+# Robustness-under-load profile (W2025 test plan S4.8). Carries WELL-FORMED background throughput only;
+# the malformed / oversized / mid-frame-disconnect inputs are injected CONCURRENTLY from the harness GUI
+# (Compose presets + Send/Receive "close mid-frame") against IB_Load_ADT :2600 while this sustained
+# phase runs. Bad input cannot be a profile mix key — the corpus generator (generators._core) only emits
+# hl7apy-conformant messages and raises on an unknown trigger, failing the build at preflight (exit 2).
+# Serve harness/config/load, then: python -m harness --load malformed-load --engine URL --token T
+#
+# All values are generic and synthetic — no real partner, site code, host, IP, or volume appears here.
+
+[load]
+name = "malformed-load"
+description = "well-formed background throughput; malformed/oversized/torn frames injected via the GUI"
+pool_size = 64
+corpus_count_per_trigger = 20
+drain_timeout_s = 300.0
+correlator_capacity = 2000000
+
+[[load.target]]
+name = "adt_hub"
+port = 2600
+types = ["ADT"]
+
+[load.mix]
+"ADT^A01" = 70.0           # all CONFORMANT triggers — the corpus only emits valid messages.
+"ADT^A08" = 30.0           # (an 'ADT^BAD' key would raise at corpus build -> exit 2)
+
+[load.slo]
+max_error_rate = 0.001     # for the well-formed background; GUI-injected bad msgs are expected ERRORs, not loss
+max_dead_letters = 0       # for the well-formed remainder
+zero_loss = true           # applies to the well-formed messages
+
+[[load.phase]]
+name = "warmup"
+kind = "warmup"
+loop = "open"
+rate_start = 100.0
+duration_s = 10.0
+
+[[load.phase]]
+name = "sustained"
+kind = "sustained"
+loop = "open"
+rate_start = 400.0
+duration_s = 180.0

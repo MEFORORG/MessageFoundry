@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Check the lockfile is in sync with pyproject (DEP-1)
         run: |
           python -m pip install --upgrade pip uv
@@ -94,11 +94,14 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Generate a CycloneDX SBOM from the lockfile
         run: |
-          python -m pip install --upgrade pip "cyclonedx-bom~=4.6"
-          cyclonedx-py requirements requirements.lock --output-format JSON --outfile sbom.cdx.json
+          # cyclonedx-bom~=7.3 (was ~=4.6): the 4.x line drags cyclonedx-python-lib 7.x → lxml<6, which
+          # has no cp314 wheel, so on the 3.14 runner pip source-builds lxml and fails. 7.3 → lxml 6.x
+          # (cp314 wheels). The 7.x `requirements` CLI renamed `--outfile` → `--output-file`.
+          python -m pip install --upgrade pip "cyclonedx-bom~=7.3"
+          cyclonedx-py requirements requirements.lock --output-format JSON --output-file sbom.cdx.json
       - name: Upload the SBOM artifact
         # SHA-pinned for supply-chain integrity, matching ci.yml's upload-artifact pin.
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -115,7 +118,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Scan source for insecure patterns
         run: |
           # Pin bandit: an unpinned upgrade once silently changed `# nosec` parsing (1.9.x requires
@@ -162,7 +165,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Run the MessageFoundry rules
         run: |
           python -m pip install --upgrade pip "semgrep~=1.90"
@@ -182,7 +185,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Diff crypto call sites against the inventory
         # Stdlib-only (no install). Exits non-zero — failing the build — on any drift.
         run: python scripts/security/crypto_inventory_check.py
@@ -200,7 +203,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - name: Scan the publishable subset for forbidden content
         # Stdlib-only scanner (no install). Exits non-zero — failing the build — on any hit. The scanner
         # lives under the deny-listed scripts/publish/, so it is ABSENT on the OSS mirror — there's

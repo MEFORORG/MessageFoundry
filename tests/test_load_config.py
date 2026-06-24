@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from harness.load.profile import PROFILES_DIR, LoadProfileError, load_profile
 from messagefoundry.config.wiring import load_config
 from messagefoundry.generators import _core, all_types  # noqa: F401  (registers message types)
 from messagefoundry.parsing import Peek, normalize
@@ -183,3 +184,15 @@ def test_no_forbidden_tokens_in_shipped_load_artifacts() -> None:
 def test_guard_actually_scans_files() -> None:
     # Guard against the guard silently scanning nothing (e.g. a moved directory).
     assert len(_shipped_files()) >= 5
+
+
+def test_all_shipped_profiles_parse() -> None:
+    # Every shipped profile must parse cleanly — guards against a typo'd/renamed key shipping a broken
+    # profile (the failure mode that left matrix row H1 pointing at a nonexistent "steady" profile).
+    profiles = sorted(PROFILES_DIR.glob("*.toml"))
+    assert len(profiles) >= 8, "expected the shipped profile set; did the directory move?"
+    for path in profiles:
+        try:
+            load_profile(path)
+        except LoadProfileError as exc:
+            pytest.fail(f"shipped profile {path.name} failed to parse: {exc}")

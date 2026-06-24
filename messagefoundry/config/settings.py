@@ -151,8 +151,10 @@ class StoreSettings(_Section):
     synchronous: SqliteSync = SqliteSync.NORMAL
 
     # --- PHI-at-rest encryption (both backends; STORE-1 / WP-5) -------------
-    # Base64 32-byte ACTIVE key; when set, PHI columns (raw bodies + error/last_error/detail) are
-    # AES-256-GCM-encrypted at rest. Secret — supply via MEFOR_STORE_ENCRYPTION_KEY, never the file.
+    # Base64 32-byte ACTIVE key; when set, PHI columns (raw bodies + summary/metadata + error/
+    # last_error/detail) are AES-256-GCM-encrypted at rest. (SQL Server encrypts raw + summary/metadata
+    # + the response/payload bodies; its error/last_error/detail stay plaintext — see sqlserver.py.)
+    # Secret — supply via MEFOR_STORE_ENCRYPTION_KEY, never the file.
     # Empty = off (values stored as-is).
     encryption_key: str | None = None
     # Comma-separated base64 RETIRED keys, kept available for *decrypt only* during a key rotation

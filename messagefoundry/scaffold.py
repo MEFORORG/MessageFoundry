@@ -155,7 +155,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.14"
       - name: Download the pinned engine wheel (no install)
         run: |
           pip download -r requirements.txt --no-deps --only-binary=:all: -d dist-verify
@@ -175,7 +175,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.14"
       - name: Install the pinned MessageFoundry engine
         run: pip install -r requirements.txt
       # `check` runs validate + dryrun (the real gate). --no-lint skips the advisory ruff/mypy pass
@@ -195,7 +195,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.14"
       - name: Audit the pinned engine + deps against advisories
         run: |
           pip install pip-audit
