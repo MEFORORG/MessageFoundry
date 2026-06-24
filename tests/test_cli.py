@@ -40,6 +40,24 @@ def test_validate_clean_sample(capsys: pytest.CaptureFixture[str]) -> None:
     assert _out_json(capsys) == []
 
 
+def test_top_level_help_encodes_on_legacy_windows_codepage(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Regression: `messagefoundry --help` crashed with UnicodeEncodeError on a cp1252/charmap
+    # console because of a U+2192 arrow in the adr-analyze subparser help. Render the help string
+    # in-process and assert it survives a cp1252 encode -- reproduces the Windows-only crash on any
+    # runner without touching the real terminal (argparse --help raises SystemExit after printing).
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    help_text = capsys.readouterr().out
+    assert "adr-analyze" in help_text, "top-level help did not render the subcommand list"
+    try:
+        help_text.encode("cp1252")
+    except UnicodeEncodeError as exc:
+        bad = help_text[exc.start]
+        pytest.fail(f"top-level --help is not cp1252-encodable: U+{ord(bad):04X} {bad!r}")
+
+
 def test_validate_reports_problems(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     (tmp_path / "bad.py").write_text("raise ValueError('boom')\n", encoding="utf-8")
     assert main(["validate", "--config", str(tmp_path), "--json"]) == 1

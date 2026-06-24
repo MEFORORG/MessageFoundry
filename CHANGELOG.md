@@ -6,6 +6,21 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-06-23 — Early Access
+
+### Fixed
+- **Windows: `messagefoundry --help` crashed on a legacy codepage** — the top-level help rendered a
+  non-cp1252 character (a `->` arrow in the `adr-analyze` subcommand help, new in 0.2.0), so `--help`
+  aborted with `UnicodeEncodeError` on a cp1252/charmap console (cmd, PowerShell, or any redirected
+  stdout). `main()` now reconfigures stdout/stderr with `errors="replace"` and the help text is ASCII;
+  the machine-read JSON introspection subcommands are unaffected (`json.dumps(ensure_ascii=True)`).
+- **`verify --section host` crashed without the `[console]` extra** — `check_console_no_window()`
+  resolved a console submodule via `find_spec`, which imported the console package and its eager `httpx`
+  dependency, so a `[sqlserver]`-only install aborted with `ModuleNotFoundError: No module named 'httpx'`
+  instead of skipping the console check. The console package now imports its API client lazily (PEP 562
+  `__getattr__`), so resolving a submodule no longer requires `httpx`, and the check degrades to SKIP if a
+  console dependency is absent.
+
 ## [0.2.0] — 2026-06-23 — Early Access
 
 ### Added
@@ -75,5 +90,7 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/v0.1.0

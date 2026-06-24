@@ -30,6 +30,21 @@ from messagefoundry.logging_setup import LOG_LEVELS, SyslogForward, configure_lo
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Harden the human-facing streams for a legacy Windows codepage (cp1252/charmap): argparse's own
+    # --help/usage printer and runtime log/print() lines bypass _safe_print, so a non-cp1252 char
+    # (an arrow or other symbol in a help string or log line) would otherwise abort with
+    # UnicodeEncodeError. errors="replace" is lossy for such chars, but the machine-read JSON
+    # subcommands stay ASCII (json.dumps ensure_ascii=True). Guarded: some stream wrappers
+    # (PYTHONLEGACYWINDOWSSTDIO, pytest capture) lack reconfigure or reject it, and the hardening
+    # must never itself crash the CLI.
+    for _stream in (sys.stdout, sys.stderr):
+        _reconfigure = getattr(_stream, "reconfigure", None)
+        if _reconfigure is not None:
+            try:
+                _reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
     parser = argparse.ArgumentParser(prog="messagefoundry", description=__doc__)
     parser.add_argument("--version", action="version", version=f"messagefoundry {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -111,8 +126,8 @@ def main(argv: list[str] | None = None) -> int:
 
     adr_analyze = sub.add_parser(
         "adr-analyze",
-        help="advisory spec-driven ADR coverage: acceptance-criteria→test links, missing criteria, "
-        "open clarifications (Secure Development Standards §5)",
+        help="advisory spec-driven ADR coverage: acceptance-criteria->test links, missing criteria, "
+        "open clarifications (Secure Development Standards section 5)",
     )
     adr_analyze.add_argument(
         "--adr-dir", default="docs/adr", help="ADR directory (default: docs/adr)"
@@ -458,7 +473,7 @@ def _serve(args: argparse.Namespace) -> int:
         # Only announce forwarding when configure_logging actually installed the handler — a TCP
         # collector that is down at startup is skipped (it warns), so this must not contradict it.
         logging.getLogger(__name__).info(
-            "off-box log forwarding enabled → %s:%d (%s, %s)",
+            "off-box log forwarding enabled -> %s:%d (%s, %s)",
             log_forward.host,
             log_forward.port,
             log_forward.protocol,

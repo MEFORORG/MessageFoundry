@@ -127,6 +127,9 @@ class ConnectionsPage(QWidget):
         menu.addSeparator()
         act_purge_top = menu.addAction("Purge Top Message")
         act_purge_all = menu.addAction("Purge All Queued Messages")
+        menu.addSeparator()
+        act_reset_sel = menu.addAction("Reset Statistics (Selected)")
+        act_reset_all = menu.addAction("Reset All Statistics")
         self._actions.setMenu(menu)
 
         self._start.clicked.connect(lambda: self._inbound_action(self._client.start_connection))
@@ -134,6 +137,8 @@ class ConnectionsPage(QWidget):
         act_restart.triggered.connect(lambda: self._inbound_action(self._client.restart_connection))
         act_purge_top.triggered.connect(lambda: self._purge("top"))
         act_purge_all.triggered.connect(lambda: self._purge("all"))
+        act_reset_sel.triggered.connect(lambda: self._reset_stats(all_connections=False))
+        act_reset_all.triggered.connect(lambda: self._reset_stats(all_connections=True))
 
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("Connections"))
@@ -292,7 +297,10 @@ class ConnectionsPage(QWidget):
         has = bool(self._selected_keys())
         self._start.setEnabled(has)
         self._stop.setEnabled(has)
-        self._actions.setEnabled(has)
+        # The Actions menu stays enabled even with no selection: "Reset All Statistics" needs none. The
+        # selection-dependent items (Restart / Purge / Reset Selected) guard themselves and report when
+        # nothing is selected.
+        self._actions.setEnabled(True)
 
     # --- actions -------------------------------------------------------------
 
@@ -338,6 +346,36 @@ class ConnectionsPage(QWidget):
         try:
             for name in names:
                 self._client.purge_connection(name, scope)
+        except ApiError as exc:
+            self.error.emit(str(exc))
+            return
+        self.refresh()
+
+    def _reset_stats(self, *, all_connections: bool) -> None:
+        """Zero the dashboard's cumulative counters (read / errored / written) for the selected rows,
+        or for every connection. Non-destructive: it moves a display baseline on the engine — messages
+        and history are untouched — so only "Reset All" is confirmed (it's broad)."""
+        targets: list[tuple[str, str, str | None]] = []
+        if all_connections:
+            answer = QMessageBox.question(
+                self,
+                "Reset all statistics",
+                "Reset the counters (read / errored / written) for ALL connections?\n\n"
+                "This only clears the dashboard tallies — messages and history are untouched.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        else:
+            # Each row key is (role, channel_id, dest|""); "" (source rows) becomes None for the API.
+            for role, channel_id, dest in self._selected_keys():
+                targets.append((role, channel_id, dest or None))
+            if not targets:
+                self.error.emit("Select one or more rows to reset, or use Reset All Statistics.")
+                return
+        try:
+            self._client.reset_stats(all_connections=all_connections, targets=targets)
         except ApiError as exc:
             self.error.emit(str(exc))
             return

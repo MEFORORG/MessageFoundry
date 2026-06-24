@@ -81,6 +81,8 @@ from messagefoundry.api.models import (
     ReloadRequest,
     ReloadResult,
     ReplayResult,
+    StatsResetRequest,
+    StatsResetResult,
     StatsResponse,
     SystemStatus,
 )
@@ -565,9 +567,9 @@ def create_app(
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> list[ConnectionRow]:
         now = time.time()
-        metrics = await engine.store.connection_metrics(
-            since=engine.started_at, now=now, rate_window=_RATE_WINDOW
-        )
+        # Offset-adjusted: subtracts any operator stats-resets (in-memory baselines). Identical to the
+        # raw store metrics when nothing has been reset.
+        metrics = await engine.connection_metrics_view(now=now, rate_window=_RATE_WINDOW)
         rows: list[ConnectionRow] = []
 
         # A source row per inbound connection, and a destination row per (inbound → outbound)
@@ -854,6 +856,58 @@ def create_app(
                 )
         cancelled = await engine.store.cancel_queued(None, name, top_only=(scope == "top"))
         return PurgeResult(cancelled=cancelled)
+
+    @app.post("/statistics/reset", response_model=StatsResetResult)
+    async def reset_statistics(
+        req: StatsResetRequest,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
+    ) -> StatsResetResult:
+        """Zero the connections-dashboard cumulative counters (inbound read/errored, outbound
+        written/dead) for the selected connections, or all of them. This moves an in-memory baseline —
+        message rows (the PHI/audit record) and the Prometheus ``/metrics`` counters are untouched, as
+        are live gauges (queue depth, ages)."""
+        inbound: list[str] = []
+        outbound: list[tuple[str, str]] = []
+        if req.all:
+            # "Reset all" spans every channel, so a channel-scoped user may not run it (mirror purge).
+            if identity.allowed_channels is not None:
+                await _audit_channel_denied(engine, identity, None)
+                raise HTTPException(403, "channel-scoped users cannot reset all statistics")
+        else:
+            for t in req.targets:
+                # Per-channel RBAC: a scoped user may reset only endpoints of their own inbound channels
+                # (a destination row is the channel_id->destination edge, so the same scope applies).
+                if identity.allowed_channels is not None and not identity.can_access_channel(
+                    t.channel_id
+                ):
+                    await _audit_channel_denied(engine, identity, t.channel_id)
+                    raise HTTPException(403, "connection is outside your channel scope")
+                if t.role == "source":
+                    if t.channel_id not in inbound:
+                        inbound.append(t.channel_id)
+                else:
+                    if t.destination is None:
+                        raise HTTPException(422, "destination rows require a destination name")
+                    key = (t.channel_id, t.destination)
+                    if key not in outbound:
+                        outbound.append(key)
+        count = await engine.reset_stats(
+            all_connections=req.all, inbound=inbound, outbound=outbound, now=time.time()
+        )
+        await engine.store.record_audit(
+            "stats_reset",
+            actor=identity.username,
+            detail=json.dumps(
+                {
+                    "all": req.all,
+                    "inbound": inbound,
+                    "outbound": [list(k) for k in outbound],
+                    "reset": count,
+                }
+            ),
+        )
+        return StatsResetResult(reset=count)
 
     # --- dead letters (verify + recover) -------------------------------------
 

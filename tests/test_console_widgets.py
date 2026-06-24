@@ -32,6 +32,7 @@ from messagefoundry.api.models import (  # noqa: E402
     OutboxInfo,
     PurgeResult,
     ReplayResult,
+    StatsResetResult,
     StatsResponse,
     SystemStatus,
 )
@@ -59,6 +60,7 @@ class StubClient:
         self.stopped: list[str] = []
         self.restarted: list[str] = []
         self.purged: list[tuple[str, str]] = []
+        self.reset_calls: list[tuple[bool, list[tuple[str, str, str | None]]]] = []
         self.detail_loads = 0
         self.last_audit_summary: object = None
         # Thread each read ran on, so tests can prove the per-page refresh now runs off the main
@@ -137,6 +139,16 @@ class StubClient:
     def purge_connection(self, name: str, scope: str = "all") -> PurgeResult:
         self.purged.append((name, scope))
         return PurgeResult(cancelled=1)
+
+    def reset_stats(
+        self,
+        *,
+        all_connections: bool = False,
+        targets: object = (),
+    ) -> StatsResetResult:
+        items = list(targets)  # type: ignore[call-overload]
+        self.reset_calls.append((all_connections, items))
+        return StatsResetResult(reset=(99 if all_connections else len(items)))
 
     def connections(self) -> list[ConnectionRow]:
         self.connections_thread = threading.get_ident()
@@ -388,6 +400,69 @@ def test_connections_purge_all_requires_confirmation(qapp, monkeypatch) -> None:
     page._table.selectAll()
     page._purge("all")
     assert client.purged == []  # declined → nothing purged
+    page.stop()
+
+
+def test_connections_reset_selected_sends_targets(qapp) -> None:  # type: ignore[no-untyped-def]
+    from messagefoundry.console.connections import ConnectionsPage
+
+    client = StubClient()
+    page = ConnectionsPage(client)
+    page.refresh()
+    _settle(qapp, page._runner)
+    page._table.selectAll()  # both rows: the source and the destination
+    page._reset_stats(all_connections=False)
+    # Source rows carry no destination (None); the destination row carries its outbound name.
+    assert client.reset_calls == [
+        (False, [("source", "ch1", None), ("destination", "ch1", "archive")])
+    ]
+    page.stop()
+
+
+def test_connections_reset_selected_requires_selection(qapp) -> None:  # type: ignore[no-untyped-def]
+    from messagefoundry.console.connections import ConnectionsPage
+
+    client = StubClient()
+    page = ConnectionsPage(client)
+    page.refresh()
+    _settle(qapp, page._runner)
+    errors: list[str] = []
+    page.error.connect(errors.append)
+    page._reset_stats(all_connections=False)  # nothing selected
+    assert client.reset_calls == []
+    assert errors and "Reset All" in errors[0]
+    page.stop()
+
+
+def test_connections_reset_all_confirms_and_sends(qapp, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from messagefoundry.console import connections as conn_mod
+    from messagefoundry.console.connections import ConnectionsPage
+
+    monkeypatch.setattr(
+        conn_mod.QMessageBox, "question", lambda *a, **k: conn_mod.QMessageBox.StandardButton.Yes
+    )
+    client = StubClient()
+    page = ConnectionsPage(client)
+    page.refresh()
+    _settle(qapp, page._runner)
+    page._reset_stats(all_connections=True)  # no selection needed for "all"
+    assert client.reset_calls == [(True, [])]
+    page.stop()
+
+
+def test_connections_reset_all_declined_does_nothing(qapp, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from messagefoundry.console import connections as conn_mod
+    from messagefoundry.console.connections import ConnectionsPage
+
+    monkeypatch.setattr(
+        conn_mod.QMessageBox, "question", lambda *a, **k: conn_mod.QMessageBox.StandardButton.No
+    )
+    client = StubClient()
+    page = ConnectionsPage(client)
+    page.refresh()
+    _settle(qapp, page._runner)
+    page._reset_stats(all_connections=True)
+    assert client.reset_calls == []  # declined → no call
     page.stop()
 
 

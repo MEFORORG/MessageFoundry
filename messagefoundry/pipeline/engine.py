@@ -13,6 +13,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore, Store
+from messagefoundry.store.store import ConnectionMetrics, DestinationMetrics, InboundMetrics
 
 __all__ = ["Engine", "ConfigReloadDenied"]
 
@@ -180,6 +182,15 @@ class Engine:
         self._graph_reconcile_interval = 1.0
         # Set when start() runs; the "since" for since-engine-start metric counts.
         self.started_at: float = 0.0
+        # Console stats-reset baselines (in-memory; dropped on restart, like the counts they offset).
+        # When an operator resets a connection's dashboard stats, we snapshot its current cumulative
+        # counters here; the connections view subtracts the snapshot so the visible read/errored/
+        # written/dead zero out without touching any message rows (the PHI/audit record). Keyed by
+        # channel_id (inbound) and (channel_id, destination) (outbound). See reset_stats().
+        self._inbound_stat_offsets: dict[str, tuple[int, int]] = {}  # cid -> (read, errored)
+        self._outbound_stat_offsets: dict[
+            tuple[str, str], tuple[int, int]
+        ] = {}  # key -> (written, dead)
         # The startup config dir is the default reload target and an implicit allowed root.
         self.config_dir: Path | None = Path(config_dir).resolve() if config_dir else None
         roots = [Path(r).resolve() for r in config_reload_roots]
@@ -711,6 +722,83 @@ class Engine:
         if requeued and self._registry_runner is not None and self._registry_runner.running:
             self._registry_runner.notify_work()
         return requeued
+
+    # --- connections-dashboard stats (in-memory reset baselines) -------------
+
+    async def connection_metrics_view(
+        self, *, now: float | None = None, rate_window: float = 60.0
+    ) -> ConnectionMetrics:
+        """Per-connection metrics for the dashboard with operator stats-resets applied. The cumulative
+        counters (inbound read/errored, outbound written/dead) have their reset baseline subtracted
+        (clamped at ``>= 0``); live gauges (queue depth, ages, last-seen) pass through untouched. With
+        no resets active this returns the store metrics verbatim, so the dashboard is byte-identical to
+        before this feature."""
+        metrics = await self.store.connection_metrics(
+            since=self.started_at, now=now, rate_window=rate_window
+        )
+        if not self._inbound_stat_offsets and not self._outbound_stat_offsets:
+            return metrics  # fast path: nothing reset
+        inbound = {cid: self._apply_inbound_offset(cid, m) for cid, m in metrics.inbound.items()}
+        destinations = {
+            key: self._apply_outbound_offset(key, m) for key, m in metrics.destinations.items()
+        }
+        return ConnectionMetrics(inbound=inbound, destinations=destinations)
+
+    def _apply_inbound_offset(self, channel_id: str, m: InboundMetrics) -> InboundMetrics:
+        off = self._inbound_stat_offsets.get(channel_id)
+        if off is None:
+            return m
+        read0, errored0 = off
+        return replace(m, read=max(0, m.read - read0), errored=max(0, m.errored - errored0))
+
+    def _apply_outbound_offset(
+        self, key: tuple[str, str], m: DestinationMetrics
+    ) -> DestinationMetrics:
+        off = self._outbound_stat_offsets.get(key)
+        if off is None:
+            return m
+        written0, dead0 = off
+        return replace(m, written=max(0, m.written - written0), dead=max(0, m.dead - dead0))
+
+    async def reset_stats(
+        self,
+        *,
+        all_connections: bool = False,
+        inbound: Sequence[str] = (),
+        outbound: Sequence[tuple[str, str]] = (),
+        now: float | None = None,
+    ) -> int:
+        """Move the connections-dashboard "count from" mark to now for the targeted connections so the
+        visible cumulative counters (inbound read/errored, outbound written/dead) zero out. Implemented
+        as an in-memory snapshot of the current counts — message rows are never touched, and the
+        Prometheus ``/metrics`` counters (which must stay monotonic) are untouched too. ``all_connections``
+        resets every connection that has carried traffic. Returns the number of endpoints reset.
+
+        A connection with no traffic yet snapshots to ``(0, 0)``, which is correct: everything it sees
+        from here on arrives after the reset. Re-resetting overwrites the snapshot with the live counts,
+        so it re-zeroes."""
+        # Snapshot the RAW store counts (no offsets) so a re-reset captures the live cumulative value.
+        metrics = await self.store.connection_metrics(since=self.started_at, now=now)
+        count = 0
+        if all_connections:
+            for cid, m in metrics.inbound.items():
+                self._inbound_stat_offsets[cid] = (m.read, m.errored)
+                count += 1
+            for key, dm in metrics.destinations.items():
+                self._outbound_stat_offsets[key] = (dm.written, dm.dead)
+                count += 1
+            return count
+        for cid in inbound:
+            im = metrics.inbound.get(cid)
+            self._inbound_stat_offsets[cid] = (im.read, im.errored) if im is not None else (0, 0)
+            count += 1
+        for key in outbound:
+            dmet = metrics.destinations.get(key)
+            self._outbound_stat_offsets[key] = (
+                (dmet.written, dmet.dead) if dmet is not None else (0, 0)
+            )
+            count += 1
+        return count
 
     async def stop(self) -> None:
         """Stop the retention task + the wired graph, then close the store."""

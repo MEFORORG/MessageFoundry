@@ -10,7 +10,7 @@ body (PHI) appears only in the single-message detail view, which is audited.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -241,6 +241,26 @@ class ConnectionRow(BaseModel):
     error: str | None = (
         None  # set when status == "failed": why the connection failed to start (ADR 0031)
     )
+
+
+class StatsResetTarget(BaseModel):
+    """One connections-dashboard endpoint to reset, matching a row's (role, channel_id, destination).
+    For ``source`` rows ``destination`` is ignored; for ``destination`` rows it is required."""
+
+    role: Literal["source", "destination"]
+    channel_id: str = Field(min_length=1, max_length=256)
+    destination: str | None = Field(default=None, max_length=256)
+
+
+class StatsResetRequest(BaseModel):
+    """Reset the dashboard's cumulative counters for ``targets``, or for every connection (``all``)."""
+
+    all: bool = False
+    targets: list[StatsResetTarget] = Field(default_factory=list)
+
+
+class StatsResetResult(BaseModel):
+    reset: int  # number of connection endpoints whose dashboard counters were reset
 
 
 class StatsResponse(BaseModel):

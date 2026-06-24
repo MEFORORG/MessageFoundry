@@ -64,6 +64,45 @@ def test_console_no_window_detects_flag() -> None:
     assert r.status is not Status.FAIL
 
 
+class _HttpxBlocker:
+    """A meta_path finder that makes httpx un-importable (simulates a no-[console] install)."""
+
+    def find_spec(self, name: str, path: object = None, target: object = None) -> None:
+        if name == "httpx" or name.startswith("httpx."):
+            raise ModuleNotFoundError("No module named 'httpx'")
+        return None
+
+
+@pytest.fixture
+def httpx_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Evict cached httpx + console modules so find_spec re-runs the parent __init__ (a cached spec
+    # would otherwise mask the crash), then block httpx at import time.
+    import sys
+
+    for mod in list(sys.modules):
+        if mod == "httpx" or mod.startswith("httpx.") or mod.startswith("messagefoundry.console"):
+            monkeypatch.delitem(sys.modules, mod, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_HttpxBlocker(), *sys.meta_path])
+
+
+def test_console_no_window_no_crash_without_httpx(httpx_absent: None) -> None:
+    # Regression (Bug B): on a [sqlserver]-only box (no [console] extra, so no httpx) this crashed
+    # the whole `verify --section host` run with ModuleNotFoundError. After the lazy-console fix the
+    # source still ships, so the check completes honestly (MANUAL or SKIP) rather than raising.
+    r = checks.check_console_no_window()
+    assert r.id == "host.noflash"
+    assert r.status in (Status.MANUAL, Status.SKIP)
+    assert r.status is not Status.FAIL
+
+
+def test_run_host_checks_never_errors_without_httpx(httpx_absent: None, tmp_path: Path) -> None:
+    # The whole host suite must still complete (no raise, no ERROR) on a non-[console] box.
+    results = checks.run_host_checks(ports={"MLLP": 2575}, writable_dir=tmp_path)
+    assert results
+    for r in results:
+        assert r.status is not Status.ERROR, f"{r.id} errored: {r.detail}"
+
+
 # ---- self smoke -------------------------------------------------------------------------------
 
 

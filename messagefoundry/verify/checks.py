@@ -196,7 +196,13 @@ def check_console_importable() -> CheckResult:
 
 def check_console_no_window() -> CheckResult:
     """The console's service-control path passes CREATE_NO_WINDOW (no console flash on Status poll)."""
-    spec = importlib.util.find_spec("messagefoundry.console.service_control")
+    try:
+        # find_spec on a SUBMODULE imports the parent package; if console/__init__ ever drags a
+        # missing [console]-extra dep (e.g. httpx) this raises ModuleNotFoundError. Degrade to SKIP
+        # like every sibling check instead of crashing the whole `verify` run on a non-[console] box.
+        spec = importlib.util.find_spec("messagefoundry.console.service_control")
+    except (ImportError, ValueError):
+        spec = None
     if spec is None or not spec.origin:
         return CheckResult(
             "host.noflash",

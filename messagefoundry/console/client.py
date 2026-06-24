@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import ssl
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from json import JSONDecodeError
 from types import TracebackType
 from typing import TypeVar
@@ -56,6 +56,7 @@ from messagefoundry.api.models import (
     PurgeResult,
     ReloadResult,
     ReplayResult,
+    StatsResetResult,
     StatsResponse,
     SystemStatus,
 )
@@ -374,6 +375,23 @@ class EngineClient:
             self._request("POST", f"/connections/{name}/purge", params={"scope": scope}),
             PurgeResult,
         )
+
+    def reset_stats(
+        self,
+        *,
+        all_connections: bool = False,
+        targets: Sequence[tuple[str, str, str | None]] = (),
+    ) -> StatsResetResult:
+        """Reset the connections-dashboard counters for ``targets`` (each ``(role, channel_id,
+        destination)``), or for every connection when ``all_connections`` is set."""
+        body = {
+            "all": all_connections,
+            "targets": [
+                {"role": role, "channel_id": channel_id, "destination": destination}
+                for (role, channel_id, destination) in targets
+            ],
+        }
+        return _decode(self._request("POST", "/statistics/reset", json=body), StatsResetResult)
 
     def list_messages(
         self,
