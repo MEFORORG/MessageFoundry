@@ -32,6 +32,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.logging_setup import ControlCharScrubFilter, RedactionFilter
 from messagefoundry.parsing.message import Message
+from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports import DeliveryError, NegativeAckError
@@ -653,6 +654,107 @@ async def test_exhausted_retries_dead_letter(store: MessageStore, tmp_path: Path
     finally:
         await runner.stop()
     assert (await store.stats()).get(OutboxStatus.DEAD.value) == 1
+
+
+# --- L1: pre-send leadership re-check (active-passive HA) ---------------------
+
+
+class _FlipCoordinator(NullCoordinator):
+    """A clustered coordinator whose ``is_leader()`` is flippable, so a test can simulate this node
+    losing leadership between claiming an outbound row and sending it."""
+
+    def __init__(self, *, leader: bool) -> None:
+        super().__init__(node_id="flip")
+        self.leader = leader
+
+    def is_leader(self) -> bool:
+        return self.leader
+
+    def is_clustered(self) -> bool:
+        return True
+
+
+class _NeverSends:
+    """A destination connector that must NEVER be called — records every send so the test can assert 0."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def send(self, payload: str) -> None:
+        self.calls += 1
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_delivery_requeues_when_leadership_lost_before_send(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # L1: a delivery worker that has LOST leadership since claiming the row must re-queue it (mark_failed
+    # → PENDING with backoff), never emit egress as a stale ex-leader, and never drop it. The cheap
+    # synchronous is_leader() gate fires before connector.send(); the row stays deliverable for the new
+    # leader (count-and-log), and the connector is never called.
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    reg = _retry_registry(
+        inbox, outdir, RetryPolicy(backoff_seconds=30.0)
+    )  # long backoff: 1 attempt
+    coord = _FlipCoordinator(leader=True)
+    runner = RegistryRunner(reg, store, poll_interval=0.02, coordinator=coord)
+    dest = _NeverSends()
+    runner._destinations["file_out"] = dest
+    # Seed one outbound row directly (a row the would-be leader routed), then drop leadership BEFORE
+    # starting the delivery worker so the very first claim re-checks not-leader.
+    mid = await store.enqueue_message(
+        channel_id="file_in", raw=ADT, deliveries=[("file_out", "OUT|body")], control_id="C1"
+    )
+    coord.leader = False
+    await runner.start()
+    try:
+        # Poll for the OBSERVABLE re-queue: the row carries the leadership-lost last_error and is back to
+        # PENDING — a positive signal, not "nothing happened" (we don't assert absence by waiting).
+        elapsed = 0.0
+        while True:
+            cur = await store._db.execute(
+                "SELECT status, last_error FROM queue WHERE message_id=?", (mid,)
+            )
+            row = await cur.fetchone()
+            if (
+                row is not None
+                and row["status"] == OutboxStatus.PENDING.value
+                and "leadership lost" in (row["last_error"] or "")
+            ):
+                break
+            await asyncio.sleep(0.02)
+            elapsed += 0.02
+            assert elapsed < 3.0, (
+                "row was not re-queued with the leadership-lost error within timeout"
+            )
+    finally:
+        await runner.stop()
+    assert dest.calls == 0  # no egress emitted as a stale ex-leader
+    # The message was NOT dead-lettered or delivered — it stays in the pipeline for the new leader.
+    assert (await store.stats()).get(OutboxStatus.DEAD.value) is None
+    assert (await store.stats()).get(OutboxStatus.DONE.value) is None
+
+
+async def test_delivery_proceeds_while_leader(store: MessageStore, tmp_path: Path) -> None:
+    # The complement: while this node IS leader, the L1 gate is a no-op and delivery proceeds normally —
+    # so the guard never blocks the happy path. (Single-node NullCoordinator is always leader → identical.)
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    reg = _retry_registry(inbox, outdir, RetryPolicy())
+    coord = _FlipCoordinator(leader=True)
+    runner = RegistryRunner(reg, store, poll_interval=0.02, coordinator=coord)
+    await runner.start()
+    flaky = _FlakyDestination(fail_times=0)  # succeeds immediately
+    runner._destinations["file_out"] = flaky
+    (inbox / "a.hl7").write_bytes(ADT.encode("utf-8"))
+    try:
+        await _until_stat(store, OutboxStatus.DONE.value, 1)
+    finally:
+        await runner.stop()
+    assert len(flaky.deliveries) == 1  # leader → delivered, the L1 gate did not interfere
 
 
 class _AlwaysRaises:

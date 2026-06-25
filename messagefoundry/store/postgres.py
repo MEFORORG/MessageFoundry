@@ -59,8 +59,15 @@ from messagefoundry.config.settings import (
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import Row
-from messagefoundry.store.crypto import PREFIX as _ENC_PREFIX
-from messagefoundry.store.crypto import AesGcmCipher, Cipher, CipherError, IdentityCipher
+from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
+from messagefoundry.store.crypto import (
+    AesGcmCipher,
+    Cipher,
+    CipherError,
+    CipherInfo,
+    IdentityCipher,
+    cipher_info,
+)
 from messagefoundry.store.store import (
     ConnectionMetrics,
     DbStatus,
@@ -76,6 +83,7 @@ from messagefoundry.store.store import (
     Stage,
     UserRecord,
     audit_row_hash,
+    delivery_key,
 )
 
 log = logging.getLogger(__name__)
@@ -192,6 +200,20 @@ _SCHEMA: list[str] = [
         PRIMARY KEY (message_id, destination_name, response_seq)
     )""",
     "CREATE INDEX IF NOT EXISTS ix_response_message ON response(message_id)",
+    # Outbound idempotency ledger (H2) — one row per COMPLETED delivery, INSERTed in the SAME txn as the
+    # outbound row's mark_done / complete_with_response. delivery_key = sha256 of non-PHI ids + a
+    # replay-stable seq (delivery_key()); outbox_id is the queue row that delivered, the FIFO claim's
+    # skip-and-complete dedup key. HASHES + IDS ONLY — no body/PHI — so it is NOT part of the cipher seam.
+    """CREATE TABLE IF NOT EXISTS delivered_keys (
+        delivery_key     TEXT PRIMARY KEY,
+        outbox_id        TEXT NOT NULL,
+        message_id       TEXT NOT NULL,
+        destination_name TEXT NOT NULL,
+        delivery_seq     INTEGER NOT NULL,
+        delivered_at     DOUBLE PRECISION NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_delivered_outbox ON delivered_keys(outbox_id)",
+    "CREATE INDEX IF NOT EXISTS ix_delivered_message ON delivered_keys(message_id, destination_name)",
     """CREATE TABLE IF NOT EXISTS audit_log (
         id         BIGSERIAL PRIMARY KEY,
         ts         DOUBLE PRECISION NOT NULL,
@@ -326,7 +348,14 @@ def _build_ssl(settings: StoreSettings) -> Any:
         ctx.check_hostname = False
         ctx.verify_mode = _ssl.CERT_NONE
         return ctx
-    return True  # verifying TLS (the secure default)
+    if settings.ssl_root_cert:
+        import ssl as _ssl
+
+        # Pin a private / self-signed CA WITHOUT touching the OS trust store: verify the server cert
+        # (+ hostname) against this PEM bundle. create_default_context() already sets CERT_REQUIRED +
+        # check_hostname=True, so this stays a fully-verifying posture (a bad path raises at connect).
+        return _ssl.create_default_context(cafile=settings.ssl_root_cert)
+    return True  # verifying TLS against the system trust store (the secure default)
 
 
 class PostgresStore:
@@ -386,6 +415,12 @@ class PostgresStore:
         # clustered, BEFORE workers start; single-node never turns it on, so no state_version rows are ever
         # written and the backend stays byte-identical.
         self._cluster_state_convergence: bool = False
+        # H1 fencing token: the leader epoch this node currently holds + the leader_lease row to validate
+        # it against, both pushed by the engine on promotion via set_leader_epoch() (the store NEVER
+        # imports the coordinator — ARCH-6). None disables the claim's epoch guard (single-node / not yet
+        # leader), keeping claim_next_fifo byte-identical to pre-H1.
+        self._leader_epoch: int | None = None
+        self._lease_key: str | None = None
 
     @classmethod
     async def open(
@@ -514,6 +549,10 @@ class PostgresStore:
         if value is None:
             return value
         return self._cipher.decrypt(value)  # '' and legacy plaintext pass through unchanged
+
+    def cipher_info(self) -> CipherInfo:
+        """The non-secret at-rest cipher posture (M5): on/off + key fingerprint, never key bytes."""
+        return cipher_info(self._cipher)
 
     def _decode_record(self, record: Any, *columns: str) -> dict[str, Any]:
         """Materialize an ``asyncpg.Record`` as a dict and decrypt the named cipher-covered text
@@ -731,7 +770,9 @@ class PostgresStore:
         prefix and NULL / blank values; bounded memory (chunks of 500)."""
         if not self._cipher.encrypts:
             return
-        like = f"{_ENC_PREFIX}%"
+        # Version-agnostic anchor (M9): `mfenc:%` matches BOTH v1 and v2 ciphertext, so a v2 row is
+        # recognised as already-encrypted and skipped — never re-wrapped.
+        like = f"{_ENC_MARKER_PREFIX}%"
         total = 0
         for table, column in self._CIPHER_COLUMNS:
             while True:
@@ -816,7 +857,10 @@ class PostgresStore:
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
             return 0  # identity cipher (no key) — nothing to rotate
-        active_like = f"{_ENC_PREFIX}{cipher.active_key_id}:%"
+        # Active-format prefix through the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for a
+        # v2-active cipher, `mfenc:v2:<alg>:<kid>:`. Built off the cipher (not a baked-in v1 prefix+keyid)
+        # so a v2-active rotation matches v2 rows and the loop terminates.
+        active_like = f"{cipher.active_marker_prefix}%"
         total = 0
         for table, column in self._CIPHER_COLUMNS:
             while True:
@@ -918,6 +962,56 @@ class PostgresStore:
             event,
             destination,
             self._enc(detail),
+        )
+
+    async def _record_delivered_key(
+        self,
+        conn: Any,
+        *,
+        outbox_id: str,
+        message_id: str,
+        destination_name: str | None,
+        handler_name: str | None,
+        now: float,
+    ) -> None:
+        """Write the H2 idempotency-ledger row for one just-completed outbound delivery, **inside the
+        caller's open transaction** (Postgres twin of :meth:`MessageStore._record_delivered_key`).
+
+        Only outbound rows deliver; ingress/routed completions (``destination_name`` NULL) are skipped.
+        ``delivery_seq`` is ``1 + COUNT`` of prior ledger rows for the pair (replay-stable, like
+        ``response_seq``). Stored row carries hashes + ids only — never a body/PHI. One row per outbox
+        row INSTANCE (a double mark_done must not accumulate a second entry); ``ON CONFLICT DO NOTHING``
+        is the belt-and-suspenders backstop on the content hash."""
+        if destination_name is None:
+            return
+        already = await conn.fetchval(
+            "SELECT 1 FROM delivered_keys WHERE outbox_id=$1 LIMIT 1", outbox_id
+        )
+        if already is not None:
+            return
+        control_id = await conn.fetchval("SELECT control_id FROM messages WHERE id=$1", message_id)
+        seq = await conn.fetchval(
+            "SELECT COUNT(*) + 1 FROM delivered_keys WHERE message_id=$1 AND destination_name=$2",
+            message_id,
+            destination_name,
+        )
+        key = delivery_key(
+            control_id=control_id,
+            message_id=message_id,
+            destination_name=destination_name,
+            handler_name=handler_name,
+            delivery_seq=int(seq),
+        )
+        await conn.execute(
+            "INSERT INTO delivered_keys"
+            " (delivery_key, outbox_id, message_id, destination_name, delivery_seq, delivered_at)"
+            " VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (delivery_key) DO NOTHING",
+            key,
+            outbox_id,
+            message_id,
+            destination_name,
+            int(seq),
+            now,
         )
 
     async def _insert_message(
@@ -1450,6 +1544,13 @@ class PostgresStore:
                 await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
         return items
 
+    def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
+        # H1: the engine pushes the held leader epoch + lease key here on promotion/demotion (read from
+        # the coordinator — the store never imports it, ARCH-6). Stamps cached state only; the next
+        # claim_next_fifo validates it inside its single claim txn. epoch=None disables the guard.
+        self._leader_epoch = epoch
+        self._lease_key = lease_key
+
     async def claim_next_fifo(
         self,
         name: str,
@@ -1477,6 +1578,20 @@ class PostgresStore:
         now = time.time() if now is None else now
         lease_until = now + self._settings.lease_ttl_seconds  # Track B Step 2: stamp the lease
         lane_col = self._lane_col(stage)  # code-controlled literal
+        # H1 FENCING TOKEN. When the engine has pushed a held leader epoch (this node is a fenced
+        # leader), gate the claim on it INSIDE the same txn: claim only while our held epoch is still
+        # current — i.e. the authoritative leader_lease.leader_epoch has NOT advanced past it. A standby
+        # that took over bumped leader_epoch on its fresh acquire, so a paused/superseded ex-leader's
+        # held epoch is strictly older → the guard `leader_lease.leader_epoch <= $held` is false → the
+        # UPDATE matches 0 rows and the stale ex-leader claims nothing. The current leader's held epoch
+        # equals leader_lease.leader_epoch (<= passes), so it claims normally. The subquery runs in the
+        # claim txn (FOR UPDATE SKIP LOCKED on head is unaffected); a missing lease row yields NULL and
+        # `NULL <= $held` is false → fail-closed (no claim) rather than racing without a fence.
+        epoch_guard = ""
+        if self._leader_epoch is not None:
+            epoch_guard = (
+                " AND (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=$8) <= $9"
+            )
         head_sql = (
             "WITH head AS ("
             f" SELECT id, next_attempt_at FROM queue WHERE stage=$1 AND {lane_col}=$2 AND status=$3"
@@ -1484,7 +1599,7 @@ class PostgresStore:
             ")"
             " UPDATE queue q SET status=$4, attempts=attempts+1, updated_at=$5,"
             " owner=$6, lease_expires_at=$7"
-            " FROM head WHERE q.id=head.id AND head.next_attempt_at<=$5 RETURNING q.*"
+            f" FROM head WHERE q.id=head.id AND head.next_attempt_at<=$5{epoch_guard} RETURNING q.*"
         )
         async with self._pool.acquire() as conn:
             async with conn.transaction():
@@ -1506,8 +1621,8 @@ class PostgresStore:
                     OutboxStatus.INFLIGHT.value,
                 )
                 # THEN claim the head in the SAME txn, stamping the queue row's own owner + row lease.
-                row = await conn.fetchrow(
-                    head_sql,
+                # When fenced, $8/$9 carry the lease key + held epoch the guard validates (H1).
+                claim_args: list[Any] = [
                     stage,
                     name,
                     OutboxStatus.PENDING.value,
@@ -1515,7 +1630,40 @@ class PostgresStore:
                     now,
                     self._owner,
                     lease_until,
-                )
+                ]
+                if self._leader_epoch is not None:
+                    claim_args.extend([self._lease_key, self._leader_epoch])
+                row = await conn.fetchrow(head_sql, *claim_args)
+                # H2 SKIP-AND-COMPLETE (Postgres twin). If THIS just-claimed outbound row instance
+                # already has a committed ledger row, a prior delivery completed but the row was
+                # re-pended (a failover re-claim, or reset_stale_inflight after mark_done committed) —
+                # re-sending it is the duplicate H2 prevents. Complete it DONE in THIS same claim txn
+                # WITHOUT handing it to a worker; the lane advances to the next head with NO reorder (the
+                # head is consumed in place). A deliberate `replay` DELETEs the ledger row, so a replayed
+                # re-send has no entry here and is claimed normally (NOT deduped). Runs INSIDE the same
+                # transaction()/leader-epoch-fenced claim, so the fence still gates this completion.
+                if row is not None and row["destination_name"] is not None:
+                    already = await conn.fetchval(
+                        "SELECT 1 FROM delivered_keys WHERE outbox_id=$1 LIMIT 1", row["id"]
+                    )
+                    if already is not None:
+                        await conn.execute(
+                            "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
+                            " owner=NULL, lease_expires_at=NULL WHERE id=$3",
+                            OutboxStatus.DONE.value,
+                            now,
+                            row["id"],
+                        )
+                        await self._event(
+                            conn,
+                            row["message_id"],
+                            "delivered",
+                            row["destination_name"],
+                            "idempotent skip (already delivered)",
+                            now,
+                        )
+                        await self._maybe_finalize_message(conn, row["message_id"], now)
+                        row = None
         return await self._fifo_item_or_dead_letter(row)
 
     async def _fifo_item_or_dead_letter(self, row: Any) -> OutboxItem | None:
@@ -1587,6 +1735,15 @@ class PostgresStore:
                     OutboxStatus.DONE.value,
                     now,
                     outbox_id,
+                )
+                # H2: record the idempotency-ledger row in THIS same txn as the DONE flip.
+                await self._record_delivered_key(
+                    conn,
+                    outbox_id=outbox_id,
+                    message_id=row["message_id"],
+                    destination_name=row["destination_name"],
+                    handler_name=row["handler_name"],
+                    now=now,
                 )
                 await self._event(
                     conn,
@@ -1670,6 +1827,15 @@ class PostgresStore:
                         work_created,
                         now,
                     )
+                # H2: idempotency-ledger row joins this SAME txn as the DONE flip + the response artifact.
+                await self._record_delivered_key(
+                    conn,
+                    outbox_id=outbox_id,
+                    message_id=message_id,
+                    destination_name=destination_name,
+                    handler_name=row["handler_name"],
+                    now=now,
+                )
                 await self._event(
                     conn,
                     message_id,
@@ -2155,6 +2321,16 @@ class PostgresStore:
                     if stuck
                     else [OutboxStatus.DONE.value]
                 )
+                if not stuck:
+                    # RE-SEND branch (H2): drop the idempotency-ledger entries of THIS message's DONE
+                    # rows (the exact set re-pended below) so a deliberate re-send is NOT skip-and-
+                    # completed as a crash-re-run duplicate. Scoped to this message only.
+                    await conn.execute(
+                        "DELETE FROM delivered_keys WHERE outbox_id IN"
+                        " (SELECT id FROM queue WHERE message_id=$1 AND status=$2)",
+                        message_id,
+                        OutboxStatus.DONE.value,
+                    )
                 result = await conn.execute(
                     "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
                     " updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])",

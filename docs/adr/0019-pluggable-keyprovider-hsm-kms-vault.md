@@ -372,13 +372,25 @@ this ADR records 13.3.3's verdict-flip intent only — it edits **no** score doc
   `[store].require_encryption` directly — see §4.) The KeyProvider's fail-closed resolution **composes
   with** this: a PHI-posture instance must have a key, and an external provider that fails to resolve is a
   fail-closed startup error, never a no-key degrade.
-- **WP-BL3-28** — the **future** `mfenc:v2` envelope: an **ML-KEM-768 (FIPS 203) / RFC 9794 hybrid**
-  KEK-wrap of the per-record AES-256-GCM DEK, format
-  `mfenc:v2:<kek_id>:<wrapped_dek>:<base64(nonce‖ct‖tag)>`, dispatched alongside `v1` by the version token
-  in the [store/crypto.py](../../messagefoundry/store/crypto.py) `PREFIX`. The KeyProvider **KEK-seam this
-  ADR designs is the migration lever WP-BL3-28 dovetails into** — a provider can later source the v2 KEK
-  from the same HSM/KMS. This ADR keeps its design **strictly forward-compatible** with a later v2 version
-  token but **does NOT pre-empt or implement v2**; `mfenc:v1` rows keep decrypting unchanged.
+- **WP-BL3-28** — the **future** post-quantum envelope: an **ML-KEM-768 (FIPS 203) / RFC 9794 hybrid**
+  KEK-wrap of the per-record AES-256-GCM DEK. The KeyProvider **KEK-seam this ADR designs is the migration
+  lever WP-BL3-28 dovetails into** — a provider can later source the wrapping KEK from the same HSM/KMS.
+  **Reconciled with M9 (see "M9 crypto-agility marker" below):** the `mfenc:v2` version token is now
+  **owned by the M9 agility format** `mfenc:v2:<alg>:<key_id>:<b64>`, so WP-BL3-28 lands as a **new
+  registered `alg` id** under that v2 dispatch (the alg segment carries the PQ-hybrid suite), **not** as a
+  competing `mfenc:v2:<kek_id>:<wrapped_dek>:…` layout. This keeps a single, additive v2 grammar and a
+  single version dispatcher; `mfenc:v1` rows keep decrypting unchanged.
+- **M9 crypto-agility marker (BUILT 2026-06-24, additive — CRYPTO-1):** the cipher
+  ([store/crypto.py](../../messagefoundry/store/crypto.py)) is now **version/alg-dispatching**. It decodes
+  both `mfenc:v1:<key_id>:<b64>` and the additive, self-describing `mfenc:v2:<alg>:<key_id>:<b64>` (`alg`
+  names the AEAD suite), and **fails closed** (`CipherError`) on an unknown version or unknown `alg` —
+  never a silent pass-through or mis-decrypt. **AES-256-GCM (`a256gcm`) is the only registered algorithm**
+  and the **v1 writer is frozen byte-identical** (a frozen-fixture test pins it); v2 writing is **wired +
+  tested but off by default** (`make_cipher(..., write_v2=True)`), so **no at-rest format change ships** —
+  this is agility *infrastructure*, honoring CRYPTO-1. The store's find-all/migration scans anchor on the
+  version-agnostic `mfenc:` prefix (a v2 row is recognised as already-encrypted); the rotation scan anchors
+  on the cipher's active-format prefix through the key fingerprint (a v2-active rotation matches v2 rows and
+  terminates). This is the "strictly forward-compatible v2 version token" this ADR reserved, now realized.
 - **WP-BL3-06** (security-config-drift gate) — `[store].key_provider` is a **secure-by-default** field
   (default `auto` / unset = today's env-then-DPAPI behavior) that the drift gate can later pin.
 

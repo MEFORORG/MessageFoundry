@@ -12,8 +12,8 @@
 | **Applies to** | Any project developed under the [Secure Development Standards](Secure_Development_Standards.md) using an AI coding assistant. **MessageFoundry (MEFOR)** is the reference implementation (Appendix A); future projects add Appendix B, C, … |
 | **Maintained by** | Project maintainers (open-source). Each deploying/adopting organization assigns its own local owner. |
 | **Status** | Draft for review |
-| **Version** | 0.1 |
-| **Date** | June 18, 2026 |
+| **Version** | 0.3 |
+| **Date** | June 24, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on **any material change to the AI toolchain or threat model** (a new agent framework, MCP server, Claude Code version, or a new probed attack class). |
 | **Aligns to** | NIST SP 800-218 (SSDF): PO.1 / PO.2 / PO.3 / PO.5 / PS.1 / PW.1 / PW.4 / PW.7 / PW.8 / RV.2 · OWASP ASVS 5.0 Level 3 (V8, V11, V14, V15, V16) · a **five-principle synthesis** distilled from the AI-assisted-development literature (§3, §11 — *not* an external standard) · the project standing contract [`../CLAUDE.md`](../CLAUDE.md) · companion to [Secure Development Standards](Secure_Development_Standards.md). **Deliberately omits any certification framework** — see §8. |
@@ -22,7 +22,7 @@
 
 ## Executive summary
 
-This is the *Secure AI-Assisted Development Standards* — a companion to the [Secure Development Standards](Secure_Development_Standards.md) (SDS) that governs **how the maintainers use Claude Code to BUILD MessageFoundry** (the engineering workflow), without weakening any SDS guarantee. It is explicitly **NOT** the runtime AI assistant the shipped product offers operators; that policy lives in [AI.md](AI.md) and is out of scope here (the two share only the word "AI"). The standard **owns and expands** the SDS [§A.6](Secure_Development_Standards.md#a6-documented-deviations) deviation — *single-maintainer development, with AI-assisted review as a compensating control* — as the detailed record for the solo-maintainer reality, and it aligns to **NIST SP 800-218 (SSDF)** and **OWASP ASVS 5.0 L3** while deliberately conferring **no certification**. **Status: Draft for review, v0.1.** It serves maintainers (the daily loop), adopters and auditors (build-provenance evidence for their own compliance program), and future projects (their own appendix).
+This is the *Secure AI-Assisted Development Standards* — a companion to the [Secure Development Standards](Secure_Development_Standards.md) (SDS) that governs **how the maintainers use Claude Code to BUILD MessageFoundry** (the engineering workflow), without weakening any SDS guarantee. It is explicitly **NOT** the runtime AI assistant the shipped product offers operators; that policy lives in [AI.md](AI.md) and is out of scope here (the two share only the word "AI"). The standard **owns and expands** the SDS [§A.6](Secure_Development_Standards.md#a6-documented-deviations) deviation — *single-maintainer development, with AI-assisted review as a compensating control* — as the detailed record for the solo-maintainer reality, and it aligns to **NIST SP 800-218 (SSDF)** and **OWASP ASVS 5.0 L3** while deliberately conferring **no certification**. **Status: Draft for review, v0.3.** It serves maintainers (the daily loop), adopters and auditors (build-provenance evidence for their own compliance program), and future projects (their own appendix).
 
 **Why it exists.** It lets a solo maintainer build a PHI-carrying healthcare engine with an AI assistant without weakening the secure-development baseline, and produces auditable build-provenance evidence. Every control traces to one of **five named failure modes (§3):** (1) intent/requirements drift with no auditable intent→code chain; (2) context loss / "context rot" (the model's working context degrading across a long session); (3) long-trajectory error accumulation; (4) the "fast but flawed" speed–quality paradox; and (5) misplaced trust in output. The calibration anchor is the **METR RCT (2025)**: 16 experienced developers on mature repos were measured **~19% SLOWER** with early-2025 AI tooling while forecasting and still believing they were faster — uncontrolled AI assistance is **not automatically** a speed or quality win.
 
@@ -421,6 +421,7 @@ The repo's tiered-honesty taxonomy, applied to the **dev-process tooling itself*
 - PreToolUse [`block-blanket-git-stage.ps1`](../scripts/hooks/block-blanket-git-stage.ps1) (Bash + PowerShell, fail-open).
 - [`.claude/settings.json`](../.claude/settings.json) secrets/keys/`*.db` **path-based** deny-list + destructive-command denies.
 - Blocking security CI: bandit, semgrep ([`.semgrep/messagefoundry.yml`](../.semgrep/messagefoundry.yml)), pip-audit, gitleaks, crypto-inventory, forbidden-content ([`scripts/publish/scan_forbidden.py`](../scripts/publish/scan_forbidden.py)). The CycloneDX **SBOM** job is **advisory** (`continue-on-error`), not blocking.
+- **Dependency-CVE fast response (SSDF RV.2 evidence):** dependency-vulnerability metrics ([`vuln-metrics.yml`](../.github/workflows/vuln-metrics.yml)), scoped Dependabot auto-merge + supply-chain cooldown ([`dependabot-auto-merge.yml`](../.github/workflows/dependabot-auto-merge.yml)), auto lock-resync ([`dependabot-lock-resync.yml`](../.github/workflows/dependabot-lock-resync.yml)), and the adopter vulnerable-pin CI tripwire. The **`CI gate` roll-up** required check gates the conditional/matrix legs in [`ci.yml`](../.github/workflows/ci.yml). *(This is the **audit/known-CVE** posture — distinct from the still-deferred hallucinated/typosquatted **new-dependency-introduction** check below.)*
 - [`messagefoundry check`](../messagefoundry/checks.py) exit-coded validate + dryrun gate.
 - SessionStart worktree-context hook; worktree scripts ([`new.ps1`/`remove.ps1`](../scripts/worktree/)); shared AI project memory (facts only); synthetic generators; the dependency-boundary test ([`tests/test_dependency_boundaries.py`](../tests/test_dependency_boundaries.py)).
 - `Co-Authored-By` provenance trailer — **by convention** (model/version, commit granularity).
@@ -505,7 +506,8 @@ MEFOR is an open-source HL7 v2.x integration engine (Python; FastAPI; SQLite/WAL
 | Worktree context + isolation | [`scripts/worktree/session-context.ps1`](../scripts/worktree/session-context.ps1), [`new.ps1`/`remove.ps1`](../scripts/worktree/) | Built |
 | Exit-coded validate + dryrun gate | [`messagefoundry/checks.py`](../messagefoundry/checks.py) | Built |
 | Blocking SAST/SCA/secret-scan/crypto-inventory/forbidden-content (+ advisory SBOM) | [`.github/workflows/security.yml`](../.github/workflows/security.yml) | Built |
-| Lint/format/type/test + cross-DB store suites | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) | Built |
+| Lint/format/type/test + cross-DB store suites + the `CI gate` roll-up required check | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) | Built |
+| Dependency-CVE fast response (RV.2): vuln metrics, scoped Dependabot auto-merge + cooldown, auto lock-resync, adopter vulnerable-pin tripwire | [`vuln-metrics.yml`](../.github/workflows/vuln-metrics.yml), [`dependabot-auto-merge.yml`](../.github/workflows/dependabot-auto-merge.yml), [`dependabot-lock-resync.yml`](../.github/workflows/dependabot-lock-resync.yml) | Built |
 | Project SAST rules | [`.semgrep/messagefoundry.yml`](../.semgrep/messagefoundry.yml) | Built |
 | Customer/PHI leak guard | [`scripts/publish/scan_forbidden.py`](../scripts/publish/scan_forbidden.py) | Built |
 | Human-gate stack | [PR template](../.github/PULL_REQUEST_TEMPLATE.md), [CODEOWNERS](../.github/CODEOWNERS), [`cla.yml`](../.github/workflows/cla.yml) | Built |
@@ -542,6 +544,7 @@ MEFOR is an open-source HL7 v2.x integration engine (Python; FastAPI; SQLite/WAL
 
 ### A.5 Project-specific parameters
 
+- **Runtime:** **Python 3.14-only** (`requires-python >=3.14`; CI runs a single 3.14 matrix across ubuntu + Windows 2022/2025) — 3.11/3.12/3.13 support dropped 2026-06-24 (PR #515).
 - **Verification order:** `ruff check` → `ruff format --check` → `mypy` (strict) → `pytest` (`QT_QPA_PLATFORM=offscreen` for console) → `messagefoundry check`.
 - **Commits:** one coherent layer per commit; branch + PR (direct `main` blocked).
 - **Trailer format:** `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>` + the `Tier:` line.
@@ -565,7 +568,7 @@ The standard requires deviations be documented with a compensating control (SDS 
 
 **Links out** (this doc → the docs graph): [`../CLAUDE.md`](../CLAUDE.md) (the operationalized standing contract) · [Secure Development Standards §A.6](Secure_Development_Standards.md#a6-documented-deviations), [PO.5](Secure_Development_Standards.md), [PW.7](Secure_Development_Standards.md) (bound via the **Standard ref** above) · [AI.md](AI.md) (out-of-scope product policy) · [PHI.md](PHI.md) (PO.5 no-real-PHI + treat-HL7-as-untrusted-data) · [WORKTREES.md](WORKTREES.md) · [security/RELEASE-GATE.md](security/RELEASE-GATE.md) (tag-time gate) · [docs/adr/README.md](adr/README.md).
 
-**Back-link stubs to add** (reciprocal wiring): **FROM** [SDS §A.6](Secure_Development_Standards.md#a6-documented-deviations) — a pointer from the *Single-maintainer development* deviation to **this doc** as its detailed record; **FROM** [AI.md](AI.md) top / Future-direction — a one-line *"for the dev-process use of AI to BUILD MessageFoundry, see [Secure_AI_Development_Standards.md](Secure_AI_Development_Standards.md) — distinct from this product policy"*; a [docs/adr/README.md](adr/README.md) row if an ADR is cut; an entry in [FEATURE-MAP.md](FEATURE-MAP.md) if it enumerates security docs.
+**Reciprocal back-links (in place):** **FROM** [SDS §A.6](Secure_Development_Standards.md#a6-documented-deviations) — the *Single-maintainer development* deviation names **this doc** as its detailed record (SDS v1.5); **FROM** [AI.md](AI.md) — both the *scope* callout (product feature ≠ dev process) and the §4.5 BAA *dev-process analogue* cross-reference this standard. *Not applicable:* a [docs/adr/README.md](adr/README.md) row (no ADR was cut for this standard) and a [FEATURE-MAP.md](FEATURE-MAP.md) entry (it enumerates security *features/controls*, not docs).
 
 ---
 
@@ -573,4 +576,6 @@ The standard requires deviations be documented with a compensating control (SDS 
 
 | Version | Date | Change |
 |---|---|---|
+| 0.3 | June 24, 2026 | **Cross-reference hygiene.** Corrected the *Cross-references* note: the reciprocal back-links it listed as "stubs to add" are already in place (SDS §A.6 → this doc since SDS v1.5; AI.md scope callout + §4.5 analogue), and the two conditional stubs (ADR-README row, FEATURE-MAP entry) are N/A. No standard-body change. |
+| 0.2 | June 24, 2026 | **Freshness refresh.** Recorded the dependency-CVE fast-response machinery shipped after v0.1 as **Built** (SSDF RV.2): vuln-metrics, scoped Dependabot auto-merge + cooldown, auto lock-resync, the adopter vulnerable-pin tripwire, and the `CI gate` roll-up required check (§9, A.2). Noted the **Python 3.14-only** runtime (PR #515, A.5). No change to the spine (§4 matrix/resolver), the controls-as-dials (§5), or the deviations register (A.6). |
 | 0.1 | June 18, 2026 | **Initial companion standard** — the `(project_scale × phi_touch)` **risk-tier matrix as the spine** (§4), the env-clamp **fail-closed tier resolver** with a recorded reason / PR tier-declaration, the **controls-as-dials master table** (§5), and the **embedded daily-loop Claude Code playbook** (§6, incl. *when NOT to use AI*, §6.8, and MCP/web-egress trust, §6.3). **Owns and expands the [SDS §A.6](Secure_Development_Standards.md#a6-documented-deviations) AI-assisted-review compensating-control deviation** (Appendix A.6). Honesty taxonomy applied to the dev-process toolchain (§9), including the SPDX-enforcement-by-convention and commit-granular-provenance gaps. |

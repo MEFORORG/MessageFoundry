@@ -288,6 +288,49 @@ async def test_run_once_acts_as_leader_with_default_coordinator(store: MessageSt
     assert result.messages_purged == 1
 
 
+class _DemoteMidPurgeCoordinator(_FollowerCoordinator):
+    """A coordinator that is leader for the FIRST ``is_leader()`` read (the top-of-pass gate) then NOT
+    leader on subsequent reads — simulating leadership lost (a self-fence) BETWEEN the top gate and the
+    L1 pre-purge re-check, so the pass must abandon the purge without touching any PHI body."""
+
+    node_id = "demoting"
+
+    def __init__(self) -> None:
+        self._reads = 0
+
+    def is_leader(self) -> bool:
+        self._reads += 1
+        return self._reads == 1  # leader only on the first (top-gate) read
+
+
+async def test_run_once_demotion_mid_purge_leaves_bodies_intact(store: MessageStore) -> None:
+    """L1 pre-purge re-check: if leadership is lost BETWEEN the top-of-pass gate and the purges, the pass
+    returns a did-nothing result WITHOUT nulling any message body or writing an audit row — a demoted node
+    must never purge PHI as a stale ex-leader (count-and-log: bodies stay for the new leader)."""
+    mid, outbox_id = await _delivered(store, now=0.0)
+    coord = _DemoteMidPurgeCoordinator()
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(messages_days=1, dead_letter_days=1),
+        clock=lambda: 10 * DAY,
+        coordinator=coord,
+    )
+
+    result = await runner.run_once()
+
+    assert (
+        coord._reads >= 2
+    )  # the top gate passed (leader) then the pre-purge re-check saw the demotion
+    assert not result.did_work
+    assert result.messages_purged == 0 and result.dead_purged == 0
+    # The PHI body + the delivered payload are untouched; no audit row written.
+    msg = await store.get_message(mid)
+    assert msg["raw"] == "MSH|^~\\&|raw-body"  # body intact, not nulled
+    assert msg["summary"] is not None
+    assert await _payload(store, outbox_id) == "OUT|delivered-body"  # payload intact
+    assert [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"] == []
+
+
 async def test_run_once_no_work_writes_no_audit(store: MessageStore) -> None:
     await _delivered(store, now=0.0)
     # Everything off → a pass does nothing and must not spam the audit log.

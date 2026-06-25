@@ -271,6 +271,9 @@ def test_serve_allows_debug_in_staging(monkeypatch: pytest.MonkeyPatch, tmp_path
     # are allowed to use DEBUG. Proves the condition isn't accidentally widened to staging.
     import uvicorn
 
+    # staging is a PHI environment, so the H3 keyless-start refusal would fire first; configure a key so
+    # this test exercises the DEBUG posture (not the keyless gate).
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: None)
     rc = __main__.main(

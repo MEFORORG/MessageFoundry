@@ -25,6 +25,9 @@ from collections.abc import AsyncIterator, Callable
 import pytest
 
 from messagefoundry.pipeline.cluster import DbCoordinator
+from messagefoundry.store import OutboxStatus
+
+_RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_POSTGRES"),
@@ -174,3 +177,65 @@ async def test_lifecycle_elects_one_then_fails_over_on_clean_stop(coords) -> Non
     await leader.stop()
     assert await _await_until(follower.is_leader, timeout=3.0)
     assert follower.is_leader() is True
+
+
+# --- H6: end-to-end stale-epoch fence after a real two-node handover ---------
+
+
+async def _clear_data(store: object) -> None:
+    """Empty the message/queue data tables so the FIFO claim below starts from a known single head."""
+    async with store._pool.acquire() as conn:  # type: ignore[attr-defined]
+        rows = await conn.fetch(
+            "SELECT tablename FROM pg_tables WHERE schemaname = ANY (current_schemas(false))"
+        )
+        existing = {r["tablename"] for r in rows}
+        targets = [t for t in ("messages", "queue", "outbox", "response") if t in existing]
+        if targets:
+            await conn.execute(f"TRUNCATE {', '.join(targets)} RESTART IDENTITY CASCADE")
+
+
+async def test_resumed_ex_leader_is_fenced_after_real_handover(coords) -> None:
+    # H6 stale-epoch failover assertion (the half UNBLOCKED by S2/H1), end-to-end against a real DB.
+    #
+    # The store-level fence tests (tests/test_postgres_store.py) seed the lease epoch BY HAND. This proves
+    # the *real coordinator handover* produces the fence: A acquires (epoch 1), A "crashes" (stops
+    # renewing), B takes over once the lease expires and the fresh-acquire BUMPS the epoch (→ 2). A then
+    # "resumes" past its temporal self-fence — but it still holds its now-stale epoch 1. We push A's held
+    # epoch + lease key into the store (exactly as the engine does on promotion) and assert A's FIFO claim
+    # is REJECTED (0 rows) — A delivers NOTHING, so no duplicate/out-of-order egress. B (current epoch)
+    # then claims the SAME head, proving the lane is intact and only the live leader drains it.
+    make, store = coords
+    await _clear_data(store)
+    a, b = make("A"), make("B")
+
+    # A acquires; capture its held epoch + the lease key it validated against (what the engine pushes down).
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+    a_epoch = a.current_epoch()
+    lease_key = a.lease_key()
+    assert a_epoch is not None and lease_key is not None
+
+    # A "crashes": let its lease age out against the DB clock, then B takes over and BUMPS the epoch.
+    await asyncio.sleep(_TTL + 0.4)
+    await b._maintain_leadership()
+    assert b.is_leader() is True
+    b_epoch = b.current_epoch()
+    assert b_epoch is not None and b_epoch > a_epoch  # fresh acquire advanced the fencing token
+
+    # One queued head on a single FIFO lane.
+    mid = await store.enqueue_message(  # type: ignore[attr-defined]
+        channel_id="IB", raw=_RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+
+    # A resumes past its temporal self-fence holding the STALE epoch — the durable fence must reject it.
+    store.set_leader_epoch(a_epoch, lease_key=lease_key)  # type: ignore[attr-defined]
+    assert await store.claim_next_fifo("OB1", now=200.0) is None  # type: ignore[attr-defined]
+    outbox = await store.outbox_for(mid)  # type: ignore[attr-defined]
+    assert outbox[0]["status"] == OutboxStatus.PENDING.value  # head untouched — A delivered nothing
+    assert outbox[0]["attempts"] == 0  # the rejected claim didn't even bump attempts
+
+    # The current leader (B's epoch) claims the same head: the lane is intact, only the live leader drains.
+    store.set_leader_epoch(b_epoch, lease_key=lease_key)  # type: ignore[attr-defined]
+    claimed = await store.claim_next_fifo("OB1", now=201.0)  # type: ignore[attr-defined]
+    assert claimed is not None and claimed.message_id == mid
+    await store.mark_done(claimed.id, now=202.0)  # type: ignore[attr-defined]

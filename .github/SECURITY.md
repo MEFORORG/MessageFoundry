@@ -12,9 +12,14 @@ verify a report against current `main` before filing.
 
 **Do not open a public issue for a vulnerability.** Instead, report it privately:
 
-- Preferred: open a [GitHub private security advisory](https://github.com/MEFORORG/MessageFoundry/security/advisories/new)
-  ("Report a vulnerability"), or
-- Email the maintainer at the address on the GitHub profile.
+- **Preferred (always available, fully private):** open a [GitHub private security advisory](https://github.com/MEFORORG/MessageFoundry/security/advisories/new)
+  ("Report a vulnerability") — GitHub keeps it private to the maintainers until coordinated disclosure.
+  This is the recommended channel on both this repository and the public mirror.
+- Alternatively, email the maintainer at the address on the GitHub profile.
+
+If you cannot reach a maintainer privately within a few business days, you may request a contact via a
+**non-detail** public issue (title only, e.g. "requesting a private security contact") — **never** put
+vulnerability details, reproduction steps, or any message content in a public issue.
 
 Please include: affected component (e.g. MLLP/file transport, store, API/auth, console),
 a description and impact, and reproduction steps or a proof of concept. Do **not** include

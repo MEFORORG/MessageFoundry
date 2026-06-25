@@ -101,6 +101,23 @@ cluster coordinates the parts that must not double-run or interleave:
   `leader_fence_timeout_seconds` (< the TTL) **self-fences** — it stops acting as leader before the lease
   can expire and a standby acquire it, so a network-partitioned old leader never double-processes
   (the split-brain guard). On a clean stop the leader expires its lease so a standby takes over at once.
+- **Store-checked leader epoch (fencing token).** The self-fence above is *temporal* — it relies on a
+  paused/partitioned old leader noticing it has fallen behind and demoting itself before the lease TTL
+  elapses. As a **second, durable** backstop the `leader_lease` row also carries a monotonic
+  `leader_epoch` that is **bumped only on a fresh acquire** (a standby taking over) — never on a renew —
+  so a node that took over holds a strictly *greater* epoch than the leader it superseded. On promotion
+  the engine reads the held epoch from the coordinator and pushes it into the store
+  (`Store.set_leader_epoch`); every FIFO claim then validates, **inside the single claim transaction**,
+  that the held epoch is still current (`held >= leader_lease.leader_epoch`). A superseded ex-leader that
+  resumes after an unusually long pause — past even the temporal fence — therefore claims **0 rows**: its
+  held epoch is now older than the live leader's, so the claim's `UPDATE` matches nothing and it delivers
+  nothing. The current leader's held epoch equals the lease epoch, so it claims normally; per-lane FIFO is
+  unaffected (the guard only ever *rejects* a stale claim, never reorders a valid one). This is a
+  **server-DB-only** safeguard (Postgres / SQL Server); SQLite is a single active node, so its
+  `set_leader_epoch` is a no-op and the claim is byte-identical. The migration that adds the column is
+  additive (`ADD COLUMN IF NOT EXISTS` / a guarded `ALTER`, run under the DDL lock), so an in-place
+  upgrade of a live cluster is safe; the column back-fills to `0` and the first fresh acquire after the
+  upgrade bumps it to `1`.
 - **Leader-gated WRITE singletons.** Retention purges and the lease-reclaim sweep run **only on the
   leader**, so they never double-execute.
 - **Leader-gated poll-source intake.** Only the leader polls a **shared** external resource (a watched

@@ -287,37 +287,89 @@ def test_serve_refuses_without_key_when_require_encryption(
 def test_serve_refuses_in_prod_without_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A PRODUCTION PHI instance must not run keyless: serve fails closed (the prod analogue of
-    # require_encryption — no flag needed), distinct from the staging warning below.
+    # A PRODUCTION PHI instance must not run keyless: serve fails closed (H3, gated on data_class==phi).
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)  # never reached, but be safe
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"]) == 2
     err = capsys.readouterr().err
-    assert "production PHI instance" in err and "UNENCRYPTED at rest" in err
+    assert "PHI instance" in err and "UNENCRYPTED at rest" in err and "prod" in err
 
 
-def test_serve_warns_in_staging_without_key(
+def test_serve_refuses_in_staging_without_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # staging may carry real PHI too, so the keyless at-rest warning fires there as well (3.1).
+    # H3: a NON-production PHI instance (staging) now REFUSES keyless too (was a warn) — the keyless
+    # refusal is gated on data_class==phi, NOT the environment label, because dev/staging routinely hold
+    # near-real PHI. This is the secure-by-default tightening (OWASP *Fail Securely* / SDS §4.3 PW.9).
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]) == 2
+    err = capsys.readouterr().err
+    assert "PHI instance" in err and "UNENCRYPTED at rest" in err and "staging" in err
+
+
+def test_serve_keyless_phi_override_starts_with_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # H3 override: [store].allow_unencrypted_phi=true is the explicit, audited opt-out that lets a PHI
+    # instance start keyless — it WARNS (and audits) rather than refusing, distinct from a default
+    # refusal. (`require_encryption=true` would still win; tested separately.)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "[store]\nallow_unencrypted_phi = true\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]) == 0
     err = capsys.readouterr().err
-    assert "UNENCRYPTED at rest" in err and "staging" in err
+    assert "allow_unencrypted_phi" in err and "UNENCRYPTED at rest" in err and "staging" in err
+
+
+def test_serve_require_encryption_overrides_keyless_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # require_encryption=true wins over allow_unencrypted_phi=true: the refusal is unconditional.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "[store]\nrequire_encryption = true\nallow_unencrypted_phi = true\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]) == 2
+    assert "require_encryption" in capsys.readouterr().err
 
 
 def test_serve_quiet_in_dev_without_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # dev is synthetic-only by policy, so the keyless warning stays quiet to avoid alarm fatigue.
+    # dev is synthetic-only by policy (data_class != phi), so a keyless start is allowed and quiet — the
+    # H3 refusal is gated on data_class==phi, not the environment label. (CI parity: synthetic stays
+    # key-free.)
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     assert "UNENCRYPTED at rest" not in capsys.readouterr().err
+
+
+def test_serve_keyless_custom_phi_env_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # H3 gates on data_class, not the env NAME: a CUSTOM env explicitly marked phi (e.g. a 'test' box
+    # holding near-real PHI) refuses keyless exactly like prod/staging — the EF-3 perception-gap fix.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[ai]\nenvironment = "test"\ndata_class = "phi"\nproduction = false\n', encoding="utf-8"
+    )
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "test"]) == 2
+    err = capsys.readouterr().err
+    assert "PHI instance" in err and "UNENCRYPTED at rest" in err and "test" in err
 
 
 def test_serve_refuses_open_egress_in_prod(

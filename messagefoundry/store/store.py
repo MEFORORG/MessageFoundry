@@ -45,8 +45,14 @@ import aiosqlite
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
-from messagefoundry.store.crypto import PREFIX as _ENC_PREFIX
-from messagefoundry.store.crypto import AesGcmCipher, Cipher, IdentityCipher
+from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
+from messagefoundry.store.crypto import (
+    AesGcmCipher,
+    Cipher,
+    CipherInfo,
+    IdentityCipher,
+    cipher_info,
+)
 
 log = logging.getLogger(__name__)
 
@@ -323,6 +329,42 @@ def audit_row_hash(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def delivery_key(
+    *,
+    control_id: str | None,
+    message_id: str,
+    destination_name: str,
+    handler_name: str | None,
+    delivery_seq: int,
+) -> str:
+    """The idempotency-ledger key for one **completed** outbound delivery (H2) — a SHA-256 digest of
+    re-run-stable, **non-PHI** identifiers only (ids + a counter; **never a body**).
+
+    Folds in the inbound control id (MSH-10) when present, else the internal ``message_id`` (so two
+    messages that happen to share a control id across channels stay distinct via the destination +
+    seq), the destination, the handler that produced the delivery (NULL → empty), and ``delivery_seq``
+    — ``1 + COUNT(prior ledger rows for this (message_id, destination))``, the same monotonic,
+    replay-stable counter shape as ``response_seq`` (ADR 0013). The seq is what distinguishes an
+    **operator replay** (a fresh, higher-seq delivery → a new key → re-sends, never deduped) from a
+    **crash-re-run** (the same row instance recovered before its completion committed — its prior
+    ledger row, if any, is keyed by ``outbox_id`` and caught at claim time, not by this hash).
+
+    Shared verbatim by all three store backends so the digest is byte-identical across SQLite/Postgres/
+    SQL Server. control_id is a peek-derived MSH field — included as an *operator-facing correlation
+    aid* in the digest input only; it is hashed, never stored or logged in the clear here."""
+    canonical = json.dumps(
+        [
+            control_id if control_id is not None else message_id,
+            destination_name,
+            handler_name or "",
+            delivery_seq,
+        ],
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 _OWNER_ONLY = stat.S_IRUSR | stat.S_IWUSR  # 0o600
 
 
@@ -528,6 +570,24 @@ CREATE TABLE IF NOT EXISTS response (
 );
 CREATE INDEX IF NOT EXISTS ix_response_message ON response(message_id);
 
+-- Outbound idempotency ledger (H2): one row per COMPLETED delivery, INSERTed in the SAME transaction
+-- as the outbound row's mark_done / complete_with_response. `delivery_key` is a SHA-256 of non-PHI ids
+-- + a replay-stable seq (see delivery_key()); `outbox_id` is the queue row that delivered, used by the
+-- FIFO claim's skip-and-complete to no-op a re-claimed already-delivered head (crash-re-run dedup)
+-- WITHOUT re-sending. This table carries HASHES + IDS ONLY — never a message body or any PHI — so it
+-- is stored in the clear (nothing to decrypt; it is not part of the `_cipher` seam). A deliberate
+-- operator `replay` DELETEs the affected rows so the re-send is NOT deduped (replay-distinguishes).
+CREATE TABLE IF NOT EXISTS delivered_keys (
+    delivery_key     TEXT PRIMARY KEY,    -- sha256(control_id|message_id, dest, handler, seq) — no PHI
+    outbox_id        TEXT NOT NULL,       -- the queue row that delivered (claim-time dedup lookup key)
+    message_id       TEXT NOT NULL,
+    destination_name TEXT NOT NULL,
+    delivery_seq     INTEGER NOT NULL,    -- 1+COUNT prior rows for (message_id, destination_name)
+    delivered_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_delivered_outbox  ON delivered_keys(outbox_id);
+CREATE INDEX IF NOT EXISTS ix_delivered_message ON delivered_keys(message_id, destination_name);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          REAL NOT NULL,
@@ -679,6 +739,10 @@ class MessageStore:
         if value is None:
             return value
         return self._cipher.decrypt(value)  # '' and legacy plaintext pass through unchanged
+
+    def cipher_info(self) -> CipherInfo:
+        """The non-secret at-rest cipher posture (M5): on/off + key fingerprint, never key bytes."""
+        return cipher_info(self._cipher)
 
     def _decode_row(self, row: aiosqlite.Row, *columns: str) -> dict[str, Any]:
         """Materialize a read-row as a dict and decrypt the named cipher-covered text columns. Returned
@@ -868,7 +932,10 @@ class MessageStore:
         work throughout and re-running is a no-op. Bounded memory (processes in chunks)."""
         if not self._cipher.encrypts:
             return
-        like = f"{_ENC_PREFIX}%"
+        # Version-agnostic anchor (M9): `mfenc:%` matches BOTH v1 and v2 ciphertext, so a v2 row is
+        # recognised as already-encrypted and skipped — never re-wrapped. Anchoring on a version-
+        # specific prefix would miss the other version's rows.
+        like = f"{_ENC_MARKER_PREFIX}%"
         total = 0
         async with self._lock:
             for table, column in self._CIPHER_COLUMNS:
@@ -967,7 +1034,11 @@ class MessageStore:
         cipher = self._cipher
         if not isinstance(cipher, AesGcmCipher):
             return 0  # identity cipher (no key) — nothing to rotate
-        active_like = f"{_ENC_PREFIX}{cipher.active_key_id}:%"
+        # The active-format prefix THROUGH the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for a
+        # v2-active cipher, `mfenc:v2:<alg>:<kid>:`. Rotation rewrites everything NOT already under this
+        # prefix, so a value re-encrypted to the active key/format matches next round and the loop ends.
+        # Built off the cipher (not a baked-in v1 prefix+keyid) so a v2-active rotation matches v2 rows.
+        active_like = f"{cipher.active_marker_prefix}%"
         total = 0
         async with self._lock:
             for table, column in self._CIPHER_COLUMNS:
@@ -1819,6 +1890,14 @@ class MessageStore:
                 await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
         return items
 
+    def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
+        # SQLite is single active node: there is no second writer to fence, so the H1 epoch guard is a
+        # no-op here and claim_next_fifo stays byte-identical. The engine never builds a DbCoordinator on
+        # SQLite (build_coordinator returns the NullCoordinator, whose current_epoch() is None), so this
+        # is only ever called with epoch=None in practice; accept and ignore any value for protocol
+        # uniformity.
+        return None
+
     async def claim_next_fifo(
         self,
         name: str,
@@ -1842,8 +1921,9 @@ class MessageStore:
         monotonically non-decreasing within the lane; :meth:`_fifo_created_at` **clamps each new row's
         ``created_at`` up to the lane's current max at insert**, so a backward wall-clock step (NTP
         step-back, VM snapshot revert) can't make a later message sort ahead of an earlier one on this
-        backend. (The SQL Server backend's ``outbox`` FIFO has no such clamp yet — its monotonic
-        ordering is part of the SQL Server staged-backend work; see docs/BACKLOG.md.) If the head is
+        backend. (The SQL Server backend applies the same clamp — ``store/sqlserver.py``'s own
+        ``_fifo_created_at`` at its insert sites; its ``claim_next_fifo`` also omits ``READPAST`` on the
+        FIFO head to preserve per-lane order, see #285.) If the head is
         still backing off (``next_attempt_at`` in
         the future) this returns ``None`` *without* skipping ahead — the head blocks the lane (head-of-
         line) until it succeeds, dead-letters, or is purged. Contrast :meth:`claim_ready`, which skips a
@@ -1872,6 +1952,32 @@ class MessageStore:
             cur = await self._db.execute("SELECT * FROM queue WHERE id=?", (row["id"],))
             claimed = await cur.fetchone()
             assert claimed is not None  # nosec B101 — just updated this row under the lock
+            # H2 SKIP-AND-COMPLETE. If THIS outbound row instance already has a committed ledger row, a
+            # prior delivery completed but the row was re-pended (a crash-re-run recovered via
+            # reset_stale_inflight after mark_done committed, or a failover re-claim) — re-sending it is
+            # the duplicate H2 prevents. Complete it DONE in THIS same claim txn WITHOUT handing it to a
+            # worker and return None, so the lane advances to the next head with NO reorder (the head is
+            # consumed in place, exactly as a delivered head would be). A deliberate `replay` DELETEs the
+            # ledger row, so a replayed re-send has no entry here and is claimed normally (NOT deduped).
+            if claimed["destination_name"] is not None:
+                dk = await self._db.execute(
+                    "SELECT 1 FROM delivered_keys WHERE outbox_id=? LIMIT 1", (row["id"],)
+                )
+                if await dk.fetchone() is not None:
+                    await self._db.execute(
+                        "UPDATE queue SET status=?, last_error=NULL, updated_at=? WHERE id=?",
+                        (OutboxStatus.DONE.value, now, row["id"]),
+                    )
+                    await self._event(
+                        claimed["message_id"],
+                        "delivered",
+                        claimed["destination_name"],
+                        "idempotent skip (already delivered)",
+                        now,
+                    )
+                    await self._maybe_finalize_message(claimed["message_id"], now)
+                    await self._db.commit()
+                    return None
             await self._db.commit()
         try:
             return OutboxItem.from_row(claimed, self._cipher)
@@ -1917,6 +2023,15 @@ class MessageStore:
                 "UPDATE queue SET status=?, last_error=NULL, updated_at=? WHERE id=?",
                 (OutboxStatus.DONE.value, now, outbox_id),
             )
+            # H2: record the idempotency-ledger row in THIS same (implicit) transaction as the DONE
+            # flip, so the ledger and the row's terminal state commit or roll back together.
+            await self._record_delivered_key(
+                outbox_id=outbox_id,
+                message_id=row["message_id"],
+                destination_name=row["destination_name"],
+                handler_name=row["handler_name"],
+                now=now,
+            )
             await self._event(
                 row["message_id"],
                 "delivered",
@@ -1956,7 +2071,7 @@ class MessageStore:
             try:
                 await self._db.execute("BEGIN")
                 cur = await self._db.execute(
-                    "SELECT message_id, destination_name, attempts FROM queue WHERE id=?",
+                    "SELECT message_id, destination_name, handler_name, attempts FROM queue WHERE id=?",
                     (outbox_id,),
                 )
                 row = await cur.fetchone()
@@ -2022,6 +2137,15 @@ class MessageStore:
                             now,
                         ),
                     )
+                # H2: the idempotency-ledger row joins this SAME explicit transaction as the DONE flip +
+                # the response artifact (single atomic completion — no second store).
+                await self._record_delivered_key(
+                    outbox_id=outbox_id,
+                    message_id=message_id,
+                    destination_name=destination_name,
+                    handler_name=row["handler_name"],
+                    now=now,
+                )
                 await self._event(
                     message_id,
                     "delivered",
@@ -2492,6 +2616,16 @@ class MessageStore:
                 else [OutboxStatus.DONE.value]
             )
             placeholders = ",".join("?" * len(replay_from))
+            if not stuck:
+                # RE-SEND branch (H2): an operator deliberately re-transmits already-DONE rows. Drop
+                # their idempotency-ledger entries FIRST so the re-claimed rows are NOT skip-and-completed
+                # as crash-re-run duplicates — a replay must actually re-deliver. Scoped to THIS message's
+                # DONE rows (the exact set the UPDATE below re-pends), so no other message is affected.
+                await self._db.execute(
+                    "DELETE FROM delivered_keys WHERE outbox_id IN"
+                    " (SELECT id FROM queue WHERE message_id=? AND status=?)",
+                    (message_id, OutboxStatus.DONE.value),
+                )
             cur = await self._db.execute(
                 "UPDATE queue SET status=?, attempts=0, next_attempt_at=?,"
                 f" last_error=NULL, updated_at=? WHERE message_id=? AND status IN ({placeholders})",
@@ -3811,6 +3945,59 @@ class MessageStore:
             "INSERT INTO message_events (message_id, ts, event, destination, detail)"
             " VALUES (?,?,?,?,?)",
             (message_id, now, event, destination, self._enc(detail)),
+        )
+
+    async def _record_delivered_key(
+        self,
+        *,
+        outbox_id: str,
+        message_id: str,
+        destination_name: str | None,
+        handler_name: str | None,
+        now: float,
+    ) -> None:
+        """Write the H2 idempotency-ledger row for one just-completed outbound delivery, **inside the
+        caller's open transaction** (so it commits or rolls back atomically with the ``mark_done`` /
+        ``complete_with_response`` it accompanies — no second store, no post-delivery side effect).
+
+        Only outbound rows deliver; ingress/routed rows (``destination_name`` NULL) own no external send
+        and are skipped. ``delivery_seq`` is ``1 + COUNT`` of this row's prior ledger entries for the
+        ``(message_id, destination_name)`` pair — the same replay-stable counter shape as
+        ``response_seq``. The stored row carries hashes + ids only — never a body/PHI. The INSERT keys on
+        the content hash; a re-run that reaches here only after the prior completion rolled back finds
+        ``COUNT=0`` again and re-derives the same key (idempotent), while the claim-time skip
+        (:meth:`claim_next_fifo`) is what actually prevents the duplicate *send*."""
+        if destination_name is None:
+            return  # ingress/routed completions own no external delivery — nothing to dedupe
+        # One ledger row per outbox row INSTANCE: a double mark_done of the same row (a re-completion, a
+        # belt-and-suspenders re-call) must not accumulate a second entry. A deliberate replay re-send
+        # DELETEs this row's entry first, so its re-delivery is recorded fresh (a new, higher seq).
+        cur = await self._db.execute(
+            "SELECT 1 FROM delivered_keys WHERE outbox_id=? LIMIT 1", (outbox_id,)
+        )
+        if await cur.fetchone() is not None:
+            return
+        cur = await self._db.execute("SELECT control_id FROM messages WHERE id=?", (message_id,))
+        m = await cur.fetchone()
+        control_id = m["control_id"] if m is not None else None
+        cur = await self._db.execute(
+            "SELECT COUNT(*) AS n FROM delivered_keys WHERE message_id=? AND destination_name=?",
+            (message_id, destination_name),
+        )
+        seq_row = await cur.fetchone()
+        seq = (int(seq_row["n"]) if seq_row else 0) + 1
+        key = delivery_key(
+            control_id=control_id,
+            message_id=message_id,
+            destination_name=destination_name,
+            handler_name=handler_name,
+            delivery_seq=seq,
+        )
+        await self._db.execute(
+            "INSERT OR IGNORE INTO delivered_keys"
+            " (delivery_key, outbox_id, message_id, destination_name, delivery_seq, delivered_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (key, outbox_id, message_id, destination_name, seq, now),
         )
 
     async def _maybe_finalize_message(self, message_id: str, now: float) -> None:

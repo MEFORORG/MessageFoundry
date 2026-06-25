@@ -37,8 +37,15 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
-from messagefoundry.store.crypto import PREFIX as _ENC_PREFIX
-from messagefoundry.store.crypto import AesGcmCipher, Cipher, CipherError, IdentityCipher
+from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
+from messagefoundry.store.crypto import (
+    AesGcmCipher,
+    Cipher,
+    CipherError,
+    CipherInfo,
+    IdentityCipher,
+    cipher_info,
+)
 from messagefoundry.store.store import (
     ConnectionMetrics,
     DbStatus,
@@ -55,6 +62,7 @@ from messagefoundry.store.store import (
     UserRecord,
     _append_channel_scope,
     audit_row_hash,
+    delivery_key,
 )
 
 log = logging.getLogger(__name__)
@@ -193,14 +201,12 @@ _SCHEMA: list[str] = [
     # queue stage, so it is invisible to _maybe_finalize's `FROM queue` scan. response_seq is replay-
     # stable (1+MAX per (message_id,destination_name)). body + detail are BOTH ciphertext at rest for
     # cross-backend read-API parity with PG/SQLite (which encrypt+purge+rotate detail); outcome stays
-    # plaintext. This is the ONE place this backend encrypts a "detail"-class column — queue.last_error,
-    # messages.error and message_events.detail stay plaintext here. NOTE (#120): those columns are NOT
-    # assumed non-PHI — every write goes through the safe_exc/safe_text PHI chokepoint (record_received /
-    # mark_failed / dead_letter_now / _event) so HL7-shaped content can't land, and on read they gate on
-    # messages:view_summary. Encrypting them at rest on this backend too is a tracked defense-in-depth
-    # follow-up (docs/PHI.md); until then the read gate + the "no PHI in exceptions" convention are the
-    # controls for any residual invented free-text. (Distinct from those detail-class columns,
-    # messages.summary/metadata — direct MRN + patient name — ARE ciphered at rest on this backend, EF-3.)
+    # plaintext. As of H4, queue.last_error, messages.error and message_events.detail are ALSO ciphered
+    # at rest on this backend — full at-rest parity with SQLite/Postgres. Those columns still go through
+    # the safe_exc/safe_text PHI chokepoint (record_received / mark_failed / dead_letter_now / _event) so
+    # HL7-shaped content can't land in the first place, AND are now encrypted around that scrub (the prior
+    # "plaintext residual" is retired). On read they gate on messages:view_summary. (Distinct from those
+    # detail-class columns, messages.summary/metadata — direct MRN + patient name — are ciphered too, EF-3.)
     """IF OBJECT_ID('response','U') IS NULL CREATE TABLE response (
         message_id NVARCHAR(64) NOT NULL, destination_name NVARCHAR(256) NOT NULL,
         response_seq INT NOT NULL, body NVARCHAR(MAX) NULL, outcome NVARCHAR(64) NOT NULL,
@@ -209,6 +215,18 @@ _SCHEMA: list[str] = [
         CONSTRAINT fk_response_message FOREIGN KEY (message_id) REFERENCES messages(id))""",
     """IF INDEXPROPERTY(OBJECT_ID('response'),'ix_response_message','IndexID') IS NULL
         CREATE INDEX ix_response_message ON response(message_id)""",
+    # Outbound idempotency ledger (H2) — one row per COMPLETED delivery, INSERTed in the SAME txn as the
+    # outbound row's mark_done / complete_with_response. delivery_key = sha256 of non-PHI ids + a replay-
+    # stable seq (delivery_key()); outbox_id is the queue row that delivered, the FIFO claim's
+    # skip-and-complete dedup key. HASHES + IDS ONLY — no body/PHI — so it is NOT ciphered at rest.
+    """IF OBJECT_ID('delivered_keys','U') IS NULL CREATE TABLE delivered_keys (
+        delivery_key NVARCHAR(64) NOT NULL PRIMARY KEY, outbox_id NVARCHAR(64) NOT NULL,
+        message_id NVARCHAR(64) NOT NULL, destination_name NVARCHAR(256) NOT NULL,
+        delivery_seq INT NOT NULL, delivered_at FLOAT NOT NULL)""",
+    """IF INDEXPROPERTY(OBJECT_ID('delivered_keys'),'ix_delivered_outbox','IndexID') IS NULL
+        CREATE INDEX ix_delivered_outbox ON delivered_keys(outbox_id)""",
+    """IF INDEXPROPERTY(OBJECT_ID('delivered_keys'),'ix_delivered_message','IndexID') IS NULL
+        CREATE INDEX ix_delivered_message ON delivered_keys(message_id, destination_name)""",
 ]
 
 
@@ -280,10 +298,16 @@ class SqlServerStore:
         # Serializes audit-chain appends in-process (the store is the single audit writer per engine
         # process; active-passive = one active node) — see record_audit.
         self._audit_lock = asyncio.Lock()
+        # H1 fencing token: the held leader epoch + the leader_lease row to validate it against, pushed
+        # by the engine on promotion via set_leader_epoch() (the store NEVER imports the coordinator —
+        # ARCH-6). None disables the claim's epoch guard, keeping claim_next_fifo byte-identical to pre-H1.
+        self._leader_epoch: int | None = None
+        self._lease_key: str | None = None
 
     # --- PHI-at-rest cipher seam for nullable text columns (mirrors MessageStore._enc/_dec) -----
-    # Used for summary/metadata (EF-3). null/empty-safe: a NULL or purged '' stays as-is, never turns
-    # into ciphertext-of-empty; decrypt passes legacy plaintext / '' through unchanged on read.
+    # Used for summary/metadata (EF-3) and error/last_error/event.detail (H4). null/empty-safe: a NULL
+    # or purged '' stays as-is, never turns into ciphertext-of-empty; decrypt passes legacy plaintext /
+    # '' through unchanged on read (so a no-key -> key restart reads pre-existing plaintext correctly).
 
     def _enc(self, value: str | None) -> str | None:
         if not value:  # None or "" → leave blank (covers purged/empty values)
@@ -294,6 +318,10 @@ class SqlServerStore:
         if value is None:
             return value
         return self._cipher.decrypt(value)  # '' and legacy plaintext pass through unchanged
+
+    def cipher_info(self) -> CipherInfo:
+        """The non-secret at-rest cipher posture (M5): on/off + key fingerprint, never key bytes."""
+        return cipher_info(self._cipher)
 
     @classmethod
     async def open(
@@ -370,7 +398,9 @@ class SqlServerStore:
         Idempotent + batched: skips rows already carrying the ciphertext prefix."""
         if not self._cipher.encrypts:
             return
-        like = f"{_ENC_PREFIX}%"
+        # Version-agnostic anchor (M9): `mfenc:%` matches BOTH v1 and v2 ciphertext, so a v2 row is
+        # recognised as already-encrypted and skipped — never re-wrapped.
+        like = f"{_ENC_MARKER_PREFIX}%"
         total = 0
         for table, column in (
             ("messages", "raw"),
@@ -400,14 +430,24 @@ class SqlServerStore:
                         await conn.rollback()
                         raise
                 total += len(rows)
-        # messages.summary/metadata (id PK, nullable PHI — EF-3): MRN + patient name. Own pass with the
-        # nullable `<> '' AND IS NOT NULL` guard so a blank/purged '' is never turned into ciphertext-of-
-        # empty (the id-keyed loop above omits that guard because raw/payload are never legitimately '').
-        for mcol in ("summary", "metadata"):
+        # Nullable id-keyed PHI text columns — each migrated on its own pass with the nullable
+        # `<> '' AND IS NOT NULL` guard so a blank/purged '' is never turned into ciphertext-of-empty
+        # (the id-keyed loop above omits that guard because raw/payload are never legitimately '').
+        #   messages.summary/metadata (id PK) — MRN + patient name (EF-3).
+        #   messages.error / queue.last_error / message_events.detail (H4) — may embed raw HL7 fragments
+        #     from exceptions; SQL Server at-rest parity with SQLite/Postgres. message_events keys on its
+        #     own INT IDENTITY `id` (an integer literal in the UPDATE, like every other id-keyed table).
+        for table, ncol in (
+            ("messages", "summary"),
+            ("messages", "metadata"),
+            ("messages", "error"),
+            ("queue", "last_error"),
+            ("message_events", "detail"),
+        ):
             while True:
                 rows = await self._fetchall(
-                    f"SELECT TOP (500) id, {mcol} AS v FROM messages"
-                    f" WHERE {mcol} NOT LIKE ? AND {mcol} <> '' AND {mcol} IS NOT NULL",
+                    f"SELECT TOP (500) id, {ncol} AS v FROM {table}"
+                    f" WHERE {ncol} NOT LIKE ? AND {ncol} <> '' AND {ncol} IS NOT NULL",
                     (like,),
                 )
                 if not rows:
@@ -417,7 +457,7 @@ class SqlServerStore:
                     try:
                         for r in rows:
                             await cur.execute(
-                                f"UPDATE messages SET {mcol}=? WHERE id=?",
+                                f"UPDATE {table} SET {ncol}=? WHERE id=?",
                                 (self._cipher.encrypt(r["v"]), r["id"]),
                             )
                         await conn.commit()
@@ -575,8 +615,8 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
 
-    @staticmethod
     async def _event(
+        self,
         cur: Any,
         message_id: str,
         event: str,
@@ -584,13 +624,60 @@ class SqlServerStore:
         detail: str | None,
         now: float,
     ) -> None:
-        detail = (
-            safe_text(detail) if detail else detail
-        )  # PHI chokepoint (#120); SQL Server stores plaintext
+        # PHI chokepoint (#120): scrub HL7-shaped content out of the detail, THEN encrypt it at rest via
+        # the store cipher (null/blank-safe) — SQL Server at-rest parity with SQLite/Postgres (H4). The
+        # scrub is defense-in-depth kept *around* the cipher, exactly as SQLite does.
+        detail = safe_text(detail) if detail else detail
         await cur.execute(
             "INSERT INTO message_events (message_id, ts, event, destination, detail)"
             " VALUES (?,?,?,?,?)",
-            (message_id, now, event, destination, detail),
+            (message_id, now, event, destination, self._enc(detail)),
+        )
+
+    async def _record_delivered_key(
+        self,
+        cur: Any,
+        *,
+        outbox_id: str,
+        message_id: str,
+        destination_name: str | None,
+        handler_name: str | None,
+        now: float,
+    ) -> None:
+        """Write the H2 idempotency-ledger row for one just-completed outbound delivery, **inside the
+        caller's open transaction** (SQL Server twin of :meth:`MessageStore._record_delivered_key`).
+
+        Only outbound rows deliver; ingress/routed completions (``destination_name`` NULL) are skipped.
+        ``delivery_seq`` is ``1 + COUNT`` of prior ledger rows for the pair (replay-stable, like
+        ``response_seq``). Stored row carries hashes + ids only — never a body/PHI. One row per outbox
+        row INSTANCE (a double mark_done must not accumulate a second entry); the ``NOT EXISTS`` insert
+        is the belt-and-suspenders backstop on the content hash."""
+        if destination_name is None:
+            return
+        await cur.execute("SELECT 1 FROM delivered_keys WHERE outbox_id=?", (outbox_id,))
+        if await cur.fetchone() is not None:
+            return
+        await cur.execute("SELECT control_id FROM messages WHERE id=?", (message_id,))
+        m = await cur.fetchone()
+        control_id = m[0] if m is not None else None
+        await cur.execute(
+            "SELECT COUNT(*) FROM delivered_keys WHERE message_id=? AND destination_name=?",
+            (message_id, destination_name),
+        )
+        seq = int((await cur.fetchone())[0]) + 1
+        key = delivery_key(
+            control_id=control_id,
+            message_id=message_id,
+            destination_name=destination_name,
+            handler_name=handler_name,
+            delivery_seq=seq,
+        )
+        await cur.execute(
+            "INSERT INTO delivered_keys"
+            " (delivery_key, outbox_id, message_id, destination_name, delivery_seq, delivered_at)"
+            " SELECT ?,?,?,?,?,? WHERE NOT EXISTS"
+            " (SELECT 1 FROM delivered_keys WHERE delivery_key=?)",
+            (key, outbox_id, message_id, destination_name, seq, now, key),
         )
 
     async def _applock(self, cur: Any, resource: str) -> None:
@@ -1074,14 +1161,19 @@ class SqlServerStore:
             try:
                 # Leading SELECT (also opens the txn so _maybe_finalize's applock is never first).
                 await cur.execute(
-                    "SELECT message_id, destination_name, attempts FROM queue WHERE id=?",
+                    "SELECT message_id, destination_name, handler_name, attempts FROM queue WHERE id=?",
                     (outbox_id,),
                 )
                 row = await cur.fetchone()
                 if row is None:
                     await conn.commit()
                     return
-                message_id, destination_name, attempts = row[0], row[1], row[2]
+                message_id, destination_name, handler_name, attempts = (
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                )
                 await cur.execute(
                     "UPDATE queue SET status=?, last_error=NULL, updated_at=?, owner=NULL,"
                     " lease_expires_at=NULL WHERE id=?",
@@ -1126,6 +1218,15 @@ class SqlServerStore:
                             now,
                         ),
                     )
+                # H2: idempotency-ledger row joins this SAME txn as the DONE flip + the response artifact.
+                await self._record_delivered_key(
+                    cur,
+                    outbox_id=outbox_id,
+                    message_id=message_id,
+                    destination_name=destination_name,
+                    handler_name=handler_name,
+                    now=now,
+                )
                 await self._event(
                     cur,
                     message_id,
@@ -1207,7 +1308,7 @@ class SqlServerStore:
                         " WHERE id=?",
                         (
                             OutboxStatus.DEAD.value,
-                            "re-ingress work-row reference is corrupt/unparseable",
+                            self._enc("re-ingress work-row reference is corrupt/unparseable"),  # H4
                             now,
                             now,
                             response_row_id,
@@ -1240,8 +1341,10 @@ class SqlServerStore:
                         " WHERE id=?",
                         (
                             OutboxStatus.DEAD.value,
-                            f"re-ingress correlation depth exceeded "
-                            f"({child_depth} > {correlation_depth_cap})",
+                            self._enc(  # H4
+                                f"re-ingress correlation depth exceeded "
+                                f"({child_depth} > {correlation_depth_cap})"
+                            ),
                             now,
                             now,
                             response_row_id,
@@ -1444,7 +1547,7 @@ class SqlServerStore:
                     await cur.execute(
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
                         " owner=NULL, lease_expires_at=NULL WHERE id=?",
-                        (OutboxStatus.DEAD.value, now, error, now, row[0]),
+                        (OutboxStatus.DEAD.value, now, self._enc(error), now, row[0]),  # H4
                     )
                     await self._event(cur, row[1], "dead", None, error, now)
                     await self._maybe_finalize(cur, row[1], now)
@@ -1472,16 +1575,24 @@ class SqlServerStore:
         blank/purged values."""
         if not isinstance(self._cipher, AesGcmCipher):
             return 0
-        active_like = f"{_ENC_PREFIX}{self._cipher.active_key_id}:%"
+        # Active-format prefix through the active key's fingerprint (M9): `mfenc:v1:<kid>:` or, for a
+        # v2-active cipher, `mfenc:v2:<alg>:<kid>:`. Built off the cipher (not a baked-in v1 prefix+keyid)
+        # so a v2-active rotation matches v2 rows and the loop terminates.
+        active_like = f"{self._cipher.active_marker_prefix}%"
         total = 0
-        # summary/metadata (EF-3): MRN/name PHI on messages — rotated like raw. The `<> ''` + NOT LIKE
-        # guard is null/empty-safe (NULL excluded by NOT LIKE; '' by <> '').
+        # summary/metadata (EF-3): MRN/name PHI on messages — rotated like raw. error/last_error/detail
+        # (H4): exception text that may embed raw HL7 fragments — rotated too, or a later retired-key drop
+        # silently loses them. message_events rides this id-keyed loop on its INT IDENTITY `id`. The
+        # `<> ''` + NOT LIKE guard is null/empty-safe (NULL excluded by NOT LIKE; '' by <> '').
         for table, column in (
             ("messages", "raw"),
             ("queue", "payload"),
             ("users", "totp_secret"),
             ("messages", "summary"),
             ("messages", "metadata"),
+            ("messages", "error"),
+            ("queue", "last_error"),
+            ("message_events", "detail"),
         ):
             while True:
                 rows = await self._fetchall(
@@ -1687,7 +1798,7 @@ class SqlServerStore:
     ) -> str:
         error = (
             safe_text(error) if error else error
-        )  # PHI chokepoint (#120); SQL Server stores plaintext
+        )  # PHI chokepoint (#120): scrub first, then cipher the column write below (H4 parity)
         now = time.time() if now is None else now
         mid = uuid4().hex
         event = "error" if status is MessageStatus.ERROR else "filtered"
@@ -1707,11 +1818,14 @@ class SqlServerStore:
                         message_type,
                         self._cipher.encrypt(raw),
                         status.value,
-                        error,
+                        self._enc(
+                            error
+                        ),  # H4: error may embed raw HL7 fragments — ciphered at rest
                         self._enc(summary),  # EF-3: MRN/name is PHI — ciphered at rest
                         self._enc(metadata),
                     ),
                 )
+                # `_event` re-scrubs + ciphers the plaintext `error` internally (parity with SQLite).
                 await self._event(cur, mid, event, None, error, now)
                 await conn.commit()
             except Exception:
@@ -1797,6 +1911,13 @@ class SqlServerStore:
             )
         return items
 
+    def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
+        # H1: the engine pushes the held leader epoch + lease key here on promotion/demotion (read from
+        # the coordinator — the store never imports it, ARCH-6). Stamps cached state only; the next
+        # claim_next_fifo validates it inside its single claim txn. epoch=None disables the guard.
+        self._leader_epoch = epoch
+        self._lease_key = lease_key
+
     async def claim_next_fifo(
         self,
         name: str,
@@ -1822,6 +1943,20 @@ class SqlServerStore:
         skipping a locked sibling to drain the lane is intended and order is explicitly not promised)."""
         now = time.time() if now is None else now
         lane_col = self._lane_col(stage)  # code-controlled literal
+        # H1 FENCING TOKEN (mirrors the Postgres guard). When the engine has pushed a held leader epoch,
+        # gate the claim on it INSIDE the same txn: claim only while our held epoch is still current —
+        # leader_lease.leader_epoch has NOT advanced past it. A standby that took over bumped the epoch on
+        # its fresh acquire, so a paused/superseded ex-leader's held epoch is strictly older → the guard
+        # is false → the UPDATE matches 0 rows. A missing lease row yields NULL and `NULL <= ?` is
+        # unknown → no claim (fail-closed). The subquery is correlated-free (single-row lease) so it adds
+        # one cheap seek under the same lock.
+        epoch_guard = ""
+        epoch_args: tuple[Any, ...] = ()
+        if self._leader_epoch is not None:
+            epoch_guard = (
+                " AND (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=?) <= ?"
+            )
+            epoch_args = (self._lease_key, self._leader_epoch)
         sql = (
             "WITH head AS (SELECT TOP (1) * FROM queue WITH (UPDLOCK, ROWLOCK)"
             f" WHERE stage=? AND {lane_col}=? AND status=? ORDER BY created_at, seq)"
@@ -1830,22 +1965,57 @@ class SqlServerStore:
             " OUTPUT inserted.id, inserted.message_id, inserted.channel_id,"
             " inserted.destination_name, inserted.handler_name, inserted.payload,"
             " inserted.attempts"
-            " WHERE next_attempt_at<=?"
+            f" WHERE next_attempt_at<=?{epoch_guard}"
         )
-        args = (stage, name, OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value, now, now)
+        args = (
+            stage,
+            name,
+            OutboxStatus.PENDING.value,
+            OutboxStatus.INFLIGHT.value,
+            now,
+            now,
+            *epoch_args,
+        )
         async with self._acquire() as conn:
             cur = await conn.cursor()
             try:
                 await cur.execute(sql, args)
                 columns = [c[0] for c in cur.description] if cur.description else []
                 row = await cur.fetchone()
+                d = dict(zip(columns, row)) if row is not None else None
+                # H2 SKIP-AND-COMPLETE (SQL Server twin). If THIS just-claimed outbound row instance
+                # already has a committed ledger row, a prior delivery completed but the row was re-pended
+                # (a failover re-claim, or reset_stale_inflight after mark_done committed) — re-sending it
+                # is the duplicate H2 prevents. Complete it DONE in THIS same claim txn WITHOUT handing it
+                # to a worker; the lane advances to the next head with NO reorder (the head is consumed in
+                # place). A deliberate `replay` DELETEs the ledger row, so a replayed re-send has no entry
+                # here and is claimed normally (NOT deduped). The OUTPUT UPDATE already opened the txn, so
+                # _maybe_finalize's applock is not the first statement.
+                if d is not None and d["destination_name"] is not None:
+                    await cur.execute("SELECT 1 FROM delivered_keys WHERE outbox_id=?", (d["id"],))
+                    if await cur.fetchone() is not None:
+                        await cur.execute(
+                            "UPDATE queue SET status=?, last_error=NULL, updated_at=?, owner=NULL,"
+                            " lease_expires_at=NULL WHERE id=?",
+                            (OutboxStatus.DONE.value, now, d["id"]),
+                        )
+                        await self._event(
+                            cur,
+                            d["message_id"],
+                            "delivered",
+                            d["destination_name"],
+                            "idempotent skip (already delivered)",
+                            now,
+                        )
+                        await self._maybe_finalize(cur, d["message_id"], now)
+                        d = None
+                        row = None
                 await conn.commit()
             except Exception:
                 await conn.rollback()
                 raise
-        if row is None:
+        if row is None or d is None:
             return None
-        d = dict(zip(columns, row))
         try:
             payload = self._cipher.decrypt(d["payload"])
         except CipherError as exc:
@@ -1869,17 +2039,31 @@ class SqlServerStore:
             cur = await conn.cursor()
             try:
                 await cur.execute(
-                    "SELECT message_id, destination_name, attempts FROM queue WHERE id=?",
+                    "SELECT message_id, destination_name, handler_name, attempts FROM queue WHERE id=?",
                     (outbox_id,),
                 )
                 row = await cur.fetchone()
                 if row is None:
                     await conn.commit()
                     return
-                message_id, destination_name, attempts = row[0], row[1], row[2]
+                message_id, destination_name, handler_name, attempts = (
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                )
                 await cur.execute(
                     "UPDATE queue SET status=?, last_error=NULL, updated_at=? WHERE id=?",
                     (OutboxStatus.DONE.value, now, outbox_id),
+                )
+                # H2: record the idempotency-ledger row in THIS same txn as the DONE flip.
+                await self._record_delivered_key(
+                    cur,
+                    outbox_id=outbox_id,
+                    message_id=message_id,
+                    destination_name=destination_name,
+                    handler_name=handler_name,
+                    now=now,
                 )
                 await self._event(
                     cur, message_id, "delivered", destination_name, f"attempt {attempts}", now
@@ -1893,7 +2077,7 @@ class SqlServerStore:
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
     ) -> None:
-        error = safe_text(error)  # PHI chokepoint (#120); SQL Server stores plaintext
+        error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
         now = time.time() if now is None else now
         async with self._acquire() as conn:
             cur = await conn.cursor()
@@ -1919,7 +2103,7 @@ class SqlServerStore:
                     status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
                 await cur.execute(
                     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=? WHERE id=?",
-                    (status, next_at, error, now, outbox_id),
+                    (status, next_at, self._enc(error), now, outbox_id),
                 )
                 await self._event(
                     cur, message_id, event, destination_name, f"attempt {attempts}: {error}", now
@@ -1966,7 +2150,7 @@ class SqlServerStore:
         :meth:`~messagefoundry.store.base.QueueStore.dead_letter_now` contract."""
         error = safe_text(
             error
-        )  # PHI chokepoint (#120) — incl. f"undecryptable payload: {exc}" callers
+        )  # PHI chokepoint (#120) — incl. f"undecryptable payload: {exc}" callers; ciphered below (H4)
         now = time.time() if now is None else now
         async with self._acquire() as conn:
             cur = await conn.cursor()
@@ -1982,7 +2166,7 @@ class SqlServerStore:
                 await cur.execute(
                     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
                     " owner=NULL, lease_expires_at=NULL WHERE id=?",
-                    (OutboxStatus.DEAD.value, now, error, now, outbox_id),
+                    (OutboxStatus.DEAD.value, now, self._enc(error), now, outbox_id),
                 )
                 await self._event(cur, message_id, "dead", destination_name, error, now)
                 await self._maybe_finalize(cur, message_id, now)
@@ -2035,7 +2219,7 @@ class SqlServerStore:
                     await cur.execute(
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
                         " owner=NULL, lease_expires_at=NULL WHERE id=?",
-                        (OutboxStatus.DEAD.value, now, error, now, row[0]),
+                        (OutboxStatus.DEAD.value, now, self._enc(error), now, row[0]),  # H4
                     )
                     await self._event(cur, row[1], "dead", row[2], error, now)
                     await self._maybe_finalize(cur, row[1], now)
@@ -2070,6 +2254,15 @@ class SqlServerStore:
                     if stuck
                     else (OutboxStatus.DONE.value,)
                 )
+                if not stuck:
+                    # RE-SEND branch (H2): drop the idempotency-ledger entries of THIS message's DONE rows
+                    # (the exact set re-pended below) so a deliberate re-send is NOT skip-and-completed as
+                    # a crash-re-run duplicate. Scoped to this message only.
+                    await cur.execute(
+                        "DELETE FROM delivered_keys WHERE outbox_id IN"
+                        " (SELECT id FROM queue WHERE message_id=? AND status=?)",
+                        (message_id, OutboxStatus.DONE.value),
+                    )
                 placeholders = ",".join("?" * len(replay_from))
                 await cur.execute(
                     f"UPDATE queue SET status=?, attempts=0, next_attempt_at=?, last_error=NULL,"
@@ -2205,6 +2398,7 @@ class SqlServerStore:
         record = await self._fetchone("SELECT * FROM messages WHERE id=?", (message_id,))
         if record is not None:
             record["raw"] = self._cipher.decrypt(record["raw"])  # decrypt the body for display
+            record["error"] = self._dec(record["error"])  # H4: error may embed raw HL7 fragments
             record["summary"] = self._dec(record["summary"])  # EF-3: MRN/name PHI, ciphered at rest
             record["metadata"] = self._dec(record["metadata"])  # EF-3
         return record
@@ -2232,8 +2426,9 @@ class SqlServerStore:
             " ORDER BY received_at DESC, id DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             (*params, offset, limit),
         )
-        for r in rows:  # EF-3: summary/metadata ciphered at rest
-            r["summary"] = self._dec(r["summary"])
+        for r in rows:
+            r["error"] = self._dec(r["error"])  # H4: error ciphered at rest
+            r["summary"] = self._dec(r["summary"])  # EF-3: summary/metadata ciphered at rest
             r["metadata"] = self._dec(r["metadata"])
         return rows
 
@@ -2270,8 +2465,9 @@ class SqlServerStore:
             " ORDER BY o.updated_at DESC, o.id DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
             (*params, offset, limit),
         )
-        for r in rows:  # EF-3: summary ciphered at rest
-            r["summary"] = self._dec(r["summary"])
+        for r in rows:
+            r["last_error"] = self._dec(r["last_error"])  # H4: last_error ciphered at rest
+            r["summary"] = self._dec(r["summary"])  # EF-3: summary ciphered at rest
         return rows
 
     async def count_dead(
@@ -2303,10 +2499,13 @@ class SqlServerStore:
         return f" WHERE {' AND '.join(clauses)}", tuple(params)
 
     async def outbox_for(self, message_id: str) -> list[dict[str, Any]]:
-        return await self._fetchall(
+        rows = await self._fetchall(
             "SELECT * FROM queue WHERE message_id=? AND stage=? ORDER BY destination_name",
             (message_id, Stage.OUTBOUND.value),
         )
+        for r in rows:
+            r["last_error"] = self._dec(r["last_error"])  # H4: last_error ciphered at rest
+        return rows
 
     async def outbox_payloads_for(self, message_id: str) -> list[dict[str, Any]]:
         """Like :meth:`outbox_for`, but also decrypts the transformed ``payload`` (PHI body) per
@@ -2319,14 +2518,16 @@ class SqlServerStore:
         )
         for r in rows:
             r["payload"] = self._cipher.decrypt(r["payload"])
-            if r["last_error"] is not None:
-                r["last_error"] = self._cipher.decrypt(r["last_error"])
+            r["last_error"] = self._dec(r["last_error"])  # H4: null/legacy-plaintext-safe decrypt
         return rows
 
     async def events_for(self, message_id: str) -> list[dict[str, Any]]:
-        return await self._fetchall(
+        rows = await self._fetchall(
             "SELECT * FROM message_events WHERE message_id=? ORDER BY id", (message_id,)
         )
+        for r in rows:
+            r["detail"] = self._dec(r["detail"])  # H4: event detail ciphered at rest
+        return rows
 
     async def record_view(
         self, message_id: str, *, actor: str | None = None, now: float | None = None

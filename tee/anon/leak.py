@@ -29,6 +29,7 @@ _M = "mer" + "cy"
 _W = "well" + "mark"
 _C = "cb" + "ord"
 _CP = "core" + "point"
+_MMC = "MM" + "C"
 
 # --- vendored from scripts/publish/scan_forbidden.py (held identical by the parity test) ----------
 FORBIDDEN: list[tuple[re.Pattern[str], str]] = [
@@ -37,6 +38,8 @@ FORBIDDEN: list[tuple[re.Pattern[str], str]] = [
     (re.compile(rf"\b{_C}\b", re.I), f"vendor tied to the real estate ({_C.upper()})"),
     (re.compile(rf"{_CP}\s+estate", re.I), f"reference to the real {_CP.title()} estate"),
     (re.compile(r"\baction\s+lists?\b", re.I), f"{_CP.title()} action-list (migration artifact)"),
+    (re.compile(rf"\b{_MMC}\b"), f"customer ({_M.title()} Medical Center / {_MMC})"),
+    (re.compile(rf"\b{_MMC}MEFOR\b", re.I), f"customer adopter repo ({_MMC}MEFOR)"),
 ]
 
 SITE_CODE_RE = re.compile(r"54\d{4}")

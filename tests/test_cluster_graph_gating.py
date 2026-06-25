@@ -122,6 +122,57 @@ async def test_reconcile_starts_on_promotion_and_stops_on_demotion(tmp_path: Pat
         await eng.stop()
 
 
+class _EpochCoordinator(_FlipCoordinator):
+    """A flippable clustered coordinator that ALSO reports an H1 leader epoch + lease key, so the test
+    can prove the engine pushes them into the store on promotion (and clears on demotion) — the
+    store↔coordinator wiring (the store never imports the coordinator; the engine pushes — ARCH-6)."""
+
+    def __init__(self, *, epoch: int, lease_key: str) -> None:
+        super().__init__(leader=False)
+        self._epoch = epoch
+        self._lease_key = lease_key
+
+    def current_epoch(self) -> int | None:
+        return self._epoch if self.leader else None
+
+    def lease_key(self) -> str | None:
+        return self._lease_key
+
+
+async def test_engine_pushes_leader_epoch_into_store_on_promotion(tmp_path: Path) -> None:
+    # H1 store↔coordinator wiring: on promotion the engine reads the coordinator's held epoch + lease key
+    # and pushes them into the store (store.set_leader_epoch), BEFORE workers drain; on demotion it pushes
+    # None to clear the fence. The store never imports the coordinator — the engine is the one-way bridge.
+    cfgdir = tmp_path / "cfg"
+    _minimal_graph(cfgdir, tmp_path)
+    coord = _EpochCoordinator(epoch=7, lease_key="public:mefor_cluster_leader")
+    eng = await Engine.create(tmp_path / "epoch.db", poll_interval=0.05, coordinator=coord)
+    eng.add_registry(load_config(cfgdir))
+
+    pushes: list[tuple[int | None, str | None]] = []
+    orig = eng.store.set_leader_epoch
+
+    def _spy(epoch: int | None, *, lease_key: str | None = None) -> None:
+        pushes.append((epoch, lease_key))
+        orig(epoch, lease_key=lease_key)
+
+    eng.store.set_leader_epoch = _spy  # type: ignore[method-assign]
+    await eng.start()
+    try:
+        assert eng._registry_runner is not None
+        assert pushes == []  # follower at start: graph not started, nothing pushed yet
+
+        coord.leader = True
+        await eng._reconcile_graph()  # promotion → push (7, lease_key)
+        assert (7, "public:mefor_cluster_leader") in pushes
+
+        coord.leader = False
+        await eng._reconcile_graph()  # demotion → push (None, ...) to clear the fence
+        assert pushes[-1] == (None, None)
+    finally:
+        await eng.stop()
+
+
 async def test_reconcile_is_idempotent_while_leader(tmp_path: Path) -> None:
     # A second reconcile while already leader+running must NOT re-start the graph (the runner's own
     # running guard makes _start_graph a no-op), so repeated supervisor polls are harmless.

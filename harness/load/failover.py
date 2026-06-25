@@ -50,7 +50,7 @@ import httpx
 
 from harness.load.corpus import build_corpus
 from harness.load.correlator import Correlator
-from harness.load.failover_track import FailoverTracker
+from harness.load.failover_track import FailoverTracker, LeadershipTracker
 from harness.load.governor import RateGovernor
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
@@ -247,6 +247,7 @@ class FailoverReport:
     lane_inversions: int
     lanes_observed: int  # distinct destination lanes (≥2 ⇒ the ordering check is non-vacuous)
     max_concurrent_leaders: int
+    leader_samples: int  # H6: how many times the leader-set size was observed (non-vacuity proof)
     in_pipeline_final: int
     dead_final: int
     lease_ttl_seconds: float
@@ -270,6 +271,7 @@ class FailoverReport:
                 "recovery_seconds": self.recovery_seconds,
                 "lease_ttl_seconds": self.lease_ttl_seconds,
                 "max_concurrent_leaders": self.max_concurrent_leaders,
+                "leader_samples": self.leader_samples,
             },
             "totals": {
                 "sent": self.sent,
@@ -309,7 +311,8 @@ class FailoverReport:
         lines.append(
             f"failover: killed={self.killed_node} promoted={self.promoted_node} "
             f"promotion={prom} recovery={rec} (lease_ttl={self.lease_ttl_seconds}s) "
-            f"max_concurrent_leaders={self.max_concurrent_leaders}"
+            f"max_concurrent_leaders={self.max_concurrent_leaders} "
+            f"(over {self.leader_samples} leadership samples)"
         )
         lines.append(
             f"traffic: sent={self.sent} acked={self.acked} nak={self.nak} timeouts={self.timeouts} "
@@ -502,6 +505,7 @@ class _KillOutcome:
     promotion_seconds: float | None
     recovery_seconds: float | None
     max_concurrent_leaders: int
+    leader_samples: int  # how many times the leader-set size was observed (non-vacuity proof, H6)
 
 
 async def _monitor_failover(
@@ -516,17 +520,26 @@ async def _monitor_failover(
     (concurrently with the rest of the measured phase + the post-load drain) so a slow-but-successful
     recovery is measured rather than timing out a fixed pre-drain window. ``done`` is DB-backed, so it
     survives the dead primary; the recovery baseline is taken at PROMOTION (not at the kill) so a delivery
-    the dying primary committed just before SIGKILL can't be mistaken for the survivor's progress."""
-    leaders_seen = 1
+    the dying primary committed just before SIGKILL can't be mistaken for the survivor's progress.
+
+    The CONTINUOUS single-leader SLO (H6): every poll observes BOTH nodes' roles and folds the count of
+    simultaneous primaries into a :class:`LeadershipTracker`, so a split-brain that flickers *between*
+    promotion and recovery is caught — not just the one pair sampled at promotion. The high-water (and a
+    non-vacuity sample count) flow into the report's ``single_leader`` SLO."""
+    leaders = LeadershipTracker()
     promotion_ns: int | None = None
     recovery_ns: int | None = None
     done_at_promotion = 0
     start = time.perf_counter()
     while time.perf_counter() - start < deadline_s:
-        role = await survivor.role(client)
-        # Split-brain watch: should never see the (killed) primary AND the survivor both primary.
-        if role == "primary" and await killed.role(client) == "primary":
-            leaders_seen = max(leaders_seen, 2)
+        # H6 continuous single-leader invariant: sample BOTH nodes' roles every poll and record how many
+        # are simultaneously primary right now. >= 2 at any sample is split-brain (a HARD SLO violation);
+        # the killed node should stop reporting primary the instant it dies, so the count is normally 0
+        # (post-kill, pre-promotion) then 1 (after the survivor promotes) — never 2.
+        survivor_role = await survivor.role(client)
+        killed_role = await killed.role(client)
+        leaders.observe((survivor_role == "primary") + (killed_role == "primary"))
+        role = survivor_role
         if promotion_ns is None and role == "primary":
             promotion_ns = time.perf_counter_ns()
             prom = await survivor.stats(client)
@@ -544,7 +557,22 @@ async def _monitor_failover(
     recovery_s = None if recovery_ns is None else (recovery_ns - kill_ns) / 1e9
     if recovery_s is None:
         notes.append(f"functional recovery NOT observed within {deadline_s:.0f}s of the kill")
-    return _KillOutcome(killed, survivor, promotion_s, recovery_s, leaders_seen)
+    if leaders.two_or_more_leader_samples:
+        notes.append(
+            f"SPLIT-BRAIN: observed two primaries simultaneously in "
+            f"{leaders.two_or_more_leader_samples} of {leaders.samples} samples"
+        )
+    # max(1, ...): the cluster had exactly one leader before the kill, so the reported high-water is at
+    # least 1 even though the post-kill / pre-promotion window legitimately samples 0 leaders. The SLO
+    # bar is "<= 1", so this floor never masks a real >= 2 split-brain.
+    return _KillOutcome(
+        killed,
+        survivor,
+        promotion_s,
+        recovery_s,
+        max(1, leaders.max_concurrent_leaders),
+        leaders.samples,
+    )
 
 
 def _build_report(
@@ -580,8 +608,14 @@ def _build_report(
             -1.0 if outcome.recovery_seconds is None else round(outcome.recovery_seconds, 2),
             outcome.recovery_seconds is not None and outcome.recovery_seconds <= recovery_bound,
         ),
+        # H6 continuous single-leader invariant: ≤ 1 simultaneous primary across EVERY sample. Non-vacuous
+        # by construction — a monitor that never observed the cluster (leader_samples == 0) FAILS rather
+        # than silently certifying "single leader" off zero evidence (mirrors the lanes_observed ≥ 2 guard).
         SloCheck(
-            "single_leader", 1, outcome.max_concurrent_leaders, outcome.max_concurrent_leaders <= 1
+            "single_leader",
+            1,
+            outcome.max_concurrent_leaders,
+            outcome.leader_samples > 0 and outcome.max_concurrent_leaders <= 1,
         ),
         SloCheck("no_acknowledged_loss", 0, acked_not_delivered, no_loss_ok),
         SloCheck("per_lane_ordering", 0, tracker.lane_inversions, tracker.lane_inversions == 0),
@@ -621,6 +655,7 @@ def _build_report(
         lane_inversions=tracker.lane_inversions,
         lanes_observed=tracker.lanes_observed,
         max_concurrent_leaders=outcome.max_concurrent_leaders,
+        leader_samples=outcome.leader_samples,
         in_pipeline_final=final.in_pipeline,
         dead_final=final.dead,
         lease_ttl_seconds=fo.leader_lease_ttl_seconds,

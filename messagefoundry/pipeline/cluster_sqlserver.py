@@ -30,12 +30,15 @@ It is duck-typed on the store (``store._acquire`` / ``store._applock`` / ``store
 the optional ``aioodbc`` extra and never hard-imports the concrete store.
 
 .. note::
-   FAILOVER IN-FLIGHT RECOVERY is unresolved here (see :meth:`reclaims_inflight`). A standby becomes
-   leader WITHOUT a restart, so the engine's startup ``reset_stale_inflight`` never re-fires for it. The
-   planned fix is an **on-acquire** ``Store.reset_stale_inflight`` hook (run once when this node flips
-   non-leader→leader, before it drains). That engine-seam wiring + :func:`build_coordinator` dispatch +
-   the ``[cluster]``-requires-postgres relaxation are DEFERRED until the cluster.py observability work
-   (branch ``ha-cluster-status-failover``) lands on main, to avoid editing cluster.py in parallel.
+   FAILOVER IN-FLIGHT RECOVERY is handled by the engine, not here. A standby becomes leader WITHOUT a
+   restart, so the unconditional **startup** ``reset_stale_inflight`` is (correctly) skipped — it would
+   steal a live sibling's rows; see :meth:`reclaims_inflight`. Instead the graph-promotion path runs an
+   **on-promotion** ``Store.reset_stale_inflight`` for the active-passive / no-lease-reclaim (SQL Server)
+   case once this node flips non-leader→leader, before it drains — the ``elif self._coordinator.is_clustered()``
+   branch of ``Engine._start_graph`` (``pipeline/engine.py``). The engine-seam wiring,
+   :func:`build_coordinator` dispatch, and the ``[cluster]`` server-DB relaxation all landed with the
+   cluster.py observability work; on-promotion recovery is covered by ``tests/test_cluster_graph_gating.py``
+   (unit) and ``tests/test_load_failover_sqlserver.py`` (per-lane FIFO + recovered-pipeline integration).
 """
 
 from __future__ import annotations
@@ -117,6 +120,11 @@ class SqlServerCoordinator:
         self._is_leader: bool = False
         # Monotonic time of the last CONFIRMED lease hold; the fence demotes when now - this > timeout.
         self._last_renew_ok: float | None = None
+        # H1 fencing token: the leader epoch this node holds, or None when not a fenced leader. Bumped in
+        # the DB only on a FRESH acquire (take-over of a free/expired/foreign lease), never on a renew —
+        # see DbCoordinator. The engine pushes it into the store on promotion; the FIFO claim then fences
+        # a superseded ex-leader (held >= leader_lease.leader_epoch).
+        self._leader_epoch: int | None = None
         self._config_version: int = 0
 
     # --- lifecycle -----------------------------------------------------------
@@ -160,11 +168,22 @@ class SqlServerCoordinator:
     def is_leader(self) -> bool:
         return self._is_leader  # cached; no DB. The active-passive gate.
 
+    def current_epoch(self) -> int | None:
+        # Cheap + synchronous: the held leader epoch (None until first acquire / after demotion). The
+        # engine reads it on promotion and pushes it into the store's FIFO claim guard (H1).
+        return self._leader_epoch
+
+    def lease_key(self) -> str | None:
+        return (
+            self._lease_key
+        )  # the leader_lease row the store validates leader_epoch against (H1).
+
     def reclaims_inflight(self) -> bool:
-        # OPEN (deferred to wiring): a standby is promoted WITHOUT a restart, so startup
-        # reset_stale_inflight never re-fires. The planned fix is an on-acquire reset_stale_inflight hook
-        # (run when _is_leader flips False->True). Reported True (clustered, leader-driven recovery) to
-        # match the clustered contract; the exact engine seam is resolved with the cluster.py work.
+        # True (clustered, leader-driven recovery): a standby is promoted WITHOUT a restart, so the engine
+        # SKIPS the unconditional startup reset_stale_inflight (it would steal a live sibling's rows) and
+        # instead runs an on-promotion reset_stale_inflight when this node flips non-leader->leader — the
+        # active-passive / no-lease-reclaim branch of Engine._start_graph (pipeline/engine.py). Covered by
+        # tests/test_cluster_graph_gating.py + tests/test_load_failover_sqlserver.py.
         return True
 
     def is_clustered(self) -> bool:
@@ -284,7 +303,19 @@ class SqlServerCoordinator:
                     "IF OBJECT_ID(N'leader_lease', N'U') IS NULL"
                     " CREATE TABLE leader_lease ("
                     " lease_key NVARCHAR(256) NOT NULL PRIMARY KEY, owner NVARCHAR(256) NULL,"
-                    " lease_expires_at FLOAT NOT NULL);"
+                    " lease_expires_at FLOAT NOT NULL,"
+                    " leader_epoch BIGINT NOT NULL"  # H1: monotonic fencing token
+                    " CONSTRAINT DF_leader_lease_epoch DEFAULT 0);"
+                )
+                # H1 (owner-gated live ALTER): additively add leader_epoch to a pre-existing leader_lease
+                # (a cluster upgraded in place). SQL Server has no ADD COLUMN IF NOT EXISTS, so guard on
+                # COL_LENGTH; idempotent (a no-op once present / on the fresh CREATE above) and under the
+                # same sp_getapplock DDL guard so two nodes can't race it (REL-1). The DEFAULT 0 backfills
+                # the existing single row, so the first fresh acquire after the upgrade bumps it to 1.
+                await cur.execute(
+                    "IF COL_LENGTH(N'leader_lease', N'leader_epoch') IS NULL"
+                    " ALTER TABLE leader_lease ADD leader_epoch BIGINT NOT NULL"
+                    " CONSTRAINT DF_leader_lease_epoch DEFAULT 0;"
                 )
                 await cur.execute(
                     "IF OBJECT_ID(N'cluster_config', N'U') IS NULL"
@@ -359,33 +390,46 @@ class SqlServerCoordinator:
                 log.info("cluster: node %s acquired leadership (lease)", self.node_id)
         elif self._is_leader:
             self._is_leader = False
+            self._leader_epoch = None  # no longer a fenced leader (H1)
             log.info("cluster: node %s lost leadership (lease taken or expired)", self.node_id)
 
     async def _claim_or_renew_lease(self) -> bool:
         """Atomically acquire (fresh / expired) or renew (already ours) the single leadership lease, all
         against the DB clock. Held iff the OUTPUT row exists AND names us. ``HOLDLOCK`` makes the
-        take-over race serializable on the lease key (the analog of PG's single-statement upsert)."""
+        take-over race serializable on the lease key (the analog of PG's single-statement upsert).
+
+        **H1 fencing token.** ``leader_epoch`` is bumped **only on a fresh acquire** — the INSERT
+        (epoch 1) or a take-over of an *expired/foreign* lease (``t.leader_epoch + 1``) — and left
+        unchanged on a renew (``t.owner = me``), mirroring :meth:`DbCoordinator._claim_or_renew_lease`.
+        ``OUTPUT inserted.leader_epoch`` carries the held value back so :meth:`_maintain_leadership`
+        caches it; the store then fences a superseded ex-leader (``held >= leader_lease.leader_epoch``)."""
         row = await self._store._fetchone(
             "SET NOCOUNT ON;"
             f" DECLARE @now FLOAT = {_DB_NOW};"
             " MERGE leader_lease WITH (HOLDLOCK) AS t USING (SELECT ? AS lease_key) AS s"
             " ON t.lease_key = s.lease_key"
             " WHEN MATCHED AND (t.owner = ? OR t.lease_expires_at < @now)"
-            " THEN UPDATE SET owner = ?, lease_expires_at = @now + ?"
+            " THEN UPDATE SET owner = ?, lease_expires_at = @now + ?,"
+            " leader_epoch = CASE WHEN t.owner = ? THEN t.leader_epoch ELSE t.leader_epoch + 1 END"
             " WHEN NOT MATCHED"
-            " THEN INSERT (lease_key, owner, lease_expires_at) VALUES (?, ?, @now + ?)"
-            " OUTPUT inserted.owner AS owner;",
+            " THEN INSERT (lease_key, owner, lease_expires_at, leader_epoch)"
+            " VALUES (?, ?, @now + ?, 1)"
+            " OUTPUT inserted.owner AS owner, inserted.leader_epoch AS leader_epoch;",
             (
                 self._lease_key,
-                self.node_id,
-                self.node_id,
-                self._lease_ttl,
-                self._lease_key,
-                self.node_id,
-                self._lease_ttl,
+                self.node_id,  # WHEN MATCHED AND (t.owner = ? ...)
+                self.node_id,  # UPDATE SET owner = ?
+                self._lease_ttl,  # lease_expires_at = @now + ?
+                self.node_id,  # CASE WHEN t.owner = ?
+                self._lease_key,  # INSERT lease_key
+                self.node_id,  # INSERT owner
+                self._lease_ttl,  # INSERT lease_expires_at
             ),
         )
-        return row is not None and row["owner"] == self.node_id
+        if row is None or row["owner"] != self.node_id:
+            return False
+        self._leader_epoch = int(row["leader_epoch"])
+        return True
 
     async def _fence_watchdog_loop(self) -> None:
         while not self._stop.is_set():
@@ -404,6 +448,7 @@ class SqlServerCoordinator:
             return  # defensive: _is_leader is only set alongside _last_renew_ok
         if self._monotonic() - last > self._fence_timeout:
             self._is_leader = False
+            self._leader_epoch = None  # fenced: drop the now-stale token (H1)
             log.warning(
                 "cluster: node %s SELF-FENCED — leadership lease not renewed within %.1fs (fence "
                 "timeout); halting leader work before the lease (TTL %.1fs) can expire",
@@ -416,6 +461,7 @@ class SqlServerCoordinator:
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None
+        self._leader_epoch = None  # released: no longer a fenced leader (H1)
         if not was_leader:
             return
         try:

@@ -483,7 +483,13 @@ deadlock, timeout — SQLSTATE class `08`/`40` or `HYTxx`) → `DeliveryError`, 
 string brace-quotes every value (no connection-string injection); TLS is **on by default** and a
 weakened posture is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set; the outbound server is gated by the
 fail-closed `[egress].allowed_db` allowlist (WP-11c). A `:name` placeholder must not appear inside a
-quoted string literal in `statement` — bind dynamic strings as parameters.
+quoted string literal in `statement` — bind dynamic strings as parameters. To validate a private /
+internal DB CA with `trust_server_certificate` left **false**, import that CA into the Windows
+**machine** trust store (`LocalMachine\Root`) via
+[`scripts/service/import-db-ca.ps1`](../scripts/service/import-db-ca.ps1) — **never**
+`TrustServerCertificate=true`; ODBC 18 has no connection-string CA-file keyword. See the CA-import +
+make-before-break rotation runbooks in
+[`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md#5-db-tls-trust-import-the-db-ca--rotate-certificates).
 
 **Idempotency — operator responsibility.** Delivery is **at-least-once**, so a retry **re-executes** the
 statement. Use an idempotent write (`MERGE`/upsert on a natural key, or a de-dup) so a retry doesn't

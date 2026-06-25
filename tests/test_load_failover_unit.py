@@ -23,7 +23,7 @@ from harness.load.failover import (
     _node_env,
     _split_phases,
 )
-from harness.load.failover_track import FailoverTracker
+from harness.load.failover_track import FailoverTracker, LeadershipTracker
 from harness.load.metrics import Counters
 from harness.load.profile import LoadProfileError, load_profile_text
 
@@ -184,6 +184,54 @@ def test_tracker_per_lane_independence() -> None:
     assert t.lane_inversions == 0
 
 
+# --- LeadershipTracker (H6 continuous single-leader SLO) ---------------------
+
+
+def test_leadership_tracker_single_leader_passes() -> None:
+    # The normal failover shape: one leader before the kill, a brief window of zero leaders (post-kill,
+    # pre-promotion), then one leader again. Never two → the continuous SLO holds.
+    t = LeadershipTracker()
+    for n in (1, 1, 0, 0, 1, 1, 1):
+        t.observe(n)
+    assert t.max_concurrent_leaders == 1
+    assert t.two_or_more_leader_samples == 0
+    assert t.slo_ok is True
+    assert t.samples == 7
+
+
+def test_leadership_tracker_two_leaders_fails_slo() -> None:
+    # Split-brain: a single sample with two simultaneous primaries fails the SLO, even amid many good ones.
+    t = LeadershipTracker()
+    for n in (1, 1, 2, 1, 1):
+        t.observe(n)
+    assert t.max_concurrent_leaders == 2
+    assert t.two_or_more_leader_samples == 1
+    assert t.slo_ok is False
+
+
+def test_leadership_tracker_vacuous_when_never_observed() -> None:
+    # A monitor that never sampled the cluster must NOT silently certify "single leader" off zero
+    # evidence — slo_ok is False until at least one observation lands.
+    t = LeadershipTracker()
+    assert t.samples == 0
+    assert t.slo_ok is False
+
+
+def test_leadership_tracker_rejects_negative() -> None:
+    t = LeadershipTracker()
+    with pytest.raises(ValueError, match="active_leaders"):
+        t.observe(-1)
+
+
+def test_leadership_tracker_counts_every_split_brain_sample() -> None:
+    t = LeadershipTracker()
+    for n in (2, 2, 1, 2):
+        t.observe(n)
+    assert t.two_or_more_leader_samples == 3
+    assert t.max_concurrent_leaders == 2
+    assert t.slo_ok is False
+
+
 # --- phase splitting ---------------------------------------------------------
 
 
@@ -264,13 +312,19 @@ def test_node_env_configures_cluster_and_forces_pool() -> None:
 # --- report builder ----------------------------------------------------------
 
 
-def _outcome(promotion: float | None = 2.0, recovery: float | None = 7.0, leaders: int = 1):
+def _outcome(
+    promotion: float | None = 2.0,
+    recovery: float | None = 7.0,
+    leaders: int = 1,
+    leader_samples: int = 10,
+):
     return _KillOutcome(
         killed=SimpleNamespace(node_id="fo-a"),  # type: ignore[arg-type]
         survivor=SimpleNamespace(node_id="fo-b"),  # type: ignore[arg-type]
         promotion_seconds=promotion,
         recovery_seconds=recovery,
         max_concurrent_leaders=leaders,
+        leader_samples=leader_samples,
     )
 
 
@@ -380,12 +434,29 @@ def test_build_report_flags_split_brain() -> None:
     assert any(s.name == "single_leader" and not s.ok for s in rep.slos)
 
 
+def test_build_report_single_leader_slo_is_non_vacuous() -> None:
+    # H6: a run where the monitor never observed the cluster (leader_samples == 0) must FAIL the
+    # single_leader SLO rather than silently certify it off zero evidence (mirrors lanes_observed >= 2).
+    rep = _report(tracker=_full_tracker(), outcome=_outcome(leaders=1, leader_samples=0))
+    assert rep.leader_samples == 0
+    assert rep.result_ok is False
+    assert any(s.name == "single_leader" and not s.ok for s in rep.slos)
+
+
+def test_build_report_single_leader_passes_with_samples() -> None:
+    # The complement: max 1 leader AND at least one observation → the SLO passes and the count surfaces.
+    rep = _report(tracker=_full_tracker(), outcome=_outcome(leaders=1, leader_samples=12))
+    assert rep.leader_samples == 12
+    assert any(s.name == "single_leader" and s.ok for s in rep.slos)
+
+
 def test_report_json_and_console_smoke() -> None:
     rep = _report(tracker=_full_tracker())
     js = rep.to_json_dict()
     assert js["kind"] == "failover"
     assert js["result"] == "PASS"
     assert js["failover"]["recovery_seconds"] == 7.0
+    assert js["failover"]["leader_samples"] == 10  # H6 sample count surfaced in the JSON report
     text = rep.render_console()
     assert "Failover-load report" in text
     assert "RESULT: PASS" in text

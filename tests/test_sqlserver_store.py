@@ -42,6 +42,7 @@ async def store() -> AsyncIterator[object]:
             "state",
             "queue",  # FK to messages(id) — must be cleared before messages
             "response",  # FK to messages(id) — must be cleared before messages
+            "delivered_keys",  # H2 idempotency ledger (no FK, but ids reference messages)
             "outbox",
             "messages",
             "sessions",
@@ -668,8 +669,12 @@ async def test_reencrypt_to_active_rotates_all_columns_including_state(store) ->
     active_id = AesGcmCipher(k2).active_key_id
     rotated = await SqlServerStore.open(settings, cipher=AesGcmCipher(k2, retired_keys=[k1]))
     try:
-        # messages.raw + the outbound queue.payload + state.value = 3 rows under the retired key
-        assert await rotated.reencrypt_to_active() == 3
+        # messages.raw + the outbound queue.payload + state.value (3 core) + the 3 lifecycle-event
+        # message_events.detail rows this flow writes — all now ciphered under H4 — = 6 under the
+        # retired key (H4 added error/last_error/detail to the rotation; here only the event details
+        # are populated). The dedicated H4 columns get their own check in
+        # test_reencrypt_rotates_error_lasterror_detail.
+        assert await rotated.reencrypt_to_active() == 6
         blobs = await rotated._fetchall(
             "SELECT value AS v FROM state"
             " UNION ALL SELECT raw FROM messages"
@@ -1036,3 +1041,285 @@ async def test_reencrypt_rotates_summary_and_metadata(store) -> None:
         )  # still decrypts under the new key
     finally:
         await rotated.close()
+
+
+# --- H4: error / last_error / message_events.detail encrypted at rest ----------
+# SQL Server parity with SQLite/Postgres: the three nullable disposition-text columns route through the
+# SAME store cipher (mfenc:v1) — at-rest ciphertext, decrypt-on-read, rotated on rekey, and legacy
+# plaintext migrated on open. The prior "SQL Server keeps these plaintext" residual is retired.
+
+
+async def test_error_lasterror_detail_encrypted_at_rest_and_decrypt(store) -> None:
+    """H4: messages.error / queue.last_error / message_events.detail are ciphertext at rest on SQL
+    Server and decrypt on every read path — parity with the SQLite/PG suites. Error strings are plain
+    (no HL7 delimiters) so safe_text leaves them intact and the round-trip is exact."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import PREFIX, AesGcmCipher
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    settings = load_settings(environ=os.environ).store
+    s = await SqlServerStore.open(settings, cipher=AesGcmCipher(b"k" * 32))
+    try:
+        # messages.error (record_received) + message_events.detail (the "error" event row).
+        err = "bad parse error from upstream"
+        eid = await s.record_received(
+            channel_id="IB", raw=RAW, status=MessageStatus.ERROR, error=err
+        )
+        # queue.last_error (mark_failed -> dead) + a "dead" message_events.detail.
+        mid = await s.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0)
+        item = (await s.claim_ready(now=100.0))[0]
+        fail = "delivery refused by partner endpoint"
+        await s.mark_failed(item.id, fail, RetryPolicy(max_attempts=1), now=110.0)  # -> DEAD
+
+        # AT REST: every value is mfenc:v1:... ciphertext — the cleartext phrase never appears in the col.
+        erow = (await s._fetchall("SELECT error FROM messages WHERE id=?", (eid,)))[0]
+        assert erow["error"].startswith(PREFIX) and "bad parse" not in erow["error"]
+        qrow = (await s._fetchall("SELECT last_error FROM queue WHERE message_id=?", (mid,)))[0]
+        assert qrow["last_error"].startswith(PREFIX) and "refused" not in qrow["last_error"]
+        drows = await s._fetchall(
+            "SELECT detail FROM message_events WHERE detail IS NOT NULL ORDER BY id"
+        )
+        assert drows, "expected at least one event with a detail"
+        for d in drows:
+            assert d["detail"].startswith(PREFIX)  # no plaintext detail at rest
+            assert "bad parse" not in d["detail"] and "refused" not in d["detail"]
+
+        # DECRYPT ON READ: every read path returns the cleartext.
+        assert (await s.get_message(eid))["error"] == err
+        assert any(m["error"] == err for m in await s.list_messages())
+        [dead] = await s.list_dead()
+        assert dead["last_error"] == fail
+        assert all(o["last_error"] == fail for o in await s.outbox_for(mid))
+        events = await s.events_for(eid)
+        assert any(e["detail"] == err for e in events)  # the "error" event detail decrypts
+    finally:
+        await s.close()
+
+
+async def test_reencrypt_rotates_error_lasterror_detail(store) -> None:
+    """H4: the three disposition-text columns are rotated to the active key on rekey like the body —
+    not stranded under a retired key (which a later retired-key drop would make undecryptable)."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    settings = load_settings(environ=os.environ).store
+    k1, k2 = b"k" * 32, b"K" * 32
+    err, fail = "bad parse rotated", "delivery rotated failure"
+    old = await SqlServerStore.open(settings, cipher=AesGcmCipher(k1))
+    try:
+        await old.record_received(channel_id="IB", raw=RAW, status=MessageStatus.ERROR, error=err)
+        await old.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0)
+        item = (await old.claim_ready(now=100.0))[0]
+        await old.mark_failed(item.id, fail, RetryPolicy(max_attempts=1), now=110.0)  # -> DEAD
+    finally:
+        await old.close()
+
+    active_id = AesGcmCipher(k2).active_key_id
+    rotated = await SqlServerStore.open(settings, cipher=AesGcmCipher(k2, retired_keys=[k1]))
+    try:
+        await rotated.reencrypt_to_active()
+        # every non-null disposition-text value now carries the ACTIVE key id (mfenc:v1:<active>:...).
+        blobs = await rotated._fetchall(
+            "SELECT error AS v FROM messages WHERE error IS NOT NULL"
+            " UNION ALL SELECT last_error FROM queue WHERE last_error IS NOT NULL"
+            " UNION ALL SELECT detail FROM message_events WHERE detail IS NOT NULL"
+        )
+        assert blobs, "expected rotated disposition-text values"
+        for r in blobs:
+            assert r["v"].split(":", 3)[2] == active_id, r["v"]
+        # still decrypts under the new key on the read paths.
+        assert any(m["error"] == err for m in await rotated.list_messages())
+        assert (await rotated.list_dead())[0]["last_error"] == fail
+        assert await rotated.reencrypt_to_active() == 0  # idempotent
+    finally:
+        await rotated.close()
+
+
+async def test_legacy_plaintext_error_detail_migrated_on_open(store) -> None:
+    """H4: a no-key -> key restart encrypts legacy plaintext error/last_error/detail in place via
+    _encrypt_existing_rows (the message_events.detail pass is keyed on the INT IDENTITY id). After the
+    keyed open, the at-rest columns are ciphertext and reads still return the original cleartext."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import PREFIX, AesGcmCipher
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    settings = load_settings(environ=os.environ).store
+    err, fail = "legacy bad parse", "legacy delivery failure"
+    # (1) Keyless (identity cipher): values land as PLAINTEXT at rest.
+    plain = await SqlServerStore.open(settings)
+    try:
+        eid = await plain.record_received(
+            channel_id="IB", raw=RAW, status=MessageStatus.ERROR, error=err
+        )
+        mid = await plain.enqueue_message(
+            channel_id="IB", raw=RAW, deliveries=[("OB", "p")], now=100.0
+        )
+        item = (await plain.claim_ready(now=100.0))[0]
+        await plain.mark_failed(item.id, fail, RetryPolicy(max_attempts=1), now=110.0)
+        # sanity: stored plaintext (no cipher prefix) before the migration runs.
+        erow = (await plain._fetchall("SELECT error FROM messages WHERE id=?", (eid,)))[0]
+        assert erow["error"] == err and not erow["error"].startswith(PREFIX)
+    finally:
+        await plain.close()
+
+    # (2) Re-open WITH a key: open() runs _encrypt_existing_rows and migrates the legacy plaintext.
+    keyed = await SqlServerStore.open(settings, cipher=AesGcmCipher(b"k" * 32))
+    try:
+        erow = (await keyed._fetchall("SELECT error FROM messages WHERE id=?", (eid,)))[0]
+        assert erow["error"].startswith(PREFIX) and "bad parse" not in erow["error"]
+        qrow = (await keyed._fetchall("SELECT last_error FROM queue WHERE message_id=?", (mid,)))[0]
+        assert qrow["last_error"].startswith(PREFIX)
+        drows = await keyed._fetchall("SELECT detail FROM message_events WHERE detail IS NOT NULL")
+        assert drows and all(d["detail"].startswith(PREFIX) for d in drows)
+        # reads still return the original cleartext after the in-place migration.
+        assert (await keyed.get_message(eid))["error"] == err
+        assert (await keyed.list_dead())[0]["last_error"] == fail
+    finally:
+        await keyed.close()
+
+
+# --- H1: store-checked leader epoch (fencing token) ---------------------------
+
+
+async def _seed_lease_epoch(store, lease_key: str, epoch: int) -> None:
+    """Upsert the single ``leader_lease`` row to ``epoch`` (the authoritative current leader epoch). The
+    cluster coordinator owns this row in production; the test sets it directly to simulate the DB state a
+    standby's fresh-acquire bump left behind, so the store's claim guard has something to validate."""
+    await store._execute(
+        "IF OBJECT_ID(N'leader_lease', N'U') IS NULL"
+        " CREATE TABLE leader_lease ("
+        " lease_key NVARCHAR(256) NOT NULL PRIMARY KEY, owner NVARCHAR(256) NULL,"
+        " lease_expires_at FLOAT NOT NULL,"
+        " leader_epoch BIGINT NOT NULL CONSTRAINT DF_leader_lease_epoch DEFAULT 0);"
+    )
+    await store._execute(
+        "MERGE leader_lease WITH (HOLDLOCK) AS t USING (SELECT ? AS lease_key) AS s"
+        " ON t.lease_key = s.lease_key"
+        " WHEN MATCHED THEN UPDATE SET leader_epoch = ?"
+        " WHEN NOT MATCHED THEN INSERT (lease_key, owner, lease_expires_at, leader_epoch)"
+        " VALUES (?, 'live', 9e18, ?);",
+        (lease_key, epoch, lease_key, epoch),
+    )
+
+
+async def test_stale_epoch_claim_is_rejected_zero_rows(store) -> None:
+    # The fence. leader_lease.leader_epoch is 5 (a standby took over + bumped). A superseded ex-leader
+    # still believes it holds epoch 3 (held < current) — its FIFO claim must affect 0 rows (None) and
+    # leave the head PENDING, untouched.
+    lease_key = "dbo:mefor_cluster_leader"
+    await _seed_lease_epoch(store, lease_key, 5)
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    store.set_leader_epoch(3, lease_key=lease_key)  # ex-leader holds a STALE (older) epoch
+    assert await store.claim_next_fifo("OB1", now=200.0) is None  # rejected by the fence
+    outbox = await store.outbox_for(mid)
+    assert outbox[0]["status"] == OutboxStatus.PENDING.value  # head untouched, lane intact
+    assert outbox[0]["attempts"] == 0
+
+
+async def test_current_epoch_claim_succeeds(store) -> None:
+    # The live leader holds the SAME epoch as the lease row (held == current): its claim passes. Equality
+    # is the boundary — held >= current must include equality, else the true leader could never claim.
+    lease_key = "dbo:mefor_cluster_leader"
+    await _seed_lease_epoch(store, lease_key, 5)
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
+    store.set_leader_epoch(5, lease_key=lease_key)
+    claimed = await store.claim_next_fifo("OB1", now=200.0)
+    assert claimed is not None and claimed.destination_name == "OB1"
+
+
+async def test_epoch_guard_disabled_when_none_is_byte_identical(store) -> None:
+    # set_leader_epoch(None) leaves the claim unfenced — byte-identical to pre-H1 (claims with no lease).
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
+    store.set_leader_epoch(None)
+    assert await store.claim_next_fifo("OB1", now=200.0) is not None
+
+
+async def test_stale_then_promoted_claim_preserves_fifo_head(store) -> None:
+    # FIFO survives the fence: two messages on one lane (N, N+1). A stale ex-leader is rejected (delivers
+    # neither); once this node is the current leader it claims the OLDEST first (N), preserving per-lane
+    # order across the would-be split-brain.
+    lease_key = "dbo:mefor_cluster_leader"
+    await _seed_lease_epoch(store, lease_key, 5)
+    m1 = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "n")], now=100.0)
+    m2 = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "n1")], now=101.0
+    )
+    store.set_leader_epoch(3, lease_key=lease_key)  # stale ex-leader
+    assert await store.claim_next_fifo("OB1", now=200.0) is None
+    store.set_leader_epoch(5, lease_key=lease_key)  # current leader
+    first = await store.claim_next_fifo("OB1", now=201.0)
+    assert first is not None and first.message_id == m1  # OLDEST first — FIFO intact
+    await store.mark_done(first.id, now=202.0)
+    second = await store.claim_next_fifo("OB1", now=203.0)
+    assert second is not None and second.message_id == m2
+
+
+# --- H2: outbound idempotency ledger parity (gated) --------------------------------------------
+
+
+async def _ss_ledger(store) -> list[dict]:
+    return await store._fetchall("SELECT * FROM delivered_keys ORDER BY delivery_seq")
+
+
+async def test_mark_done_writes_one_ledger_row_ss(store) -> None:
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], control_id="MSG1", now=100.0
+    )
+    item = await store.claim_next_fifo("OB1", now=200.0)
+    assert item is not None
+    await store.mark_done(item.id, now=300.0)
+    rows = await _ss_ledger(store)
+    assert len(rows) == 1
+    assert rows[0]["outbox_id"] == item.id and rows[0]["delivery_seq"] == 1
+    assert "p1" not in str(rows[0].values()) and "MSH" not in str(rows[0].values())
+    assert len(rows[0]["delivery_key"]) == 64
+    assert mid
+
+
+async def test_claim_skips_already_delivered_head_no_resend_ss(store) -> None:
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0
+    )
+    item = await store.claim_next_fifo("OB1", now=200.0)
+    assert item is not None
+    await store.mark_done(item.id, now=300.0)
+    assert len(await _ss_ledger(store)) == 1
+    async with store._pool.acquire() as conn:
+        cur = await conn.cursor()
+        await cur.execute(
+            "UPDATE queue SET status=? WHERE id=?", (OutboxStatus.PENDING.value, item.id)
+        )
+        await conn.commit()
+    assert await store.claim_next_fifo("OB1", now=400.0) is None  # dup head completed in place
+    outbox = await store.outbox_for(mid)
+    assert outbox[0]["status"] == OutboxStatus.DONE.value
+    assert len(await _ss_ledger(store)) == 1
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+
+async def test_crash_re_run_mark_done_is_idempotent_ss(store) -> None:
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0)
+    item = await store.claim_next_fifo("OB1", now=200.0)
+    assert item is not None
+    await store.mark_done(item.id, now=300.0)
+    await store.mark_done(item.id, now=301.0)  # re-run after crash → no duplicate ledger row
+    assert len(await _ss_ledger(store)) == 1
+
+
+async def test_replay_resend_not_deduped_ss(store) -> None:
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0
+    )
+    item = await store.claim_next_fifo("OB1", now=200.0)
+    assert item is not None
+    await store.mark_done(item.id, now=300.0)
+    assert len(await _ss_ledger(store)) == 1
+    assert await store.replay(mid, now=400.0) == 1  # re-send drops the ledger entry
+    assert await _ss_ledger(store) == []
+    again = await store.claim_next_fifo("OB1", now=500.0)
+    assert again is not None and again.id == item.id  # claimed normally, NOT deduped
+    await store.mark_done(again.id, now=600.0)
+    assert len(await _ss_ledger(store)) == 1

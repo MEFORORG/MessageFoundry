@@ -38,6 +38,7 @@ from messagefoundry.transports.signing import (
     _verify,
 )
 from messagefoundry.transports.smart import (
+    _CLIENT_ASSERTION_TYPE,
     SmartAuthError,
     SmartBackendTokenProvider,
     token_provider_from_destination,
@@ -393,3 +394,62 @@ def test_smart_private_key_redacted(rsa_pem: str) -> None:
     assert red["smart_private_key"] == "***"
     assert red["smart_private_key_password"] == "***"
     assert "BEGIN" not in json.dumps(red)  # the PEM never appears in the metadata view
+
+
+# --- S12 audit anchors (ADDED-1): aud==token endpoint + structural-only --------
+# The S12 clinical-surface audit verdict for SMART/OAuth is CONFORMING. These regression tests PIN the
+# load-bearing invariants so a refactor can't silently regress them. Per the audit scope they assert
+# STRUCTURAL fields only — never a bearer/token/assertion-signature VALUE.
+
+
+def test_audit_aud_defaults_to_token_endpoint(rsa_pem: str) -> None:
+    # RFC 7523 / SMART Backend Services: the client_assertion `aud` MUST be the token endpoint unless the
+    # server documents another audience. With no explicit audience, aud == token_url (per-mint, structural).
+    provider = _provider(rsa_pem)
+    assert provider.audience == TOKEN_URL
+    claims = provider._assertion_claims()
+    assert (
+        claims["aud"] == TOKEN_URL
+    )  # the value the SMART AS validates to bind the assertion to itself
+
+
+def test_audit_explicit_audience_overrides_token_endpoint(rsa_pem: str) -> None:
+    # When a server documents a distinct audience, it is honored verbatim (still structural, no secret).
+    explicit = "https://auth.example/oauth2/aud"
+    provider = _provider(rsa_pem, audience=explicit)
+    assert provider.audience == explicit
+    assert provider._assertion_claims()["aud"] == explicit
+
+
+def test_audit_aud_tracks_a_distinct_token_url(rsa_pem: str) -> None:
+    # The default-aud invariant must follow whatever token_url is configured (not a hardcoded constant) —
+    # a mis-wired aud would let an assertion minted for one AS be replayed at another.
+    other = "https://other-as.example/token"
+    provider = _provider(rsa_pem, token_url=other)
+    assert provider._assertion_claims()["aud"] == other
+
+
+def test_audit_token_post_never_asserts_a_token_value(rsa_pem: str) -> None:
+    # Structural-only contract: the assertion POST carries the SMART-mandated grant fields; the test
+    # asserts their PRESENCE/shape, never the signed-assertion bytes or any returned bearer value.
+    provider = _provider(rsa_pem)
+    opener = _token_opener(token="MUST-NOT-BE-ASSERTED")
+    provider._opener = opener  # type: ignore[assignment]
+    token = provider.access_token()
+    form = urllib.parse.parse_qs(opener.requests[0].data.decode())  # type: ignore[union-attr]
+    # The assertion is PRESENT and compact (three dot-separated segments) — shape only, not its bytes.
+    assert form["client_assertion_type"] == [_CLIENT_ASSERTION_TYPE]
+    assert len(form["client_assertion"][0].split(".")) == 3
+    # The bearer round-trips opaquely; we never pin its value beyond "non-empty str" (no value coupling).
+    assert isinstance(token, str) and token
+
+
+def test_audit_token_url_must_be_egress_listed(rsa_pem: str) -> None:
+    # ADDED-1 requires the [egress].allowed_http gate to cover smart_token_url SPECIFICALLY (a second
+    # egress host beyond the FHIR base). Listing only the data host but not the token host is refused.
+    spec = with_smart_backend(
+        FHIR(url=FHIR_BASE), token_url=TOKEN_URL, client_id="c", private_key=rsa_pem
+    )
+    dest = Destination(name="OB", type=ConnectorType.FHIR, settings=spec.settings)
+    with pytest.raises(WiringError, match="SMART token endpoint"):
+        check_egress_allowed(dest, EgressSettings(allowed_http=["fhir.example"]))

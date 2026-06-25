@@ -367,6 +367,36 @@ class AiPolicy(BaseModel):
     reason: str | None = None
 
 
+class SecurityPosture(BaseModel):
+    """The instance's **effective** PHI-at-rest security posture (M5), behind the authenticated,
+    permission-gated ``GET /security/posture`` route. Surfaces what protection is *actually* in effect
+    (vs. what an operator assumes) so an EF-3-class accidental-dangerous-deploy is visible.
+
+    **No secret material ever appears here** (SECRET-1): ``key_id`` is only the active key's one-way
+    **fingerprint** (the first 16 hex of SHA-256(key)), never key bytes, and ``key_source`` is the
+    provider *name*, not a credential. ``data_class``/``production`` are the resolved posture;
+    ``encryption_enabled`` is read from the *live* store cipher (not just config). ``plaintext_columns``
+    lists any PHI-bearing columns that stay UNENCRYPTED at rest on the active backend — ``[]`` on every
+    backend now (the SQL Server ``error``/``last_error``/``message_events.detail`` residual was retired
+    by H4; SQLite, Postgres, and SQL Server all have full at-rest coverage of the PHI-bearing columns).
+    """
+
+    data_class: DataClass | None = None  # resolved PHI posture (synthetic|phi), if resolvable
+    production: bool | None = None  # production-tier posture, if resolvable
+    environment: str | None = None  # the active-environment NAME (ADR 0017)
+    backend: str  # store backend: "sqlite" | "postgres" | "sqlserver"
+    encryption_enabled: bool  # whether the LIVE store cipher encrypts at rest
+    key_source: str  # [store].key_provider name (auto|env|dpapi|aws_kms|...); NOT key material
+    key_id: str | None = (
+        None  # active key FINGERPRINT only (first 16 hex of SHA-256(key)); never bytes
+    )
+    require_encryption: bool  # whether keyless start is refused regardless of data_class
+    allow_unencrypted_phi: bool  # whether the audited keyless-PHI override is set
+    # PHI-bearing columns NOT encrypted at rest on this backend; empty on every backend (the SQL Server
+    # error/last_error/detail residual was retired by H4) or when encryption is off, where it is N/A.
+    plaintext_columns: list[str] = Field(default_factory=list)
+
+
 class ConnectionMetadata(BaseModel):
     """Static metadata for one connection (operability Tier 4). ``metadata`` is the operator's
     free-form label table (owner / runbook / environment); ``settings`` is **secret-scrubbed**

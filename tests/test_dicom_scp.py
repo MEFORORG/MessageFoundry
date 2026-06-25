@@ -8,10 +8,18 @@ timeout-failure policy, the PHI-no-log rule, and clean shutdown."""
 from __future__ import annotations
 
 import asyncio
+import datetime
+import ipaddress
 import logging
+import ssl
 from io import BytesIO
+from pathlib import Path
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
 pytest.importorskip("pydicom", reason="DICOM SCP tests need the [dicom] extra")
 pytest.importorskip("pynetdicom", reason="DICOM SCP tests need the [dicom] extra")
@@ -19,7 +27,7 @@ pytest.importorskip("pynetdicom", reason="DICOM SCP tests need the [dicom] extra
 from messagefoundry.config.models import ConnectorType, Source  # noqa: E402
 from messagefoundry.parsing import RawMessage  # noqa: E402
 from messagefoundry.parsing.dicom import DicomPeek  # noqa: E402
-from messagefoundry.transports.dicom import DicomScpSource  # noqa: E402
+from messagefoundry.transports.dicom import DicomScpSource, _server_ssl_context  # noqa: E402
 
 from tests._dicom_sample import make_sr_part10  # noqa: E402
 
@@ -170,3 +178,71 @@ async def test_scp_stop_is_idempotent() -> None:
     await scp.start(handler)
     await scp.stop()
     await scp.stop()  # second stop must not raise
+
+
+# --- S12 audit anchors (ADDED-2): SCP server-side DICOM-over-TLS floor ---------
+# test_dicom_wiring.py already pins the SCU *client* TLS floor; the SCP *server* context — the surface
+# that RECEIVES PHI objects from modalities/PACS — had no dedicated floor test. The S12 audit verdict is
+# CONFORMING; these pin the server SSLContext invariants (TLS 1.2+ floor + CERT_REQUIRED mTLS) so a
+# refactor can't silently weaken the listener's TLS posture. Pure `ssl` — no live association.
+
+
+def _server_cert(tmp_path: Path) -> tuple[str, str]:
+    """A self-signed EC cert (SAN 127.0.0.1, CA:TRUE so it doubles as an mTLS trust anchor) + key PEM."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc))
+        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.timezone.utc))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+            critical=False,
+        )
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    cp, kp = tmp_path / "scp-c.pem", tmp_path / "scp-k.pem"
+    cp.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    kp.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return str(cp), str(kp)
+
+
+def test_scp_tls_off_returns_none() -> None:
+    assert _server_ssl_context({"tls": False}) is None
+
+
+def test_scp_tls_requires_cert() -> None:
+    # tls=true without a server identity must fail loud at build (dry-run/check), not at bind.
+    with pytest.raises(ValueError, match="tls_cert_file"):
+        _server_ssl_context({"tls": True})
+
+
+def test_scp_tls_floor_is_1_2_no_mtls_by_default(tmp_path: Path) -> None:
+    cert, key = _server_cert(tmp_path)
+    ctx = _server_ssl_context({"tls": True, "tls_cert_file": cert, "tls_key_file": key})
+    assert ctx is not None
+    assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2  # TLS 1.2+ floor (no SSLv3/TLS1.0/1.1)
+    # Without a tls_ca_file the SCP does not demand a client cert (server-auth-only DICOM-over-TLS).
+    assert ctx.verify_mode == ssl.CERT_NONE
+
+
+def test_scp_tls_ca_file_requires_client_cert(tmp_path: Path) -> None:
+    # Opt-in mTLS: a tls_ca_file makes the SCP REQUIRE + verify a calling peer's client cert.
+    cert, key = _server_cert(tmp_path)
+    ctx = _server_ssl_context(
+        {"tls": True, "tls_cert_file": cert, "tls_key_file": key, "tls_ca_file": cert}
+    )
+    assert ctx is not None
+    assert ctx.verify_mode == ssl.CERT_REQUIRED  # fail-closed mTLS — an unverified peer is rejected
+    assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2

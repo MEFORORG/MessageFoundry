@@ -14,9 +14,12 @@ from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.ai_policy import DataClass
 from messagefoundry.config.models import RetryPolicy
-from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.settings import AiSettings, AuthSettings, StoreSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.store import MessageStore
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -658,3 +661,108 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
         assert (await c.post("/users/ad9/reset-password", headers=admin)).status_code == 400
         me_id = (await c.get("/auth/me", headers=admin)).json()["user_id"]
         assert (await c.post(f"/users/{me_id}/reset-password", headers=admin)).status_code == 400
+
+
+# --- M5: GET /security/posture (authenticated, permission-gated, no key bytes) ----------------------
+
+
+def _posture_client(
+    engine: Engine,
+    service: AuthService,
+    *,
+    ai_settings: AiSettings | None = None,
+    store_settings: StoreSettings | None = None,
+) -> httpx.AsyncClient:
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service, ai_settings=ai_settings, store_settings=store_settings)
+    )
+    return httpx.AsyncClient(transport=transport, base_url="http://t")
+
+
+async def test_security_posture_requires_auth_and_permission(engine: Engine) -> None:
+    # M5: GET /security/posture is authenticated + permission-gated (MONITORING_READ), NOT GET /health.
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)  # holds monitoring:read
+    await _add(service, "norole")  # empty roles → lacks monitoring:read
+    async with _posture_client(engine, service) as c:
+        assert (await c.get("/security/posture")).status_code == 401  # no token → fail closed
+        assert (
+            await c.get("/security/posture", headers=_auth("not-a-real-token"))
+        ).status_code == 401  # invalid token
+        nr = _auth((await _login(c, "norole")).json()["token"])
+        assert (await c.get("/security/posture", headers=nr)).status_code == 403  # lacks permission
+        vw = _auth((await _login(c, "vw")).json()["token"])
+        assert (
+            await c.get("/security/posture", headers=vw)
+        ).status_code == 200  # authed + permitted
+
+
+async def test_security_posture_keyless_reports_off(engine: Engine) -> None:
+    # The default engine fixture opens a keyless SQLite store → encryption off, no key_id, sqlite backend.
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)
+    ai = AiSettings(environment="staging", data_class=DataClass.PHI, production=False)
+    store = StoreSettings(allow_unencrypted_phi=True)
+    async with _posture_client(engine, service, ai_settings=ai, store_settings=store) as c:
+        vw = _auth((await _login(c, "vw")).json()["token"])
+        body = (await c.get("/security/posture", headers=vw)).json()
+    assert body["encryption_enabled"] is False
+    assert body["key_id"] is None
+    assert body["backend"] == "sqlite"
+    assert body["data_class"] == "phi" and body["production"] is False
+    assert body["environment"] == "staging"
+    assert body["allow_unencrypted_phi"] is True and body["require_encryption"] is False
+    assert body["plaintext_columns"] == []  # encryption off → N/A
+    assert body["key_source"] == "auto"
+
+
+async def test_security_posture_encrypted_exposes_fingerprint_not_key_bytes(
+    tmp_path: Path, engine: Engine
+) -> None:
+    # With encryption ON, the route reports encryption_enabled + the active key FINGERPRINT only — the
+    # raw key bytes (or its base64) MUST NOT appear anywhere in the response (SECRET-1).
+    key_b64 = generate_key()
+    store = await MessageStore.open(tmp_path / "enc.db", cipher=make_cipher(key_b64))
+    enc_engine = Engine(store, poll_interval=0.02)
+    try:
+        service = AuthService(enc_engine.store, AuthSettings())
+        await service.initialize()
+        await _add(service, "vw", Role.VIEWER)
+        ai = AiSettings(environment="prod", data_class=DataClass.PHI, production=True)
+        store_settings = StoreSettings(encryption_key=key_b64, key_provider="env")
+        async with _posture_client(
+            enc_engine, service, ai_settings=ai, store_settings=store_settings
+        ) as c:
+            resp = await c.get(
+                "/security/posture",
+                headers=_auth((await _login(c, "vw")).json()["token"]),
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["encryption_enabled"] is True
+        # The active_key_id is the cipher's fingerprint (16 hex), not key material.
+        assert body["key_id"] == store.cipher_info().active_key_id
+        assert body["key_id"] and len(body["key_id"]) == 16
+        assert body["key_source"] == "env"
+        # Hard no-key-bytes assertion: neither the base64 key nor its decoded bytes leak in the payload.
+        raw = resp.text
+        assert key_b64 not in raw
+        import base64
+
+        assert base64.b64decode(key_b64).hex() not in raw
+    finally:
+        await enc_engine.stop()
+
+
+def test_security_posture_sqlserver_reports_no_plaintext_residual() -> None:
+    # H4 (S5) retired the SQL Server error/last_error/message_events.detail plaintext residual — those
+    # columns now route through the same store cipher as SQLite/Postgres, so the per-backend coverage
+    # helper reports NO residual on any backend. Unit-level: the helper is the source of that list.
+    from messagefoundry.api.app import _plaintext_columns
+
+    # Every backend has full at-rest coverage now → empty on each.
+    assert _plaintext_columns("sqlserver", encryption_enabled=True) == []
+    assert _plaintext_columns("sqlite", encryption_enabled=True) == []
+    assert _plaintext_columns("postgres", encryption_enabled=True) == []
+    # Encryption off is N/A everywhere (the encryption_enabled=false bit conveys it).
+    assert _plaintext_columns("sqlserver", encryption_enabled=False) == []

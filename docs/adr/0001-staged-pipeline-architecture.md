@@ -103,6 +103,20 @@ the **outbound delivery stage** — which already requires idempotent receivers 
 new idempotency burden** as long as transform purity is enforced (we should make it a checked
 expectation, not just a convention).
 
+> **Update (H2, 2026-06-24): MF-side outbound idempotency ledger.** The outbound stage stays
+> at-least-once, but it no longer relies *solely* on the receiver to dedupe. A `delivered_keys` ledger
+> row is written **in the same transaction** as `mark_done` / `complete_with_response`, keyed on the
+> queue row's `outbox_id` and a SHA-256 of **non-PHI** ids + a replay-stable `delivery_seq` (the same
+> counter shape as `response_seq`). The FIFO claim then **skips-and-completes in place** a re-claimed
+> head whose `outbox_id` is already in the ledger (a crash-re-run recovered by `reset_stale_inflight`
+> *after* `mark_done` committed, or a failover re-claim) — completing it `DONE` without a second send
+> and returning `None`, so the lane advances with **no reorder**. A deliberate operator `replay`
+> re-send DELETEs the affected ledger rows first, so an intentional re-transmit is **not** deduped
+> (replay-distinguishing). The residual at-least-once window — a crash *before* `mark_done`/the ledger
+> row commit — is unchanged (no ledger row exists to skip on, exactly as before), so idempotent
+> receivers remain the contract for that window. The ledger carries **hashes + ids only, never a body
+> or PHI**, so it is stored in the clear and is not part of the `_cipher` seam.
+
 ### 3. Revised invariants
 
 - **Reliability (revised):** the inbound is ACKed only after the **raw message is durably committed to

@@ -389,9 +389,15 @@ def _serve(args: argparse.Namespace) -> int:
         return 2
     env_name = settings.ai.environment
 
-    # PHI-at-rest posture (WP-5/WP-11d): refuse (require_encryption) or warn (PHI-carrying instance)
-    # when no key is configured. A DPAPI-protected key file (Windows) counts as a configured key; if
-    # it's set but unreadable here, open_store fails closed at startup with the DPAPI error.
+    # PHI-at-rest posture (H3, OWASP *Fail Securely* / SDS §4.3 PW.9 secure-by-default): with no key
+    # configured, a PHI-carrying instance — gated on data_class == phi, NOT the environment label, so a
+    # custom-named dev/test box holding near-real PHI is covered the same as prod — REFUSES to start
+    # (fail-closed). The refusal fires in EVERY environment (dev/staging/prod) once data_class is phi.
+    # An explicit [store].allow_unencrypted_phi=true is the loud, audited override that lets such an
+    # instance start keyless (warn). A synthetic/non-PHI instance stays key-free (CI parity), and
+    # [store].require_encryption forces the refusal even for a synthetic instance. A DPAPI-protected key
+    # file (Windows) counts as a configured key; if it's set but unreadable here, open_store fails closed
+    # at startup with the DPAPI error.
     if not (settings.store.encryption_key or settings.store.encryption_key_file):
         if settings.store.require_encryption:
             print(
@@ -401,30 +407,37 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        # Fail closed on a PRODUCTION PHI instance: a live production store must never run keyless
-        # (the prod analogue of require_encryption — the deployment doesn't have to set the flag to
-        # get the protection). staging/dev keep the softer posture below.
-        if production and data_class is DataClass.PHI:
-            print(
-                f"error: no MEFOR_STORE_ENCRYPTION_KEY (or [store].encryption_key_file) set on a "
-                f"production PHI instance ({env_name!r}); refusing to start — PHI bodies and the "
-                "summary/metadata (MRN + patient name) and error/last_error/detail columns would be "
-                "stored UNENCRYPTED at rest. Generate a key "
-                "with `messagefoundry gen-key` (or protect one to a file with `messagefoundry "
-                "protect-key`) and configure it before starting a production store.",
-                file=sys.stderr,
-            )
-            return 2
-        # Warn on a non-production PHI-carrying instance (e.g. staging). A synthetic instance stays
-        # quiet to avoid alarm fatigue (CLAUDE.md §9 / docs/PHI.md).
         if data_class is DataClass.PHI:
+            if not settings.store.allow_unencrypted_phi:
+                # Secure-by-default: any PHI instance (data_class==phi), in any environment, refuses to
+                # run keyless. This is the H3 tightening — previously prod refused and non-prod only
+                # warned (fail-open), but dev/staging routinely hold near-real PHI.
+                print(
+                    f"error: no MEFOR_STORE_ENCRYPTION_KEY (or [store].encryption_key_file) set on a "
+                    f"PHI instance (environment {env_name!r}, [ai].data_class=phi); refusing to start "
+                    "— PHI bodies and the summary/metadata (MRN + patient name) and "
+                    "error/last_error/detail columns would be stored UNENCRYPTED at rest. Generate a "
+                    "key with `messagefoundry gen-key` (or protect one to a file with `messagefoundry "
+                    "protect-key`) and configure it; or, to deliberately run without at-rest "
+                    "encryption, set [store].allow_unencrypted_phi=true (audited).",
+                    file=sys.stderr,
+                )
+                return 2
+            # Explicit, audited override: start keyless on a PHI instance. Emit a loud warning AND a
+            # WARNING-level audit record (captured by NSSM stdout/SIEM) so the deliberate weakening is
+            # never silent. (Logging isn't configured yet here, so this goes through the root logger,
+            # which emits >=WARNING to stderr by default — a durable startup audit line.)
+            logging.getLogger(__name__).warning(
+                "AUDIT: starting keyless on a PHI instance (environment %r, data_class=phi) because "
+                "[store].allow_unencrypted_phi=true — PHI is stored UNENCRYPTED at rest "
+                "(at-rest encryption opt-out override).",
+                env_name,
+            )
             print(
-                f"warning: no MEFOR_STORE_ENCRYPTION_KEY set in a PHI-carrying environment "
-                f"({env_name!r}) — PHI bodies and the summary/metadata (MRN + patient name) and "
-                "error/last_error/detail columns are stored "
-                "UNENCRYPTED at rest (only volume encryption protects them). Generate a key with "
-                "`messagefoundry gen-key` (or protect one to a file with `messagefoundry "
-                "protect-key`), or set [store].require_encryption.",
+                f"warning: [store].allow_unencrypted_phi=true — starting a PHI environment "
+                f"({env_name!r}) keyless; PHI bodies and the summary/metadata (MRN + patient name) and "
+                "error/last_error/detail columns are stored UNENCRYPTED at rest (only volume "
+                "encryption protects them). Configure MEFOR_STORE_ENCRYPTION_KEY to encrypt them.",
                 file=sys.stderr,
             )
 

@@ -81,6 +81,7 @@ from messagefoundry.api.models import (
     ReloadRequest,
     ReloadResult,
     ReplayResult,
+    SecurityPosture,
     StatsResetRequest,
     StatsResetResult,
     StatsResponse,
@@ -118,6 +119,7 @@ from messagefoundry.config.settings import (
     ReferenceSettings,
     RetentionSettings,
     ShadowSettings,
+    StoreBackend,
     StoreSettings,
 )
 from messagefoundry.config.wiring import EnvRef, WiringError, load_config, redacted_settings
@@ -268,6 +270,26 @@ def _scope(identity: Identity) -> list[str] | None:
     return None if identity.allowed_channels is None else sorted(identity.allowed_channels)
 
 
+#: PHI-bearing columns that stay UNENCRYPTED at rest on the SQL Server backend even when a key is
+#: configured. RETIRED (empty) as of H4 (S5): error/last_error/message_events.detail now route through
+#: the same store cipher on SQL Server as on SQLite/Postgres, so SQL Server is at full at-rest parity and
+#: GET /security/posture reports no residual. Kept as an explicit empty tuple (rather than deleting the
+#: surface) so the posture route still emits the per-backend coverage field with a documented anchor.
+_SQLSERVER_PLAINTEXT_RESIDUAL: tuple[str, ...] = ()
+
+
+def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
+    """The PHI-bearing columns NOT encrypted at rest on ``backend`` (M5). Empty when encryption is off
+    (N/A — every column is plaintext, which the ``encryption_enabled=false`` bit already conveys), and
+    now empty on EVERY backend: SQLite, Postgres, and (as of H4) SQL Server all have full at-rest
+    coverage of the PHI-bearing columns."""
+    if not encryption_enabled:
+        return []
+    if backend == StoreBackend.SQLSERVER.value:
+        return list(_SQLSERVER_PLAINTEXT_RESIDUAL)  # () since H4 — full parity, no residual
+    return []
+
+
 async def _audit_channel_denied(engine: Engine, identity: Identity, channel: str | None) -> None:
     """Audit a per-channel RBAC denial (mirrors auth.permission_denied)."""
     await engine.store.record_audit(
@@ -389,6 +411,7 @@ def create_app(
     lifespan: object | None = None,
     auth: AuthService | None = None,
     ai_settings: AiSettings | None = None,
+    store_settings: StoreSettings | None = None,
     approvals: ApprovalsSettings | None = None,
     alerts_settings: AlertsSettings | None = None,
     expose_docs: bool = False,
@@ -413,6 +436,11 @@ def create_app(
         app.state.auth = auth
     if ai_settings is not None:
         app.state.ai = ai_settings
+    # Store settings back the M5 GET /security/posture view (backend, key_provider source,
+    # require_encryption / allow_unencrypted_phi). The managed-app lifespan sets the live value once the
+    # store opens; here it supports the direct-construction (test) path.
+    if store_settings is not None:
+        app.state.store_settings = store_settings
     # Fail-closed when no auth is attached unless explicitly opted out (embedding/dev) — SYS-1.
     app.state.allow_no_auth = allow_no_auth
     # Loaded [alerts] config for the read-only /alerts/rules view (independent of engine; may be None,
@@ -534,6 +562,55 @@ def create_app(
             production=production,
             assist_permitted=permitted,
             reason=eff.reason,
+        )
+
+    @app.get("/security/posture", response_model=SecurityPosture)
+    async def security_posture(
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+    ) -> SecurityPosture:
+        """The instance's **effective** PHI-at-rest security posture (M5) — what protection is *actually*
+        in effect, so an EF-3-class accidental-dangerous-deploy is visible to an operator.
+
+        Authenticated + permission-gated (``MONITORING_READ``), deliberately NOT ``GET /health`` (that
+        stays a liveness boolean). The access is audited. **No key material is ever returned**
+        (SECRET-1): ``encryption_enabled`` and the key **fingerprint** are read from the *live* store
+        cipher via the public ``store.cipher_info()`` accessor (never the private ``_cipher``), and
+        ``key_source`` is the provider *name*. ``plaintext_columns`` reports any PHI column left
+        unencrypted on the active backend — empty on every backend now (the SQL Server residual was
+        retired by H4; SQLite/Postgres/SQL Server all have full at-rest coverage)."""
+        # The live cipher posture (on/off + key fingerprint only). cipher_info() is the public Store
+        # accessor — the route never touches engine.store._cipher.
+        info = engine.store.cipher_info()
+        # Store config: backend + key SOURCE (provider name) + the two keyless-gate flags. From app.state
+        # (the lifespan/managed-app stashes the resolved StoreSettings); fall back to defaults if absent.
+        store = getattr(request.app.state, "store_settings", None) or StoreSettings()
+        ai = getattr(request.app.state, "ai", None) or AiSettings()
+        data_class, production = ai.derived_posture()
+        backend = store.backend.value
+        await engine.store.record_audit(
+            "security.posture_view",
+            actor=identity.username,
+            detail=json.dumps(
+                {
+                    "backend": backend,
+                    "encryption_enabled": info.encrypts,
+                    "key_source": store.key_provider,
+                }
+            ),
+        )
+        return SecurityPosture(
+            data_class=data_class,
+            production=production,
+            environment=ai.environment,
+            backend=backend,
+            encryption_enabled=info.encrypts,
+            key_source=store.key_provider,
+            key_id=info.active_key_id,  # FINGERPRINT only, never key bytes
+            require_encryption=store.require_encryption,
+            allow_unencrypted_phi=store.allow_unencrypted_phi,
+            plaintext_columns=_plaintext_columns(backend, encryption_enabled=info.encrypts),
         )
 
     # --- connections list (inbound connections, for the Log Search filter) ---
@@ -1683,6 +1760,7 @@ def create_managed_app(
             engine.add_registry(load_config(config_dir))
         await engine.start()
         app.state.engine = engine
+        app.state.store_settings = resolved  # back GET /security/posture (M5)
         app.state.alerts_settings = alerts_settings
         app.state.approval_gate = _build_approval_gate(
             engine, approvals_settings or ApprovalsSettings()

@@ -29,7 +29,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import SqliteSync, StoreBackend, StoreSettings
-from messagefoundry.store.crypto import make_cipher
+from messagefoundry.store.crypto import CipherInfo, make_cipher
 from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.store import (
     CapturedResponse,
@@ -272,6 +272,22 @@ class QueueStore(StoreLifecycle, Protocol):
         node and have no such residue."""
         ...
 
+    def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
+        """Push this node's currently-held **leader epoch** (the H1 fencing token) into the store so the
+        FIFO claim can fence a superseded ex-leader, **inside** the existing single claim transaction.
+
+        The engine calls this on promotion/demotion: it reads the value from the cluster coordinator
+        (:meth:`ClusterCoordinator.current_epoch` / :meth:`ClusterCoordinator.lease_key`) and pushes it
+        here, so the **store never imports the coordinator** (the one-way ARCH-6 dependency direction).
+        ``epoch=None`` disables the guard (single-node / not yet leader / demoted) — the claim is then
+        byte-identical to before H1. With a non-``None`` epoch the server-DB backends add
+        ``leader_lease.leader_epoch <= :held`` to the claim's UPDATE so a paused/superseded ex-leader
+        (whose held epoch is now strictly older than the live leader's) claims **0 rows**.
+
+        Cheap + synchronous (it only stamps cached state — no DB round-trip). A **no-op on SQLite**
+        (single active node — no second writer to fence)."""
+        ...
+
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None: ...
 
     async def complete_with_response(
@@ -468,6 +484,13 @@ class QueueStore(StoreLifecycle, Protocol):
     async def wal_checkpoint(self) -> None: ...
 
     async def vacuum(self) -> None: ...
+
+    # --- at-rest posture (M5) -------------------------------------------------
+    def cipher_info(self) -> CipherInfo:
+        """The **non-secret** at-rest cipher posture (M5): whether encryption is on and, if so, the
+        active key's **fingerprint** (``active_key_id``) — never key bytes. The public accessor the M5
+        ``GET /security/posture`` route reads instead of reaching a backend's private ``_cipher``."""
+        ...
 
     # --- store health / metrics ----------------------------------------------
     async def db_status(self) -> DbStatus: ...

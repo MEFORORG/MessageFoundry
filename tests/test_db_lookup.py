@@ -248,3 +248,52 @@ def test_dry_run_raises_when_handler_calls_db_lookup() -> None:
     result = dryrun.dry_run(reg, raw, inbound="IB")
     assert result.disposition is MessageStatus.ERROR
     assert "db_lookup" in (result.error or "")
+
+
+# --- S12 audit anchors (ADDED-4): HL7-as-untrusted-input at db_lookup ----------
+# The S12 audit verdict for the db_lookup boundary is CONFORMING (PHI-2/REL-2/NET-2/PROC-1). These pin
+# the load-bearing invariants. NOTE — write/read-only is enforced by *parameterization* (a value can
+# never inject a write) + the documented read-only contract + the autocommit pool; there is no
+# statement-keyword write-blocker. So a Handler AUTHOR could still pass a literal write statement: that
+# is the author's contract, not an attacker-influenceable path. See the audit memo + backlog note S12-1.
+
+
+async def test_audit_attacker_value_cannot_inject_a_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The threat is untrusted HL7 reaching the DB. A hostile field value is bound as a PARAMETER, never
+    # interpolated into SQL — so it can never become a `; DROP TABLE` / write. Pin: the value lands in
+    # the positional params tuple and the SQL keeps its single placeholder, byte-for-byte.
+    pool = _patch_pool(monkeypatch, rows=[], columns=["npi"])
+    ex = DatabaseLookupExecutor(_CONN)
+    hostile = "1; DROP TABLE patient; --"  # an attacker-influenced HL7 field value
+    await ex.query("clarity", "SELECT npi FROM p WHERE mrn = :mrn", {"mrn": hostile})
+    assert pool.cursor_obj.executed is not None
+    sql, params = pool.cursor_obj.executed
+    assert params == (hostile,)  # carried as data, not SQL
+    assert sql.count("?") == 1 and "DROP" not in sql  # the hostile text never reached the statement
+
+
+async def test_audit_query_runs_via_autocommit_readonly_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Read-only posture: the lookup pool is opened with autocommit=True (each query is its own implicit,
+    # uncommitted-state-free transaction — nothing here issues a write/commit path). Pin the pool flag so
+    # a refactor can't silently open a writable transactional pool for live lookups.
+    seen: dict[str, bool] = {}
+    real_pool = _patch_pool(monkeypatch, rows=[], columns=["npi"])
+
+    async def spy_make_pool(dsn: str, pool_max: int, *, autocommit: bool):  # type: ignore[no-untyped-def]
+        seen["autocommit"] = autocommit
+        return real_pool
+
+    monkeypatch.setattr(database, "_make_pool", spy_make_pool)
+    ex = DatabaseLookupExecutor(_CONN)
+    await ex.query("clarity", "SELECT npi FROM p WHERE mrn = :mrn", {"mrn": "M1"})
+    assert seen["autocommit"] is True
+
+
+def test_audit_db_lookup_egress_gate_is_allowed_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    # NET-2: a DatabaseLookup dials out, so it is gated by [egress].allowed_db SPECIFICALLY (not a
+    # different transport's list). An unlisted server is refused fail-closed at load/reload/start.
+    egress = EgressSettings(allowed_db=["db.local:1433"])
+    with pytest.raises(WiringError, match="\\[egress\\].allowed_db"):
+        check_lookup_allowed("clarity", {"server": "exfil.evil", "port": 1433}, egress)

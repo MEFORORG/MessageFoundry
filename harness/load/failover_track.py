@@ -28,6 +28,43 @@ All state is bounded by the run's sent count (a failover run is a short burst, n
 from __future__ import annotations
 
 
+class LeadershipTracker:
+    """Continuous "active leaders ∈ {0,1}" SLO (H6). The Jepsen-style single-leader invariant: across a
+    failover the cluster must never have **two** nodes simultaneously reporting primary. The failover
+    monitor samples both nodes' roles repeatedly (every poll, not just at promotion) and folds each
+    observed concurrent-leader count in here; ``>= 2`` at any sample is a HARD SLO violation.
+
+    This is the *continuous* form of the failover report's ``max_concurrent_leaders``: the report SLO
+    asserts the high-water never exceeded 1, and this tracker is the thing that records that high-water
+    from the stream of samples. ``samples`` lets a test prove the check was non-vacuous (it actually
+    observed the cluster), so a monitor that never sampled can't silently certify "single leader".
+
+    Aggregate counts only — never a node-id list or any message content (PHI rule)."""
+
+    __slots__ = ("samples", "max_concurrent_leaders", "two_or_more_leader_samples")
+
+    def __init__(self) -> None:
+        self.samples = 0  # how many times the cluster's leader-set size was observed
+        self.max_concurrent_leaders = 0  # high-water of simultaneous primaries seen
+        self.two_or_more_leader_samples = 0  # samples that violated the invariant (>= 2 leaders)
+
+    def observe(self, active_leaders: int) -> None:
+        """Record one observation of how many nodes are simultaneously reporting primary right now."""
+        if active_leaders < 0:
+            raise ValueError("active_leaders cannot be negative")
+        self.samples += 1
+        if active_leaders > self.max_concurrent_leaders:
+            self.max_concurrent_leaders = active_leaders
+        if active_leaders >= 2:
+            self.two_or_more_leader_samples += 1
+
+    @property
+    def slo_ok(self) -> bool:
+        """The continuous single-leader invariant held across every observation (``≤ 1`` leader always).
+        Vacuously False when nothing was ever observed — a monitor that never sampled must NOT pass."""
+        return self.samples > 0 and self.max_concurrent_leaders <= 1
+
+
 class FailoverTracker:
     """Records acks (sender side) and deliveries (sink side) for the failover no-loss/ordering verdict."""
 

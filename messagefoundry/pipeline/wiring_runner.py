@@ -952,6 +952,9 @@ class RegistryRunner:
                     # FIFO: claim only the due head; the head blocks the lane while it backs off. Under
                     # active-passive HA the graph runs on the leader ONLY, so one node drains this lane;
                     # the Postgres claim also reclaims a prior leader's stranded head for failover FIFO.
+                    # H2: if the claimed head is an already-delivered duplicate (its outbox_id is in the
+                    # idempotency ledger), claim_next_fifo completes it in place and returns None — so the
+                    # worker never re-sends it; it simply re-polls and the lane advances (no reorder).
                     head = await self.store.claim_next_fifo(name)
                     items = [head] if head is not None else []
                 else:
@@ -982,6 +985,24 @@ class RegistryRunner:
                         )
                         await self.store.mark_failed(item.id, detail, retry)
                         await self._maybe_alert_buildup(name)
+                        continue
+                    # L1 pre-send leadership re-check (active-passive HA). The graph runs on the leader
+                    # ONLY, but leadership can be lost (a self-fence) BETWEEN claiming this row and the
+                    # send below. A cheap, SYNCHRONOUS is_leader() read (cached state — no DB round-trip)
+                    # closes that narrow window: a node that has stopped being leader must not emit egress
+                    # as a stale ex-leader. We do NOT drop the row — re-queue it via the existing retry
+                    # (mark_failed → PENDING with backoff) so the new leader delivers it (count-and-log,
+                    # REL-4). This is a cheap fast-path guard, NOT the authority: the durable backstop is
+                    # H1's store-checked leader_epoch fence, which rejects a superseded ex-leader's claim
+                    # at the DB inside the claim transaction even if this in-memory check raced. On the
+                    # single-node NullCoordinator is_leader() is always True, so this never fires and the
+                    # delivery path is byte-identical.
+                    if not self._coordinator.is_leader():
+                        await self.store.mark_failed(
+                            item.id,
+                            "leadership lost before send; re-queued for the new leader",
+                            retry,
+                        )
                         continue
                     try:
                         if self._simulate.get(name, False):

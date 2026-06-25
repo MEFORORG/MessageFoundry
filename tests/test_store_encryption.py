@@ -11,7 +11,9 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.store.crypto import (
+    MARKER_PREFIX,
     PREFIX,
+    AesGcmCipher,
     CipherError,
     IdentityCipher,
     generate_key,
@@ -414,5 +416,178 @@ async def test_rotation_without_prior_key_raises(tmp_path: Path) -> None:
     try:
         with pytest.raises(CipherError):
             await store.reencrypt_to_active()
+    finally:
+        await store.close()
+
+
+# --- M9: additive mfenc:v2 crypto-agility (version/alg dispatch) -------------
+#
+# The hard constraint is CRYPTO-1: the mfenc:v1 WRITER is frozen — existing v1 ciphertext and new v1
+# writes stay byte-identical. M9 adds *agility infrastructure only*: a version/alg-dispatching cipher
+# that is DECODE-CAPABLE of mfenc:v2 and CAN write it (opt-in), but WRITES v1 BY DEFAULT. AES-256-GCM
+# stays the only registered algorithm. These tests pin: (1) v1 byte-identical (frozen fixture); (2) v2
+# round-trip; (3) a v2-active cipher reads v1 with no rotation; (4) mixed v1+v2 rows; (5) fail-closed
+# CipherError on an unknown marker version AND an unknown alg id.
+
+# A FROZEN FIXTURE: a v1 blob written by the pre-M9 writer for plaintext "LEGACY-V1" under the key below
+# (nonce fixed to 12 zero bytes). Hardcoded so a regression in the v1 reader is caught against a value
+# this code did NOT just produce. key_b64 = base64(b"\x01"*32); nonce = b"\x00"*12.
+_FROZEN_V1_KEY_B64 = base64.b64encode(b"\x01" * 32).decode()
+_FROZEN_V1_PLAINTEXT = "LEGACY-V1"
+
+
+def _v1_blob(key_b64: str, plaintext: str, nonce: bytes) -> str:
+    """Reproduce the EXACT pre-M9 v1 marker layout for a fixed key+plaintext+nonce, independent of the
+    cipher under test — the oracle the byte-identical assertions compare against."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    from messagefoundry.store.crypto import _fingerprint
+
+    key = base64.b64decode(key_b64)
+    ct = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), None)
+    blob = base64.b64encode(nonce + ct).decode("ascii")
+    return f"mfenc:v1:{_fingerprint(key)}:{blob}"
+
+
+def test_v1_frozen_fixture_decrypts() -> None:
+    # A v1 blob built by the standalone oracle (not the cipher) still decrypts — the v1 READER is intact.
+    frozen = _v1_blob(_FROZEN_V1_KEY_B64, _FROZEN_V1_PLAINTEXT, b"\x00" * 12)
+    assert frozen.startswith("mfenc:v1:")
+    assert make_cipher(_FROZEN_V1_KEY_B64).decrypt(frozen) == _FROZEN_V1_PLAINTEXT
+
+
+def test_v1_writer_is_byte_identical(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The v1 WRITER output is byte-identical to the frozen layout for a fixed key+plaintext+nonce —
+    the CRYPTO-1 guarantee. Pin the nonce (the only random input) so the full marker is deterministic,
+    then compare the whole string against the independent oracle."""
+    fixed_nonce = b"\x00" * 12
+    monkeypatch.setattr("messagefoundry.store.crypto.os.urandom", lambda n: fixed_nonce)
+
+    cipher = make_cipher(_FROZEN_V1_KEY_B64)  # default writer = v1
+    produced = cipher.encrypt(_FROZEN_V1_PLAINTEXT)
+    expected = _v1_blob(_FROZEN_V1_KEY_B64, _FROZEN_V1_PLAINTEXT, fixed_nonce)
+    assert produced == expected  # full-string byte-identical, not just the prefix
+    assert produced.startswith("mfenc:v1:") and ":v2:" not in produced
+
+
+def test_default_writer_is_v1_not_v2() -> None:
+    # The shipping default never emits a v2 marker — no at-rest format change ships with M9.
+    token = make_cipher(generate_key()).encrypt("x")
+    assert token.startswith(PREFIX)  # mfenc:v1:
+    assert not token.startswith("mfenc:v2:")
+
+
+def test_v2_round_trip_marker_and_decrypt() -> None:
+    cipher = make_cipher(generate_key(), write_v2=True)
+    token = cipher.encrypt(ADT)
+    # mfenc:v2:<alg>:<key_id>:<b64> — alg id present, PHI hidden.
+    assert token.startswith("mfenc:v2:a256gcm:")
+    assert token.startswith(MARKER_PREFIX) and cipher.is_encrypted(token)
+    assert "DOE" not in token and "MSH" not in token
+    assert cipher.decrypt(token) == ADT
+
+
+def test_v2_active_decrypts_v1_without_rotation() -> None:
+    # A v2-writing cipher must still READ v1 rows in place (the whole point of decode-capability — no
+    # forced migration). Same key, so the v2-active cipher decrypts the v1 blob it did not write.
+    key = generate_key()
+    v1_token = make_cipher(key).encrypt(ADT)  # written by a v1 cipher
+    assert v1_token.startswith(PREFIX)
+    v2_cipher = make_cipher(key, write_v2=True)
+    assert v2_cipher.decrypt(v1_token) == ADT  # decoded with no rotation
+
+
+def test_v1_active_decrypts_v2() -> None:
+    # Symmetric: the default v1-writing cipher decodes a v2 blob written under the same key.
+    key = generate_key()
+    v2_token = make_cipher(key, write_v2=True).encrypt(ADT)
+    assert make_cipher(key).decrypt(v2_token) == ADT
+
+
+def test_active_marker_prefix_v1_and_v2() -> None:
+    # The rotation seam: active_marker_prefix carries the key fingerprint in the RIGHT position for each
+    # version, and the value the writer emits starts with it (so rotation recognises active-key rows).
+    key_b64 = generate_key()
+    fp = AesGcmCipher(base64.b64decode(key_b64)).active_key_id
+
+    v1 = make_cipher(key_b64)
+    assert isinstance(v1, AesGcmCipher)
+    assert v1.active_marker_prefix == f"mfenc:v1:{fp}:"
+    assert v1.encrypt("x").startswith(v1.active_marker_prefix)
+
+    v2 = make_cipher(key_b64, write_v2=True)
+    assert isinstance(v2, AesGcmCipher)
+    assert v2.active_marker_prefix == f"mfenc:v2:a256gcm:{fp}:"
+    assert v2.encrypt("x").startswith(v2.active_marker_prefix)
+
+
+def test_unknown_marker_version_fails_closed() -> None:
+    # A future/garbage version under the mfenc: umbrella must raise, never pass through or mis-decode.
+    cipher = make_cipher(generate_key())
+    with pytest.raises(CipherError, match="unknown at-rest marker version"):
+        cipher.decrypt("mfenc:v3:deadbeef:QUJD")
+
+
+def test_unknown_v2_alg_fails_closed() -> None:
+    # A v2 marker naming an algorithm this build doesn't register must raise (fail-closed agility).
+    cipher = make_cipher(generate_key())
+    with pytest.raises(CipherError, match="unknown/unsupported at-rest cipher algorithm"):
+        cipher.decrypt("mfenc:v2:chacha20:deadbeef:QUJD")
+
+
+def test_marker_prefix_is_version_agnostic() -> None:
+    # Both versions sit under the bare mfenc: umbrella so a find-all LIKE matches either.
+    key = generate_key()
+    assert make_cipher(key).encrypt("x").startswith(MARKER_PREFIX)
+    assert make_cipher(key, write_v2=True).encrypt("x").startswith(MARKER_PREFIX)
+    assert MARKER_PREFIX == "mfenc:"
+
+
+async def test_store_migration_skips_existing_v2_rows(tmp_path: Path) -> None:
+    """A v2 ciphertext already on disk is recognised as encrypted by the version-agnostic find-all
+    anchor, so the on-open migration leaves it untouched (it is NOT re-wrapped into v1-of-v2)."""
+    db = tmp_path / "mixed.db"
+    key = generate_key()
+    store = await MessageStore.open(db, cipher=make_cipher(key))
+    try:
+        # Hand-plant a v2 blob into a body column, bypassing the (v1-writing) store cipher.
+        v2_token = make_cipher(key, write_v2=True).encrypt(ADT)
+        mid = await store.enqueue_message(channel_id="ch", raw="placeholder", deliveries=[])
+        await store._db.execute("UPDATE messages SET raw=? WHERE id=?", (v2_token, mid))
+        await store._db.commit()
+    finally:
+        await store.close()
+
+    # Reopen with a key → the on-open migration runs; the v2 row must be left byte-for-byte as-is.
+    reopened = await MessageStore.open(db, cipher=make_cipher(key))
+    try:
+        assert _raw_at_rest(db) == v2_token  # untouched on disk (find-all saw it as encrypted)
+        rec = await reopened.get_message(mid)
+        assert rec is not None and rec["raw"] == ADT  # and still decrypts on read
+    finally:
+        await reopened.close()
+
+
+async def test_store_reads_mixed_v1_and_v2_rows(tmp_path: Path) -> None:
+    """Mixed v1 + v2 ciphertext under the same key in one table both decrypt on the normal read path —
+    the decode-capable dispatch in action across rows."""
+    db = tmp_path / "mixed2.db"
+    key = generate_key()
+    store = await MessageStore.open(db, cipher=make_cipher(key))  # writes v1
+    try:
+        m1 = await store.enqueue_message(channel_id="ch", raw=ADT, deliveries=[])  # v1 row
+        # Plant a second message whose body is a v2 blob of a distinct payload.
+        other = (
+            "MSH|^~\\&|S|F|R|RF|20260101||ADT^A02|MSG2|P|2.5.1\rPID|1||200^^^H^MR||ROE^RICHARD\r"
+        )
+        v2_token = make_cipher(key, write_v2=True).encrypt(other)
+        m2 = await store.enqueue_message(channel_id="ch", raw="ph", deliveries=[])
+        await store._db.execute("UPDATE messages SET raw=? WHERE id=?", (v2_token, m2))
+        await store._db.commit()
+
+        rec1 = await store.get_message(m1)
+        rec2 = await store.get_message(m2)
+        assert rec1 is not None and rec1["raw"] == ADT  # v1 row decrypts
+        assert rec2 is not None and rec2["raw"] == other  # v2 row decrypts
     finally:
         await store.close()

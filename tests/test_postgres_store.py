@@ -37,6 +37,7 @@ _TABLES = (
     "cluster_config",
     "queue",
     "response",
+    "delivered_keys",
     "messages",
     "state",
     "state_version",
@@ -241,6 +242,86 @@ async def test_reset_stale_inflight_recovers(store) -> None:
     recovered = await store.reset_stale_inflight(now=300.0)
     assert recovered == 1
     assert (await store.outbox_for(item.message_id))[0]["status"] == OutboxStatus.PENDING.value
+
+
+# --- H1: store-checked leader epoch (fencing token) ---------------------------
+
+
+async def _seed_lease_epoch(store, lease_key: str, epoch: int) -> None:
+    """Upsert the single ``leader_lease`` row to ``epoch`` (the authoritative current leader epoch). In
+    production the cluster coordinator owns this row; here we set it directly to simulate the DB state a
+    standby's fresh-acquire bump left behind, so the store's claim guard has something to validate."""
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS leader_lease ("
+            " lease_key TEXT PRIMARY KEY, owner TEXT, lease_expires_at DOUBLE PRECISION NOT NULL,"
+            " leader_epoch BIGINT NOT NULL DEFAULT 0)"
+        )
+        await conn.execute(
+            "INSERT INTO leader_lease (lease_key, owner, lease_expires_at, leader_epoch)"
+            " VALUES ($1, 'live', 9e18, $2)"
+            " ON CONFLICT (lease_key) DO UPDATE SET leader_epoch = EXCLUDED.leader_epoch",
+            lease_key,
+            epoch,
+        )
+
+
+async def test_stale_epoch_claim_is_rejected_zero_rows(store) -> None:
+    # The fence. The authoritative leader_lease.leader_epoch is 5 (a standby took over and bumped it). A
+    # superseded ex-leader still believes it holds epoch 3 (held < current) — its FIFO claim must affect
+    # 0 rows (return None) and leave the head PENDING, untouched.
+    lease_key = "public:mefor_cluster_leader"
+    await _seed_lease_epoch(store, lease_key, 5)
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    store.set_leader_epoch(3, lease_key=lease_key)  # ex-leader holds a STALE (older) epoch
+    claimed = await store.claim_next_fifo("OB1", now=200.0)
+    assert claimed is None  # rejected by the fence
+    outbox = await store.outbox_for(mid)
+    assert outbox[0]["status"] == OutboxStatus.PENDING.value  # head untouched, lane intact
+    assert outbox[0]["attempts"] == 0  # claim did not even increment attempts
+
+
+async def test_current_epoch_claim_succeeds(store) -> None:
+    # The live leader holds the SAME epoch as the lease row (held == current): its claim passes. Equal is
+    # the boundary — held >= current must include equality, else the true leader could never claim.
+    lease_key = "public:mefor_cluster_leader"
+    await _seed_lease_epoch(store, lease_key, 5)
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
+    store.set_leader_epoch(5, lease_key=lease_key)
+    claimed = await store.claim_next_fifo("OB1", now=200.0)
+    assert claimed is not None
+    assert claimed.destination_name == "OB1"
+
+
+async def test_epoch_guard_disabled_when_none_is_byte_identical(store) -> None:
+    # set_leader_epoch(None) (single-node / not-yet-leader) leaves the claim unfenced — byte-identical to
+    # pre-H1: it claims even with no leader_lease row at all.
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
+    store.set_leader_epoch(None)
+    claimed = await store.claim_next_fifo("OB1", now=200.0)
+    assert claimed is not None
+
+
+async def test_stale_then_promoted_claim_preserves_fifo_head(store) -> None:
+    # FIFO survives the fence: two messages on one lane (N then N+1). A stale ex-leader is rejected (0
+    # rows) so it delivers NEITHER; once this node is the current leader (held == lease epoch) it claims
+    # the OLDEST first (N), preserving per-lane order across the would-be split-brain.
+    lease_key = "public:mefor_cluster_leader"
+    await _seed_lease_epoch(store, lease_key, 5)
+    m1 = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "n")], now=100.0)
+    m2 = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "n1")], now=101.0
+    )
+    store.set_leader_epoch(3, lease_key=lease_key)  # stale ex-leader
+    assert await store.claim_next_fifo("OB1", now=200.0) is None  # rejected, delivers nothing
+    store.set_leader_epoch(5, lease_key=lease_key)  # now the current leader
+    first = await store.claim_next_fifo("OB1", now=201.0)
+    assert first is not None and first.message_id == m1  # OLDEST first — FIFO intact
+    await store.mark_done(first.id, now=202.0)
+    second = await store.claim_next_fifo("OB1", now=203.0)
+    assert second is not None and second.message_id == m2
 
 
 async def test_replay_requeues(store) -> None:
@@ -1442,3 +1523,72 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
         )
     finally:
         await s.close()
+
+
+# --- H2: outbound idempotency ledger parity (gated) --------------------------------------------
+
+
+async def _pg_ledger(store) -> list[dict]:
+    rows = await store._fetchall("SELECT * FROM delivered_keys ORDER BY delivery_seq")
+    return [dict(r) for r in rows]
+
+
+async def test_mark_done_writes_one_ledger_row_pg(store) -> None:
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], control_id="MSG1", now=100.0
+    )
+    item = await store.claim_next_fifo("OB1", now=200.0)
+    assert item is not None
+    await store.mark_done(item.id, now=300.0)
+    rows = await _pg_ledger(store)
+    assert len(rows) == 1
+    assert rows[0]["outbox_id"] == item.id and rows[0]["delivery_seq"] == 1
+    assert "p1" not in str(rows[0].values()) and "MSH" not in str(rows[0].values())
+    assert len(rows[0]["delivery_key"]) == 64
+    assert mid
+
+
+async def test_claim_skips_already_delivered_head_no_resend_pg(store) -> None:
+    # Deliver → ledger + DONE; re-pend the DONE row (failover / post-commit reset) WITHOUT clearing the
+    # ledger; the next claim skip-and-completes it in place (None) — no re-send, still exactly one row.
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0
+    )
+    item = await store.claim_next_fifo("OB1", now=200.0)
+    assert item is not None
+    await store.mark_done(item.id, now=300.0)
+    assert len(await _pg_ledger(store)) == 1
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE queue SET status=$1 WHERE id=$2", OutboxStatus.PENDING.value, item.id
+        )
+    assert await store.claim_next_fifo("OB1", now=400.0) is None  # dup head completed in place
+    outbox = await store.outbox_for(mid)
+    assert outbox[0]["status"] == OutboxStatus.DONE.value
+    assert len(await _pg_ledger(store)) == 1
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+
+async def test_crash_re_run_mark_done_is_idempotent_pg(store) -> None:
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0)
+    item = await store.claim_next_fifo("OB1", now=200.0)
+    assert item is not None
+    await store.mark_done(item.id, now=300.0)
+    await store.mark_done(item.id, now=301.0)  # re-run after crash → no duplicate ledger row
+    assert len(await _pg_ledger(store)) == 1
+
+
+async def test_replay_resend_not_deduped_pg(store) -> None:
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p1")], now=100.0
+    )
+    item = await store.claim_next_fifo("OB1", now=200.0)
+    assert item is not None
+    await store.mark_done(item.id, now=300.0)
+    assert len(await _pg_ledger(store)) == 1
+    assert await store.replay(mid, now=400.0) == 1  # re-send drops the ledger entry
+    assert await _pg_ledger(store) == []
+    again = await store.claim_next_fifo("OB1", now=500.0)
+    assert again is not None and again.id == item.id  # claimed normally, NOT deduped
+    await store.mark_done(again.id, now=600.0)
+    assert len(await _pg_ledger(store)) == 1

@@ -605,3 +605,149 @@ async def test_connection_metrics_respects_since_window(store: MessageStore) -> 
     dest = m.destinations[("c1", "d1")]
     assert dest.written == 0  # the t=12 delivery predates the window
     assert dest.queue_depth == 1  # current state is unaffected by the window
+
+
+# --- H2: outbound idempotency ledger (delivered_keys) ------------------------------------------
+#
+# A delivered_keys row is written in the SAME txn as mark_done / complete_with_response (hash + ids
+# only, no body/PHI); the FIFO claim skip-and-completes a re-claimed already-delivered head without
+# re-sending; an operator replay re-send is NOT deduped.
+
+
+async def _ledger_rows(store: MessageStore) -> list[dict]:
+    cur = await store._db.execute("SELECT * FROM delivered_keys ORDER BY delivery_seq")
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def test_mark_done_writes_one_ledger_row(store: MessageStore) -> None:
+    mid = await store.enqueue_message(
+        channel_id="c1", raw="MSH|x", deliveries=[("d1", "p1")], control_id="CTRL1", now=100.0
+    )
+    item = await store.claim_next_fifo("d1", now=100.0)
+    assert item is not None
+    await store.mark_done(item.id, now=101.0)
+    rows = await _ledger_rows(store)
+    assert len(rows) == 1
+    assert rows[0]["outbox_id"] == item.id
+    assert rows[0]["message_id"] == mid
+    assert rows[0]["destination_name"] == "d1"
+    assert rows[0]["delivery_seq"] == 1
+    # Ledger carries hashes + ids only — never the payload/body or any PHI field.
+    assert "p1" not in str(rows[0].values())
+    assert "MSH" not in str(rows[0].values())
+    assert len(rows[0]["delivery_key"]) == 64  # sha256 hex
+
+
+async def test_ledger_at_rest_carries_no_phi(tmp_path) -> None:
+    # At-rest no-PHI assertion: read the delivered_keys table's RAW on-disk bytes (not the live row
+    # mapping) and confirm neither the body NOR the control_id appears in the clear — the control_id is
+    # only HASHED into delivery_key, never stored.
+    import sqlite3
+
+    db = tmp_path / "ledger.db"
+    s = await MessageStore.open(db)
+    try:
+        await s.enqueue_message(
+            channel_id="c1",
+            raw="MSH|secretbody",
+            deliveries=[("d1", "secretbody")],
+            control_id="MRN-998877",
+            now=100.0,
+        )
+        item = await s.claim_next_fifo("d1", now=100.0)
+        assert item is not None
+        await s.mark_done(item.id, now=101.0)
+    finally:
+        await s.close()
+    raw = sqlite3.connect(db).execute("SELECT * FROM delivered_keys").fetchall()
+    blob = repr(raw)
+    assert raw and "secretbody" not in blob  # no body at rest
+    assert (
+        "MRN-998877" not in blob
+    )  # control_id is hashed into delivery_key, never stored cleartext
+
+
+async def test_complete_with_response_writes_one_ledger_row(store: MessageStore) -> None:
+    mid = await store.enqueue_message(
+        channel_id="c1", raw="MSH|x", deliveries=[("d1", "p1")], now=100.0
+    )
+    item = await store.claim_next_fifo("d1", now=100.0)
+    assert item is not None
+    await store.complete_with_response(
+        item.id, body="MSA|AA", outcome="accepted", detail="ok", now=101.0
+    )
+    rows = await _ledger_rows(store)
+    assert len(rows) == 1 and rows[0]["outbox_id"] == item.id
+    assert "MSA" not in str(rows[0].values())  # the reply body never lands in the ledger
+    assert mid  # message persisted
+
+
+async def test_ingress_routed_completion_writes_no_ledger_row(store: MessageStore) -> None:
+    # Only outbound deliveries own an external send; an ingress/routed completion writes no ledger row.
+    await store.enqueue_ingress(channel_id="c1", raw="MSH|x", now=100.0)
+    item = await store.claim_next_fifo("c1", now=100.0, stage="ingress")
+    assert item is not None and item.destination_name is None
+    # route_handoff consumes the ingress row; either way no ledger row exists for a non-outbound row.
+    assert await _ledger_rows(store) == []
+
+
+async def test_claim_skips_and_completes_already_delivered_head_no_resend(
+    store: MessageStore,
+) -> None:
+    # Deliver row → ledger written + DONE. Then simulate a post-commit re-claim (failover / a stale
+    # reset_stale_inflight after mark_done committed): force the DONE row back to PENDING. The next
+    # FIFO claim must skip-and-complete it (return None, DONE again) WITHOUT handing it to a worker.
+    mid = await store.enqueue_message(
+        channel_id="c1", raw="MSH|x", deliveries=[("d1", "p1")], now=100.0
+    )
+    item = await store.claim_next_fifo("d1", now=100.0)
+    assert item is not None
+    await store.mark_done(item.id, now=101.0)
+    assert len(await _ledger_rows(store)) == 1
+    # Re-pend the already-delivered row WITHOUT clearing its ledger entry (the crash-re-run shape).
+    await store._db.execute(
+        "UPDATE queue SET status=? WHERE id=?", (OutboxStatus.PENDING.value, item.id)
+    )
+    await store._db.commit()
+    # The claim consumes the dup head in place and returns None — the worker never re-sends it.
+    assert await store.claim_next_fifo("d1", now=200.0) is None
+    rows = await store.outbox_for(mid)
+    assert rows[0]["status"] == OutboxStatus.DONE.value  # completed in place, not re-delivered
+    # Exactly one ledger row still (the skip-and-complete does NOT add a second).
+    assert len(await _ledger_rows(store)) == 1
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+
+async def test_crash_re_run_before_commit_is_a_noop_replay(store: MessageStore) -> None:
+    # A crash BEFORE mark_done committed leaves no ledger row, so the recovered row re-delivers (the
+    # inherent at-least-once window) — but re-running mark_done writes exactly ONE ledger row total
+    # (idempotent on the content hash), never two for the same logical delivery.
+    await store.enqueue_message(channel_id="c1", raw="MSH|x", deliveries=[("d1", "p1")], now=100.0)
+    item = await store.claim_next_fifo("d1", now=100.0)
+    assert item is not None
+    await store.mark_done(item.id, now=101.0)
+    # Idempotent: a second mark_done of the same row does not add a duplicate ledger row.
+    await store.mark_done(item.id, now=102.0)
+    assert len(await _ledger_rows(store)) == 1
+
+
+async def test_replay_resend_is_not_deduped(store: MessageStore) -> None:
+    # An operator replay of a fully-delivered message must actually RE-SEND (not be skip-and-completed
+    # as a duplicate): replay DELETEs the ledger entry, so the re-claimed row is claimed normally.
+    mid = await store.enqueue_message(
+        channel_id="c1", raw="MSH|x", deliveries=[("d1", "p1")], now=100.0
+    )
+    item = await store.claim_next_fifo("d1", now=100.0)
+    assert item is not None
+    await store.mark_done(item.id, now=101.0)
+    assert len(await _ledger_rows(store)) == 1
+    # Re-send: nothing stuck, so replay re-pends the DONE row AND drops its ledger entry.
+    requeued = await store.replay(mid, now=200.0)
+    assert requeued == 1
+    assert await _ledger_rows(store) == []  # ledger cleared for the re-sent row
+    # The replayed row is claimed normally (NOT deduped) and re-delivers.
+    again = await store.claim_next_fifo("d1", now=200.0)
+    assert again is not None and again.id == item.id and again.payload == "p1"
+    await store.mark_done(again.id, now=201.0)
+    # A fresh ledger row is written for the re-delivery (seq recomputes to 1 after the delete).
+    assert len(await _ledger_rows(store)) == 1

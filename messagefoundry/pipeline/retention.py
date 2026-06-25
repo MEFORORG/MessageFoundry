@@ -190,6 +190,26 @@ class RetentionRunner:
         now = self._clock() if now is None else now
         s = self._settings
 
+        # L1 pre-purge leadership re-check (active-passive HA). The top-of-method gate above ran when the
+        # pass began; leadership can be lost (a self-fence) BETWEEN that gate and the purges below — a
+        # demoted node must not null PHI bodies / write audit rows as a stale ex-leader. A cheap,
+        # SYNCHRONOUS is_leader() read (cached state, no DB round-trip) closes that narrow window: if we
+        # are no longer leader, return a did-nothing pass WITHOUT touching the store — the message bodies
+        # stay intact and the new leader purges on its next acting pass (count-and-log: nothing is
+        # purged-and-lost on a demoted node). This is a cheap fast-path guard, not the authority — the
+        # purge writes themselves are leader-only WRITE singletons gated above; this only tightens the
+        # gate→purge window. Single-node (NullCoordinator) is always leader, so this never fires.
+        if not self._coordinator.is_leader():
+            return RetentionPass(
+                messages_purged=0,
+                dead_purged=0,
+                state_purged=0,
+                wal_checkpointed=False,
+                vacuumed=False,
+                size_bytes=0,
+                over_limit=False,
+            )
+
         messages_purged = 0
         if s.messages_days > 0:
             messages_purged = await self._store.purge_message_bodies(

@@ -161,9 +161,17 @@ class StoreSettings(_Section):
     # (ASVS 11.2.2) until `messagefoundry rotate-key` finishes re-encrypting under the active key.
     # Secret — env-only (MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). Empty = none.
     encryption_keys_retired: str = ""
-    # When true, `serve` refuses to start without an encryption key (any environment). Off by default;
-    # with it off, a 'prod' environment still gets a loud startup warning. See docs/PHI.md §3.
+    # When true, `serve` refuses to start without an encryption key (any environment, any data_class).
+    # Off by default. See docs/PHI.md §3. (Independent of the data_class-gated keyless refusal below:
+    # this forces the refusal even for a synthetic/non-PHI instance.)
     require_encryption: bool = False
+    # Explicit, audited opt-out of the data_class-gated keyless refusal (H3, OWASP *Fail Securely* / SDS
+    # §4.3 PW.9). By default a PHI-carrying instance (`[ai].data_class == phi`, ANY environment) REFUSES
+    # to start with no encryption key — secure-by-default. Setting this true is the loud, deliberate
+    # override that lets such an instance start keyless (it still emits the UNENCRYPTED-at-rest warning
+    # and the override is audited at startup). It does NOT override `require_encryption=true` (that wins).
+    # A synthetic/non-PHI instance never needs this — it stays key-free regardless (CI parity).
+    allow_unencrypted_phi: bool = False
     # Windows DPAPI-protected key file (WP-11d, ASVS 13.3.1): a path produced by
     # `messagefoundry protect-key`. When `encryption_key` is unset and this is set, the active key is
     # CryptUnprotectData'd from this file at open — so the plaintext key never sits in the service
@@ -194,6 +202,13 @@ class StoreSettings(_Section):
     password: str | None = None  # secret — supply via MEFOR_STORE_PASSWORD, never the file
     encrypt: bool = True
     trust_server_certificate: bool = False
+    # Optional PEM CA bundle to verify the DB server certificate against a PRIVATE / self-signed CA (the
+    # common hospital-estate posture) WITHOUT installing it box-globally into the OS trust store. POSTGRES
+    # ONLY: asyncpg takes an SSLContext, so this loads ssl.create_default_context(cafile=...). SQL Server
+    # (ODBC Driver 18) has NO connection-string CA-file keyword — it validates against the OS trust store —
+    # so it is REJECTED for the sqlserver backend (install the CA into the Windows machine trust store
+    # instead). A path, not a secret. Empty = use the system trust store (the secure default).
+    ssl_root_cert: str | None = None
     pool_size: int = 5
     connect_timeout: int = 15  # seconds
     command_timeout: int = 30  # seconds
@@ -255,6 +270,21 @@ class StoreSettings(_Section):
                 missing.append("username")  # SQL login needs a user (+ MEFOR_STORE_PASSWORD)
             if missing:
                 raise ValueError(f"{label} backend requires: " + ", ".join(missing))
+        return self
+
+    @model_validator(mode="after")
+    def _ssl_root_cert_postgres_only(self) -> "StoreSettings":
+        """``ssl_root_cert`` pins a private CA for server-cert verification, but only the Postgres backend
+        can honor it (asyncpg accepts an SSLContext). SQL Server's ODBC Driver 18 has no connection-string
+        CA-file keyword (it validates against the OS trust store) and SQLite uses no TLS, so setting it
+        there is a silent no-op — fail loud instead of leaving the operator thinking a private CA is pinned."""
+        if self.ssl_root_cert and self.backend is not StoreBackend.POSTGRES:
+            raise ValueError(
+                "[store].ssl_root_cert is supported only by the postgres backend (asyncpg accepts an "
+                f"SSLContext); backend={self.backend.value!r}. For SQL Server, install the DB's CA into "
+                "the OS trust store (ODBC Driver 18 has no connection-string CA-file option); SQLite "
+                "uses no TLS."
+            )
         return self
 
 

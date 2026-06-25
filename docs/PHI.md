@@ -75,9 +75,10 @@ PHI is persisted in the SQLite message store ([store/store.py](../messagefoundry
 | `queue.payload` (stage=`outbound`) | **Yes** — transformed outbound body | **Yes, when a key is set** — AES-256-GCM | One row per destination; the persistent footprint |
 | `queue.handler_name` (stage=`routed`) | No — a handler name, not a body | No (metadata, deliberately not ciphered) | The handler the transform worker runs |
 | `messages.summary`, `messages.metadata` | **Yes** — MRN / patient name / order; operator-attached values | **Yes, when a key is set** — AES-256-GCM (EF-3) | Ingest-derived; routed through the store cipher like `raw` (no SQL search/index exists on `summary`, so encrypting it costs nothing). NULL/blank stay as-is |
-| `messages.error`, `queue.last_error`, `message_events.detail` | **Possibly** — may embed raw fragments from exceptions | **Yes, when a key is set** — AES-256-GCM (WP-5); **SQL Server backend keeps these plaintext** (read-gated + `safe_exc()`-redacted, a tracked follow-up) | Routed through the store cipher like `raw`/`payload`; NULL/blank values stay as-is. See [§3](#3-encryption-at-rest), [§7](#7-logging--phi-redaction) |
+| `messages.error`, `queue.last_error`, `message_events.detail` | **Possibly** — may embed raw fragments from exceptions | **Yes, when a key is set** — AES-256-GCM (WP-5; **all three backends, incl. SQL Server as of H4** — the prior SQL Server plaintext residual is retired); also `safe_exc()`-redacted before write | Routed through the store cipher like `raw`/`payload`; NULL/blank values stay as-is. See [§3](#3-encryption-at-rest), [§7](#7-logging--phi-redaction) |
 | `messages.control_id`, `message_type` | Low (MSH-10/MSH-9) | No | Needed plaintext for dedup/routing/indexes (`ix_messages_control`) |
 | `audit_log.detail` | Low — exposed IDs/counts, not bodies | No | JSON metadata about PHI *access*, not the PHI itself |
+| `delivered_keys` (H2 idempotency ledger) | **No** — hashes + ids only | No (deliberately not ciphered — nothing to protect) | One row per completed outbound delivery: a SHA-256 `delivery_key` over non-PHI ids + a replay-stable seq, plus `outbox_id`/`message_id`/`destination_name`/`delivery_seq`. **Never a body or any PHI** — `control_id` is only *folded into the hash input*, never stored in the clear here. Lets the FIFO claim skip-and-complete a re-claimed already-delivered head without re-sending |
 | SQLite file + `-wal` / `-shm` siblings | **Yes** (mirror the above) | No | WAL/shm hold recently-written PHI outside any app-level encryption |
 | File-connector output / spill dirs (`.hl7`, `.processed`, `.error`) | **Yes** — plaintext on disk | No | Written by the File transport; treat the directory as PHI |
 
@@ -111,6 +112,32 @@ harden them per [§10](#10-secure-deployment--operations-checklist).
 and logs, so runtime PHI is never committed. Keep it that way — never `git add -f` a database or a
 real message file.
 
+### At-rest threat-coverage matrix
+
+**`[MIXED]`** — which encryption layer covers which at-rest threat, per backend. The layers are
+**distinct and complementary**: application-level **AEAD** (the `mfenc` column cipher, §3) protects
+specific PHI columns *inside* the database engine; **whole-database / native encryption** — SQLCipher
+for SQLite, **TDE** for SQL Server — protects the entire file/database including indexes and journals;
+**FDE** (full-disk: BitLocker / LUKS) protects everything on the powered-off volume. They cover
+different attackers, so the column below is "which threat does each layer answer," not a ranking.
+
+| At-rest threat | App-level AEAD (`mfenc`, §3) | Whole-DB layer | FDE (BitLocker / LUKS) |
+|---|---|---|---|
+| Stolen powered-off disk / backup volume | Covers ciphered columns | Covers whole DB (incl. indexes, WAL) | **Covers everything** |
+| Live file/backup copy from a running host | **Covers ciphered columns** (key not in the file) | Covers whole DB if its key isn't on the host | Does **not** help (volume is mounted/unlocked) |
+| `summary`/`metadata` (MRN, patient name) | **Covered** (EF-3 — ciphered like `raw`) | Covered | Powered-off only |
+| Plaintext residual columns (`control_id`, `message_type` — low-sensitivity routing/dedup keys) | **Not** covered (by design — these stay plaintext for indexing) | **Covered** | Powered-off only |
+| `-wal` / `-shm` / temp / journal files | Not covered (app cipher can't reach them) | **Covered** | Powered-off only |
+
+**Per-backend whole-DB layer.** SQLite = **SQLCipher** (the documented whole-DB alternative, §3) —
+a native dependency that replaces the connect path. SQL Server = **TDE** (Transparent Data
+Encryption), configured **at the database by a DBA**, *not* by MessageFoundry — it is the SQL Server
+native whole-DB layer and is what covers the low-sensitivity plaintext columns (`control_id`/
+`message_type`), indexes, and journals. (Do not
+conflate the two: SQLCipher is the SQLite layer; TDE is the SQL Server layer — there is no SQLCipher
+on SQL Server.) MessageFoundry's own at-rest control is the app-level AEAD; the whole-DB and FDE
+layers are **deployment prerequisites** (§3, §10).
+
 ---
 
 ## 3. Encryption at rest
@@ -128,6 +155,16 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    also satisfies the HIPAA *integrity* safeguard (tamper-evidence), and the prefix lets reads tell
    ciphertext from legacy plaintext (and from a retention-purged blank `''`, which is never ciphered).
    A one-time migration encrypts existing rows in place on first start with a key.
+   **Crypto-agility (M9, additive — CRYPTO-1).** The cipher is **version/alg-dispatching**: it decodes
+   both `mfenc:v1:<key_id>:<b64>` and an additive, self-describing `mfenc:v2:<alg>:<key_id>:<b64>`
+   (`alg` names the AEAD), and **fails closed** (`CipherError`) on an unknown marker version or an
+   unknown/unsupported `alg` — never a silent pass-through or mis-decrypt. **AES-256-GCM is the only
+   registered algorithm** and the **v1 writer is frozen byte-identical** (a frozen-fixture test pins it);
+   v2 writing is **wired + tested but off by default**, so no at-rest format change ships — this is
+   agility *infrastructure*, not a format migration. The store's find-all/migration scans anchor on the
+   version-agnostic `mfenc:` prefix (so a v2 row is recognised as already-encrypted), and the rotation
+   scan anchors on the cipher's active-format prefix through the key fingerprint (so a v2-active rotation
+   matches v2 rows and terminates).
 2. **Key management + rotation `[BUILT]`.** The key is a base64 32-byte secret from the **environment**
    (`MEFOR_STORE_ENCRYPTION_KEY`), never the TOML file — reusing the existing secrets convention
    (cf. `MEFOR_STORE_PASSWORD`). Mint one with `messagefoundry gen-key`. On Windows it may instead live
@@ -142,8 +179,17 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    `…_RETIRED`, run **`messagefoundry rotate-key`** (offline) to re-encrypt every value under the new
    key, then drop the retired key. An undecryptable value (corrupt blob / missing key) is contained —
    the row is dead-lettered, never crashes a worker.
-   **Fail-closed/warn:** `serve` warns loudly when no key is set in a `prod` environment, and **refuses
-   to start** when `[store].require_encryption = true` and no key is configured.
+   **Fail-closed (secure-by-default; H3, OWASP *Fail Securely* / SDS §4.3 PW.9):** `serve` **refuses to
+   start with no key on ANY PHI instance** — the refusal is gated on the resolved **`[ai].data_class ==
+   phi`**, *not* the environment label, so a custom-named dev/test box holding near-real PHI fails closed
+   exactly like `prod`/`staging` (closing the EF-3 perception gap where non-prod only warned). A
+   **synthetic/non-PHI** instance (`data_class != phi`, e.g. `dev`) stays **key-free** for CI parity.
+   Two explicit overrides: `[store].require_encryption = true` forces the refusal even for a synthetic
+   instance; `[store].allow_unencrypted_phi = true` is the loud, **audited** opt-out that lets a PHI
+   instance start keyless anyway (it still emits the UNENCRYPTED-at-rest warning, and `require_encryption`
+   wins over it). The effective posture (encryption on/off, key **source**, key **fingerprint**,
+   `data_class`, per-backend column coverage) is surfaced at the authenticated, `MONITORING_READ`-gated
+   **`GET /security/posture`** route (M5) — never key bytes; every access is audited.
 3. **Pluggable key sourcing — the KeyProvider seam `[BUILT]` (ASVS 13.3.3; ADR 0019 amended 2026-06-18,
    PR #377).** Where the DEK *comes from* is now routed through a pluggable **KeyProvider** seam
    ([store/keyprovider.py](../messagefoundry/store/keyprovider.py)) selected by the `[store].key_provider`
@@ -194,14 +240,23 @@ PHI is exposed for the **minimum window and surface** needed to route and transf
   routed through the store cipher on write/read — there is no SQL search or index on `summary`, so
   encrypting it costs nothing — and decrypt only at the audited, RBAC-gated read paths.
 
-**Honest limitation:** decrypted PHI is ordinary Python heap for the processing window and is **not
-zeroized after use** — CPython strings/bytes are immutable and not reliably wipeable, and full in-use
-memory encryption (ASVS 11.7.1) is a host/OS capability (Intel TME / AMD SEV / confidential VMs), not
-something an application library can provide. This in-use DEK-in-heap exposure is the standing
-**ASVS 11.7.1 / WP-BL3-28** residual that survives even when the KeyProvider seam (§3) is pointed at an
-external HSM/KMS/Vault — envelope decryption protects the **root KEK**, not the unwrapped DEK the bulk
-AES-256-GCM path holds in process. The compensating controls are the documented
-restricted-service-account + volume-encryption posture (§10) on a single-tenant host.
+**Honest limitation (heap lifetime — decrypted PHI *and* the DEK):** decrypted PHI is ordinary Python
+heap for the processing window and is **not zeroized after use** — CPython `str`/`bytes` are immutable
+and not reliably wipeable (no `memset`-on-free guarantee; the GC may copy or retain the object, and an
+in-memory secret can surface in a heap dump or be paged to a swap file). The **same applies to the
+unwrapped DEK**: once the KeyProvider hands back the base64-decoded 32-byte key, it lives in an
+immutable `bytes` for the cipher's lifetime — MessageFoundry **cannot** scrub it, and any "zeroize"
+call would be best-effort theater on CPython. We are deliberately honest about this rather than
+claiming a wipe we can't deliver. What we *do* enforce: the DEK is never logged, never put into an
+exception message, and never serialized — only its SHA-256 **fingerprint** (`key_id`) is ever surfaced
+(§3, §6), so the in-heap key bytes are the *only* place the secret exists in the process. This is the
+standing **ASVS 11.7.1 / CWE-316 / WP-BL3-28** residual: full in-use memory encryption is a host/OS
+capability (Intel TME / AMD SEV / confidential VMs), not something an application library can provide,
+and it survives even when the KeyProvider seam is pointed at an external HSM/KMS/Vault — envelope
+decryption protects the **root KEK**, not the unwrapped DEK the bulk AES-256-GCM path holds in process.
+The compensating controls are the documented restricted-service-account + volume-encryption posture
+(§10) on a single-tenant host: keep the decrypted-secret window inside an OS-isolated process whose
+memory and swap an attacker cannot reach without already owning the host.
 
 ---
 
@@ -215,10 +270,18 @@ restricted-service-account + volume-encryption posture (§10) on a single-tenant
 | File connector | Plaintext `.hl7` on disk/share | Rely on volume/share encryption; SFTP later |
 | Engine API ↔ console | Loopback HTTP by default; off-loopback requires TLS — **in-process** (`[api].tls_cert_file`, WP-13a) **or upstream** at a trusted reverse proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15) `[BUILT]`. HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
 | AD / LDAP auth | **LDAPS** with cert verification (`ad_tls_verify`) `[BUILT]` | — |
-| SQL Server backend | `Encrypt=yes` TLS-to-DB `[BUILT]` | — |
+| PostgreSQL / SQL Server backend | TLS-to-DB on by default (`[store].encrypt`), server cert **validated** (`trust_server_certificate=false`) `[BUILT]`. Trust a private/internal DB CA without disabling validation: Postgres `[store].ssl_root_cert` file-pin **or** a Windows machine-store (`LocalMachine\Root`) CA import; SQL Server (ODBC 18) machine store only. | — |
 
 **Hard rule:** never bind the API to `0.0.0.0` (or any non-loopback interface) without TLS in front
 of it. Bearer tokens and PHI would otherwise cross the network in cleartext.
+
+**DB-TLS CA trust + rotation `[BUILT — runbook]` (NIST SP 800-52r2; HIPAA §164.312(e)(1); CWE-295).**
+Validating the DB server certificate against a private/internal CA needs that CA trusted, and rotation
+needs a make-before-break overlap so no connection fails validation mid-swap. The operator procedure —
+machine-store CA import ([`scripts/service/import-db-ca.ps1`](../scripts/service/import-db-ca.ps1)) and
+add-new-then-remove-old CA/cert rotation for both backends — is in
+[`DEPLOY-SERVER-DB.md` §5](DEPLOY-SERVER-DB.md#5-db-tls-trust-import-the-db-ca--rotate-certificates).
+Never remediate a chain-build failure with `TrustServerCertificate=true`.
 
 **Phase 2 transport design `[ROADMAP]`.** In-process API/WebSocket TLS (P2-1), MLLP-over-TLS (P1-4),
 and a reverse-proxy / forwarded-header alternative are designed in
@@ -360,7 +423,7 @@ through the `messagefoundry.audit` logger to the same forwarder, across all thre
 |---|---|---|---|
 | **General log** (stdout → NSSM rotating files; optional off-box **syslog/SIEM** copy — `[logging].forward_*`) | operational events, exception **types**, redacted messages | single-line text or structured **JSON** (`[logging].format`), UTC `Z` timestamps | never-log-bodies rule; CR/LF + control-char scrub; `safe_exc()` on logged exceptions; python-hl7 PHI loggers silenced — **same filters on the off-box forwarder**; syslog transport is plaintext (front with TLS — §7) |
 | **`audit_log`** (SQLite) | who/what/when of auth + PHI *access* (IDs/counts, not bodies) | structured JSON `detail`, tamper-evident hash chain | bodies/credentials never written; read via `GET /audit` |
-| **`messages.error` / `queue.last_error` / `message_events.detail`** (SQLite) | per-message disposition detail | text, **AES-256-GCM at rest** (WP-5) + **`safe_exc()`-redacted** (WP-6c) | encrypted + redacted; volume encryption backstop |
+| **`messages.error` / `queue.last_error` / `message_events.detail`** (SQLite, Postgres, **and SQL Server as of H4**) | per-message disposition detail | text, **AES-256-GCM at rest** (WP-5; H4 brought SQL Server to parity) + **`safe_exc()`-redacted** (WP-6c) | encrypted + redacted; volume encryption backstop |
 
 ---
 
@@ -475,6 +538,16 @@ Phased by exposure and effort (S ≈ ≤1 day, M ≈ 2–4 days, L ≈ 1–2 wee
 Security Rule NPRM, which moves encryption (at rest **and** in transit) and MFA from "addressable" to
 mandatory.
 
+> **Forward-alignment only — not a compliance claim.** The **2025 HIPAA Security Rule NPRM** (90 FR
+> 898, published Jan 6 2025) is a **proposed** rule and, as of this writing (2026-06), is **not final**;
+> its text and effective dates may change. We track it as *forward-alignment* — building toward the
+> direction it signals (encryption at rest and in transit, MFA, network segmentation moving from
+> *addressable* to *required*) **so we are not caught flat-footed if/when it finalizes** — **not** as a
+> statement that MessageFoundry is, or makes its adopter, compliant with the NPRM, the current HIPAA
+> Security Rule, or any other regulation. **Compliance is a property of a covered entity's whole
+> deployment and program**, assessed by that entity and its counsel — this document is engineering
+> guidance, **not** a certification or legal advice.
+
 ### Shipped (formerly P0 + P1-1)
 
 Landed in the security-remediation pass and now reflected as built above — listed here only for
@@ -565,10 +638,15 @@ The roadmap is aligned to these; they are the basis for the safeguard mappings a
 
 - **HIPAA Security Rule — Technical Safeguards**, 45 CFR §164.312 (access control, audit controls,
   integrity, person/entity authentication, transmission security).
-- **2025 HIPAA Security Rule NPRM** (proposed) — moves encryption (at rest **and** in transit) and
-  MFA from *addressable* to *required*, and adds network-segmentation expectations. We design to it
-  even though it is not yet final.
+- **2025 HIPAA Security Rule NPRM** (proposed; 90 FR 898, Jan 6 2025) — moves encryption (at rest
+  **and** in transit) and MFA from *addressable* to *required*, and adds network-segmentation
+  expectations. We design to it as **forward-alignment only** even though it is not yet final — this is
+  **not** a compliance claim (see the §11 note).
   <https://www.federalregister.gov/documents/2025/01/06/2024-30983/>
+- **OWASP ASVS v5 §11.7 / CWE-316** (cleartext storage of sensitive information in memory) — the basis
+  for the honest in-use heap-lifetime limitation in [§3](#3-encryption-at-rest): neither decrypted PHI
+  nor the unwrapped DEK can be reliably zeroized on CPython; full in-use memory encryption is a host/OS
+  capability.
 - **NIST SP 800-66 Rev. 2** — implementing the HIPAA Security Rule (maps standards → NIST controls).
 - **NIST SP 800-52 Rev. 2** — TLS configuration (TLS 1.2+; basis for MLLP-over-TLS and API TLS).
 - **SQLCipher** — the documented whole-DB at-rest alternative if the plaintext `summary`/index

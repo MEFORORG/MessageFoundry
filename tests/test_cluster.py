@@ -63,6 +63,14 @@ class _NotLeaderCoordinator:
     def is_leader(self) -> bool:
         return False
 
+    def current_epoch(self) -> int | None:
+        # A non-leader stand-in holds no fencing epoch (H1). Present so this stand-in still structurally
+        # satisfies the ClusterCoordinator protocol.
+        return None
+
+    def lease_key(self) -> str | None:
+        return None
+
     def reclaims_inflight(self) -> bool:
         return False
 
@@ -162,6 +170,22 @@ def test_db_coordinator_starts_not_leader() -> None:
     # is_leader() reads cached state; before any maintenance tick a freshly-built coordinator is NOT yet
     # leader (it becomes leader only after acquiring the leadership lease on its maintenance tick).
     assert DbCoordinator(None, "n").is_leader() is False
+
+
+def test_null_coordinator_current_epoch_is_none() -> None:
+    # H1: single-node is UNFENCED — there is no second writer to fence, so the store's epoch guard stays
+    # disabled. current_epoch() is None (not 0) and there is no lease row to validate against.
+    coord = NullCoordinator()
+    assert coord.current_epoch() is None
+    assert coord.lease_key() is None
+
+
+def test_db_coordinator_current_epoch_none_before_acquire() -> None:
+    # H1: a freshly-built coordinator holds no epoch until it acquires the lease; lease_key() is the
+    # schema-namespaced leader_lease row the store validates leader_epoch against.
+    c = DbCoordinator(None, "n", db_schema="tenant_a")
+    assert c.current_epoch() is None
+    assert c.lease_key() == "tenant_a:mefor_cluster_leader"
 
 
 def test_db_coordinator_logs_cluster_enabled_once(monkeypatch, caplog) -> None:

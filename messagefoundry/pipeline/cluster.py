@@ -148,6 +148,27 @@ class ClusterCoordinator(Protocol):
         :class:`NullCoordinator` (single-node)."""
         ...
 
+    def current_epoch(self) -> int | None:
+        """This node's currently-held **leader epoch** (the monotonic fencing token, H1), or ``None``
+        when this node is not a fenced leader.
+
+        The epoch is bumped **only on a fresh acquire** (a node taking the lease — not a renew), so a
+        superseded ex-leader holds a strictly *older* epoch than the live leader. The engine reads this
+        synchronously on promotion and pushes it into the store (:meth:`Store.set_leader_epoch`), where
+        the FIFO claim validates ``held_epoch >= leader_lease.leader_epoch`` inside the single claim
+        transaction so a paused/superseded ex-leader's stale claim affects **0 rows** (Kleppmann fencing
+        token; store ↔ coordinator import direction is one-way — the engine pushes, the store never
+        imports the coordinator, ARCH-6). Cheap + synchronous (cached state). :class:`NullCoordinator`
+        returns ``None`` — single-node is unfenced (there is no second writer to fence)."""
+        ...
+
+    def lease_key(self) -> str | None:
+        """The schema-namespaced ``leader_lease`` row key whose ``leader_epoch`` the store validates the
+        held epoch against (H1), or ``None`` on the single-node :class:`NullCoordinator` (no lease row).
+        The engine pushes it alongside :meth:`current_epoch` so the store can locate the authoritative
+        epoch row without importing the coordinator (ARCH-6)."""
+        ...
+
     def reclaims_inflight(self) -> bool:
         """Whether crashed-node in-flight recovery is the **leader's periodic reclaim sweep** (True) or
         the engine's **unconditional startup reset** (False).
@@ -229,6 +250,16 @@ class NullCoordinator:
 
     def is_leader(self) -> bool:
         return True
+
+    def current_epoch(self) -> int | None:
+        # Single-node: unfenced. There is no second writer to fence, so the store's epoch guard stays
+        # disabled (set_leader_epoch(None) is the byte-identical no-op). Returning None — NOT 0 — keeps
+        # the "is there a fence to enforce?" question distinct from any real epoch value.
+        return None
+
+    def lease_key(self) -> str | None:
+        # Single-node: no leader_lease row to validate against.
+        return None
 
     def reclaims_inflight(self) -> bool:
         # Single-node: the engine keeps the unconditional startup reset (immediate self-recovery of
@@ -375,6 +406,12 @@ class DbCoordinator:
         # The monotonic time of the last CONFIRMED lease hold (acquire or successful renew), or None if
         # this node has never held the lease. The fence watchdog demotes when now - this > fence_timeout.
         self._last_renew_ok: float | None = None
+        # H1 fencing token: the leader epoch this node currently holds, or None when not a fenced leader.
+        # Bumped in the DB only on a FRESH acquire (a take-over of a free/expired/foreign lease), NOT on a
+        # renew, so a superseded ex-leader keeps its now-stale older epoch while the live leader's epoch
+        # advances. The claim/renew statement RETURNS the row's leader_epoch; on a confirmed hold we cache
+        # it here, and current_epoch() exposes it for the engine to push into the store on promotion.
+        self._leader_epoch: int | None = None
         # Cached cluster-wide config-reload version (Track B Step 6), read by the cheap/synchronous
         # config_version_cached() the engine's convergence loop polls. Refreshed once per maintenance
         # tick and updated immediately by bump_config_version() (so the node that bumps sees its own new
@@ -435,6 +472,16 @@ class DbCoordinator:
         # Cheap + synchronous: read the cached state the maintenance loop + fence watchdog maintain (no
         # DB round-trip on the hot path). True only while this node holds the leadership lease.
         return self._is_leader
+
+    def current_epoch(self) -> int | None:
+        # Cheap + synchronous: the leader epoch captured on the last confirmed hold. None until first
+        # acquire (or after a demotion/fence clears it), so the store's epoch guard stays off until this
+        # node is genuinely a fenced leader. The engine reads this on promotion (H1).
+        return self._leader_epoch
+
+    def lease_key(self) -> str | None:
+        # The schema-namespaced leader_lease key whose leader_epoch the store validates against (H1).
+        return self._lease_key
 
     def reclaims_inflight(self) -> bool:
         # Clustered: the leader's periodic reclaim_expired_leases sweep recovers crashed nodes' in-
@@ -611,8 +658,19 @@ class DbCoordinator:
                     "CREATE TABLE IF NOT EXISTS leader_lease ("
                     " lease_key        TEXT PRIMARY KEY,"
                     " owner            TEXT,"
-                    " lease_expires_at DOUBLE PRECISION NOT NULL"
+                    " lease_expires_at DOUBLE PRECISION NOT NULL,"
+                    " leader_epoch     BIGINT NOT NULL DEFAULT 0"  # H1: monotonic fencing token
                     ")"
+                )
+                # H1 (owner-gated live ALTER): additively add leader_epoch to a pre-existing
+                # leader_lease (a cluster upgraded in place). ADD COLUMN IF NOT EXISTS is a no-op on the
+                # fresh CREATE above and on any node that already migrated, and runs under the same DDL
+                # advisory lock so two nodes opening at once can't race it (REL-1 additive migration).
+                # DEFAULT 0 backfills the existing single row, so the first fresh acquire after the
+                # upgrade bumps it to 1 — a strictly-increasing epoch from the legacy baseline.
+                await conn.execute(
+                    "ALTER TABLE leader_lease ADD COLUMN IF NOT EXISTS leader_epoch BIGINT NOT NULL "
+                    "DEFAULT 0"
                 )
 
     async def _register(self) -> None:
@@ -729,6 +787,11 @@ class DbCoordinator:
         elif self._is_leader:
             # The lease is held by another node (or expired and taken over) — we are no longer leader.
             self._is_leader = False
+            # Drop the held epoch: we are no longer a fenced leader, and the next acquire will read the
+            # (now-higher) epoch the successor bumped. Leaving a stale epoch cached would be harmless
+            # (the store guard already lost when the graph stopped) but clearing it keeps current_epoch()
+            # honest.
+            self._leader_epoch = None
             log.info("cluster: node %s lost leadership (lease taken or expired)", self.node_id)
 
     async def _claim_or_renew_lease(self) -> bool:
@@ -738,20 +801,37 @@ class DbCoordinator:
         clock skew never affects who may hold the lease): INSERT the row if absent (we acquire); on
         conflict, UPDATE owner + expiry **only if** we already own it (renew) OR the existing lease has
         expired (take over a dead leader). If another node holds a live lease the WHERE is false, the
-        UPDATE no-ops, ``RETURNING`` yields nothing, and we report not-held."""
+        UPDATE no-ops, ``RETURNING`` yields nothing, and we report not-held.
+
+        **H1 fencing token.** The same statement maintains ``leader_epoch`` so the store can fence a
+        superseded ex-leader. The epoch is bumped **only on a FRESH acquire** — the INSERT (epoch 1) or a
+        take-over of an *expired/foreign* lease (``leader_epoch + 1``) — and **left unchanged on a renew**
+        (``owner = me``). So a paused/partitioned ex-leader that comes back keeps its now-stale older
+        epoch, while a standby that took over advanced it; the store's claim guard
+        (``held >= leader_lease.leader_epoch``) then rejects the ex-leader. ``RETURNING leader_epoch``
+        carries the held value back so :meth:`_maintain_leadership` can cache it. (Renew keeps it because
+        ``owner = me`` can only be reached when no other node took over in between — a take-over would
+        have changed ``owner`` and routed us through the bump branch.)"""
         row = await self._pool.fetchrow(
-            "INSERT INTO leader_lease (lease_key, owner, lease_expires_at) "
-            "VALUES ($1, $2, EXTRACT(EPOCH FROM clock_timestamp()) + $3) "
+            "INSERT INTO leader_lease (lease_key, owner, lease_expires_at, leader_epoch) "
+            "VALUES ($1, $2, EXTRACT(EPOCH FROM clock_timestamp()) + $3, 1) "
             "ON CONFLICT (lease_key) DO UPDATE SET "
-            "owner = EXCLUDED.owner, lease_expires_at = EXCLUDED.lease_expires_at "
+            "owner = EXCLUDED.owner, lease_expires_at = EXCLUDED.lease_expires_at, "
+            "leader_epoch = CASE WHEN leader_lease.owner = EXCLUDED.owner "
+            "THEN leader_lease.leader_epoch ELSE leader_lease.leader_epoch + 1 END "
             "WHERE leader_lease.owner = $2 "
             "OR leader_lease.lease_expires_at < EXTRACT(EPOCH FROM clock_timestamp()) "
-            "RETURNING owner",
+            "RETURNING owner, leader_epoch",
             self._lease_key,
             self.node_id,
             self._lease_ttl,
         )
-        return row is not None and row["owner"] == self.node_id
+        if row is None or row["owner"] != self.node_id:
+            return False
+        # Cache the epoch we now hold (fresh-acquire bump or renew's unchanged value). The engine reads it
+        # on promotion and pushes it into the store; a renew leaves it identical so no push churn.
+        self._leader_epoch = int(row["leader_epoch"])
+        return True
 
     async def _fence_watchdog_loop(self) -> None:
         """Self-fence watchdog (Workstream A2). Wakes every ``_fence_tick`` and, doing **no DB I/O**,
@@ -777,6 +857,8 @@ class DbCoordinator:
             return  # leader is only set alongside _last_renew_ok; defensive no-op
         if self._monotonic() - last > self._fence_timeout:
             self._is_leader = False
+            # Drop the held epoch on self-fence too: a fenced node must not present a (now-stale) token.
+            self._leader_epoch = None
             log.warning(
                 "cluster: node %s SELF-FENCED — leadership lease not renewed within %.1fs (fence "
                 "timeout); halting leader work before the lease (TTL %.1fs) can expire",
@@ -792,6 +874,7 @@ class DbCoordinator:
         was_leader = self._is_leader
         self._is_leader = False
         self._last_renew_ok = None
+        self._leader_epoch = None  # released: no longer a fenced leader
         if not was_leader:
             return
         try:

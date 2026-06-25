@@ -69,26 +69,44 @@ def handle(msg):
 
 @pytest.fixture
 def server(tmp_path: Path) -> Iterator[tuple[str, int]]:
-    mllp_port = _free_port()
-    dead_port = _free_port()  # nothing listens here → echo deliveries are refused → dead-lettered
-    _write_config(tmp_path / "config", mllp_port, tmp_path / "out", dead_port)
-    app = create_managed_app(
-        db_path=tmp_path / "scenarios.db", config_dir=tmp_path / "config", poll_interval=0.05
-    )
-    api_port = _free_port()
-    uv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="warning"))
-    thread = threading.Thread(target=uv.run, daemon=True)
-    thread.start()
-    deadline = time.time() + 10
-    while not uv.started:
-        time.sleep(0.05)
-        if time.time() > deadline:
-            raise RuntimeError("server did not start")
-    try:
-        yield f"http://127.0.0.1:{api_port}", mllp_port
-    finally:
+    # _free_port() returns a port that is free *now* but closes the socket before uvicorn / the MLLP
+    # listener actually binds it — a TOCTOU race that intermittently loses the port to another process
+    # on a busy CI runner (EADDRINUSE → uvicorn never sets `started` → "server did not start"). Retry the
+    # whole bring-up on a FRESH set of ports (and a fresh db) instead of reding the leg; a re-roll almost
+    # never collides twice.
+    last_error = "server did not start"
+    for attempt in range(4):
+        mllp_port = _free_port()
+        dead_port = (
+            _free_port()
+        )  # nothing listens here → echo deliveries are refused → dead-lettered
+        _write_config(tmp_path / "config", mllp_port, tmp_path / "out", dead_port)
+        app = create_managed_app(
+            db_path=tmp_path / f"scenarios-{attempt}.db",
+            config_dir=tmp_path / "config",
+            poll_interval=0.05,
+        )
+        api_port = _free_port()
+        uv = uvicorn.Server(
+            uvicorn.Config(app, host="127.0.0.1", port=api_port, log_level="warning")
+        )
+        thread = threading.Thread(target=uv.run, daemon=True)
+        thread.start()
+        deadline = time.time() + 10
+        while not uv.started and thread.is_alive() and time.time() < deadline:
+            time.sleep(0.05)
+        if uv.started:
+            try:
+                yield f"http://127.0.0.1:{api_port}", mllp_port
+            finally:
+                uv.should_exit = True
+                thread.join(timeout=10)
+            return
+        # bring-up failed (a port-bind race or the listener died) — tear down and re-roll the ports
         uv.should_exit = True
         thread.join(timeout=10)
+        last_error = f"server did not start (api_port={api_port}, mllp_port={mllp_port})"
+    raise RuntimeError(last_error)
 
 
 @pytest.mark.parametrize(

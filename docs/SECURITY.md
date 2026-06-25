@@ -284,12 +284,12 @@ Router/Handler is user code that can `raise ValueError(f"...{raw}")`, so every v
 `messages.error` / `queue.last_error` / `message_events.detail` (and a connector's captured-reply
 `detail`) goes through the `safe_exc` / `safe_text` chokepoint
 ([`redaction.py`](../messagefoundry/redaction.py)) at the wiring runner, the connectors, **and** the store
-write methods — so an HL7-shaped fragment can't land in those columns (the last is the only control on the
-SQL Server backend, which stores them plaintext). HL7-shaped content (segment dumps, ≥2-delimiter field
-runs) is cut while the exception **type** / field **name** is kept; the residual control for free-text PHI
-a script invents (e.g. a bare `"DOE^JANE"`) remains the read-side gate above + the "never put PHI in an
-exception" convention. Encrypting these columns at rest on **every** backend (SQLite/PG already do) is a
-tracked defense-in-depth follow-up (`docs/PHI.md`).
+write methods — so an HL7-shaped fragment can't land in those columns. HL7-shaped content (segment dumps,
+≥2-delimiter field runs) is cut while the exception **type** / field **name** is kept; the residual control
+for free-text PHI a script invents (e.g. a bare `"DOE^JANE"`) remains the read-side gate above + the "never
+put PHI in an exception" convention. These columns are also **encrypted at rest on every backend** —
+SQLite, Postgres, **and SQL Server** (H4 brought SQL Server to parity; `docs/PHI.md` §3) — as
+defense-in-depth around the scrub.
 
 **Write side — N/A by design.** The API exposes **no client-writable PHI properties**: every mutation is
 a coarse, separately permission-gated action (`messages:replay` / `messages:purge` / `config:deploy` /

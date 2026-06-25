@@ -37,6 +37,26 @@ async def test_claim_next_fifo_returns_oldest_then_next(store: MessageStore) -> 
     assert second is not None and second.payload == "p2"  # then the next oldest, in order
 
 
+async def test_fifo_dup_head_is_completed_and_advanced_no_reorder(store: MessageStore) -> None:
+    # H2: an already-delivered head re-pended at the front of the lane is skip-and-completed IN PLACE
+    # by the claim (no re-send, return None) and the lane advances to the next-oldest — NOT reordered.
+    for i, now in enumerate((100.0, 101.0, 102.0), start=1):
+        await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", f"p{i}")], now=now)
+    # Deliver p1 (head) → ledger written + DONE.
+    h1 = await store.claim_next_fifo("d1", now=200.0)
+    assert h1 is not None and h1.payload == "p1"
+    await store.mark_done(h1.id, now=200.0)
+    # Simulate a post-commit re-claim: force p1 back to PENDING at the front of the lane (its FIFO
+    # created_at is the smallest, so it is the head again) WITHOUT clearing its ledger entry.
+    await store._db.execute("UPDATE queue SET status=? WHERE id=?", ("pending", h1.id))
+    await store._db.commit()
+    # The claim consumes the dup head in place (returns None) — it must NOT re-offer p1, and it must
+    # NOT skip ahead and reorder. The very next claim returns p2 (the true next head), in order.
+    assert await store.claim_next_fifo("d1", now=201.0) is None  # dup head completed in place
+    nxt = await store.claim_next_fifo("d1", now=201.0)
+    assert nxt is not None and nxt.payload == "p2"  # advanced to the next-oldest, order preserved
+
+
 async def test_claim_next_fifo_blocks_head_on_backoff(store: MessageStore) -> None:
     await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=100.0)
     await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p2")], now=101.0)

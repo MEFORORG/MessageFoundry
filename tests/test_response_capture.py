@@ -94,6 +94,41 @@ async def test_mark_done_writes_no_response_row_xor(store: MessageStore) -> None
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
 
+async def test_complete_with_response_writes_ledger_row_same_txn(store: MessageStore) -> None:
+    # H2: complete_with_response writes the idempotency-ledger row in the SAME txn as the response
+    # artifact + the DONE flip (hash + ids only; the reply body never lands in the ledger).
+    mid, item = await _enqueue_and_claim(store)
+    await store.complete_with_response(
+        item.id, body="MSA|AA|secret", outcome="accepted", detail="MSA-1=AA", now=101.0
+    )
+    cur = await store._db.execute("SELECT * FROM delivered_keys WHERE outbox_id=?", (item.id,))
+    rows = [dict(r) for r in await cur.fetchall()]
+    assert len(rows) == 1
+    assert rows[0]["message_id"] == mid and rows[0]["destination_name"] == "OB_Q"
+    assert "MSA" not in str(rows[0].values()) and "secret" not in str(rows[0].values())
+
+
+async def test_replay_resend_after_capture_appends_response_and_reseeds_ledger(
+    store: MessageStore,
+) -> None:
+    # An operator re-send after a captured reply must actually re-deliver (NOT be deduped): replay
+    # clears the ledger entry, the re-claimed row is delivered normally, a 2nd response is captured,
+    # and a fresh ledger row is written for the re-delivery.
+    mid, item = await _enqueue_and_claim(store)
+    await store.complete_with_response(item.id, body="R1", outcome="accepted", now=101.0)
+    requeued = await store.replay(mid, now=102.0)  # re-send → ledger entry dropped
+    assert requeued == 1
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM delivered_keys")
+    assert (await cur.fetchone())["n"] == 0  # ledger cleared for the re-sent row (NOT deduped)
+    again = await store.claim_next_fifo("OB_Q", now=103.0)
+    assert again is not None and again.id == item.id  # claimed normally, not skip-and-completed
+    await store.complete_with_response(again.id, body="R2", outcome="accepted", now=104.0)
+    caps = await store.correlate_response(mid)
+    assert [(c.response_seq, c.body) for c in caps] == [(1, "R1"), (2, "R2")]
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM delivered_keys")
+    assert (await cur.fetchone())["n"] == 1  # one fresh ledger row for the re-delivery
+
+
 async def test_response_seq_is_replay_stable(store: MessageStore) -> None:
     # replay() resets queue.attempts=0, so an attempts-keyed artifact would collide on the next
     # delivery. response_seq is 1+MAX, so a replayed re-delivery appends seq=N+1 with no PK clash.

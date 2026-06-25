@@ -40,7 +40,8 @@ class _FakeLeaseDB:
 
     def __init__(self, db_clock: _Clock) -> None:
         self._db_clock = db_clock
-        self.row: dict[str, object] | None = None  # {"owner": str, "lease_expires_at": float}
+        # {"owner": str, "lease_expires_at": float, "leader_epoch": int}
+        self.row: dict[str, object] | None = None
 
 
 class _FakeLeasePool:
@@ -55,18 +56,28 @@ class _FakeLeasePool:
     async def fetchrow(self, sql: str, *args: object) -> dict[str, object] | None:
         if self.fail:
             raise RuntimeError("partitioned from db")
-        # Mirrors _claim_or_renew_lease's INSERT ... ON CONFLICT ... WHERE owner OR expired RETURNING.
+        # Mirrors _claim_or_renew_lease's INSERT ... ON CONFLICT ... WHERE owner OR expired RETURNING,
+        # INCLUDING the H1 leader_epoch maintenance: epoch 1 on a fresh INSERT, +1 on a take-over of an
+        # expired/foreign lease, UNCHANGED on a renew (owner == me). RETURNS owner + leader_epoch.
         assert "leader_lease" in sql and "INSERT" in sql
+        assert "leader_epoch" in sql, "claim SQL must maintain the H1 fencing epoch"
         _lease_key, owner, ttl = args
         now = self._db._db_clock()
         row = self._db.row
         if row is None:
-            self._db.row = {"owner": owner, "lease_expires_at": now + float(ttl)}  # type: ignore[arg-type]
-            return {"owner": owner}
+            self._db.row = {
+                "owner": owner,
+                "lease_expires_at": now + float(ttl),  # type: ignore[arg-type]
+                "leader_epoch": 1,  # fresh acquire on an empty table
+            }
+            return {"owner": owner, "leader_epoch": 1}
         if row["owner"] == owner or float(row["lease_expires_at"]) < now:  # type: ignore[arg-type]
+            # Renew (owner == me) keeps the epoch; a take-over of an expired/foreign lease bumps it.
+            if row["owner"] != owner:
+                row["leader_epoch"] = int(row["leader_epoch"]) + 1  # type: ignore[arg-type]
             row["owner"] = owner
             row["lease_expires_at"] = now + float(ttl)  # type: ignore[arg-type]
-            return {"owner": owner}
+            return {"owner": owner, "leader_epoch": row["leader_epoch"]}
         return None  # another node holds a live lease
 
     async def execute(self, sql: str, *args: object) -> None:
@@ -107,7 +118,8 @@ async def test_acquire_lease_on_empty_table() -> None:
     await a._maintain_leadership()
     assert a.is_leader() is True
     assert a._last_renew_ok == 0.0
-    assert db.row == {"owner": "A", "lease_expires_at": 30.0}  # now(0) + ttl(30)
+    # now(0) + ttl(30); leader_epoch 1 on the first fresh acquire (H1).
+    assert db.row == {"owner": "A", "lease_expires_at": 30.0, "leader_epoch": 1}
 
 
 async def test_renew_extends_expiry_and_keeps_leadership() -> None:
@@ -246,3 +258,81 @@ async def test_clean_release_lets_standby_take_over_immediately() -> None:
     db_clock.t = 1.0  # far before the TTL would have expired
     await b._maintain_leadership()
     assert b.is_leader() is True  # standby took over at once
+
+
+# --- H1: monotonic leader epoch (fencing token) -----------------------------
+
+
+async def test_epoch_is_one_on_first_acquire() -> None:
+    # The very first leader on an empty lease table holds epoch 1 (the DB DEFAULT 0 baseline + 1).
+    db = _FakeLeaseDB(_Clock(0.0))
+    a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A")
+    assert a.current_epoch() is None  # not yet a leader
+    await a._maintain_leadership()
+    assert a.is_leader() is True
+    assert a.current_epoch() == 1
+    assert db.row is not None and db.row["leader_epoch"] == 1
+
+
+async def test_epoch_unchanged_on_renew() -> None:
+    # A renew (the same node holding its live lease) must NOT bump the epoch — only a fresh acquire does.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    mono = _Clock(0.0)
+    a = _coord(_FakeLeasePool(db), mono, node="A")
+    await a._maintain_leadership()  # acquire → epoch 1
+    assert a.current_epoch() == 1
+    for t in (5.0, 10.0, 15.0):  # several renews, lease stays live (ttl 30)
+        db_clock.t = t
+        mono.t = t
+        await a._maintain_leadership()
+        assert a.current_epoch() == 1  # held epoch never moves on a renew
+    assert db.row is not None and db.row["leader_epoch"] == 1
+
+
+async def test_epoch_bumps_on_takeover_and_supersedes_old_leader() -> None:
+    # The fencing invariant: when a standby takes over an EXPIRED lease it bumps the epoch, so the new
+    # leader holds a STRICTLY GREATER epoch than the superseded old leader ever held. This is exactly the
+    # comparison the store guard relies on (held >= leader_lease.leader_epoch): the live leader's held
+    # epoch == the row epoch (passes); the old leader's held epoch is now strictly LESS (rejected).
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A")
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B")
+    await a._maintain_leadership()  # A acquires → epoch 1
+    assert a.current_epoch() == 1
+    db_clock.t = 31.0  # A's lease expires (A presumed paused/partitioned)
+    await b._maintain_leadership()  # B takes over the expired lease → epoch 2
+    assert b.is_leader() is True
+    assert b.current_epoch() == 2  # STRICTLY greater than A's held epoch (1)
+    assert db.row is not None and db.row["leader_epoch"] == 2
+    # The authoritative row epoch (2) is now greater than A's still-held epoch (1): the store guard
+    # `1 >= 2` is False, so a paused A's claim would match 0 rows — the fence. (A also self-fences /
+    # demotes on its next maintain tick, clearing its held epoch.)
+    assert a.current_epoch() == 1  # A has not run since; it still believes it holds epoch 1
+    await a._maintain_leadership()  # A, if it runs again, finds B owns a live lease → demotes
+    assert a.is_leader() is False
+    assert a.current_epoch() is None  # demotion clears the stale token
+
+
+async def test_epoch_cleared_on_self_fence() -> None:
+    # A self-fenced leader must drop its held epoch so current_epoch() never reports a stale token.
+    db = _FakeLeaseDB(_Clock(0.0))
+    mono = _Clock(0.0)
+    a = _coord(_FakeLeasePool(db), mono, node="A", fence=20.0)
+    await a._maintain_leadership()  # leader, epoch 1
+    assert a.current_epoch() == 1
+    a._pool.fail = True  # type: ignore[attr-defined]  # partition: renews stop
+    mono.t = 20.1
+    a._check_fence()
+    assert a.is_leader() is False
+    assert a.current_epoch() is None  # fenced → no token
+
+
+async def test_epoch_cleared_on_clean_release() -> None:
+    db = _FakeLeaseDB(_Clock(0.0))
+    a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A")
+    await a._maintain_leadership()
+    assert a.current_epoch() == 1
+    await a._release_leadership()
+    assert a.current_epoch() is None

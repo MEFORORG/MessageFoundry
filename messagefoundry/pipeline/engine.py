@@ -494,6 +494,15 @@ class Engine:
         against the runner's own ``running`` guard."""
         if self._registry_runner is None:
             return
+        # H1 FENCING TOKEN. Push THIS node's held leader epoch (+ the lease row to validate it against)
+        # into the store BEFORE any worker drains, so every FIFO claim this node makes as leader carries
+        # the fence. The engine reads it from the coordinator and pushes it down (the store never imports
+        # the coordinator — ARCH-6 one-way dependency). On the single-node NullCoordinator current_epoch()
+        # is None, so this is the byte-identical no-op (the guard stays disabled). A superseded ex-leader
+        # whose graph is being (re)started will hold a now-stale epoch; the store rejects its claims.
+        self.store.set_leader_epoch(
+            self._coordinator.current_epoch(), lease_key=self._coordinator.lease_key()
+        )
         # A4 — on promotion (clustered Postgres), recover the prior leader's stranded in-flight rows
         # IMMEDIATELY (owner-scoped, lease-blind), instead of waiting out the ~[store].lease_ttl_seconds
         # per-row lease TTL — which was the dominant failover-recovery delay (#293: ~60s on PG vs ~7s on
@@ -536,6 +545,10 @@ class Engine:
         loops keep running (a follower still converges its caches), so only the runner is stopped."""
         if self._registry_runner is not None:
             await self._registry_runner.stop()
+        # H1: clear the held epoch on demotion so a freshly-demoted node carries no (now-stale) fencing
+        # token if it were to claim before promotion re-pushes the current one. Defensive — the runner is
+        # already stopped, so no claim is in flight — but it keeps set_leader_epoch's lifecycle honest.
+        self.store.set_leader_epoch(None)
         log.info("engine graph stopped — this node is now standby")
 
     async def _reconcile_graph(self) -> None:
