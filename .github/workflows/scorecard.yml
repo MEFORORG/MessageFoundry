@@ -1,0 +1,59 @@
+name: Scorecard
+
+# OpenSSF Scorecard — a holistic supply-chain hygiene score (Pinned-Dependencies, Dangerous-Workflow,
+# Token-Permissions, Branch-Protection, Maintained, SAST-present, ...). It validates the hardening this
+# repo already does (SHA-pinned Actions, least-privilege tokens) and catches regressions, and yields a
+# public OpenSSF badge.
+#
+# WHY GUARDED TO THE MIRROR: like CodeQL, Scorecard uploads SARIF to GitHub code scanning (paid GHAS on
+# a private repo) and `publish_results: true` requires a PUBLIC repo. So this is gated to the public
+# mirror MEFORORG/MessageFoundry — a skipped no-op on the private source repo, free on the mirror after
+# publish.ps1 mirrors this file. NOTE: the Branch-Protection check then reflects the MIRROR's settings,
+# not the private repo's; the workflow-hardening checks (Pinned-Dependencies / Dangerous-Workflow /
+# Token-Permissions) assess the shared source and are the signal that transfers.
+#
+# PINNING CAVEAT: actions/checkout + actions/upload-artifact reuse this repo's existing SHA pins; the
+# ossf/scorecard-action and github/codeql-action/upload-sarif steps are on version tags pending a
+# SHA-pin lookup (zizmor / Scorecard itself will flag them).
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "0 8 * * 1" # weekly (Mon 08:00 UTC)
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    # ONLY on the public mirror (free code scanning + public badge); skipped no-op on the private repo.
+    if: github.repository == 'MEFORORG/MessageFoundry'
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # upload the SARIF results to code scanning
+      id-token: write # publish results to the public OpenSSF Scorecard API (the badge)
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@v2 # TODO: SHA-pin (repo convention)
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - name: Upload the SARIF artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          retention-days: 5
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@v3 # TODO: SHA-pin (repo convention)
+        with:
+          sarif_file: results.sarif
