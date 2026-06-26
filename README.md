@@ -98,19 +98,12 @@ deliberate — replace `<version>` with the current release shown at the top of 
 needs (each is opt-in and lazy-imported):
 
 ```bash
-pip install "messagefoundry[console]==<version>"     # admin console (PySide6 GUI) — the operator UI; most operators want this
 pip install "messagefoundry[postgres]==<version>"    # PostgreSQL store backend (production server DB)
 pip install "messagefoundry[sqlserver]==<version>"   # SQL Server store backend (+ OS-level ODBC Driver 18)
+pip install "messagefoundry[console]==<version>"     # PySide6 admin console
 pip install "messagefoundry[sftp]==<version>"        # SFTP transport for the REMOTEFILE connector
 pip install "messagefoundry[dicom]==<version>"       # DICOM codec + C-STORE SCP (pydicom + pynetdicom)
 ```
-
-**What's in the `messagefoundry` package — and what isn't.** It is the **engine plus the admin
-console**: the console ships in the same wheel, with its PySide6/GUI dependencies as the opt-in
-`[console]` extra, so a headless server, container, or adopter install stays lean — the console is one
-flag away (`messagefoundry[console]`) when you want the operator UI. The **VS Code extension is a
-separate product, not on PyPI** (a VS Code extension is a different ecosystem); see *VS Code extension &
-test harness* below for where to get it.
 
 > **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow,
 > Sigstore-signed, and carries SLSA build-provenance + PEP 740 attestations. Verify a downloaded
@@ -155,16 +148,10 @@ python -m messagefoundry.console --url http://127.0.0.1:8765
 
 - **VS Code extension** ([`ide/`](https://github.com/MEFORORG/MessageFoundry/tree/main/ide/)) — author and test interfaces in your editor: a New Route
   Wizard, validate-on-save, a Test Bench (dry-run `.hl7` files with before/after diffs), Stage →
-  Promote to a running engine, and an HL7-aware `@messagefoundry` chat participant. **It is not on PyPI**
-  (a VS Code extension is a different ecosystem) **and not yet on the VS Code Marketplace** — Marketplace
-  + Open VSX publishing is **planned** (see [the backlog](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/BACKLOG.md)). Until then, get it from
-  this repo: open the `ide/` folder in VS Code and press **F5** (Extension Development Host), or build the
-  VSIX (`cd ide && npm install && npx @vscode/vsce package`) and install the `.vsix`. See
-  [ide/README.md](https://github.com/MEFORORG/MessageFoundry/blob/main/ide/README.md).
-- **Test harness** — synthetic-only send/receive (MLLP), load, and failover tooling for exercising a
-  running engine. It ships as a **separate distribution, `messagefoundry-harness`**, released in lockstep
-  with the engine (it is *not* in the engine wheel): `pip install messagefoundry-harness`, then
-  `python -m harness`. From a checkout, run `python -m harness` directly. Synthetic, PHI-free traffic only.
+  Promote to a running engine, and an HL7-aware `@messagefoundry` chat participant. Open the `ide/`
+  folder in VS Code and press **F5**, or see [ide/README.md](https://github.com/MEFORORG/MessageFoundry/blob/main/ide/README.md).
+- **Test harness** — a standalone PySide6 send/receive MLLP tool for exercising the engine with
+  synthetic, PHI-free traffic: `python -m harness`.
 
 ## License
 

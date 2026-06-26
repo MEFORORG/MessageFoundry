@@ -15,14 +15,6 @@
 # `-*` tags publish to PRODUCTION PyPI (a TestPyPI route would need its own Trusted Publisher). Cut the tag
 # only AFTER the py.typed marker (WS-3) is on main — the wheel smoke step enforces this on a tag.
 #
-# SECOND distribution — `messagefoundry-harness` (the synthetic test/load/failover harness,
-# packaging/messagefoundry-harness/) — is built + published in lockstep by the `release-harness` job
-# below (same version, same tag). Its PyPI publish is GATED on the `PUBLISH_HARNESS` repo variable so it
-# stays a no-op until the OWNER (one-time): (1) configures a `messagefoundry-harness` PyPI Trusted
-# Publisher — a PENDING publisher for repo MEFORORG/MessageFoundry + workflow `release.yml` (blank
-# environment, matching the engine) — then (2) sets repo variable PUBLISH_HARNESS=true. Until then the
-# job still BUILDS + version-checks the harness wheel each release and attaches it to the GitHub release.
-#
 # The version is single-sourced from messagefoundry/__init__.py (hatchling dynamic version), so the built
 # artifact's version must match the tag.
 name: release
@@ -34,20 +26,16 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+-*"  # pre-releases: v0.1.0-rc1, …
   workflow_dispatch:
 
-# Deny-all at the workflow level; each job below requests only the scopes it uses (least privilege).
-permissions: {}
+permissions:
+  contents: write       # create the release + upload its assets
+  id-token: write       # Sigstore signing, PyPI Trusted Publishing, + provenance — all via the GitHub OIDC identity
+  attestations: write   # write the SLSA build-provenance attestation (actions/attest-build-provenance)
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write       # create the release + upload its assets
-      id-token: write       # Sigstore signing, PyPI Trusted Publishing, + provenance — all via the GitHub OIDC identity
-      attestations: write   # write the SLSA build-provenance attestation (actions/attest-build-provenance)
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false  # release uses GH_TOKEN env / OIDC, never the persisted git credential
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
@@ -161,71 +149,5 @@ jobs:
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           packages-dir: dist-pub/
-          skip-existing: true
-          attestations: true
-
-  release-harness:
-    # Build + publish the SEPARATE `messagefoundry-harness` distribution (the synthetic test/load/failover
-    # harness, packaging/messagefoundry-harness/) in lockstep with the engine — same version, same tag.
-    # Isolated from the `release` job so a harness-side issue can never jeopardize the engine release;
-    # `needs: release` so the engine ships (and its GitHub release exists) first. Inherits the workflow's
-    # contents:write + id-token:write. The PyPI publish is GATED on the `PUBLISH_HARNESS` repo variable:
-    # until the owner sets up the harness Trusted Publisher AND PUBLISH_HARNESS=true (see the header note),
-    # this job still BUILDS + version-checks the wheel and attaches it to the GitHub release, but does not
-    # publish — so a missing harness PyPI project can never red a release.
-    needs: release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write   # gh release upload (attach the harness wheel)
-      id-token: write   # PyPI Trusted Publishing (OIDC) for the harness wheel
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false  # gh upload uses GH_TOKEN env / OIDC, never the persisted git credential
-
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
-        with:
-          python-version: "3.14"
-
-      - name: Build the harness wheel (wheel-only — harness/ is force-included from the repo root)
-        run: |
-          python -m pip install --upgrade pip build
-          # Wheel-only on purpose: the harness source (harness/) lives OUTSIDE this project dir (it is
-          # force-included from ../../harness), so an sdist would not be self-contained. Pure-Python, so a
-          # wheel suffices. Version is read from messagefoundry/__init__.py (lockstep with the engine).
-          python -m build --wheel ./packaging/messagefoundry-harness --outdir harness-dist
-          ls -l harness-dist/
-
-      - name: Smoke-check the harness wheel (version == engine == tag)
-        run: |
-          built=$(python -c "import glob,re; print(re.search(r'messagefoundry_harness-([^-]+)-', glob.glob('harness-dist/*.whl')[0]).group(1))")
-          echo "harness wheel version: $built"
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
-            want="${GITHUB_REF_NAME#v}"
-            [ "$built" = "$want" ] || { echo "::error::harness wheel version $built != tag $want"; exit 1; }
-          fi
-
-      - name: Attach the harness wheel to the GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" harness-dist/*.whl --clobber
-
-      - name: Upload harness artifact (dry-run / always)
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: harness-artifacts
-          path: harness-dist/
-          if-no-files-found: ignore
-
-      # GATED: no-op until the owner configures the messagefoundry-harness PyPI Trusted Publisher AND sets
-      # repo variable PUBLISH_HARNESS=true. The build + version-check above still run every release.
-      - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
-        if: ${{ startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_HARNESS == 'true' }}
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
-        with:
-          packages-dir: harness-dist/
           skip-existing: true
           attestations: true

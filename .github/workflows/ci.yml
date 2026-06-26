@@ -10,11 +10,6 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Least privilege: every job here only reads the repo and runs tests/builds (no gh writes, no git push,
-# no secrets), so a read-only default token is sufficient. A job needing more declares its own block.
-permissions:
-  contents: read
-
 jobs:
   # Lint + type-check + unit tests. The project supports a single Python — 3.14 — so every leg runs it.
   # Linux carries the cheap breadth (1x minutes); Windows Server 2022 + 2025 is the primary deployment
@@ -814,13 +809,9 @@ jobs:
         if: >-
           contains(needs.*.result, 'failure') ||
           contains(needs.*.result, 'cancelled')
-        env:
-          # Pass the needs context via env, not inline ${{ }} in the run block (defense-in-depth against
-          # template injection — a job output could in theory carry a quote that breaks out of echo).
-          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
           echo "::error::A gated CI leg failed or was cancelled."
-          echo "$NEEDS_JSON"
+          echo '${{ toJSON(needs) }}'
           exit 1
 
       - name: Gated legs OK

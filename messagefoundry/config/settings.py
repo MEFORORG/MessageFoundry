@@ -1116,8 +1116,8 @@ class ClusterSettings(_Section):
     ``heartbeat_seconds`` to ``DB_now + leader_lease_ttl_seconds``, a standby acquires only once that
     lease has expired, and a leader that cannot renew within ``leader_fence_timeout_seconds`` self-fences
     before the lease can expire (the split-brain guard). The cross-section validator below requires
-    ``[store].backend`` in ``{postgres, sqlserver}`` and ``[store].pool_size >= 2`` when this is enabled
-    (a clustered node drives concurrent background work against the pool)."""
+    ``[store].backend = postgres`` and ``[store].pool_size >= 2`` when this is enabled (a clustered node
+    drives concurrent background work against the pool)."""
 
     enabled: bool = False
     # Override the auto-generated node id (host:pid:hex). Pin it for a stable identity across restarts
@@ -1306,7 +1306,7 @@ class ServiceSettings(BaseModel):
                     f"(got {self.store.pool_size}); a clustered node drives concurrent background work "
                     "(the membership/lease maintenance loop + the leader reclaim sweep + the per-stage "
                     "workers) against the pool, so a pool of 1 would serialize everything — prefer "
-                    "pool_size >= 3 for a clustered node (Postgres or SQL Server)"
+                    "pool_size >= 3 for clustered Postgres"
                 )
         return self
 

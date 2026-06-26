@@ -6,68 +6,6 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.2.5] — 2026-06-26 — Early Access
-
-A bug-fix release hardening SQL Server cluster cold-start.
-
-### Fixed
-- **SQL Server: concurrent schema-init race on a virgin DB (HA cold start).** Two cluster nodes starting
-  simultaneously against an empty database both ran the `IF OBJECT_ID(...) IS NULL CREATE TABLE` guards
-  with no cross-node lock, so both issued `CREATE` and the loser died at startup on a `2714` ("There is
-  already an object named ..."). `_ensure_schema` now takes an exclusive `sp_getapplock`
-  (`mefor:schema_init`) around the DDL — the T-SQL analog of the PostgreSQL store's existing schema
-  advisory lock — so the second node serializes and runs the now-no-op guarded CREATEs cleanly. Single-node
-  and pre-created schema are unaffected; SQLite and PostgreSQL were already race-safe. (#553)
-
-### Changed
-- Docs: the `[cluster]` settings docstring and the pool-size validation error now name both `postgres` and
-  `sqlserver` (the cross-section validator already admitted both). (#553)
-
-## [0.2.4] — 2026-06-26 — Early Access
-
-A bug-fix release that completes the EF-6 SQL Server fix shipped in 0.2.3.
-
-### Fixed
-- **SQL Server: EF-6 "Connection is busy with results for another command" fully resolved (0.2.3's fix
-  was incomplete).** v0.2.3 (#543) switched the FIFO claim read to `fetchall`, but draining the
-  `UPDATE...OUTPUT` *rows* does not free the *statement handle* — without MARS the pooled connection was
-  still returned to the aioodbc pool busy, so the error reproduced at every cold start. All pooled cursor
-  sites now close the cursor (`SQLFreeStmt`/`SQLCloseCursor`) via a new `_cursor` context manager before
-  the connection is released, on both the success and exception paths; `claim_ready` (another
-  `UPDATE...OUTPUT`) and the `DELETE...OUTPUT` handoffs had the same latent gap and are covered too. A
-  driver-free unit test now asserts the close-before-release invariant so the regression can't recur.
-  SQLite and PostgreSQL were unaffected. (#550)
-
-## [0.2.3] — 2026-06-26 — Early Access
-
-A bug-fix + feature release: the SQL Server store no longer raises "connection busy" errors under
-concurrent load, plus connection/transport event logging, GUI-managed translation tables, and inbound
-listener port-conflict detection.
-
-### Fixed
-- **SQL Server: "Connection is busy with results for another command" under concurrent load (EF-6).**
-  `claim_next_fifo` — and three sibling sites (`_maybe_finalize`, `consume_recovery_code_hash`,
-  `consume_totp_step`) — read a result-set-returning statement with a lone `fetchone()` and could return
-  the pooled connection to the pool with the result set still pending, so the next borrower's first
-  command raced an `HY000` busy error (ODBC Driver 18, no MARS). All affected sites now fully drain the
-  result set (`fetchall`) before commit/release. SQLite and PostgreSQL were unaffected (asyncpg
-  materializes rows; SQLite has no shared pooled-connection single-result-set constraint). (#543)
-
-### Added
-- **Connection/transport event log + "Response Sent" ACK capture** (ADR 0020 / ADR 0021). A new id-keyed,
-  metadata-only `connection_event` table records inbound connection lifecycle, pre-ingress failures, and
-  outbound lane transitions, with a `[diagnostics]` config block (per-connection overrides + retention),
-  a `GET /events` read API, and a console **Event Log** page. Event reasons are scrubbed and encrypted at
-  rest. (#541)
-- **GUI-managed translation tables (code sets)** (ADR 0033). A code-set CLI + writer and a VS Code
-  extension grid editor / **Translation Tables** view for maintaining code-set mappings. (#540)
-- **Inbound listener port-conflict detection** — static + runtime checks that flag two inbound
-  connections bound to the same host:port before they collide at startup. (#538)
-
-### Changed
-- Docs: README install instructions are now version-agnostic and link the website docs; the roadmap
-  section is replaced with a features summary. (#542, #544)
-
 ## [0.2.2] — 2026-06-24 — Early Access
 
 A security-hardening release: PHI-at-rest encryption is closed across every backend, the active-passive
@@ -203,11 +141,7 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.5...HEAD
-[0.2.5]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.4...v0.2.5
-[0.2.4]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.3...v0.2.4
-[0.2.3]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.2...v0.2.3
-[0.2.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.1...v0.2.2
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/v0.1.0
