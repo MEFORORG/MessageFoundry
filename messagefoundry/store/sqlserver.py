@@ -785,8 +785,12 @@ class SqlServerStore:
             # No queue rows remain: the router/handlers produced no delivery. FILTERED only if it was
             # actually routed; never clobber UNROUTED / ERROR / a status already set terminal.
             await cur.execute("SELECT status FROM messages WHERE id=?", (message_id,))
-            mrow = await cur.fetchone()
-            if not mrow or mrow[0] != MessageStatus.ROUTED.value:
+            # EF-6: fetchall (not a lone fetchone) so a returned status row is fully drained. This is the
+            # LAST statement on the cursor before the caller commits + returns the connection to the pool,
+            # so a pending result set here would race the next pool borrower into HY000 "connection is busy"
+            # (no MARS). The 0-row case is already exhausted; the row-exists/non-ROUTED case is the leak.
+            mrows = await cur.fetchall()
+            if not mrows or mrows[0][0] != MessageStatus.ROUTED.value:
                 return
             status = MessageStatus.FILTERED.value
         else:
@@ -2140,7 +2144,14 @@ class SqlServerStore:
             try:
                 await cur.execute(sql, args)
                 columns = [c[0] for c in cur.description] if cur.description else []
-                row = await cur.fetchone()
+                # EF-6: fully DRAIN the UPDATE...OUTPUT result set (TOP(1) -> 0 or 1 row) with fetchall,
+                # not a lone fetchone. One fetchone of the single OUTPUT row leaves the result set active
+                # on the cursor; the no-dedup (ingress/routed, destination_name NULL) path below has no
+                # follow-on execute to discard it, so the connection returns to the aioodbc pool with
+                # results still pending and the next borrower's first execute races a HY000 "connection is
+                # busy" (no MARS). fetchall reaches end-of-set and frees it (mirrors claim_ready's drain).
+                rows = await cur.fetchall()
+                row = rows[0] if rows else None
                 d = dict(zip(columns, row)) if row is not None else None
                 # H2 SKIP-AND-COMPLETE (SQL Server twin). If THIS just-claimed outbound row instance
                 # already has a committed ledger row, a prior delivery completed but the row was re-pended
@@ -2978,8 +2989,10 @@ class SqlServerStore:
                     "SELECT totp_recovery_codes FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (user_id,),
                 )
-                row = await cur.fetchone()
-                raw = row[0] if row else None
+                # EF-6: fetchall fully drains the SELECT so the two early-return commits below don't leave a
+                # pending result set on the pooled connection (HY000 "connection is busy" for the next borrower).
+                rows = await cur.fetchall()
+                raw = rows[0][0] if rows else None
                 if raw is None:
                     await conn.commit()
                     return False
@@ -3010,11 +3023,13 @@ class SqlServerStore:
                     "SELECT last_totp_step FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (user_id,),
                 )
-                row = await cur.fetchone()
-                if row is None:
+                # EF-6: fetchall fully drains the SELECT so the replay-step early-return commit below doesn't
+                # leave a pending result set on the pooled connection (HY000 "connection is busy").
+                rows = await cur.fetchall()
+                if not rows:
                     await conn.commit()
                     return False
-                last = row[0]
+                last = rows[0][0]
                 if last is not None and last >= step:
                     await conn.commit()
                     return False  # already consumed (or an older step) — replay within the window

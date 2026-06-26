@@ -15,6 +15,21 @@ readme = "README.md"
 requires-python = ">=3.14"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE", "NOTICE"]  # ship the license + copyright/attribution NOTICE in sdist+wheel (PEP 639)
+classifiers = [
+    "Development Status :: 4 - Beta",  # Early Access
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Topic :: Communications",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: System :: Networking",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console",
+    "Typing :: Typed",
+]
 dependencies = [
     "hl7apy>=1.3",          # version-aware validation + profiles
     "hl7>=0.4.5",           # python-hl7: fast, tolerant parsing for routing

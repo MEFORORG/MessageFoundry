@@ -6,6 +6,36 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-06-26 — Early Access
+
+A bug-fix + feature release: the SQL Server store no longer raises "connection busy" errors under
+concurrent load, plus connection/transport event logging, GUI-managed translation tables, and inbound
+listener port-conflict detection.
+
+### Fixed
+- **SQL Server: "Connection is busy with results for another command" under concurrent load (EF-6).**
+  `claim_next_fifo` — and three sibling sites (`_maybe_finalize`, `consume_recovery_code_hash`,
+  `consume_totp_step`) — read a result-set-returning statement with a lone `fetchone()` and could return
+  the pooled connection to the pool with the result set still pending, so the next borrower's first
+  command raced an `HY000` busy error (ODBC Driver 18, no MARS). All affected sites now fully drain the
+  result set (`fetchall`) before commit/release. SQLite and PostgreSQL were unaffected (asyncpg
+  materializes rows; SQLite has no shared pooled-connection single-result-set constraint). (#543)
+
+### Added
+- **Connection/transport event log + "Response Sent" ACK capture** (ADR 0020 / ADR 0021). A new id-keyed,
+  metadata-only `connection_event` table records inbound connection lifecycle, pre-ingress failures, and
+  outbound lane transitions, with a `[diagnostics]` config block (per-connection overrides + retention),
+  a `GET /events` read API, and a console **Event Log** page. Event reasons are scrubbed and encrypted at
+  rest. (#541)
+- **GUI-managed translation tables (code sets)** (ADR 0033). A code-set CLI + writer and a VS Code
+  extension grid editor / **Translation Tables** view for maintaining code-set mappings. (#540)
+- **Inbound listener port-conflict detection** — static + runtime checks that flag two inbound
+  connections bound to the same host:port before they collide at startup. (#538)
+
+### Changed
+- Docs: README install instructions are now version-agnostic and link the website docs; the roadmap
+  section is replaced with a features summary. (#542, #544)
+
 ## [0.2.2] — 2026-06-24 — Early Access
 
 A security-hardening release: PHI-at-rest encryption is closed across every backend, the active-passive
@@ -141,7 +171,9 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MEFORORG/MessageFoundry/releases/tag/v0.1.0
