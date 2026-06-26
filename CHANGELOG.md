@@ -6,6 +6,21 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-06-26 — Early Access
+
+A bug-fix release that completes the EF-6 SQL Server fix shipped in 0.2.3.
+
+### Fixed
+- **SQL Server: EF-6 "Connection is busy with results for another command" fully resolved (0.2.3's fix
+  was incomplete).** v0.2.3 (#543) switched the FIFO claim read to `fetchall`, but draining the
+  `UPDATE...OUTPUT` *rows* does not free the *statement handle* — without MARS the pooled connection was
+  still returned to the aioodbc pool busy, so the error reproduced at every cold start. All pooled cursor
+  sites now close the cursor (`SQLFreeStmt`/`SQLCloseCursor`) via a new `_cursor` context manager before
+  the connection is released, on both the success and exception paths; `claim_ready` (another
+  `UPDATE...OUTPUT`) and the `DELETE...OUTPUT` handoffs had the same latent gap and are covered too. A
+  driver-free unit test now asserts the close-before-release invariant so the regression can't recur.
+  SQLite and PostgreSQL were unaffected. (#550)
+
 ## [0.2.3] — 2026-06-26 — Early Access
 
 A bug-fix + feature release: the SQL Server store no longer raises "connection busy" errors under
@@ -171,7 +186,8 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.0...v0.2.1
