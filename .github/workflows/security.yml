@@ -109,6 +109,43 @@ jobs:
           name: sbom-cyclonedx
           path: sbom.cdx.json
 
+  trivy:
+    name: trivy (container image vulnerabilities)
+    runs-on: ubuntu-latest
+    # ADVISORY for its first cycle (continue-on-error): scan the built engine image for OS-package and
+    # Python CVEs — the supply-chain layer pip-audit (lockfile only) and bandit/semgrep (source only)
+    # never see: the Debian base, system libs, and (on the -sqlserver variant) the msodbcsql18/unixODBC
+    # apt layer. Once a baseline run confirms it's clean, DELETE `continue-on-error` to make it BLOCKING
+    # like the other gates here. There's now a real docker/Dockerfile, so the image is a live surface.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Build the slim engine image
+        # The slim default the docker-smoke leg (ci.yml) and the Dockerfile's `docker build` docs produce.
+        run: docker build -f docker/Dockerfile -t messagefoundry:scan .
+      - name: Install Trivy (pinned)
+        run: |
+          # Pin the release; bump deliberately (same posture as the gitleaks job). Verify the tag exists
+          # at https://github.com/aquasecurity/trivy/releases if this step 404s.
+          VER=0.71.2
+          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${VER}/trivy_${VER}_Linux-64bit.tar.gz" \
+            | tar -xz -C /tmp trivy
+          sudo install -m 0755 /tmp/trivy /usr/local/bin/trivy
+          trivy --version
+      - name: Scan the image (fixable HIGH/CRITICAL fail the build)
+        # --ignore-unfixed keeps the gate ACTIONABLE: a Debian CVE with no upstream fix can't be
+        # remediated by us and shouldn't redden CI; only patchable HIGH/CRITICAL fail. --scanners vuln
+        # keeps this to CVEs (secrets stay gitleaks' job). Extend to `--target runtime-sqlserver` (more
+        # OS surface) once this is green. Trivy auto-pulls its vuln DB from ghcr.io on first run.
+        run: |
+          trivy image --no-progress --scanners vuln \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+            messagefoundry:scan
+      - name: Lint the Dockerfile for misconfig (informational)
+        # IaC checks (non-root USER, pinned base, secrets in layers). Informational only — never fails.
+        if: always()
+        run: trivy config --no-progress --severity HIGH,CRITICAL docker/Dockerfile || true
+
   bandit:
     name: bandit (Python SAST)
     runs-on: ubuntu-latest
@@ -173,6 +210,32 @@ jobs:
           # Includes `tee/` (in-tree vendored SOUP) so the standalone relay is held to the same
           # dangerous-sink rules as the engine.
           semgrep --config .semgrep --error --metrics off messagefoundry tee
+
+  zizmor:
+    name: zizmor (GitHub Actions static analysis)
+    runs-on: ubuntu-latest
+    # BLOCKING: static analysis of the workflow files THEMSELVES (Trail of Bits) — template injection,
+    # over-broad GITHUB_TOKEN permissions, dangerous triggers, artifact-credential persistence. The
+    # baseline is clean — high-confidence findings are fixed in-tree (least-privilege per-job permissions,
+    # env-passed refs, persist-credentials: false) and the few safe-by-design ones are recorded with a
+    # justification in .github/zizmor.yml — so a NEW workflow-security regression now fails the build.
+    # Tune suppressions in .github/zizmor.yml (with a reason), not by relaxing this gate.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+      - name: Install zizmor (pinned)
+        run: |
+          # Pin deliberately; verify the tag at https://github.com/zizmorcore/zizmor/releases if it 404s.
+          python -m pip install --upgrade pip "zizmor==1.5.2"
+      - name: Analyze the workflows
+        env:
+          # Lets zizmor run its online audits (e.g. unpinned / known-problematic action refs).
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor .github/workflows
 
   crypto-inventory:
     name: crypto-inventory (ASVS 11.1.3 discovery gate)

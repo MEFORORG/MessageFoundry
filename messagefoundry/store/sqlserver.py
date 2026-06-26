@@ -404,8 +404,7 @@ class SqlServerStore:
             updates.append((prev, r["id"]))
         if updates:
             # Runs in open() before the store is returned, so no concurrent record_audit can race it.
-            async with self._acquire() as conn:
-                cur = await conn.cursor()
+            async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
                     for row_hash, rid in updates:
                         await cur.execute(
@@ -441,8 +440,7 @@ class SqlServerStore:
                 )
                 if not rows:
                     break
-                async with self._acquire() as conn:
-                    cur = await conn.cursor()
+                async with self._acquire() as conn, self._cursor(conn) as cur:
                     try:
                         for r in rows:
                             await cur.execute(
@@ -477,8 +475,7 @@ class SqlServerStore:
                 )
                 if not rows:
                     break
-                async with self._acquire() as conn:
-                    cur = await conn.cursor()
+                async with self._acquire() as conn, self._cursor(conn) as cur:
                     try:
                         for r in rows:
                             await cur.execute(
@@ -502,8 +499,7 @@ class SqlServerStore:
                 )
                 if not rows:
                     break
-                async with self._acquire() as conn:
-                    cur = await conn.cursor()
+                async with self._acquire() as conn, self._cursor(conn) as cur:
                     try:
                         for r in rows:
                             await cur.execute(
@@ -543,6 +539,9 @@ class SqlServerStore:
             log.warning("skipping the RCSI check on %r (could not connect): %s", db, exc)
             return
         try:
+            # Standalone one-shot connection (NOT pooled) — `conn.close()` in the finally below frees
+            # the cursor with it, so this site is exempt from the EF-6 pool-bleed race that `_cursor`
+            # guards against on the pooled paths.
             cur = await conn.cursor()
             await cur.execute(
                 "SELECT is_read_committed_snapshot_on, snapshot_isolation_state "
@@ -577,8 +576,7 @@ class SqlServerStore:
             await conn.close()
 
     async def _ensure_schema(self) -> None:
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 for statement in _SCHEMA:
                     await cur.execute(statement)
@@ -609,9 +607,34 @@ class SqlServerStore:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit
             yield conn
 
+    @asynccontextmanager
+    async def _cursor(self, conn: Any) -> AsyncIterator[Any]:
+        """Yield a cursor that is ALWAYS closed before its connection returns to the pool (EF-6).
+
+        Without MARS a SQL Server connection allows ONE active statement at a time. An
+        ``UPDATE...OUTPUT`` claim (:meth:`claim_next_fifo`, :meth:`claim_ready`) leaves the statement
+        handle *active* even after ``fetchall`` has drained its rows; if the connection is released to
+        the aioodbc pool with that handle still open, the next borrower's first ``execute`` races a
+        ``HY000 ... Connection is busy with results for another command``. ``fetchall`` drains the
+        ROWS but does not free the STATEMENT — only closing the cursor (``SQLFreeStmt``/
+        ``SQLCloseCursor``) does, deterministically (the v0.2.3 row-drain alone was insufficient: the
+        box still reproduced EF-6 at every cold start). We deliberately do NOT use
+        ``async with conn.cursor()``: aioodbc's ``conn.cursor()`` context manager commits on normal
+        exit (when the connection is not autocommit) and rolls back on the exception path — either
+        would override each caller's own explicit ``commit``/``rollback``, so we close the cursor
+        directly here and let the caller own the transaction. A close failure is swallowed
+        (best-effort) so it can never mask the real error already in flight."""
+        cur = await conn.cursor()
+        try:
+            yield cur
+        finally:
+            try:
+                await cur.close()
+            except Exception:  # noqa: BLE001 - a close failure must not mask the in-flight error
+                log.debug("cursor close on connection release failed", exc_info=True)
+
     async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(sql, params) if params else await cur.execute(sql)
                 columns = [c[0] for c in cur.description]
@@ -631,8 +654,7 @@ class SqlServerStore:
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         """Run a single write statement (or T-SQL batch) in its own committed transaction."""
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(sql, params)
                 await conn.commit()
@@ -785,8 +807,12 @@ class SqlServerStore:
             # No queue rows remain: the router/handlers produced no delivery. FILTERED only if it was
             # actually routed; never clobber UNROUTED / ERROR / a status already set terminal.
             await cur.execute("SELECT status FROM messages WHERE id=?", (message_id,))
-            mrow = await cur.fetchone()
-            if not mrow or mrow[0] != MessageStatus.ROUTED.value:
+            # fetchall (not a lone fetchone) reads the status AND drains the SELECT so the same-cursor
+            # UPDATE on the FILTERED path below is clean. Deterministic close of this cursor before its
+            # connection returns to the pool is handled by `_cursor` (EF-6) at the caller's block exit —
+            # this just keeps the in-transaction cursor un-busy. The row-exists/non-ROUTED case returns.
+            mrows = await cur.fetchall()
+            if not mrows or mrows[0][0] != MessageStatus.ROUTED.value:
                 return
             status = MessageStatus.FILTERED.value
         else:
@@ -834,8 +860,7 @@ class SqlServerStore:
         now = time.time() if now is None else now
         mid = uuid4().hex
         status = MessageStatus.RECEIVED.value if deliveries else MessageStatus.UNROUTED.value
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
@@ -957,8 +982,7 @@ class SqlServerStore:
         message id."""
         now = time.time() if now is None else now
         mid = uuid4().hex
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
@@ -1020,8 +1044,7 @@ class SqlServerStore:
         post-router disposition under the finalize applock. Idempotent: returns False (no-op) if the
         ingress row was already consumed by a committed prior run."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "DELETE FROM queue OUTPUT deleted.id WHERE id=? AND stage=? AND status=?",
@@ -1068,8 +1091,7 @@ class SqlServerStore:
         disposition (ROUTED with handlers, UNROUTED with none) under the finalize applock. Idempotent:
         False if the ingress row was already consumed."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "DELETE FROM queue OUTPUT deleted.id WHERE id=? AND stage=? AND status=?",
@@ -1113,8 +1135,7 @@ class SqlServerStore:
         commit. Idempotent: False if the routed row was already consumed."""
         now = time.time() if now is None else now
         applied: list[tuple[tuple[str, str], Any]] = []
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "DELETE FROM queue OUTPUT deleted.id WHERE id=? AND stage=? AND status=?",
@@ -1181,8 +1202,7 @@ class SqlServerStore:
         row (which holds the origin non-terminal until ``ingress_handoff`` consumes it). body + detail
         are ciphertext; outcome is plaintext."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 # Leading SELECT (also opens the txn so _maybe_finalize's applock is never first).
                 await cur.execute(
@@ -1312,8 +1332,7 @@ class SqlServerStore:
         dest = "\x1fack:" + inbound_name
         enc_body = self._enc(ack_body) if (ack_body and self._cipher.encrypts) else None
         enc_detail = self._enc(safe_text(detail)[:200]) if detail else None
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
@@ -1429,8 +1448,7 @@ class SqlServerStore:
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 # (1) Guard-read the in-flight work-row (also opens the txn -> applock not first).
                 await cur.execute(
@@ -1673,8 +1691,7 @@ class SqlServerStore:
         in sorted id order to avoid multi-message deadlock; a killed routed row -> DEAD -> the finalizer
         resolves the message to ERROR."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT id, message_id, handler_name FROM queue"
@@ -1752,8 +1769,7 @@ class SqlServerStore:
                 updates = [
                     (self._cipher.encrypt(self._cipher.decrypt(r["v"])), r["id"]) for r in rows
                 ]
-                async with self._acquire() as conn:
-                    cur = await conn.cursor()
+                async with self._acquire() as conn, self._cursor(conn) as cur:
                     try:
                         for enc, rid in updates:
                             await cur.execute(
@@ -1779,8 +1795,7 @@ class SqlServerStore:
                 (self._cipher.encrypt(self._cipher.decrypt(r["value"])), r["namespace"], r["key"])
                 for r in rows
             ]
-            async with self._acquire() as conn:
-                cur = await conn.cursor()
+            async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
                     for enc, ns, skey in state_updates:
                         await cur.execute(
@@ -1814,8 +1829,7 @@ class SqlServerStore:
                     )
                     for r in rows
                 ]
-                async with self._acquire() as conn:
-                    cur = await conn.cursor()
+                async with self._acquire() as conn, self._cursor(conn) as cur:
                     try:
                         for enc, rmid, rdest, rseq in resp_updates:
                             await cur.execute(
@@ -1838,8 +1852,7 @@ class SqlServerStore:
         blanked to '' (not deleted) so the cipher re-encrypt scans skip them and the FK to messages
         stays intact. The eligible set is materialized ONCE so all three tables purge exactly the same
         messages. Returns the number of message bodies blanked."""
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 # CREATE (no params) so the temp table lives at CONNECTION scope; a parameterized
                 # SELECT...INTO runs under sp_executesql and would scope #eligible to that proc (gone
@@ -1882,8 +1895,7 @@ class SqlServerStore:
 
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
         # #46: metadata-only rows (no body/FK) — age-DELETE on their own window (RetentionRunner-driven).
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("DELETE FROM connection_event WHERE ts < ?", (older_than,))
                 purged = cur.rowcount
@@ -1896,8 +1908,7 @@ class SqlServerStore:
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state rows last set before ``older_than`` (ADR 0005 retention), evicting
         them from the read-through cache post-commit. Returns the number deleted."""
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT namespace, [key] FROM state WHERE set_at < ?", (older_than,)
@@ -1918,8 +1929,7 @@ class SqlServerStore:
     async def purge_dead_letters(self, *, older_than: float, now: float | None = None) -> int:
         """Blank the payload of dead outbound rows updated before ``older_than`` (retention). Keeps the
         dead row + 'dead' status (counts/disposition) but frees the body; idempotent (payload <> '')."""
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
@@ -1961,8 +1971,7 @@ class SqlServerStore:
         now = time.time() if now is None else now
         mid = uuid4().hex
         event = "error" if status is MessageStatus.ERROR else "filtered"
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "INSERT INTO messages (id, channel_id, received_at, source_type, control_id,"
@@ -2037,8 +2046,7 @@ class SqlServerStore:
             " inserted.attempts"
         )
         args = (limit, *filters, OutboxStatus.INFLIGHT.value, now)
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(sql, args)
                 columns = [c[0] for c in cur.description]
@@ -2135,12 +2143,19 @@ class SqlServerStore:
             now,
             *epoch_args,
         )
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(sql, args)
                 columns = [c[0] for c in cur.description] if cur.description else []
-                row = await cur.fetchone()
+                # EF-6: read the claimed row with fetchall (not a lone fetchone) so the OUTPUT *rows*
+                # are drained; the no-dedup (ingress/routed, destination_name NULL) path below has no
+                # follow-on execute to discard the result set. NB the v0.2.3 row-drain alone did NOT
+                # fix EF-6 — fetchall frees the rows but not the STATEMENT handle, so without MARS the
+                # connection still returned to the pool "busy" for the next borrower. The deterministic
+                # fix is `_cursor` closing the cursor (SQLFreeStmt) before release; this fetchall just
+                # gets the row.
+                rows = await cur.fetchall()
+                row = rows[0] if rows else None
                 d = dict(zip(columns, row)) if row is not None else None
                 # H2 SKIP-AND-COMPLETE (SQL Server twin). If THIS just-claimed outbound row instance
                 # already has a committed ledger row, a prior delivery completed but the row was re-pended
@@ -2194,8 +2209,7 @@ class SqlServerStore:
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT message_id, destination_name, handler_name, attempts FROM queue WHERE id=?",
@@ -2238,8 +2252,7 @@ class SqlServerStore:
     ) -> None:
         error = safe_text(error)  # PHI chokepoint (#120): scrub first, then cipher last_error (H4)
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT message_id, destination_name, attempts FROM queue WHERE id=?",
@@ -2293,8 +2306,7 @@ class SqlServerStore:
             "UPDATE queue SET status=?, next_attempt_at=?, updated_at=?, owner=NULL,"
             f" lease_expires_at=NULL WHERE {' AND '.join(clauses)}"
         )
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(sql, (OutboxStatus.PENDING.value, now, now, *params))
                 count = cur.rowcount
@@ -2311,8 +2323,7 @@ class SqlServerStore:
             error
         )  # PHI chokepoint (#120) — incl. f"undecryptable payload: {exc}" callers; ciphered below (H4)
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT message_id, destination_name FROM queue WHERE id=?", (outbox_id,)
@@ -2359,8 +2370,7 @@ class SqlServerStore:
         (H-5). The per-message finalize applocks are pre-acquired in sorted id order so two concurrent
         multi-message finalizers can't deadlock."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT id, message_id, destination_name FROM queue"
@@ -2399,8 +2409,7 @@ class SqlServerStore:
         sibling); else replay the done rows. messages.status -> RECEIVED if a pending ingress/routed
         row remains (needs re-routing), else ROUTED."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT COUNT(*) FROM queue WHERE message_id=? AND status IN (?, ?)",
@@ -2476,8 +2485,7 @@ class SqlServerStore:
             where.append("destination_name=?")
             params.append(destination_name)
         clause = " AND ".join(where)
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     f"SELECT DISTINCT message_id FROM queue WHERE {clause}", tuple(params)
@@ -2519,8 +2527,7 @@ class SqlServerStore:
             where.insert(1, "channel_id=?")
             params.insert(1, channel_id)
         top = "TOP (1) " if top_only else ""
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     f"SELECT {top}id, message_id FROM queue WHERE {' AND '.join(where)}"
@@ -2692,8 +2699,7 @@ class SqlServerStore:
         self, message_id: str, *, actor: str | None = None, now: float | None = None
     ) -> None:
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await self._event(cur, message_id, "viewed", None, actor or "", now)
                 await conn.commit()
@@ -2717,8 +2723,7 @@ class SqlServerStore:
         # reliable — unlike a txn-scoped sp_getapplock taken as the connection's first statement, which
         # does not release on commit and strands under concurrent contention.
         async with self._audit_lock:
-            async with self._acquire() as conn:
-                cur = await conn.cursor()
+            async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
                     await cur.execute("SELECT TOP (1) row_hash FROM audit_log ORDER BY id DESC")
                     last = await cur.fetchone()
@@ -2845,8 +2850,7 @@ class SqlServerStore:
     ) -> bool:
         """Atomically move a still-``pending`` request to ``status`` (approved/rejected/expired).
         Returns ``True`` iff this call made the transition — guards against a double decision."""
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "UPDATE pending_approvals SET status = ?, approver = ?, decided_at = ?"
@@ -2971,15 +2975,17 @@ class SqlServerStore:
         UPDATE run in one transaction, so concurrent verifications can't double-spend a single-use
         recovery code (WP-14)."""
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT totp_recovery_codes FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (user_id,),
                 )
-                row = await cur.fetchone()
-                raw = row[0] if row else None
+                # fetchall reads the codes AND drains the SELECT so the same-cursor UPDATE below is clean.
+                # Deterministic close before the pooled connection is reused is `_cursor`'s job (EF-6);
+                # the early-return commits below then release a cursor that gets closed on block exit.
+                rows = await cur.fetchall()
+                raw = rows[0][0] if rows else None
                 if raw is None:
                     await conn.commit()
                     return False
@@ -3003,18 +3009,19 @@ class SqlServerStore:
         consumed (strictly greater than any prior step). A code replayed inside its ±1-step verify
         window resolves to a non-greater step and returns ``False`` — single-use per ASVS 6.5.1. The
         ``UPDLOCK`` SELECT + UPDATE run in one transaction so concurrent verifications can't both win."""
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT last_totp_step FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                     (user_id,),
                 )
-                row = await cur.fetchone()
-                if row is None:
+                # fetchall reads the step AND drains the SELECT so the same-cursor UPDATE below is clean;
+                # `_cursor` closes the cursor before the pooled connection is reused (EF-6).
+                rows = await cur.fetchall()
+                if not rows:
                     await conn.commit()
                     return False
-                last = row[0]
+                last = rows[0][0]
                 if last is not None and last >= step:
                     await conn.commit()
                     return False  # already consumed (or an older step) — replay within the window
@@ -3049,8 +3056,7 @@ class SqlServerStore:
         )
 
     async def delete_user(self, user_id: str) -> None:
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
                 await cur.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
@@ -3121,8 +3127,7 @@ class SqlServerStore:
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
                 for role_id in role_ids:
@@ -3163,8 +3168,7 @@ class SqlServerStore:
 
     async def set_ad_group_role_map(self, entries: Iterable[tuple[str, str]]) -> None:
         pairs = sorted({(g.strip().lower(), r) for g, r in entries if g.strip()})
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("DELETE FROM ad_group_role_map")
                 for ad_group, role_id in pairs:
@@ -3197,8 +3201,7 @@ class SqlServerStore:
         pairs = sorted(
             {(g.strip().lower(), c.strip()) for g, c in entries if g.strip() and c.strip()}
         )
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("DELETE FROM ad_group_scope_map")
                 for ad_group, channel in pairs:
@@ -3284,8 +3287,7 @@ class SqlServerStore:
         if except_token_hash is not None:
             sql += " AND token_hash != ?"
             params.append(except_token_hash)
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(sql, tuple(params))
                 count = cur.rowcount
@@ -3313,8 +3315,7 @@ class SqlServerStore:
 
     async def purge_expired_sessions(self, *, now: float | None = None) -> int:
         now = time.time() if now is None else now
-        async with self._acquire() as conn:
-            cur = await conn.cursor()
+        async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
                 count = cur.rowcount

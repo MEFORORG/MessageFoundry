@@ -75,6 +75,10 @@ jobs:
           uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
 
       - name: Commit and push the resynced locks
+        env:
+          # Pass the PR head ref through the environment, NOT inline ${{ }} in the run block, so a branch
+          # name containing shell metacharacters can never be evaluated as code (template injection).
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
           git config user.name 'dependabot[bot]'
@@ -88,4 +92,4 @@ jobs:
           # Push with the persisted App-token credential (NOT GITHUB_TOKEN). An App-token push emits a
           # synchronize event so the required checks (DEP-1, ci.yml) re-run on the new commit; a
           # GITHUB_TOKEN push would leave them pending and the PR unmergeable.
-          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          git push origin "HEAD:${HEAD_REF}"
