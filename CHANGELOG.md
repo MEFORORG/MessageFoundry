@@ -6,6 +6,23 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.5] — 2026-06-26 — Early Access
+
+A bug-fix release hardening SQL Server cluster cold-start.
+
+### Fixed
+- **SQL Server: concurrent schema-init race on a virgin DB (HA cold start).** Two cluster nodes starting
+  simultaneously against an empty database both ran the `IF OBJECT_ID(...) IS NULL CREATE TABLE` guards
+  with no cross-node lock, so both issued `CREATE` and the loser died at startup on a `2714` ("There is
+  already an object named ..."). `_ensure_schema` now takes an exclusive `sp_getapplock`
+  (`mefor:schema_init`) around the DDL — the T-SQL analog of the PostgreSQL store's existing schema
+  advisory lock — so the second node serializes and runs the now-no-op guarded CREATEs cleanly. Single-node
+  and pre-created schema are unaffected; SQLite and PostgreSQL were already race-safe. (#553)
+
+### Changed
+- Docs: the `[cluster]` settings docstring and the pool-size validation error now name both `postgres` and
+  `sqlserver` (the cross-section validator already admitted both). (#553)
+
 ## [0.2.4] — 2026-06-26 — Early Access
 
 A bug-fix release that completes the EF-6 SQL Server fix shipped in 0.2.3.
@@ -186,7 +203,8 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.1...v0.2.2

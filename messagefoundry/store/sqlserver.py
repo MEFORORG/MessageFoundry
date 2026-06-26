@@ -70,6 +70,12 @@ log = logging.getLogger(__name__)
 
 # Schema (T-SQL). Idempotent: guarded by OBJECT_ID / IndexProperty so re-open is a no-op. Epoch
 # timestamps are FLOAT; ids are NVARCHAR(64) (uuid4 hex); bodies NVARCHAR(MAX).
+#
+# Schema-init is serialized across concurrent opens by this named applock (the T-SQL analog of the
+# Postgres store's ``pg_advisory_xact_lock("mefor_schema_init")`` — store/postgres.py). The OBJECT_ID
+# guards below are check-then-create and do NOT serialize concurrent creators on a virgin DB — see
+# _ensure_schema.
+_SCHEMA_LOCK = "mefor:schema_init"
 _SCHEMA: list[str] = [
     """IF OBJECT_ID('messages','U') IS NULL CREATE TABLE messages (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, channel_id NVARCHAR(256) NOT NULL,
@@ -578,6 +584,14 @@ class SqlServerStore:
     async def _ensure_schema(self) -> None:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # Serialize schema-init across concurrent opens (e.g. a 2-node HA cold start against a
+                # virgin DB) — the T-SQL analog of the Postgres store's schema advisory lock. Without it
+                # the `IF OBJECT_ID(...) IS NULL CREATE` guards below are check-then-create: two nodes
+                # both see NULL and both CREATE, and the loser dies on a 2714 "There is already an object
+                # named ...". The applock is transaction-scoped (the autocommit=False pool means this
+                # first statement opens the txn), so it auto-releases on the commit/rollback below; the
+                # second node then runs the now-no-op guarded CREATEs cleanly.
+                await self._applock(cur, _SCHEMA_LOCK)
                 for statement in _SCHEMA:
                     await cur.execute(statement)
                 await conn.commit()
