@@ -200,6 +200,16 @@ or leave empty for no restriction.
 > scoped to one listener; the same off-loopback risk applies), and **`source_ip_allowlist`** restricts
 > which peers that listener accepts. See [docs/CONFIGURATION.md](CONFIGURATION.md).
 
+> **Port-conflict detection.** Two inbound listeners that bind the **same port on overlapping
+> interfaces** are caught **statically** — at `messagefoundry check` / dry-run and at engine
+> start/reload — naming **both** connections, instead of aborting at the bare OS bind. The check is
+> **interface-aware**: two listeners on the same port but **different** explicit `bind_address`es (a
+> multi-NIC host) don't conflict, while a `0.0.0.0` (all-interfaces) bind conflicts with any specific
+> interface on that port. `env()`-resolved ports and the engine's own **API listener port** (`[api].port`)
+> are included in the start/reload pass. At runtime, a port already held by **another process** (a
+> second instance, an OS service) is reported as a clear, named conflict and the affected inbound is
+> **isolated** (the engine still comes up; see [ADR 0031](adr/0031-startup-connection-fault-isolation.md)).
+
 #### Inspecting & testing a connection (API)
 
 Two read/diagnostic endpoints back the console's connection view (auth + per-channel RBAC apply — see

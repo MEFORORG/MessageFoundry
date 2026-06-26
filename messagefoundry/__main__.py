@@ -8,6 +8,7 @@
     messagefoundry dryrun    --config ./samples/config --messages ./msgs --json   # run, don't send
     messagefoundry check     --config ./samples/config --messages ./msgs          # commit/CI gate
     messagefoundry connection upsert --config ./samples/config --data '{...}'      # edit connections.toml
+    messagefoundry codeset upsert --config ./samples/config --data '{...}'         # edit codesets/*.csv
     messagefoundry generate  --type ADT --count 5 --out ./out/adt                 # synthetic HL7
     messagefoundry hl7schema --json                                               # HL7 field schema
     messagefoundry init      ./my-config-repo                                      # scaffold a config repo
@@ -161,6 +162,26 @@ def main(argv: list[str] | None = None) -> int:
         "--data", default=None, help="connection JSON for upsert (default: read from stdin)"
     )
     connection.add_argument("--json", action="store_true", help="emit JSON")
+
+    codeset = sub.add_parser(
+        "codeset",
+        help="manage codesets/*.csv translation tables — list / show / upsert / "
+        "rename / remove (the VS Code grid editor shells this)",
+    )
+    codeset.add_argument("action", choices=["list", "show", "upsert", "rename", "remove"])
+    codeset.add_argument("--config", default="samples/config", help="config modules directory")
+    codeset.add_argument(
+        "--name",
+        default=None,
+        help="code-set name (the file stem; required for show/rename/remove)",
+    )
+    codeset.add_argument("--to", default=None, help="new name for `codeset rename`")
+    codeset.add_argument(
+        "--data",
+        default=None,
+        help="code-set DETAIL JSON for upsert (default: read from stdin)",
+    )
+    codeset.add_argument("--json", action="store_true", help="emit JSON")
 
     alert = sub.add_parser(
         "alert",
@@ -628,6 +649,8 @@ def _serve(args: argparse.Namespace) -> int:
         buildup_default=settings.delivery.buildup_threshold(),
         ack_after_default=settings.inbound.ack_after,
         max_correlation_depth=settings.pipeline.max_correlation_depth,
+        connection_events=settings.diagnostics.connection_events,
+        response_sent_default=settings.diagnostics.response_sent,
         env_values_provider=env_values,
         auth_settings=settings.auth,
         ai_settings=settings.ai,
@@ -635,6 +658,9 @@ def _serve(args: argparse.Namespace) -> int:
         retention_settings=settings.retention,
         cert_monitor_settings=settings.cert_monitor,
         api_tls_cert_file=settings.api.tls_cert_file,
+        # Reserve the engine's own API listener so no inbound can be wired onto it (it would collide
+        # with uvicorn at bind); surfaced as a clear PortConflictError at check/start instead.
+        api_listener=(settings.api.host, settings.api.port),
         reference_settings=settings.reference,
         egress_settings=settings.egress,
         shadow_settings=settings.shadow,
@@ -1220,7 +1246,7 @@ def _connection(args: argparse.Namespace) -> int:
         resolve_values_base_dir,
     )
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.config.wiring import WiringError, load_config
+    from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
 
     if args.action == "list":
@@ -1259,6 +1285,9 @@ def _connection(args: argparse.Namespace) -> int:
             inbound_bind_host=settings.inbound.bind_host,
             env_values=env_values,
             egress=settings.egress,
+            # Reserve the configured API listener so an edit that puts an inbound on the API's port is
+            # rejected here, before it persists — same check the running engine applies.
+            reserved_bindings=((API_LISTENER_LABEL, settings.api.host, settings.api.port),),
         )
 
     try:
@@ -1273,6 +1302,76 @@ def _connection(args: argparse.Namespace) -> int:
     except json.JSONDecodeError as exc:
         return _emit_error(f"invalid connection JSON: {exc}", as_json=args.json)
     except (WiringError, OSError) as exc:
+        return _emit_error(str(exc), as_json=args.json)
+    _print_json(result, compact=args.json)
+    return 0
+
+
+def _codeset(args: argparse.Namespace) -> int:
+    """Manage ``codesets/*.csv`` translation tables: ``list`` / ``show`` to populate the VS Code grid,
+    ``upsert`` / ``rename`` / ``remove`` to save (a developer can also hand-edit the files). Offline:
+    touches no network, starts no server, loads no config modules — validating a code set means
+    "does this file load as a CodeSet", done by re-running the code_sets.py loader on the candidate.
+    ``upsert`` writes ``.csv`` atomically with owner-only perms and rolls back on a load failure."""
+    from pathlib import Path
+
+    from messagefoundry.config import codeset_edit
+    from messagefoundry.config.code_sets import CodeSetError, load_code_set
+    from messagefoundry.config.wiring import WiringError
+
+    # The post-write check is the REAL loader on the written file (no egress/env build-check — a code
+    # set is standalone data): if the candidate .csv doesn't load, the writer rolls back.
+    def validate(path: Path) -> None:
+        load_code_set(path)
+
+    try:
+        if args.action == "list":
+            entries = codeset_edit.list_code_sets(args.config)
+            _print_json(entries, compact=args.json)
+            return 0
+        if args.action == "show":
+            if not args.name:
+                return _emit_error("--name is required for `codeset show`", as_json=args.json)
+            detail = codeset_edit.show_code_set(args.config, args.name)
+            _print_json(detail, compact=args.json)
+            return 0
+        if args.action == "upsert":
+            raw = args.data if args.data is not None else sys.stdin.read()
+            detail = json.loads(raw)
+            if not isinstance(detail, dict):
+                return _emit_error("code set: input must be a JSON object", as_json=args.json)
+            fmt = detail.get("format")
+            if fmt is not None and fmt != "csv":
+                return _emit_error(
+                    f"code set: only CSV code sets are editable here (got format {fmt!r})",
+                    as_json=args.json,
+                )
+            result = codeset_edit.upsert_code_set(
+                args.config,
+                detail.get("name"),
+                detail.get("columns"),
+                detail.get("rows", []),
+                validate=validate,
+            )
+        elif args.action == "rename":
+            if not args.name:
+                return _emit_error("--name is required for `codeset rename`", as_json=args.json)
+            if not args.to:
+                return _emit_error("--to is required for `codeset rename`", as_json=args.json)
+            result = codeset_edit.rename_code_set(
+                args.config, args.name, args.to, validate=validate
+            )
+        else:  # remove
+            if not args.name:
+                return _emit_error("--name is required for `codeset remove`", as_json=args.json)
+            result = codeset_edit.remove_code_set(args.config, args.name, validate=validate)
+    except json.JSONDecodeError as exc:
+        return _emit_error(f"invalid code set JSON: {exc}", as_json=args.json)
+    except (WiringError, CodeSetError, OSError) as exc:
+        # codeset_edit raises WiringError for its own (pre-write) validation, but the post-write
+        # reload callback calls load_code_set() directly, which raises the loader's own CodeSetError
+        # (a sibling of WiringError, not a subclass). Catch both so a post-write reload rejection is
+        # surfaced as {"error": ...} for the IDE rather than crashing with no JSON on stdout.
         return _emit_error(str(exc), as_json=args.json)
     _print_json(result, compact=args.json)
     return 0
@@ -1399,6 +1498,7 @@ _DISPATCH = {
     "check": _check,
     "adr-analyze": _adr_analyze,
     "connection": _connection,
+    "codeset": _codeset,
     "alert": _alert,
     "generate": _generate,
     "hl7schema": _hl7schema,

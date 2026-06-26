@@ -125,3 +125,53 @@ export async function runJson<T>(args: string[], cwd?: string): Promise<T> {
   }
   return parsed as T;
 }
+
+// ---- Code-set (translation table) CLI bridge --------------------------------------------------
+// Thin typed wrappers over `messagefoundry codeset <action>` (see docs/CODESETS.md / the contract).
+// Each reuses runJson, so a `{"error": ...}` body throws and the {compact} JSON shapes parse as-is.
+// A code set is read-only reference data in codesets/<name>.csv|.toml relative to the --config dir.
+
+// SUMMARY (one per code set, from `codeset list`).
+export interface CodeSetSummary {
+  name: string;
+  format: "csv" | "toml";
+  key: string;
+  columns: string[];
+  value_columns: string[];
+  shape: "scalar" | "dict";
+  entries: number;
+}
+
+// DETAIL/GRID (from `codeset show`; consumed by `codeset upsert`). Rows are an array-of-arrays of
+// strings, each inner row aligned to `columns` by position; row[0] is the lookup key.
+export interface CodeSetDetail {
+  name: string;
+  format: "csv" | "toml";
+  columns: string[];
+  rows: string[][];
+}
+
+/** `codeset list` — every code set under codesets/ as a SUMMARY, sorted by name. */
+export function codesetList(cwd?: string): Promise<CodeSetSummary[]> {
+  return runJson<CodeSetSummary[]>(["codeset", "list", "--config", configDir()], cwd);
+}
+
+/** `codeset show NAME` — the DETAIL/grid for one code set (a .toml one comes back read-only). */
+export function codesetShow(name: string, cwd?: string): Promise<CodeSetDetail> {
+  return runJson<CodeSetDetail>(["codeset", "show", "--config", configDir(), "--name", name], cwd);
+}
+
+/** `codeset upsert` — write codesets/NAME.csv from a DETAIL (the CLI validates + re-loads it). */
+export function codesetUpsert(detail: CodeSetDetail, cwd?: string): Promise<unknown> {
+  return runJson(["codeset", "upsert", "--config", configDir(), "--data", JSON.stringify(detail)], cwd);
+}
+
+/** `codeset rename NAME --to NEWNAME` — rename the file (keeps its extension). */
+export function codesetRename(name: string, to: string, cwd?: string): Promise<unknown> {
+  return runJson(["codeset", "rename", "--config", configDir(), "--name", name, "--to", to], cwd);
+}
+
+/** `codeset remove NAME` — delete codesets/NAME.csv|.toml. */
+export function codesetRemove(name: string, cwd?: string): Promise<unknown> {
+  return runJson(["codeset", "remove", "--config", configDir(), "--name", name], cwd);
+}

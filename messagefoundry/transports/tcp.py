@@ -46,6 +46,7 @@ from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_FRAME_BYTES,
     DEFAULT_RECEIVE_TIMEOUT,
+    _peer_host,
 )
 
 __all__ = ["TcpSource", "TcpDestination"]
@@ -236,6 +237,19 @@ class TcpSource(SourceConnector):
             await self._server.wait_closed()
             self._server = None
 
+    async def _emit_event(
+        self, kind: str, *, peer_host: str | None = None, reason: str | None = None
+    ) -> None:
+        """Fire one connection event (Corepoint-style log, #46) to the injected sink, fail-soft — a
+        capture/store hiccup must never raise into the per-client loop. No-op when the sink is unset."""
+        sink = self.on_connection_event
+        if sink is None:
+            return
+        try:
+            await sink(kind, peer_host, reason)
+        except Exception as exc:
+            logger.warning("TCP connection-event emit failed: %s", safe_exc(exc))
+
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
         # Register before anything else so stop() can always find + close this connection (H-2).
@@ -243,6 +257,10 @@ class TcpSource(SourceConnector):
         self._clients.add(writer)
         if task is not None:
             self._client_tasks.add(task)
+        peer_host = _peer_host(writer)
+        established = False  # paired with a single `closed` event on a clean/idle end
+        failed = False  # an error close is covered by its specific failure kind — don't double-emit
+        close_reason = "eof"
         try:
             if self.source_ip_allowlist is not None:
                 peer = writer.get_extra_info("peername")
@@ -250,10 +268,14 @@ class TcpSource(SourceConnector):
                     logger.warning(
                         "TCP connection from %s refused: not in source_ip_allowlist", peer
                     )
+                    await self._emit_event("peer_not_allowlisted", peer_host=peer_host)
                     return  # not allowlisted — refuse (closed in the outer finally; _active untouched)
             if self.max_connections is not None and self._active >= self.max_connections:
+                await self._emit_event("at_capacity", peer_host=peer_host)
                 return  # at capacity — refuse the new client (closed in the outer finally)
             self._active += 1
+            established = True
+            await self._emit_event("established", peer_host=peer_host)
             try:
                 decoder = self.codec.decoder(max_frame_bytes=self.max_frame_bytes)
                 while True:
@@ -261,6 +283,7 @@ class TcpSource(SourceConnector):
                         try:
                             chunk = await asyncio.wait_for(reader.read(4096), self.receive_timeout)
                         except asyncio.TimeoutError:
+                            close_reason = "idle_timeout"
                             break  # idle past receive_timeout — close the connection
                     else:
                         chunk = await reader.read(4096)
@@ -277,6 +300,10 @@ class TcpSource(SourceConnector):
                         logger.warning(
                             "TCP frame from %s over cap; closing connection: %s", peer, exc
                         )
+                        failed = True
+                        await self._emit_event(
+                            "frame_oversize", peer_host=peer_host, reason=safe_exc(exc)
+                        )
                         break  # drop the connection rather than buffer without bound
                     except OSError:
                         raise  # peer reset / write failure → handled by the outer OSError catch (quiet)
@@ -287,9 +314,14 @@ class TcpSource(SourceConnector):
                         logger.error(
                             "TCP connection from %s failed unexpectedly: %s", peer, safe_exc(exc)
                         )
+                        failed = True
+                        await self._emit_event(
+                            "framing_error", peer_host=peer_host, reason=safe_exc(exc)
+                        )
                         break
-            except OSError:
-                pass  # peer reset; nothing to do but drop the connection
+            except OSError as exc:
+                failed = True  # peer reset; nothing to do but drop the connection
+                await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
             finally:
                 self._active -= 1
         finally:
@@ -301,6 +333,8 @@ class TcpSource(SourceConnector):
                 await writer.wait_closed()
             except OSError:
                 pass
+            if established and not failed:
+                await self._emit_event("closed", peer_host=peer_host, reason=close_reason)
 
 
 register_destination(ConnectorType.TCP, TcpDestination)

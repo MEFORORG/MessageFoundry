@@ -11,7 +11,17 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.wiring import WiringError, load_config, validate_config
+from messagefoundry.config.wiring import (
+    API_LISTENER_LABEL,
+    MLLP,
+    PortConflictError,
+    Registry,
+    WiringError,
+    build_inbound_connection,
+    inbound_binding_conflicts,
+    load_config,
+    validate_config,
+)
 from messagefoundry.parsing import Message
 
 _MSG = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01^ADT_A01|MSG1|P|2.5.1\rEVN|A01|20260101\r"
@@ -183,6 +193,138 @@ def test_validate_config_reports_port_collision(tmp_path: Path) -> None:
     )
     diags = validate_config(tmp_path)
     assert any("both bind port 2575" in d.message for d in diags)
+
+
+def test_same_port_different_bind_address_is_not_a_collision(tmp_path: Path) -> None:
+    # Interface-aware (low-13): two listeners share a port but bind DIFFERENT explicit interfaces
+    # (a multi-NIC host) — they don't actually contend, so this must load cleanly. The old port-only
+    # check false-positived here.
+    _write(
+        tmp_path,
+        """
+        from messagefoundry import inbound, MLLP, router
+        inbound("a", MLLP(port=2575), router="r", bind_address="127.0.0.1")
+        inbound("b", MLLP(port=2575), router="r", bind_address="10.0.0.5")
+
+        @router("r")
+        def route(msg):
+            return []
+        """,
+    )
+    reg = load_config(tmp_path)  # no WiringError
+    assert reg.port_collisions() == []
+
+
+def test_wildcard_bind_overlaps_a_specific_interface_on_the_same_port(tmp_path: Path) -> None:
+    # A wildcard (0.0.0.0 = every interface) DOES contend with a specific-interface bind on the same
+    # port — flag it even though the host strings differ.
+    _write(
+        tmp_path,
+        """
+        from messagefoundry import inbound, MLLP, router
+        inbound("a", MLLP(port=2575), router="r", bind_address="0.0.0.0")
+        inbound("b", MLLP(port=2575), router="r", bind_address="127.0.0.1")
+
+        @router("r")
+        def route(msg):
+            return []
+        """,
+    )
+    with pytest.raises(WiringError, match="both bind port 2575"):
+        load_config(tmp_path)
+
+
+def test_database_poll_sources_sharing_the_sql_port_are_not_flagged(tmp_path: Path) -> None:
+    # A DATABASE poll source carries a `port` (the SQL server's) but DIALS OUT — it never binds a
+    # listener, so two of them on 1433 must NOT be mistaken for a bind collision.
+    _write(
+        tmp_path,
+        """
+        from messagefoundry import inbound, DatabasePoll, router
+        inbound("a", DatabasePoll(server="db1", database="d", poll_statement="SELECT 1"), router="r")
+        inbound("b", DatabasePoll(server="db2", database="d", poll_statement="SELECT 1"), router="r")
+
+        @router("r")
+        def route(msg):
+            return []
+        """,
+    )
+    reg = load_config(tmp_path)
+    assert reg.port_collisions() == []
+
+
+def test_inbound_binding_conflicts_resolves_env_ports(tmp_path: Path) -> None:
+    # env() ports are invisible to the literal-only static check, but the runner's authoritative pass
+    # resolves them against the instance's values: two listeners that resolve to the SAME port collide.
+    _write(
+        tmp_path,
+        """
+        from messagefoundry import inbound, MLLP, router, env
+        inbound("a", MLLP(port=env("p1", cast=int)), router="r")
+        inbound("b", MLLP(port=env("p2", cast=int)), router="r")
+
+        @router("r")
+        def route(msg):
+            return []
+        """,
+    )
+    reg = load_config(tmp_path)
+    assert reg.port_collisions() == []  # literal-only static check can't see env() ports
+    same = inbound_binding_conflicts(
+        reg, bind_host="127.0.0.1", env_values={"p1": "2575", "p2": "2575"}
+    )
+    assert any("both bind port 2575" in m for m in same)
+    # Distinct resolved ports → no conflict.
+    assert (
+        inbound_binding_conflicts(
+            reg, bind_host="127.0.0.1", env_values={"p1": "2575", "p2": "2576"}
+        )
+        == []
+    )
+
+
+def test_inbound_binding_conflicts_reserves_the_api_port() -> None:
+    # An inbound wired onto the engine's own API listener port is caught here, naming the reservation —
+    # rather than surfacing as a bare bind OSError once uvicorn already holds it.
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("a", MLLP(port=8765), router="r"))
+    msgs = inbound_binding_conflicts(
+        reg,
+        bind_host="127.0.0.1",
+        env_values={},
+        reserved=((API_LISTENER_LABEL, "127.0.0.1", 8765),),
+    )
+    assert msgs and "reserved for" in msgs[0] and API_LISTENER_LABEL in msgs[0]
+    # A listener on a different port doesn't touch the reservation.
+    other = Registry()
+    other.add_inbound(build_inbound_connection("a", MLLP(port=2575), router="r"))
+    assert (
+        inbound_binding_conflicts(
+            other,
+            bind_host="127.0.0.1",
+            env_values={},
+            reserved=((API_LISTENER_LABEL, "127.0.0.1", 8765),),
+        )
+        == []
+    )
+
+
+def test_build_check_registry_raises_port_conflict_error_on_api_port() -> None:
+    # The authoritative reload/start pass raises PortConflictError (a WiringError subclass → API 422).
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.wiring_runner import build_check_registry
+
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("a", MLLP(port=8765), router="r"))
+    reg.add_router("r", lambda m: [])
+    with pytest.raises(PortConflictError, match="reserved for"):
+        build_check_registry(
+            reg,
+            inbound_bind_host="127.0.0.1",
+            env_values={},
+            egress=EgressSettings(),
+            reserved_bindings=((API_LISTENER_LABEL, "127.0.0.1", 8765),),
+        )
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX ownership check (CONFIG-2 / review M-21)")

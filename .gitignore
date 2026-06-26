@@ -64,3 +64,9 @@ TRANSCRIPTS.md
 /docs/security/DEPENDENCY-RESPONSE-A4-HANDOFF.md
 # vuln_metrics.py local CSV output (the CI run uploads it as an artifact; not committed)
 /docs/security/metrics/
+
+# Operator-local load/throughput profiles — tuned to a specific deployment's volume; kept OUT of the
+# OSS repo + public mirror (the plan itself lives on the operator share, WIN2025-LOAD-THROUGHPUT-MATRIX.md).
+# Still usable by name (they sit in PROFILES_DIR) and copy-on to the test box.
+/harness/load/profiles/hospital-baseline.toml
+/harness/load/profiles/soak-12h.toml

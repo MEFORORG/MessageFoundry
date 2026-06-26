@@ -56,6 +56,7 @@ from messagefoundry.api.models import (
     ClusterNode,
     ClusterNodeList,
     ClusterStatus,
+    ConnectionEventInfo,
     ConnectionMetadata,
     ConnectionRow,
     ConnectionTestResult,
@@ -988,6 +989,51 @@ def create_app(
 
     # --- dead letters (verify + recover) -------------------------------------
 
+    def _conn_event_info(e: Any) -> ConnectionEventInfo:
+        return ConnectionEventInfo(
+            id=e.id,
+            ts=e.ts,
+            connection=e.connection,
+            transport=e.transport,
+            direction=e.direction,
+            kind=e.kind,
+            peer_host=e.peer_host,
+            message_id=e.message_id,
+            reason=e.reason,
+        )
+
+    @app.get("/events", response_model=list[ConnectionEventInfo])
+    async def list_connection_events(
+        engine: Engine = Depends(_get_engine),
+        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        connection: str | None = Query(None, max_length=256),
+        kind: list[str] | None = Query(None),
+        since: float | None = Query(None, ge=0),
+        limit: int = Query(100, ge=1, le=1000),
+    ) -> list[ConnectionEventInfo]:
+        """The Corepoint-style connection/transport event log (#46), newest first — **metadata only,
+        no PHI**, so it is gated by ``monitoring:read`` (not the PHI-read tier). Optionally filtered by
+        ``connection``, one-or-more event ``kind``s, and a ``since`` epoch timestamp."""
+        rows = await engine.store.list_connection_events(
+            connection=connection, kinds=kind, since=since, limit=limit
+        )
+        return [_conn_event_info(r) for r in rows]
+
+    @app.get("/connections/{name}/events", response_model=list[ConnectionEventInfo])
+    async def list_connection_events_for(
+        name: str,
+        engine: Engine = Depends(_get_engine),
+        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        kind: list[str] | None = Query(None),
+        since: float | None = Query(None, ge=0),
+        limit: int = Query(100, ge=1, le=1000),
+    ) -> list[ConnectionEventInfo]:
+        """The connection/transport event log scoped to one connection (#46), newest first."""
+        rows = await engine.store.list_connection_events(
+            connection=name, kinds=kind, since=since, limit=limit
+        )
+        return [_conn_event_info(r) for r in rows]
+
     @app.get("/dead-letters", response_model=DeadLetterList)
     async def list_dead_letters(
         request: Request,
@@ -1682,6 +1728,8 @@ def create_managed_app(
     buildup_default: BuildupThreshold | None = None,
     ack_after_default: AckAfter | None = None,
     max_correlation_depth: int = 8,
+    connection_events: bool = True,
+    response_sent_default: bool = True,
     env_values: Mapping[str, Any] | None = None,
     env_values_provider: Callable[[], Mapping[str, Any]] | None = None,
     auth_settings: AuthSettings | None = None,
@@ -1690,6 +1738,7 @@ def create_managed_app(
     retention_settings: RetentionSettings | None = None,
     cert_monitor_settings: CertMonitorSettings | None = None,
     api_tls_cert_file: str | None = None,
+    api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
     egress_settings: EgressSettings | None = None,
     shadow_settings: ShadowSettings | None = None,
@@ -1704,7 +1753,9 @@ def create_managed_app(
     ``synchronous``) as a SQLite shortcut. ``config_dir`` loads the code-first Connection/Router/
     Handler graph. ``auth_settings`` (when enabled) attaches an :class:`AuthService`, seeds the
     built-in roles, and creates a bootstrap admin on first run. The store is opened via the
-    backend-agnostic :func:`~messagefoundry.store.open_store`.
+    backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
+    ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
+    — the CLI server passes it; in-process/test callers omit it (no separate API socket is bound).
     """
     if store_settings is None:
         if db_path is None:
@@ -1734,6 +1785,8 @@ def create_managed_app(
             store,
             poll_interval=poll_interval,
             max_correlation_depth=max_correlation_depth,
+            connection_events=connection_events,
+            response_sent_default=response_sent_default,
             config_dir=config_dir,
             config_reload_roots=config_reload_roots,
             inbound_bind_host=inbound_bind_host,
@@ -1747,6 +1800,7 @@ def create_managed_app(
             retention_settings=retention_settings,
             cert_monitor_settings=cert_monitor_settings,
             api_tls_cert_file=api_tls_cert_file,
+            api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
             shadow_settings=shadow_settings,

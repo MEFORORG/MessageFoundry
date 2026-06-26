@@ -25,6 +25,7 @@ from messagefoundry.config.models import ConnectorType, Destination, Source
 
 __all__ = [
     "InboundHandler",
+    "ConnectionEventSink",
     "DeliveryError",
     "NegativeAckError",
     "TestNotSupportedError",
@@ -43,6 +44,13 @@ __all__ = [
 # callback and sends whatever it returns back to the sender. Return ``None`` for
 # fire-and-forget transports (e.g. file) that have no reply channel.
 InboundHandler = Callable[[bytes], Awaitable[str | None]]
+
+# A source emits connection-lifecycle / transport events (Corepoint-style log, #46) to this OPTIONAL,
+# store-agnostic sink: ``(kind, peer_host, reason)``. The runner injects it after build and binds the
+# connection name + transport + direction; the source only knows the wire-level facts. ``None`` (the
+# default) makes every emit site a no-op (byte-identical when off). Metadata only — never a raw frame
+# or message body; the source passes a ``safe_exc``-scrubbed reason and the store scrubs again (#120).
+ConnectionEventSink = Callable[[str, str | None, str | None], Awaitable[None]]
 
 
 def _peer_ip(peername: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -166,6 +174,13 @@ class SourceConnector(abc.ABC):
 
     # Documentation flag (see the class docstring): True on poll sources, False on listen sources.
     polls_shared_resource: ClassVar[bool] = False
+
+    #: Optional connection-event sink (Corepoint-style log, #46), **injected by the runner after build**
+    #: (not a builder arg, not a settings value — same runtime-injection shape as ``leader_gate`` is
+    #: passed). A listen source (MLLP/TCP) calls it on accept / refuse / close; ``None`` (the default)
+    #: makes every emit site a no-op, so a poll/file source that never sets it is byte-identical. Keeping
+    #: it an injected awaitable keeps ``transports/`` free of any ``store``/``pipeline`` import.
+    on_connection_event: ConnectionEventSink | None = None
 
     @abc.abstractmethod
     async def start(

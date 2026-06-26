@@ -378,6 +378,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
+        # #46: an outbound lane went down. The shared _emit throttle keys on (type, connection), so a
+        # retry storm on one lane collapses to one notification per cooldown. detail is safe_exc-scrubbed.
+        self._emit({"type": "connection_error", "connection": name, "kind": kind, "detail": detail})
+
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
         # The DB path stands in for "connection" so the realert throttle + subject keying work
         # uniformly; the event carries no message content (no PHI), only sizes.

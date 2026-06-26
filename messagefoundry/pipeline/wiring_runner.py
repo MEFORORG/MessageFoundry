@@ -23,12 +23,13 @@ Reuses the store, the connector registry, and the ACK builder.
 from __future__ import annotations
 
 import asyncio
+import errno
 import functools
 import json
 import logging
 import time
 import urllib.parse
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -51,9 +52,13 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     InboundConnection,
     OutboundConnection,
+    PortConflictError,
     Registry,
     WiringError,
+    bindings_overlap,
+    inbound_binding_conflicts,
     resolve_env_settings,
+    resolve_listener_binding,
 )
 from messagefoundry.parsing import HL7PeekError, Peek, RawMessage, normalize, summarize, validate
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -69,6 +74,7 @@ from messagefoundry.transports import (
     build_destination,
     build_source,
 )
+from messagefoundry.transports.base import ConnectionEventSink
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.mllp import build_ack
 
@@ -84,6 +90,12 @@ _WORKER_ERROR_BACKOFF_SECONDS = 1.0
 # so an ongoing stall reminds the operator without spamming on every backed-off retry.
 _BUILDUP_REALERT_SECONDS = 300.0
 
+# Bound on the in-runner connection-event queue (#46). A flood of refused/garbage connections can't grow
+# memory without limit — excess events are dropped + counted (a diagnostic log, not a reliability surface).
+_CONN_EVENT_QUEUE_MAX = 10000
+# How long teardown waits for the drain queue to flush before cancelling the drainer (bounded shutdown).
+_CONN_EVENT_FLUSH_GRACE = 2.0
+
 # The ingress worker has no per-message "failure" to hang a buildup check on (a slow-but-working
 # router just falls behind), so it polls the lane depth at most this often — bounding the extra
 # COUNT+MIN query rate on the ingress hot path regardless of throughput.
@@ -93,6 +105,13 @@ _BUILDUP_CHECK_INTERVAL = 1.0
 # A live lookup that exceeds this raises (→ the message's transform fails and dead-letters) rather than
 # pinning a worker thread forever; the orphaned query still completes on the loop and releases its conn.
 _LOOKUP_RESULT_TIMEOUT_SECONDS = 30.0
+
+# OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
+# PortConflictError naming the connection + binding, instead of a bare unattributed OSError aborting the
+# inbound. EADDRINUSE: another process/instance holds it; EADDRNOTAVAIL: the bind_address isn't a local
+# interface; EACCES: a privileged port (<1024) without permission. The within-graph + reserved-port
+# cases are caught statically before the bind (_guard_port_conflict); this catches the EXTERNAL ones.
+_BIND_CONFLICT_ERRNOS = frozenset({errno.EADDRINUSE, errno.EADDRNOTAVAIL, errno.EACCES})
 
 
 def _peek_for_loopback(
@@ -124,6 +143,7 @@ class RegistryRunner:
         poll_interval: float = 0.25,
         claim_limit: int = 20,
         inbound_bind_host: str = "127.0.0.1",
+        reserved_bindings: Sequence[tuple[str, str, int]] = (),
         allow_insecure_bind: bool = False,
         delivery_defaults: RetryPolicy | None = None,
         ordering_default: OrderingMode | None = None,
@@ -137,6 +157,8 @@ class RegistryRunner:
         active_environment: str | None = None,
         coordinator: ClusterCoordinator | None = None,
         max_correlation_depth: int = 8,
+        connection_events: bool = True,
+        response_sent_default: bool = True,
     ) -> None:
         self.registry = registry
         self.store = store
@@ -176,6 +198,12 @@ class RegistryRunner:
         # The interface inbound listeners bind to (service-level; authors never set a host). Loopback
         # by default — see config.settings.InboundSettings.bind_host.
         self._inbound_bind_host = inbound_bind_host
+        # Reserved service bindings a listener must not steal — each (label, host, port), e.g. the
+        # engine's own API listener ([api].host:[api].port). Threaded from the Engine (empty in
+        # tests/embedding, where no API socket is bound). Consulted by the static port-conflict pass
+        # (build_check / start) so an inbound on the API port is refused with a clear message, not a
+        # bare OSError once uvicorn already holds it.
+        self._reserved_bindings: tuple[tuple[str, str, int], ...] = tuple(reserved_bindings)
         # Whether `serve --allow-insecure-bind` was passed — the dev escape that downgrades the MLLP
         # exposed-gate (a non-loopback plaintext bind) from refuse to a loud warning (ADR 0002 §0).
         self._allow_insecure_bind = allow_insecure_bind
@@ -205,6 +233,11 @@ class RegistryRunner:
         self._buildup: dict[str, BuildupThreshold] = {}
         # Effective per-connection egress-suppression (#15): per-connection simulate= OR simulate_all.
         self._simulate: dict[str, bool] = {}
+        # Per-outbound-lane health (#46), for the edge-triggered connection_lost/restored events. True
+        # (or unset) = healthy; flipped on the FIRST transport DeliveryError and back on the next
+        # success, so a retry storm emits one transition pair, not one per delivery. A partner reject
+        # (NegativeAckError) is not a transport failure and never flips it.
+        self._lane_healthy: dict[str, bool] = {}
         # Connections that FAILED to build/bind at start (name → reason). A failed connection is
         # isolated, never fatal — the rest of the graph still comes up (a failed connection must not
         # crash the engine, ADR 0031). A failed OUTBOUND still gets its delivery worker, but with no
@@ -232,6 +265,17 @@ class RegistryRunner:
         # is produced (a captured reply owes a re-ingress) — a sibling of _ingress_work/_routed_work.
         self._response_work = asyncio.Event()
         self._work = asyncio.Event()
+        # Connection-event log (Corepoint-style #46): on each listen source the runner injects a sink
+        # that put_nowait's an event dict onto this bounded queue; a single drain task writes them to the
+        # store OFF the accept/delivery hot path (pure observer — the listener never awaits a store
+        # write). connection_events=False → no sink injected (byte-identical). Created in start(), torn
+        # down (after a best-effort flush) in _teardown_unsafe.
+        self._connection_events = connection_events
+        # Master switch for "Response Sent" ACK capture (#46); a per-inbound capture_ack overrides it.
+        self._response_sent_default = response_sent_default
+        self._conn_event_q: asyncio.Queue[dict[str, Any]] | None = None
+        self._conn_event_drainer: asyncio.Task[None] | None = None
+        self._conn_events_dropped = 0
         self._running = False
         self._reload_lock = asyncio.Lock()  # serialize concurrent reloads
 
@@ -256,6 +300,117 @@ class RegistryRunner:
         """Replace the environment values used to resolve ``env()`` refs when (re)building connectors.
         The engine calls this on reload so a promote picks up edited values without a restart (M-23)."""
         self._env_values = dict(values)
+
+    # --- connection-event capture (Corepoint-style transport/lifecycle log, #46) ----------------
+    def _make_connection_event_sink(self, ic: InboundConnection) -> ConnectionEventSink | None:
+        """The per-inbound sink the runner injects on a source, or ``None`` when capture is off (→ the
+        source's emit sites are no-ops, byte-identical). The closure binds the connection name +
+        transport + ``direction='inbound'``; the source supplies ``(kind, peer_host, reason)``. It only
+        ``put_nowait``'s onto the bounded drain queue — never an awaited store write — so a listener's
+        accept path is never blocked by capture (pure observer). The per-inbound
+        ``capture_connection_errors`` overrides the ``[diagnostics].connection_events`` master switch
+        (``None`` = inherit)."""
+        enabled = ic.capture_connection_errors
+        if enabled is None:
+            enabled = self._connection_events
+        if not enabled:
+            return None
+        name = ic.name
+        transport = ic.spec.type.value
+
+        async def _sink(kind: str, peer_host: str | None, reason: str | None) -> None:
+            self._enqueue_connection_event(
+                connection=name,
+                transport=transport,
+                direction="inbound",
+                kind=kind,
+                peer_host=peer_host,
+                message_id=None,
+                reason=reason,
+            )
+
+        return _sink
+
+    def _enqueue_connection_event(self, **fields: Any) -> None:
+        """Non-blocking enqueue onto the drain queue (#46). On overflow drop the event + count it — a
+        connection-event flood must never block a listener/delivery lane or grow memory unbounded."""
+        q = self._conn_event_q
+        if q is None:
+            return
+        try:
+            q.put_nowait(fields)
+        except asyncio.QueueFull:
+            self._conn_events_dropped += 1
+
+    async def _connection_event_drainer(self) -> None:
+        """Write queued connection events to the store OFF the listener/delivery hot path (#46). One
+        write per event, **fail-soft**: a store error drops that one observation, never a message or the
+        listener. Cancelled (after a best-effort flush) on teardown."""
+        q = self._conn_event_q
+        assert q is not None
+        while True:
+            fields = await q.get()
+            try:
+                await self.store.record_connection_event(**fields)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("connection-event write failed; dropping one event")
+            finally:
+                q.task_done()
+
+    def _outbound_transport(self, name: str) -> str:
+        """The transport label of an outbound connection for a connection event, read live from the
+        registry (a reload can swap it). ``'unknown'`` if the connection is gone mid-reconcile."""
+        oc = self.registry.outbound.get(name)
+        return oc.spec.type.value if oc is not None else "unknown"
+
+    def _note_lane_unhealthy(self, name: str, message_id: str, exc: BaseException) -> None:
+        """Edge-trigger ``connection_lost`` + a throttled ``connection_error`` alert on the FIRST
+        transport ``DeliveryError`` after the lane was healthy (#46) — not per retry. No-op when capture
+        is off (byte-identical) or the lane is already marked down."""
+        if not self._connection_events or not self._lane_healthy.get(name, True):
+            return
+        self._lane_healthy[name] = False
+        reason = safe_exc(exc)
+        self._enqueue_connection_event(
+            connection=name,
+            transport=self._outbound_transport(name),
+            direction="outbound",
+            kind="connection_lost",
+            peer_host=None,
+            message_id=message_id,
+            reason=reason,
+        )
+        try:
+            self._alert_sink.connection_error(name, kind="connection_lost", detail=reason)
+        except Exception:
+            log.warning("alert sink raised on connection_error for %r", name)
+
+    def _note_lane_healthy(self, name: str) -> None:
+        """Edge-trigger ``connection_restored`` on the FIRST successful delivery after the lane was down
+        (#46). Store-row only (a recovery needs no alert). No-op when capture is off or already healthy."""
+        if not self._connection_events or self._lane_healthy.get(name, True):
+            return
+        self._lane_healthy[name] = True
+        self._enqueue_connection_event(
+            connection=name,
+            transport=self._outbound_transport(name),
+            direction="outbound",
+            kind="connection_restored",
+            peer_host=None,
+            message_id=None,
+            reason=None,
+        )
+
+    def _capture_ack_enabled(self, ic: InboundConnection) -> bool:
+        """Whether to record the "Response Sent" ACK for this inbound (ADR 0021, #46). Only a reply-
+        capable LISTEN source (MLLP/TCP) actually returns an ACK to a sender — a FILE/DB/poll source has
+        no reply channel, so it captures nothing (ADR 0021 §3). The per-inbound ``capture_ack`` overrides
+        the ``[diagnostics].response_sent`` master switch (``None`` = inherit)."""
+        if ic.spec.type not in (ConnectorType.MLLP, ConnectorType.TCP):
+            return False
+        return ic.capture_ack if ic.capture_ack is not None else self._response_sent_default
 
     def _build_lookup_executor(self) -> DatabaseLookupExecutor | None:
         """Build the pooled live-lookup executor from the current graph's ``DatabaseLookup`` specs, or
@@ -369,6 +524,37 @@ class RegistryRunner:
             await self._stop_inbound_unsafe(name)
             await self._start_inbound_unsafe(name)
 
+    def _guard_port_conflict(self, ic: InboundConnection) -> None:
+        """Refuse to bind ``ic`` if its resolved ``(host, port)`` collides with a reserved service
+        binding (the API listener) or an already-bound sibling source — raising :class:`PortConflictError`
+        before the bind. A no-op for a non-listener or an unresolvable ``env()`` port (nothing to
+        compare). Per-connection by design: when the second of a conflicting pair starts, the first is
+        already in ``_sources`` and is named here, so it stays up while this one is isolated (ADR 0031);
+        the whole-graph view is covered by :func:`inbound_binding_conflicts` at build_check/reload."""
+        binding = resolve_listener_binding(
+            ic, bind_host=self._inbound_bind_host, env_values=self._env_values
+        )
+        if binding is None:
+            return
+        host, port = binding
+        for label, rhost, rport in self._reserved_bindings:
+            if bindings_overlap(host, port, rhost, rport):
+                raise PortConflictError(
+                    f"inbound connection {ic.name!r} binds port {port}, reserved for {label}"
+                )
+        for other_name in self._sources:
+            other = self.registry.inbound.get(other_name)
+            if other is None:
+                continue
+            other_binding = resolve_listener_binding(
+                other, bind_host=self._inbound_bind_host, env_values=self._env_values
+            )
+            if other_binding is not None and bindings_overlap(host, port, *other_binding):
+                raise PortConflictError(
+                    f"inbound connection {ic.name!r} cannot bind port {port}: already bound by "
+                    f"{other_name!r}"
+                )
+
     async def _start_inbound_unsafe(self, name: str) -> None:
         """start_inbound body without the reload lock — for callers that already hold it (start,
         reload). asyncio.Lock isn't reentrant, so the public wrappers must not call each other."""
@@ -385,6 +571,12 @@ class RegistryRunner:
                 f"inbound connection {name!r}: ack_after='delivered' is not yet implemented "
                 "(Step A ships ACK-on-receipt only — use ack_after='ingest', the default)"
             )
+        # Refuse a listener whose resolved (host, port) collides with a reserved service binding (the
+        # API listener) or an already-bound sibling — BEFORE the bind, so the message names the
+        # contended port + the other side rather than surfacing as a bare OSError on the loser of an OS
+        # bind race. The external case (another process holds the port) can't be known statically; the
+        # source.start() bind below classifies that OSError into the same PortConflictError.
+        self._guard_port_conflict(ic)
         source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
         check_source_allowed(source_cfg, ic.name, self._egress)  # fail-closed connect allowlist
         # Exposed-gate (ADR 0002 §0 / ADR 0025 §9): refuse a non-loopback MLLP or DICOM SCP listener
@@ -392,6 +584,10 @@ class RegistryRunner:
         check_mllp_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
         check_dimse_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
         source = build_source(source_cfg)
+        # Inject the connection-event sink (#46) BEFORE start so a listen source can emit accept/refuse/
+        # close. None when capture is off (byte-identical). transports/ stays store-agnostic — the sink
+        # is a runner-owned coroutine that only enqueues onto the off-hot-path drain queue.
+        source.on_connection_event = self._make_connection_event_sink(ic)
         # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
         # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/
         # free of any pipeline/cluster import. Only POLL sources act on it — they skip a scan when it
@@ -400,7 +596,26 @@ class RegistryRunner:
         # single-node (NullCoordinator) is_leader is always True, so every poll source scans as before.
         # Bind BEFORE registering: a failed bind (e.g. port in use) must not leave a dead source in
         # _sources, where inbound_running() would report True and a retry would no-op (review M-9).
-        await source.start(self._make_handler(ic), leader_gate=self._coordinator.is_leader)
+        try:
+            await source.start(self._make_handler(ic), leader_gate=self._coordinator.is_leader)
+        except OSError as exc:
+            # Classify a bind failure (port already taken by an EXTERNAL process, an unavailable
+            # bind_address, a privileged port) into a named PortConflictError so the operator sees which
+            # connection + binding failed, not a bare unattributed OSError. Re-raised, so ADR 0031's
+            # per-connection isolation in start() records it failed (engine DEGRADED) — or a direct
+            # start_inbound caller (console) gets the clear reason. Non-bind OSErrors propagate as-is.
+            if exc.errno in _BIND_CONFLICT_ERRNOS:
+                host = source_cfg.settings.get("host")
+                port = source_cfg.settings.get("port")
+                detail = (
+                    "another process or instance is already bound there"
+                    if exc.errno == errno.EADDRINUSE
+                    else (exc.strerror or "bind failed")
+                )
+                raise PortConflictError(
+                    f"inbound connection {name!r}: cannot bind {host}:{port} — {detail}"
+                ) from exc
+            raise
         self._sources[name] = source
         self._failed.pop(
             name, None
@@ -492,6 +707,11 @@ class RegistryRunner:
             self._stop.clear()
             # Capture the engine loop so a handler's worker thread can bridge a db_lookup back onto it.
             self._loop = asyncio.get_running_loop()
+            # Connection-event drain task (#46): created before any source binds so an early accept's
+            # enqueued event has a consumer. Skipped entirely when capture is off (no sink, no queue).
+            if self._connection_events:
+                self._conn_event_q = asyncio.Queue(maxsize=_CONN_EVENT_QUEUE_MAX)
+                self._conn_event_drainer = asyncio.create_task(self._connection_event_drainer())
             try:
                 # Per-connection fault isolation (ADR 0031): a single outbound build / inbound bind
                 # failure no longer aborts startup — it is recorded + alerted and the rest of the graph
@@ -567,6 +787,19 @@ class RegistryRunner:
         for task in (*self._workers.values(), *inbound_tasks):
             task.cancel()
         await asyncio.gather(*self._workers.values(), *inbound_tasks, return_exceptions=True)
+        # Connection-event drainer (#46): sources are stopped above, so no new events enqueue — flush
+        # what's queued (bounded), then cancel the drainer. Un-flushed events on a hard crash are lost by
+        # design (a diagnostic trail, not a reliability surface).
+        if self._conn_event_drainer is not None:
+            if self._conn_event_q is not None:
+                try:
+                    await asyncio.wait_for(self._conn_event_q.join(), _CONN_EVENT_FLUSH_GRACE)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            self._conn_event_drainer.cancel()
+            await asyncio.gather(self._conn_event_drainer, return_exceptions=True)
+            self._conn_event_drainer = None
+            self._conn_event_q = None
         for connector in self._destinations.values():
             await connector.aclose()
         if self._lookup_executor is not None:
@@ -581,6 +814,7 @@ class RegistryRunner:
         self._internal_error.clear()
         self._buildup.clear()
         self._simulate.clear()
+        self._lane_healthy.clear()
         self._next_buildup_alert.clear()
         self._sources.clear()
         self._running = False
@@ -674,6 +908,7 @@ class RegistryRunner:
             inbound_bind_host=self._inbound_bind_host,
             env_values=self._env_values,
             egress=self._egress,
+            reserved_bindings=self._reserved_bindings,
         )
 
     async def _reconcile_outbounds(self, old: Registry, new: Registry) -> None:
@@ -838,19 +1073,30 @@ class RegistryRunner:
                 else raw.decode(encoding)
             )
         except UnicodeDecodeError as exc:
-            await self.store.record_received(
+            decode_err = f"decode error ({encoding}): {safe_exc(exc)}"
+            mid = await self.store.record_received(
                 channel_id=ic.name,
                 raw=raw.decode("latin-1"),  # lossless byte view — the declared encoding rejected it
                 status=MessageStatus.ERROR,
-                error=f"decode error ({encoding}): {safe_exc(exc)}",
+                error=decode_err,
                 source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
-            return (
+            ack = (
                 build_ack(raw, code="AR", text="decode error", ack_mode=ack_mode)
                 if (hl7v2 and reply)
                 else None
             )
+            if ack is not None and self._capture_ack_enabled(ic):
+                await self._capture_ack(
+                    mid,
+                    ic.name,
+                    ack_code="AR",
+                    ack_phase="decode",
+                    ack_body=None,
+                    detail=decode_err,
+                )
+            return ack
 
         if not hl7v2:
             # Payload-agnostic ingress (ADR 0004): a non-HL7 inbound skips HL7 peek/validate and the
@@ -870,14 +1116,20 @@ class RegistryRunner:
         try:
             peek = Peek.parse(text)
         except HL7PeekError as exc:
-            await self.store.record_received(
+            parse_err = f"parse error: {safe_exc(exc)}"
+            mid = await self.store.record_received(
                 channel_id=ic.name,
                 raw=text,
                 status=MessageStatus.ERROR,
-                error=f"parse error: {safe_exc(exc)}",
+                error=parse_err,
                 source_type=src,
             )
-            return build_ack(text, code="AR", text=str(exc), ack_mode=ack_mode) if reply else None
+            ack = build_ack(text, code="AR", text=str(exc), ack_mode=ack_mode) if reply else None
+            if ack is not None and self._capture_ack_enabled(ic):
+                await self._capture_ack(
+                    mid, ic.name, ack_code="AR", ack_phase="parse", ack_body=None, detail=parse_err
+                )
+            return ack
 
         if ic.validation.strict:
             # hl7apy validation is CPU-bound (full structure/cardinality parse) — run it off the event
@@ -893,14 +1145,26 @@ class RegistryRunner:
                 # needs) but cuts the value (review #120). The scrubbed text is gated behind
                 # messages:view_summary on read, like every other stored error.
                 persisted = f"strict-validation failed: {safe_text(joined)}"
-                await self._record(ic, peek, text, MessageStatus.ERROR, error=persisted)
+                mid = await self._record(ic, peek, text, MessageStatus.ERROR, error=persisted)
                 # The AE ACK goes back to the partner that SENT this message (their own data) and is
                 # transient (never persisted), so it may carry the fuller, bounded validation text.
-                return (
+                ack = (
                     build_ack(peek, code="AE", text=joined[:200], ack_mode=ack_mode)
                     if reply
                     else None
                 )
+                if ack is not None and self._capture_ack_enabled(ic):
+                    # PHI-1: the DURABLE ack detail is the safe_text-scrubbed `persisted`, NEVER the raw
+                    # `joined` (hl7apy quotes the offending field VALUE = PHI) — #120 preserved.
+                    await self._capture_ack(
+                        mid,
+                        ic.name,
+                        ack_code="AE",
+                        ack_phase="strict",
+                        ack_body=None,
+                        detail=persisted,
+                    )
+                return ack
 
         # ACK-on-receipt (staged pipeline, ADR 0001 Step A): persist the raw message durably to the
         # ingress stage, then ACK. Routing/transform/delivery run AFTER the ACK in the ingress worker,
@@ -909,7 +1173,7 @@ class RegistryRunner:
         # parse, and strict validation above stay synchronous and still NAK, preserving the partner
         # contract for a malformed message. ack_after='delivered' (defer the ACK) is rejected at
         # wiring in Step A, so this is always ACK-on-ingest.
-        await self.store.enqueue_ingress(
+        mid = await self.store.enqueue_ingress(
             channel_id=ic.name,
             raw=text,
             control_id=peek.control_id,
@@ -918,7 +1182,14 @@ class RegistryRunner:
             summary=summarize(peek) or None,
         )
         self._ingress_work.set()  # wake the router worker to route the freshly-committed message
-        return build_ack(peek, code="AA", ack_mode=ack_mode) if reply else None
+        ack = build_ack(peek, code="AA", ack_mode=ack_mode) if reply else None
+        if ack is not None and self._capture_ack_enabled(ic):
+            # The AA frame echoes MSH/MSA control fields; record_ack_sent stores its body only on an
+            # encrypted store (else NULL), so default-on capture never lands raw ACK PHI in the clear.
+            await self._capture_ack(
+                mid, ic.name, ack_code="AA", ack_phase="ingest", ack_body=ack, detail=None
+            )
+        return ack
 
     async def _record(
         self,
@@ -928,8 +1199,8 @@ class RegistryRunner:
         status: MessageStatus,
         *,
         error: str | None = None,
-    ) -> None:
-        await self.store.record_received(
+    ) -> str:
+        return await self.store.record_received(
             channel_id=ic.name,
             raw=raw,
             status=status,
@@ -939,6 +1210,34 @@ class RegistryRunner:
             source_type=ic.spec.type.value,
             summary=summarize(peek) or None,
         )
+
+    async def _capture_ack(
+        self,
+        message_id: str,
+        inbound_name: str,
+        *,
+        ack_code: str,
+        ack_phase: str,
+        ack_body: str | None,
+        detail: str | None,
+    ) -> None:
+        """Record the "Response Sent" ACK/NAK we returned to the sender (ADR 0021, #46) — SYNCHRONOUSLY
+        (no fire-and-forget vs key-rotation race) but **fail-soft**: a capture/store error must never
+        flip the ACK already computed nor tear down the listener. The store applies the PHI fail-safe
+        (AA body only on an encrypted store; every NAK body NULL; detail scrubbed)."""
+        outcome = "accepted" if ack_code in ("AA", "CA") else "rejected"
+        try:
+            await self.store.record_ack_sent(
+                message_id=message_id,
+                inbound_name=inbound_name,
+                ack_body=ack_body,
+                ack_code=ack_code,
+                ack_phase=ack_phase,
+                outcome=outcome,
+                detail=detail,
+            )
+        except Exception as exc:
+            log.warning("ack capture failed for %r: %s", inbound_name, safe_exc(exc))
 
     # --- delivery path -------------------------------------------------------
 
@@ -1030,6 +1329,8 @@ class RegistryRunner:
                         # per policy (retry-forever by default, so nothing is silently lost).
                         await self.store.mark_failed(item.id, safe_exc(exc), retry)
                         await self._maybe_alert_buildup(name)
+                        # #46: edge-trigger connection_lost (+ throttled alert) on the lane going down.
+                        self._note_lane_unhealthy(name, item.id, exc)
                     except Exception as exc:
                         # Internal/code error (our bug, not the partner). The per-connection policy
                         # decides: STOP halts the lane (preserve the message, alert an operator) while
@@ -1069,6 +1370,9 @@ class RegistryRunner:
                             item.id, f"internal error: {safe_exc(exc)}"
                         )
                     else:
+                        # #46: a successful delivery means the lane is up — edge-trigger
+                        # connection_restored if it had been marked down (no-op otherwise).
+                        self._note_lane_healthy(name)
                         # ADR 0013: a capturing outbound returns a DeliveryResponse; persist the reply
                         # AND mark the row done in ONE transaction (exactly-once capture). A non-capturing
                         # outbound returns None → plain mark_done, byte-identical. The XOR (never both)
@@ -1526,12 +1830,24 @@ def build_check_registry(
     inbound_bind_host: str,
     env_values: Mapping[str, Any],
     egress: EgressSettings,
+    reserved_bindings: Sequence[tuple[str, str, int]] = (),
 ) -> None:
     """Construct (and discard) every connector in ``registry`` + run the fail-closed connect/egress
     allowlists, so a bad connector spec or a non-allowlisted host fails as a :class:`WiringError`
     BEFORE anything is applied. The standalone core of :meth:`RegistryRunner.build_check`, callable
     offline — e.g. the ``connection`` CLI validating an edit before it persists (ADR 0007). Builds
     nothing live (no socket bind / file I/O — binding happens later in ``start_inbound``)."""
+    # Port-conflict pre-flight (env-resolved + reserved-port aware): a listener stealing a sibling's or
+    # the API's (host, port) fails the whole reload here, before quiescing, naming both ends — rather
+    # than half-applying and surfacing as a bare bind OSError. PortConflictError is a WiringError → 422.
+    conflicts = inbound_binding_conflicts(
+        registry,
+        bind_host=inbound_bind_host,
+        env_values=env_values,
+        reserved=reserved_bindings,
+    )
+    if conflicts:
+        raise PortConflictError("; ".join(conflicts))
     try:
         for ic in registry.inbound.values():
             source_cfg = _source_config(ic, inbound_bind_host, env_values)

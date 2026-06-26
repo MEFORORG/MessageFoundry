@@ -42,6 +42,14 @@ class AlertSink(Protocol):
         retry-forever head is blocking the lane. (Emitted by the buildup detector — ordering Layer 4b.)"""
         ...
 
+    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
+        """An outbound connection's delivery lane went **down** — the first transport failure
+        (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
+        one alert per lane per cooldown (#46, Corepoint "connection lost"). ``kind`` is the connection-
+        event kind (``connection_lost``); ``detail`` is a ``safe_exc``-scrubbed reason (no PHI). A
+        partner *rejection* (``NegativeAckError``) is NOT a connection error and never fires this."""
+        ...
+
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
         """The message store grew past the configured ``[retention] max_db_mb`` advisory threshold.
         Emitted by the :class:`~messagefoundry.pipeline.retention.RetentionRunner` once per pass while
@@ -72,6 +80,9 @@ class LoggingAlertSink:
             depth,
             oldest_age_seconds,
         )
+
+    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
+        log.warning("ALERT connection_error: outbound %r %s: %s", name, kind, detail or "")
 
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
         log.warning(

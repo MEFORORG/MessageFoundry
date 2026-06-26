@@ -35,7 +35,7 @@ import ipaddress
 import os
 import sys
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -98,6 +98,11 @@ __all__ = [
     "OutboundConnection",
     "Registry",
     "WiringError",
+    "PortConflictError",
+    "API_LISTENER_LABEL",
+    "inbound_binding_conflicts",
+    "resolve_listener_binding",
+    "bindings_overlap",
     "Diagnostic",
     "inbound",
     "outbound",
@@ -113,6 +118,16 @@ __all__ = [
 
 class WiringError(ValueError):
     """A connection/router/handler was declared wrong, or references something missing."""
+
+
+class PortConflictError(WiringError):
+    """Two inbound listeners — or a listener and a reserved service binding (the API listener) — want
+    the same ``(host, port)``.
+
+    A subclass of :class:`WiringError`, so every existing handler keeps working: the API still maps it
+    to 422, ``messagefoundry check`` still reports it, and the runner's ADR 0031 per-connection
+    isolation still records the offending inbound as failed (the engine comes up DEGRADED rather than
+    aborting). Callers that care can still catch the conflict specifically."""
 
 
 @dataclass(frozen=True)
@@ -1393,6 +1408,11 @@ class InboundConnection:
     metadata: Mapping[str, Any] | None = None
     bind_address: str | None = None
     source_ip_allowlist: tuple[str, ...] | None = None
+    # Corepoint-style event log overrides (#46): None = inherit the matching [diagnostics] master switch
+    # for this connection; True/False = explicit override. capture_ack → "Response Sent" (ADR 0021);
+    # capture_connection_errors → the inbound connection_event log (lifecycle + pre-ingress failures).
+    capture_ack: bool | None = None
+    capture_connection_errors: bool | None = None
     source_file: str | None = None  # where it was declared (for IDE go-to-definition)
     source_line: int | None = None
 
@@ -1415,6 +1435,168 @@ class OutboundConnection:
     )
     source_file: str | None = None
     source_line: int | None = None
+
+
+# --- inbound listener port-conflict detection (review low-13) -----------------
+# A listening source (MLLP/TCP/X12/DICOM C-STORE SCP) binds a local (host, port); two that bind the
+# SAME port on OVERLAPPING interfaces collide at OS bind time with an EADDRINUSE that would otherwise
+# abort the engine (or a single listener) with a bare, unattributed OSError. These primitives catch it
+# statically — Registry.port_collisions at validate/check/load (literal ports), inbound_binding_conflicts
+# (env-resolved + reserved-port aware) at the runner's start/reload — and the RegistryRunner also
+# classifies the runtime bind failure, so a conflict always names the connection(s) + the contended port.
+
+#: Connector types that bind a local listening port (so a port conflict is possible). File/Timer/
+#: Loopback/RemoteFile sources never bind a listening port. A DATABASE poll source carries a ``port``
+#: (the SQL server's), but it DIALS OUT — it must not be mistaken for a bind (a latent false positive
+#: the literal-port-only check used to have, now excluded by this filter).
+_LISTEN_TYPES: frozenset[ConnectorType] = frozenset(
+    {ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.X12, ConnectorType.DIMSE}
+)
+
+#: Host spellings that mean "every interface": a wildcard bind contends with ANY host on the same port.
+# B104 false positive: these are wildcard spellings we DETECT for port-conflict analysis, not a bind.
+_WILDCARD_HOSTS = frozenset({"", "0.0.0.0", "::", "*", "::0"})  # nosec B104
+
+#: Label for the reserved engine API-listener binding in a port-conflict message — the single source of
+#: truth shared by the engine (which reserves it at runtime) and the ``connection`` CLI (which reserves
+#: it when validating an edit). E.g. "inbound 'X' binds port 8765, reserved for the engine API listener
+#: ([api].port)".
+API_LISTENER_LABEL = "the engine API listener ([api].port)"
+
+
+@dataclass(frozen=True)
+class _Binding:
+    """One resolved listener binding for conflict comparison: a display ``label`` + normalized
+    ``host`` + ``port``. ``host`` is ``None`` when it inherits the (here-unknown) service
+    ``[inbound].bind_host`` — two such inheritors resolve to the same interface, so they overlap."""
+
+    label: str
+    host: str | None
+    port: int
+
+
+def _normalize_bind_host(host: str | None) -> str | None:
+    """Canonicalize a bind host for overlap comparison. ``None`` (inherit ``[inbound].bind_host``) is
+    kept as ``None``; a wildcard spelling (``0.0.0.0``/``::``/``*``) folds to ``"*"`` (binds every
+    interface); ``localhost`` folds to ``127.0.0.1``. IPv6 ``::1`` is left distinct from ``127.0.0.1``
+    (whether v4/v6 loopback contend is OS-dependent — the runtime bind catch backstops that edge)."""
+    if host is None:
+        return None
+    h = host.strip().lower()
+    if h in _WILDCARD_HOSTS:
+        return "*"
+    if h == "localhost":
+        return "127.0.0.1"
+    return h
+
+
+def _hosts_overlap(a: str | None, b: str | None) -> bool:
+    """Whether two normalized bind hosts contend for the same port. A wildcard (``"*"``) overlaps every
+    host; the inherit sentinel (``None``) overlaps another inheritor (same resolved bind_host) but NOT
+    an explicit distinct interface — that may be a different NIC, so don't false-positive (the runner's
+    env-resolved pass, which knows the real bind_host, decides those exactly)."""
+    if a == "*" or b == "*":
+        return True
+    if a is None or b is None:
+        return a is None and b is None
+    return a == b
+
+
+def _binding_conflicts(bindings: list[_Binding]) -> list[tuple[_Binding, _Binding]]:
+    """Every pair of bindings sharing a port on overlapping interfaces, in declaration order."""
+    out: list[tuple[_Binding, _Binding]] = []
+    for i, a in enumerate(bindings):
+        for b in bindings[i + 1 :]:
+            if a.port == b.port and _hosts_overlap(a.host, b.host):
+                out.append((a, b))
+    return out
+
+
+def _resolve_port(raw: Any, env_values: Mapping[str, Any]) -> int | None:
+    """Resolve a connector ``port`` setting to an ``int`` when possible, else ``None`` (uncheckable).
+
+    Handles a literal ``int``, a string literal (``"2575"`` from ``connections.toml``), and an
+    :func:`env` ref (resolved against ``env_values``, applying its cast). A ``bool`` (an ``int``
+    subclass) or an unresolved/unparseable value yields ``None`` so the caller simply skips it — a
+    missing ``env()`` value is reported loud elsewhere (when the connector is built), not doubled here."""
+    if isinstance(raw, EnvRef):
+        if raw.key not in env_values:
+            return None
+        value: Any = env_values[raw.key]
+        if raw.cast is not None:
+            try:
+                value = raw.cast(value)
+            except (ValueError, TypeError):
+                return None
+        raw = value
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int(raw.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def resolve_listener_binding(
+    ic: "InboundConnection", *, bind_host: str, env_values: Mapping[str, Any]
+) -> tuple[str | None, int] | None:
+    """The ``(normalized_host, port)`` a listener inbound will bind, or ``None`` when it binds no
+    checkable listening port (not a listening source, or an ``env()`` port with no value yet). The host
+    is the per-connection ``bind_address`` else the service ``bind_host`` (matching ``_source_config``),
+    normalized for overlap comparison."""
+    if ic.spec.type not in _LISTEN_TYPES:
+        return None
+    port = _resolve_port(ic.spec.settings.get("port"), env_values)
+    if port is None:
+        return None
+    return _normalize_bind_host(ic.bind_address or bind_host), port
+
+
+def bindings_overlap(host_a: str | None, port_a: int, host_b: str | None, port_b: int) -> bool:
+    """Whether two resolved ``(host, port)`` listener bindings contend for the same socket. Hosts are
+    (re-)normalized defensively, so a caller may pass a raw reserved host (e.g. ``"0.0.0.0"``)."""
+    return port_a == port_b and _hosts_overlap(
+        _normalize_bind_host(host_a), _normalize_bind_host(host_b)
+    )
+
+
+def inbound_binding_conflicts(
+    registry: "Registry",
+    *,
+    bind_host: str,
+    env_values: Mapping[str, Any],
+    reserved: Sequence[tuple[str, str, int]] = (),
+) -> list[str]:
+    """Human-readable port-conflict messages for the inbound listeners in ``registry``, resolved
+    against this instance's settings — the authoritative pass the runner runs at start/reload.
+
+    Unlike :meth:`Registry.port_collisions` (registry-only, literal ports), this resolves ``env()``
+    ports and the EFFECTIVE bind host (a connection's ``bind_address`` else the service ``bind_host``),
+    and checks each listener against the ``reserved`` service bindings — each a ``(label, host, port)``,
+    e.g. the engine's API listener — so an inbound that would steal the API's port is caught here rather
+    than as a bare bind failure. Returns ``[]`` when there is no conflict."""
+    listeners: list[_Binding] = []
+    for conn in registry.inbound.values():
+        binding = resolve_listener_binding(conn, bind_host=bind_host, env_values=env_values)
+        if binding is None:
+            continue  # not a listener, or an env() port with no value yet (reported loud at build)
+        listeners.append(_Binding(conn.name, binding[0], binding[1]))
+    messages = [
+        f"inbound connections {a.label!r} and {b.label!r} both bind port {a.port}"
+        for a, b in _binding_conflicts(listeners)
+    ]
+    for label, rhost, rport in reserved:
+        for listener in listeners:
+            if bindings_overlap(listener.host, listener.port, rhost, rport):
+                messages.append(
+                    f"inbound connection {listener.label!r} binds port {listener.port}, "
+                    f"reserved for {label}"
+                )
+    return messages
 
 
 @dataclass
@@ -1474,21 +1656,25 @@ class Registry:
             raise WiringError(f"inbound connections {first!r} and {second!r} both bind port {port}")
 
     def port_collisions(self) -> list[tuple[int, str, str]]:
-        """Inbound connections sharing a literal bind port, as ``(port, first, colliding)`` tuples.
+        """Inbound listeners that bind a shared literal port on overlapping interfaces, as
+        ``(port, first, colliding)`` tuples.
 
         Caught statically so a duplicate port surfaces at validate/``check`` time naming both
-        connections, instead of aborting the whole engine with a bare bind ``OSError`` (review
-        low-13). ``EnvRef`` ports resolve per-environment, so only ``int`` literals are checkable."""
-        seen: dict[int, str] = {}
-        out: list[tuple[int, str, str]] = []
-        for conn in self.inbound.values():
-            port = conn.spec.settings.get("port")
-            if isinstance(port, int) and not isinstance(port, bool):
-                if port in seen:
-                    out.append((port, seen[port], conn.name))
-                else:
-                    seen[port] = conn.name
-        return out
+        connections, instead of aborting the whole engine with a bare bind ``OSError`` (review low-13).
+        Registry-only (no service settings here): the interface is the per-connection ``bind_address``
+        — two listeners that override it to *different* explicit interfaces don't collide, while the
+        common case (both inheriting ``[inbound].bind_host``) still does. Only listener types bind a
+        port, and only an ``int`` literal is checkable (an ``EnvRef`` port resolves per environment —
+        the runner's :func:`inbound_binding_conflicts` covers those, plus the reserved API port, at
+        start/reload)."""
+        bindings = [
+            _Binding(conn.name, _normalize_bind_host(conn.bind_address), port)
+            for conn in self.inbound.values()
+            if conn.spec.type in _LISTEN_TYPES
+            and isinstance((port := conn.spec.settings.get("port")), int)
+            and not isinstance(port, bool)
+        ]
+        return [(a.port, a.label, b.label) for a, b in _binding_conflicts(bindings)]
 
 
 # --- declaration API (writes to the registry being loaded) -------------------
@@ -1580,6 +1766,8 @@ def build_inbound_connection(
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
     source_ip_allowlist: list[str] | None = None,
+    capture_ack: bool | None = None,
+    capture_connection_errors: bool | None = None,
     source_file: str | None = None,
     source_line: int | None = None,
 ) -> InboundConnection:
@@ -1657,6 +1845,20 @@ def build_inbound_connection(
                 f"inbound connection {name!r}: bind_address must be a non-empty host/IP, not blank"
             )
     allowlist = _check_source_ip_allowlist(name, listens, source_ip_allowlist)
+    # Corepoint-style event-log overrides (#46). capture_ack="Response Sent" only makes sense when the
+    # inbound actually returns an HL7 ACK, so True requires an HL7v2 content_type with ACKs enabled
+    # (ADR 0021 §4). capture_connection_errors logs pre-ingress framing/refuse failures, which only a
+    # LISTEN source has (ADR 0021 §7.4) — content-agnostic, so no HL7/ack constraint. None = inherit.
+    if capture_ack and (ack_mode is AckMode.NONE or content_type is not ContentType.HL7V2):
+        raise WiringError(
+            f"inbound connection {name!r}: capture_ack=True requires an HL7v2 content_type with ACKs "
+            "enabled (ack_mode != NONE) — there is no ACK to record otherwise"
+        )
+    if capture_connection_errors and not listens:
+        raise WiringError(
+            f"inbound connection {name!r}: capture_connection_errors=True is only valid for an "
+            "MLLP/TCP listen source (a poll/file source has no per-connection framing/refuse failures)"
+        )
     return InboundConnection(
         name=name,
         spec=spec,
@@ -1668,6 +1870,8 @@ def build_inbound_connection(
         metadata=metadata,
         bind_address=bind_address,
         source_ip_allowlist=allowlist,
+        capture_ack=capture_ack,
+        capture_connection_errors=capture_connection_errors,
         source_file=source_file,
         source_line=source_line,
     )
@@ -1686,6 +1890,8 @@ def inbound(
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
     source_ip_allowlist: list[str] | None = None,
+    capture_ack: bool | None = None,
+    capture_connection_errors: bool | None = None,
 ) -> None:
     """Declare an inbound connection that feeds every received message to ``router``.
 
@@ -1719,6 +1925,8 @@ def inbound(
             metadata=metadata,
             bind_address=bind_address,
             source_ip_allowlist=source_ip_allowlist,
+            capture_ack=capture_ack,
+            capture_connection_errors=capture_connection_errors,
             source_file=file,
             source_line=line,
         )

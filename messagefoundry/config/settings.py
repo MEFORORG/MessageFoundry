@@ -49,6 +49,7 @@ __all__ = [
     "InboundSettings",
     "DeliverySettings",
     "PipelineSettings",
+    "DiagnosticsSettings",
     "EnvironmentsSettings",
     "LoggingSettings",
     "LogFormat",
@@ -86,6 +87,7 @@ _SECTIONS = (
     "alerts",
     "cluster",
     "approvals",
+    "diagnostics",
 )
 _ENV_PREFIX = "MEFOR_"
 _DEFAULT_FILE = "messagefoundry.toml"
@@ -455,6 +457,24 @@ class PipelineSettings(_Section):
     max_correlation_depth: int = Field(default=8, ge=1)
 
 
+class DiagnosticsSettings(_Section):
+    """``[diagnostics]`` — the Corepoint-style event log (#46). Both switches are **on by default** and
+    safe to be: ``connection_events`` writes only metadata (connection name, peer IP, a scrubbed
+    reason — never a frame or body), and ``response_sent`` always stores the non-PHI ACK disposition
+    metadata while storing the AA-ACK *body* only when the store is encrypted (else NULL). A
+    per-connection ``capture_connection_errors`` / ``capture_ack`` flag overrides the matching master
+    switch for one connection (``None`` = inherit)."""
+
+    # Master switch for the connection/transport event log: inbound lifecycle (established/closed) +
+    # pre-ingress failures (allowlist/capacity/oversize/peer-reset/framing) + outbound lane transitions
+    # (connection_lost/restored). Metadata-only; written off the hot path by a drain task.
+    connection_events: bool = True
+    # Master switch for "Response Sent" — the ACK/NAK the engine returns to an inbound sender. Always
+    # captures the disposition metadata (ack_code/phase/outcome); the AA body is stored only on an
+    # encrypted store, and every NAK body is NULL (the offending field value is never persisted).
+    response_sent: bool = True
+
+
 class EnvironmentsSettings(_Section):
     """Where the per-environment **values** (``env()`` lookups in the message graph) live.
 
@@ -596,6 +616,10 @@ class RetentionSettings(_Section):
     # in-memory state cache + table bounded. A simple global age purge; per-namespace policy is a
     # follow-up. 0 = keep forever (the default — state correlation data is opt-in to purge).
     state_max_age_days: int = 0
+    # Past N HOURS, DELETE connection_event rows (#46) — the Corepoint-style transport/lifecycle log can
+    # be high-volume (a connect-per-message sender, a probe storm), so it has its own short window in
+    # HOURS (not days). 0 = inherit the message-body window (messages_days), the ADR 0021 §7.5 default.
+    connection_event_retention_hours: int = 0
     # Audit-log retention. RESERVED / not enforced: the audit_log is a tamper-evident hash chain and
     # HIPAA expects ~6-year retention, so audit is keep-forever by design here; archive-first pruning
     # is a tracked follow-up. Accepted (not rejected) so a forward-looking file still loads.
@@ -615,7 +639,12 @@ class RetentionSettings(_Section):
     vacuum_at: str = ""
 
     @field_validator(
-        "messages_days", "dead_letter_days", "audit_days", "max_db_mb", "state_max_age_days"
+        "messages_days",
+        "dead_letter_days",
+        "audit_days",
+        "max_db_mb",
+        "state_max_age_days",
+        "connection_event_retention_hours",
     )
     @classmethod
     def _non_negative_days(cls, value: int) -> int:
@@ -962,7 +991,13 @@ class AlertSeverity(str, Enum):
 
 #: The alert event types a rule may match (plus ``"any"``); mirror the AlertSink methods.
 _ALERT_EVENT_TYPES = frozenset(
-    {"connection_stopped", "queue_buildup", "storage_threshold", "cert_expiry"}
+    {
+        "connection_stopped",
+        "queue_buildup",
+        "storage_threshold",
+        "cert_expiry",
+        "connection_error",  # #46: an outbound lane went down (connection_lost), throttled per lane
+    }
 )
 #: The transport names a rule may route to; mirror ``AlertTransport.name``.
 _ALERT_TRANSPORTS = frozenset({"webhook", "email"})
@@ -977,9 +1012,7 @@ class AlertRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # --- match (all conditions must hold) ---
-    event_type: str = (
-        "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry
-    )
+    event_type: str = "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry | connection_error
     connection: str = "*"  # fnmatch glob over the connection name; "*" = all
     min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
     min_oldest_seconds: float | None = Field(
@@ -1233,6 +1266,7 @@ class ServiceSettings(BaseModel):
     inbound: InboundSettings = Field(default_factory=InboundSettings)
     delivery: DeliverySettings = Field(default_factory=DeliverySettings)
     pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
+    diagnostics: DiagnosticsSettings = Field(default_factory=DiagnosticsSettings)
     environments: EnvironmentsSettings = Field(default_factory=EnvironmentsSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     reference: ReferenceSettings = Field(default_factory=ReferenceSettings)

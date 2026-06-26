@@ -188,6 +188,34 @@ system value, a facility code → a downstream mnemonic. Rather than a hand-main
   crash-re-run can make the re-run derive a different output. That's acceptable for reference data (a
   code set is deliberately operator-editable, and a reload is an explicit, audited act), but it is the
   one way a transform's re-run can legitimately differ — note it where you document the transform.
+- **Editing — by hand or from the IDE.** A code set is a plain `codesets/<name>.csv` you can edit in any
+  editor, **and** a GUI-manageable artifact ([ADR 0033](adr/0033-gui-manageable-code-sets.md)). The VS
+  Code extension opens a **grid editor** (rows × columns of strings — the first column is the lookup
+  key) to **create / edit / rename / delete** a translation table; it shells a new
+  **`messagefoundry codeset`** CLI that owns validation and the atomic write. Both editors write the
+  same file (CSV-first), so a hand edit and a GUI save are interchangeable — mirroring the connections
+  editor ([ADR 0007](adr/0007-gui-manageable-connections-toml.md)).
+  - `messagefoundry codeset list  --config DIR` — summarize every set under `codesets/` (`.csv` **and**
+    `.toml`; TOML sets are summarized and shown **read-only** in the grid — TOML-in-grid editing is a
+    fast-follow).
+  - `messagefoundry codeset show   --config DIR --name N` — the grid (headers + rows).
+  - `messagefoundry codeset upsert --config DIR --data '{…}'` — validate → write `codesets/N.csv`
+    atomically (temp + replace, owner-only perms) → **re-load the written file as the final check**;
+    a bad save rolls back, so the CLI never leaves an unloadable table.
+  - `messagefoundry codeset rename --config DIR --name N --to M` / `… remove --config DIR --name N`.
+
+  The CLI is **offline** (no engine start, no egress check — a code set is standalone data); it validates
+  against the **same loader** that runs at startup, and the operator-supplied **name is treated as
+  untrusted data** (rejecting path separators, `..`, absolute/drive paths, and an embedded extension, so
+  a name can't escape `codesets/`). Apply a change with the existing audited promote/reload below.
+- **Promote to apply (rename/remove caveat).** Editing a `codesets/` file changes nothing live; the
+  running graph adopts the change only through **`POST /config/reload`** (the IDE promote), exactly like
+  a connection or handler change. **Renaming or removing a code set can break a handler reference** — a
+  `code_set("old_name")` call then raises at run time (that message's `ERROR` disposition). A plain
+  `validate` only confirms each file parses, so it **won't** catch a now-dangling reference; **run
+  `messagefoundry check` after a rename/remove**, whose dry-run executes the transforms and surfaces the
+  broken `code_set(...)` lookup before you promote. See [docs/CODESETS.md](CODESETS.md) for the full grid
+  editor + CLI reference.
 
 ### Transform state — cross-message correlation ([ADR 0005](adr/0005-transform-accessible-state.md))
 

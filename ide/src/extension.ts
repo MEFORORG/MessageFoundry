@@ -12,7 +12,10 @@ import { workspaceDir } from "./cli";
 import { registerCompletion } from "./completion";
 import { registerChat } from "./chat";
 import { generateSamples } from "./generate";
+import { openCodeSetEditor } from "./codeSetEditor";
+import { CodeSetsProvider } from "./codesetsTree";
 import { openConnectionEditor } from "./connectionEditor";
+import { codesetRemove, codesetRename } from "./cli";
 import { GraphProvider } from "./graphTree";
 import { HomeView } from "./home";
 import { openNewRoute } from "./newRoute";
@@ -47,6 +50,15 @@ export function activate(context: vscode.ExtensionContext): void {
   const routerNames = (): string[] => graph.getGraph()?.routers.map((r) => r.name) ?? [];
   const graphView = vscode.window.createTreeView("messagefoundry.graph", { treeDataProvider: graph });
   context.subscriptions.push(graphView);
+  // Translation Tables (code sets) tree — its own provider, refreshed on save.
+  const codeSets = new CodeSetsProvider();
+  const codeSetsView = vscode.window.createTreeView("messagefoundry.codesets", {
+    treeDataProvider: codeSets,
+  });
+  context.subscriptions.push(codeSetsView);
+  // Helper: read a code-set name off a tree node (its label) for the item-context commands.
+  const codeSetName = (node?: vscode.TreeItem): string | undefined =>
+    typeof node?.label === "string" ? node.label : undefined;
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("messagefoundry.home", new HomeView()),
   );
@@ -115,6 +127,75 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("messagefoundry.newConnection", () =>
       openConnectionEditor(context, { routers: routerNames(), onSaved: () => graph.refresh() }),
     ),
+    // ---- Translation Tables (code sets) ----
+    vscode.commands.registerCommand("messagefoundry.refreshCodeSets", () => codeSets.refresh()),
+    vscode.commands.registerCommand("messagefoundry.newCodeSet", () =>
+      openCodeSetEditor(context, { onSaved: () => codeSets.refresh() }),
+    ),
+    // Edit a code set (grid editor). A row click / context action passes the node; the editor opens
+    // read-only for a TOML code set (it only writes CSV).
+    vscode.commands.registerCommand("messagefoundry.editCodeSet", (node?: vscode.TreeItem) => {
+      const name = codeSetName(node);
+      if (!name) {
+        void vscode.window.showInformationMessage("MessageFoundry: pick a translation table to edit.");
+        return;
+      }
+      void openCodeSetEditor(context, { editName: name, onSaved: () => codeSets.refresh() });
+    }),
+    // Rename a code set's file (keeps its extension). Name-safety is enforced by the CLI.
+    vscode.commands.registerCommand("messagefoundry.renameCodeSet", async (node?: vscode.TreeItem) => {
+      const name = codeSetName(node);
+      if (!name) {
+        return;
+      }
+      const ws = workspaceDir();
+      if (!ws) {
+        return;
+      }
+      const to = await vscode.window.showInputBox({
+        prompt: `Rename code set "${name}" to…`,
+        value: name,
+        placeHolder: "new_name (a bare stem, no extension)",
+      });
+      if (!to || to === name) {
+        return; // cancelled or unchanged
+      }
+      try {
+        await codesetRename(name, to, ws);
+      } catch (e) {
+        void vscode.window.showErrorMessage(`MessageFoundry: rename failed — ${String(e)}`);
+        return;
+      }
+      void codeSets.refresh();
+      void vscode.window.showInformationMessage(`MessageFoundry: renamed code set ${name} → ${to}.`);
+    }),
+    // Delete a code set from the tree: modal confirm, then shell `codeset remove`.
+    vscode.commands.registerCommand("messagefoundry.deleteCodeSet", async (node?: vscode.TreeItem) => {
+      const name = codeSetName(node);
+      if (!name) {
+        return;
+      }
+      const ws = workspaceDir();
+      if (!ws) {
+        return;
+      }
+      const confirm = await vscode.window.showWarningMessage(
+        `Remove code set "${name}"?`,
+        { modal: true },
+        "Remove",
+      );
+      if (confirm !== "Remove") {
+        return;
+      }
+      try {
+        await codesetRemove(name, ws);
+      } catch (e) {
+        void vscode.window.showErrorMessage(`MessageFoundry: remove failed — ${String(e)}`);
+        return;
+      }
+      void codeSets.refresh();
+      void vscode.window.showInformationMessage(`MessageFoundry: removed code set ${name}.`);
+    }),
     vscode.commands.registerCommand("messagefoundry.newRoute", () =>
       openNewRoute(context, () => graph.refresh()),
     ),
@@ -143,6 +224,7 @@ export function activate(context: vscode.ExtensionContext): void {
   if (workspaceDir()) {
     void validator.run();
     void graph.refresh();
+    void codeSets.refresh();
   }
 
   // One-time nudge to put a MessageFoundry project under version control + commit-time checks.

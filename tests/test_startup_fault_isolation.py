@@ -10,17 +10,21 @@ backstop) and test_response_capture.py (capture/backend isolation)."""
 from __future__ import annotations
 
 import asyncio
+import socket
 from pathlib import Path
 
 import pytest
 
 from messagefoundry.config.models import ConnectorType, RetryPolicy
 from messagefoundry.config.wiring import (
+    API_LISTENER_LABEL,
+    MLLP,
     ConnectionSpec,
     InboundConnection,
     OutboundConnection,
     Registry,
     Send,
+    build_inbound_connection,
     env,
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
@@ -44,12 +48,16 @@ class _RecordingAlertSink:
     def __init__(self) -> None:
         self.stopped: list[tuple[str, str]] = []
         self.buildups: list[tuple[str, int, float]] = []
+        self.errors: list[tuple[str, str]] = []
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         self.stopped.append((name, detail))
 
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
         self.buildups.append((name, depth, oldest_age_seconds))
+
+    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
+        self.errors.append((name, kind))
 
 
 async def _until(predicate, timeout: float = 10.0) -> None:  # type: ignore[no-untyped-def]
@@ -96,6 +104,58 @@ def _file_inbound(inbox: Path) -> InboundConnection:
         ),
         router="r",
     )
+
+
+def _free_port() -> int:
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
+
+
+async def test_duplicate_inbound_port_isolates_the_loser(store: MessageStore) -> None:
+    # Two MLLP listeners declared on the SAME (host, port): the first binds, the second is refused
+    # BEFORE its bind and ISOLATED with a clear reason (ADR 0031, low-13) — the engine stays up and the
+    # first keeps listening, rather than a bare OSError aborting the inbound.
+    port = _free_port()
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("a", MLLP(port=port), router="r"))
+    reg.add_inbound(build_inbound_connection("b", MLLP(port=port), router="r"))
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    await runner.start()
+    try:
+        assert runner.running
+        assert set(runner.degraded_connections()) == {"b"}  # 'a' bound first; 'b' is the loser
+        assert "already bound by 'a'" in (runner.connection_failed("b") or "")
+        assert runner.inbound_running("a") and not runner.inbound_running("b")
+    finally:
+        await runner.stop()
+
+
+async def test_inbound_on_reserved_api_port_isolated(store: MessageStore) -> None:
+    # An inbound wired onto the engine's reserved API listener port is refused before the bind and
+    # isolated (it would otherwise collide with uvicorn) — the engine still comes up DEGRADED.
+    port = _free_port()
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("a", MLLP(port=port), router="r"))
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        reserved_bindings=((API_LISTENER_LABEL, "127.0.0.1", port),),
+    )
+    await runner.start()
+    try:
+        assert runner.running
+        assert "a" in runner.degraded_connections()
+        assert "reserved for" in (runner.connection_failed("a") or "")
+        assert not runner.inbound_running("a")
+    finally:
+        await runner.stop()
 
 
 async def test_failed_outbound_isolated_retries_and_recovers(

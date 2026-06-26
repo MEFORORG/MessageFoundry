@@ -69,6 +69,7 @@ from messagefoundry.store.crypto import (
     cipher_info,
 )
 from messagefoundry.store.store import (
+    ConnectionEvent,
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
@@ -197,6 +198,9 @@ _SCHEMA: list[str] = [
         outcome          TEXT NOT NULL,
         detail           TEXT,
         captured_at      DOUBLE PRECISION NOT NULL,
+        kind             TEXT NOT NULL DEFAULT 'response',  -- ADR 0021: 'response' | 'ack_sent'
+        ack_code         TEXT,
+        ack_phase        TEXT,
         PRIMARY KEY (message_id, destination_name, response_seq)
     )""",
     "CREATE INDEX IF NOT EXISTS ix_response_message ON response(message_id)",
@@ -214,6 +218,23 @@ _SCHEMA: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS ix_delivered_outbox ON delivered_keys(outbox_id)",
     "CREATE INDEX IF NOT EXISTS ix_delivered_message ON delivered_keys(message_id, destination_name)",
+    # Connection/transport event log (Corepoint-style #46) — METADATA-ONLY: inbound lifecycle +
+    # pre-ingress failures + outbound lane transitions. id-keyed (NOT a queue stage → invisible to the
+    # finalizer's `FROM queue` scan); message_id is NULLABLE with NO FK (correlation hint only) so a
+    # pre-ingress event needs no messages row and can't inflate counts. reason is safe_text-scrubbed +
+    # cipher-encrypted at rest (rides the id-keyed _CIPHER_COLUMNS loops).
+    """CREATE TABLE IF NOT EXISTS connection_event (
+        id          BIGSERIAL PRIMARY KEY,
+        ts          DOUBLE PRECISION NOT NULL,
+        connection  TEXT NOT NULL,
+        transport   TEXT NOT NULL,
+        direction   TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        peer_host   TEXT,
+        message_id  TEXT,
+        reason      TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_connection_event_conn ON connection_event(connection, ts)",
     """CREATE TABLE IF NOT EXISTS audit_log (
         id         BIGSERIAL PRIMARY KEY,
         ts         DOUBLE PRECISION NOT NULL,
@@ -381,6 +402,10 @@ class PostgresStore:
         ("messages", "summary"),  # EF-3: ingest-derived MRN/name — PHI, not just metadata
         ("messages", "metadata"),  # EF-3: code/operator-attached values
         ("users", "totp_secret"),  # MFA secret (WP-14) — id-keyed, rides the migration + rotation
+        (
+            "connection_event",
+            "reason",
+        ),  # #46: scrubbed event reason — id-keyed (BIGSERIAL), rides the loops
         # NB: the `response` table (ADR 0013) is cipher-covered (body, detail) but has a COMPOSITE PK,
         # so it rides the composite helpers below, not this id-keyed list (like state/reference).
     )
@@ -529,6 +554,25 @@ class PostgresStore:
         )
         if not sessions_has_mfa:
             await conn.execute("ALTER TABLE sessions ADD COLUMN mfa_verified_at DOUBLE PRECISION")
+        # ADR 0021 "Response Sent": the response table gains kind/ack_code/ack_phase. information_schema-
+        # gated (a bare ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE on every open). Existing rows
+        # backfill kind='response' via the DEFAULT.
+        response_cols = {
+            r["column_name"]
+            for r in await conn.fetch(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_name='response' AND column_name = ANY($1::text[])",
+                ["kind", "ack_code", "ack_phase"],
+            )
+        }
+        if "kind" not in response_cols:
+            await conn.execute(
+                "ALTER TABLE response ADD COLUMN kind TEXT NOT NULL DEFAULT 'response'"
+            )
+        if "ack_code" not in response_cols:
+            await conn.execute("ALTER TABLE response ADD COLUMN ack_code TEXT")
+        if "ack_phase" not in response_cols:
+            await conn.execute("ALTER TABLE response ADD COLUMN ack_phase TEXT")
         # Active-active scale-out was dropped: drop the retired per-lane FIFO-ownership table from any DB
         # that was opened by an earlier build. Failover FIFO safety no longer depends on a lane lease —
         # claim_next_fifo reclaims a stranded head from the queue table directly. IF EXISTS is a no-op on
@@ -2049,7 +2093,8 @@ class PostgresStore:
         ``response_seq``; ``body``/``detail`` decrypted. The PHI read surface behind the audited,
         body-gated ``GET /messages/{id}/responses`` route."""
         rows = await self._pool.fetch(
-            "SELECT message_id, destination_name, response_seq, body, outcome, detail, captured_at"
+            "SELECT message_id, destination_name, response_seq, body, outcome, detail, captured_at,"
+            " kind, ack_code, ack_phase"
             " FROM response WHERE message_id=$1 ORDER BY destination_name, response_seq",
             message_id,
         )
@@ -2062,6 +2107,126 @@ class PostgresStore:
                 detail=self._dec(r["detail"]),
                 captured_at=r["captured_at"],
                 body=self._dec(r["body"]),
+                kind=r["kind"],
+                ack_code=r["ack_code"],
+                ack_phase=r["ack_phase"],
+            )
+            for r in rows
+        ]
+
+    async def record_ack_sent(
+        self,
+        *,
+        message_id: str,
+        inbound_name: str,
+        ack_body: str | None,
+        ack_code: str,
+        ack_phase: str,
+        outcome: str,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        # ADR 0021 "Response Sent" — see MessageStore.record_ack_sent for the full contract. Own txn
+        # (seq SELECT + INSERT); finalizer-invisible; NAK body NULL; AA body only when encrypted.
+        now = time.time() if now is None else now
+        dest = "\x1fack:" + inbound_name
+        enc_body = self._enc(ack_body) if (ack_body and self._cipher.encrypts) else None
+        enc_detail = self._enc(safe_text(detail)[:200]) if detail else None
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                seq = await conn.fetchval(
+                    "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
+                    " WHERE message_id=$1 AND destination_name=$2 AND kind='ack_sent'",
+                    message_id,
+                    dest,
+                )
+                await conn.execute(
+                    "INSERT INTO response"
+                    " (message_id, destination_name, response_seq, body, outcome, detail,"
+                    "  captured_at, kind, ack_code, ack_phase)"
+                    " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                    message_id,
+                    dest,
+                    seq,
+                    enc_body,
+                    outcome,
+                    enc_detail,
+                    now,
+                    "ack_sent",
+                    ack_code,
+                    ack_phase,
+                )
+
+    # --- connection events (Corepoint-style transport/lifecycle log, #46) -----
+    async def record_connection_event(
+        self,
+        *,
+        connection: str,
+        transport: str,
+        direction: str,
+        kind: str,
+        peer_host: str | None = None,
+        message_id: str | None = None,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        # Pure observer: a single short INSERT in its own statement — no queue row, no finalizer, never
+        # inside a handoff txn. reason rides the safe_text PHI chokepoint (#120) + the cipher.
+        now = time.time() if now is None else now
+        reason_enc = self._enc(safe_text(reason)[:200]) if reason else None
+        await self._pool.execute(
+            "INSERT INTO connection_event"
+            " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
+            " VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            now,
+            connection,
+            transport,
+            direction,
+            kind,
+            peer_host,
+            message_id,
+            reason_enc,
+        )
+
+    async def list_connection_events(
+        self,
+        *,
+        connection: str | None = None,
+        kinds: Sequence[str] | None = None,
+        since: float | None = None,
+        limit: int = 100,
+    ) -> list[ConnectionEvent]:
+        limit = max(1, min(limit, 1000))  # server-side clamp
+        where: list[str] = []
+        params: list[Any] = []
+        if connection is not None:
+            params.append(connection)
+            where.append(f"connection=${len(params)}")
+        if kinds:
+            placeholders = ",".join(f"${len(params) + i + 1}" for i in range(len(kinds)))
+            params.extend(kinds)
+            where.append(f"kind IN ({placeholders})")
+        if since is not None:
+            params.append(since)
+            where.append(f"ts>=${len(params)}")
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        params.append(limit)
+        rows = await self._pool.fetch(
+            "SELECT id, ts, connection, transport, direction, kind, peer_host, message_id, reason"
+            f" FROM connection_event{clause} ORDER BY ts DESC, id DESC LIMIT ${len(params)}",
+            *params,
+        )
+        return [
+            ConnectionEvent(
+                id=r["id"],
+                ts=r["ts"],
+                connection=r["connection"],
+                transport=r["transport"],
+                direction=r["direction"],
+                kind=r["kind"],
+                peer_host=r["peer_host"],
+                message_id=r["message_id"],
+                reason=self._dec(r["reason"]),
             )
             for r in rows
         ]
@@ -3291,6 +3456,11 @@ class PostgresStore:
                     inflight,
                 )
         return purged
+
+    async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
+        # #46: metadata-only rows (no body/FK) — age-DELETE on their own window (RetentionRunner-driven).
+        result = await self._pool.execute("DELETE FROM connection_event WHERE ts < $1", older_than)
+        return _rowcount(result)
 
     async def purge_dead_letters(self, *, older_than: float, now: float | None = None) -> int:
         """Null the bodies of dead-lettered **outbound** rows last updated before ``older_than`` (their

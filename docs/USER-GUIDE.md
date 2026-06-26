@@ -42,6 +42,7 @@ This guide serves two audiences: **operators** who install, run, and monitor the
 |---|---|
 | The full architecture, modularity standard, and dependency rules | [ARCHITECTURE.md](ARCHITECTURE.md) (diagrams: [architecture-diagram.md](architecture-diagram.md)) |
 | Connection types, settings, and the graph (incl. `connections.toml`) | [CONNECTIONS.md](CONNECTIONS.md), [ADR 0007](adr/0007-gui-manageable-connections-toml.md) |
+| Translation tables (code sets) — the grid editor + `codeset` CLI | [CODESETS.md](CODESETS.md), [ADR 0033](adr/0033-gui-manageable-code-sets.md) |
 | Service settings, environments, and `env()` values | [CONFIGURATION.md](CONFIGURATION.md) |
 | Running as a Windows service (NSSM) | [SERVICE.md](SERVICE.md) |
 | Auth, RBAC, audit, and TLS | [SECURITY.md](SECURITY.md), [DEPLOYMENT.md](DEPLOYMENT.md) |
@@ -403,13 +404,53 @@ Routers and Handlers work against the mutable HL7 `Message` in [messagefoundry/p
 
 A non-HL7 inbound (`content_type` other than `hl7v2`) delivers a `RawMessage` instead — read `.raw` / `.text` / `.json()` / `.xml()` (the XML accessor is XXE-safe via defusedxml: DOCTYPE, external-entity, and billion-laughs payloads raise) and `Send` a built string. For cross-field business-rule checks beyond what schema validation catches, compose the primitives in `parsing/consistency.py`, as [samples/consistency/validated_adt.py](../samples/consistency/validated_adt.py) does (raise `ConsistencyError` → dead-letter, or `return None` → filter). The three validation tiers are laid out in [HL7-VALIDATION.md](HL7-VALIDATION.md).
 
-### 4. Purity rule (don't break this)
+### 4. Translation tables (code sets)
+
+A Router or Handler often maps a coded value to a downstream one — a sending-facility code to a mnemonic (the `FACILITY_MNEMONICS` lookup in the Handler above), an order code to a partner's code, a bed location to a room. Rather than hand-maintain a Python dict, you can back that lookup with a **translation table** (internally a *code set*): a `codesets/<name>.csv` file in your config dir (the name is the file stem). It **loads with the graph and reloads on promote**, and the lookup is **pure**, so it's safe under the staged pipeline.
+
+`codesets/facility_mnemonics.csv`:
+
+```csv
+sending_facility,mnemonic
+ACME_MAIN,ACMS
+ACME_WEST,ACMW
+```
+
+Read it with `code_set("name")`, which returns a frozen, read-only mapping. Capture it once at a module's top level (or call it inline in a handler — both resolve):
+
+```python
+from messagefoundry import code_set, handler, Send
+
+FACILITIES = code_set("facility_mnemonics")     # loads with the graph; reloads on promote
+
+@handler("archive")
+def archive(msg):
+    src = msg["MSH-4"]
+    msg["MSH-4"] = FACILITIES.get(src, src)     # translate; pass through unchanged if unmapped
+    return Send("FILE-OUT_Test_ADT", msg)
+```
+
+- **Missing key — you choose the behavior.** `code_set(...).get(key, default)` returns `default` on a miss (pass-through as above, or `""` to blank it); the subscript `code_set(...)[key]` **raises** on a miss, sending that message to its `ERROR`/dead-letter disposition (the strict "never deliver an unmapped value" path).
+- **Single vs. multi-column.** One value column → the value is a scalar string; two or more → it's a `{header: cell}` dict (`code_set("x")["k"]["mnemonic"]`). Keys are exact-match, **case-sensitive** strings.
+
+**Create and edit tables** by hand, or in the **Translation Tables** view of the VS Code extension — a grid editor (*New / Edit Translation Table*) that shells the offline `messagefoundry codeset` CLI (the validation authority):
+
+```bash
+messagefoundry codeset list   --config samples/config
+messagefoundry codeset upsert --config samples/config --data '{...}'   # validate → atomic write
+messagefoundry codeset rename --config samples/config --name old --to new
+messagefoundry codeset remove --config samples/config --name old
+```
+
+A save is validated against the **same loader the engine uses** (no duplicate keys, no malformed file) and written atomically; a bad edit rolls back, and the change goes live through the usual **promote** (`POST /config/reload`). **After a rename or remove, run `messagefoundry check`** — a handler's `code_set("old_name")` reference resolves at run time, so a plain `validate` won't catch a now-dangling name, but `check`'s dry-run will. Full reference: [CODESETS.md](CODESETS.md) and [CONFIGURATION.md](CONFIGURATION.md#code-sets--reference-lookup-tables-codesets); design record [ADR 0033](adr/0033-gui-manageable-code-sets.md). (For lookup data that lives in an **external** file or database rather than the bundle, see reference sets ([ADR 0006](adr/0006-external-data-lookups.md)) and the live `db_lookup` below.)
+
+### 5. Purity rule (don't break this)
 
 Routers and Handlers **must be pure**: message in → message(s) out, no external side effects. At-least-once delivery re-runs a transform after a crash and relies on the re-run producing identical output. Side effects (network, file, DB writes) belong in outbound Connections, not in your functions.
 
 The **one sanctioned exception** is a Handler making a **live, read-only** `db_lookup(connection, statement, params)` for enrichment/gating — its result may differ on a re-run, and that is accepted by design. It is read-only, gated by `[egress].allowed_db`, runs off the event loop, and is **unavailable on a Router or in dry-run** (it raises). See [ADR 0010](adr/0010-handler-callable-db-lookup.md).
 
-### 5. The authoring dev loop
+### 6. The authoring dev loop
 
 Run these from your config-repo root as you write — they touch no network and start no server.
 
@@ -482,6 +523,7 @@ The extension is a thin TypeScript UI that shells out to the `messagefoundry` CL
 
 - **Setup / scaffolding** — a **Home** launchpad with a **New Route Wizard** (Inbound → Router → Handler → Outbound generated as one module), **New Connection** (form → generates a `[TYPE]_[PARTNER]_[MESSAGE]` module like `IB_ACME_ADT`), New Router/Handler, **Generate Samples** (writes a synthetic, conformant corpus via `messagefoundry generate` — no PHI), and **Set Up Version Control & Checks** (puts the project under git with a `messagefoundry check` pre-commit hook).
 - **Validate + graph** — *Validate on save* surfaces problems in the Problems panel; the **Connections** sidebar renders the wired graph (`messagefoundry graph`) by convention name, with **Filter** and **Group** controls and a row **⚙ gear** to open a connection's `MLLP()`/`File()` settings in code.
+- **Translation tables** — a **Translation Tables** view with a grid editor to create / edit / rename / delete a translation table (code set); it shells the `messagefoundry codeset` CLI (validate-on-save, atomic write) and offers **Promote** to apply. See [CODESETS.md](CODESETS.md).
 - **Test Bench** — load `.hl7` files (each may hold many messages, split on `MSH`), **dry-run** them through the config without sending, and see each message's disposition, with a **Before/After** diff and a **Debug** step-through under `debugpy`. The load dialog opens to `messagefoundry.messageSetsDir` (default `samples/messages`).
 - **Stage → Promote** — apply local config to a *running* engine: validate, pick a target environment, pre-flight a dry-run `POST /config/reload {dry_run:true}` against that target's `env()` values, confirm, then atomically swap the live graph. The engine requires auth, so the extension signs you in (token cached in VS Code SecretStorage).
 - **AI assist** — an `@messagefoundry` chat participant (`/explain`, `/transform`, `/router`, `/review`, `/migrate`, `/test`) that is provider-agnostic and **only ever sends code + the config graph, never message bodies / PHI**.
@@ -572,6 +614,7 @@ The SMTP password is a secret — supply it via `MEFOR_ALERTS_EMAIL_PASSWORD`, n
 - **Concepts in depth** — [MENTAL-MODEL.md](MENTAL-MODEL.md), [ARCHITECTURE.md](ARCHITECTURE.md) (diagrams: [architecture-diagram.md](architecture-diagram.md))
 - **Narrative onboarding, install to production** — [EARLY-ADOPTER-GUIDE.md](EARLY-ADOPTER-GUIDE.md), [INSTALL-GUIDE.md](INSTALL-GUIDE.md), [SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md)
 - **Connections reference** — [CONNECTIONS.md](CONNECTIONS.md), [ADR 0007](adr/0007-gui-manageable-connections-toml.md) (`connections.toml`)
+- **Translation tables (code sets)** — [CODESETS.md](CODESETS.md), [ADR 0033](adr/0033-gui-manageable-code-sets.md)
 - **Service settings & environments** — [CONFIGURATION.md](CONFIGURATION.md)
 - **Validation tiers** — [HL7-VALIDATION.md](HL7-VALIDATION.md)
 - **Run as a service** — [SERVICE.md](SERVICE.md)

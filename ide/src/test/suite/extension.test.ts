@@ -34,6 +34,22 @@ suite("MessageFoundry extension", () => {
     const contributed = pkg.contributes.commands.map((c) => c.command);
     assert.ok(contributed.length > 0, "package.json contributes no commands");
 
+    // The Translation Tables (code set) commands must be contributed AND registered — assert their
+    // presence explicitly so dropping one is caught here, not only at runtime.
+    const codeSetCommands = [
+      "messagefoundry.newCodeSet",
+      "messagefoundry.editCodeSet",
+      "messagefoundry.renameCodeSet",
+      "messagefoundry.deleteCodeSet",
+      "messagefoundry.refreshCodeSets",
+    ];
+    const notContributed = codeSetCommands.filter((id) => !contributed.includes(id));
+    assert.deepStrictEqual(
+      notContributed,
+      [],
+      `code-set commands missing from package.json: ${notContributed.join(", ")}`,
+    );
+
     const registered = await vscode.commands.getCommands(true);
     const missing = contributed.filter((id) => !registered.includes(id));
     assert.deepStrictEqual(

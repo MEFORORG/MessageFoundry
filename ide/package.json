@@ -63,6 +63,28 @@
         "title": "MessageFoundry: Edit Connection"
       },
       {
+        "command": "messagefoundry.newCodeSet",
+        "title": "MessageFoundry: New Translation Table",
+        "icon": "$(add)"
+      },
+      {
+        "command": "messagefoundry.editCodeSet",
+        "title": "MessageFoundry: Edit Translation Table"
+      },
+      {
+        "command": "messagefoundry.renameCodeSet",
+        "title": "MessageFoundry: Rename Translation Table"
+      },
+      {
+        "command": "messagefoundry.deleteCodeSet",
+        "title": "MessageFoundry: Delete Translation Table"
+      },
+      {
+        "command": "messagefoundry.refreshCodeSets",
+        "title": "MessageFoundry: Refresh Translation Tables",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "messagefoundry.newRoute",
         "title": "MessageFoundry: New Route Wizard"
       },
@@ -114,6 +136,10 @@
         {
           "id": "messagefoundry.graph",
           "name": "Connections"
+        },
+        {
+          "id": "messagefoundry.codesets",
+          "name": "Translation Tables"
         }
       ]
     },
@@ -138,6 +164,16 @@
           "command": "messagefoundry.refreshGraph",
           "when": "view == messagefoundry.graph",
           "group": "navigation@4"
+        },
+        {
+          "command": "messagefoundry.newCodeSet",
+          "when": "view == messagefoundry.codesets",
+          "group": "navigation@1"
+        },
+        {
+          "command": "messagefoundry.refreshCodeSets",
+          "when": "view == messagefoundry.codesets",
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [
@@ -150,11 +186,43 @@
           "command": "messagefoundry.editConnection",
           "when": "view == messagefoundry.graph && viewItem == meforConnection",
           "group": "1_edit"
+        },
+        {
+          "command": "messagefoundry.editCodeSet",
+          "when": "view == messagefoundry.codesets && viewItem == meforCodeSetCsv",
+          "group": "1_edit"
+        },
+        {
+          "command": "messagefoundry.editCodeSet",
+          "when": "view == messagefoundry.codesets && viewItem == meforCodeSetToml",
+          "group": "1_edit"
+        },
+        {
+          "command": "messagefoundry.renameCodeSet",
+          "when": "view == messagefoundry.codesets && viewItem == meforCodeSetCsv",
+          "group": "1_edit"
+        },
+        {
+          "command": "messagefoundry.deleteCodeSet",
+          "when": "view == messagefoundry.codesets && (viewItem == meforCodeSetCsv || viewItem == meforCodeSetToml)",
+          "group": "9_danger"
         }
       ],
       "commandPalette": [
         {
           "command": "messagefoundry.editConnection",
+          "when": "false"
+        },
+        {
+          "command": "messagefoundry.editCodeSet",
+          "when": "false"
+        },
+        {
+          "command": "messagefoundry.renameCodeSet",
+          "when": "false"
+        },
+        {
+          "command": "messagefoundry.deleteCodeSet",
           "when": "false"
         }
       ]

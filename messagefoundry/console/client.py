@@ -46,6 +46,7 @@ from messagefoundry.api.models import (
     ChannelInfo,
     ClusterNodeList,
     ClusterStatus,
+    ConnectionEventInfo,
     ConnectionRow,
     DeadLetterList,
     DeadLetterReplayResult,
@@ -443,6 +444,18 @@ class EngineClient:
             audit_summary=audit_summary or None,
         )
         return DeadLetterList.model_validate(response.json())
+
+    def list_connection_events(
+        self,
+        *,
+        connection: str | None = None,
+        kind: str | None = None,
+        limit: int = 200,
+    ) -> list[ConnectionEventInfo]:
+        """The Corepoint-style connection/transport event log (#46), newest first — metadata only (no
+        PHI), so it needs only ``monitoring:read``."""
+        response = self._get("/events", connection=connection, kind=kind, limit=limit)
+        return [ConnectionEventInfo.model_validate(e) for e in response.json()]
 
     def replay_dead_letters(
         self, *, channel_id: str | None = None, destination_name: str | None = None

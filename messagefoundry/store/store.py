@@ -160,6 +160,29 @@ class CapturedResponse:
     detail: str | None
     captured_at: float
     body: str | None
+    # ADR 0021 "Response Sent": 'response' (outbound reply, the default) | 'ack_sent' (inbound ACK we
+    # returned). ack_code/ack_phase are non-PHI disposition metadata, populated only for ack_sent rows.
+    kind: str = "response"
+    ack_code: str | None = None
+    ack_phase: str | None = None
+
+
+@dataclass(frozen=True)
+class ConnectionEvent:
+    """One metadata-only connection event (Corepoint-style transport/lifecycle log, #46), as returned
+    by ``list_connection_events`` for the ``GET /events`` read surface. Never carries a frame, message
+    body, or HL7 field value — ``reason`` is ``safe_text``-scrubbed and decrypted here. ``message_id``
+    is a nullable, non-FK correlation hint set only for outbound lane events."""
+
+    id: int
+    ts: float
+    connection: str
+    transport: str
+    direction: str  # 'inbound' | 'outbound'
+    kind: str
+    peer_host: str | None
+    message_id: str | None
+    reason: str | None
 
 
 @dataclass(frozen=True)
@@ -566,6 +589,10 @@ CREATE TABLE IF NOT EXISTS response (
     outcome          TEXT    NOT NULL,   -- 'accepted' | 'rejected' | 'unparseable' | 'no_reply'
     detail           TEXT,               -- short reason (MSA-1 / HTTP status), encrypted at rest
     captured_at      REAL    NOT NULL,
+    -- ADR 0021 "Response Sent": the inbound ACK we returned rides this table via a `kind` discriminator.
+    kind             TEXT    NOT NULL DEFAULT 'response',  -- 'response' (outbound reply) | 'ack_sent'
+    ack_code         TEXT,               -- AA|AE|AR|CA|CE|CR for ack_sent; NULL for an outbound response
+    ack_phase        TEXT,               -- decode|parse|strict|ingest for ack_sent; NULL for response
     PRIMARY KEY (message_id, destination_name, response_seq)
 );
 CREATE INDEX IF NOT EXISTS ix_response_message ON response(message_id);
@@ -587,6 +614,26 @@ CREATE TABLE IF NOT EXISTS delivered_keys (
 );
 CREATE INDEX IF NOT EXISTS ix_delivered_outbox  ON delivered_keys(outbox_id);
 CREATE INDEX IF NOT EXISTS ix_delivered_message ON delivered_keys(message_id, destination_name);
+
+-- Connection/transport event log (Corepoint-style #46): inbound lifecycle (established/closed), the
+-- pre-ingress failures that have no message_id (allowlist/capacity/oversize/peer-reset/framing), and
+-- outbound lane transitions (connection_lost/restored). METADATA-ONLY — never a frame, body, or HL7
+-- field value. id-keyed (so it is NOT a `queue` stage → invisible to _maybe_finalize_message's
+-- `FROM queue` scan, exactly like `response`); `message_id` is a NULLABLE, deliberately NO-FK
+-- correlation hint (outbound lane events only) so a pre-ingress event needs no messages row and can
+-- never inflate received counts. `reason` is safe_text-scrubbed and encrypted at rest (_CIPHER_COLUMNS).
+CREATE TABLE IF NOT EXISTS connection_event (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL NOT NULL,
+    connection  TEXT NOT NULL,        -- inbound/outbound connection name (config metadata, never payload)
+    transport   TEXT NOT NULL,        -- ConnectorType.value, e.g. 'mllp'
+    direction   TEXT NOT NULL,        -- 'inbound' | 'outbound' (code-enforced; SQLite can't ADD a CHECK)
+    kind        TEXT NOT NULL,        -- bounded engine enum (lifecycle + failure kinds)
+    peer_host   TEXT,                 -- peer IP from the socket (metadata); NULL for outbound/unknown
+    message_id  TEXT,                 -- NULLABLE, NO FK — outbound lane correlation hint only
+    reason      TEXT                  -- safe_text-scrubbed diagnostic, encrypted at rest
+);
+CREATE INDEX IF NOT EXISTS ix_connection_event_conn ON connection_event(connection, ts);
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -919,6 +966,10 @@ class MessageStore:
             "users",
             "totp_secret",
         ),  # MFA secret (WP-14) — id-keyed, so it rides the migration + rotation
+        (
+            "connection_event",
+            "reason",
+        ),  # #46: scrubbed event reason — id-keyed, rides the loops below
         # NB: the `response` table (ADR 0013) is cipher-covered too, but it has a COMPOSITE PK (no
         # `id`), so it can't ride the id-keyed loops below — it has its own passes, like state/reference.
     )
@@ -1205,6 +1256,19 @@ class MessageStore:
         # MFA-required user must re-verify). A NULL on a non-MFA deployment is simply never consulted.
         if "mfa_verified_at" not in session_cols:
             await db.execute("ALTER TABLE sessions ADD COLUMN mfa_verified_at REAL")
+        # ADR 0021 "Response Sent" rides the response table via a `kind` discriminator. A pre-existing
+        # DB's response table predates the three columns — ALTER them in (existing rows backfill
+        # kind='response' via the DEFAULT). Metadata-only on SQLite (no table rewrite). Idempotent.
+        cur = await db.execute("PRAGMA table_info(response)")
+        response_cols = {row["name"] for row in await cur.fetchall()}
+        if "kind" not in response_cols:
+            await db.execute(
+                "ALTER TABLE response ADD COLUMN kind TEXT NOT NULL DEFAULT 'response'"
+            )
+        if "ack_code" not in response_cols:
+            await db.execute("ALTER TABLE response ADD COLUMN ack_code TEXT")
+        if "ack_phase" not in response_cols:
+            await db.execute("ALTER TABLE response ADD COLUMN ack_phase TEXT")
         await MessageStore._migrate_outbox_to_queue(db)
 
     @staticmethod
@@ -2394,15 +2458,73 @@ class MessageStore:
             art = await cur.fetchone()
         return self._dec(art["body"]) if (art and art["body"] is not None) else ""
 
+    async def record_ack_sent(
+        self,
+        *,
+        message_id: str,
+        inbound_name: str,
+        ack_body: str | None,
+        ack_code: str,
+        ack_phase: str,
+        outcome: str,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        # ADR 0021 "Response Sent": an immutable kind='ack_sent' response row under a sentinel dest
+        # (\x1fack:<inbound>) — the leading \x1f can't occur in a real connection name, so the key is
+        # provably disjoint from every outbound destination. Own transaction (seq SELECT + INSERT);
+        # touches no queue row and calls no _maybe_finalize (response is finalizer-invisible). PHI
+        # fail-safe: a NAK passes ack_body=None → body NULL; an AA body is stored ONLY when the store is
+        # encrypted, else NULL — default-on never persists raw ACK PHI on an unencrypted store. detail
+        # is safe_text-scrubbed (#120) + encrypted.
+        now = time.time() if now is None else now
+        dest = "\x1fack:" + inbound_name
+        enc_body = self._enc(ack_body) if (ack_body and self._cipher.encrypts) else None
+        enc_detail = self._enc(safe_text(detail)[:200]) if detail else None
+        async with self._lock:
+            try:
+                await self._db.execute("BEGIN")
+                cur = await self._db.execute(
+                    "SELECT COALESCE(MAX(response_seq), 0) AS m FROM response"
+                    " WHERE message_id=? AND destination_name=? AND kind='ack_sent'",
+                    (message_id, dest),
+                )
+                seq_row = await cur.fetchone()
+                seq = (int(seq_row["m"]) if seq_row else 0) + 1
+                await self._db.execute(
+                    "INSERT INTO response"
+                    " (message_id, destination_name, response_seq, body, outcome, detail,"
+                    "  captured_at, kind, ack_code, ack_phase)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        message_id,
+                        dest,
+                        seq,
+                        enc_body,
+                        outcome,
+                        enc_detail,
+                        now,
+                        "ack_sent",
+                        ack_code,
+                        ack_phase,
+                    ),
+                )
+                await self._db.commit()
+            except Exception:
+                await self._db.rollback()
+                raise
+
     async def correlate_response(self, message_id: str) -> list[CapturedResponse]:
-        """Every captured reply for ``message_id`` (ADR 0013), ordered by destination then
-        ``response_seq`` (so the **latest** ``response_seq`` per destination is the authoritative reply).
-        A **PHI read surface**: ``body``/``detail`` are decrypted here, and the API route that exposes
-        them is deny-by-default, body-gated, and audited (``response.read``)."""
+        """Every captured reply for ``message_id`` (ADR 0013) + the inbound ``ack_sent`` rows (ADR
+        0021), ordered by destination then ``response_seq`` (so the **latest** ``response_seq`` per
+        destination is the authoritative reply; ack rows sort under their sentinel name, disjoint from
+        real destinations). A **PHI read surface**: ``body``/``detail`` are decrypted here, and the API
+        route that exposes them is deny-by-default, body-gated, and audited (``response.read``)."""
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT message_id, destination_name, response_seq, body, outcome, detail,"
-                " captured_at FROM response WHERE message_id=? ORDER BY destination_name, response_seq",
+                " captured_at, kind, ack_code, ack_phase FROM response"
+                " WHERE message_id=? ORDER BY destination_name, response_seq",
                 (message_id,),
             )
             rows = await cur.fetchall()
@@ -2415,6 +2537,9 @@ class MessageStore:
                 detail=self._dec(r["detail"]),
                 captured_at=r["captured_at"],
                 body=self._dec(r["body"]),
+                kind=r["kind"],
+                ack_code=r["ack_code"],
+                ack_phase=r["ack_phase"],
             )
             for r in rows
         ]
@@ -2932,6 +3057,79 @@ class MessageStore:
                 "SELECT * FROM message_events WHERE message_id=? ORDER BY id", (message_id,)
             )
             return [self._decode_row(r, "detail") for r in await cur.fetchall()]
+
+    # --- connection events (Corepoint-style transport/lifecycle log, #46) -----
+    async def record_connection_event(
+        self,
+        *,
+        connection: str,
+        transport: str,
+        direction: str,
+        kind: str,
+        peer_host: str | None = None,
+        message_id: str | None = None,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        # Pure observer: a single short INSERT under the write lock — NOT inside any handoff txn, no
+        # queue row, no finalizer call (connection_event is invisible to _maybe_finalize_message, which
+        # scans `FROM queue`). reason goes through the safe_text PHI chokepoint (#120) + the cipher.
+        now = time.time() if now is None else now
+        reason_enc = self._enc(safe_text(reason)[:200]) if reason else None
+        async with self._lock:
+            await self._db.execute(
+                "INSERT INTO connection_event"
+                " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (now, connection, transport, direction, kind, peer_host, message_id, reason_enc),
+            )
+            await self._db.commit()
+
+    async def list_connection_events(
+        self,
+        *,
+        connection: str | None = None,
+        kinds: Sequence[str] | None = None,
+        since: float | None = None,
+        limit: int = 100,
+    ) -> list[ConnectionEvent]:
+        limit = max(
+            1, min(limit, 1000)
+        )  # server-side clamp (a flooded log can't drive an unbounded read)
+        where: list[str] = []
+        params: list[Any] = []
+        if connection is not None:
+            where.append("connection=?")
+            params.append(connection)
+        if kinds:
+            placeholders = ",".join("?" for _ in kinds)
+            where.append(f"kind IN ({placeholders})")
+            params.extend(kinds)
+        if since is not None:
+            where.append("ts>=?")
+            params.append(since)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        params.append(limit)
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT id, ts, connection, transport, direction, kind, peer_host, message_id, reason"
+                f" FROM connection_event{clause} ORDER BY ts DESC, id DESC LIMIT ?",
+                params,
+            )
+            return [
+                ConnectionEvent(
+                    id=r["id"],
+                    ts=r["ts"],
+                    connection=r["connection"],
+                    transport=r["transport"],
+                    direction=r["direction"],
+                    kind=r["kind"],
+                    peer_host=r["peer_host"],
+                    message_id=r["message_id"],
+                    reason=self._dec(r["reason"]),
+                )
+                for r in await cur.fetchall()
+            ]
 
     async def record_view(
         self, message_id: str, *, actor: str | None = None, now: float | None = None
@@ -3723,6 +3921,14 @@ class MessageStore:
                 await self._db.rollback()
                 raise
         return int(purged)
+
+    async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
+        # #46: connection events are metadata-only (no body to null, no FK), so they are age-DELETEd on
+        # their own window (driven by the RetentionRunner). A single short transaction.
+        async with self._lock:
+            cur = await self._db.execute("DELETE FROM connection_event WHERE ts < ?", (older_than,))
+            await self._db.commit()
+            return int(cur.rowcount)
 
     async def purge_dead_letters(self, *, older_than: float, now: float | None = None) -> int:
         """Null the bodies of dead-lettered **outbound** rows last updated before ``older_than`` —

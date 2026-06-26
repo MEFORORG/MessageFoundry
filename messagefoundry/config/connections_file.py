@@ -89,6 +89,8 @@ _INBOUND_KEYS = frozenset(
         "metadata",
         "bind_address",
         "source_ip_allowlist",
+        "capture_ack",
+        "capture_connection_errors",
     }
 )
 _OUTBOUND_KEYS = frozenset(
@@ -158,6 +160,8 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         metadata=_optional_table(table, "metadata", where),
         bind_address=_optional_str(table, "bind_address", where),
         source_ip_allowlist=_optional_str_list(table, "source_ip_allowlist", where),
+        capture_ack=_optional_bool(table, "capture_ack", where),
+        capture_connection_errors=_optional_bool(table, "capture_connection_errors", where),
         source_file=source,
         source_line=None,
     )
@@ -262,6 +266,18 @@ def _optional_str_list(table: dict[str, Any], key: str, where: str) -> list[str]
 def _require_bool(table: dict[str, Any], key: str, where: str) -> bool:
     if key not in table:
         return False
+    value = table[key]
+    if not isinstance(value, bool):
+        raise WiringError(f"{where}: {key!r} must be true or false")
+    return value
+
+
+def _optional_bool(table: dict[str, Any], key: str, where: str) -> bool | None:
+    """A tri-state bool: absent → ``None`` (inherit the default), else the bool. Used for the
+    Corepoint-style event-log per-connection overrides (#46), where ``None`` means "inherit the
+    ``[diagnostics]`` master switch" — distinct from an explicit ``false``."""
+    if key not in table:
+        return None
     value = table[key]
     if not isinstance(value, bool):
         raise WiringError(f"{where}: {key!r} must be true or false")

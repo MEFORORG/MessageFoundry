@@ -47,6 +47,7 @@ from messagefoundry.store.crypto import (
     cipher_info,
 )
 from messagefoundry.store.store import (
+    ConnectionEvent,
     ConnectionMetrics,
     DbStatus,
     DestinationMetrics,
@@ -124,6 +125,19 @@ _SCHEMA: list[str] = [
         event NVARCHAR(64) NOT NULL, destination NVARCHAR(256) NULL, detail NVARCHAR(MAX) NULL)""",
     """IF INDEXPROPERTY(OBJECT_ID('message_events'),'ix_events_message','IndexID') IS NULL
         CREATE INDEX ix_events_message ON message_events(message_id, ts)""",
+    # Connection/transport event log (Corepoint-style #46) — METADATA-ONLY: inbound lifecycle +
+    # pre-ingress failures + outbound lane transitions. id-keyed BIGINT IDENTITY (NOT a queue stage →
+    # invisible to the finalizer's `FROM queue` scan); message_id is NULLABLE with NO FK (correlation
+    # hint only). reason is safe_text-scrubbed and CIPHERED at rest (rides the id-keyed nullable cipher
+    # loop, like message_events.detail — H4 retired the prior plaintext residual, so reason is encrypted
+    # here too, NOT plaintext as the stale ADR 0021 §7.5 directs).
+    """IF OBJECT_ID('connection_event','U') IS NULL CREATE TABLE connection_event (
+        id BIGINT IDENTITY(1,1) PRIMARY KEY, ts FLOAT NOT NULL,
+        connection NVARCHAR(256) NOT NULL, transport NVARCHAR(64) NOT NULL,
+        direction NVARCHAR(16) NOT NULL, kind NVARCHAR(64) NOT NULL,
+        peer_host NVARCHAR(256) NULL, message_id NVARCHAR(64) NULL, reason NVARCHAR(MAX) NULL)""",
+    """IF INDEXPROPERTY(OBJECT_ID('connection_event'),'ix_connection_event_conn','IndexID') IS NULL
+        CREATE INDEX ix_connection_event_conn ON connection_event(connection, ts)""",
     # Transform-accessible state (ADR 0005). Written here via transform_handoff (parity with SQLite/
     # Postgres): the read-through cache is loaded at open and refreshed post-commit, so a Handler's
     # cross-message state_get(...) resolves in-process. Schema matches SQLite.
@@ -211,10 +225,20 @@ _SCHEMA: list[str] = [
         message_id NVARCHAR(64) NOT NULL, destination_name NVARCHAR(256) NOT NULL,
         response_seq INT NOT NULL, body NVARCHAR(MAX) NULL, outcome NVARCHAR(64) NOT NULL,
         detail NVARCHAR(MAX) NULL, captured_at FLOAT NOT NULL,
+        kind NVARCHAR(32) NOT NULL CONSTRAINT df_response_kind DEFAULT 'response',
+        ack_code NVARCHAR(8) NULL, ack_phase NVARCHAR(16) NULL,
         CONSTRAINT pk_response PRIMARY KEY (message_id, destination_name, response_seq),
         CONSTRAINT fk_response_message FOREIGN KEY (message_id) REFERENCES messages(id))""",
     """IF INDEXPROPERTY(OBJECT_ID('response'),'ix_response_message','IndexID') IS NULL
         CREATE INDEX ix_response_message ON response(message_id)""",
+    # ADR 0021 "Response Sent" columns on a pre-existing response table. Adding NOT NULL `kind` with a
+    # CONSTANT default is metadata-only (no rewrite) on SQL Server 2016+ (CI 2022); a migration-timing
+    # test on a pre-populated table guards this, with a batched NULLable-add → backfill → SET NOT NULL
+    # fallback if any rewrite is observed. Mutually exclusive with the fresh CREATE above (one per DB).
+    """IF COL_LENGTH('response','kind') IS NULL
+        ALTER TABLE response ADD kind NVARCHAR(32) NOT NULL CONSTRAINT df_response_kind DEFAULT 'response'""",
+    """IF COL_LENGTH('response','ack_code') IS NULL ALTER TABLE response ADD ack_code NVARCHAR(8) NULL""",
+    """IF COL_LENGTH('response','ack_phase') IS NULL ALTER TABLE response ADD ack_phase NVARCHAR(16) NULL""",
     # Outbound idempotency ledger (H2) — one row per COMPLETED delivery, INSERTed in the SAME txn as the
     # outbound row's mark_done / complete_with_response. delivery_key = sha256 of non-PHI ids + a replay-
     # stable seq (delivery_key()); outbox_id is the queue row that delivered, the FIFO claim's
@@ -443,6 +467,7 @@ class SqlServerStore:
             ("messages", "error"),
             ("queue", "last_error"),
             ("message_events", "detail"),
+            ("connection_event", "reason"),  # #46: id-keyed (BIGINT IDENTITY), nullable — H4 parity
         ):
             while True:
                 rows = await self._fetchall(
@@ -1248,7 +1273,8 @@ class SqlServerStore:
         ciphertext); a NULL (never-captured or purged) body/detail returns ``None`` while an empty ``''``
         round-trips as ``''`` — parity with PG/SQLite ``_dec``; ``outcome`` is plaintext."""
         rows = await self._fetchall(
-            "SELECT message_id, destination_name, response_seq, body, outcome, detail, captured_at"
+            "SELECT message_id, destination_name, response_seq, body, outcome, detail, captured_at,"
+            " kind, ack_code, ack_phase"
             " FROM response WHERE message_id=? ORDER BY destination_name, response_seq",
             (message_id,),
         )
@@ -1261,6 +1287,125 @@ class SqlServerStore:
                 detail=self._cipher.decrypt(r["detail"]) if r["detail"] is not None else None,
                 captured_at=float(r["captured_at"]),
                 body=self._cipher.decrypt(r["body"]) if r["body"] is not None else None,
+                kind=r["kind"],
+                ack_code=r["ack_code"],
+                ack_phase=r["ack_phase"],
+            )
+            for r in rows
+        ]
+
+    async def record_ack_sent(
+        self,
+        *,
+        message_id: str,
+        inbound_name: str,
+        ack_body: str | None,
+        ack_code: str,
+        ack_phase: str,
+        outcome: str,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        # ADR 0021 "Response Sent" — see MessageStore.record_ack_sent for the contract. Leading SELECT
+        # opens the txn; single commit. NAK body NULL; AA body only when encrypted; detail scrubbed+enc.
+        now = time.time() if now is None else now
+        dest = "\x1fack:" + inbound_name
+        enc_body = self._enc(ack_body) if (ack_body and self._cipher.encrypts) else None
+        enc_detail = self._enc(safe_text(detail)[:200]) if detail else None
+        async with self._acquire() as conn:
+            cur = await conn.cursor()
+            try:
+                await cur.execute(
+                    "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
+                    " WHERE message_id=? AND destination_name=? AND kind=?",
+                    (message_id, dest, "ack_sent"),
+                )
+                seq = int((await cur.fetchone())[0])
+                await cur.execute(
+                    "INSERT INTO response"
+                    " (message_id, destination_name, response_seq, body, outcome, detail,"
+                    "  captured_at, kind, ack_code, ack_phase)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        message_id,
+                        dest,
+                        seq,
+                        enc_body,
+                        outcome,
+                        enc_detail,
+                        now,
+                        "ack_sent",
+                        ack_code,
+                        ack_phase,
+                    ),
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+    # --- connection events (Corepoint-style transport/lifecycle log, #46) -----
+    async def record_connection_event(
+        self,
+        *,
+        connection: str,
+        transport: str,
+        direction: str,
+        kind: str,
+        peer_host: str | None = None,
+        message_id: str | None = None,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        # Pure observer: a single committed INSERT in its own txn (_execute) — no queue row, no
+        # finalizer, never inside a handoff. reason rides safe_text (#120) + the cipher (H4 parity).
+        now = time.time() if now is None else now
+        reason_enc = self._enc(safe_text(reason)[:200]) if reason else None
+        await self._execute(
+            "INSERT INTO connection_event"
+            " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (now, connection, transport, direction, kind, peer_host, message_id, reason_enc),
+        )
+
+    async def list_connection_events(
+        self,
+        *,
+        connection: str | None = None,
+        kinds: Sequence[str] | None = None,
+        since: float | None = None,
+        limit: int = 100,
+    ) -> list[ConnectionEvent]:
+        limit = max(1, min(limit, 1000))  # server-side clamp
+        where: list[str] = []
+        params: list[Any] = [limit]  # TOP (?) is the first placeholder
+        if connection is not None:
+            where.append("connection=?")
+            params.append(connection)
+        if kinds:
+            placeholders = ",".join("?" for _ in kinds)
+            where.append(f"kind IN ({placeholders})")
+            params.extend(kinds)
+        if since is not None:
+            where.append("ts>=?")
+            params.append(since)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        rows = await self._fetchall(
+            "SELECT TOP (?) id, ts, connection, transport, direction, kind, peer_host, message_id, reason"
+            f" FROM connection_event{clause} ORDER BY ts DESC, id DESC",
+            tuple(params),
+        )
+        return [
+            ConnectionEvent(
+                id=int(r["id"]),
+                ts=float(r["ts"]),
+                connection=r["connection"],
+                transport=r["transport"],
+                direction=r["direction"],
+                kind=r["kind"],
+                peer_host=r["peer_host"],
+                message_id=r["message_id"],
+                reason=self._dec(r["reason"]),
             )
             for r in rows
         ]
@@ -1593,6 +1738,7 @@ class SqlServerStore:
             ("messages", "error"),
             ("queue", "last_error"),
             ("message_events", "detail"),
+            ("connection_event", "reason"),  # #46: rotate the scrubbed event reason too (H4 parity)
         ):
             while True:
                 rows = await self._fetchall(
@@ -1728,6 +1874,19 @@ class SqlServerStore:
                     " AND message_id IN (SELECT id FROM #eligible)"
                 )
                 await cur.execute("DROP TABLE #eligible")
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(purged) if purged is not None else 0
+
+    async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
+        # #46: metadata-only rows (no body/FK) — age-DELETE on their own window (RetentionRunner-driven).
+        async with self._acquire() as conn:
+            cur = await conn.cursor()
+            try:
+                await cur.execute("DELETE FROM connection_event WHERE ts < ?", (older_than,))
+                purged = cur.rowcount
                 await conn.commit()
             except Exception:
                 await conn.rollback()

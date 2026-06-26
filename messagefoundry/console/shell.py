@@ -36,10 +36,11 @@ from messagefoundry.console.connections import ConnectionsPage
 from messagefoundry.console.search import LogSearchPage
 from messagefoundry.console.status import EngineStatusPage
 from messagefoundry.console.dead_letters_page import DeadLettersPage
+from messagefoundry.console.event_log_page import EventLogPage
 from messagefoundry.console.users_page import UsersPage
 from messagefoundry.console.widgets import ERROR_COLOR, RefreshSettingsDialog
 
-_NAV = ["Connections", "Alerts", "Dead Letters", "Log Search", "Engine Status"]
+_NAV = ["Connections", "Alerts", "Dead Letters", "Event Log", "Log Search", "Engine Status"]
 _HEALTH_INTERVAL_MS = 5000  # heart polls health on its own timer (independent of auto-refresh)
 _LOW_DISK_BYTES = 1024**3  # < 1 GiB free on the DB drive => "running out of space"
 
@@ -171,6 +172,7 @@ class AppWindow(QWidget):
         self.connections = ConnectionsPage(client, poll_client=self._poll_client)
         self.alerts = AlertsPage(client, poll_client=self._poll_client)
         self.dead_letters = DeadLettersPage(client, poll_client=self._poll_client)
+        self.event_log = EventLogPage(client, poll_client=self._poll_client)
         self.log_search = LogSearchPage(client, poll_client=self._poll_client)
         self.engine_status = EngineStatusPage(self._poll_client, service_name=service_name)
         nav_items = list(_NAV)
@@ -178,6 +180,7 @@ class AppWindow(QWidget):
             self.connections,
             self.alerts,
             self.dead_letters,
+            self.event_log,
             self.log_search,
             self.engine_status,
         ]
@@ -205,6 +208,7 @@ class AppWindow(QWidget):
         self.connections.error.connect(self._show_error)
         self.alerts.error.connect(self._show_error)
         self.dead_letters.error.connect(self._show_error)
+        self.event_log.error.connect(self._show_error)
         self.log_search.error.connect(self._show_error)
         self.engine_status.error.connect(self._show_error)
 

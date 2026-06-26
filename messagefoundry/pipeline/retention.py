@@ -49,6 +49,7 @@ class RetentionPass:
     messages_purged: int
     dead_purged: int
     state_purged: int
+    conn_events_purged: int
     wal_checkpointed: bool
     vacuumed: bool
     size_bytes: int
@@ -62,6 +63,7 @@ class RetentionPass:
             self.messages_purged > 0
             or self.dead_purged > 0
             or self.state_purged > 0
+            or self.conn_events_purged > 0
             or self.vacuumed
             or self.over_limit
         )
@@ -105,6 +107,7 @@ class RetentionRunner:
             s.messages_days
             or s.dead_letter_days
             or s.state_max_age_days
+            or s.connection_event_retention_hours
             or s.max_db_mb
             or s.wal_checkpoint_seconds
             or s.vacuum_time() is not None
@@ -182,6 +185,7 @@ class RetentionRunner:
                 messages_purged=0,
                 dead_purged=0,
                 state_purged=0,
+                conn_events_purged=0,
                 wal_checkpointed=False,
                 vacuumed=False,
                 size_bytes=0,
@@ -204,6 +208,7 @@ class RetentionRunner:
                 messages_purged=0,
                 dead_purged=0,
                 state_purged=0,
+                conn_events_purged=0,
                 wal_checkpointed=False,
                 vacuumed=False,
                 size_bytes=0,
@@ -225,6 +230,18 @@ class RetentionRunner:
             state_purged = await self._store.purge_state(
                 older_than=now - s.state_max_age_days * _SECONDS_PER_DAY, now=now
             )
+        # Connection events (#46): the dedicated `connection_event_retention_hours` window if set,
+        # else inherit the message-body window (the ADR 0021 §7.5 default — bound the log alongside
+        # the bodies). A positive hours value can keep events longer OR shorter than message bodies.
+        conn_events_purged = 0
+        if s.connection_event_retention_hours > 0:
+            conn_events_purged = await self._store.purge_connection_events(
+                older_than=now - s.connection_event_retention_hours * 3600.0, now=now
+            )
+        elif s.messages_days > 0:
+            conn_events_purged = await self._store.purge_connection_events(
+                older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
+            )
 
         wal_checkpointed = False
         if s.wal_checkpoint_seconds > 0 and now - self._last_wal >= s.wal_checkpoint_seconds:
@@ -244,6 +261,7 @@ class RetentionRunner:
             messages_purged=messages_purged,
             dead_purged=dead_purged,
             state_purged=state_purged,
+            conn_events_purged=conn_events_purged,
             wal_checkpointed=wal_checkpointed,
             vacuumed=vacuumed,
             size_bytes=size_bytes,
@@ -282,6 +300,8 @@ class RetentionRunner:
                 "dead_purged": result.dead_purged,
                 "state_max_age_days": self._settings.state_max_age_days,
                 "state_purged": result.state_purged,
+                "connection_event_retention_hours": self._settings.connection_event_retention_hours,
+                "conn_events_purged": result.conn_events_purged,
                 "vacuumed": result.vacuumed,
                 "db_size_bytes": result.size_bytes,
                 "max_db_mb": self._settings.max_db_mb,

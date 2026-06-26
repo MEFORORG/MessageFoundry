@@ -6,6 +6,12 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-06-24 — Early Access
+
+A security-hardening release: PHI-at-rest encryption is closed across every backend, the active-passive
+cluster gains a store-checked split-brain fence, outbound delivery is effectively-once, and the at-rest
+cipher becomes crypto-agile — all additive, with the on-disk `mfenc:v1` format byte-identical.
+
 ### Changed
 - **BREAKING — Python 3.14 is now the only supported runtime.** `requires-python` is raised to `>=3.14`
   (was `>=3.11`), and the ruff/mypy targets, CI matrix (Linux + Windows Server 2022/2025, all on 3.14),
@@ -14,6 +20,42 @@ All notable changes to MessageFoundry are documented here. The format follows
   apparatus is retired with this change (the `MEFOR_PY311_QUARANTINE` conftest lever, the `py3.11 store
   soak` CI job, and `scripts/soak/store_soak.py`; the underlying BACKLOG #17 asyncio↔aiosqlite concern is
   still mitigated by the shared session loop in `pyproject.toml`).
+
+### Security
+- **PHI-at-rest encryption closed across all three backends.** The patient `summary` (MRN + name) and
+  `metadata` columns are now encrypted at rest (previously cleartext even with encryption enabled), and the
+  SQL Server `error` / `last_error` / `message_events.detail` columns are brought to parity with SQLite and
+  Postgres — every cipher column is now AES-256-GCM at rest. Coverage is surfaced by a new authenticated,
+  audited `GET /security/posture` route (reports the active-key fingerprint + per-backend column coverage;
+  never key bytes).
+- **Fail-closed for PHI without a key.** An instance declared `data_class = phi` now **refuses to start**
+  without an encryption key (previously it started in cleartext with a warning), unless explicitly overridden
+  by the new, audited `[store].allow_unencrypted_phi`.
+- **Crypto-agility marker (additive).** The at-rest cipher marker is now version/algorithm-aware
+  (`mfenc:v2:<alg>:…`) so a future algorithm can be introduced without a data migration. The `mfenc:v1`
+  format is byte-identical and AES-256-GCM remains the only algorithm; decryption fails closed on an unknown
+  marker version or algorithm.
+- **Database-TLS hardening.** A new `[store].ssl_root_cert` pins a private database CA (Postgres), with
+  machine-store CA-import and certificate-rotation operator runbooks. The DPAPI key file's ACL now grants the
+  service account read access without broadening exposure.
+
+### Added
+- **Active-passive split-brain fence.** A monotonic leader-epoch fencing token on the leadership lease,
+  validated inside the FIFO claim transaction, so a superseded or paused ex-leader that resumes is fenced out
+  (it claims nothing) — backed by continuous "at most one leader" SLO checks and a real-handover failover
+  test. SQLite (single-node) behavior is unchanged.
+- **Effectively-once outbound delivery.** A same-transaction idempotency ledger skips re-delivery of an
+  already-delivered message after a failover or crash-recovery re-claim, without re-ordering a lane; an
+  operator-initiated replay still re-sends.
+- **Pre-side-effect leadership re-checks** so a node that loses leadership between claiming and sending
+  re-queues the work rather than emitting it as a stale leader.
+- `messagefoundry verify --check-disposition` for post-deploy disposition validation.
+
+### Fixed
+- CycloneDX SBOM generation on Python 3.14.
+- PyPI long-description rendering (version pins, links).
+- De-flaked several intermittent CI tests (failover-load timeouts, a harness server port-bind race, the
+  startup fault-isolation recovery assertion, and the docker-smoke shutdown-marker check).
 
 ## [0.2.1] — 2026-06-23 — Early Access
 

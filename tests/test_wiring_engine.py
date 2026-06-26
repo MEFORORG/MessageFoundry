@@ -822,12 +822,16 @@ class _RecordingAlertSink:
     def __init__(self) -> None:
         self.stopped: list[tuple[str, str]] = []
         self.buildups: list[tuple[str, int, float]] = []
+        self.errors: list[tuple[str, str]] = []
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         self.stopped.append((name, detail))
 
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
         self.buildups.append((name, depth, oldest_age_seconds))
+
+    def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
+        self.errors.append((name, kind))
 
 
 def _stop_registry(inbox: Path, outdir: Path, internal_error) -> Registry:  # type: ignore[no-untyped-def]

@@ -143,6 +143,22 @@ class DeadLetterList(BaseModel):
     dead_letters: list[DeadLetterRow]
 
 
+class ConnectionEventInfo(BaseModel):
+    """One connection/transport event (Corepoint-style log, #46) — **metadata only, no PHI**: the
+    connection name, transport, direction, event kind, peer IP, and a scrubbed reason. Read via the
+    ``monitoring:read``-gated ``GET /events`` / ``GET /connections/{name}/events`` routes."""
+
+    id: int
+    ts: float
+    connection: str
+    transport: str
+    direction: str  # 'inbound' | 'outbound'
+    kind: str
+    peer_host: str | None = None
+    message_id: str | None = None
+    reason: str | None = None
+
+
 class DeadLetterReplayRequest(BaseModel):
     # Connection names; bounded so an over-long value can't reach the store query (ASVS 1.3.3).
     channel_id: str | None = Field(None, max_length=256)  # scope replay to one inbound (None = all)

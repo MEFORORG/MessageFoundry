@@ -49,62 +49,34 @@ renders on GitHub and in the VS Code preview). The prose source of truth is
   and **transport TLS** (HTTPS/WSS for the API plus MLLP-over-TLS) are **built**; MFA and off-box log
   shipping remain on the roadmap. See [docs/PHI.md](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/PHI.md) for the full data-protection map.
 
-## Roadmap
+## Features
 
-**Phase 1 — minimum reliable engine**
-- [x] Connection/Router/Handler model + config-module loader
-- [x] Durable message store / queue (SQLite WAL, outbox pattern)
-- [x] Parse / validate (tolerant peek + opt-in strict validation)
-- [x] MLLP source + destination (correct `0x0B … 0x1C 0x0D` framing, ACK/NACK)
-- [x] File source + destination
-- [x] Pipeline: source → parse/validate/filter/transform → outbox → per-dest workers,
-      with retry/backoff, dead-letter, and replay
-- [x] localhost API (connections start/stop, message track/search/detail, replay, stats,
-      live WebSocket feed) + `python -m messagefoundry serve`
-- [x] PySide6 console: connection dashboard, message browser, HL7 parse-tree viewer,
-      delivery/audit trail, replay (`python -m messagefoundry.console`)
+MessageFoundry ships a reliable, PHI-aware engine today: the Connection/Router/Handler graph
+over a durable staged pipeline (at-least-once delivery, retries, dead-letter, replay), backed by
+SQLite, PostgreSQL, or SQL Server. It speaks MLLP (plain and over TLS), file/SFTP, REST, SOAP,
+FHIR, database, and DICOM (C-STORE SCP), parses HL7 v2 tolerantly (with opt-in strict validation)
+and carries other formats payload-agnostically (JSON, XML/SOAP, X12, binary). Security is
+first-class — authentication, RBAC, a user-attributed audit log, at-rest body encryption, and
+transport TLS — and it runs single-node or in active-passive high availability.
 
-**Phase 1 complete.**
+**See the full, up-to-date feature breakdown — built vs. planned — at
+[messagefoundry.org/features-table.html](https://messagefoundry.org/features-table.html).**
 
-**Since Phase 1 — now built**
-- [x] Staged pipeline (ingress → routed → outbound): at-least-once handoff, dead-letter, replay
-- [x] Authentication, RBAC, user-attributed audit log, at-rest body encryption (AES-256-GCM)
-- [x] **PostgreSQL** store backend (production, single-node)
-- [x] **Microsoft SQL Server** store backend (production, single-node)
-- [x] REST, SOAP, and Database destinations
-- [x] Database poll source
-- [x] Reference / lookup tables (`code_set`) for enrichment
-- [x] Alerting — logging sink + webhook/email notifier
-- [x] Connections-as-data (`connections.toml`) editable by hand or a VS Code GUI
-- [x] **Active-passive high availability** — self-fencing leadership lease, leader-gated graph, and a
-      failover-load test harness (kill-the-primary-under-load), on **both** PostgreSQL and SQL Server
-- [x] **Native transport TLS** — in-process API TLS (HTTPS/WSS) and MLLP-over-TLS, with an off-loopback
-      bind guard and a certificate-expiry monitor
-- [x] Published throughput + active-passive failover **baseline** ([docs/benchmarks/TUNING-BASELINE.md](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/benchmarks/TUNING-BASELINE.md))
-- [x] **SMART Backend Services token provider** — OAuth2 `client_credentials` + signed-JWT
-      `client_assertion` (RS384/ES384) authenticating the FHIR/REST outbound against real SMART-secured
-      servers (Epic, Oracle Health); a `with_smart_backend()` composer over `FHIR()`/`Rest()` that mints,
-      caches, and re-mints (on 401) a short-lived bearer, token endpoint gated by `[egress].allowed_http`
-      ([ADR 0024](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/adr/0024-smart-backend-services-token-provider.md))
-- [x] **base64 binary-carriage codec** — an `mfb64:v1:` marker carries arbitrary NUL-safe **bytes** over
-      the str/TEXT ingress + store (`RawMessage.from_bytes()`/`.raw_bytes`/`.binary()`/`.is_binary`), plus
-      HL7 OBX-5 ED (Encapsulated Data) embedding helpers ([ADR 0028](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/adr/0028-base64-binary-carriage-codec.md))
-- [x] **DICOM codec + C-STORE SCP** (Phase 1) — a pure codec (routing peek, headers/Structured Report,
-      code-first SR→HL7 mapping helpers; **headers + SR only, no pixel data**) on `content_type=dicom`
-      payload-agnostic ingress, plus an inbound C-STORE SCP listener (`DICOM()`) ([ADR 0025](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/adr/0025-dicom-codec-store-connectors.md))
-- [x] **Anonymizer / de-identification** — builds PHI-free test datasets from real traffic with
-      deterministic secret-per-dataset pseudonymization, field-anchored site-code scrub, and fail-closed
-      emission (never an un-scrubbed body), via a `tee anonymize-captures` subcommand and test-harness
-      hooks ([ADR 0030](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/adr/0030-anonymization-test-harness-tee.md))
+## Documentation
 
-**Later** — higher-throughput delivery (a pooled/persistent MLLP connector); a read-only **component
-SDK** (fork-to-customize); DICOM Phase 2 (C-STORE SCU + C-ECHO + DICOMweb STOW-RS, designed); MFA and
-off-box log shipping. See [docs/EARLY-ADOPTER-GUIDE.md](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/EARLY-ADOPTER-GUIDE.md) §2 for the current
-built-vs-experimental map.
+Full documentation lives on **[messagefoundry.org](https://messagefoundry.org/)**:
 
-Horizontal **active-active** scale-out (the multi-node cluster path) was **dropped on 2026-06-18 and
-its code removed** — it is not a planned milestone; single-leader **active-passive** HA (above) is the
-supported HA model.
+- **[Mental map](https://messagefoundry.org/assets/docs/MessageFoundry-Mental-Model.pdf)** — a one-page
+  picture of how the pieces fit: Connections → Router → Handlers → Connections, with the headless
+  engine and the console/IDE that drive it.
+- **[Install Guide](https://messagefoundry.org/assets/docs/MessageFoundry-Install-Guide.pdf)** — install,
+  configure, secure, and roll out to production.
+- **[User Guide](https://messagefoundry.org/assets/docs/MessageFoundry-User-Guide.pdf)** — author and
+  operate interfaces day to day.
+
+**Get started:** [Quickstart](https://messagefoundry.org/getting-started.html) ·
+[Guides](https://messagefoundry.org/guides/) ·
+[Documents](https://messagefoundry.org/documents.html)
 
 ## Installing & rolling out
 
@@ -114,21 +86,23 @@ supported production artifact, with no source checkout required. Install it as a
 dependency**, then scaffold your own config repo ([ADR 0017](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/adr/0017-consumer-deployment-model.md)):
 
 ```bash
-pip install "messagefoundry==0.2.1"   # pin the exact engine version (core runtime, SQLite store)
-messagefoundry init ./my-config-repo     # scaffold a standalone config repo
+pip install "messagefoundry==<version>"   # pin the exact engine version (core runtime, SQLite store)
+messagefoundry init ./my-config-repo      # scaffold a standalone config repo
 cd ./my-config-repo
 messagefoundry serve --config config --env dev
 ```
 
-`0.2.1` is the current **Early Access** release on PyPI. Always **pin the exact version** so
-upgrades stay deliberate. Add the extras your deployment needs (each is opt-in and lazy-imported):
+MessageFoundry is in **Early Access**. Always **pin the exact version** so upgrades stay
+deliberate — replace `<version>` with the current release shown at the top of the
+[PyPI project page](https://pypi.org/project/messagefoundry/). Add the extras your deployment
+needs (each is opt-in and lazy-imported):
 
 ```bash
-pip install "messagefoundry[postgres]==0.2.1"    # PostgreSQL store backend (production server DB)
-pip install "messagefoundry[sqlserver]==0.2.1"   # SQL Server store backend (+ OS-level ODBC Driver 18)
-pip install "messagefoundry[console]==0.2.1"     # PySide6 admin console
-pip install "messagefoundry[sftp]==0.2.1"        # SFTP transport for the REMOTEFILE connector
-pip install "messagefoundry[dicom]==0.2.1"       # DICOM codec + C-STORE SCP (pydicom + pynetdicom)
+pip install "messagefoundry[postgres]==<version>"    # PostgreSQL store backend (production server DB)
+pip install "messagefoundry[sqlserver]==<version>"   # SQL Server store backend (+ OS-level ODBC Driver 18)
+pip install "messagefoundry[console]==<version>"     # PySide6 admin console
+pip install "messagefoundry[sftp]==<version>"        # SFTP transport for the REMOTEFILE connector
+pip install "messagefoundry[dicom]==<version>"       # DICOM codec + C-STORE SCP (pydicom + pynetdicom)
 ```
 
 > **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow,
@@ -140,7 +114,7 @@ pip install "messagefoundry[dicom]==0.2.1"       # DICOM codec + C-STORE SCP (py
 >
 > *(Engine developers install from a checkout instead — see [Development](#development).)*
 
-Piloting MessageFoundry? The **[Early-Adopter Installation & Rollout Guide](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/EARLY-ADOPTER-GUIDE.md)**
+Piloting MessageFoundry? The **[Install Guide](https://messagefoundry.org/assets/docs/MessageFoundry-Install-Guide.pdf)**
 takes you from first install through a staged, go/no-go-gated path to full production
 (Lab → Shadow/Parallel → Limited → Full). It leads with an honest built-vs-experimental
 maturity map and covers prerequisites, install, security/PHI hardening, reliability

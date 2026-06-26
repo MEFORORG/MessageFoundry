@@ -33,6 +33,7 @@ from messagefoundry.store.crypto import CipherInfo, make_cipher
 from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.store import (
     CapturedResponse,
+    ConnectionEvent,
     ConnectionMetrics,
     DbStatus,
     LatencyHistogram,
@@ -315,7 +316,36 @@ class QueueStore(StoreLifecycle, Protocol):
     async def correlate_response(self, message_id: str) -> list[CapturedResponse]:
         """Every captured reply for ``message_id`` (ADR 0013), ordered by destination then
         ``response_seq`` (latest seq per destination = the authoritative reply). The PHI read surface
-        behind the audited, body-gated ``GET /messages/{id}/responses`` route."""
+        behind the audited, body-gated ``GET /messages/{id}/responses`` route. Also returns the inbound
+        ``ack_sent`` rows (ADR 0021): they sort under a sentinel synthetic ``destination_name`` disjoint
+        from every real destination, so the outbound per-destination authoritative-reply ordering is
+        unaffected."""
+        ...
+
+    async def record_ack_sent(
+        self,
+        *,
+        message_id: str,
+        inbound_name: str,
+        ack_body: str | None,
+        ack_code: str,
+        ack_phase: str,
+        outcome: str,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Record the ACK/NAK MessageFoundry **returned** to an inbound sender — Corepoint's "Response
+        Sent" (ADR 0021 §§1-6) — as an immutable ``kind='ack_sent'`` row on the ``response`` table,
+        keyed to ``message_id`` under a sentinel synthetic ``destination_name`` (``\\x1fack:<inbound>``)
+        provably disjoint from every outbound destination.
+
+        Captured **synchronously** after the ingress commit, so it is finalizer-invisible (``response``
+        is not a ``queue`` stage) and never NAKs the sender. **PHI fail-safe** (#120): a NAK passes
+        ``ack_body=None`` → ``body`` is always ``NULL`` (the AE/AR frame quotes the offending field
+        value); an AA ``ack_body`` is stored **only when the store is encrypted**, else ``body`` is
+        ``NULL`` — so default-on capture never forces raw ACK PHI onto an unencrypted store. ``detail``
+        is the ``safe_text``-scrubbed, bounded reason (encrypted). ``ack_code``/``ack_phase`` are non-PHI
+        plaintext disposition metadata."""
         ...
 
     async def ingress_handoff(
@@ -460,6 +490,47 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def events_for(self, message_id: str) -> Sequence[Row]: ...
 
+    # --- connection events (Corepoint-style transport/lifecycle log, #46) -----
+    async def record_connection_event(
+        self,
+        *,
+        connection: str,
+        transport: str,
+        direction: str,
+        kind: str,
+        peer_host: str | None = None,
+        message_id: str | None = None,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Append one **metadata-only** connection event to the ``connection_event`` log (#46): the
+        inbound lifecycle (``established``/``closed``) + the pre-ingress failures
+        (``peer_not_allowlisted``/``at_capacity``/``frame_oversize``/``peer_reset``/``framing_error``)
+        + the outbound lane transitions (``connection_lost``/``connection_restored``).
+
+        It is a **pure observer**: a single short INSERT in its own transaction, touching no ``queue``
+        row and calling no finalizer, so it can never pin a message's disposition or inflate received
+        counts (``connection_event`` is invisible to ``_maybe_finalize_message``, which scans ``queue``
+        only). ``message_id`` is a nullable, **non-FK** correlation hint (set only for outbound lane
+        events). ``reason`` is ``safe_text``-scrubbed (#120) and encrypted at rest on every backend; the
+        raw frame / message body is **never** passed here. The caller (runner) wraps every emit
+        fail-soft, so a store error here can never wedge a listener or delivery lane."""
+        ...
+
+    async def list_connection_events(
+        self,
+        *,
+        connection: str | None = None,
+        kinds: Sequence[str] | None = None,
+        since: float | None = None,
+        limit: int = 100,
+    ) -> list[ConnectionEvent]:
+        """Read connection events newest-first, optionally filtered by ``connection``, an ``kinds``
+        allow-set, and a ``since`` timestamp. ``reason`` is decrypted at the boundary. The read accessor
+        for the engine ``GET /events`` route + the deferred console "Event Log" page; runs on the
+        lockfree read path. ``limit`` is clamped server-side."""
+        ...
+
     async def stats(self) -> dict[str, int]: ...
 
     async def in_pipeline_depth(self) -> int:
@@ -479,6 +550,12 @@ class QueueStore(StoreLifecycle, Protocol):
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries (ADR 0005) last written before ``older_than`` (age-based
         retention). Returns the number purged. Off unless ``[retention].state_max_age_days`` is set."""
+        ...
+
+    async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
+        """Delete connection-event rows (#46) older than ``older_than`` (age-based — they are metadata
+        with no body to null and no FK). Returns the number purged. Driven by the
+        ``[retention].connection_event_retention_hours`` override, else the message-body window."""
         ...
 
     async def wal_checkpoint(self) -> None: ...

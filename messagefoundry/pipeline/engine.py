@@ -32,7 +32,12 @@ from messagefoundry.config.settings import (
     RetentionSettings,
     ShadowSettings,
 )
-from messagefoundry.config.wiring import Registry, WiringError, load_config
+from messagefoundry.config.wiring import (
+    API_LISTENER_LABEL,
+    Registry,
+    WiringError,
+    load_config,
+)
 from messagefoundry.pipeline.alerts import AlertSink
 from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
@@ -70,6 +75,8 @@ class Engine:
         *,
         poll_interval: float = 0.25,
         max_correlation_depth: int = 8,
+        connection_events: bool = True,
+        response_sent_default: bool = True,
         config_dir: str | Path | None = None,
         config_reload_roots: Sequence[str | Path] = (),
         inbound_bind_host: str = "127.0.0.1",
@@ -83,6 +90,7 @@ class Engine:
         retention_settings: RetentionSettings | None = None,
         cert_monitor_settings: CertMonitorSettings | None = None,
         api_tls_cert_file: str | None = None,
+        api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings | None = None,
         shadow_settings: ShadowSettings | None = None,
@@ -123,6 +131,9 @@ class Engine:
         self._poll_interval = poll_interval
         # [pipeline] re-ingress loop-prevention cap (ADR 0013 Increment 2); every runner inherits it.
         self._max_correlation_depth = max_correlation_depth
+        # [diagnostics] Corepoint-style event log (#46); every runner inherits these master switches.
+        self._connection_events = connection_events
+        self._response_sent_default = response_sent_default
         # Where the runner reports operational alerts; None → the runner's default logging sink.
         self._alert_sink = alert_sink
         # [retention] enforcement. None (embedding/tests) → no retention task; the runner itself is a
@@ -134,6 +145,15 @@ class Engine:
         # certs (read live, so a reload that adds/removes a TLS connection is picked up).
         self._cert_monitor_settings = cert_monitor_settings
         self._api_tls_cert_file = api_tls_cert_file
+        # The engine's own API listener (host, port), reserved so no inbound listener can steal it (it
+        # would collide with uvicorn at bind). None (embedding/tests with no API socket) → nothing
+        # reserved. Rendered into the (label, host, port) tuples every runner consults for port-conflict
+        # detection at build_check/start. See RegistryRunner.reserved_bindings.
+        self._reserved_bindings: tuple[tuple[str, str, int], ...] = (
+            ((API_LISTENER_LABEL, api_listener[0], api_listener[1]),)
+            if api_listener is not None
+            else ()
+        )
         self._cert_expiry_runner: CertExpiryRunner | None = None
         # [reference] enforcement (ADR 0006). None (embedding/tests) → default settings; the reference
         # sync runner is a no-op when the graph declares no reference sets.
@@ -208,6 +228,8 @@ class Engine:
         *,
         poll_interval: float = 0.25,
         max_correlation_depth: int = 8,
+        connection_events: bool = True,
+        response_sent_default: bool = True,
         synchronous: str = "NORMAL",
         config_dir: str | Path | None = None,
         config_reload_roots: Sequence[str | Path] = (),
@@ -222,6 +244,7 @@ class Engine:
         retention_settings: RetentionSettings | None = None,
         cert_monitor_settings: CertMonitorSettings | None = None,
         api_tls_cert_file: str | None = None,
+        api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings | None = None,
         shadow_settings: ShadowSettings | None = None,
@@ -240,6 +263,8 @@ class Engine:
             store,
             poll_interval=poll_interval,
             max_correlation_depth=max_correlation_depth,
+            connection_events=connection_events,
+            response_sent_default=response_sent_default,
             config_dir=config_dir,
             config_reload_roots=config_reload_roots,
             inbound_bind_host=inbound_bind_host,
@@ -253,6 +278,7 @@ class Engine:
             retention_settings=retention_settings,
             cert_monitor_settings=cert_monitor_settings,
             api_tls_cert_file=api_tls_cert_file,
+            api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
             shadow_settings=shadow_settings,
@@ -272,6 +298,7 @@ class Engine:
             self.store,
             poll_interval=self._poll_interval,
             inbound_bind_host=self._inbound_bind_host,
+            reserved_bindings=self._reserved_bindings,
             allow_insecure_bind=self._allow_insecure_bind,
             delivery_defaults=self._delivery_defaults,
             ordering_default=self._ordering_default,
@@ -285,6 +312,8 @@ class Engine:
             active_environment=self._active_environment,
             coordinator=self._coordinator,
             max_correlation_depth=self._max_correlation_depth,
+            connection_events=self._connection_events,
+            response_sent_default=self._response_sent_default,
         )
         self._registry_runner = runner
         return runner
@@ -667,6 +696,7 @@ class Engine:
                 self.store,
                 poll_interval=self._poll_interval,
                 inbound_bind_host=self._inbound_bind_host,
+                reserved_bindings=self._reserved_bindings,
                 delivery_defaults=self._delivery_defaults,
                 ordering_default=self._ordering_default,
                 internal_error_default=self._internal_error_default,
