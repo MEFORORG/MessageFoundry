@@ -33,6 +33,13 @@ dependencies = [
     "defusedxml>=0.7.1",    # hardened XML parse for RawMessage.xml() — XXE/DTD/entity-expansion safe (ADR 0004, BACKLOG #31)
 ]
 
+# Shown on the PyPI sidebar; point at the PUBLIC repo/site (the wshallwshall repo is private).
+[project.urls]
+Homepage = "https://messagefoundry.org/"
+Documentation = "https://messagefoundry.org/"
+Repository = "https://github.com/MEFORORG/MessageFoundry"
+Issues = "https://github.com/MEFORORG/MessageFoundry/issues"
+
 [project.optional-dependencies]
 console = [
     "PySide6>=6.6",         # admin console (LGPL — OSS-distributable)

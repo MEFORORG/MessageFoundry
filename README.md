@@ -5,6 +5,8 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://github.com/MEFORORG/MessageFoundry/blob/main/LICENSE)
 [![Python 3.14+](https://img.shields.io/badge/python-3.14%2B-blue.svg)](https://github.com/MEFORORG/MessageFoundry/blob/main/pyproject.toml)
 
+**Website & documentation: [messagefoundry.org](https://messagefoundry.org/)**
+
 MessageFoundry is an **open-source healthcare integration engine** — a modern, Python-native HL7
 interface engine. It connects clinical and business systems by routing, transforming, and validating
 messages across many formats (HL7 v2, JSON, XML/SOAP, X12, database records) and connection types
@@ -66,9 +68,9 @@ transport TLS — and it runs single-node or in active-passive high availability
 
 Full documentation lives on **[messagefoundry.org](https://messagefoundry.org/)**:
 
-- **[Mental map](https://messagefoundry.org/assets/docs/MessageFoundry-Mental-Model.pdf)** — a one-page
-  picture of how the pieces fit: Connections → Router → Handlers → Connections, with the headless
-  engine and the console/IDE that drive it.
+- **[Mental map](https://messagefoundry.org/assets/docs/MessageFoundry-Mental-Model.pdf)** — an
+  orientation guide to how the pieces fit: Connections → Router → Handlers → Connections, with the
+  headless engine and the console/IDE that drive it.
 - **[Install Guide](https://messagefoundry.org/assets/docs/MessageFoundry-Install-Guide.pdf)** — install,
   configure, secure, and roll out to production.
 - **[User Guide](https://messagefoundry.org/assets/docs/MessageFoundry-User-Guide.pdf)** — author and
