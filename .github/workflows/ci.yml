@@ -592,7 +592,14 @@ jobs:
           # install-service.ps1 -Environment threads it into the service command + resolves
           # environments/prod.toml). INFO not DEBUG: `serve` refuses DEBUG in prod (Gate #1 — DEBUG can
           # surface PHI); INFO is enough to smoke service start + MLLP.
-          .\scripts\service\install-service.ps1 -AppExe $exe -LogLevel INFO -Environment prod
+          # -LockConfigDir: the runner checks out samples/config with the default ACL, which grants
+          # BUILTIN\Users (S-1-5-32-545) write. The in-process config-source trust guard (SEC-003,
+          # wiring._assert_safe_config_source_windows) then REFUSES to load it ("writable-by-others
+          # path") and `serve` crash-loops to SERVICE_PAUSED, so /health never comes up. Locking the
+          # config dir (strip inheritance -> SYSTEM/Administrators only; the LocalSystem service still
+          # reads it) is the production-correct posture docs/SERVICE.md prescribes, and exercises the
+          # real -LockConfigDir install path rather than the MEFOR_ALLOW_INSECURE_CONFIG_SOURCE dev escape.
+          .\scripts\service\install-service.ps1 -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir
           # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
           # connector LOADS its client cert at wiring time, so the engine refuses to start the graph
           # without a readable cert+key. Mint a throwaway pair for the smoke — the smoke sends only an

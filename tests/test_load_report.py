@@ -215,21 +215,25 @@ def test_baseline_compare_flags_throughput_regression() -> None:
 
 def test_engine_poller_parses_sample_from_client() -> None:
     poller = EnginePoller("http://x", None, origin=0.0)
-    poller._client = SimpleNamespace(  # type: ignore[assignment]
-        stats=lambda: SimpleNamespace(
-            outbox_by_status={"pending": 2, "inflight": 1, "done": 50, "dead": 3},
-            in_pipeline=4,  # whole-pipeline gauge — deliberately != the outbound-only backlog (3)
-        ),
-        connections=lambda: [
-            SimpleNamespace(read=100, written=None, errored=1, queue_depth=None),  # inbound row
-            SimpleNamespace(read=None, written=280, errored=3, queue_depth=3),  # outbound row
-            SimpleNamespace(read=None, written=20, errored=0, queue_depth=0),  # outbound row
-        ],
-        status=lambda: SimpleNamespace(
-            db=SimpleNamespace(size_bytes=4096, journal_mode="wal"),
-            engine=SimpleNamespace(uptime_seconds=12.0),
-        ),
-    )
+    # Single-shard parse: one client in the list (the cluster path sums many; see
+    # tests/test_enginepoll_aggregate.py). _sample_sync reads self._clients, not the old _client.
+    poller._clients = [  # type: ignore[list-item]
+        SimpleNamespace(
+            stats=lambda: SimpleNamespace(
+                outbox_by_status={"pending": 2, "inflight": 1, "done": 50, "dead": 3},
+                in_pipeline=4,  # whole-pipeline gauge — deliberately != the outbound-only backlog (3)
+            ),
+            connections=lambda: [
+                SimpleNamespace(read=100, written=None, errored=1, queue_depth=None),  # inbound row
+                SimpleNamespace(read=None, written=280, errored=3, queue_depth=3),  # outbound row
+                SimpleNamespace(read=None, written=20, errored=0, queue_depth=0),  # outbound row
+            ],
+            status=lambda: SimpleNamespace(
+                db=SimpleNamespace(size_bytes=4096, journal_mode="wal"),
+                engine=SimpleNamespace(uptime_seconds=12.0),
+            ),
+        )
+    ]
     sample = poller._sample_sync()
     assert sample is not None
     assert sample.read == 100  # only inbound row contributes read

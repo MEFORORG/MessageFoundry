@@ -78,6 +78,7 @@ def build_shard_specs(
     base_port: int,
     env: str | None = None,
     service_config: str | None = None,
+    project_root: str | None = None,
     extra_serve_args: Sequence[str] = (),
     python_executable: str | None = None,
 ) -> list[ShardSpec]:
@@ -113,6 +114,11 @@ def build_shard_specs(
             argv += ["--env", env]
         if service_config is not None:
             argv += ["--service-config", service_config]
+        if project_root is not None:
+            # Anchor each shard's environments/<env>.toml resolution. By default that resolves against
+            # the child's CWD (config/environments.py), so a spawned `serve --env <e>` can miss the env
+            # value file; forwarding --project-root makes `supervise --env <e>` resolve it consistently.
+            argv += ["--project-root", project_root]
         argv += list(extra_serve_args)
         specs.append(ShardSpec(shard=shard, db_path=db_path, port=port, argv=tuple(argv)))
     return specs
@@ -125,6 +131,7 @@ def discover_shard_specs(
     base_port: int,
     env: str | None = None,
     service_config: str | None = None,
+    project_root: str | None = None,
     extra_serve_args: Sequence[str] = (),
     python_executable: str | None = None,
 ) -> list[ShardSpec]:
@@ -146,6 +153,7 @@ def discover_shard_specs(
         base_port=base_port,
         env=env,
         service_config=service_config,
+        project_root=project_root,
         extra_serve_args=extra_serve_args,
         python_executable=python_executable,
     )
@@ -270,6 +278,7 @@ async def supervise(
     base_port: int,
     env: str | None = None,
     service_config: str | None = None,
+    project_root: str | None = None,
     extra_serve_args: Sequence[str] = (),
     install_signal_handlers: bool = True,
 ) -> int:
@@ -287,6 +296,7 @@ async def supervise(
             base_port=base_port,
             env=env,
             service_config=service_config,
+            project_root=project_root,
             extra_serve_args=extra_serve_args,
         )
     except (WiringError, FileNotFoundError, ValueError) as exc:

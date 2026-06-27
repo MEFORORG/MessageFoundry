@@ -6,6 +6,70 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.8] — 2026-06-27 — Early Access
+
+A tooling/ops release: the load harness gains a **multi-shard driver** so one harness can drive a
+`supervise` cluster (unblocking the multi-core throughput measurement), `supervise` resolves
+`--env` files for its shards, and a prominent upgrade note for the config-directory permission
+guard introduced in 0.2.6.
+
+> ### ⚠ Upgrading from ≤ 0.2.5 — tighten config-dir ACLs first
+> The config-directory permission guard (SEC-003 / ADR 0036), added in **0.2.6**, refuses to load a
+> `--config` directory that is **writable by a broad principal** (e.g. `Authenticated Users` /
+> `S-1-5-11`). A deployment whose config dir inherits that write — common under `C:\srv\…` — will
+> **fail to start on first upgrade to ≥ 0.2.6** with *"refusing to load config from writable-by-others
+> path …"*. **Before upgrading**, tighten the directory (elevated):
+> ```powershell
+> icacls "<config-dir>" /inheritance:d /T
+> icacls "<config-dir>" /remove:g *S-1-5-11 /T          # drop Authenticated Users
+> icacls "<config-dir>" /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F /T  # SYSTEM + Admins
+> ```
+> See [`docs/SERVICE.md`](docs/SERVICE.md) → *Update to a new build* and *Lock down the config
+> directory (CONFIG-2)*.
+
+### Added
+- **Multi-shard load driving (`messagefoundry-harness`).** `python -m harness` gains
+  **`--skip-preflight`** (drive shard MLLP ports that no single `--engine` owns) and a repeatable
+  **`--shard-engine <url>`**: the engine poller now takes a list of shard APIs and **sums** each
+  shard's `/stats` (read/written/backlog/in_pipeline/queue_depth/dead) into one cluster sample, so
+  the no-loss reconcile and drain are **cluster-aggregate** — a healthy K-shard run reports pass,
+  not a false "lost on intake". With no `--shard-engine` the behavior is byte-identical to before.
+  Two sample graphs ship for the throughput suite: `harness/config/store_once` (the
+  dedup-triggering one-handler-`list[Send]`-of-identical-body shape for store-once) and
+  `harness/config/passthrough` (an internal `PassThrough()` re-ingress hop); the load graph
+  (`harness/config/load`) is now shard-taggable via `MEFOR_LOAD_SHARD_ADT`/`_RESULTS`/`_OTHER`. (#604)
+
+### Fixed
+- **`supervise --project-root`.** `supervise` now accepts `--project-root` and forwards it to each
+  spawned `serve --shard`, so `supervise --config <dir> --env <env>` resolves each shard's
+  `environments/<env>.toml` (previously the shards resolved nothing from their spawned cwd and
+  required an explicit `--service-config` posture). Backward compatible — no `--project-root` is
+  unchanged. (#602)
+
+## [0.2.7] — 2026-06-27 — Early Access
+
+A docs/packaging release that fixes the broken badge images on the PyPI project page
+and adds a config-check pre-commit hook.
+
+### Fixed
+- **Broken badge images in the PyPI project description.** The CI and Security status
+  badges in the README pointed at the **private** source repo, so they rendered as
+  broken images on the public PyPI page — an anonymous viewer can't fetch a private
+  repo's GitHub Actions badge SVG (it 404s). The README now points at the public
+  mirror (`MEFORORG/MessageFoundry`), and the release build additionally rewrites any
+  remaining `wshallwshall`→`MEFORORG` repo slug in the README before it is embedded as
+  the PyPI `long_description`, so the rendered badges resolve anonymously. (#568)
+
+### Added
+- **`messagefoundry check` pre-commit hook.** A VS Code-extension-generated
+  `.mefor-hooks/pre-commit` runs `messagefoundry check` so a commit can't introduce a
+  broken config (skips cleanly if python or the package isn't importable; bypass with
+  `--no-verify`). (#568)
+
+### Docs
+- Backlog **#47** — base64 embedded-document (attachment) pruning (Mirth
+  attachment-handler / data-pruner parity); and a Changelog link in the README. (#568)
+
 ## [0.2.6] — 2026-06-27 — Early Access
 
 A large release: the **throughput-maximization build** (high-fan-out store-once, multi-process
@@ -275,7 +339,9 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.7...v0.2.8
+[0.2.7]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.3...v0.2.4
