@@ -91,16 +91,6 @@ definition drifted — the install script is idempotent (it stops and reconfigur
 If the package was installed **non-editable** (a plain `pip install .`), the venv holds a
 snapshot of the old code — run `.venv\Scripts\python.exe -m pip install -e .` first, then restart.
 
-> **⚠ Upgrading from ≤ 0.2.5 → ≥ 0.2.6: tighten the config-dir ACLs first.** The config-directory
-> permission guard (SEC-003 / ADR 0036) did **not** exist in 0.2.5. From 0.2.6 on, `serve` refuses to
-> start against a `--config` directory **writable by a broad principal** (e.g. `Authenticated Users` /
-> `S-1-5-11`) — *"refusing to load config from writable-by-others path …"*. A config dir that inherits
-> that write (common under `C:\srv\…`) therefore **fails its first start after the upgrade**. Lock it
-> down **before** restarting onto the new build — use the surgical recipe under
-> [Lock down the config directory (CONFIG-2)](#lock-down-the-config-directory-config-2)
-> (`icacls /inheritance:d /T` + `/remove:g *S-1-5-11 /T` + grant SYSTEM/Admins), the lighter-touch
-> alternative to a full `/inheritance:r` reset for a shared tree.
-
 ## Start / stop / status
 
 ```powershell
@@ -200,15 +190,6 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   (full) and the service account (read+execute). It is **opt-in** because the config dir often lives
   inside a developer's repo where stripping inheritance is surprising — for production, point
   `-Config` at a dedicated admin-owned directory and pass `-LockConfigDir`.
-- **Fix an existing tree that inherits a broad write grant** without a full ACL reset. A config dir
-  placed under a shared root (e.g. `C:\srv\…`) often inherits `Authenticated Users` (`S-1-5-11`)
-  write, which trips the guard below. The lighter-touch alternative to `/inheritance:r` is to break
-  inheritance, surgically drop just the broad principal, and grant the run-as user read+execute:
-  ```powershell
-  icacls "C:\srv\mefor\config" /inheritance:d /T
-  icacls "C:\srv\mefor\config" /remove:g *S-1-5-11 /T
-  icacls "C:\srv\mefor\config" /grant "<run-as-user>:(OI)(CI)RX" /T
-  ```
 - The loader **actively enforces** this at load time (and on `/config/reload`), not just as a
   documented recommendation (ADR 0036, SEC-003):
   - On **Windows** the loader now parses the directory's and each `*.py`'s NTFS owner + DACL and

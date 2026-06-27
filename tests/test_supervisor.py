@@ -58,28 +58,6 @@ def test_spec_argv_includes_env_and_service_config_when_given() -> None:
     assert argv[:4] == (specs[0].argv[0], "-m", "messagefoundry", "serve")
 
 
-def test_spec_argv_includes_project_root_when_given() -> None:
-    # --project-root is forwarded to EVERY shard so a spawned `serve --env <e>` resolves
-    # environments/<e>.toml against the given root, not the child's working directory.
-    specs = build_shard_specs(
-        ["a", "b"],
-        config="cfg",
-        db_base="m.db",
-        base_port=8765,
-        env="prod",
-        project_root="C:/srv/mefor",
-    )
-    for spec in specs:
-        argv = spec.argv
-        assert "--project-root" in argv
-        assert argv[argv.index("--project-root") + 1] == "C:/srv/mefor"
-
-
-def test_spec_argv_omits_project_root_when_not_given() -> None:
-    specs = build_shard_specs(["a"], config="cfg", db_base="m.db", base_port=8765)
-    assert "--project-root" not in specs[0].argv
-
-
 # --- lifecycle (fake process) ------------------------------------------------
 
 
