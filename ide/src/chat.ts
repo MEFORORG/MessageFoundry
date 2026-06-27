@@ -98,7 +98,7 @@ export function registerChat(context: vscode.ExtensionContext, graph: GraphProvi
   const handler: vscode.ChatRequestHandler = async (request, _chatContext, stream, token) => {
     // Honor the centrally-governed AI policy before touching any model: a "off" / managed-provider /
     // unpermitted policy disables assistance entirely (see aiPolicy.assistantState).
-    const state = assistantState(await resolveAiPolicy());
+    const state = assistantState(await resolveAiPolicy(context));
     if (!state.enabled) {
       stream.markdown(state.message ?? "AI assistance is unavailable under your MessageFoundry policy.");
       return;

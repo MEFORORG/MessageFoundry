@@ -9,6 +9,7 @@ pass/fail. Run `python -m harness --list-profiles` to list the built-ins.
 |---------------------|-------------------------------------------------------------------------|-------------|
 | `smoke`             | Tiny zero-loss wiring check — proves the pipeline, not performance.      | CI gate     |
 | `fanout-baseline`   | ADT-dominant mixed feed at high fan-out; characterizes a realistic mix.  | On-demand   |
+| `adt-fanout-stress` | Pure-ADT feed at worst-case fan-out (~20); isolates the ADT write-amp.   | On-demand   |
 | `soak`              | Long steady-state run; watches DB/WAL growth + dead-letter accumulation. | On-demand   |
 | `spike-burst`       | Burst above the ceiling, then a measured recovery/drain (W2025 plan S4.3). | On-demand |
 | `writeamp`          | Thin lane; serve-side fan-out is the write-amplification stress (S4.5).  | On-demand   |

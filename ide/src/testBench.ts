@@ -39,7 +39,15 @@ function nonce(): string {
 }
 
 function esc(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // Escape quotes too, not just &<>: these dry-run-derived values (source/disposition, themselves
+  // influenced by the HL7 under test) land inside double-quoted HTML attributes (e.g.
+  // class="disp ${esc(...)}"), so an unescaped " would break out of the attribute.
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function defaultMessagesUri(): vscode.Uri | undefined {

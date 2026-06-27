@@ -24,10 +24,16 @@ interface AiPolicyWire {
   reason: string | null;
 }
 
-// Conservative built-in used only when both the engine and the CLI are unavailable: BYO + code_only
-// keeps the existing PHI-safe assistant working without assuming any elevated policy.
-const DEFAULT_POLICY: AiPolicy = {
-  mode: "byo",
+// globalState key holding the last authoritative (engine) policy, so a previously-seen central
+// "off" / ai:assist deny is not overridable simply by taking the engine offline (SEC-022).
+const LAST_POLICY_KEY = "messagefoundry.lastAiPolicy";
+
+// Fail-closed fallback used when the engine is unreachable, no cached authoritative policy exists,
+// AND the local CLI can't positively confirm a policy: assistance is DISABLED rather than silently
+// re-enabling BYO. The "unverified" mode is mapped to {enabled:false} by assistantState (SEC-022,
+// CWE-636 — an org-set central "off" must not fail open just because the engine is unreachable).
+const UNVERIFIED_POLICY: AiPolicy = {
+  mode: "unverified",
   dataScope: "code_only",
   environment: null,
   assistPermitted: null,
@@ -45,22 +51,44 @@ function fromWire(w: AiPolicyWire): AiPolicy {
 }
 
 /**
- * Resolve the effective AI policy. Order: (a) the running engine [authoritative — includes the
- * identity-dependent `assist_permitted`]; (b) the local CLI [reads messagefoundry.toml; assist bit
- * is null offline]; (c) a conservative built-in default so the safe BYO assistant still works.
+ * Pick the policy when the authoritative engine is unreachable. Pure + testable. Order:
+ *   (a) the last cached authoritative (engine) policy, if any — so a previously-seen central "off" /
+ *       ai:assist deny survives going offline; else
+ *   (b) the local CLI's policy, if it positively returned one (it may itself carry mode "off"); else
+ *   (c) the fail-closed UNVERIFIED policy (assistance disabled) — NEVER silently re-enable BYO.
  */
-export async function resolveAiPolicy(): Promise<AiPolicy> {
-  try {
-    return fromWire(await getJson<AiPolicyWire>(engineUrl(), "/ai/policy"));
-  } catch {
-    // Engine unreachable or errored — fall back to the offline CLI view of the local config.
+export function pickOfflinePolicy(cached: AiPolicy | null, cli: AiPolicy | null): AiPolicy {
+  if (cached) {
+    return cached;
   }
-  try {
-    return fromWire(await runJson<AiPolicyWire>(["ai-policy"], workspaceDir()));
-  } catch {
-    // CLI unavailable too (no Python / no workspace) — use the safe built-in default.
+  if (cli) {
+    return cli;
   }
-  return DEFAULT_POLICY;
+  return UNVERIFIED_POLICY;
+}
+
+/**
+ * Resolve the effective AI policy. Order: (a) the running engine [authoritative — includes the
+ * identity-dependent `assist_permitted`; cached on success]; (b) when the engine is unreachable, the
+ * last cached authoritative policy; (c) the local CLI [reads messagefoundry.toml]; (d) a fail-closed
+ * "unverified" policy (assistance disabled) so a central "off" can't be bypassed by going offline.
+ */
+export async function resolveAiPolicy(ctx: vscode.ExtensionContext): Promise<AiPolicy> {
+  try {
+    const policy = fromWire(await getJson<AiPolicyWire>(engineUrl(), "/ai/policy"));
+    await ctx.globalState.update(LAST_POLICY_KEY, policy); // remember the authoritative answer
+    return policy;
+  } catch {
+    // Engine unreachable or errored — fall back to the cached authoritative / CLI / fail-closed view.
+  }
+  const cached = ctx.globalState.get<AiPolicy>(LAST_POLICY_KEY) ?? null;
+  let cli: AiPolicy | null = null;
+  try {
+    cli = fromWire(await runJson<AiPolicyWire>(["ai-policy"], workspaceDir()));
+  } catch {
+    // CLI unavailable too (no Python / no workspace / untrusted) — leave cli null.
+  }
+  return pickOfflinePolicy(cached, cli);
 }
 
 /**
@@ -71,6 +99,15 @@ export async function resolveAiPolicy(): Promise<AiPolicy> {
 export function assistantState(p: AiPolicy): { enabled: boolean; message?: string } {
   if (p.mode === "off") {
     return { enabled: false, message: "AI assistance is turned off by your MessageFoundry policy." };
+  }
+  if (p.mode === "unverified") {
+    // Engine unreachable + no cached policy + no positive local CLI policy: fail closed so a central
+    // "off" / ai:assist deny can't be bypassed by going offline (SEC-022).
+    return {
+      enabled: false,
+      message:
+        "MessageFoundry AI policy could not be verified (engine unreachable) — assistance is disabled until it can be confirmed.",
+    };
   }
   if (p.mode === "managed_claude" || p.mode === "managed_claude_baa") {
     return {
@@ -87,8 +124,8 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
 }
 
 /** Fetch the current policy and surface it to the user (command: messagefoundry.showAiPolicy). */
-export async function showAiPolicy(): Promise<void> {
-  const p = await resolveAiPolicy();
+export async function showAiPolicy(ctx: vscode.ExtensionContext): Promise<void> {
+  const p = await resolveAiPolicy(ctx);
   const permitted =
     p.assistPermitted === null ? "unknown" : p.assistPermitted ? "yes" : "no";
   const reason = p.reason ? ` — ${p.reason}` : "";

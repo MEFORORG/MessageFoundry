@@ -161,7 +161,9 @@ slo = { max_e2e_p99_ms = 999.0 }
         load_profile_text(text)
 
 
-@pytest.mark.parametrize("name", ["smoke", "fanout-baseline", "soak", "closed-loop"])
+@pytest.mark.parametrize(
+    "name", ["smoke", "fanout-baseline", "soak", "closed-loop", "adt-fanout-stress"]
+)
 def test_builtin_presets_parse(name: str) -> None:
     p = get_profile(name)
     assert p.name == name
@@ -186,9 +188,42 @@ def test_closed_loop_profile_sweeps_concurrency_with_conformance_slo() -> None:
     assert p.default_slo.min_sustained_msg_s is None
 
 
+def test_reference_ladder_climbs_past_consumer_floor() -> None:
+    # The reference rate ladder must keep climbing well past the old ~70/s consumer-hardware cap so the
+    # throughput knee can actually be located on enterprise hardware (every step below the knee holds
+    # achieved ≈ offered, so a ladder topping out at 70 never finds the real ceiling).
+    p = get_profile("reference")
+    measured_rates = [ph.rate_start for ph in p.phases if ph.measured]
+    # The measured rate steps must rise monotonically (excluding the final low cooldown drain) and reach
+    # several hundred msg/s — strictly past the 70/s floor the lane was opened to lift.
+    assert max(measured_rates) >= 400.0, measured_rates
+    steps_above_floor = [r for r in measured_rates if r > 70.0]
+    assert len(steps_above_floor) >= 3, measured_rates
+    # The low cooldown phase stays well below the ceiling so the backlog drains (zero_loss + drain).
+    cooldown = next(ph for ph in p.phases if ph.name == "cooldown")
+    assert cooldown.rate_start < 30.0
+
+
+def test_adt_fanout_stress_is_pure_adt_rate_ladder() -> None:
+    # The high-fan-out ADT stress profile isolates the ADT hub's worst-case fan-out: a PURE-ADT mix
+    # (no results/orders types diluting it) on an open-loop rate ladder, conformance-tier SLO only.
+    p = get_profile("adt-fanout-stress")
+    assert p.codes() == {"ADT"}  # pure ADT — isolates the ADT write-amplification stress
+    assert all(t.types == ("ADT",) for t in p.targets)
+    for ph in p.phases:
+        assert (
+            ph.loop == "open"
+        )  # rate-shaped, like reference (fan-out is the serve-side FANOUT knob)
+    measured_rates = [ph.rate_start for ph in p.phases if ph.measured and ph.name != "cooldown"]
+    assert len(measured_rates) >= 4 and measured_rates == sorted(measured_rates)
+    # Conformance-tier SLO only — throughput is measured, not floored (Q3 two-tier gate).
+    assert p.default_slo.zero_loss is True
+    assert p.default_slo.min_sustained_msg_s is None
+
+
 def test_list_profiles_includes_builtins() -> None:
     names = set(list_profiles())
-    assert {"smoke", "fanout-baseline", "soak", "closed-loop"} <= names
+    assert {"smoke", "fanout-baseline", "soak", "closed-loop", "adt-fanout-stress"} <= names
 
 
 def test_get_profile_unknown_lists_choices() -> None:

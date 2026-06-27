@@ -185,8 +185,27 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   ```powershell
   icacls "D:\hl7\config" /inheritance:r /grant "Administrators:(OI)(CI)F" "NT SERVICE\MessageFoundry:(OI)(CI)R"
   ```
-- On POSIX hosts the loader additionally **refuses** to load from a group/world-writable
-  directory or module file.
+  The supported one-step way to do this at install time is `install-service.ps1 -LockConfigDir`
+  (with `-ServiceAccount`): it strips inherited ACEs and locks the dir to SYSTEM + Administrators
+  (full) and the service account (read+execute). It is **opt-in** because the config dir often lives
+  inside a developer's repo where stripping inheritance is surprising — for production, point
+  `-Config` at a dedicated admin-owned directory and pass `-LockConfigDir`.
+- The loader **actively enforces** this at load time (and on `/config/reload`), not just as a
+  documented recommendation (ADR 0036, SEC-003):
+  - On **Windows** the loader now parses the directory's and each `*.py`'s NTFS owner + DACL and
+    **refuses** to load when a broad/low-privilege principal (Everyone, Authenticated Users,
+    `BUILTIN\Users`, INTERACTIVE, …) or any non-owner/non-admin principal holds a write-class right
+    (write/append/delete/`WRITE_DAC`/`WRITE_OWNER`/generic-write). A `NULL` DACL (everyone allowed)
+    is likewise refused. If the DACL **cannot be read** (a Win32 API error), the guard **fails open
+    with a loud WARNING** rather than bricking a previously-working service — a WARNING about an
+    *unevaluable* guard means "fix/lock the config-dir ACL", not "ignore it".
+  - On **POSIX** hosts the loader **refuses** to load from a group/world-writable or foreign-owned
+    directory or module file.
+  - **Dev/test escape (never set in production).** Because a default Windows checkout grants
+    `BUILTIN\Users` write, set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` to downgrade the refusal to a
+    loud WARNING when running from an intentionally user-writable dev/CI tree. A production service
+    leaves it unset and locks the config dir (above), so the guard stays fail-closed; the env var is
+    the explicit, audited opt-out (mirrors `MEFOR_ALLOW_INSECURE_TLS`).
 - `/config/reload` only loads from the startup `--config` directory and any directories listed in
   `[api].config_reload_roots` (see [CONFIGURATION.md](CONFIGURATION.md)); an arbitrary path is
   rejected. Keep those roots admin-owned too.

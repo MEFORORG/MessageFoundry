@@ -4,6 +4,7 @@
 // demand or after a 401.
 import * as vscode from "vscode";
 import { getJson, HttpError, postJson } from "./engineClient";
+import { assertTargetAllowed } from "./engineTarget";
 
 const SECRET_PREFIX = "messagefoundry.token:";
 
@@ -28,6 +29,13 @@ export async function clearToken(ctx: vscode.ExtensionContext, url: string): Pro
 
 /** Prompt for credentials and sign in to `url`; stores + returns the token, or undefined if cancelled. */
 async function login(ctx: vscode.ExtensionContext, url: string): Promise<string | undefined> {
+  // Belt-and-suspenders: any caller of login()/withAuth() (not just promote) inherits the non-TLS
+  // refusal — never prompt for or send credentials in clear to a non-loopback host (SEC-005).
+  const gate = assertTargetAllowed(url);
+  if (!gate.ok) {
+    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
+    return undefined;
+  }
   let provider = "local";
   try {
     const providers = await getJson<ProvidersInfo>(url, "/auth/providers");

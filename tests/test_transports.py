@@ -204,6 +204,29 @@ def test_claim_unique_falls_back_to_copy_when_link_unsupported(
     assert target.read_bytes() == b"existing"  # the pre-existing file is never clobbered
 
 
+@pytest.mark.skipif(
+    os.name != "posix", reason="POSIX permission bits; Windows ignores os.open mode"
+)
+def test_claim_unique_copy_fallback_is_not_world_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The cross-filesystem copy fallback creates the delivered file with mode 0o600, matching the
+    # mkstemp temp + the os.link/os.replace paths that inherit it. A delivered file can carry PHI, so
+    # the fallback must not be the one path that leaves it group/world-readable (CodeQL
+    # py/overly-permissive-file). Assert the group/other bits are clear (umask-independent).
+    def _no_link(src: str, dst: str) -> None:
+        raise OSError("hard links not supported on this filesystem")
+
+    monkeypatch.setattr(os, "link", _no_link)
+    src = tmp_path / "src.part"
+    src.write_bytes(b"PAYLOAD")
+    target = tmp_path / "out.hl7"
+
+    claimed = _claim_unique(src, target)
+    assert claimed.read_bytes() == b"PAYLOAD"
+    assert claimed.stat().st_mode & 0o077 == 0  # no group/other access
+
+
 # --- file source -------------------------------------------------------------
 
 

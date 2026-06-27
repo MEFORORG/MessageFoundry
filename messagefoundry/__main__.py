@@ -86,12 +86,50 @@ def main(argv: list[str] | None = None) -> int:
         "under NSSM) so env() values aren't silently empty.",
     )
     serve.add_argument(
+        "--shard",
+        default=None,
+        help="run only the inbound connections tagged with this shard id (L3 multi-process "
+        "sharding). Outbound/routers/handlers are shared; only intake is partitioned. Omit to run "
+        "the whole graph. `messagefoundry supervise` sets this per subprocess.",
+    )
+    serve.add_argument(
         "--allow-insecure-bind",
         action="store_true",
         help="permit a non-loopback [api].host WITHOUT TLS (bearer tokens and PHI would cross the "
         "network in cleartext); a dev override for a trusted, firewalled network. Prefer configuring "
         "[api].tls_cert_file (+ tls_key_file) for in-process TLS, which is allowed off-loopback "
         "without this flag. Does not relax the no-auth refuse.",
+    )
+
+    supervise = sub.add_parser(
+        "supervise",
+        help="L3 multi-process sharding: spawn one `serve --shard <id>` subprocess per shard "
+        "(each its own db file + API port), monitor + restart them, stop all on shutdown",
+    )
+    supervise.add_argument(
+        "--config", default="samples/config", help="config modules directory (*.py)"
+    )
+    supervise.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML passed to each shard (default: ./messagefoundry.toml if present)",
+    )
+    supervise.add_argument(
+        "--db",
+        default="messagefoundry.db",
+        help="base store path; each shard gets <stem>_<shard>.db (a single default shard keeps the "
+        "bare path)",
+    )
+    supervise.add_argument(
+        "--base-port",
+        type=int,
+        default=8765,
+        help="API port for the first shard; subsequent shards get base+1, base+2, ... (sorted order)",
+    )
+    supervise.add_argument(
+        "--env",
+        default=None,
+        help="active environment NAME passed to every shard (overrides each shard's [ai].environment)",
     )
 
     validate = sub.add_parser("validate", help="check a config dir and report all problems")
@@ -637,9 +675,24 @@ def _serve(args: argparse.Namespace) -> int:
             environ=os.environ,
         )
 
+    # L3 multi-process sharding (ADR-pending; messagefoundry/pipeline/sharding.py): with --shard the
+    # loaded graph is filtered to that shard's inbounds before the Engine is built (and re-filtered on
+    # every reload), so this process owns a disjoint slice of intake. Without it, the whole graph runs
+    # exactly as before. The supervisor spawns one such process per shard with its own --db and --port.
+    registry_filter = None
+    if args.shard is not None:
+        from messagefoundry.config.wiring import Registry
+        from messagefoundry.pipeline.sharding import filter_registry_for_shard
+
+        shard_id: str = args.shard
+
+        def registry_filter(reg: Registry) -> Registry:  # noqa: F811 (local shard-bound closure)
+            return filter_registry_for_shard(reg, shard_id)
+
     app = create_managed_app(
         store_settings=settings.store,
         config_dir=args.config,
+        registry_filter=registry_filter,
         config_reload_roots=settings.api.config_reload_roots,
         inbound_bind_host=settings.inbound.bind_host,
         allow_insecure_bind=args.allow_insecure_bind,
@@ -699,6 +752,27 @@ def _serve(args: argparse.Namespace) -> int:
         logging.getLogger(__name__).critical("server exited abnormally: %s", safe_exc(exc))
         raise
     return 0
+
+
+def _supervise(args: argparse.Namespace) -> int:
+    """L3 multi-process sharding (messagefoundry/pipeline/supervisor.py): discover the shard ids in the
+    config and run one `serve --shard <id>` subprocess per shard, each with its own SQLite db file and
+    API port. Monitors + restarts crashed shards, and stops them all cleanly on SIGINT/SIGTERM. A single
+    (default) shard yields a single subprocess — identical to a plain `serve`."""
+    import asyncio
+
+    from messagefoundry.pipeline.supervisor import supervise
+
+    configure_logging("INFO")
+    return asyncio.run(
+        supervise(
+            args.config,
+            db_base=args.db,
+            base_port=args.base_port,
+            env=args.env,
+            service_config=args.service_config,
+        )
+    )
 
 
 def _validate(args: argparse.Namespace) -> int:
@@ -1491,6 +1565,7 @@ def _emit_error(message: str, *, as_json: bool) -> int:
 
 _DISPATCH = {
     "serve": _serve,
+    "supervise": _supervise,
     "init": _init,
     "validate": _validate,
     "graph": _graph,

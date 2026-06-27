@@ -94,9 +94,11 @@ class RedactionFilter(logging.Filter):
     (segment lines + runs carrying ≥2 ``|^~&`` delimiters), so ordinary operational messages pass through
     unchanged. Pair it with :class:`ControlCharScrubFilter` (added after, so it scrubs the redacted text).
 
-    *Residual:* a bare free-text name a user invents (e.g. ``raise ValueError("DOE^JANE")`` with no
-    surrounding segment) is not HL7-shaped and is not caught — the "never put PHI in an exception
-    message" convention remains the control for that (see :mod:`messagefoundry.redaction`)."""
+    *Residual:* ``redact`` now also applies a conservative free-text heuristic — date/DOB runs and
+    multi-token name runs (e.g. ``DOE JANE``) are scrubbed even without HL7 delimiters — so this flows
+    through to both the stdout handler and the off-box forwarder by construction. The remaining residual
+    is an adversarially-crafted *single-token* or non-name-shaped identifier, for which the "never put
+    PHI in an exception message" convention remains the control (see :mod:`messagefoundry.redaction`)."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()

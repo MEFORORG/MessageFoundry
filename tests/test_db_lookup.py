@@ -188,6 +188,79 @@ def test_executor_requires_server_and_database() -> None:
         DatabaseLookupExecutor({"bad": {"server": "db.local"}})
 
 
+# --- read-only enforcement (SEC-009 / ADR 0010) ------------------------------
+
+
+async def test_insert_lookup_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A write statement is rejected BEFORE it reaches the autocommit pool — the fake cursor never runs.
+    pool = _patch_pool(monkeypatch, columns=["x"])
+    ex = DatabaseLookupExecutor(_CONN)
+    with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
+        await ex.query("clarity", "INSERT INTO t VALUES (1)", None)
+    assert pool.cursor_obj.executed is None  # the write never reached/committed
+
+
+@pytest.mark.parametrize(
+    "stmt",
+    [
+        "UPDATE t SET x=1",
+        "DELETE FROM t",
+        "MERGE t USING s ON t.id=s.id WHEN MATCHED THEN UPDATE SET x=1",
+        "EXEC sp_foo",
+        "EXECUTE dbo.bar",
+        "  exec sp_lower ",
+    ],
+)
+async def test_update_and_exec_rejected(monkeypatch: pytest.MonkeyPatch, stmt: str) -> None:
+    pool = _patch_pool(monkeypatch, columns=["x"])
+    ex = DatabaseLookupExecutor(_CONN)
+    with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
+        await ex.query("clarity", stmt, None)
+    assert pool.cursor_obj.executed is None
+
+
+async def test_multi_statement_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool = _patch_pool(monkeypatch, columns=["x"])
+    ex = DatabaseLookupExecutor(_CONN)
+    with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
+        await ex.query("clarity", "SELECT 1; DROP TABLE t", None)
+    assert pool.cursor_obj.executed is None
+
+
+async def test_select_with_leading_comment_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A leading comment preamble and a CTE both pass the gate and execute on the fake.
+    pool = _patch_pool(monkeypatch, rows=[("123",)], columns=["npi"])
+    ex = DatabaseLookupExecutor(_CONN)
+    rows = await ex.query(
+        "clarity", "-- comment\nSELECT npi FROM provider WHERE mrn = :mrn", {"mrn": "M1"}
+    )
+    assert rows == [{"npi": "123"}]
+    assert pool.cursor_obj.executed is not None
+
+    pool2 = _patch_pool(monkeypatch, rows=[("1",)], columns=["c"])
+    ex2 = DatabaseLookupExecutor(_CONN)
+    assert await ex2.query("clarity", "WITH cte AS (SELECT 1 AS c) SELECT * FROM cte", None) == [
+        {"c": "1"}
+    ]
+    assert pool2.cursor_obj.executed is not None
+
+
+async def test_trailing_semicolon_select_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A single trailing ';' (with only whitespace/comments after) is NOT a second statement.
+    pool = _patch_pool(monkeypatch, rows=[("1",)], columns=["c"])
+    ex = DatabaseLookupExecutor(_CONN)
+    assert await ex.query("clarity", "SELECT 1 AS c ;  ", None) == [{"c": "1"}]
+    assert pool.cursor_obj.executed is not None
+
+
+def test_lookup_dsn_is_read_only() -> None:
+    # The db_lookup pool advertises ApplicationIntent=ReadOnly; the destination default does NOT (so the
+    # DATABASE destination/source DSN stays byte-identical).
+    settings = {"server": "db.local", "database": "Clarity", "username": "u", "password": "p"}
+    assert "ApplicationIntent=ReadOnly" in database._build_dsn(settings, read_only=True)
+    assert "ApplicationIntent=ReadOnly" not in database._build_dsn(settings)
+
+
 # --- DatabaseLookup factory + Registry table ---------------------------------
 
 

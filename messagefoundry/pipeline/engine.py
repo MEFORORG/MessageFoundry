@@ -46,7 +46,10 @@ from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.wiring_runner import (
+    RegistryRunner,
+    check_pt_backend_supported,
+)
 from messagefoundry.store import MessageStore, Store
 from messagefoundry.store.store import ConnectionMetrics, DestinationMetrics, InboundMetrics
 
@@ -99,8 +102,14 @@ class Engine:
         env_values_provider: Callable[[], Mapping[str, Any]] | None = None,
         coordinator: ClusterCoordinator | None = None,
         cluster_settings: ClusterSettings | None = None,
+        registry_filter: Callable[[Registry], Registry] | None = None,
     ) -> None:
         self.store = store
+        # L3 multi-process sharding (messagefoundry/pipeline/sharding.py): an optional pure transform
+        # applied to EVERY loaded graph — at startup (add_registry, applied by the caller) and on each
+        # reload here — so a `serve --shard X` process keeps owning only shard X's inbounds across
+        # reloads. None = identity (the whole graph, unchanged default).
+        self._registry_filter = registry_filter
         # Cluster coordination seam (Track B Step 3). None → the no-op NullCoordinator, so single-node
         # (SQLite and single-node Postgres) is byte-identical: is_leader() is always True and
         # start()/stop() do nothing. A DbCoordinator (built by build_coordinator on an enabled [cluster]
@@ -253,6 +262,7 @@ class Engine:
         env_values_provider: Callable[[], Mapping[str, Any]] | None = None,
         coordinator: ClusterCoordinator | None = None,
         cluster_settings: ClusterSettings | None = None,
+        registry_filter: Callable[[Registry], Registry] | None = None,
     ) -> "Engine":
         """Open a SQLite-backed engine from a path (convenience for tests/embedding). The service
         path goes through :func:`~messagefoundry.store.open_store` (backend-agnostic). The SQLite
@@ -287,6 +297,7 @@ class Engine:
             env_values_provider=env_values_provider,
             coordinator=coordinator,
             cluster_settings=cluster_settings,
+            registry_filter=registry_filter,
         )
 
     # --- code-first wiring ---------------------------------------------------
@@ -414,6 +425,13 @@ class Engine:
                     "(ADR 0001 Step A is SQLite-only; SQL Server staging is gated on BACKLOG #1) — "
                     "use the sqlite backend"
                 )
+            # Fail-fast (not at the first Handler Send into a PT connector) if the wired graph contains a
+            # pass-through (PT) inbound but the configured backend doesn't implement PT re-ingress (the
+            # `pt_deliveries` branch of transform_handoff). PT is ALLOW-LISTED to backends that opt in via
+            # `supports_pt_reingress` (SQLite, Postgres, SQL Server today): any future backend that hasn't
+            # implemented the branch is rejected here, before any inbound listener binds,
+            # so the runtime NotImplementedError (after the inbound is already ACKed) can never surface.
+            self._check_pt_backend_supported()
             if not self._coordinator.is_clustered():
                 # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
                 # before — byte-identical. The config-drift sweeps + reference materialize + listener
@@ -514,6 +532,18 @@ class Engine:
             self._graph_supervisor = asyncio.create_task(self._graph_supervisor_loop())
 
     # --- active-passive graph gating (Workstream A1/A3/A4) -------------------
+
+    def _check_pt_backend_supported(self) -> None:
+        """Gate the start-time graph through the SINGLE source of truth for the PT-backend allow-list
+        (:func:`check_pt_backend_supported`) — the same gate the reload + dry-run paths reach via
+        :meth:`RegistryRunner.build_check`. Reject a graph with a pass-through (PT) inbound on a
+        backend that doesn't implement PT re-ingress, BEFORE any inbound listener accepts a message,
+        so the runtime NotImplementedError (after the inbound was already ACKed) can never surface.
+        No-op when there is no wired graph; the helper is a no-op on a PT-supporting backend (SQLite)
+        or a graph with no PT inbound, so the SQLite path is byte-identical."""
+        if self._registry_runner is None:
+            return
+        check_pt_backend_supported(self._registry_runner.registry, self.store)
 
     async def _start_graph(self) -> None:
         """Bring the wired graph up: (A4) recover the prior leader's stranded in-flight rows + lane
@@ -680,6 +710,10 @@ class Engine:
         # Off the event loop: load_config executes user config modules (arbitrary, potentially heavy
         # imports), which would otherwise stall every listener mid-reload (review low-3).
         registry = await asyncio.to_thread(load_config, path)  # raises WiringError on a bad config
+        if self._registry_filter is not None:
+            # Re-apply this process's shard filter so a reload keeps owning only its shard's inbounds
+            # (outbound/routers/handlers stay shared). Pure + cheap (sharding.filter_registry_for_shard).
+            registry = self._registry_filter(registry)
         if not registry.inbound and not registry.outbound:
             raise WiringError(
                 f"config directory {config_dir!r} declares no connections — "

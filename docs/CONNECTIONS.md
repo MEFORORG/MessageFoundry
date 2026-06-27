@@ -823,9 +823,12 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
 | `tls` | `false` | wrap the association in **DICOM-over-TLS** (required for a non-loopback bind — see below) |
 | `tls_cert_file` / `tls_key_file` | — | the SCP's server-identity cert + private key (required when `tls=true`) |
+| `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted `tls_key_file` (`env()`-sourced, mirroring MLLP's `MEFOR_*_TLS_KEY_PASSWORD`). An encrypted key supplied with **no/wrong** passphrase **fails fast** at startup/`check` rather than hanging on an interactive TTY prompt (there is no TTY under an NSSM service account / in a container). |
 | `tls_ca_file` | — | opt-in **mTLS**: require + verify a calling peer's client certificate |
 
-The **bind interface** is the service-level `[inbound].bind_host` and the **peer-IP gate** is `[inbound].source_ip_allowlist` (the same inbound settings MLLP/TCP use) — not `DICOM()` arguments. A non-loopback cleartext SCP is **refused at startup** unless `tls=true` or `serve --allow-insecure-bind` (the generalized bind-guard). (`host` / `called_ae_title` / `connect_timeout` on `DICOM()` are for the **Phase-2 outbound SCU** and are unused by the inbound SCP.)
+The **bind interface** is the service-level `[inbound].bind_host` and the **peer-IP gate** is `[inbound].source_ip_allowlist` (the same inbound settings MLLP/TCP use) — not `DICOM()` arguments. A non-loopback cleartext SCP is **refused at startup** unless `tls=true` or `serve --allow-insecure-bind` (the generalized [cleartext] bind-guard — `check_dimse_tls_exposure`). (`host` / `called_ae_title` / `connect_timeout` on `DICOM()` are for the **Phase-2 outbound SCU** and are unused by the inbound SCP.)
+
+> **Fail-closed peer controls (deny-by-default, ADR 0025 §9).** DICOM has no transport authentication on its own, so a **non-loopback** SCP **MUST** set at least one peer control — `calling_ae_allowlist`, `[inbound].source_ip_allowlist`, or **mTLS** (`tls=true` **and** `tls_ca_file`, which makes the SCP require + verify a client cert). With **none** of the three set, a non-loopback SCP is **refused at construction** (the connection degrades per ADR 0031 startup fault isolation; surfaced under `check`/dry-run). This is the **authentication** analog of the `check_dimse_tls_exposure` cleartext bind-guard above (which is the orthogonal **confidentiality** guard): TLS-without-mTLS encrypts the channel but does **not** authenticate the peer. A **loopback** bind (`127.0.0.1`/`localhost`/`::1`, the common dev/single-box case) is exempt.
 
 ```python
 from messagefoundry import DICOM, ContentType, Message, Send, handler, inbound, router
@@ -860,6 +863,24 @@ def handle(msg):
     for set_id, m in enumerate(measurements, start=1):
         oru.add_segment(hl7_map.obx_from_measurement(set_id, m))
     return Send("OB_POWERSCRIBE", oru.encode())
+```
+
+A **hardened non-loopback** SCP (bound to an imaging VLAN) pairs DICOM-over-TLS for confidentiality with at
+least one peer control for authentication — here both an AE-title allowlist **and** mTLS (secrets are always
+`env()` references, never inline):
+
+```python
+from messagefoundry import DICOM, ContentType, env, inbound
+
+inbound("IB_RADIOLOGY_SR",
+        DICOM(ae_title="MEFOR_SR_SCP", port=11112,
+              calling_ae_allowlist=["RAD_MODALITY"],            # authentication: only this calling AE
+              tls=True,                                          # confidentiality: DICOM-over-TLS
+              tls_cert_file=env("DICOM_TLS_CERT"),
+              tls_key_file=env("DICOM_TLS_KEY"),
+              tls_key_password=env("DICOM_TLS_KEY_PASSWORD"),   # if the key is passphrase-encrypted
+              tls_ca_file=env("DICOM_MTLS_CA")),                # mTLS: require + verify the peer's client cert
+        router="sr_router", content_type=ContentType.DICOM)
 ```
 
 The full worked route (with the outbound MLLP + `env()` wiring) ships at
@@ -903,6 +924,7 @@ behind the console's "Test Connection"). Egress is gated by `[egress].allowed_tc
 | `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
 | `connect_timeout` | `10.0` | association-request (TCP connect) timeout |
 | `tls` / `tls_ca_file` / `tls_cert_file` / `tls_key_file` | `false` / — | **DICOM-over-TLS**: verify the peer's server cert (`tls_ca_file` pins the anchor); `tls_cert_file`/`tls_key_file` opt into **mTLS** |
+| `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted mTLS-client `tls_key_file` (`env()`-sourced). Same fail-fast semantics as the inbound SCP (no/wrong passphrase raises at construction, never a TTY hang). |
 
 **Status → retry classification.** C-STORE **Success** (`0x0000`) / a **Warning** (`0xB0xx`, stored with a
 caveat) → delivered; **Out of Resources** (`0xA7xx`) or an association/transport failure → transient

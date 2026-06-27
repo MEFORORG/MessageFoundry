@@ -69,7 +69,10 @@ ROLE_METADATA: dict[Role, tuple[str, str]] = {
     ),
     Role.DEPLOYMENT: ("Deployment", "Deploy and validate the connection/router/handler graph."),
     Role.CODING: ("Coding", "Author and validate Router/Handler code."),
-    Role.VIEWER: ("Viewer", "Read-only dashboards and non-PHI message metadata."),
+    Role.VIEWER: (
+        "Viewer",
+        "Read-only dashboards and message list metadata (PHI fields withheld).",
+    ),
     Role.AUDITOR: ("Auditor", "Read the audit trail (separation of duties)."),
 }
 

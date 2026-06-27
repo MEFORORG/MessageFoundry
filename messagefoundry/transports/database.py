@@ -75,12 +75,18 @@ def _odbc_brace(value: str) -> str:
     return "{" + value.replace("}", "}}") + "}"
 
 
-def _build_dsn(s: dict[str, Any]) -> str:
+def _build_dsn(s: dict[str, Any], *, read_only: bool = False) -> str:
     """Build the ODBC connection string for SQL Server from the connection settings.
 
     Free-text values are brace-quoted (injection guard) and the ``Encrypt``/``TrustServerCertificate``
     flags are emitted **last** (ODBC is last-wins, so nothing earlier can downgrade TLS). A weakened
-    TLS posture is **refused** unless the explicit dev escape is set, exactly like the store backend."""
+    TLS posture is **refused** unless the explicit dev escape is set, exactly like the store backend.
+
+    ``read_only`` (only the db_lookup pool sets it; destination/source omit it, keeping their DSN
+    byte-identical) appends ``ApplicationIntent=ReadOnly`` so the connection advertises read-only intent
+    — defense-in-depth for the ADR 0010 read-only carve-out, layered with the statement guard in
+    :func:`_require_read_only` (note: ApplicationIntent is only honored by a SQL Server Always-On read
+    replica, a no-op otherwise — the statement guard is the load-bearing control)."""
     encrypt = bool(s.get("encrypt", True))
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not insecure_tls_allowed():
@@ -116,9 +122,60 @@ def _build_dsn(s: dict[str, Any]) -> str:
         parts.append("Trusted_Connection=yes")
     else:  # entra
         parts.append("Authentication=ActiveDirectoryDefault")
+    if read_only:
+        # Advertise read-only intent for the db_lookup pool (ADR 0010). Emitted before the TLS flags so
+        # the last-wins Encrypt/TrustServerCertificate posture is unchanged.
+        parts.append("ApplicationIntent=ReadOnly")
     parts.append(f"Encrypt={'yes' if encrypt else 'no'}")
     parts.append(f"TrustServerCertificate={'yes' if trust else 'no'}")
     return ";".join(parts) + ";"
+
+
+# A leading SQL line comment (`-- ...` to end of line) or block comment (`/* ... */`). Stripped (with
+# leading whitespace) before the read-only check so a commented preamble can't mask a write statement.
+_SQL_LEADING_COMMENT_RE = re.compile(r"^\s*(?:--[^\n]*\n|/\*.*?\*/)", re.DOTALL)
+
+
+def _require_read_only(statement: str) -> None:
+    """Enforce the ADR 0010 db_lookup read-only carve-out at the statement layer (defense-in-depth with
+    ``ApplicationIntent=ReadOnly`` + a recommended ``db_datareader``-only login).
+
+    After stripping any leading SQL comments/whitespace the statement must begin (case-insensitive) with
+    ``SELECT`` or ``WITH`` and must not chain a second statement (a ``;`` followed by more SQL). This is
+    a conservative lightweight gate, not a full SQL parser: it blocks ``INSERT``/``UPDATE``/``DELETE``/
+    ``MERGE``/``EXEC`` and multi-statement smuggling so a crash-replay of the transform can't silently
+    double-apply a write the at-least-once reliability model assumes is impossible. Raises
+    :class:`DbLookupError` (PHI-free — never echoes the statement text) on violation."""
+    stripped = statement
+    while True:
+        m = _SQL_LEADING_COMMENT_RE.match(stripped)
+        if not m:
+            break
+        stripped = stripped[m.end() :]
+    stripped = stripped.lstrip()
+    head = stripped[:6].upper()
+    if not (head.startswith("SELECT") or head.startswith("WITH")):
+        raise DbLookupError(
+            "db_lookup statement must be a read-only SELECT/WITH query "
+            "(no writes, no EXEC, no multiple statements)"
+        )
+    # Reject a chained second statement: any ';' followed by non-whitespace/non-comment text. A single
+    # trailing ';' (optionally followed by whitespace/comments) is fine.
+    for idx, ch in enumerate(stripped):
+        if ch != ";":
+            continue
+        rest = stripped[idx + 1 :]
+        while True:
+            m = _SQL_LEADING_COMMENT_RE.match(rest)
+            if not m:
+                break
+            rest = rest[m.end() :]
+        if rest.strip():
+            raise DbLookupError(
+                "db_lookup statement must be a read-only SELECT/WITH query "
+                "(no writes, no EXEC, no multiple statements)"
+            )
+    return None
 
 
 def _parse_named_params(statement: str) -> tuple[str, list[str]]:
@@ -609,7 +666,10 @@ class DatabaseLookupExecutor:
     while ``db_lookup`` bridges to it from the handler's worker thread via ``run_coroutine_threadsafe``.
     Reuses the DATABASE connector's DSN build / named-parameter translation / SQLSTATE extraction. Pools
     are autocommit — a lookup is read-only, so each query is its own implicit transaction; nothing here
-    writes. Production / supported (SQL Server via the ``[sqlserver]`` extra), like the DATABASE connector."""
+    writes. **Read-only is enforced** (ADR 0010), not merely documented: every statement is gated by
+    :func:`_require_read_only` (must begin SELECT/WITH, no chained writes/EXEC) and the pool DSN carries
+    ``ApplicationIntent=ReadOnly`` (``_build_dsn(read_only=True)``). Production / supported (SQL Server
+    via the ``[sqlserver]`` extra), like the DATABASE connector."""
 
     def __init__(self, connections: Mapping[str, Mapping[str, Any]]) -> None:
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
@@ -620,7 +680,9 @@ class DatabaseLookupExecutor:
             for req in ("server", "database"):
                 if not s.get(req):
                     raise ValueError(f"DatabaseLookup {cname!r} requires a {req!r} setting")
-            self._dsn[cname] = _build_dsn(dict(s))  # fail fast on weakened-TLS / bad-auth config
+            # read_only=True: advertise ApplicationIntent=ReadOnly on the lookup pool (ADR 0010). Fail
+            # fast on weakened-TLS / bad-auth config.
+            self._dsn[cname] = _build_dsn(dict(s), read_only=True)
             self._pool_max[cname] = int(s.get("pool_max", 5))
             self._acquire_timeout[cname] = float(
                 s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT)
@@ -650,8 +712,10 @@ class DatabaseLookupExecutor:
         """Run ``statement`` against ``connection`` and return rows as ``{column: value}`` dicts.
 
         Always parameterized (``:name`` → positional ``?``, bound from ``params`` — a value can never
-        inject SQL). Raises :class:`DbLookupError` (PHI-free) on an unknown connection, a missing
-        parameter, or a DB/driver error — the transform worker turns it into that message's ``ERROR`` /
+        inject SQL) and **read-only enforced** (the statement must be a SELECT/WITH query — see
+        :func:`_require_read_only`). Raises :class:`DbLookupError` (PHI-free) on an unknown connection, a
+        non-read-only statement, a missing parameter, or a DB/driver error — the transform worker turns
+        it into that message's ``ERROR`` /
         dead-letter disposition. Runs on the engine loop (the handler thread bridges in via
         ``run_coroutine_threadsafe``), so a slow query never blocks the loop, only its own worker thread."""
         if connection not in self._dsn:
@@ -659,6 +723,10 @@ class DatabaseLookupExecutor:
             raise DbLookupError(
                 f"db_lookup: no DatabaseLookup connection named {connection!r} (declared: {known})"
             )
+        # ADR 0010: enforce the read-only carve-out at the statement layer before anything executes, so a
+        # write/EXEC never reaches the autocommit pool (which would silently commit and re-apply on a
+        # crash-replay of the transform). PHI-free — never echoes the statement.
+        _require_read_only(statement)
         sql, names = _parse_named_params(statement)
         bound = _bind_lookup_params(params or {}, names, connection)
         pool = await self._get_pool(connection)

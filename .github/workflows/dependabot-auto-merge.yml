@@ -17,6 +17,22 @@ name: Dependabot auto-merge
 # (routine updates age before a PR opens); SECURITY updates bypass cooldown by design, so a real
 # advisory fix still arrives immediately and (if a patch) auto-merges.
 #
+# SECURITY-TRACK GUARDRAILS (DEPENDENCY-POSTURE-REVIEW.md #2 and #3 — close SEC-007, CWE-829):
+#   #3 DENY-LIST — the auth/token/crypto stack (cryptography, argon2-cffi, fastapi, …) is NEVER
+#      auto-merged, not even for a patch: any such dep routes the PR to MANUAL review. A grouped
+#      PR that includes ANY denied dep is denied WHOLE (fail-safe — never partial-merge a group).
+#   #2 PUBLISHED-GHSA GATE — a SECURITY-track PR (which bypasses the cooldown by Dependabot design)
+#      auto-merges ONLY when a real, published, non-withdrawn advisory is confirmed against the
+#      dependency's PREVIOUS version (the axios-1.14.1 pattern). The advisory lookup FAILS CLOSED:
+#      a rate-limit/API error or no-matching-advisory routes to manual review, never auto-merge.
+#      The non-security VERSION track keeps its cooldown-aged auto-merge unchanged (already aged by
+#      dependabot.yml, so it does not need the GHSA gate).
+#
+# RESIDUAL ACCEPTED RISK: a malicious patch that BOTH rides a real concurrent published advisory
+# AND is not on the deny-list would still auto-merge. The deny-list shields the highest-value
+# (auth/crypto) deps unconditionally; the GHSA gate blocks the no-advisory fast-publish poison on
+# the security track; main's required CI (pip-audit/bandit/tests/lock-sync) backstops both.
+#
 # Why `pull_request` (not pull_request_target): a Dependabot `pull_request` run gets a read-only
 # GITHUB_TOKEN by default, which the `permissions:` block below elevates to exactly what the merge
 # API needs — no untrusted-code-with-secrets exposure, no GitHub App required. This is the pattern
@@ -27,6 +43,7 @@ on: pull_request
 permissions:
   contents: write # complete the merge
   pull-requests: write # enable auto-merge on the PR
+  security-events: read # read Dependabot alerts for the published-GHSA gate (#2)
 
 concurrency:
   group: dependabot-automerge-${{ github.event.pull_request.number }}
@@ -47,11 +64,101 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Guardrail #3 (DEPENDENCY-POSTURE-REVIEW.md): the auth/token/crypto stack NEVER auto-merges,
+      # not even a patch. dependency-names is comma-separated for grouped PRs; we deny the WHOLE
+      # group if ANY token matches (fail-safe — never partial-merge a group). Exact token match on
+      # the comma-split names (not a naive substring) so 'cffi' does not match 'argon2-cffi-bindings'
+      # and vice-versa.
+      - name: Reject security-critical deps (deny-list)
+        id: denylist
+        env:
+          DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
+        run: |
+          # Single source of truth for the security-critical deny-list.
+          denylist="cryptography argon2-cffi argon2-cffi-bindings paramiko ldap3 pyspnego \
+            fastapi starlette uvicorn pydantic pydantic-core python-jose pyjwt passlib bcrypt cffi"
+          deny=false
+          IFS=',' read -ra names <<< "$DEP_NAMES"
+          for raw in "${names[@]}"; do
+            # trim surrounding whitespace and lowercase
+            name="$(echo "$raw" | tr '[:upper:]' '[:lower:]' | xargs)"
+            [ -z "$name" ] && continue
+            for crit in $denylist; do
+              if [ "$name" = "$crit" ]; then
+                echo "::notice::'$name' is a security-critical dependency — routing to manual review (no auto-merge)."
+                deny=true
+              fi
+            done
+          done
+          echo "deny=$deny" >> "$GITHUB_OUTPUT"
+
+      # Guardrail #2 (DEPENDENCY-POSTURE-REVIEW.md): a SECURITY-track PR auto-merges ONLY when a
+      # real, published, non-withdrawn advisory covers the dependency's PREVIOUS version. The
+      # security track is detected by Dependabot's `dependency-group` (python-security/ide-security)
+      # — a security-update group — falling back to a present-but-empty group meaning version track.
+      # The advisory lookup FAILS CLOSED: any error or no-match leaves advisory_ok=false.
+      - name: Verify a published advisory backs the security track
+        id: ghsa
+        env:
+          DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
+          DEP_GROUP: ${{ steps.meta.outputs.dependency-group }}
+          PREV_VERSION: ${{ steps.meta.outputs.previous-version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          # Is this the security track? Dependabot tags security-update grouped PRs with a
+          # *-security dependency-group. A non-security (version) PR has no security group.
+          is_security=false
+          case "$DEP_GROUP" in
+            *security*) is_security=true ;;
+          esac
+
+          if [ "$is_security" != "true" ]; then
+            # Version track: already cooldown-aged by dependabot.yml — the GHSA gate does not apply.
+            echo "security_track=false" >> "$GITHUB_OUTPUT"
+            echo "advisory_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "security_track=true" >> "$GITHUB_OUTPUT"
+
+          # Require at least one matching published (non-withdrawn) advisory for EVERY named dep at
+          # the previous version. Query the global advisories endpoint (ecosystem pip — Python
+          # advisories are pip-keyed). Fail closed on any error.
+          advisory_ok=true
+          IFS=',' read -ra names <<< "$DEP_NAMES"
+          for raw in "${names[@]}"; do
+            name="$(echo "$raw" | tr '[:upper:]' '[:lower:]' | xargs)"
+            [ -z "$name" ] && continue
+            count="$(gh api -X GET /advisories \
+              -f ecosystem=pip \
+              -f affects="${name}@${PREV_VERSION}" \
+              --jq '[.[] | select(.withdrawn_at == null)] | length' 2>/dev/null || echo "ERR")"
+            if [ "$count" = "ERR" ] || [ -z "$count" ]; then
+              echo "::warning::advisory lookup failed for '$name' — failing closed (manual review)."
+              advisory_ok=false
+              break
+            fi
+            if [ "$count" -lt 1 ]; then
+              echo "::warning::no published advisory covers '${name}@${PREV_VERSION}' — failing closed (manual review)."
+              advisory_ok=false
+              break
+            fi
+            echo "::notice::published advisory confirmed for '${name}@${PREV_VERSION}'."
+          done
+          echo "advisory_ok=$advisory_ok" >> "$GITHUB_OUTPUT"
+
       - name: Enable auto-merge for in-scope updates
+        # Auto-merge only when: (a) the update is an in-scope type (any patch, or a dev-only minor),
+        # AND (b) no security-critical dep is involved (deny-list #3), AND (c) for the SECURITY track
+        # ONLY, a published advisory is confirmed (#2). A non-security (version-track) patch keeps its
+        # cooldown-aged auto-merge — advisory_ok is not required there.
         if: >-
-          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
-          (steps.meta.outputs.update-type == 'version-update:semver-minor' &&
-           steps.meta.outputs.dependency-type == 'direct:development')
+          steps.denylist.outputs.deny != 'true' &&
+          (steps.ghsa.outputs.security_track != 'true' ||
+           steps.ghsa.outputs.advisory_ok == 'true') &&
+          (steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+           (steps.meta.outputs.update-type == 'version-update:semver-minor' &&
+            steps.meta.outputs.dependency-type == 'direct:development'))
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}

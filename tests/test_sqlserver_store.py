@@ -1323,3 +1323,197 @@ async def test_replay_resend_not_deduped_ss(store) -> None:
     assert again is not None and again.id == item.id  # claimed normally, NOT deduped
     await store.mark_done(again.id, now=600.0)
     assert len(await _ss_ledger(store)) == 1
+
+
+# --- pass-through (PT) re-ingress parity (mirrors tests/test_passthrough.py, ADR 0013) ---
+#
+# The atomic PT branch inside transform_handoff (a Send into an internal PT inbound re-ingresses the
+# body as a new INGRESS child + stamps the parent's terminal marker) is implemented at full SQLite
+# parity here (supports_pt_reingress=True). These drive the real staged flow (enqueue_ingress →
+# route_handoff → transform_handoff) to land an INFLIGHT routed row, then exercise the PT branch.
+
+
+async def _ss_seed_routed(
+    store,
+    *,
+    channel_id: str = "IB_REAL",
+    raw: str = "MSH|payload",
+    metadata: str | None = None,
+    now: float = 100.0,
+):
+    """A message at the ROUTED stage with a single INFLIGHT routed row (as the transform worker would
+    have claimed it), ready for a transform_handoff. Returns (message_id, routed_id)."""
+    mid = await store.enqueue_ingress(channel_id=channel_id, raw=raw, metadata=metadata, now=now)
+    ing = await store.claim_next_fifo(channel_id, stage=Stage.INGRESS.value, now=now)
+    assert ing is not None
+    await store.route_handoff(
+        ingress_id=ing.id,
+        message_id=mid,
+        channel_id=channel_id,
+        handlers=[("h1", raw)],
+        disposition=MessageStatus.ROUTED,
+        now=now,
+    )
+    rtd = await store.claim_next_fifo(channel_id, stage=Stage.ROUTED.value, now=now)
+    assert rtd is not None
+    return mid, rtd.id
+
+
+async def test_pt_handoff_produces_child_and_parent_processed_ss(store) -> None:
+    import json
+
+    parent, routed = await _ss_seed_routed(store, now=100.0)
+    ok = await store.transform_handoff(
+        routed_id=routed,
+        message_id=parent,
+        channel_id="IB_REAL",
+        deliveries=[],
+        pt_deliveries=[("PT_NEXT", "MSH|child")],
+        now=110.0,
+    )
+    assert ok is True
+    # Parent: PROCESSED (a done PT marker row, no in-flight rows) — NOT FILTERED.
+    pmsg = await store.get_message(parent)
+    assert pmsg is not None and pmsg["status"] == MessageStatus.PROCESSED.value
+    # Child: a distinct message on the PT channel, RECEIVED, correlated, with a pending INGRESS row.
+    msgs = await store.list_messages(channel_id="PT_NEXT")
+    assert len(msgs) == 1
+    child = msgs[0]
+    assert child["id"] != parent
+    assert child["status"] == MessageStatus.RECEIVED.value
+    assert child["source_type"] == "passthrough"
+    full = await store.get_message(child["id"])
+    assert full is not None and full["raw"] == "MSH|child"
+    meta = json.loads(full["metadata"])
+    assert meta["correlation_id"] == parent
+    assert meta["correlation_root_id"] == parent
+    assert meta["correlation_depth"] == 1
+    assert meta["passthrough_from"] == parent
+    depth, _ = await store.pending_depth("PT_NEXT", stage=Stage.INGRESS.value)
+    assert depth == 1
+
+
+async def test_pt_child_id_is_content_addressed_ss(store) -> None:
+    parent, routed = await _ss_seed_routed(store, now=100.0)
+    await store.transform_handoff(
+        routed_id=routed,
+        message_id=parent,
+        channel_id="IB_REAL",
+        deliveries=[],
+        pt_deliveries=[("PT_NEXT", "MSH|child")],
+        now=110.0,
+    )
+    from messagefoundry.store.store import MessageStore
+
+    expected = MessageStore._passthrough_message_id(routed, "PT_NEXT", "MSH|child")
+    assert (await store.list_messages(channel_id="PT_NEXT"))[0]["id"] == expected
+
+
+async def test_pt_plus_outbound_in_one_handler_ss(store) -> None:
+    parent, routed = await _ss_seed_routed(store, now=100.0)
+    ok = await store.transform_handoff(
+        routed_id=routed,
+        message_id=parent,
+        channel_id="IB_REAL",
+        deliveries=[("OB_REAL", "MSH|out")],
+        pt_deliveries=[("PT_NEXT", "MSH|child")],
+        now=110.0,
+    )
+    assert ok is True
+    # The real outbound row is pending → parent not yet finalized (stays ROUTED until delivery).
+    depth_out, _ = await store.pending_depth("OB_REAL", stage=Stage.OUTBOUND.value)
+    assert depth_out == 1
+    assert (await store.get_message(parent))["status"] == MessageStatus.ROUTED.value
+    # The PT child exists independently.
+    assert len(await store.list_messages(channel_id="PT_NEXT")) == 1
+
+
+async def test_pt_handoff_idempotent_rerun_ss(store) -> None:
+    parent, routed = await _ss_seed_routed(store, now=100.0)
+    assert await store.transform_handoff(
+        routed_id=routed,
+        message_id=parent,
+        channel_id="IB_REAL",
+        deliveries=[],
+        pt_deliveries=[("PT_NEXT", "MSH|child")],
+        now=110.0,
+    )
+    # Routed row is gone → second call is a no-op (False), writes nothing.
+    assert (
+        await store.transform_handoff(
+            routed_id=routed,
+            message_id=parent,
+            channel_id="IB_REAL",
+            deliveries=[],
+            pt_deliveries=[("PT_NEXT", "MSH|child")],
+            now=120.0,
+        )
+        is False
+    )
+    assert len(await store.list_messages(channel_id="PT_NEXT")) == 1
+
+
+async def test_pt_depth_cap_drops_child_and_errors_parent_ss(store) -> None:
+    import json
+
+    cap = 3
+    parent, routed = await _ss_seed_routed(
+        store,
+        metadata=json.dumps({"correlation_depth": cap, "correlation_root_id": "root-1"}),
+        now=100.0,
+    )
+    ok = await store.transform_handoff(
+        routed_id=routed,
+        message_id=parent,
+        channel_id="IB_REAL",
+        deliveries=[],
+        pt_deliveries=[("PT_NEXT", "MSH|child")],
+        correlation_depth_cap=cap,
+        now=110.0,
+    )
+    assert ok is True
+    # No child produced; parent finalizes ERROR (the dead PT marker row).
+    assert await store.list_messages(channel_id="PT_NEXT") == []
+    pmsg = await store.get_message(parent)
+    assert pmsg is not None and pmsg["status"] == MessageStatus.ERROR.value
+
+
+async def test_pt_correlation_root_propagates_ss(store) -> None:
+    import json
+
+    parent, routed = await _ss_seed_routed(
+        store,
+        metadata=json.dumps(
+            {"correlation_depth": 2, "correlation_root_id": "ROOT", "correlation_id": "mid-prev"}
+        ),
+        now=100.0,
+    )
+    await store.transform_handoff(
+        routed_id=routed,
+        message_id=parent,
+        channel_id="IB_REAL",
+        deliveries=[],
+        pt_deliveries=[("PT_NEXT", "MSH|child")],
+        now=110.0,
+    )
+    child_id = (await store.list_messages(channel_id="PT_NEXT"))[0]["id"]
+    full = await store.get_message(child_id)
+    assert full is not None
+    meta = json.loads(full["metadata"])
+    assert meta["correlation_root_id"] == "ROOT"
+    assert meta["correlation_depth"] == 3
+    assert meta["correlation_id"] == parent
+
+
+async def test_pt_no_pt_is_byte_identical_ss(store) -> None:
+    # Regression: empty pt_deliveries leaves the pre-feature path unchanged (normal FILTERED collapse).
+    parent, routed = await _ss_seed_routed(store, now=100.0)
+    assert await store.transform_handoff(
+        routed_id=routed, message_id=parent, channel_id="IB_REAL", deliveries=[], now=110.0
+    )
+    pmsg = await store.get_message(parent)
+    assert pmsg is not None and pmsg["status"] == MessageStatus.FILTERED.value
+
+
+async def test_supports_pt_reingress_true_ss(store) -> None:
+    assert store.supports_pt_reingress is True

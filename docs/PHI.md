@@ -371,8 +371,14 @@ captures to rotating files); running a **`prod`** environment at `DEBUG` is **re
 provides `redact()` (scrubs HL7 segment/field content from free text, keeping segment IDs) and
 `safe_exc()` (the chokepoint used at every exception→`last_error`/`detail`/log site in the
 [wiring runner](../messagefoundry/pipeline/wiring_runner.py)). It is conservative redaction, **not**
-de-identification (§9); the residual control for free-text PHI a user script invents is the
-"never put PHI in an exception message" convention. The existing controls — never log full bodies at
+de-identification (§9). Beyond HL7-shaped spans, `redact()` now also applies a **conservative free-text
+heuristic** — date/DOB runs and multi-token name runs (e.g. `DOE JANE`) are scrubbed even without HL7
+delimiters — so the prior free-text residual is **narrowed** to an adversarially-crafted *single-token*
+or non-name-shaped identifier, still governed by the "never put PHI in an exception message" convention.
+Reinforcing that convention, `messagefoundry check` ships an **advisory `raise-fstring` lint** that
+AST-scans the config-dir Router/Handler modules and flags `raise <Exc>(f"...{var}...")` (an f-string
+raise interpolating a variable — the pattern that can carry free-text PHI past redaction); it prints a
+heuristic reminder and never blocks the gate. The existing controls — never log full bodies at
 INFO+, the CR/LF log-injection filter, and silencing python-hl7's PHI-prone loggers — remain in
 [logging_setup.py](../messagefoundry/logging_setup.py).
 

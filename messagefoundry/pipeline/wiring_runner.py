@@ -48,7 +48,7 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.config.db_lookup import DbLookupError, activated as db_lookup_activated
 from messagefoundry.config.run_context import RunContext, run_contexts
-from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.settings import EgressSettings, StoreBackend
 from messagefoundry.config.wiring import (
     InboundConnection,
     OutboundConnection,
@@ -61,6 +61,7 @@ from messagefoundry.config.wiring import (
     resolve_listener_binding,
 )
 from messagefoundry.parsing import HL7PeekError, Peek, RawMessage, normalize, summarize, validate
+from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import safe_exc, safe_text
@@ -105,6 +106,15 @@ _BUILDUP_CHECK_INTERVAL = 1.0
 # A live lookup that exceeds this raises (→ the message's transform fails and dead-letters) rather than
 # pinning a worker thread forever; the orphaned query still completes on the loop and releases its conn.
 _LOOKUP_RESULT_TIMEOUT_SECONDS = 30.0
+
+# Engine-level ingress size ceiling for NON-HL7 content types (SEC-017, CWE-770). The HL7 path already
+# enforces this via Peek.parse → enforce_size_limits; the binary/text branches had only the per-transport
+# frame cap (each individually disable-able with max_frame_bytes=0). Mirroring the HL7 cap here makes the
+# 16 MiB ceiling an engine-level invariant (belt-and-suspenders) rather than a per-transport one, so an
+# operator who disabled a transport cap (or a future transport that ships without one) still can't buffer
+# a multi-GB body whole. Measured on the raw BYTES pre-base64-inflation (binary) / the decoded str (text,
+# matching enforce_size_limits' len(norm) convention).
+_INGRESS_MAX_BYTES = DEFAULT_MAX_MESSAGE_BYTES
 
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
 # PortConflictError naming the connection + binding, instead of a bare unattributed OSError aborting the
@@ -414,10 +424,11 @@ class RegistryRunner:
 
     def _build_lookup_executor(self) -> DatabaseLookupExecutor | None:
         """Build the pooled live-lookup executor from the current graph's ``DatabaseLookup`` specs, or
-        ``None`` if the graph declares none (so the transform path stays byte-identical — inline call,
-        no thread hop, no runner). Resolves ``env()`` in each spec and fail-closed egress-checks the
-        server, exactly like a DATABASE source. ``build_check`` already validated these on a reload, so
-        this won't raise there; at start a bad spec surfaces here and unwinds the partial start."""
+        ``None`` if the graph declares none (so ``db_lookup`` is unavailable and the lookup runner is not
+        activated — but the transform still runs OFF the loop either way, for availability; SEC-013).
+        Resolves ``env()`` in each spec and fail-closed egress-checks the server, exactly like a DATABASE
+        source. ``build_check`` already validated these on a reload, so this won't raise there; at start a
+        bad spec surfaces here and unwinds the partial start."""
         if not self.registry.lookups:
             return None
         resolved: dict[str, dict[str, Any]] = {}
@@ -431,9 +442,9 @@ class RegistryRunner:
         self, connection: str, statement: str, params: Mapping[str, Any] | None
     ) -> list[dict[str, Any]]:
         """The lookup runner published to Handlers (``db_lookup`` → this). Called FROM the handler's
-        worker thread (``transform_one`` runs off the loop when lookups are declared), it bridges the
-        async query onto the engine loop via ``run_coroutine_threadsafe`` and blocks the WORKER THREAD —
-        never the loop — for the result (bounded by ``_LOOKUP_RESULT_TIMEOUT_SECONDS``)."""
+        worker thread (``transform_one`` always runs off the loop), it bridges the async query onto the
+        engine loop via ``run_coroutine_threadsafe`` and blocks the WORKER THREAD — never the loop — for
+        the result (bounded by ``_LOOKUP_RESULT_TIMEOUT_SECONDS``)."""
         executor = self._lookup_executor
         loop = self._loop
         if executor is None or loop is None:  # only published when both exist; guard defensively
@@ -580,9 +591,11 @@ class RegistryRunner:
         source_cfg = _source_config(ic, self._inbound_bind_host, self._env_values)
         check_source_allowed(source_cfg, ic.name, self._egress)  # fail-closed connect allowlist
         # Exposed-gate (ADR 0002 §0 / ADR 0025 §9): refuse a non-loopback MLLP or DICOM SCP listener
-        # without TLS at start (cleartext PHI on the wire). Each guard no-ops for the other's type.
+        # without TLS at start, and a non-loopback raw-TCP/X12 listener (plaintext-only — no TLS option)
+        # at start (cleartext PHI on the wire). Each guard no-ops for the other's type.
         check_mllp_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
         check_dimse_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
+        check_tcp_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
         source = build_source(source_cfg)
         # Inject the connection-event sink (#46) BEFORE start so a listen source can emit accept/refuse/
         # close. None when capture is off (byte-identical). transports/ stays store-agnostic — the sink
@@ -902,7 +915,14 @@ class RegistryRunner:
         """Construct (and discard) every connector in ``registry`` so a bad connector spec fails
         BEFORE a reload quiesces anything — i.e. the running graph is left untouched. Construction
         is side-effect-free (no socket bind / file I/O — binding happens later in ``start_inbound``).
-        Raises :class:`WiringError` so the API maps it to 422 like other invalid-config errors."""
+        Raises :class:`WiringError` so the API maps it to 422 like other invalid-config errors.
+
+        This is the COMMON validation every config-application path runs (reload's live-runner swap,
+        the runner-None bring-up, and ``reload(dry_run=True)``'s pre-flight all funnel through here),
+        so the store-capability gates that must hold on every such path live here too: the
+        pass-through (PT) backend allow-list (:func:`check_pt_backend_supported`) rejects a PT inbound
+        on a backend that can't re-ingress (Postgres/SQL Server/any non-SQLite) BEFORE the swap, so a
+        reload/promote can never bring a PT-on-non-SQLite graph live."""
         build_check_registry(
             registry,
             inbound_bind_host=self._inbound_bind_host,
@@ -910,6 +930,10 @@ class RegistryRunner:
             egress=self._egress,
             reserved_bindings=self._reserved_bindings,
         )
+        # PT-backend allow-list — folded in here (vs only at Engine.start) so EVERY reload + dry-run
+        # path that build-checks the new registry also rejects a PT-on-non-SQLite graph before any
+        # swap. RegistryRunner carries the resolved store, so the gate sees the backend's capability.
+        check_pt_backend_supported(registry, self.store)
 
     async def _reconcile_outbounds(self, old: Registry, new: Registry) -> None:
         """Bring the outbound connectors/workers in line with ``new`` without tearing down a live
@@ -1044,6 +1068,23 @@ class RegistryRunner:
         hl7v2 = ic.content_type is ContentType.HL7V2
 
         if not hl7v2 and ic.content_type.is_binary:
+            # Engine-level ingress size guard (SEC-017, CWE-770): the HL7 path enforces a 16 MiB ceiling
+            # via Peek.parse → enforce_size_limits; mirror it here for binary ingress so the cap is an
+            # engine invariant, not just a per-transport frame cap (which is disable-able). Measure on the
+            # RAW bytes (pre-base64-inflation) so the carriage codec can't blow past the ceiling. Record
+            # ERROR + return None (no HL7 ACK for non-HL7) — count-and-log, never crash the connection.
+            if len(raw) > _INGRESS_MAX_BYTES:
+                await self.store.record_received(
+                    channel_id=ic.name,
+                    raw=raw.decode(
+                        "latin-1"
+                    ),  # lossless byte view (same pattern as the decode-error path)
+                    status=MessageStatus.ERROR,
+                    error=f"ingress exceeds max size ({len(raw)} > {_INGRESS_MAX_BYTES} bytes)",
+                    source_type=src,
+                    message_type=ic.content_type.value,
+                )
+                return None
             # Binary ingress (ADR 0028): a byte-oriented content type carries raw bytes that cannot
             # ride the str/TEXT store as text — a NUL/non-UTF-8 body is rejected (Postgres) or
             # truncated (SQLite/SQL Server). Base64-carry them at the source boundary via
@@ -1099,6 +1140,20 @@ class RegistryRunner:
             return ack
 
         if not hl7v2:
+            # Engine-level ingress size guard (SEC-017, CWE-770), mirroring the HL7 path's
+            # enforce_size_limits (which measures len(norm) on the decoded str). Measure on the decoded
+            # text the same way so the engine ceiling matches the HL7 path. Record ERROR + return None
+            # (no HL7 ACK for non-HL7) — count-and-log, never crash the connection.
+            if len(text) > _INGRESS_MAX_BYTES:
+                await self.store.record_received(
+                    channel_id=ic.name,
+                    raw=text,
+                    status=MessageStatus.ERROR,
+                    error=f"ingress exceeds max size ({len(text)} > {_INGRESS_MAX_BYTES} bytes)",
+                    source_type=src,
+                    message_type=ic.content_type.value,
+                )
+                return None
             # Payload-agnostic ingress (ADR 0004): a non-HL7 inbound skips HL7 peek/validate and the
             # HL7 ACK. The decoded body is committed verbatim and the router/transform workers route it
             # as a RawMessage; the source connector owns its own receive-time response (no MLLP ACK).
@@ -1457,7 +1512,14 @@ class RegistryRunner:
                         ),
                         phase="router",
                     ):
-                        names = route_only(self.registry, ic, item.payload)
+                        # Run the Router OFF the event loop (SEC-013, CWE-1322). A Router is arbitrary
+                        # synchronous Python whose CPU cost can scale with attacker-influenced content
+                        # (ReDoS over a field, O(n^2) build); running it inline would let one message
+                        # stall the single loop, freezing every listener, worker, and the API.
+                        # asyncio.to_thread copies THIS context (the run_contexts views) into the worker
+                        # thread, so a call-time code_set()/reference()/current_environment() still
+                        # resolves. db_lookup raises on a Router by design, so no lookup runner is needed.
+                        names = await asyncio.to_thread(route_only, self.registry, ic, item.payload)
                 except Exception as exc:
                     # Router code error (incl. an unknown handler name). Post-ACK, so no NAK — the
                     # global internal_error policy decides. Log the exception TYPE only; full detail
@@ -1646,31 +1708,37 @@ class RegistryRunner:
                         ),
                         phase="transform",
                     ):
+                        # Run the Handler's transform OFF the event loop UNCONDITIONALLY (SEC-013,
+                        # CWE-1322). A Handler is arbitrary synchronous Python whose CPU cost can scale
+                        # with attacker-influenced content (ReDoS, O(n^2) build, large fan-out); the old
+                        # no-lookup fast-path ran it inline on the single loop, so one pathological message
+                        # could stall every listener, worker, and the API. asyncio.to_thread copies THIS
+                        # context (the run_contexts views, plus the lookup runner when activated) into the
+                        # worker thread, so code_set()/reference()/state_get()/current_environment() — and
+                        # db_lookup() on the lookup path — all resolve there while the loop stays free.
+                        content_type = self.registry.inbound[name].content_type.value
                         if self._lookup_executor is not None:
                             # The graph declares ≥1 DatabaseLookup, so a Handler may call db_lookup() — a
-                            # LIVE, synchronous DB read (ADR 0010). A handler is synchronous and must not
-                            # block the event loop, so run the transform OFF the loop in a worker thread.
-                            # asyncio.to_thread copies THIS context into the thread — the run_contexts
-                            # views AND the active lookup runner — so db_lookup()/code_set()/reference()/
-                            # state_get()/current_environment() all resolve there, while the loop stays
-                            # free to service the lookup's async query and every other connection. The
-                            # runner bridges back onto the loop (run_coroutine_threadsafe). db_lookup is
-                            # the deliberate re-run-stability exception (ADR 0009) and raises in dry-run.
+                            # LIVE, synchronous DB read (ADR 0010). The runner bridges back onto the loop
+                            # (run_coroutine_threadsafe). db_lookup is the deliberate re-run-stability
+                            # exception (ADR 0009) and raises in dry-run.
                             with db_lookup_activated(self._run_lookup):
                                 deliveries_preview, state_preview = await asyncio.to_thread(
                                     transform_one,
                                     self.registry,
                                     hname,
                                     item.payload,
-                                    self.registry.inbound[name].content_type.value,
+                                    content_type,
                                 )
                         else:
-                            # No DatabaseLookup declared → byte-identical to before: run inline on the loop.
-                            deliveries_preview, state_preview = transform_one(
+                            # No DatabaseLookup declared → db_lookup() is unavailable (raises if called),
+                            # but the transform still hops off the loop for availability (no inline path).
+                            deliveries_preview, state_preview = await asyncio.to_thread(
+                                transform_one,
                                 self.registry,
                                 hname,
                                 item.payload,
-                                self.registry.inbound[name].content_type.value,
+                                content_type,
                             )
                 except Exception as exc:
                     # Handler/transform code error (incl. an unknown outbound name). Post-ACK, so no
@@ -1700,7 +1768,13 @@ class RegistryRunner:
                     )
                     await self.store.dead_letter_now(item.id, f"handler error: {safe_exc(exc)}")
                     continue
-                deliveries = [(d.to, d.payload) for d in deliveries_preview]
+                # Split outbound deliveries from pass-through (PT) Sends (ADR 0013, generalized): a PT
+                # target re-ingresses the body through an internal inbound's own router (a fresh INGRESS
+                # row on the PT channel), produced atomically in the SAME transform_handoff transaction
+                # as the outbound rows + routed-row DELETE. transform_one already validated each target
+                # and tagged PT ones (is_passthrough).
+                deliveries = [(d.to, d.payload) for d in deliveries_preview if not d.is_passthrough]
+                pt_deliveries = [(d.to, d.payload) for d in deliveries_preview if d.is_passthrough]
                 state_ops = [(s.namespace, s.key, s.value) for s in state_preview]
                 await self.store.transform_handoff(
                     routed_id=item.id,
@@ -1708,9 +1782,15 @@ class RegistryRunner:
                     channel_id=name,
                     deliveries=deliveries,
                     state_ops=state_ops,
+                    pt_deliveries=pt_deliveries,
+                    correlation_depth_cap=self._max_correlation_depth,
                 )
                 if deliveries:
                     self._work.set()  # wake the outbound delivery workers for the freshly-queued rows
+                if pt_deliveries:
+                    # A PT child INGRESS row was committed on the PT channel — wake the router workers so
+                    # the PT inbound's router re-routes it without waiting for the idle-poll interval.
+                    self._ingress_work.set()
                 # Off the hot path (rate-limited): alert if this inbound's routed (transform) backlog is
                 # building behind a slow/hung handler — reported separately from the ingress lane.
                 now = time.time()
@@ -1796,7 +1876,7 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
     # bind to the per-connection bind_address if set, else the service-level [inbound].bind_host. File
     # and other inbounds have no host and ignore this. A peer-IP allowlist rides into the connector's
     # settings so the listener can reject a non-allowlisted peer at accept time. (bind_address and the
-    # allowlist are MLLP/TCP-only at wiring, so for X12 both fields are None here = unchanged behaviour.)
+    # allowlist are MLLP/TCP/DIMSE/X12-only at wiring; all four are LISTEN types that bind an interface.)
     if ic.spec.type in (
         ConnectorType.MLLP,
         ConnectorType.TCP,
@@ -1890,6 +1970,40 @@ def build_check_registry(
         raise
     except Exception as exc:
         raise WiringError(f"connector build failed: {exc}") from exc
+
+
+def check_pt_backend_supported(registry: Registry, store: QueueStore) -> None:
+    """Reject a graph with a pass-through (PT) inbound on a store backend that doesn't implement PT
+    re-ingress, BEFORE any inbound listener accepts a message.
+
+    **ALLOW-LIST semantics:** PT is permitted only on a backend whose ``supports_pt_reingress`` is
+    ``True`` (SQLite today). Postgres, SQL Server, and any future backend default to ``False`` (set on
+    the ``Store`` base), so a backend that hasn't implemented the ``pt_deliveries`` branch of
+    :meth:`transform_handoff` is rejected here rather than at the first Handler ``Send`` into a PT
+    connector (which would NotImplementedError *after* the inbound was already ACKed). Names the
+    offending PT connection(s) and the backend.
+
+    This is the **single source of truth** for the gate: it runs on EVERY config-application path —
+    ``Engine.start`` calls it directly, and the reload (live-runner + runner-None bring-up) and
+    ``reload(dry_run=True)`` paths reach it via :meth:`RegistryRunner.build_check` — so a PT-on-non-
+    SQLite graph is rejected with a :class:`WiringError` (422) before any swap/start, leaving any
+    already-running graph untouched. No-op when the backend supports PT or the graph has no PT inbound,
+    so the SQLite path is byte-identical."""
+    if getattr(store, "supports_pt_reingress", False):
+        return  # backend opted in (SQLite) — PT is permitted, nothing to gate
+    pt_inbounds = sorted(
+        name for name, ic in registry.inbound.items() if ic.spec.type is ConnectorType.PT
+    )
+    if not pt_inbounds:
+        return  # no PT connector in the graph — any backend is fine
+    backend = getattr(store, "backend", None)
+    backend_name = backend.value if isinstance(backend, StoreBackend) else type(store).__name__
+    names = ", ".join(repr(n) for n in pt_inbounds)
+    plural = "s" if len(pt_inbounds) > 1 else ""
+    raise WiringError(
+        f"Pass-through (PT) connector{plural} {names} require{'' if plural else 's'} the SQLite "
+        f"store backend; backend {backend_name!r} does not support PT re-ingress yet."
+    )
 
 
 def _allowlist_for(conn_type: ConnectorType, egress: EgressSettings) -> list[str]:
@@ -2046,6 +2160,40 @@ def check_dimse_tls_exposure(source: Source, name: str, *, allow_insecure_bind: 
         "+ pixel data) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the DICOM connection, or pass `serve --allow-insecure-bind` to accept the "
         "cleartext risk on a trusted, firewalled network."
+    )
+
+
+def check_tcp_tls_exposure(source: Source, name: str, *, allow_insecure_bind: bool) -> None:
+    """Exposed-gate (ADR 0002 §0, raw-TCP/X12 side): refuse a **non-loopback raw-TCP or X12 listener**
+    on a cleartext bind — it would put raw-TCP/X12 payloads (frequently PHI: X12 270/271 eligibility,
+    raw/FHIR bodies) on the wire in plaintext. The TCP/X12 sibling of :func:`check_mllp_tls_exposure`
+    and :func:`check_dimse_tls_exposure`, generalizing the exposed-gate to the remaining cleartext-only
+    LISTEN types. Unlike MLLP/DICOM these connectors are **plaintext-only** — they have **no** ``tls=``
+    option (``asyncio.start_server`` is called with no ``ssl=`` arg), so there is no TLS escape hatch:
+    the only ways forward are a loopback bind, OS-level firewall/segmentation, or
+    ``serve --allow-insecure-bind`` to accept the cleartext risk (then warn). Loopback binds pass
+    unconditionally; the guard no-ops for any non-TCP/X12 type."""
+    if source.type not in (ConnectorType.TCP, ConnectorType.X12):
+        return
+    host = str(source.settings.get("host", "127.0.0.1"))
+    if host in _LOOPBACK_HOSTS:
+        return
+    if allow_insecure_bind:
+        log.warning(
+            "inbound %r binds non-loopback host %r for a plaintext-only %s listener "
+            "(--allow-insecure-bind); X12/raw-TCP payloads (frequently PHI) cross the network in "
+            "cleartext — these listeners have no TLS, so firewall/segment them.",
+            name,
+            host,
+            source.type.value.upper(),
+        )
+        return
+    raise WiringError(
+        f"inbound connection {name!r} binds non-loopback host {host!r} on a plaintext-only "
+        f"{source.type.value.upper()} listener; raw-TCP/X12 payloads (frequently PHI) would cross the "
+        "network in cleartext. TCP/X12 listeners are plaintext-only (no TLS option) — bind loopback, "
+        "firewall/segment the port at the OS level, or pass `serve --allow-insecure-bind` to accept "
+        "the cleartext risk on a trusted, firewalled network."
     )
 
 

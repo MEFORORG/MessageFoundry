@@ -1,8 +1,12 @@
 src/**
+out/**
 node_modules/**
 .vscode/**
+.vscode-test/**
 **/*.map
 **/*.ts
 esbuild.js
 tsconfig.json
+tsconfig.test.json
 .gitignore
+**/*.vsix

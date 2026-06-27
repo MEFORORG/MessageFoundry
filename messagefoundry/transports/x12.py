@@ -38,6 +38,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    peer_ip_allowed,
     probe_tcp_reachable,
     register_destination,
     register_source,
@@ -217,6 +218,10 @@ class X12Source(SourceConnector):
         self.receive_timeout: float | None = float(rt) if rt else None
         mib = s.get("max_interchange_bytes", DEFAULT_MAX_INTERCHANGE_BYTES)
         self.max_interchange_bytes: int | None = int(mib) if mib else None
+        # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.
+        # Absent/empty = no restriction. Mirrors TcpSource/MLLPSource.
+        sa = s.get("source_ip_allowlist")
+        self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         self._active = 0
@@ -267,6 +272,13 @@ class X12Source(SourceConnector):
         if task is not None:
             self._client_tasks.add(task)
         try:
+            if self.source_ip_allowlist is not None:
+                peer = writer.get_extra_info("peername")
+                if not peer_ip_allowed(peer, self.source_ip_allowlist):
+                    logger.warning(
+                        "X12 connection from %s refused: not in source_ip_allowlist", peer
+                    )
+                    return  # not allowlisted — refuse (closed in the outer finally; _active untouched)
             if self.max_connections is not None and self._active >= self.max_connections:
                 return  # at capacity — refuse the new client (closed in the outer finally)
             self._active += 1

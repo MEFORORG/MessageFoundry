@@ -10,7 +10,9 @@ DATABASE driver fake and the REST opener fake. paramiko need not be installed.
 from __future__ import annotations
 
 import asyncio
+import logging
 import posixpath
+import ssl
 from typing import Any
 
 import pytest
@@ -25,6 +27,7 @@ from messagefoundry.transports import remotefile
 from messagefoundry.transports.remotefile import (
     RemoteFileDestination,
     RemoteFileSource,
+    _FtpClient,
     _RemoteClient,
     _RemoteError,
     _SftpClient,
@@ -460,6 +463,82 @@ def test_ftps_with_credentials_is_allowed(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     dest = build_destination(_ftp_dest(tls=True, username="u", password="p"))  # TLS → fine
     assert isinstance(dest, RemoteFileDestination)
+
+
+# === security: FTPS TLS certificate verification (SEC-001) ===================
+
+
+def test_ftps_context_verifies_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The FTPS client builds a VERIFYING SSLContext (not ftplib's no-verify stdlib fallback): the server
+    # certificate and hostname are validated. This is the core of the fix.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    client = _FtpClient({"host": "ftp.example.com", "remote_dir": "/in"}, tls=True)
+    assert client._context is not None
+    assert client._context.verify_mode == ssl.CERT_REQUIRED
+    assert client._context.check_hostname is True
+
+
+def test_plain_ftp_has_no_tls_context() -> None:
+    # Plain ftp builds no TLS context (ftplib.FTP, no FTP_TLS) — guards the tls-branch boundary.
+    client = _FtpClient({"host": "ftp.example.com", "remote_dir": "/in"}, tls=False)
+    assert client._context is None
+
+
+def test_ftps_insecure_refused_without_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+    # tls_verify=false without the explicit escape is refused at construction (build_check), exactly like
+    # the MLLP outbound path — never silently insecure.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with pytest.raises(ValueError, match="tls_verify=false"):
+        _FtpClient({"host": "ftp.example.com", "remote_dir": "/in", "tls_verify": False}, tls=True)
+
+
+def test_ftps_insecure_allowed_with_escape(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.remotefile"):
+        client = _FtpClient(
+            {"host": "ftp.example.com", "remote_dir": "/in", "tls_verify": False}, tls=True
+        )
+    assert client._context is not None
+    assert client._context.verify_mode == ssl.CERT_NONE
+    assert client._context.check_hostname is False
+    assert any("verification is DISABLED" in r.message for r in caplog.records)
+
+
+def test_ftps_connect_passes_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    # FTP_TLS is constructed with the built verifying context= kwarg (not the no-verify default).
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    recorded: dict[str, Any] = {}
+
+    class _RecordingFTPTLS:
+        def __init__(self, *, context: Any = None, timeout: float | None = None) -> None:
+            recorded["context"] = context
+            recorded["timeout"] = timeout
+
+        def connect(self, host: str, port: int) -> None:
+            pass
+
+        def login(self, *, user: str, passwd: str) -> None:
+            pass
+
+        def prot_p(self) -> None:
+            pass
+
+        def quit(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    import ftplib as _ftplib
+
+    monkeypatch.setattr(_ftplib, "FTP_TLS", _RecordingFTPTLS)
+    client = _FtpClient({"host": "ftp.example.com", "remote_dir": "/in"}, tls=True)
+    ftp = client._connect()
+    assert isinstance(ftp, _RecordingFTPTLS)
+    assert isinstance(recorded["context"], ssl.SSLContext)
+    assert recorded["context"].verify_mode == ssl.CERT_REQUIRED
 
 
 def test_sftp_with_credentials_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:

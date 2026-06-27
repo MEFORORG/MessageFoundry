@@ -517,7 +517,10 @@ def _claim_unique(tmp: Path, target: Path) -> Path:
             except OSError:
                 linkable = False  # hard links unusable on this filesystem — copy instead
         try:
-            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            # 0o600 (owner-only), matching the mkstemp temp this delivers and the os.link / os.replace
+            # paths that inherit its mode: delivered files can carry PHI, so the rare cross-filesystem
+            # copy fallback must not be the one path that leaves them world-readable.
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
             n += 1
             candidate = target.with_name(f"{stem}-{n}{suffix}")

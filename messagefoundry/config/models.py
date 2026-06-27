@@ -34,6 +34,7 @@ class ConnectorType(str, Enum):
     TIMER = "timer"  # clock-driven source — emits a configured body on a schedule (source only, ADR 0011)
     X12 = "x12"  # raw-TCP X12 EDI — ISA/IEA-framed (no transport sentinel), source + destination (ADR 0012)
     LOOPBACK = "loopback"  # inert inbound — messages arrive only via ingress_handoff (re-ingress, ADR 0013)
+    PT = "passthrough"  # internal pass-through inbound — a Handler Sends here; its own router re-routes (ADR 0013 generalized)
     FHIR = "fhir"  # FHIR REST destination — POST/PUT a resource or transaction Bundle to a server (ADR 0022)
     DIMSE = "dimse"  # raw DICOM upper-layer — C-STORE SCP source + C-STORE SCU/C-ECHO destination (ADR 0025)
     DICOMWEB = "dicomweb"  # DICOMweb STOW-RS over HTTP — outbound store/send destination (ADR 0025 Phase 2)

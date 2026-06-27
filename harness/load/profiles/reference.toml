@@ -90,6 +90,54 @@ loop = "open"
 rate_start = 70.0
 duration_s = 40.0
 
+# Higher rate steps so the ladder keeps climbing past the consumer-hardware floor (~70/s) into the
+# several-hundred/s range — on enterprise hardware every step below the knee still holds achieved ≈
+# offered, so the run keeps going until a step shows achieved < offered (the knee) instead of topping
+# out before the engine's real ceiling is found. Same MEASURED (sustained) shape as the steps above:
+# each reports achieved vs offered + ACK/e2e latency at its offered rate. The cooldown below still
+# drains whatever backlog the post-knee steps built, so zero_loss + drain stay honest.
+[[load.phase]]
+name = "r100"
+kind = "sustained"
+loop = "open"
+rate_start = 100.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r150"
+kind = "sustained"
+loop = "open"
+rate_start = 150.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r200"
+kind = "sustained"
+loop = "open"
+rate_start = 200.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r300"
+kind = "sustained"
+loop = "open"
+rate_start = 300.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r450"
+kind = "sustained"
+loop = "open"
+rate_start = 450.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r650"
+kind = "sustained"
+loop = "open"
+rate_start = 650.0
+duration_s = 40.0
+
 # Cooldown well below any backend's delivery ceiling, so whatever backlog the steps above built drains
 # within the run + the final drain — keeping the zero_loss + drain conformance check honest.
 [[load.phase]]

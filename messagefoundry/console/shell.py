@@ -6,6 +6,7 @@ whichever page is active. Pages: Connections, Alerts, Dead Letters, Log Search, 
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -14,6 +15,7 @@ from PySide6.QtGui import QCloseEvent, QIcon, QKeySequence, QShortcut
 from PySide6.QtSvgWidgets import QSvgWidget
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
@@ -37,6 +39,7 @@ from messagefoundry.console.search import LogSearchPage
 from messagefoundry.console.status import EngineStatusPage
 from messagefoundry.console.dead_letters_page import DeadLettersPage
 from messagefoundry.console.event_log_page import EventLogPage
+from messagefoundry.console.shards import ShardRegistry
 from messagefoundry.console.users_page import UsersPage
 from messagefoundry.console.widgets import ERROR_COLOR, RefreshSettingsDialog
 
@@ -150,6 +153,10 @@ class AppWindow(QWidget):
     # entrypoint can re-prompt sign-in instead of leaving the user stuck (review M-26).
     session_expired = Signal()
 
+    # Emitted when the operator picks a different shard in the selector, carrying the new shard id.
+    # The entrypoint uses it to (re)authenticate the per-shard client before pages talk to it.
+    shard_changed = Signal(str)
+
     def __init__(
         self,
         client: EngineClient,
@@ -157,6 +164,8 @@ class AppWindow(QWidget):
         poll_client: EngineClient | None = None,
         poll_seconds: float = 2.0,
         service_name: str = "MessageFoundry",
+        registry: ShardRegistry | None = None,
+        client_factory: Callable[[str], tuple[EngineClient, EngineClient]] | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle("MessageFoundry Console")
@@ -169,48 +178,38 @@ class AppWindow(QWidget):
         self._service_name = service_name
         self._interval = max(0.0, poll_seconds)
 
-        self.connections = ConnectionsPage(client, poll_client=self._poll_client)
-        self.alerts = AlertsPage(client, poll_client=self._poll_client)
-        self.dead_letters = DeadLettersPage(client, poll_client=self._poll_client)
-        self.event_log = EventLogPage(client, poll_client=self._poll_client)
-        self.log_search = LogSearchPage(client, poll_client=self._poll_client)
-        self.engine_status = EngineStatusPage(self._poll_client, service_name=service_name)
-        nav_items = list(_NAV)
-        self._pages: list[QWidget] = [
-            self.connections,
-            self.alerts,
-            self.dead_letters,
-            self.event_log,
-            self.log_search,
-            self.engine_status,
-        ]
-        if client.can("users:manage"):  # user administration is permission-gated
-            self.users = UsersPage(client, poll_client=self._poll_client)
-            self.users.error.connect(self._show_error)
-            nav_items.append("Users")
-            self._pages.append(self.users)
+        # Multi-shard wiring (opt-in). `registry` lists the configured engine endpoints; the active
+        # shard's clients are the ones above. `client_factory(shard_id)` lazily builds (and caches)
+        # an (action, poll) client pair for a shard the first time it is selected — the entrypoint
+        # supplies it so per-shard authentication/keyring lives there, not in the GUI. With neither,
+        # the window is single-shard (exactly the legacy behaviour) and the selector is hidden.
+        self._registry = registry
+        self._client_factory = client_factory
+        #: shard_id -> (action_client, poll_client); seeded with the active shard so a re-select of it
+        #: is free and the launch-time authenticated clients are reused, never rebuilt.
+        self._shard_clients: dict[str, tuple[EngineClient, EngineClient]] = {}
+        active_id = registry.active_id if registry is not None else None
+        if active_id is not None:
+            self._shard_clients[active_id] = (self._client, self._poll_client)
+        self._active_shard_id = active_id
+        #: The launch-time client pair is owned/closed by the entrypoint; every OTHER pair the window
+        #: lazily built is owned by the window and closed on teardown. Track the launch ids to skip.
+        self._entrypoint_clients = {id(self._client), id(self._poll_client)}
+
+        self._pages: list[QWidget] = []
         self._stack = QStackedWidget()
-        for page in self._pages:
-            self._stack.addWidget(page)
+        self._build_pages(client, self._poll_client)
 
         self._nav = QListWidget()
         self._nav.setObjectName("nav")  # styled by the theme (active-item accent bar, hover)
-        self._nav.addItems(nav_items)
+        self._nav.addItems(self._nav_items)
         self._nav.setFixedWidth(190)
         self._nav.setIconSize(QSize(18, 18))
-        for i, label in enumerate(nav_items):
+        for i, label in enumerate(self._nav_items):
             icon_file = _NAV_ICONS.get(label)
             if icon_file:
                 self._nav.item(i).setIcon(QIcon(str(_ICONS_DIR / icon_file)))
         self._nav.currentRowChanged.connect(self._on_nav)
-
-        self.connections.open_logs.connect(self._open_logs)
-        self.connections.error.connect(self._show_error)
-        self.alerts.error.connect(self._show_error)
-        self.dead_letters.error.connect(self._show_error)
-        self.event_log.error.connect(self._show_error)
-        self.log_search.error.connect(self._show_error)
-        self.engine_status.error.connect(self._show_error)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -272,11 +271,31 @@ class AppWindow(QWidget):
         heart_row.addWidget(self._heart)
         heart_row.addWidget(QLabel("Engine"))
         heart_row.addStretch(1)
+
+        # Shard selector: a combobox listing the configured engine endpoints, switching the active
+        # one. Shown only when more than one shard is configured (a single-shard / legacy launch keeps
+        # the footer exactly as before). It carries the shard id as item data so reordering can't
+        # mis-target a switch.
+        self._shard_combo = QComboBox()
+        self._shard_combo.setObjectName("shardSelector")
+        self._shard_combo.setToolTip("Engine endpoint (shard)")
+        self._populate_shard_combo()
+        self._shard_combo.activated.connect(self._on_shard_selected)
+
         # The heart + label sit in a styled #footer strip under the nav (top border, surface fill).
+        footer_col = QVBoxLayout()
+        footer_col.setContentsMargins(0, 0, 0, 0)
+        footer_col.setSpacing(0)
+        if self._shard_combo.count() > 1:
+            shard_row = QHBoxLayout()
+            shard_row.setContentsMargins(14, 8, 14, 0)
+            shard_row.addWidget(self._shard_combo, stretch=1)
+            footer_col.addLayout(shard_row)
+        footer_col.addLayout(heart_row)
         footer = QWidget()
         footer.setObjectName("footer")
         footer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        footer.setLayout(heart_row)
+        footer.setLayout(footer_col)
 
         left = QVBoxLayout()
         left.setContentsMargins(0, 0, 0, 0)
@@ -320,6 +339,118 @@ class AppWindow(QWidget):
         self._health_timer.start(_HEALTH_INTERVAL_MS)
         self._poll_health()
 
+    def _build_pages(self, client: EngineClient, poll_client: EngineClient) -> None:
+        """Construct the page set against ``client``/``poll_client`` and register them in the stack.
+
+        Called once at construction and again on each shard switch (after the old pages are torn
+        down). It owns the page list, the nav-item labels, and the per-page error/open-logs wiring so
+        a shard switch rebuilds a consistent set without duplicating that wiring at the call site."""
+        self.connections = ConnectionsPage(client, poll_client=poll_client)
+        self.alerts = AlertsPage(client, poll_client=poll_client)
+        self.dead_letters = DeadLettersPage(client, poll_client=poll_client)
+        self.event_log = EventLogPage(client, poll_client=poll_client)
+        self.log_search = LogSearchPage(client, poll_client=poll_client)
+        self.engine_status = EngineStatusPage(poll_client, service_name=self._service_name)
+        self._nav_items = list(_NAV)
+        self._pages = [
+            self.connections,
+            self.alerts,
+            self.dead_letters,
+            self.event_log,
+            self.log_search,
+            self.engine_status,
+        ]
+        if client.can("users:manage"):  # user administration is permission-gated
+            self.users = UsersPage(client, poll_client=poll_client)
+            self.users.error.connect(self._show_error)
+            self._nav_items.append("Users")
+            self._pages.append(self.users)
+        for page in self._pages:
+            self._stack.addWidget(page)
+
+        self.connections.open_logs.connect(self._open_logs)
+        self.connections.error.connect(self._show_error)
+        self.alerts.error.connect(self._show_error)
+        self.dead_letters.error.connect(self._show_error)
+        self.event_log.error.connect(self._show_error)
+        self.log_search.error.connect(self._show_error)
+        self.engine_status.error.connect(self._show_error)
+
+    def _populate_shard_combo(self) -> None:
+        """Fill the selector from the registry and select the active shard. Hidden for 0/1 shard."""
+        combo = self._shard_combo
+        combo.blockSignals(True)  # programmatic fill must not fire activated/currentIndexChanged
+        combo.clear()
+        shards = self._registry.list() if self._registry is not None else []
+        for shard in shards:
+            combo.addItem(shard.name, shard.id)
+        if self._active_shard_id is not None:
+            idx = combo.findData(self._active_shard_id)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+        # Only meaningful with a choice to make; a single-shard / legacy launch hides it entirely.
+        combo.setVisible(len(shards) > 1)
+
+    def _on_shard_selected(self, index: int) -> None:
+        """Selector activated by the user: switch to the chosen shard (no-op if it's already active)."""
+        shard_id = self._shard_combo.itemData(index)
+        if isinstance(shard_id, str) and shard_id != self._active_shard_id:
+            self.set_active_shard(shard_id)
+
+    def set_active_shard(self, shard_id: str) -> bool:
+        """Re-point every page at ``shard_id``'s engine client and refresh the current page.
+
+        Lazily builds (and caches) the shard's (action, poll) client pair via ``client_factory`` the
+        first time it is selected, rebuilds the page set against it, persists the active shard in the
+        registry, and emits :attr:`shard_changed`. Returns ``False`` (no-op) when multi-shard wiring
+        isn't configured, the id is unknown, the factory is missing, or it is already active."""
+        if self._registry is None or self._client_factory is None:
+            return False
+        if shard_id == self._active_shard_id:
+            return True  # already there
+        if self._registry.get(shard_id) is None:
+            return False
+        clients = self._shard_clients.get(shard_id)
+        if clients is None:
+            try:
+                clients = self._client_factory(shard_id)
+            except Exception as exc:  # noqa: BLE001 — a factory failure must not crash the window
+                self._show_error(f"could not connect to shard: {exc}")
+                self._populate_shard_combo()  # snap the selector back to the still-active shard
+                return False
+            self._shard_clients[shard_id] = clients
+        action_client, poll_client = clients
+
+        # Tear down the current pages (stop their background runners) and clear the stack before
+        # rebuilding against the new clients, so no torn-down page is left receiving queued results.
+        current_row = self._nav.currentRow()
+        for page in self._pages:
+            stop = getattr(page, "stop", None)
+            if callable(stop):
+                stop()
+            self._stack.removeWidget(page)
+            page.deleteLater()
+
+        self._client = action_client
+        self._poll_client = poll_client
+        self._active_shard_id = shard_id
+        self._registry.set_active(shard_id)
+        self._build_pages(action_client, poll_client)
+
+        # Re-point the nav at the same row (the page set is identical unless the users:manage gate
+        # differs across shards; clamp to a valid row in that case).
+        row = min(max(0, current_row), len(self._pages) - 1)
+        self._nav.blockSignals(True)
+        self._nav.setCurrentRow(row)
+        self._nav.blockSignals(False)
+        self._stack.setCurrentIndex(row)
+        self._populate_shard_combo()  # reflect the new active selection
+        self.shard_changed.emit(shard_id)
+        cast(_Refreshable, self._pages[row]).reload()  # user-initiated switch -> reload (audited)
+        self._poll_health()  # update the heart for the new engine right away
+        return True
+
     def refresh_all(self) -> None:
         self._refresh_current()
 
@@ -336,6 +467,13 @@ class AppWindow(QWidget):
             stop = getattr(page, "stop", None)
             if callable(stop):
                 stop()
+        # Close every per-shard client the window built itself (the launch pair belongs to the
+        # entrypoint, which closes it after the event loop exits — skip those).
+        for action_client, poll_client in self._shard_clients.values():
+            for c in (action_client, poll_client):
+                close = getattr(c, "close", None)
+                if id(c) not in self._entrypoint_clients and callable(close):
+                    close()
         super().closeEvent(event)
 
     def _app(self) -> QApplication:

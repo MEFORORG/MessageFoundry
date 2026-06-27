@@ -2,3 +2,4 @@
 # `git diff --exit-code`) can't be tripped by Windows CRLF drift (DEP-1).
 uv.lock text eol=lf
 requirements.lock text eol=lf
+.mefor-hooks/** text eol=lf

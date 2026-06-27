@@ -10,7 +10,10 @@ A single connector type (``REMOTEFILE``) with a ``protocol`` setting selecting t
   mirroring the SQL Server backend's weakened-TLS posture.
 - ``ftp`` — plain FTP (stdlib ``ftplib``). Cleartext: credentials over plain ``ftp`` are **refused**
   unless the escape is set (use ``ftps``/``sftp``), mirroring :func:`refuse_cleartext_credentials`.
-- ``ftps`` — FTP over explicit TLS (``ftplib.FTP_TLS`` + ``PROT P``), credentials encrypted.
+- ``ftps`` — FTP over explicit TLS (``ftplib.FTP_TLS`` + ``PROT P``), credentials encrypted. **The
+  server certificate and hostname are verified by default** (a verifying :class:`ssl.SSLContext`, not
+  ftplib's no-verify stdlib fallback); ``tls_verify=false`` drops verification only when the explicit
+  escape ``MEFOR_ALLOW_INSECURE_TLS`` is set (and is logged loudly), mirroring the MLLP outbound posture.
 
 **Destination** uploads each payload to ``remote_dir``/``filename`` (``{HL7-path}`` placeholders
 resolved via :func:`render_filename`). The write goes to a temp name then a **rename** to the final
@@ -40,11 +43,13 @@ import ftplib  # nosec B402 — plain FTP is gated: cleartext credentials are re
 import io
 import logging
 import posixpath
+import ssl
 import uuid
 from typing import Any, Callable, TypeVar
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
+from messagefoundry.config.tls_policy import harden_kex_groups, harden_verify_flags
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
@@ -120,9 +125,55 @@ class _RemoteClient(abc.ABC):
         """Best-effort create ``remote_dir`` (ignore "already exists")."""
 
 
+def _ftps_ssl_context(settings: dict[str, Any]) -> ssl.SSLContext:
+    """Build a verifying TLS context for an FTPS control+data channel, mirroring the MLLP outbound arm
+    (mllp.py ``_mllp_ssl_context``). Without this, ``ftplib.FTP_TLS()`` falls back to a no-verify stdlib
+    context (``check_hostname=False`` / ``CERT_NONE``) — any certificate, including an attacker's, is
+    silently accepted, so the encrypted FTPS channel is MITM-able. We verify the server certificate and
+    hostname by default and only drop verification behind the explicit, loudly-logged dev escape.
+
+    Fail-fast (build time): ``tls_verify=false`` without ``MEFOR_ALLOW_INSECURE_TLS`` raises, exactly
+    like the MLLP path, so a misconfiguration is refused at construction rather than silently insecure.
+    Optional mTLS via ``tls_cert_file``/``tls_key_file`` (passphrase ``tls_key_password``)."""
+    verify = bool(settings.get("tls_verify", True))
+    if not verify and not insecure_tls_allowed():
+        raise ValueError(
+            "REMOTEFILE ftps tls_verify=false disables server-certificate verification (MITM risk). "
+            f"Use a trusted CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a "
+            "trusted-network bind."
+        )
+    ca = settings.get("tls_ca_file")
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    if verify:
+        ctx.check_hostname = bool(settings.get("tls_check_hostname", True))
+    else:
+        logger.warning(
+            "REMOTEFILE ftps TLS certificate verification is DISABLED (tls_verify=false, permitted "
+            "by %s) — MITM-able; for a trusted-network dev/test bind only.",
+            INSECURE_TLS_ESCAPE_ENV,
+        )
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    cert = settings.get("tls_cert_file")
+    if cert:  # optional client identity for mTLS
+        key = settings.get("tls_key_file")
+        key_password = settings.get("tls_key_password")
+        # An encrypted key with NO passphrase must fail deterministically, not block on a TTY prompt
+        # (there is none under a service account) — same empty-bytes callback guard as the MLLP path.
+        pw_arg = key_password if key_password is not None else (lambda: b"")
+        ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
+    harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    if verify:  # nothing to strict-validate on the CERT_NONE path (ASVS 12.1.4)
+        harden_verify_flags(ctx)
+    return ctx
+
+
 class _FtpClient(_RemoteClient):
     """FTP / FTPS client over the stdlib ``ftplib``. ``tls`` selects ``FTP_TLS`` (explicit TLS, with
-    ``PROT P`` so the data channel is encrypted too) over plain ``FTP``."""
+    ``PROT P`` so the data channel is encrypted too) over plain ``FTP``. For FTPS a verifying
+    :class:`ssl.SSLContext` is built at construction (fail-fast) so the server certificate and hostname
+    are validated — ftplib's default no-verify stdlib context is never used."""
 
     def __init__(self, settings: dict[str, Any], *, tls: bool) -> None:
         self._host = str(settings["host"])
@@ -131,12 +182,15 @@ class _FtpClient(_RemoteClient):
         self._password = settings.get("password")
         self._tls = tls
         self._timeout = float(settings.get("connect_timeout", 30.0))
+        # Build the verifying TLS context once, fail-fast (build_check) — mirrors the SFTP host-key
+        # posture: a verify-disabled ftps without the escape is refused here, not silently insecure.
+        self._context: ssl.SSLContext | None = _ftps_ssl_context(settings) if tls else None
 
     def _connect(self) -> ftplib.FTP:
         # B321: plain FTP only when explicitly selected; credentials over it are refused unless
         # MEFOR_ALLOW_INSECURE_TLS is set (see _validate_common). FTPS/SFTP are the encrypted defaults.
         if self._tls:
-            ftp: ftplib.FTP = ftplib.FTP_TLS(timeout=self._timeout)
+            ftp: ftplib.FTP = ftplib.FTP_TLS(context=self._context, timeout=self._timeout)
         else:
             ftp = ftplib.FTP(timeout=self._timeout)  # nosec B321
         ftp.connect(self._host, self._port)

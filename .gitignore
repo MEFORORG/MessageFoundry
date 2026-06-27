@@ -70,3 +70,8 @@ TRANSCRIPTS.md
 # Still usable by name (they sit in PROFILES_DIR) and copy-on to the test box.
 /harness/load/profiles/hospital-baseline.toml
 /harness/load/profiles/soak-12h.toml
+# --- MessageFoundry ---
+.mefor/
+*.db*
+.DS_Store
+Thumbs.db

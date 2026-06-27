@@ -7,6 +7,8 @@ import * as vscode from "vscode";
 import { withAuth } from "./auth";
 import { configDir, engineUrl, environments, runJson, workspaceDir, type EnvironmentTarget } from "./cli";
 import { HttpError, postJson } from "./engineClient";
+import { assertTargetAllowed, isLocalEngine } from "./engineTarget";
+import { planTargetResolution, resolveTargetUrl, type ResolvedTarget } from "./promoteTarget";
 
 // Shape emitted by `messagefoundry validate --json` (see ide/src/validate.ts).
 interface Diagnostic {
@@ -29,17 +31,6 @@ function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/** True if the engine URL's host is loopback — only then does the IDE's local config path mean
- * anything to the engine; a remote engine reads its own filesystem (review M-29). */
-function isLocalEngine(url: string): boolean {
-  try {
-    const host = new URL(url).hostname;
-    return host === "127.0.0.1" || host === "localhost" || host === "::1";
-  } catch {
-    return false; // unparseable → treat as remote (send null, the safe choice)
-  }
-}
-
 /** The environment to promote to: a configured one (picked if several), else the single engineUrl. */
 async function pickTarget(): Promise<EnvironmentTarget | undefined> {
   const envs = environments();
@@ -54,6 +45,27 @@ async function pickTarget(): Promise<EnvironmentTarget | undefined> {
     { placeHolder: "Promote to which environment?" },
   );
   return pick?.env;
+}
+
+/**
+ * Resolve the chosen environment to a concrete engine instance. With ≥2 shards this shows a SECOND
+ * QuickPick to choose one and deploys to its url; with 0 or 1 shard it behaves exactly as before (no
+ * extra prompt). Returns undefined if the user cancels the shard pick. The url decision itself lives
+ * in the pure {@link resolveTargetUrl}/{@link planTargetResolution} (unit-tested without vscode).
+ */
+async function pickTargetUrl(env: EnvironmentTarget): Promise<ResolvedTarget | undefined> {
+  const plan = planTargetResolution(env);
+  if (!plan.needsPick) {
+    return plan.resolved;
+  }
+  const pick = await vscode.window.showQuickPick(
+    plan.shards.map((s) => ({ label: s.name, description: s.url, shard: s })),
+    { placeHolder: `Promote to which engine instance in ${env.name}?` },
+  );
+  if (!pick) {
+    return undefined; // shard selection cancelled
+  }
+  return resolveTargetUrl(env, pick.shard);
 }
 
 export async function promote(context: vscode.ExtensionContext): Promise<void> {
@@ -85,10 +97,40 @@ export async function promote(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
 
-  // 2. Choose the target environment (DEV/PROD/…).
-  const target = await pickTarget();
-  if (!target) {
+  // 2. Choose the target environment (DEV/PROD/…), then — if it defines several engine instances
+  //    (shards) — which instance within it. With 0 or 1 shard this is a single prompt as before.
+  const env = await pickTarget();
+  if (!env) {
     return;
+  }
+  const target = await pickTargetUrl(env);
+  if (!target) {
+    return; // shard selection cancelled
+  }
+  // Guard the target host BEFORE any credential prompt / token send (SEC-005): refuse plain http://
+  // off-box, and for an https off-box target require an explicit, host-naming confirmation so a
+  // (plausibly internal-looking) malicious URL can't silently collect a developer's account password
+  // and bearer token. Loopback over http stays allowed (the default 127.0.0.1 dev flow).
+  const gate = assertTargetAllowed(target.url);
+  if (!gate.ok) {
+    void vscode.window.showErrorMessage(`MessageFoundry: ${gate.reason}`);
+    return;
+  }
+  if (!isLocalEngine(target.url)) {
+    let host: string;
+    try {
+      host = new URL(target.url).hostname;
+    } catch {
+      host = target.url;
+    }
+    const confirm = await vscode.window.showWarningMessage(
+      `You are about to sign in and send credentials to ${host} (${target.url}). Continue?`,
+      { modal: true },
+      "Continue",
+    );
+    if (confirm !== "Continue") {
+      return;
+    }
   }
   // The engine reads the config dir from ITS OWN filesystem. Only send our local absolute path to a
   // local engine; to a remote target that path is meaningless (it would 403/404, or worse resolve to

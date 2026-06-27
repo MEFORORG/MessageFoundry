@@ -187,8 +187,12 @@ def _npi_handler(seen_threads: list[bool]) -> _Handler:
     def handle(msg: Message) -> Send | None:
         seen_threads.append(threading.current_thread() is threading.main_thread())
         provider_id = msg["PV1-7.1"] or ""
+        # Read-only SELECT (ADR 0010 carve-out enforced by _require_read_only — db_lookup refuses a
+        # write/EXEC). A read-only mapping lookup, the canonical db_lookup use.
         rows = db_lookup(
-            "clarity", "EXEC mmc.Provider_GetNPIFromMeditechID :id", {"id": provider_id}
+            "clarity",
+            "SELECT npi FROM mmc.Provider WHERE meditech_id = :id",
+            {"id": provider_id},
         )
         if not rows:
             return None  # not found → gated drop (FILTERED), never silently delivered

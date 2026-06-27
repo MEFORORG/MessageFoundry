@@ -76,6 +76,17 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     # adopter's own CI (their remediation clock starts without reading an advisory).
     assert "audit-pin:" in ci
     assert "pip-audit -r requirements.txt" in ci
+    # SEC-021 (CWE-494): the engine attestation does NOT vouch for the live, unhashed transitive
+    # resolve. The audit-pin job must verify a hash-pinned lock with --require-hashes when present
+    # and otherwise WARN that the closure resolves live + recommend an index pin.
+    assert "--require-hashes" in ci
+    assert "requirements.lock" in ci
+    assert "::warning::" in ci  # fails-soft warning wording on the unpinned default path
+    # SEC-021: the README teaches the dependency-confusion defences — index pin + hash-pinned lock.
+    assert "dependency-confusion" in readme
+    assert "--index-url" in readme and "PIP_CONSTRAINT" in readme
+    assert "--require-hashes" in readme
+    assert "--generate-hashes" in readme or "uv export" in readme
 
 
 def test_scaffold_refuses_nonempty_without_force(tmp_path: Path) -> None:

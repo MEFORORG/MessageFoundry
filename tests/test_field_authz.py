@@ -159,9 +159,9 @@ def test_mapped_properties_exist_on_their_models() -> None:
 def test_known_phi_fields_are_mapped() -> None:
     # Change-detector: if a new PHI-bearing response property is added, it must be added to PHI_FIELDS
     # (and this expectation) — otherwise it would be returned ungated.
-    assert set(gated_properties(MessageSummary)) == {"summary", "error"}
+    assert set(gated_properties(MessageSummary)) == {"summary", "error", "metadata"}
     assert set(gated_properties(DeadLetterRow)) == {"summary", "last_error"}
-    assert set(gated_properties(MessageDetail)) == {"summary", "error"}
+    assert set(gated_properties(MessageDetail)) == {"summary", "error", "metadata"}
     assert set(gated_properties(OutboxInfo)) == {"last_error"}
     assert set(gated_properties(EventInfo)) == {"detail"}
     assert set(gated_properties(CapturedResponseInfo)) == {"detail"}

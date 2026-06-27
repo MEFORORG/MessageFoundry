@@ -145,6 +145,29 @@ def insecure_tls_allowed() -> bool:
     return os.environ.get(INSECURE_TLS_ESCAPE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+#: Env var that explicitly permits loading config from a source a low-privileged principal can write
+#: (a user-writable dev/CI checkout). Off by default so a production service fails closed (SEC-003).
+INSECURE_CONFIG_SOURCE_ESCAPE_ENV = "MEFOR_ALLOW_INSECURE_CONFIG_SOURCE"
+
+
+def insecure_config_source_allowed() -> bool:
+    """Whether the explicit dev/test escape to load config from a writable-by-others source is set.
+
+    The config loader executes config Python as the engine's service account (which holds PHI + DB
+    credentials), so a directory a low-privileged user can write is a local code-execution vector and
+    is **refused** at load time (SEC-003, CWE-732). A production deployment locks the config dir (the
+    installer does — see docs/SERVICE.md), so it never trips. This escape downgrades the refusal to a
+    loud warning for a dev/CI checkout that is intentionally user-writable (e.g. the default ACL on a
+    Windows runner grants ``BUILTIN\\Users`` write); it must never be set in production, mirroring
+    ``MEFOR_ALLOW_INSECURE_TLS``."""
+    return os.environ.get(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 class StoreSettings(_Section):
     backend: StoreBackend = StoreBackend.SQLITE
 
@@ -1116,8 +1139,8 @@ class ClusterSettings(_Section):
     ``heartbeat_seconds`` to ``DB_now + leader_lease_ttl_seconds``, a standby acquires only once that
     lease has expired, and a leader that cannot renew within ``leader_fence_timeout_seconds`` self-fences
     before the lease can expire (the split-brain guard). The cross-section validator below requires
-    ``[store].backend = postgres`` and ``[store].pool_size >= 2`` when this is enabled (a clustered node
-    drives concurrent background work against the pool)."""
+    ``[store].backend`` in ``{postgres, sqlserver}`` and ``[store].pool_size >= 2`` when this is enabled
+    (a clustered node drives concurrent background work against the pool)."""
 
     enabled: bool = False
     # Override the auto-generated node id (host:pid:hex). Pin it for a stable identity across restarts
@@ -1306,7 +1329,7 @@ class ServiceSettings(BaseModel):
                     f"(got {self.store.pool_size}); a clustered node drives concurrent background work "
                     "(the membership/lease maintenance loop + the leader reclaim sweep + the per-stage "
                     "workers) against the pool, so a pool of 1 would serialize everything — prefer "
-                    "pool_size >= 3 for clustered Postgres"
+                    "pool_size >= 3 for a clustered node (Postgres or SQL Server)"
                 )
         return self
 

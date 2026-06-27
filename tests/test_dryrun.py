@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import pytest
 
-from messagefoundry.config.models import ConnectorType, Validation
+from typing import Any
+
+from messagefoundry.config.models import ConnectorType, ContentType, Validation
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -14,7 +16,7 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.pipeline.dryrun import (
     DeliveryPreview,
     dry_run,
@@ -158,9 +160,10 @@ def test_transform_one_filtering_handler_returns_no_deliveries() -> None:
 
 
 def test_transform_one_unknown_outbound_raises() -> None:
-    # The transform-stage fail-closed: a handler sending to an unregistered outbound raises here.
+    # The transform-stage fail-closed: a handler sending to an unregistered outbound (or pass-through)
+    # target raises here (the message names both since a Send.to may now name a PT inbound, ADR 0013).
     reg = _registry(lambda m: ["h"], {"h": lambda m: Send("ghost_out", m)})
-    with pytest.raises(ValueError, match="unknown outbound connection 'ghost_out'"):
+    with pytest.raises(ValueError, match="unknown outbound/pass-through connection 'ghost_out'"):
         transform_one(reg, "h", ADT_A01)
 
 
@@ -230,3 +233,102 @@ def test_select_inbound_requires_name_when_ambiguous() -> None:
     with pytest.raises(ValueError):
         select_inbound(reg)
     assert select_inbound(reg, "in2").name == "in2"
+
+
+# --- parse-once on the per-message fan-out (hotpath) --------------------------
+
+
+def _raw_registry(route, handlers, *, content_type: ContentType):  # type: ignore[no-untyped-def]
+    """A non-HL7 inbound: Router/Handlers receive a RawMessage (ADR 0004)."""
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "in",
+            ConnectionSpec(ConnectorType.FILE, {}),
+            router="r",
+            content_type=content_type,
+        )
+    )
+    reg.add_outbound(OutboundConnection("out", ConnectionSpec(ConnectorType.FILE, {})))
+    reg.add_router("r", route)
+    for name, fn in handlers.items():
+        reg.add_handler(name, fn)
+    return reg
+
+
+def test_route_message_hl7_parses_once_per_consumer() -> None:
+    # HL7 payloads are MUTABLE (Handlers transform in place), so each consumer (router + every handler)
+    # must get its OWN parse — never a shared object. Hold a reference to each Message (NOT id(), whose
+    # value CPython recycles for ephemeral objects) and assert all three are distinct instances.
+    seen: list[Message] = []
+
+    def route(msg: Message) -> list[str]:
+        seen.append(msg)
+        return ["h1", "h2"]
+
+    def make_handler() -> Any:
+        def handle(msg: Message) -> Send:
+            seen.append(msg)
+            return Send("out", msg)
+
+        return handle
+
+    reg = _registry(route, {"h1": make_handler(), "h2": make_handler()})
+    route_message(reg, reg.inbound["in"], ADT_A01)
+    assert len(seen) == 3  # router + h1 + h2
+    # All THREE are distinct objects — each consumer parsed its own (no shared mutable Message).
+    assert seen[0] is not seen[1] and seen[1] is not seen[2] and seen[0] is not seen[2]
+
+
+def test_route_message_nonhl7_shares_one_rawmessage() -> None:
+    # A RawMessage is READ-ONLY, so the parse-once win: build it ONCE and reuse the SAME instance for
+    # the router and every handler (instead of re-decoding/re-constructing it N+1 times on a high-fan-out
+    # non-HL7 feed). Hold a reference to each object and assert they are all the one same instance.
+    seen: list[RawMessage] = []
+
+    def route(msg: RawMessage) -> list[str]:
+        seen.append(msg)
+        return ["h1", "h2"]
+
+    def make_handler() -> Any:
+        def handle(msg: RawMessage) -> Send:
+            seen.append(msg)
+            return Send("out", msg.raw)
+
+        return handle
+
+    reg = _raw_registry(
+        route, {"h1": make_handler(), "h2": make_handler()}, content_type=ContentType.JSON
+    )
+    outcome = route_message(reg, reg.inbound["in"], '{"a": 1}')
+    assert len(seen) == 3  # router + h1 + h2
+    assert all(isinstance(m, RawMessage) for m in seen)
+    # All THREE are the one shared RawMessage (read-only → safe to reuse across the fan-out).
+    assert seen[0] is seen[1] and seen[1] is seen[2]
+    assert [d.to for d in outcome.deliveries] == ["out", "out"]  # both handlers still delivered
+
+
+def test_transform_one_honors_prebuilt_payload() -> None:
+    # The optional pre-parsed `payload` is used as-is instead of parsing `raw`. Pass a payload built
+    # from DIFFERENT content than `raw` to prove the payload (not the raw) drove the transform.
+    def handle(msg: Message) -> Send:
+        return Send("out", msg)
+
+    reg = _registry(lambda m: ["h"], {"h": handle})
+    other = Message.parse(ADT_A01.replace("MSG1", "FROMPAYLOAD"))
+    deliveries, _ = transform_one(reg, "h", ADT_A01, payload=other)
+    assert "FROMPAYLOAD" in deliveries[0].payload  # the prebuilt payload won, not the raw arg
+
+
+def test_route_only_honors_prebuilt_payload() -> None:
+    # route_only uses the prebuilt payload as-is (no re-parse of raw).
+    seen: list[int] = []
+
+    def route(msg: Message) -> list[str]:
+        seen.append(id(msg))
+        return []
+
+    reg = _registry(route, {})
+    prebuilt = Message.parse(ADT_A01)
+    assert route_only(reg, reg.inbound["in"], ADT_A01, payload=prebuilt) == []
+    assert seen == [id(prebuilt)]  # the router received the exact prebuilt object

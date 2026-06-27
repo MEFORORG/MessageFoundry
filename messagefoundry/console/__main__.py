@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from collections.abc import Callable
 from importlib.resources import files
 
 from PySide6.QtCore import QSettings
@@ -25,6 +26,7 @@ from messagefoundry.console.client import ApiError, EngineClient
 from messagefoundry.console.login import LoginDialog
 from messagefoundry.console.mfa import MfaVerifyDialog, make_mfa_handler
 from messagefoundry.console.reauth import make_step_up_handler
+from messagefoundry.console.shards import ShardRegistry
 from messagefoundry.console.shell import AppWindow
 
 log = logging.getLogger(__name__)
@@ -213,6 +215,40 @@ def _open_window(window: AppWindow, app: QApplication) -> None:
         window.show()
 
 
+def _make_shard_factory(
+    registry: ShardRegistry, args: argparse.Namespace
+) -> Callable[[str], tuple[EngineClient, EngineClient]]:
+    """Build the per-shard client factory the window calls when the operator selects a new shard.
+
+    Each shard gets its own freshly authenticated :class:`EngineClient` (action) + a read-only
+    polling copy, built with the same TLS posture as the launch client (``--insecure``/``--cacert``/
+    ``--client-cert``/``--client-key``). The per-shard bearer token already works for free: the
+    keyring is keyed by ``base_url`` (``_load_token``/``_save_token``), so ``_authenticate`` reuses a
+    remembered token or prompts sign-in for that endpoint. A cancelled sign-in raises so the window
+    keeps the previously active shard. The window owns/closes the returned clients (it caches them per
+    shard and stops them on switch/teardown)."""
+
+    def factory(shard_id: str) -> tuple[EngineClient, EngineClient]:
+        shard = registry.get(shard_id)
+        if shard is None:
+            raise ValueError(f"unknown shard {shard_id!r}")
+        client = EngineClient(
+            shard.base_url,
+            allow_insecure=args.insecure,
+            cacert=args.cacert,
+            tls_client_cert=args.client_cert,
+            tls_client_key=args.client_key,
+        )
+        client.set_step_up_handler(make_step_up_handler(client))
+        client.set_mfa_handler(make_mfa_handler(client))
+        if not _authenticate(client):
+            client.close()
+            raise RuntimeError(f"sign-in cancelled for {shard.name}")
+        return client, client.for_polling()
+
+    return factory
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="messagefoundry.console")
     parser.add_argument("--url", default="http://127.0.0.1:8765", help="engine API base URL")
@@ -279,13 +315,28 @@ def main(argv: list[str] | None = None) -> int:
     # thread (sign-in / step-up / MFA / user actions), so no single client is shared across threads.
     poll_client = client.for_polling()
 
+    # Multi-shard registry (QSettings-backed). Seed a single default shard from --url when nothing is
+    # configured, so a legacy single-engine launch is unchanged: exactly one shard, already active,
+    # bound to the client we just authenticated.
+    settings = QSettings()
+    registry = ShardRegistry(settings)
+    active = registry.ensure_default(client.base_url)
+    # The launch-time clients ARE the active shard's clients; the window seeds its cache with them so
+    # a re-select of the active shard never rebuilds. Selecting a *different* shard calls the factory.
+    factory = _make_shard_factory(registry, args)
+
     # Remembered interval wins; fall back to --poll on first run. QSettings returns the value
     # as a str (registry) or float (in-memory), so normalise via str() before parsing.
-    settings = QSettings()
     poll_seconds = float(str(settings.value(_SETTINGS_KEY, args.poll)))
     window = AppWindow(
-        client, poll_client=poll_client, poll_seconds=poll_seconds, service_name=args.service_name
+        client,
+        poll_client=poll_client,
+        poll_seconds=poll_seconds,
+        service_name=args.service_name,
+        registry=registry,
+        client_factory=factory,
     )
+    _ = active  # ensured above; the window reads the active shard from the registry
     window.interval_changed.connect(lambda seconds: settings.setValue(_SETTINGS_KEY, seconds))
     window.logout_requested.connect(lambda: _sign_out(client, app))
     window.change_password_requested.connect(lambda: _password_changed(client, app))

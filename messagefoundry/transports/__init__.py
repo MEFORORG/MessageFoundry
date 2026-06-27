@@ -21,6 +21,7 @@ from messagefoundry.transports import (  # noqa: F401  (import = registration)
     file,
     loopback,
     mllp,
+    passthrough,
     remotefile,
     rest,
     soap,

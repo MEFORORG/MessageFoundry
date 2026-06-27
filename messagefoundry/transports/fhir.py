@@ -38,6 +38,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -77,6 +78,14 @@ _CONDITIONALS = ("if-none-exist", "conditional-update", "if-match")
 _TRANSIENT_ISSUE_CODES = frozenset(
     {"transient", "lock-error", "throttled", "timeout", "incomplete"}
 )
+
+# FHIR path-segment grammars (https://hl7.org/fhir/datatypes.html#id). A resourceType is a token of
+# ASCII letters; an id is 1-64 of [A-Za-z0-9.-] (note: '_' is NOT in the FHIR id grammar). These gate
+# the message-derived path segments so a crafted resource can't smuggle '/', '..', '?', '#', or '@'
+# into the request path and redirect a PHI-bearing write to a different resource/operation on the same
+# allow-listed host (the [egress].allowed_http gate pins the host, not the path).
+_FHIR_TYPE_RE = re.compile(r"^[A-Za-z]+$")
+_FHIR_ID_RE = re.compile(r"^[A-Za-z0-9.\-]{1,64}$")
 
 
 def _operation_outcome(body: str) -> dict[str, Any] | None:
@@ -147,6 +156,22 @@ def _reject_control_chars(value: str, field: str) -> str:
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
         raise NegativeAckError(
             f"FHIR {field} contains an illegal control character",
+            code="bad-request-value",
+            permanent=True,
+        )
+    return value
+
+
+def _validate_path_token(value: str, pattern: re.Pattern[str], field: str) -> str:
+    """Reject a message-derived path segment that doesn't match its FHIR grammar before it flows into
+    the request URL. ``_reject_control_chars`` blocks CRLF/NUL but NOT path metacharacters ('/', '..',
+    '?', '#', '@'); a crafted resource id/resourceType could otherwise redirect a PHI-bearing PUT/POST
+    to a different resource or ``$operation`` on the same allow-listed host (CWE-918). Surfaced as a
+    permanent ``NegativeAckError`` (a retry re-sends the same body) with a PHI-safe message naming only
+    the field, mirroring ``_reject_control_chars``."""
+    if not pattern.match(value):
+        raise NegativeAckError(
+            f"FHIR {field} is not a valid FHIR token/id",
             code="bad-request-value",
             permanent=True,
         )
@@ -286,13 +311,17 @@ class FhirDestination(DestinationConnector):
                 "outgoing FHIR body has no resourceType", code="no-resource-type", permanent=True
             )
         _reject_control_chars(resource_type, "resourceType")  # it flows into the URL path
+        # Grammar-gate the message-derived type so a crafted resource can't smuggle path metacharacters
+        # ('/', '..', '?', '#') into the path and redirect the write to another resource/operation.
+        _validate_path_token(resource_type, _FHIR_TYPE_RE, "resourceType")
+        type_seg = urllib.parse.quote(resource_type, safe="")  # defense-in-depth percent-encode
 
         if self.conditional == "conditional-update":
-            return "PUT", f"{base}/{resource_type}?{self.conditional_query}", {}
+            return "PUT", f"{base}/{type_seg}?{self.conditional_query}", {}
         if self.conditional == "if-none-exist":
             return (
                 "POST",
-                f"{base}/{resource_type}",
+                f"{base}/{type_seg}",
                 {"If-None-Exist": self.conditional_query or ""},
             )
         if self.conditional == "if-match":
@@ -304,13 +333,16 @@ class FhirDestination(DestinationConnector):
                     permanent=True,
                 )
             _reject_control_chars(version_id, "meta.versionId")  # it flows into the If-Match header
-            resource_id = self._require_id(peek)
-            return "PUT", f"{base}/{resource_type}/{resource_id}", {"If-Match": f'W/"{version_id}"'}
+            # versionId is an id-typed FHIR value: gate it to the id grammar so it can't break out of
+            # the W/"..." ETag (quoting is wrong for a header value, so reject rather than encode).
+            _validate_path_token(version_id, _FHIR_ID_RE, "meta.versionId")
+            id_seg = urllib.parse.quote(self._require_id(peek), safe="")
+            return "PUT", f"{base}/{type_seg}/{id_seg}", {"If-Match": f'W/"{version_id}"'}
 
         if self.interaction == "update":
-            resource_id = self._require_id(peek)
-            return "PUT", f"{base}/{resource_type}/{resource_id}", {}
-        return "POST", f"{base}/{resource_type}", {}  # create (default)
+            id_seg = urllib.parse.quote(self._require_id(peek), safe="")
+            return "PUT", f"{base}/{type_seg}/{id_seg}", {}
+        return "POST", f"{base}/{type_seg}", {}  # create (default)
 
     @staticmethod
     def _require_id(peek: FhirPeek) -> str:
@@ -318,7 +350,9 @@ class FhirDestination(DestinationConnector):
             raise NegativeAckError(
                 "FHIR update requires the resource id", code="no-id", permanent=True
             )
-        return _reject_control_chars(peek.id, "resource id")  # it flows into the URL path
+        _reject_control_chars(peek.id, "resource id")  # it flows into the URL path
+        # Grammar-gate the message-derived id so '../$reindex'-style traversal can't redirect the write.
+        return _validate_path_token(peek.id, _FHIR_ID_RE, "resource id")
 
     @staticmethod
     def _version_id(peek: FhirPeek) -> str | None:

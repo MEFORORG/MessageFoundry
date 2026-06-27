@@ -38,13 +38,18 @@ from messagefoundry.auth import Identity, Permission
 
 #: Response model → {property → Permission that unlocks it}. The single source of truth for which
 #: response properties are PHI-gated and by which permission; :func:`redact_unauthorized` nulls a
-#: property when the caller lacks its permission. Both summary-tier PHI fields gate on
-#: ``messages:view_summary`` today (the body, gated by ``messages:view_raw``, is handled at the
-#: endpoint). Add a row here when a new PHI-bearing response property is introduced.
+#: property when the caller lacks its permission. All three summary-tier PHI fields
+#: (``summary`` / ``error`` / ``metadata``) gate on ``messages:view_summary`` today (the body, gated
+#: by ``messages:view_raw``, is handled at the endpoint). ``metadata`` is an EF-3 cipher-encrypted,
+#: PHI-classified column (carrying re-ingress/correlation lineage today, operator/handler-attached
+#: values by design) — so it must be gated and audited like the other summary-tier PHI fields, not
+#: returned to a caller lacking view_summary. Add a row here when a new PHI-bearing response property
+#: is introduced.
 PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
     MessageSummary: {
         "summary": Permission.MESSAGES_VIEW_SUMMARY,
         "error": Permission.MESSAGES_VIEW_SUMMARY,
+        "metadata": Permission.MESSAGES_VIEW_SUMMARY,
     },
     DeadLetterRow: {
         "summary": Permission.MESSAGES_VIEW_SUMMARY,
@@ -59,6 +64,7 @@ PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
     MessageDetail: {
         "summary": Permission.MESSAGES_VIEW_SUMMARY,
         "error": Permission.MESSAGES_VIEW_SUMMARY,
+        "metadata": Permission.MESSAGES_VIEW_SUMMARY,
     },
     OutboxInfo: {
         "last_error": Permission.MESSAGES_VIEW_SUMMARY,

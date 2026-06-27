@@ -53,6 +53,7 @@ from uuid import uuid4
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
+    StoreBackend,
     StoreSettings,
     insecure_tls_allowed,
 )
@@ -132,6 +133,7 @@ _SCHEMA: list[str] = [
         destination_name TEXT,
         handler_name     TEXT,
         payload          TEXT NOT NULL,
+        body_ref         TEXT,
         status           TEXT NOT NULL,
         attempts         INTEGER NOT NULL DEFAULT 0,
         next_attempt_at  DOUBLE PRECISION NOT NULL,
@@ -153,6 +155,19 @@ _SCHEMA: list[str] = [
     "CREATE INDEX IF NOT EXISTS ix_queue_fifo_in"
     " ON queue(stage, channel_id, status, created_at, seq)",
     "CREATE INDEX IF NOT EXISTS ix_queue_message ON queue(message_id)",
+    # ix_queue_body_ref is created in _migrate_lease_columns, AFTER body_ref is guaranteed present — on a
+    # pre-existing queue without the column it'd reference a not-yet-added column (like ix_queue_lease).
+    # Store-once-deliver-many (L2b): the single shared copy of a body fanned out to N destinations.
+    # `hash` = sha256(plaintext); `body` is the one encrypted copy (cipher-covered, rides rotation);
+    # `refcount` GC's the row at 0. SCHEMA PARITY here — the SQLite backend implements the dedup/deref/GC
+    # behavior; on Postgres `body_ref` stays NULL today (bodies inline, byte-identical) and a follow-up
+    # wires the insert/deref/GC without a second migration. CI-verified post-merge.
+    """CREATE TABLE IF NOT EXISTS shared_body (
+        hash       TEXT PRIMARY KEY,
+        body       TEXT NOT NULL,
+        refcount   INTEGER NOT NULL,
+        created_at DOUBLE PRECISION NOT NULL
+    )""",
     # ix_queue_lease (the reclaim sweep's index) is created in _migrate_lease_columns, AFTER the lease
     # columns are guaranteed present — on a Step-1 table the index references a not-yet-added column.
     """CREATE TABLE IF NOT EXISTS message_events (
@@ -390,6 +405,13 @@ class PostgresStore:
     # complete_with_response), with the same single-transaction atomicity as SQLite.
     supports_response_capture = True
 
+    # Pass-through (PT) re-ingress (the `pt_deliveries` branch of transform_handoff, ADR 0013
+    # generalized) is implemented at full SQLite parity: the atomic PT-child + parent-marker branch runs
+    # inside transform_handoff's transaction (see _insert_passthrough_child_pg / _insert_passthrough_
+    # marker_pg). A graph with a PT inbound is therefore accepted at engine startup on this backend.
+    supports_pt_reingress = True
+    backend = StoreBackend.POSTGRES
+
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
     #: columns (error/last_error/detail), and summary/metadata (MRN + patient name) added in EF-3.
     #: Used by the on-open migration and rotate-key (mirrors MessageStore._CIPHER_COLUMNS).
@@ -408,6 +430,9 @@ class PostgresStore:
         ),  # #46: scrubbed event reason — id-keyed (BIGSERIAL), rides the loops
         # NB: the `response` table (ADR 0013) is cipher-covered (body, detail) but has a COMPOSITE PK,
         # so it rides the composite helpers below, not this id-keyed list (like state/reference).
+        # The `shared_body` table (store-once-deliver-many) is cipher-covered (`body`, hash-keyed) on the
+        # SQLite backend; on Postgres it is schema-only this increment (body_ref stays NULL → the table is
+        # always empty), so it needs no rotation pass here until the dedup insert is wired (CI-verified).
     )
 
     def __init__(self, pool: Any, settings: StoreSettings, *, cipher: Cipher | None = None) -> None:
@@ -511,13 +536,19 @@ class PostgresStore:
             for r in await conn.fetch(
                 "SELECT column_name FROM information_schema.columns"
                 " WHERE table_name='queue' AND column_name = ANY($1::text[])",
-                ["owner", "lease_expires_at"],
+                ["owner", "lease_expires_at", "body_ref"],
             )
         }
         if "owner" not in present:
             await conn.execute("ALTER TABLE queue ADD COLUMN owner TEXT")
         if "lease_expires_at" not in present:
             await conn.execute("ALTER TABLE queue ADD COLUMN lease_expires_at DOUBLE PRECISION")
+        # Store-once-deliver-many (L2b): body_ref on a pre-existing queue (NULL = body inline, byte-
+        # identical). shared_body is created by the _SCHEMA loop's CREATE TABLE IF NOT EXISTS.
+        if "body_ref" not in present:
+            await conn.execute("ALTER TABLE queue ADD COLUMN body_ref TEXT")
+        # The deref index, created AFTER body_ref is guaranteed present (like ix_queue_lease above).
+        await conn.execute("CREATE INDEX IF NOT EXISTS ix_queue_body_ref ON queue(body_ref)")
         # The reclaim sweep scans inflight rows by lease expiry (reclaim_expired_leases). Partial:
         # only inflight rows carry a lease, so the index needn't cover the pending/terminal majority.
         await conn.execute(
@@ -1182,6 +1213,136 @@ class PostgresStore:
             message_id,
         )
 
+    async def _insert_passthrough_child_pg(
+        self,
+        conn: Any,
+        routed_id: str,
+        parent_id: str,
+        pt_channel: str,
+        body: str,
+        parent_meta: dict[str, Any],
+        correlation_depth_cap: int,
+        now: float,
+    ) -> bool:
+        """Produce one PT child INGRESS row + message inside the caller's transaction (ADR 0013, gen.).
+
+        Postgres twin of :meth:`MessageStore._insert_passthrough_child`. Returns ``True`` if a child was
+        produced, ``False`` if the depth cap was breached (no child; the caller records the parent
+        ``ERROR`` via a dead marker). The child is a new, independent message (``source_type=
+        'passthrough'``, its own content-addressed id, status ``RECEIVED`` per count-and-log), correlated
+        to the parent. Idempotent re-run: the content-addressed id is pre-checked so a partial-then-
+        recovered run does not double-inject. Depth is computed purely from the parent's immutable
+        metadata → re-run-stable."""
+        child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
+        root = parent_meta.get("correlation_root_id") or parent_id
+        if child_depth > correlation_depth_cap:
+            # Depth-cap breach: produce NO child, log the breach on the parent. The caller still consumes
+            # the routed row (the Send is "handled" — dead-lettered) and the parent finalizes ERROR via
+            # the dead marker the caller records. Mirrors the ingress_handoff depth-cap branch.
+            await self._event(
+                conn,
+                parent_id,
+                "passthrough_dropped",
+                pt_channel,
+                f"depth cap ({child_depth} > {correlation_depth_cap})",
+                now,
+            )
+            return False
+        new_mid = MessageStore._passthrough_message_id(routed_id, pt_channel, body)
+        exists = await conn.fetchval("SELECT 1 FROM messages WHERE id=$1", new_mid)
+        if exists is None:
+            child_meta = json.dumps(
+                {
+                    "correlation_id": parent_id,
+                    "correlation_root_id": root,
+                    "correlation_depth": child_depth,
+                    "passthrough_from": parent_id,
+                }
+            )
+            await self._insert_message(
+                conn,
+                new_mid,
+                channel_id=pt_channel,
+                raw=body,
+                status=MessageStatus.RECEIVED.value,
+                control_id=None,
+                message_type=None,
+                source_type="passthrough",
+                summary=None,
+                metadata=child_meta,
+                error=None,
+                now=now,
+            )
+            ingress_created = await self._fifo_created_at(
+                conn, Stage.INGRESS.value, "channel_id", pt_channel, now
+            )
+            await conn.execute(
+                "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
+                " handler_name, payload, status, attempts, next_attempt_at, created_at,"
+                " updated_at) VALUES ($1,$2,$3,$4,NULL,NULL,$5,$6,0,$7,$8,$9)",
+                uuid4().hex,
+                new_mid,
+                Stage.INGRESS.value,
+                pt_channel,
+                self._cipher.encrypt(body),
+                OutboxStatus.PENDING.value,
+                now,
+                ingress_created,
+                now,
+            )
+            await self._event(
+                conn,
+                new_mid,
+                "received",
+                None,
+                f"passthrough from {parent_id} -> {pt_channel}",
+                now,
+            )
+            await self._event(
+                conn,
+                parent_id,
+                "passthrough",
+                pt_channel,
+                f"-> {new_mid} depth {child_depth}",
+                now,
+            )
+        return True
+
+    async def _insert_passthrough_marker_pg(
+        self, conn: Any, parent_id: str, pt_name: str, produced: bool, now: float
+    ) -> None:
+        """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
+
+        Postgres twin of :meth:`MessageStore._insert_passthrough_marker`. A single ``stage='outbound'``
+        row keyed by the PT inbound name, inserted already-terminal: ``done`` when the child was produced
+        (→ parent finalizes ``PROCESSED``), or ``dead`` when the depth cap was breached (→ parent
+        finalizes ``ERROR``). Never claimed (no delivery worker for a PT name; claims take ``pending``
+        rows only), so it is inert; it exists solely so the finalizer counts the Send's outcome. The
+        payload is the empty-body sentinel; ``next_attempt_at`` is ``now`` (terminal, never due)."""
+        status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
+        created_at = await self._fifo_created_at(
+            conn, Stage.OUTBOUND.value, "destination_name", pt_name, now
+        )
+        await conn.execute(
+            "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
+            " payload, status, attempts, next_attempt_at, created_at, updated_at)"
+            " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,0,$8,$9,$10)",
+            uuid4().hex,
+            parent_id,
+            Stage.OUTBOUND.value,
+            pt_name,
+            pt_name,
+            self._cipher.encrypt(""),
+            status,
+            now,
+            created_at,
+            now,
+        )
+        if produced:
+            await self._event(conn, parent_id, "delivered", pt_name, "passthrough re-ingress", now)
+        else:
+            await self._event(conn, parent_id, "dead", pt_name, "passthrough depth cap", now)
+
     @staticmethod
     def _lane_col(stage: str) -> str:
         """The FIFO/depth lane column for a stage (code-controlled literal): ``channel_id`` for
@@ -1422,6 +1583,8 @@ class PostgresStore:
         channel_id: str,
         deliveries: Sequence[tuple[str, str]],
         state_ops: Sequence[tuple[str, str, Any]] = (),
+        pt_deliveries: Sequence[tuple[str, str]] = (),
+        correlation_depth_cap: int = 8,
         now: float | None = None,
     ) -> bool:
         """Advance one handler assignment from the **routed** stage to outbound (the transform half of
@@ -1429,7 +1592,17 @@ class PostgresStore:
         apply each declared state write (ADR 0005) atomically with them, then let the finalizer
         recompute the terminal disposition (this method never writes ``messages.status``). State
         exactly-once: each op upserts by (namespace,key) inside this same transaction; the read cache
-        is updated only after commit. Idempotent: ``False`` if the routed row was already consumed."""
+        is updated only after commit. Idempotent: ``False`` if the routed row was already consumed.
+
+        **Pass-through re-ingress (ADR 0013, generalized).** ``pt_deliveries`` are the handler's
+        ``Send``\\ s whose target is an internal **pass-through (PT) inbound** (not an outbound). For
+        each, this produces — **in this same transaction** — a new INGRESS-stage child message on the
+        PT channel (a content-addressed id; ``RECEIVED`` per count-and-log; correlated to the parent),
+        plus a single already-terminal outbound marker row on *this* (parent) message keyed by the PT
+        inbound name, so the parent finalizes ``PROCESSED`` (the Send was delivered into the PT) rather
+        than collapsing to ``FILTERED``. A ``correlation_depth`` breach drops the child and dead-letters
+        the parent's marker (``ERROR``). Byte-identical to the pre-feature path when ``pt_deliveries`` is
+        empty. Mirrors :class:`MessageStore` (SQLite) exactly."""
         now = time.time() if now is None else now
         applied: list[tuple[tuple[str, str], Any]] = []
         async with self._pool.acquire() as conn:
@@ -1446,6 +1619,34 @@ class PostgresStore:
                     await self._insert_outbound_row(
                         conn, message_id, channel_id, dest_name, payload, now
                     )
+                # Pass-through re-ingress (ADR 0013, generalized): produce each PT child + the parent's
+                # terminal marker IN THIS same transaction as the routed-row DELETE, so the handoff is
+                # atomic and re-run-idempotent. Read the parent's correlation lineage once (absent →
+                # depth 0).
+                if pt_deliveries:
+                    prow = await conn.fetchrow(
+                        "SELECT metadata FROM messages WHERE id=$1", message_id
+                    )
+                    parent_meta: dict[str, Any] = {}
+                    pmeta_json = self._dec(prow["metadata"]) if prow else None
+                    if pmeta_json:
+                        loaded = json.loads(pmeta_json)
+                        if isinstance(loaded, dict):
+                            parent_meta = loaded
+                    for pt_name, body in pt_deliveries:
+                        produced = await self._insert_passthrough_child_pg(
+                            conn,
+                            routed_id,
+                            message_id,
+                            pt_name,
+                            body,
+                            parent_meta,
+                            correlation_depth_cap,
+                            now,
+                        )
+                        await self._insert_passthrough_marker_pg(
+                            conn, message_id, pt_name, produced, now
+                        )
                 for namespace, key, value in state_ops:
                     value_json = json.dumps(value)
                     await self._apply_state_op(conn, namespace, key, value_json, message_id, now)
@@ -1469,12 +1670,13 @@ class PostgresStore:
                         )
                         assert row is not None, "state_version upsert returned no row"
                         bumped.append((ns, int(row["version"])))
+                total_targets = len(deliveries) + len(pt_deliveries)
                 await self._event(
                     conn,
                     message_id,
                     "transformed",
                     None,
-                    f"{len(deliveries)} destination(s)",
+                    f"{total_targets} destination(s)",
                     now,
                 )
                 # H-8: serialize per-message finalize on the advisory lock, then recompute on a fresh
@@ -2195,6 +2397,7 @@ class PostgresStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
+        allowed_channels: Sequence[str] | None = None,
     ) -> list[ConnectionEvent]:
         limit = max(1, min(limit, 1000))  # server-side clamp
         where: list[str] = []
@@ -2209,6 +2412,11 @@ class PostgresStore:
         if since is not None:
             params.append(since)
             where.append(f"ts>=${len(params)}")
+        # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
+        # outbound row (which spans channels), matching the SQLite path and the metadata/purge boundary.
+        if allowed_channels is not None:
+            where.append("direction='inbound'")
+            _append_channel_scope_pg(where, params, "connection", allowed_channels)
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         params.append(limit)
         rows = await self._pool.fetch(

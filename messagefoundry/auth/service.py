@@ -1037,7 +1037,10 @@ class AuthService:
                 # highest-consumed time-step atomically, so a code captured and replayed inside its
                 # ~30 s verify window resolves to a non-greater step and is rejected. Mirrors the
                 # recovery-code compare-and-set; a genuine code always advances the step as time
-                # moves forward, so a legitimate later login is unaffected.
+                # moves forward, so a legitimate later login is unaffected. verify_totp_step clamps a
+                # tolerated future (fast-clock) code to the CURRENT step (SEC-014), so consuming it
+                # can't advance the high-water mark past now and lock the user out of their own next
+                # legitimate code.
                 return await self._store.consume_totp_step(user.id, matched_step)
         normalized = code.upper()  # recovery codes are minted uppercase
         hashes = await self._store.get_recovery_code_hashes(user.id)

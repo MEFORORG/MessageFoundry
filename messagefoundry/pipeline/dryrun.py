@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
-from messagefoundry.config.models import ContentType
+from messagefoundry.config.models import ConnectorType, ContentType
 from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.wiring import (
     HandlerFn,
@@ -83,18 +83,45 @@ def _partition(
 
 def _payload(raw: str | bytes, content_type: str) -> Message | RawMessage:
     """The object a Router/Handler receives (ADR 0004): a mutable HL7 :class:`Message` for ``hl7v2``,
-    or a verbatim :class:`RawMessage` (``.raw``/``.text``/``.json()``) for any other ``content_type``."""
+    or a verbatim :class:`RawMessage` (``.raw``/``.text``/``.json()``) for any other ``content_type``.
+
+    Each call yields a **fresh** object. For ``hl7v2`` that isolation is load-bearing: a Handler
+    *mutates* its :class:`Message`, so every consumer must get its own parse (one parse per consumer
+    is also cheaper than parse-once-then-deep-copy — python-hl7's parse beats deep-copying its nested
+    list tree). A :class:`RawMessage` is read-only, so it is safe to *share* across consumers of the
+    same message (see :func:`_shareable_payload`)."""
     if content_type == ContentType.HL7V2.value:
         return Message.parse(raw)
     return RawMessage(raw if isinstance(raw, str) else raw.decode("utf-8"), content_type)
 
 
+def _shareable_payload(raw: str | bytes, content_type: str) -> Message | RawMessage | None:
+    """A single payload object safe to reuse across a router + every handler of *one* message, or
+    ``None`` when no such object exists and each consumer must build its own.
+
+    A non-HL7 :class:`RawMessage` is immutable (read-only ``.raw``/``.text``/``.json()`` surface), so
+    one instance serves the whole fan-out — building it once avoids re-decoding/re-constructing it per
+    handler on a high-fan-out non-HL7 feed. An HL7 :class:`Message` is *mutable* (Handlers transform
+    it in place), so it cannot be shared: this returns ``None`` and each consumer re-parses (the
+    optimal isolation strategy — see :func:`_payload`)."""
+    if content_type == ContentType.HL7V2.value:
+        return None
+    return RawMessage(raw if isinstance(raw, str) else raw.decode("utf-8"), content_type)
+
+
 @dataclass(frozen=True)
 class DeliveryPreview:
-    """What a Handler would deliver to an outbound connection (no send happens)."""
+    """What a Handler would deliver (no send happens).
+
+    ``to`` names a known **outbound** connection (the body is delivered there) **or** a **pass-through
+    (PT) inbound** (ADR 0013, generalized) — an internal inbound whose own Router re-routes the body.
+    ``is_passthrough`` distinguishes the two so the transform handoff produces an outbound row vs. a
+    re-ingressed child INGRESS row on the PT channel; it defaults ``False`` so every existing outbound
+    delivery is byte-identical."""
 
     to: str
     payload: str
+    is_passthrough: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,7 +149,13 @@ class RouteOutcome:
         return bool(self.handlers)
 
 
-def route_only(registry: Registry, ic: InboundConnection, raw: str | bytes) -> list[str]:
+def route_only(
+    registry: Registry,
+    ic: InboundConnection,
+    raw: str | bytes,
+    *,
+    payload: Message | RawMessage | None = None,
+) -> list[str]:
     """Run ``ic``'s Router and return the handler name(s) it selected (``[]`` = routed nowhere).
 
     The **router half** of the split routing core (ADR 0001 Step B): it decides *which* handlers take
@@ -131,9 +164,17 @@ def route_only(registry: Registry, ic: InboundConnection, raw: str | bytes) -> l
     than producing a routed-stage row no transform worker can run; on the live path the router worker
     dead-letters/NAK-equivalents it, and dry-run / ``messagefoundry check`` surface the bad name
     (review M-7). The live engine's router worker calls this; the combined :func:`route_message` does too.
+
+    ``payload`` is an optional pre-built Router input: when given it is used **as-is** instead of
+    parsing ``raw`` (a caller that already built the read-only :class:`RawMessage` — see
+    :func:`_shareable_payload` — passes it to skip a redundant construct). The caller is responsible
+    for the payload being a faithful, *isolated-where-mutable* view of ``raw``; ``None`` (the default)
+    keeps the self-parsing behavior, so every existing call site is byte-identical.
     """
     route = registry.routers[ic.router]
-    names = _handler_names(route(_payload(raw, ic.content_type.value)))
+    if payload is None:
+        payload = _payload(raw, ic.content_type.value)
+    names = _handler_names(route(payload))
     for hname in names:
         if hname not in registry.handlers:
             raise ValueError(f"router {ic.router!r} returned unknown handler {hname!r}")
@@ -141,7 +182,12 @@ def route_only(registry: Registry, ic: InboundConnection, raw: str | bytes) -> l
 
 
 def transform_one(
-    registry: Registry, hname: str, raw: str | bytes, content_type: str = ContentType.HL7V2.value
+    registry: Registry,
+    hname: str,
+    raw: str | bytes,
+    content_type: str = ContentType.HL7V2.value,
+    *,
+    payload: Message | RawMessage | None = None,
 ) -> tuple[list[DeliveryPreview], list[StateOpPreview]]:
     """Run **one** Handler on its own freshly-built payload; return ``(deliveries, state_ops)``.
 
@@ -156,15 +202,31 @@ def transform_one(
     live transform worker passes them to ``transform_handoff(state_ops=...)``). The caller guarantees
     ``hname`` is registered (:func:`route_only` validated it); the live engine's transform worker calls
     this per routed-stage row.
+
+    ``payload`` is an optional pre-built Handler input; ``None`` (the default) self-parses ``raw``, so
+    every existing call site is byte-identical. **Only pass a payload that is safe for this handler to
+    mutate in isolation** — a read-only :class:`RawMessage` (see :func:`_shareable_payload`) qualifies
+    and may be shared across a message's handlers; a mutable HL7 :class:`Message` must *not* be reused
+    across handlers (the caller passes ``None`` for HL7 so each handler re-parses its own).
     """
     handle: HandlerFn = registry.handlers[hname]
-    sends, ops = _partition(handle(_payload(raw, content_type)))
+    if payload is None:
+        payload = _payload(raw, content_type)
+    sends, ops = _partition(handle(payload))
     deliveries: list[DeliveryPreview] = []
     for send in sends:
-        if send.to not in registry.outbound:
-            raise ValueError(f"handler {hname!r} sent to unknown outbound connection {send.to!r}")
-        payload = send.message if isinstance(send.message, str) else send.message.encode()
-        deliveries.append(DeliveryPreview(to=send.to, payload=payload))
+        # A Send.to names a known OUTBOUND (deliver there) OR a pass-through (PT) INBOUND (ADR 0013,
+        # generalized — re-ingress the body through that internal inbound's own Router). Either fails
+        # closed HERE if unknown: an undeliverable target would otherwise enqueue a row no worker drains
+        # (silent accept-and-strand). A non-PT inbound is NOT a valid target (only an outbound or a PT).
+        tic = registry.inbound.get(send.to)
+        is_pt = tic is not None and tic.spec.type is ConnectorType.PT
+        if not is_pt and send.to not in registry.outbound:
+            raise ValueError(
+                f"handler {hname!r} sent to unknown outbound/pass-through connection {send.to!r}"
+            )
+        out_payload = send.message if isinstance(send.message, str) else send.message.encode()
+        deliveries.append(DeliveryPreview(to=send.to, payload=out_payload, is_passthrough=is_pt))
     state_ops = [StateOpPreview(namespace=op.namespace, key=op.key, value=op.value) for op in ops]
     return deliveries, state_ops
 
@@ -237,10 +299,16 @@ def route_message(
         ),
         phase="transform",
     ):
-        names = route_only(registry, ic, raw)
         ct = ic.content_type.value
+        # Parse-once on the per-message fan-out: for a non-HL7 feed the payload is a read-only
+        # RawMessage, so build it ONCE and reuse it for the router and every handler instead of
+        # re-decoding/re-constructing it N+1 times. For HL7 this is None (Handlers mutate their
+        # Message in place — see _shareable_payload — so each consumer re-parses its own, which is
+        # also cheaper than parse-once-then-deep-copy). Value-identical either way.
+        shared = _shareable_payload(raw, ct)
+        names = route_only(registry, ic, raw, payload=shared)
         for hname in names:
-            ds, ops = transform_one(registry, hname, raw, ct)
+            ds, ops = transform_one(registry, hname, raw, ct, payload=shared)
             deliveries.extend(ds)
             for op in ops:
                 sim_state[(op.namespace, op.key)] = op.value  # visible to subsequent handlers

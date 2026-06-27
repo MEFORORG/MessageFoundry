@@ -100,6 +100,11 @@ def _service(request: Request) -> AuthService:
 
 
 def _client(request: Request) -> str | None:
+    # Already proxy-aware: uvicorn runs with forwarded_allow_ips = settings.api.trusted_proxies
+    # (__main__.py; defaults to [] = trust nothing), so behind a declared trusted proxy this resolves
+    # to the real client. The per-IP login limiter remains in-process and bypassable by pure source-IP
+    # rotation from a directly-reachable attacker (SEC-024) — the real brute-force bounds are the
+    # global ceiling + per-account argon2 lockout (applied to both the password and MFA factors).
     return request.client.host if request.client else None
 
 
@@ -457,6 +462,18 @@ def add_auth_routes(app: FastAPI) -> None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
         if body.disabled and user_id == identity.user_id:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot disable your own account")
+        # SEC-015: disabling is a lock-out path equivalent to stripping the admin role — apply the
+        # same last-admin guard the roles endpoint enforces, so an admin can't disable every other
+        # admin and erase the dual-admin safeguard. (is_last_enabled_admin only fires when the target
+        # IS the sole enabled admin, so this no-ops for non-admins and non-last admins.)
+        if (
+            "disabled" in body.model_fields_set
+            and body.disabled
+            and await service.is_last_enabled_admin(user_id)
+        ):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "cannot disable the last administrator"
+            )
         # PATCH is partial: only fields actually present in the body should change. Omitted
         # display_name/email keep their current value (the store sets them unconditionally, so a
         # partial PATCH would otherwise NULL them); an explicit null still clears (review M-20).
@@ -480,6 +497,10 @@ def add_auth_routes(app: FastAPI) -> None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot delete your own account")
         if await service.store.get_user(user_id) is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        # SEC-015: deleting the last enabled admin is the same lock-out path — guard it for symmetry
+        # with the roles/disable endpoints (no-ops unless the target is the sole enabled admin).
+        if await service.is_last_enabled_admin(user_id):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot delete the last administrator")
         await service.delete_user(user_id, actor=identity.username)
         return SimpleMessage(detail="deleted")
 

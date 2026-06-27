@@ -43,12 +43,14 @@ from uuid import uuid4
 import aiosqlite
 
 from messagefoundry.config.models import RetryPolicy
+from messagefoundry.config.settings import StoreBackend
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
     Cipher,
+    CipherError,
     CipherInfo,
     IdentityCipher,
     cipher_info,
@@ -132,13 +134,22 @@ class OutboxItem:
     created_at: float | None = None
 
     @classmethod
-    def from_row(cls, row: aiosqlite.Row, cipher: Cipher) -> "OutboxItem":
+    def from_row(
+        cls, row: aiosqlite.Row, cipher: Cipher, *, shared_ciphertext: str | None = None
+    ) -> "OutboxItem":
+        """Build an item from a claimed queue row, decrypting its body for processing/delivery.
+
+        ``shared_ciphertext`` is the store-once deref seam: when a row carries a ``body_ref`` (its body
+        lives once in ``shared_body``), the caller passes that shared copy's ciphertext here and it is
+        decrypted in place of the row's empty inline ``payload``. ``None`` (no ref) decrypts the inline
+        ``payload`` exactly as before — byte-identical."""
+        ciphertext = shared_ciphertext if shared_ciphertext is not None else row["payload"]
         return cls(
             id=row["id"],
             message_id=row["message_id"],
             channel_id=row["channel_id"],
             destination_name=row["destination_name"],
-            payload=cipher.decrypt(row["payload"]),  # decrypt the body for processing/delivery
+            payload=cipher.decrypt(ciphertext),  # decrypt the body for processing/delivery
             attempts=row["attempts"],
             stage=row["stage"],
             # Plaintext metadata (the handler to run), not a body — never encrypted. NULL off-routed.
@@ -505,6 +516,9 @@ CREATE TABLE IF NOT EXISTS queue (
     destination_name TEXT,            -- outbound connection name; NULL for ingress/routed rows
     handler_name     TEXT,            -- handler to run; set only on routed rows, NULL otherwise
     payload          TEXT NOT NULL,   -- stage body (encoded): ingress/routed=raw, outbound=transformed
+    body_ref         TEXT,            -- store-once-deliver-many: when set, the body lives ONCE in
+                                      -- shared_body[body_ref] and payload is '' (deref'd at delivery);
+                                      -- NULL = body is inline in payload (the default, byte-identical)
     status           TEXT NOT NULL,
     attempts         INTEGER NOT NULL DEFAULT 0,
     next_attempt_at  REAL NOT NULL,
@@ -520,6 +534,28 @@ CREATE INDEX IF NOT EXISTS ix_queue_ready ON queue(stage, status, next_attempt_a
 CREATE INDEX IF NOT EXISTS ix_queue_fifo_out ON queue(stage, destination_name, status, created_at);
 CREATE INDEX IF NOT EXISTS ix_queue_fifo_in  ON queue(stage, channel_id, status, created_at);
 CREATE INDEX IF NOT EXISTS ix_queue_message  ON queue(message_id);
+-- ix_queue_body_ref (store-once-deliver-many) is created in _migrate, AFTER body_ref is guaranteed
+-- present — on a Step-A `queue` table (no body_ref) a body_ref index here would reference a missing
+-- column (CREATE TABLE IF NOT EXISTS is a no-op on the pre-existing table). Mirrors handler_name.
+
+-- Store-once-deliver-many (L2b): when one handler's transform produces an IDENTICAL transformed body
+-- for N destinations (a high-fan-out feed), the body is stored ONCE here and the N outbound rows carry
+-- a `body_ref` to it instead of each holding its own encrypted copy — cutting stored body bytes from
+-- N× to ~1×. `hash` is the content address: SHA-256 of the PLAINTEXT body (hashing the plaintext, not
+-- the ciphertext — AES-GCM uses a random nonce, so two encryptions of one plaintext differ). `body` is
+-- the single encrypted copy (cipher-covered at rest exactly like queue.payload, and it rides the
+-- key-rotation re-encrypt). `refcount` is the number of live queue rows referencing this body; a body
+-- is GC-deleted the moment its refcount reaches 0 (decremented when a referencing row's body is purged
+-- or the row is deleted), so retention can never orphan a body nor delete one an outbound row still
+-- needs. Bodies are deduped only WITHIN one transform_handoff's deliveries (same transaction, same
+-- plaintext in hand) — a conservative, well-bounded unit that captures the fan-out win without a
+-- cross-message dedup race.
+CREATE TABLE IF NOT EXISTS shared_body (
+    hash       TEXT PRIMARY KEY,   -- sha256(plaintext body) — the content address
+    body       TEXT NOT NULL,      -- the single encrypted copy (cipher-covered, like queue.payload)
+    refcount   INTEGER NOT NULL,   -- live queue rows referencing this body; row GC'd at 0
+    created_at REAL NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS message_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -739,6 +775,14 @@ class MessageStore:
     # complete_with_response). The runner refuses to start a capturing outbound on a backend that
     # can't, failing closed rather than silently dropping captures.
     supports_response_capture = True
+
+    # This backend implements pass-through (PT) re-ingress — the foundational slice of the
+    # `pt_deliveries` branch of transform_handoff (ConnectorType.PT, ADR 0013 generalized) lands here.
+    # The engine ALLOW-LISTS PT to this backend only: a graph with a PT inbound on any backend whose
+    # `supports_pt_reingress` is False is rejected at startup (see Engine.start), so a Send into a PT
+    # connector never trips the unimplemented branch at runtime.
+    supports_pt_reingress = True
+    backend = StoreBackend.SQLITE
 
     def __init__(
         self,
@@ -972,6 +1016,8 @@ class MessageStore:
         ),  # #46: scrubbed event reason — id-keyed, rides the loops below
         # NB: the `response` table (ADR 0013) is cipher-covered too, but it has a COMPOSITE PK (no
         # `id`), so it can't ride the id-keyed loops below — it has its own passes, like state/reference.
+        # The `shared_body` table (store-once-deliver-many) is likewise cipher-covered (`body`) but keyed
+        # by `hash`, not `id`, so it has its own pass in _encrypt_existing_rows / reencrypt_to_active.
     )
 
     async def _encrypt_existing_rows(self) -> None:
@@ -1072,6 +1118,23 @@ class MessageStore:
                     )
                     await self._db.commit()
                     total += len(rows)
+            # The `shared_body` table (store-once-deliver-many) is keyed by `hash` (the plaintext content
+            # address), not `id`; migrate any legacy plaintext body separately. (Normally a no-op — a
+            # brand-new table — present for parity with state/reference/response.)
+            while True:
+                cur = await self._db.execute(
+                    "SELECT hash, body FROM shared_body WHERE body NOT LIKE ? AND body <> '' LIMIT 500",
+                    (like,),
+                )
+                rows = list(await cur.fetchall())
+                if not rows:
+                    break
+                await self._db.executemany(
+                    "UPDATE shared_body SET body=? WHERE hash=?",
+                    [(self._cipher.encrypt(r["body"]), r["hash"]) for r in rows],
+                )
+                await self._db.commit()
+                total += len(rows)
         if total:
             log.info("encrypted %d existing value(s) at rest", total)
 
@@ -1119,9 +1182,34 @@ class MessageStore:
             total += await self._reencrypt_reference_to_active(cipher, active_like, batch)
             # The `response` table (composite PK + two PHI columns — ADR 0013) rotates on its own pass.
             total += await self._reencrypt_response_to_active(cipher, active_like, batch)
+            # The `shared_body` table (store-once-deliver-many) is keyed by `hash`, not `id` — its own pass.
+            total += await self._reencrypt_shared_body_to_active(cipher, active_like, batch)
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         return total
+
+    async def _reencrypt_shared_body_to_active(
+        self, cipher: AesGcmCipher, active_like: str, batch: int
+    ) -> int:
+        """Re-encrypt the ``shared_body`` table's ``body`` under the active key (caller holds the lock).
+
+        Mirrors :meth:`_reencrypt_state_to_active` but keys on the content-address PK ``hash`` (store-
+        once-deliver-many). The ``hash`` is over the PLAINTEXT, so re-encrypting under a new key never
+        changes it — the content address is rotation-stable."""
+        rotated = 0
+        while True:
+            cur = await self._db.execute(
+                "SELECT hash, body FROM shared_body WHERE body NOT LIKE ? AND body <> '' LIMIT ?",
+                (active_like, batch),
+            )
+            rows = list(await cur.fetchall())
+            if not rows:
+                break
+            updates = [(cipher.encrypt(cipher.decrypt(r["body"])), r["hash"]) for r in rows]
+            await self._db.executemany("UPDATE shared_body SET body=? WHERE hash=?", updates)
+            await self._db.commit()
+            rotated += len(rows)
+        return rotated
 
     async def _reencrypt_state_to_active(
         self, cipher: AesGcmCipher, active_like: str, batch: int
@@ -1244,8 +1332,17 @@ class MessageStore:
         # Step-A DB's queue table predates the column — ALTER it in (NULL on existing ingress/outbound
         # rows is correct). The queue table always exists here (CREATE IF NOT EXISTS ran in _SCHEMA).
         cur = await db.execute("PRAGMA table_info(queue)")
-        if "handler_name" not in {row["name"] for row in await cur.fetchall()}:
+        queue_cols = {row["name"] for row in await cur.fetchall()}
+        if "handler_name" not in queue_cols:
             await db.execute("ALTER TABLE queue ADD COLUMN handler_name TEXT")
+        # store-once-deliver-many (L2b): a pre-existing queue predates body_ref — ALTER it in (NULL on
+        # existing rows = "body inline in payload", byte-identical to before). shared_body is created by
+        # the CREATE TABLE IF NOT EXISTS in _SCHEMA, so a reopened DB gains it without a separate step.
+        if "body_ref" not in queue_cols:
+            await db.execute("ALTER TABLE queue ADD COLUMN body_ref TEXT")
+        # The body_ref deref index lives here (not _SCHEMA) so it is created only AFTER the column is
+        # guaranteed present — on a Step-A queue it'd otherwise reference a not-yet-added column.
+        await db.execute("CREATE INDEX IF NOT EXISTS ix_queue_body_ref ON queue(body_ref)")
         # Step-up re-verification (ASVS 7.5.3) adds sessions.reauth_at. A pre-existing DB's rows get
         # NULL (treated as "never re-verified" — a sensitive op then requires /me/reauth).
         cur = await db.execute("PRAGMA table_info(sessions)")
@@ -1371,8 +1468,7 @@ class MessageStore:
                     error=None,
                     now=now,
                 )
-                for dest_name, payload in deliveries:
-                    await self._insert_outbound_row(mid, channel_id, dest_name, payload, now)
+                await self._insert_outbound_deliveries(mid, channel_id, deliveries, now)
                 await self._db.execute(
                     "INSERT INTO message_events (message_id, ts, event, detail) VALUES (?,?,?,?)",
                     (mid, now, "received", self._enc(f"{len(deliveries)} destination(s)")),
@@ -1412,25 +1508,127 @@ class MessageStore:
             return float(last)
         return now
 
-    async def _insert_outbound_row(
-        self, mid: str, channel_id: str, dest_name: str, payload: str, now: float
+    async def _insert_outbound_deliveries(
+        self,
+        mid: str,
+        channel_id: str,
+        deliveries: Sequence[tuple[str, str]],
+        now: float,
     ) -> None:
-        """Insert one ``stage='outbound'`` queue row (one message→destination delivery)."""
+        """Insert one ``stage='outbound'`` queue row per delivery, **storing-once any identical body**.
+
+        Store-once-deliver-many (L2b): when ≥2 of *this* handler's deliveries carry a byte-identical
+        transformed body (the high-fan-out case), the body is encrypted and stored a **single** time in
+        ``shared_body`` (keyed by ``sha256(plaintext)``, ``refcount`` = how many of these rows reference
+        it) and each of those outbound rows carries a ``body_ref`` with an empty inline ``payload`` —
+        cutting stored body bytes from N× to ~1×. A body that appears exactly once stays **inline** in
+        ``payload`` (NULL ``body_ref``), byte-identical to the pre-feature behavior — no shared_body row,
+        no deref at delivery. Dedup is scoped to this single call's deliveries (one transaction), the
+        conservative well-bounded unit. All inserts run inside the caller's transaction."""
+        # Group destinations by plaintext body so we know each body's fan-out before inserting.
+        by_body: dict[str, list[str]] = {}
+        order: list[str] = []  # preserve first-seen body order for stable hashing/insert
+        for dest_name, payload in deliveries:
+            if payload not in by_body:
+                by_body[payload] = []
+                order.append(payload)
+            by_body[payload].append(dest_name)
+        # Pre-create each shared body that fans out to ≥2 destinations (refcount = that fan-out).
+        body_ref_for: dict[str, str] = {}
+        for payload in order:
+            dests = by_body[payload]
+            if len(dests) < 2:
+                continue  # singleton → stays inline, byte-identical to before
+            body_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            await self._reserve_shared_body(body_hash, payload, len(dests), now)
+            body_ref_for[payload] = body_hash
+        # Insert the rows in the original delivery order (FIFO stamping per destination lane).
+        for dest_name, payload in deliveries:
+            await self._insert_outbound_row(
+                mid, channel_id, dest_name, payload, now, body_ref=body_ref_for.get(payload)
+            )
+
+    async def _reserve_shared_body(
+        self, body_hash: str, payload: str, refs: int, now: float
+    ) -> None:
+        """Create (or bump the refcount of) the single shared copy of ``payload`` (store-once).
+
+        Inserts a ``shared_body`` row holding ONE encrypted copy with ``refcount=refs``; if the content
+        address already exists (an earlier handoff produced the same body, or a retried delivery), the
+        refcount is incremented by ``refs`` instead so the existing copy is reused. Runs in the caller's
+        transaction, so it commits or rolls back atomically with the referencing outbound rows."""
+        await self._db.execute(
+            "INSERT INTO shared_body (hash, body, refcount, created_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(hash) DO UPDATE SET refcount = refcount + excluded.refcount",
+            (body_hash, self._cipher.encrypt(payload), refs, now),
+        )
+
+    async def _release_shared_body(self, body_hash: str, count: int = 1) -> None:
+        """Drop ``count`` references to a shared body and GC it at refcount 0 (store-once retention).
+
+        Called when a referencing outbound row's body is purged or the row is deleted. Decrements the
+        refcount; when it reaches 0 the single encrypted copy is DELETEd, so a body is never orphaned and
+        never kept past its last referrer. Clamped at 0 (a double-release can't drive it negative)."""
+        await self._db.execute(
+            "UPDATE shared_body SET refcount = MAX(0, refcount - ?) WHERE hash=?",
+            (count, body_hash),
+        )
+        await self._db.execute("DELETE FROM shared_body WHERE hash=? AND refcount<=0", (body_hash,))
+
+    async def _release_outbound_body_refs(self, where: str, params: tuple[object, ...]) -> None:
+        """Release every shared body referenced by the outbound rows matching ``where`` (store-once GC).
+
+        The retention seam: tally the ``body_ref`` of each matching row, decrement each shared body's
+        refcount by how many of these rows reference it (GC at 0), then NULL ``body_ref`` on those rows so
+        the release is exactly-once even if the purge re-runs (a re-run no longer matches). Runs in the
+        caller's transaction. ``where`` is a code-controlled fragment (never user input) selecting
+        ``stage='outbound'`` rows with a non-NULL ``body_ref``."""
+        cur = await self._db.execute(
+            f"SELECT body_ref, COUNT(*) AS n FROM queue WHERE {where} GROUP BY body_ref", params
+        )
+        releases = [(r["body_ref"], int(r["n"])) for r in await cur.fetchall()]
+        if not releases:
+            return
+        for body_hash, count in releases:
+            await self._release_shared_body(body_hash, count)
+        # Null body_ref on the just-released rows so a re-run of the purge is a no-op (idempotent GC).
+        await self._db.execute(f"UPDATE queue SET body_ref=NULL WHERE {where}", params)
+
+    async def _insert_outbound_row(
+        self,
+        mid: str,
+        channel_id: str,
+        dest_name: str,
+        payload: str,
+        now: float,
+        *,
+        body_ref: str | None = None,
+    ) -> None:
+        """Insert one ``stage='outbound'`` queue row (one message→destination delivery).
+
+        ``body_ref`` is the store-once seam: ``None`` (default) inlines the encrypted body in ``payload``
+        (byte-identical to the pre-feature path); a non-``None`` content-address hash references the single
+        copy in ``shared_body`` and stores an empty inline ``payload`` (dereferenced at delivery). The
+        caller (:meth:`_insert_outbound_deliveries`) reserves the shared_body row before passing a ref."""
         created_at = await self._fifo_created_at(
             Stage.OUTBOUND.value, "destination_name", dest_name, now
         )
+        # When the body is shared, the inline payload is empty ('' — never ciphertext-of-empty, so it
+        # reads back as a blank that the deref replaces). NOT NULL is satisfied by the '' sentinel.
+        stored_payload = "" if body_ref is not None else self._cipher.encrypt(payload)
         await self._db.execute(
             "INSERT INTO queue"
-            " (id, message_id, stage, channel_id, destination_name, payload,"
+            " (id, message_id, stage, channel_id, destination_name, payload, body_ref,"
             "  status, attempts, next_attempt_at, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,0,?,?,?)",
+            " VALUES (?,?,?,?,?,?,?,?,0,?,?,?)",
             (
                 uuid4().hex,
                 mid,
                 Stage.OUTBOUND.value,
                 channel_id,
                 dest_name,
-                self._cipher.encrypt(payload),
+                stored_payload,
+                body_ref,
                 OutboxStatus.PENDING.value,
                 now,
                 created_at,
@@ -1573,8 +1771,7 @@ class MessageStore:
                     # Already handed off by a prior run (crash-restart) — idempotent no-op.
                     await self._db.rollback()
                     return False
-                for dest_name, payload in deliveries:
-                    await self._insert_outbound_row(message_id, channel_id, dest_name, payload, now)
+                await self._insert_outbound_deliveries(message_id, channel_id, deliveries, now)
                 await self._db.execute(
                     "UPDATE messages SET status=? WHERE id=?", (disposition.value, message_id)
                 )
@@ -1751,6 +1948,8 @@ class MessageStore:
         channel_id: str,
         deliveries: Sequence[tuple[str, str]],  # (destination_name, transformed_payload)
         state_ops: Sequence[tuple[str, str, Any]] = (),  # (namespace, key, value) — ADR 0005
+        pt_deliveries: Sequence[tuple[str, str]] = (),  # (pt_inbound_name, body) — ADR 0013 gen.
+        correlation_depth_cap: int = 8,  # bounds internal PT re-ingress loops
         now: float | None = None,
     ) -> bool:
         """Advance one handler assignment from the **routed** stage to outbound — the transform half of
@@ -1767,6 +1966,19 @@ class MessageStore:
         identical outbound rows **and** state writes — transforms are pure), and a committed run is an
         idempotent no-op on re-invocation (routed row gone → ``False``). Returns ``True`` if this call
         performed the handoff, ``False`` if it was a no-op.
+
+        **Pass-through re-ingress (ADR 0013, generalized).** ``pt_deliveries`` are the handler's ``Send``\\ s
+        whose target is an internal **pass-through (PT) inbound** (not an outbound). For each, this
+        produces — **in this same transaction** — a new, independent INGRESS-stage child message on the
+        PT channel (a content-addressed id; ``RECEIVED`` per count-and-log; correlated to this message),
+        which the PT inbound's own router worker then re-routes. The Send-into-PT also stamps a single
+        **already-``done`` outbound marker row** on *this* (parent) message keyed by the PT inbound name,
+        so the parent finalizes ``PROCESSED`` (the Send was delivered — into the PT) and never collapses
+        to ``FILTERED``. Atomicity makes "child produced" and "routed row consumed" one durable fact, so a
+        crash/re-run is an idempotent no-op (the content-addressed child id + the guarded routed-row
+        DELETE). A ``correlation_depth`` breach drops the child and dead-letters the parent's marker
+        (``ERROR``), bounding internal loops. When ``pt_deliveries`` is empty this is byte-identical to
+        the pre-feature path.
 
         **State exactly-once (ADR 0005):** each ``state_ops`` entry is upserted by ``(namespace, key)``
         **inside this same transaction** as the outbound rows, so it commits or rolls back atomically
@@ -1785,8 +1997,37 @@ class MessageStore:
                     # Already handed off by a prior run (crash-restart) — idempotent no-op.
                     await self._db.rollback()
                     return False
-                for dest_name, payload in deliveries:
-                    await self._insert_outbound_row(message_id, channel_id, dest_name, payload, now)
+                await self._insert_outbound_deliveries(message_id, channel_id, deliveries, now)
+                # Pass-through re-ingress (ADR 0013, generalized): produce each PT child + the parent's
+                # done marker in THIS same transaction as the routed-row DELETE, so the handoff is atomic
+                # and re-run-idempotent. Read the parent's correlation lineage once (absent → depth 0).
+                if pt_deliveries:
+                    pcur = await self._db.execute(
+                        "SELECT metadata FROM messages WHERE id=?", (message_id,)
+                    )
+                    prow = await pcur.fetchone()
+                    parent_meta: dict[str, Any] = {}
+                    pmeta_json = self._dec(prow["metadata"]) if prow else None
+                    if pmeta_json:
+                        loaded = json.loads(pmeta_json)
+                        if isinstance(loaded, dict):
+                            parent_meta = loaded
+                    for pt_name, body in pt_deliveries:
+                        produced = await self._insert_passthrough_child(
+                            routed_id,
+                            message_id,
+                            pt_name,
+                            body,
+                            parent_meta,
+                            correlation_depth_cap,
+                            now,
+                        )
+                        # The parent's disposition for this Send: a marker outbound row keyed by the PT
+                        # inbound, already terminal (DONE = delivered into the PT, or DEAD = depth-cap
+                        # breach → parent ERROR). It is never claimed (no delivery worker for a PT name;
+                        # claims take PENDING rows only), so it is inert; it exists solely so the
+                        # finalizer counts the Send as delivered/errored rather than collapsing FILTERED.
+                        await self._insert_passthrough_marker(message_id, pt_name, produced, now)
                 # JSON-encode + apply each declared state write in the SAME transaction as the outbound
                 # rows. Encoding is done up front so a (shouldn't-happen) serialization error aborts the
                 # whole handoff cleanly rather than after some rows were inserted. SetState validated
@@ -1796,8 +2037,9 @@ class MessageStore:
                     value_json = json.dumps(value)
                     await self._apply_state_op(namespace, key, value_json, message_id, now)
                     applied.append(((namespace, key), value))
+                total_targets = len(deliveries) + len(pt_deliveries)
                 await self._event(
-                    message_id, "transformed", None, f"{len(deliveries)} destination(s)", now
+                    message_id, "transformed", None, f"{total_targets} destination(s)", now
                 )
                 # Finalizer owns the terminal disposition (incl. the ROUTED→FILTERED collapse when this
                 # was the last handler and nothing delivered anywhere). Runs in this same transaction.
@@ -1948,11 +2190,30 @@ class MessageStore:
         items: list[OutboxItem] = []
         for row in rows:
             try:
-                items.append(OutboxItem.from_row(row, self._cipher))
+                items.append(await self._outbox_item_from_row(row))
             except Exception as exc:
                 log.warning("dead-lettering undecryptable outbox row %s: %s", row["id"], exc)
                 await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
         return items
+
+    async def _outbox_item_from_row(self, row: aiosqlite.Row) -> OutboxItem:
+        """Build an :class:`OutboxItem` from a claimed queue row, dereferencing a shared body if any.
+
+        Store-once-deliver-many deref: a row with a non-NULL ``body_ref`` holds its body once in
+        ``shared_body`` (its inline ``payload`` is empty); fetch that single encrypted copy and decrypt it
+        as the row's body. A row with no ``body_ref`` decrypts its inline ``payload`` directly — byte-
+        identical to the pre-feature path (no shared_body read). A missing shared body (corruption /
+        premature GC) raises like any undecryptable payload, so the caller dead-letters that one row
+        rather than stalling the lane."""
+        body_ref = row["body_ref"] if "body_ref" in row.keys() else None
+        if body_ref is None:
+            return OutboxItem.from_row(row, self._cipher)
+        async with self._read() as db:
+            cur = await db.execute("SELECT body FROM shared_body WHERE hash=?", (body_ref,))
+            br = await cur.fetchone()
+        if br is None:
+            raise CipherError(f"shared body {body_ref} missing")
+        return OutboxItem.from_row(row, self._cipher, shared_ciphertext=br["body"])
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
         # SQLite is single active node: there is no second writer to fence, so the H1 epoch guard is a
@@ -2044,7 +2305,7 @@ class MessageStore:
                     return None
             await self._db.commit()
         try:
-            return OutboxItem.from_row(claimed, self._cipher)
+            return await self._outbox_item_from_row(claimed)
         except Exception as exc:
             # Same as claim_ready: an undecryptable head must not stall the lane — dead-letter it and
             # let the next poll advance to the new head, rather than re-raising into the worker (H-1).
@@ -2222,6 +2483,159 @@ class MessageStore:
             except Exception:
                 await self._db.rollback()
                 raise
+
+    @staticmethod
+    def _passthrough_message_id(routed_id: str, pt_channel: str, body: str) -> str:
+        """The content-addressed id of a pass-through (PT) child message (ADR 0013, generalized).
+
+        A Handler's ``Send`` into a PT inbound re-ingresses ``body`` as a new INGRESS-stage message on
+        ``pt_channel`` **inside** the parent's ``transform_handoff`` transaction. The id is a
+        deterministic function of the **parent's routed row** (``routed_id``, the unit of work being
+        consumed), the target PT channel, and the body — 32 hex chars wide to match ``uuid4().hex``. This
+        is defense-in-depth: the guarded DELETE of the routed row is the exactly-once gate (a committed
+        handoff can never re-run), but a content-addressed id makes a re-run after a *rolled-back partial*
+        an idempotent no-op for the child message INSERT too. ``routed_id`` (not the parent message id)
+        is the salt so two distinct routed rows of the *same* message that each Send the *same* body into
+        the *same* PT inbound produce two distinct children (each is a real, separate unit of work)."""
+        h = hashlib.sha256()
+        h.update(b"passthrough:")
+        h.update(routed_id.encode())
+        h.update(b":")
+        h.update(pt_channel.encode())
+        h.update(b":")
+        h.update(body.encode())
+        return h.hexdigest()[:32]
+
+    async def _insert_passthrough_child(
+        self,
+        routed_id: str,
+        parent_id: str,
+        pt_channel: str,
+        body: str,
+        parent_meta: dict[str, Any],
+        correlation_depth_cap: int,
+        now: float,
+    ) -> bool:
+        """Produce one PT child INGRESS row + message inside the caller's transaction (ADR 0013, gen.).
+
+        Returns ``True`` if a child was produced, ``False`` if the depth cap was breached (no child; the
+        caller records the parent ``ERROR`` instead). The child is a **new, independent** message
+        (``source_type='passthrough'``, its own content-addressed id, status ``RECEIVED`` per
+        count-and-log), correlated to the parent (``correlation_id``/``correlation_root_id``/
+        ``correlation_depth``). The PT inbound's own router worker drains the INGRESS row and re-routes
+        it. Idempotent re-run: the content-addressed id is pre-checked, so a partial-then-recovered run
+        does not double-inject the message. Bounds internal loops by ``correlation_depth`` (mirrors
+        ``ingress_handoff``'s cap), computed purely from the parent's immutable metadata → re-run-stable.
+        """
+        child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
+        root = parent_meta.get("correlation_root_id") or parent_id
+        if child_depth > correlation_depth_cap:
+            # Depth-cap breach: produce NO child, log the breach on the parent. The caller's
+            # transform_handoff still consumes the routed row (the Send is "handled" — dead-lettered),
+            # and the parent finalizes ERROR via the dead marker the caller records. Mirrors the
+            # ingress_handoff depth-cap branch (bound total work, not topology).
+            await self._event(
+                parent_id,
+                "passthrough_dropped",
+                pt_channel,
+                f"depth cap ({child_depth} > {correlation_depth_cap})",
+                now,
+            )
+            return False
+        new_mid = self._passthrough_message_id(routed_id, pt_channel, body)
+        cur = await self._db.execute("SELECT 1 FROM messages WHERE id=?", (new_mid,))
+        if await cur.fetchone() is None:
+            child_meta = json.dumps(
+                {
+                    "correlation_id": parent_id,
+                    "correlation_root_id": root,
+                    "correlation_depth": child_depth,
+                    "passthrough_from": parent_id,
+                }
+            )
+            await self._insert_message(
+                new_mid,
+                channel_id=pt_channel,
+                raw=body,
+                status=MessageStatus.RECEIVED.value,
+                control_id=None,
+                message_type=None,
+                source_type="passthrough",
+                summary=None,
+                metadata=child_meta,
+                error=None,
+                now=now,
+            )
+            ingress_created = await self._fifo_created_at(
+                Stage.INGRESS.value, "channel_id", pt_channel, now
+            )
+            await self._db.execute(
+                "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
+                " handler_name, payload, status, attempts, next_attempt_at, created_at,"
+                " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    uuid4().hex,
+                    new_mid,
+                    Stage.INGRESS.value,
+                    pt_channel,
+                    None,
+                    None,
+                    self._cipher.encrypt(body),
+                    OutboxStatus.PENDING.value,
+                    0,
+                    now,
+                    ingress_created,
+                    now,
+                ),
+            )
+            await self._event(
+                new_mid, "received", None, f"passthrough from {parent_id} -> {pt_channel}", now
+            )
+            await self._event(
+                parent_id, "passthrough", pt_channel, f"-> {new_mid} depth {child_depth}", now
+            )
+        return True
+
+    async def _insert_passthrough_marker(
+        self, parent_id: str, pt_name: str, produced: bool, now: float
+    ) -> None:
+        """Stamp the parent's terminal disposition row for a Send-into-PT (ADR 0013, generalized).
+
+        A single ``stage='outbound'`` row keyed by the PT inbound name, inserted already-terminal: ``done``
+        when the child was produced (the Send was *delivered* into the PT → the parent finalizes
+        ``PROCESSED``, not ``FILTERED``), or ``dead`` when the depth cap was breached (→ the parent
+        finalizes ``ERROR``). It is **never claimed** — there is no delivery worker for a PT inbound name,
+        and FIFO/ready claims take ``pending`` rows only — so it is inert work-wise; it exists solely so
+        the single finalizer authority counts the Send's outcome. The payload is the empty-body sentinel
+        (no real egress body); ``next_attempt_at`` is ``now`` (terminal, never due). A ``delivered``/
+        ``dead`` event mirrors a normal outbound's so the hop is visible in the per-message timeline."""
+        status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
+        created_at = await self._fifo_created_at(
+            Stage.OUTBOUND.value, "destination_name", pt_name, now
+        )
+        await self._db.execute(
+            "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
+            " payload, status, attempts, next_attempt_at, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                uuid4().hex,
+                parent_id,
+                Stage.OUTBOUND.value,
+                pt_name,
+                pt_name,
+                None,
+                self._cipher.encrypt(""),
+                status,
+                0,
+                now,
+                created_at,
+                now,
+            ),
+        )
+        if produced:
+            await self._event(parent_id, "delivered", pt_name, "passthrough re-ingress", now)
+        else:
+            await self._event(parent_id, "dead", pt_name, "passthrough depth cap", now)
 
     @staticmethod
     def _reingress_message_id(origin_id: str, dest: str, seq: int, body: str) -> str:
@@ -3044,12 +3458,23 @@ class MessageStore:
         each outbound delivery — the parity-comparison read path (#14). Kept separate from
         ``outbox_for`` so the metadata-only message-detail view never materializes plaintext bodies;
         the API gates this behind ``MESSAGES_VIEW_RAW`` and audits the access."""
+        # LEFT JOIN the single shared copy so a body_ref row's body is decrypted from shared_body.body;
+        # an inline row (NULL body_ref) keeps its own queue.payload. COALESCE picks the right ciphertext
+        # source per row so store-once is transparent to this PHI-body read (the #14 parity comparison).
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT * FROM queue WHERE message_id=? AND stage=? ORDER BY destination_name",
+                "SELECT q.*, "
+                "COALESCE(sb.body, q.payload) AS _body_ciphertext "
+                "FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref "
+                "WHERE q.message_id=? AND q.stage=? ORDER BY q.destination_name",
                 (message_id, Stage.OUTBOUND.value),
             )
-            return [self._decode_row(r, "last_error", "payload") for r in await cur.fetchall()]
+            out: list[dict[str, Any]] = []
+            for r in await cur.fetchall():
+                d = self._decode_row(r, "last_error")
+                d["payload"] = self._dec(d.pop("_body_ciphertext"))
+                out.append(d)
+            return out
 
     async def events_for(self, message_id: str) -> list[dict[str, Any]]:
         async with self._read() as db:
@@ -3092,6 +3517,7 @@ class MessageStore:
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
+        allowed_channels: Sequence[str] | None = None,
     ) -> list[ConnectionEvent]:
         limit = max(
             1, min(limit, 1000)
@@ -3108,6 +3534,12 @@ class MessageStore:
         if since is not None:
             where.append("ts>=?")
             params.append(since)
+        # Per-channel RBAC: a scoped caller sees ONLY their own inbound-direction events and never any
+        # outbound row (which spans channels) — mirrors the connection_metadata/purge boundary that
+        # hides shared-outbound topology. None leaves the read unrestricted.
+        if allowed_channels is not None:
+            where.append("direction='inbound'")
+            _append_channel_scope(where, params, "connection", allowed_channels)
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         params.append(limit)
         async with self._read() as db:
@@ -3890,10 +4322,26 @@ class MessageStore:
                     (older_than, *inflight),
                 )
                 purged = cur.rowcount
-                # Blank the kept (delivered/cancelled) outbound payloads for the same eligible set.
+                # store-once: release the shared bodies the eligible delivered/cancelled rows reference
+                # (decrement refcount, GC at 0, null body_ref) BEFORE blanking — so a shared body is freed
+                # exactly when its last referrer is purged, never orphaned and never kept too long.
+                await self._release_outbound_body_refs(
+                    "stage=? AND status IN (?, ?) AND body_ref IS NOT NULL "
+                    f"AND message_id IN ({eligible})",
+                    (
+                        Stage.OUTBOUND.value,
+                        OutboxStatus.DONE.value,
+                        OutboxStatus.CANCELLED.value,
+                        older_than,
+                        *inflight,
+                    ),
+                )
+                # Blank the kept (delivered/cancelled) outbound payloads for the same eligible set. Inline
+                # bodies have a non-blank payload; a store-once row's payload is already '' and its
+                # body_ref was just nulled above, so this UPDATE simply clears its last_error.
                 await self._db.execute(
                     f"UPDATE queue SET payload='', last_error=NULL "
-                    f"WHERE stage=? AND status IN (?, ?) AND payload <> '' "
+                    f"WHERE stage=? AND status IN (?, ?) AND (payload <> '' OR last_error IS NOT NULL) "
                     f"AND message_id IN ({eligible})",
                     (
                         Stage.OUTBOUND.value,
@@ -3939,12 +4387,24 @@ class MessageStore:
         Idempotent (guards on a non-blank payload); returns the number of dead rows purged."""
         now = time.time() if now is None else now
         async with self._lock:
-            cur = await self._db.execute(
-                "UPDATE queue SET payload='', last_error=NULL "
-                "WHERE stage=? AND status=? AND payload <> '' AND updated_at < ?",
-                (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, older_than),
-            )
-            await self._db.commit()
+            try:
+                await self._db.execute("BEGIN")
+                # store-once: release shared bodies these dead rows reference (refcount-/GC/null body_ref)
+                # before blanking, so a shared body outlives its last dead referrer no longer than this.
+                await self._release_outbound_body_refs(
+                    "stage=? AND status=? AND body_ref IS NOT NULL AND updated_at < ?",
+                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, older_than),
+                )
+                cur = await self._db.execute(
+                    "UPDATE queue SET payload='', last_error=NULL "
+                    "WHERE stage=? AND status=? AND (payload <> '' OR last_error IS NOT NULL) "
+                    "AND updated_at < ?",
+                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, older_than),
+                )
+                await self._db.commit()
+            except Exception:
+                await self._db.rollback()
+                raise
             return int(cur.rowcount)
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:

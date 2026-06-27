@@ -22,12 +22,16 @@ environment is set whose security posture is unresolved (a *custom* name with no
 foot-gun is caught at commit/CI time instead of at runtime. No ``messagefoundry.toml`` → SKIP.
 
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
-a non-developer author shouldn't be stopped by a lint nit. Exit-code policy lives in the CLI
-(``__main__._check``): 0 iff no required check failed.
+a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
+config-dir Router/Handler modules that flags ``raise <Exc>(f"...{var}...")``, the exact pattern that can
+carry free-text PHI past the exception-path redaction (``redaction.py``); it only ever **prints** a
+heuristic reminder of the "never put PHI in an exception message" convention, never blocks the gate.
+Exit-code policy lives in the CLI (``__main__._check``): 0 iff no required check failed.
 """
 
 from __future__ import annotations
 
+import ast
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -93,7 +97,58 @@ def run_checks(
     if run_lint:
         results.append(_run_tool("ruff", ["ruff", "check", str(config_dir)]))
         results.append(_run_tool("mypy", ["mypy", str(config_dir)]))
+    # Appended AFTER the ruff/mypy advisory block so it only adds an advisory result and never blocks
+    # the gate (required=False keeps __main__._check's "0 iff no required check failed" exit policy).
+    results.append(_check_raise_fstring(config_dir))
     return CheckReport(results)
+
+
+def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
+    """Advisory: flag ``raise <Exc>(f"...{var}...")`` in the config-dir Router/Handler modules — an
+    f-string ``raise`` that interpolates a variable, the one pattern that can carry **free-text PHI**
+    past the exception-path redaction (``redaction.py``) into the stored ``last_error``/``detail`` and
+    the log. It is a heuristic reminder of the "never put PHI in an exception message" convention, not a
+    hard rule: a benign interpolation (``raise ValueError(f"port {p} in use")``) trips it too, so the
+    check is **advisory** (prints, never blocks).
+
+    Scans every ``*.py`` under ``config_dir`` (helpers included — a ``_*`` helper can ``raise`` too).
+    A malformed module never crashes the gate (``SyntaxError``/``OSError`` → skip that file; ``validate``
+    already reports a broken module). A single file / non-dir ``config_dir`` yields no glob hits → skip.
+    """
+    base = Path(config_dir)
+    if not base.is_dir():
+        return CheckResult(
+            "raise-fstring", ok=True, required=False, skipped=True, detail="not a config dir"
+        )
+    hits: list[str] = []
+    for path in sorted(base.glob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, OSError):
+            # A broken module is already caught by validate; never crash the advisory gate on it.
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
+                continue
+            args = node.exc.args
+            first = args[0] if args else None
+            # An f-string with at least one ``{var}`` (FormattedValue); a constant-only f-string or a
+            # plain string literal is fine and not flagged.
+            if isinstance(first, ast.JoinedStr) and any(
+                isinstance(part, ast.FormattedValue) for part in first.values
+            ):
+                hits.append(f"{path.name}:{node.lineno}")
+    if not hits:
+        return CheckResult(
+            "raise-fstring", ok=True, required=False, skipped=True, detail="no f-string raises"
+        )
+    shown = ", ".join(hits[:5])
+    more = f" (+{len(hits) - 5} more)" if len(hits) > 5 else ""
+    detail = (
+        f"{len(hits)} f-string raise(s) interpolate a variable (heuristic PHI reminder — keep "
+        f"identifiers out of exception messages): {shown}{more}"
+    )
+    return CheckResult("raise-fstring", ok=True, required=False, detail=detail)
 
 
 def _check_validate(config_dir: str | Path) -> CheckResult:

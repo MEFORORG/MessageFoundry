@@ -200,6 +200,26 @@ jobs:
         run: |
           pip install pip-audit
           pip-audit -r requirements.txt --desc
+      # SEC-021 (CWE-494): pip-audit only catches PUBLISHED advisories — it does NOT vouch for a
+      # novel malicious substitute pulled from a compromised/confused index. The default
+      # requirements.txt pins ONLY the engine, so `pip install -r requirements.txt` resolves the
+      # whole transitive closure (fastapi, cryptography, pydantic, …) LIVE and UNHASHED. Two
+      # defences, gated on whether you ship a hash-pinned lock:
+      #   - requirements.lock present  -> install with --require-hashes (every byte verified).
+      #   - engine-only requirements.txt -> WARN that the closure resolves live and recommend an
+      #     index pin (--index-url / PIP_CONSTRAINT) to defeat dependency-confusion.
+      # Generate the lock with `pip-compile --generate-hashes` or `uv export` over YOUR closure
+      # (see the README "Transitive supply-chain" section), then this job verifies it reproducibly.
+      - name: Verify the transitive resolve is hash-pinned (or warn it is not)
+        run: |
+          if [ -f requirements.lock ]; then
+            echo "requirements.lock present — verifying a fully hash-pinned resolve (--require-hashes)."
+            python -m venv .verify-resolve
+            ./.verify-resolve/bin/pip install --require-hashes --dry-run -r requirements.lock
+          else
+            echo "::warning::No requirements.lock — the transitive dependency closure resolves LIVE and UNHASHED at install time."
+            echo "::warning::Pin your index (pip --index-url / PIP_CONSTRAINT) against dependency-confusion, and ship a hash-pinned requirements.lock (pip-compile --generate-hashes / uv export) installed with --require-hashes. See the README."
+          fi
 """
 
 _GITIGNORE = """\
@@ -278,6 +298,32 @@ dependency closure, so a vulnerability **disclosed against the version you're pi
 CI red automatically — your remediation clock starts without waiting to read an advisory. Remediate by
 bumping the engine pin in `requirements.txt` to a release that fixed it (accept a triaged advisory with
 `pip-audit --ignore-vuln <ID>`, recorded per your own change control).
+
+## Transitive supply-chain (your deps, not the engine)
+`gh attestation verify` authenticates the **engine wheel** only; `pip install -r requirements.txt`
+then resolves the **whole transitive closure** (fastapi, cryptography, pydantic, …) **live and
+unhashed** from your configured index. `pip-audit` flags *published* advisories — it does **not** stop
+a novel malicious substitute pulled via a compromised mirror or a **dependency-confusion** attack
+(an attacker publishing a same-named package to a public index your resolver also searches). Two
+hardening steps (recommended for any PHI-handling adopter):
+
+1. **Pin the index** so the resolver cannot be confused onto a hostile source:
+   ```bash
+   pip install --index-url https://your-internal-index/simple -r requirements.txt
+   # or set it in the environment / pip.conf, plus a constraints pin:
+   export PIP_CONSTRAINT=requirements.lock
+   ```
+2. **Hash-pin your transitive closure** so every byte is verified at install — generate a lock over
+   *your* resolved deps and install with `--require-hashes`:
+   ```bash
+   # generate (pick one):
+   pip-compile --generate-hashes -o requirements.lock requirements.txt
+   uv export --format requirements-txt > requirements.lock
+   # install — fails if ANY requirement is unhashed:
+   pip install --require-hashes -r requirements.lock
+   ```
+   When you commit a `requirements.lock`, the `audit-pin` CI job verifies it installs reproducibly
+   under `--require-hashes`; without one it **warns** that the closure resolves live and unhashed.
 
 ## Environments & posture
 The active environment is **required** and **free-form** — name instances `dev`/`staging`/`test`/`prod`/`poc`/…

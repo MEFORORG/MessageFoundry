@@ -103,6 +103,13 @@ def verify_totp_step(
     their ~30 s step window (ASVS 6.5.1). Constant-time compared over a fixed set of candidate steps
     (no early break) so a match near the window edge can't be distinguished by timing; a non-numeric
     or wrong-length ``code`` returns ``None``.
+
+    The forward half of the skew window is *accepted* (so a near-boundary fast-clock authenticator can
+    still log in) but the returned step is **clamped to the current step** (SEC-014, CWE-287): a
+    tolerated future code (``counter+1``) reports ``counter``, never advancing the single-use high-
+    water mark past the genuinely-current step. Otherwise burning ``counter+1`` would reject the user's
+    own current-step code (a non-greater step) for up to ~30 s — a self-inflicted lockout, not a
+    bypass. The clamp only lowers the recorded step, so single-use is preserved.
     """
     candidate = code.strip()
     if len(candidate) != digits or not candidate.isdigit():
@@ -116,7 +123,7 @@ def verify_totp_step(
             continue
         if hmac.compare_digest(_hotp(key, step, digits), candidate):
             matched = step
-    return matched
+    return min(matched, counter) if matched is not None else None
 
 
 def verify_totp(

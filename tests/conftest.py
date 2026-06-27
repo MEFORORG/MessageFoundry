@@ -15,9 +15,37 @@ asyncio_default_fixture_loop_scope = "session"), which removes the per-test even
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from collections.abc import Iterator
 
 import pytest
+
+from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _allow_insecure_config_source_in_tests() -> Iterator[None]:
+    """The suite loads sample/harness configs from the repo checkout, which is intentionally
+    user-writable — and on the Windows CI runner the default workspace ACL grants ``BUILTIN\\Users``
+    write, so the SEC-003 config-source trust guard would fail-closed on every config load. Set the
+    documented dev/test escape (``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE``) so the guard downgrades its
+    production refusal to a warning here. Scoped to win32 only: POSIX checkouts aren't group/world-
+    writable, so the POSIX refusal tests must keep seeing the escape OFF. The guard's own Windows
+    refusal test pins the escape back OFF to assert the fail-closed path. Never set in production."""
+    if sys.platform != "win32":
+        yield
+        return
+    prev = os.environ.get(INSECURE_CONFIG_SOURCE_ESCAPE_ENV)
+    os.environ[INSECURE_CONFIG_SOURCE_ESCAPE_ENV] = "1"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, None)
+        else:
+            os.environ[INSECURE_CONFIG_SOURCE_ESCAPE_ENV] = prev
+
 
 # Minimal source-logger set: every background-component child reaches one of these by propagation, so
 # quiescing these five drops a late teardown-window emit at its source. Chosen from the suite's actual

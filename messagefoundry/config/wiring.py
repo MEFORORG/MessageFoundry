@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import ipaddress
+import logging
 import os
 import sys
 import threading
@@ -70,6 +71,7 @@ __all__ = [
     "File",
     "Timer",
     "Loopback",
+    "PassThrough",
     "Rest",
     "FHIR",
     "DICOM",
@@ -114,6 +116,8 @@ __all__ = [
     "load_config",
     "validate_config",
 ]
+
+_logger = logging.getLogger(__name__)
 
 
 class WiringError(ValueError):
@@ -822,6 +826,24 @@ def Loopback() -> ConnectionSpec:
     return ConnectionSpec(ConnectorType.LOOPBACK, {})
 
 
+def PassThrough() -> ConnectionSpec:
+    """A pass-through (PT) **inbound** (ADR 0013, generalized): an inert *internal* inbound with **no
+    source**. Messages arrive *only* via the engine-internal pass-through handoff — a Handler ``Send``\\ s
+    its transformed message into this inbound (naming it like an outbound), and the engine re-ingresses
+    that body as a **new, independent inbound message** on this channel, routed by this inbound's own
+    Router. This is the Corepoint ``PT_*`` pattern: one logical feed fans out across internal connectors
+    and re-routes deeper (e.g. ``PT_540700_ADT_2``) without an external hop.
+
+    It is an ordinary ``inbound(...)`` otherwise: declare its ``router`` (which re-routes the message)
+    and ``content_type`` (``hl7v2`` → :class:`~messagefoundry.parsing.message.Message`; ``x12``/``text``/
+    ``json`` → :class:`~messagefoundry.parsing.message.RawMessage`). It takes **no** ``ack_mode`` (no
+    external peer to ACK — forced to ``NONE``), no ``bind_address``/``source_ip_allowlist`` (no socket),
+    and no ``strict`` validation (no untrusted intake — the body is engine-internal, already-stored
+    state). Unlike :func:`Loopback`, which captures a 1:1 partner *reply*, a PT inbound is the 1:N
+    internal *routing* sibling: any Handler may target it, and the body is the transformed message."""
+    return ConnectionSpec(ConnectorType.PT, {})
+
+
 def Rest(
     *,
     url: str | EnvRef,  # the endpoint; may be env() for DEV/PROD-specific hosts
@@ -940,6 +962,9 @@ def DICOM(
     # fail-closed unless `serve --allow-insecure-bind` (the generalized bind-guard)
     tls_cert_file: str | EnvRef | None = None,  # SCP server identity (required when tls=True)
     tls_key_file: str | EnvRef | None = None,  # the cert's private key (PEM)
+    tls_key_password: str | EnvRef | None = None,  # passphrase for a PKCS#8-encrypted tls_key_file
+    # (env()-sourced, mirroring MLLP); None → unencrypted key. A no/wrong passphrase fails fast at
+    # construction rather than hanging on an interactive TTY prompt (no TTY under a service/container).
     tls_ca_file: str
     | EnvRef
     | None = None,  # opt-in mTLS: require + verify a calling peer's client cert
@@ -982,6 +1007,7 @@ def DICOM(
             "tls": tls,
             "tls_cert_file": tls_cert_file,
             "tls_key_file": tls_key_file,
+            "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
             "max_object_bytes": max_object_bytes,
             "max_associations": max_associations,
@@ -1413,6 +1439,12 @@ class InboundConnection:
     # capture_connection_errors → the inbound connection_event log (lifecycle + pre-ingress failures).
     capture_ack: bool | None = None
     capture_connection_errors: bool | None = None
+    # Multi-process sharding (L3): the shard this inbound belongs to. None = the implicit default
+    # shard. The supervisor runs one engine subprocess per distinct shard, each owning a disjoint
+    # subset of inbounds (so intake parallelizes across CPU cores); outbound/routers/handlers are
+    # shared across shards. Purely an intake-partition tag — never used for routing. See
+    # messagefoundry/pipeline/sharding.py.
+    shard: str | None = None
     source_file: str | None = None  # where it was declared (for IDE go-to-definition)
     source_line: int | None = None
 
@@ -1707,14 +1739,14 @@ def _check_source_ip_allowlist(
     name: str, listens: bool, allowlist: list[str] | None
 ) -> tuple[str, ...] | None:
     """Validate an inbound peer-IP allowlist and freeze it to a tuple. Each entry must parse as an IP
-    address or a CIDR network; the allowlist is only meaningful for an MLLP/TCP **listen** source.
-    ``None``/empty = no restriction (the ``[egress]`` allowlist convention)."""
+    address or a CIDR network; the allowlist is only meaningful for an MLLP/TCP/X12/DIMSE **listen**
+    source. ``None``/empty = no restriction (the ``[egress]`` allowlist convention)."""
     if not allowlist:
         return None
     if not listens:
         raise WiringError(
-            f"inbound connection {name!r}: source_ip_allowlist is only valid for an MLLP/TCP "
-            "listen source"
+            f"inbound connection {name!r}: source_ip_allowlist is only valid for an "
+            "MLLP/TCP/X12/DIMSE listen source"
         )
     for entry in allowlist:
         if not isinstance(entry, str) or not entry.strip():
@@ -1768,6 +1800,7 @@ def build_inbound_connection(
     source_ip_allowlist: list[str] | None = None,
     capture_ack: bool | None = None,
     capture_connection_errors: bool | None = None,
+    shard: str | None = None,
     source_file: str | None = None,
     source_line: int | None = None,
 ) -> InboundConnection:
@@ -1811,30 +1844,40 @@ def build_inbound_connection(
             f"inbound connection {name!r}: validation.strict is HL7-specific and can't apply to a "
             f"{content_type.value!r} content_type — validate non-HL7 payloads in the Handler instead"
         )
-    if spec.type is ConnectorType.LOOPBACK:
-        # A loopback inbound (ADR 0013) has no socket and no untrusted intake: strict HL7 validation is
-        # meaningless, and there is no external peer to ACK. Messages arrive only via ingress_handoff.
+    if spec.type in (ConnectorType.LOOPBACK, ConnectorType.PT):
+        # An internal inbound (loopback re-ingress / pass-through, ADR 0013) has no socket and no
+        # untrusted intake: strict HL7 validation is meaningless, and there is no external peer to ACK.
+        # Messages arrive only via the engine-internal handoff (ingress_handoff / the PT branch of
+        # transform_handoff). A PT inbound is a normal inbound for ROUTING (it carries a required
+        # router — enforced by the inbound() signature — and gets router/transform workers), but it has
+        # no LISTENER, so it shares these guards with Loopback().
+        factory = "Loopback()" if spec.type is ConnectorType.LOOPBACK else "PassThrough()"
         if strict:
             raise WiringError(
-                f"inbound connection {name!r}: validation.strict is meaningless for a Loopback() "
+                f"inbound connection {name!r}: validation.strict is meaningless for a {factory} "
                 "inbound (no socket / no untrusted intake)"
             )
         if ack_mode in (AckMode.NONE, AckMode.ORIGINAL):
             ack_mode = AckMode.NONE  # unset/default → NONE (no external peer to ACK)
         else:
             raise WiringError(
-                f"inbound connection {name!r}: Loopback() takes no ACK (no external peer) — "
+                f"inbound connection {name!r}: {factory} takes no ACK (no external peer) — "
                 "ack_mode must be NONE"
             )
     _check_metadata(name, metadata)
     # Listen sources bind an interface and can carry a per-connection bind_address + peer-IP allowlist.
-    # DIMSE (the C-STORE SCP) is a listener like MLLP/TCP (X12 binds but omits these per-conn knobs).
-    listens = spec.type in (ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.DIMSE)
+    # DIMSE (the C-STORE SCP) and X12 are listeners like MLLP/TCP — all bind an interface.
+    listens = spec.type in (
+        ConnectorType.MLLP,
+        ConnectorType.TCP,
+        ConnectorType.DIMSE,
+        ConnectorType.X12,
+    )
     if bind_address is not None:
         if not listens:
-            # Only a listen source (MLLP/TCP/DIMSE) binds an interface; File/DB/etc. have nothing to bind.
+            # Only a listen source (MLLP/TCP/DIMSE/X12) binds an interface; File/DB/etc. have nothing.
             raise WiringError(
-                f"inbound connection {name!r}: bind_address is only valid for an MLLP/TCP/DIMSE "
+                f"inbound connection {name!r}: bind_address is only valid for an MLLP/TCP/DIMSE/X12 "
                 "listen source"
             )
         if not bind_address.strip():
@@ -1859,6 +1902,14 @@ def build_inbound_connection(
             f"inbound connection {name!r}: capture_connection_errors=True is only valid for an "
             "MLLP/TCP listen source (a poll/file source has no per-connection framing/refuse failures)"
         )
+    if shard is not None and not shard.strip():
+        # A present-but-blank shard tag would silently collapse into its own nameless shard (the
+        # supervisor would spawn a subprocess named ""), a config footgun — fail loud at wiring so
+        # it's caught in dry-run / `messagefoundry check`. Omit shard to use the default shard.
+        raise WiringError(
+            f"inbound connection {name!r}: shard must be a non-empty name, not blank "
+            "(omit it to use the default shard)"
+        )
     return InboundConnection(
         name=name,
         spec=spec,
@@ -1872,6 +1923,7 @@ def build_inbound_connection(
         source_ip_allowlist=allowlist,
         capture_ack=capture_ack,
         capture_connection_errors=capture_connection_errors,
+        shard=shard,
         source_file=source_file,
         source_line=source_line,
     )
@@ -1892,6 +1944,7 @@ def inbound(
     source_ip_allowlist: list[str] | None = None,
     capture_ack: bool | None = None,
     capture_connection_errors: bool | None = None,
+    shard: str | None = None,
 ) -> None:
     """Declare an inbound connection that feeds every received message to ``router``.
 
@@ -1910,7 +1963,12 @@ def inbound(
     Operability (Tier 4, all optional): ``metadata`` attaches free-form operator labels
     (owner/runbook/environment) surfaced by the API and never used for routing; ``bind_address``
     overrides the service ``[inbound].bind_host`` for this MLLP/TCP listener only; ``source_ip_allowlist``
-    restricts an MLLP/TCP listener to the given peer IPs / CIDR networks (absent/empty = no restriction)."""
+    restricts an MLLP/TCP listener to the given peer IPs / CIDR networks (absent/empty = no restriction).
+
+    ``shard`` (L3 multi-process sharding) tags this inbound for a named engine subprocess: ``messagefoundry
+    supervise`` runs one subprocess per distinct shard, each owning a disjoint set of inbounds (intake
+    parallelizes across CPU cores; outbound/routers/handlers stay shared). ``None`` = the implicit default
+    shard. It never affects routing — see :mod:`messagefoundry.pipeline.sharding`."""
     file, line = _call_site()
     _active_registry().add_inbound(
         build_inbound_connection(
@@ -1927,6 +1985,7 @@ def inbound(
             source_ip_allowlist=source_ip_allowlist,
             capture_ack=capture_ack,
             capture_connection_errors=capture_connection_errors,
+            shard=shard,
             source_file=file,
             source_line=line,
         )
@@ -2112,8 +2171,12 @@ class _SiblingHelperFinder:
     The loader runs non-``_`` modules under mangled names and skips ``_``-prefixed files as top-level
     modules, but CLAUDE.md §4 documents importing shared ``_``-prefixed helpers from siblings. Those
     files aren't on ``sys.path``, so without a finder Python can't locate them and the import fails
-    (review low-10). Installed on ``sys.meta_path`` only while a config dir loads, and resolves a name
-    only when ``<name>.py`` exists in that dir. :func:`_assert_safe_config_source` already vets every
+    (review low-10). Installed on ``sys.meta_path`` only while a config dir loads, and resolves **only**
+    ``_``-prefixed top-level names (matching the loader's ``_*``-skip rule) against ``<name>.py`` in
+    that dir. Scoping to ``_``-prefixed names means a config-dir file named after a real module
+    (``os.py``, ``json.py``, ``ssl.py``, ``requests.py`` — none start with ``_``) can no longer
+    shadow the stdlib/installed module for the duration of the load (SEC-019, CWE-427); only the
+    documented ``_``-helper convention is served. :func:`_assert_safe_config_source` already vets every
     ``*.py`` (including ``_*``), so a helper sits inside the same trust boundary as its importers."""
 
     def __init__(self, directory: Path, created: set[str]) -> None:
@@ -2123,6 +2186,12 @@ class _SiblingHelperFinder:
     def find_spec(self, fullname: str, path: Any, target: Any = None) -> Any:
         if path is not None or "." in fullname:
             return None  # only top-level absolute imports, resolved against the config dir
+        # SEC-019 (CWE-427): only serve the documented ``_``-prefixed helper convention so a config-dir
+        # file named after a real stdlib/installed module (os/json/ssl/requests — none start with ``_``)
+        # cannot pre-empt normal finder resolution and silently shadow it. No stdlib/installed top-level
+        # module name starts with ``_``, and every legitimate sibling helper does, so this is sufficient.
+        if not fullname.startswith("_"):
+            return None
         candidate = self._dir / f"{fullname}.py"
         if not candidate.is_file():
             return None
@@ -2203,17 +2272,334 @@ def load_config(directory: str | Path) -> Registry:
 # Group-write (0o020) | world-write (0o002): a writable bit for anyone but the owner.
 _GROUP_WORLD_WRITABLE = 0o022
 
+# --- Windows config-source trust (SEC-003, CWE-732) --------------------------
+#
+# On Windows the config dir + each *.py DACL/owner is parsed in-process (mirroring the POSIX
+# group/world-writable + foreign-owner check) and a source whose DACL grants a broad/low-privilege
+# principal a write-class right is refused. The check used to be an unconditional no-op, delegating
+# entirely to install-time ACLs — but Windows is the documented primary deployment target and the
+# installer does not lock the config dir, so an inherited write ACE could let a low-privileged local
+# user rewrite a module that then executes as the engine service account (local privilege escalation).
+
+# Any ALLOWED ACE granting one of these access rights is "write-class" — enough to rewrite/replace the
+# executed code or hijack its ACL. FILE_WRITE_DATA/APPEND/WRITE_EA/WRITE_ATTRIBUTES + DELETE + the two
+# ACL-control bits (WRITE_DAC/WRITE_OWNER) + GENERIC_WRITE/GENERIC_ALL.
+_WIN_WRITE_MASK = (
+    0x00000002  # FILE_WRITE_DATA
+    | 0x00000004  # FILE_APPEND_DATA
+    | 0x00000010  # FILE_WRITE_EA
+    | 0x00000100  # FILE_WRITE_ATTRIBUTES
+    | 0x00010000  # DELETE
+    | 0x00040000  # WRITE_DAC
+    | 0x00080000  # WRITE_OWNER
+    | 0x10000000  # GENERIC_ALL
+    | 0x40000000  # GENERIC_WRITE
+)
+
+# Broad/low-privilege well-known SIDs that must never hold a write-class right on executed config.
+_WIN_REJECTED_SIDS = frozenset(
+    {
+        "S-1-1-0",  # Everyone
+        "S-1-5-11",  # NT AUTHORITY\Authenticated Users
+        "S-1-5-32-545",  # BUILTIN\Users
+        "S-1-5-4",  # NT AUTHORITY\INTERACTIVE
+        "S-1-5-7",  # NT AUTHORITY\Anonymous Logon
+    }
+)
+
+# SIDs trusted to hold write on executed config (the owner is also always trusted, plus the current
+# process user, both passed in at evaluation time): SYSTEM and the local Administrators group. The two
+# placeholder/alias SIDs CREATOR OWNER (S-1-3-0) and OWNER RIGHTS (S-1-3-4) resolve to whoever OWNS the
+# object (not a foreign principal), so an ACE granting them write is equivalent to an owner grant and
+# is trusted — they appear on inherited ACLs (e.g. the user-profile temp dir) and must not be refused.
+_WIN_TRUSTED_SIDS = frozenset(
+    {
+        "S-1-5-18",  # NT AUTHORITY\SYSTEM
+        "S-1-5-32-544",  # BUILTIN\Administrators
+        "S-1-3-0",  # CREATOR OWNER (placeholder: rights granted to the object's owner)
+        "S-1-3-4",  # OWNER RIGHTS (the current owner's effective rights)
+    }
+)
+
+# ACE type byte (ACE_HEADER.AceType) for an ACCESS_ALLOWED_ACE — the only type that grants rights.
+_WIN_ACCESS_ALLOWED_ACE_TYPE = 0x00
+
+
+def _evaluate_config_dacl(
+    owner_sid: str,
+    aces: Sequence[tuple[int, int, str]],
+    self_sid: str | None,
+) -> str | None:
+    """Pure DACL policy: return a refusal reason, or ``None`` if the source is trusted.
+
+    ``aces`` is ``(ace_type, access_mask, trustee_sid)`` tuples as strings (``ConvertSidToStringSidW``
+    form). A source is refused when any **ALLOWED** ACE grants a **write-class** right to a principal
+    that is neither the file owner, nor the current process user, nor a trusted admin/SYSTEM SID —
+    and unconditionally when a broad/low-privilege SID (Everyone/Authenticated Users/Users/…) holds
+    such a right. Kept free of ctypes so the policy is unit-testable on every platform."""
+    trusted = set(_WIN_TRUSTED_SIDS)
+    trusted.add(owner_sid)
+    if self_sid is not None:
+        trusted.add(self_sid)
+    for ace_type, access_mask, trustee_sid in aces:
+        if ace_type != _WIN_ACCESS_ALLOWED_ACE_TYPE:
+            continue  # DENY/audit/etc. ACEs never grant a right
+        if not access_mask & _WIN_WRITE_MASK:
+            continue  # read/execute-only ACE (e.g. Users:RX on a repo checkout) is fine
+        if trustee_sid in _WIN_REJECTED_SIDS:
+            return f"a broad/low-privilege principal ({trustee_sid}) has write access"
+        if trustee_sid not in trusted:
+            return f"a non-owner, non-admin principal ({trustee_sid}) has write access"
+    return None
+
+
+def _assert_safe_config_source_windows(directory: Path) -> None:
+    """Windows NTFS-DACL/owner check mirroring the POSIX guard (SEC-003).
+
+    Parses the owner + DACL of the directory and each ``*.py`` (incl. ``_*.py`` helpers, the same
+    candidate set as POSIX) via ctypes/advapi32 and refuses to load when :func:`_evaluate_config_dacl`
+    rejects it. **Fail-open with a loud WARNING on a Win32 API error**: a ``GetNamedSecurityInfoW``
+    failure must not brick a previously-working service — it logs and proceeds (no worse than the old
+    no-op). A NULL/absent DACL, however, means "everyone allowed" and is treated as a REFUSAL. All
+    ctypes work lives behind the ``sys.platform == 'win32'`` guard in the caller so mypy/lint pass on
+    the Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`)."""
+    if sys.platform != "win32":  # pragma: no cover - guard for type-checker / non-Windows
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    # Declare prototypes so 64-bit pointers aren't truncated to a default c_int arg (which raises an
+    # OverflowError on a high address). PVOID = c_void_p; PSID/PACL/PSECURITY_DESCRIPTOR are pointers.
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR,  # pObjectName
+        ctypes.c_int,  # SE_OBJECT_TYPE
+        wintypes.DWORD,  # SECURITY_INFORMATION
+        ctypes.POINTER(ctypes.c_void_p),  # ppsidOwner
+        ctypes.POINTER(ctypes.c_void_p),  # ppsidGroup
+        ctypes.POINTER(ctypes.c_void_p),  # ppDacl
+        ctypes.POINTER(ctypes.c_void_p),  # ppSacl
+        ctypes.POINTER(ctypes.c_void_p),  # ppSecurityDescriptor
+    ]
+    advapi32.GetAce.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,  # TOKEN_INFORMATION_CLASS
+        ctypes.c_void_p,  # TokenInformation (buffer)
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    # GetNamedSecurityInfoW(pObjectName, SE_FILE_OBJECT=1, SecurityInfo, ppOwner, ppGroup, ppDacl,
+    # ppSacl, ppSecurityDescriptor). We request OWNER (0x1) | DACL (0x4). The SD is allocated by the
+    # API and must be LocalFree'd; the owner/DACL pointers point INTO that buffer (do not free them).
+    _SE_FILE_OBJECT = 1
+    _OWNER_SECURITY_INFORMATION = 0x00000001
+    _DACL_SECURITY_INFORMATION = 0x00000004
+
+    class _ACL(ctypes.Structure):
+        _fields_ = (
+            ("AclRevision", wintypes.BYTE),
+            ("Sbz1", wintypes.BYTE),
+            ("AclSize", wintypes.WORD),
+            ("AceCount", wintypes.WORD),
+            ("Sbz2", wintypes.WORD),
+        )
+
+    class _ACE_HEADER(ctypes.Structure):
+        _fields_ = (
+            ("AceType", wintypes.BYTE),
+            ("AceFlags", wintypes.BYTE),
+            ("AceSize", wintypes.WORD),
+        )
+
+    # ACCESS_ALLOWED_ACE: header + AccessMask (DWORD) + the first DWORD of the trustee SID (SidStart).
+    class _ACCESS_ALLOWED_ACE(ctypes.Structure):
+        _fields_ = (
+            ("Header", _ACE_HEADER),
+            ("Mask", wintypes.DWORD),
+            ("SidStart", wintypes.DWORD),
+        )
+
+    def _sid_to_str(sid_ptr: int) -> str | None:
+        out = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(out)):
+            return None
+        try:
+            return out.value
+        finally:
+            # ConvertSidToStringSidW allocates the string with LocalAlloc; free its address.
+            if out:
+                kernel32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
+
+    def _self_sid() -> str | None:
+        # Current process user SID, so a config dir the service account itself owns/controls passes.
+        token = wintypes.HANDLE()
+        _TOKEN_QUERY = 0x0008
+        _TokenUser = 1
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), _TOKEN_QUERY, ctypes.byref(token)
+        ):
+            return None
+        try:
+            size = wintypes.DWORD(0)
+            advapi32.GetTokenInformation(token, _TokenUser, None, 0, ctypes.byref(size))
+            if size.value == 0:
+                return None
+            buf = ctypes.create_string_buffer(size.value)
+            if not advapi32.GetTokenInformation(
+                token, _TokenUser, buf, size.value, ctypes.byref(size)
+            ):
+                return None
+            # TOKEN_USER = SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes; }; Sid is the first pointer.
+            sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+            return _sid_to_str(sid_ptr) if sid_ptr else None
+        finally:
+            kernel32.CloseHandle(token)
+
+    self_sid = _self_sid()
+    candidates = [directory, *directory.glob("*.py")]
+    for path in candidates:
+        owner_sid_ptr = ctypes.c_void_p()
+        dacl_ptr = ctypes.c_void_p()
+        sd_ptr = ctypes.c_void_p()
+        rc = advapi32.GetNamedSecurityInfoW(
+            ctypes.c_wchar_p(str(path)),
+            _SE_FILE_OBJECT,
+            _OWNER_SECURITY_INFORMATION | _DACL_SECURITY_INFORMATION,
+            ctypes.byref(owner_sid_ptr),
+            None,
+            ctypes.byref(dacl_ptr),
+            None,
+            ctypes.byref(sd_ptr),
+        )
+        if rc != 0:
+            # API error (not a policy decision): fail OPEN with a loud warning — never brick a service
+            # that started fine before this change (the worst case is "no worse than the old no-op").
+            _logger.warning(
+                "config-source trust guard could not evaluate the DACL of %s (Win32 error %d); "
+                "proceeding WITHOUT the Windows ACL check — verify the config dir is not writable by "
+                "a low-privileged principal (see docs/SERVICE.md)",
+                path,
+                rc,
+            )
+            continue
+        try:
+            # A NULL DACL means "no DACL present" => everyone is implicitly allowed full control. That
+            # is the most-permissive possible state, so REFUSE (unlike an API error, this is a real,
+            # observed insecure ACL — not an inability to read it).
+            if not dacl_ptr:
+                _refuse_unsafe_config_source(
+                    f"refusing to load config from {path}: it has a NULL DACL (everyone implicitly "
+                    f"has full control); see docs/SERVICE.md for required permissions"
+                )
+                continue
+            owner_addr = owner_sid_ptr.value
+            owner_sid = _sid_to_str(owner_addr) if owner_addr else None
+            if owner_sid is None:
+                _logger.warning(
+                    "config-source trust guard could not resolve the owner SID of %s; proceeding "
+                    "WITHOUT the Windows ACL check for this path (see docs/SERVICE.md)",
+                    path,
+                )
+                continue
+            acl = ctypes.cast(dacl_ptr, ctypes.POINTER(_ACL)).contents
+            aces: list[tuple[int, int, str]] = []
+            unreadable = False
+            for i in range(acl.AceCount):
+                ace_ptr = ctypes.c_void_p()
+                if not advapi32.GetAce(dacl_ptr, i, ctypes.byref(ace_ptr)):
+                    unreadable = True
+                    break
+                header = ctypes.cast(ace_ptr, ctypes.POINTER(_ACE_HEADER)).contents
+                if header.AceType != _WIN_ACCESS_ALLOWED_ACE_TYPE:
+                    aces.append((header.AceType, 0, ""))  # non-allow ACE: policy ignores it
+                    continue
+                allowed = ctypes.cast(ace_ptr, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
+                # The trustee SID begins at the SidStart field offset within the ACE structure.
+                sid_offset = _ACCESS_ALLOWED_ACE.SidStart.offset
+                sid_ptr = ace_ptr.value + sid_offset if ace_ptr.value is not None else 0
+                trustee = _sid_to_str(sid_ptr) if sid_ptr else None
+                if trustee is None:
+                    unreadable = True
+                    break
+                aces.append((header.AceType, int(allowed.Mask), trustee))
+            if unreadable:
+                _logger.warning(
+                    "config-source trust guard could not enumerate the DACL of %s; proceeding WITHOUT "
+                    "the Windows ACL check for this path (see docs/SERVICE.md)",
+                    path,
+                )
+                continue
+            reason = _evaluate_config_dacl(owner_sid, aces, self_sid)
+            if reason is not None:
+                _refuse_unsafe_config_source(
+                    f"refusing to load config from writable-by-others path {path}: {reason}; "
+                    f"see docs/SERVICE.md for required permissions"
+                )
+        finally:
+            if sd_ptr:
+                kernel32.LocalFree(sd_ptr)
+
+
+def _refuse_unsafe_config_source(message: str) -> None:
+    """Raise ``WiringError(message)`` unless the explicit dev/test escape is set, then warn instead.
+
+    Fail-closed by default: a PHI service must not execute config Python a low-privileged user can
+    rewrite. ``MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`` (off by default; never set in production — the
+    installer locks the config dir so production never trips this) downgrades the refusal to a loud
+    warning for a user-writable dev/CI checkout. Symmetric across the POSIX and Windows guards."""
+    # Local import keeps the settings <-> wiring module load order independent (no circular import).
+    from messagefoundry.config.settings import (
+        INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
+        insecure_config_source_allowed,
+    )
+
+    if insecure_config_source_allowed():
+        _logger.warning(
+            "%s — proceeding because %s is set (dev/test override; NEVER set this in production)",
+            message,
+            INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
+        )
+        return
+    raise WiringError(message)
+
 
 def _assert_safe_config_source(directory: Path) -> None:
-    """Refuse to execute config Python from a group/world-writable location (POSIX).
+    """Refuse to execute config Python from a writable-by-others location.
 
     Because :func:`_exec_module` runs arbitrary Python as the engine's service account, a
     lower-privileged user who can write into the config dir (or a module file) could execute
     code as that account on the next reload. On POSIX we hard-fail on a group/world-writable
-    directory or module. On Windows, NTFS DACL enforcement is delegated to the documented
-    install-time ACL (see docs/SERVICE.md) — reading DACLs reliably needs platform APIs out of
-    scope here — and to running under a least-privilege account (docs/SERVICE.md, DEPLOY-1)."""
-    if os.name != "posix" or not directory.is_dir():
+    directory or module. On Windows the equivalent NTFS-DACL check now runs in-process
+    (:func:`_assert_safe_config_source_windows`, SEC-003): the directory and each ``*.py``
+    owner/DACL is parsed via ctypes and a source whose DACL grants a broad/low-privilege
+    principal a write-class right is refused — no longer a silent no-op delegated entirely to
+    install-time ACLs (docs/SERVICE.md, DEPLOY-1)."""
+    if not directory.is_dir():
+        return
+    if sys.platform == "win32":
+        _assert_safe_config_source_windows(directory)
+        return
+    if os.name != "posix":
         return
     # getattr keeps mypy happy on win32 (os.getuid is POSIX-only); we already returned on non-posix.
     _getuid = getattr(os, "getuid", None)
@@ -2227,14 +2613,15 @@ def _assert_safe_config_source(directory: Path) -> None:
         except OSError:
             continue
         if st.st_mode & _GROUP_WORLD_WRITABLE:
-            raise WiringError(
+            _refuse_unsafe_config_source(
                 f"refusing to load config from group/world-writable path {path} "
                 f"(mode {oct(st.st_mode & 0o777)}); see docs/SERVICE.md for required permissions"
             )
+            continue
         # Code here runs as the engine's account, so a file owned by a *different* unprivileged user
         # is an escalation vector even at 0644 — that user can rewrite it (CONFIG-2 / review M-21).
         if self_uid is not None and self_uid != 0 and st.st_uid != self_uid:
-            raise WiringError(
+            _refuse_unsafe_config_source(
                 f"refusing to load config from {path} owned by uid {st.st_uid} — the engine runs as "
                 f"uid {self_uid}; that owner could rewrite the executed code (see docs/SERVICE.md)"
             )

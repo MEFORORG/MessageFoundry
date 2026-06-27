@@ -11,13 +11,13 @@ interface Action {
 
 const GROUPS: { title: string; actions: Action[] }[] = [
   {
-    title: "Authoring",
+    title: "Wizards",
     actions: [
-      { id: "messagefoundry.newRoute", label: "New Route Wizard" },
-      { id: "messagefoundry.newConnection", label: "New Connection" },
-      { id: "messagefoundry.newRouter", label: "New Router" },
-      { id: "messagefoundry.newHandler", label: "New Handler" },
-      { id: "messagefoundry.newAlert", label: "New Alert" },
+      { id: "messagefoundry.newRoute", label: "Route Wizard" },
+      { id: "messagefoundry.newConnection", label: "Connection Wizard" },
+      { id: "messagefoundry.newRouter", label: "Router Wizard" },
+      { id: "messagefoundry.newHandler", label: "Handler Wizard" },
+      { id: "messagefoundry.newAlert", label: "Alert Wizard" },
     ],
   },
   {
@@ -47,7 +47,14 @@ function nonce(): string {
 }
 
 function esc(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // Escape quotes too, not just &<>: these values land inside double-quoted HTML attributes
+  // (e.g. data-cmd="${esc(...)}"), so an unescaped " would break out of the attribute.
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 export class HomeView implements vscode.WebviewViewProvider {
@@ -65,14 +72,16 @@ export class HomeView implements vscode.WebviewViewProvider {
     const n = nonce();
     const groups = GROUPS.map(
       (g) =>
-        `<div class="group"><div class="title">${esc(g.title)}</div>${g.actions
+        `<details class="group" data-key="${esc(g.title)}" open><summary class="title">${esc(
+          g.title,
+        )}</summary><div class="body">${g.actions
           .map(
             (a) =>
               `<button class="action" data-cmd="${esc(a.id)}">${esc(a.label)}${
                 a.soon ? '<span class="soon">soon</span>' : ""
               }</button>`,
           )
-          .join("")}</div>`,
+          .join("")}</div></details>`,
     ).join("");
 
     return `<!DOCTYPE html>
@@ -84,8 +93,13 @@ export class HomeView implements vscode.WebviewViewProvider {
   <style>
     body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 6px 8px; }
     .group { margin-bottom: 12px; }
-    .title { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
-      color: var(--vscode-descriptionForeground); margin: 6px 2px; }
+    summary.title { display: flex; align-items: center; gap: 4px; font-size: 11px; text-transform: uppercase;
+      letter-spacing: .04em; color: var(--vscode-descriptionForeground); margin: 6px 2px; cursor: pointer;
+      user-select: none; list-style: none; }
+    summary.title::-webkit-details-marker { display: none; }
+    summary.title::before { content: "▸"; font-size: 14px; transition: transform .12s ease; }
+    details[open] > summary.title::before { transform: rotate(90deg); }
+    details:not([open]) > .body { display: none; }
     button.action { display: flex; align-items: center; justify-content: space-between; width: 100%;
       text-align: left; font-family: inherit; font-size: 13px; margin: 3px 0; padding: 6px 10px; cursor: pointer;
       color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground);
@@ -99,6 +113,15 @@ export class HomeView implements vscode.WebviewViewProvider {
   ${groups}
   <script nonce="${n}">
     const vscode = acquireVsCodeApi();
+    const state = vscode.getState() || { collapsed: {} };
+    for (const d of document.querySelectorAll('details.group')) {
+      const key = d.dataset.key;
+      if (state.collapsed[key]) { d.open = false; }
+      d.addEventListener('toggle', () => {
+        state.collapsed[key] = !d.open;
+        vscode.setState(state);
+      });
+    }
     for (const b of document.querySelectorAll('button.action')) {
       b.addEventListener('click', () => vscode.postMessage({ command: 'run', id: b.dataset.cmd }));
     }

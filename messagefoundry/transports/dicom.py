@@ -88,12 +88,21 @@ _STATUS_OUT_OF_RESOURCES = 0xA700  # over-cap, or a commit timeout/failure (re-s
 _STATUS_CANNOT_UNDERSTAND = 0xC000  # the object would not decode/re-encode
 _STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist
 
+#: Loopback bind interfaces that need no peer controls (the common dev/single-box case). Copied (not
+#: imported) from :data:`messagefoundry.pipeline.wiring_runner._LOOPBACK_HOSTS` to keep the dependency
+#: direction one-way (transports never import pipeline).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
+
 
 def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
     """Build the SCP's server ``SSLContext`` for DICOM-over-TLS, or ``None`` when ``tls`` is off. Built
     once at construction so a bad cert/key fails at build (dry-run/``check``), not at bind. TLS 1.2+
     floor; ``tls_ca_file`` opts into mTLS (require + verify a calling peer's client cert). Mirrors the
-    MLLP inbound TLS posture (ADR 0002)."""
+    MLLP inbound TLS posture (ADR 0002).
+
+    ``tls_key_password`` decrypts a passphrase-encrypted private key (``env()``-sourced, mirroring
+    MLLP's ``tls_key_password`` / the API listener's ``MEFOR_API_TLS_KEY_PASSWORD``); ``None`` (the
+    default) loads an unencrypted key exactly as before."""
     if not s.get("tls"):
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
@@ -103,7 +112,16 @@ def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
         )
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None)
+    # Pass a deterministic empty-bytes passphrase callback (mirrors mllp.py / api TLS, WP-13b) so an
+    # encrypted key with no/wrong passphrase fails fast with ssl.SSLError at build time (surfaced by
+    # check/dry-run, ADR-0031 startup fault isolation) instead of blocking on OpenSSL's interactive
+    # TTY prompt — there is no TTY under an NSSM service account / in a container. The callback is
+    # never invoked for an unencrypted key, so prior behavior is preserved.
+    key_password = s.get("tls_key_password")
+    pw_arg: bytes | Callable[[], bytes] = (
+        key_password if key_password is not None else (lambda: b"")
+    )
+    ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None, password=pw_arg)
     if ca:  # opt-in mTLS: require + verify a calling peer's client cert against this trust anchor
         ctx.load_verify_locations(cafile=str(ca))
         ctx.verify_mode = ssl.CERT_REQUIRED
@@ -141,6 +159,24 @@ class DicomScpSource(SourceConnector):
         self._timeout = float(s.get("timeout_seconds", 30.0))
         # Build the TLS context now so a bad cert/key fails at build, not at bind (like MLLP/LDAPS).
         self._ssl = _server_ssl_context(s)
+        # Fail-closed peer controls (SEC-012, deny-by-default per ADR 0025 §9): a non-loopback SCP with
+        # NO peer authentication is refused at construction. DIMSE has no transport auth on its own, so
+        # a remotely-reachable SCP must gate peers by at least one of: the calling-AE allowlist, the
+        # [inbound].source_ip_allowlist, or mTLS (tls + tls_ca_file → CERT_REQUIRED in
+        # _server_ssl_context). This is the AUTHENTICATION analog of check_dimse_tls_exposure's cleartext
+        # bind guard (which is the orthogonal CONFIDENTIALITY guard). Raising here integrates with
+        # ADR-0031 startup fault isolation (the connection degrades, not the engine) and surfaces under
+        # check/dry-run. Loopback binds (dev/single-box) are exempt.
+        mtls_on = bool(s.get("tls")) and bool(s.get("tls_ca_file"))
+        if self._host not in _LOOPBACK_HOSTS and not (
+            self._calling_ae_allowlist or self._source_ip_allowlist or mtls_on
+        ):
+            raise ValueError(
+                f"DICOM C-STORE SCP bound non-loopback host {self._host!r} with no peer controls: "
+                "set at least one of calling_ae_allowlist, [inbound].source_ip_allowlist, or mTLS "
+                "(tls_ca_file) to fail closed (egress deny-by-default ethos, ADR 0025 §9), or bind "
+                "127.0.0.1."
+            )
         self._handler: InboundHandler | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._ae: Any = None
@@ -310,7 +346,8 @@ def _client_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
     store and reject every cert). ``tls_ca_file`` pins a private trust anchor instead; ``tls_cert_file``/
     ``tls_key_file`` opt into mTLS. Verification is never disabled (a downstream is a PHI egress). TLS
     1.2+ floor. Built once at construction so a bad cert/key fails at build (dry-run/``check``), not at
-    the first delivery — the client mirror of :func:`_server_ssl_context`."""
+    the first delivery — the client mirror of :func:`_server_ssl_context`. ``tls_key_password`` decrypts
+    a passphrase-encrypted mTLS client key (``env()``-sourced, mirroring MLLP)."""
     if not s.get("tls"):
         return None
     ca = s.get("tls_ca_file")
@@ -319,7 +356,14 @@ def _client_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     cert, key = s.get("tls_cert_file"), s.get("tls_key_file")
     if cert:  # opt-in mTLS: present a client cert to the peer SCP
-        ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None)
+        # Empty-bytes passphrase callback (parity with the SCP server context / mllp.py, WP-13b): an
+        # encrypted client key with no/wrong passphrase fails fast with ssl.SSLError at construction
+        # (check/dry-run) instead of blocking on OpenSSL's TTY prompt; never invoked for a plain key.
+        key_password = s.get("tls_key_password")
+        pw_arg: bytes | Callable[[], bytes] = (
+            key_password if key_password is not None else (lambda: b"")
+        )
+        ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of the peer's server cert (ASVS 12.1.4)
     return ctx

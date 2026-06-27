@@ -10,15 +10,17 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
 
 ## MVP features (Phase 2)
 
-- **Home** — an action launchpad at the top of the MessageFoundry sidebar. **New Route Wizard** steps
+- **Home** — an action launchpad at the top of the MessageFoundry sidebar. The **Wizards** group:
+  **Route Wizard** steps
   you through a whole interface (Inbound → Router → Handler → Outbound, wired and generated as one
-  module); **New Connection** opens a form (pick a type → fill key fields → it generates a config
-  module, auto-named `[TYPE]_[PARTNER]_[MESSAGE]`); **Set Up Version Control & Checks** (see below);
-  **Generate Samples** (pick a message type → triggers → count; writes a synthetic, conformant corpus
-  into `messageSetsDir` via `messagefoundry generate` — no PHI); **New Alert** opens an editor for the
+  module); **Connection Wizard** opens a form (pick a type → fill key fields → it generates a config
+  module, auto-named `[TYPE]_[PARTNER]_[MESSAGE]`); **Alert Wizard** opens an editor for the
   operator alert rules (ADR 0014) in the service-settings TOML's `[[alerts.rules]]` — add/remove
   first-match-wins routing/threshold rules (pure data; takes effect on the next engine restart); plus
-  New Router/Handler, Open Test Bench, Validate, and **Stage → Promote** (see below). (Engine run/stop
+  **Router Wizard**/**Handler Wizard**. Then **Set Up Version Control & Checks** (see below),
+  **Generate Samples** (pick a message type → triggers → count; writes a synthetic, conformant corpus
+  into `messageSetsDir` via `messagefoundry generate` — no PHI), Open Test Bench, Validate, and
+  **Stage → Promote** (see below). (Engine run/stop
   and monitoring live in the Console, not here.)
 - **Set Up Version Control & Checks** (Home → *Operate*, or the command palette) — a guided, **offline,
   provider-agnostic** flow that puts a code-first project under git and runs MessageFoundry checks on
@@ -49,6 +51,11 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   names in `Send("…")` / `router="…"` from the cached graph. General Python completion comes from
   Pylance (install the Python extension).
 - **Validate on save** → Problems panel (`messagefoundry validate`).
+- **Editor build toolbar** — when a Python file under `configDir` is open, a **MessageFoundry**
+  dropdown button (the anvil) appears in the editor title bar with build actions (Validate, Test Bench,
+  Stage → Promote) and scaffolds (New Router / New Handler); **CodeLens** actions (Test Bench /
+  Validate) also sit above each `@router` / `@handler` / `inbound(…)` / `outbound(…)` declaration. These
+  wrap the *real* Python editor (Pylance/debugpy intact) — no custom editor.
 - **Connections sidebar** — the configured connections by their convention name
   (`messagefoundry graph`); click one to jump to its definition, or use the row's **⚙ gear** to open
   its `MLLP()`/`File()` settings in code. **Inbound** rows expand to their `router → handler →
@@ -71,7 +78,13 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   model **code + the config graph** — never message bodies / PHI. Requires a Chat provider
   (e.g. the GitHub Copilot Chat extension) to host the Chat view.
 - **Scaffold snippets**: `meforinbound`, `meforoutbound`, `meforrouter`, `meforhandler` (and matching
-  *MessageFoundry: New …* commands).
+  *MessageFoundry: … Wizard* commands).
+- **Insert Element** (*MessageFoundry: Insert Element*, keybindable) — a quick-pick of the most-used
+  Handler/Router idioms that drops **real, editable Python** at the cursor: field read/set/copy, code-set
+  and `db_lookup` lookups, repetition/segment loops, timestamp conversion, `Send`/split-and-send, etc.
+  Each is also a tab-completion snippet (`meforget`, `meforcopy`, `meforcodelookup`, `mefordblookup`,
+  `mefordate`, `meforsend`, `meforsplit`, …). It's a typing accelerator, not a visual/declarative builder —
+  you still read and edit the Python.
 
 ## Settings
 
@@ -96,6 +109,7 @@ cd ide
 npm install
 npm run compile        # bundle to dist/ (or: npm run watch)
 npm run typecheck      # tsc --noEmit
+npm run package        # build a VSIX (messagefoundry-0.0.1.vsix) for `code --install-extension`
 npm test               # integration tests: launch a headless VS Code (@vscode/test-electron + mocha)
 ```
 

@@ -8,9 +8,11 @@
 import * as vscode from "vscode";
 import { openAlertEditor } from "./alertEditor";
 import { showAiPolicy } from "./aiPolicy";
-import { workspaceDir } from "./cli";
+import { isExecGated, workspaceDir } from "./cli";
 import { registerCompletion } from "./completion";
 import { registerChat } from "./chat";
+import { registerEditorToolbar } from "./editorToolbar";
+import { registerInsertElement } from "./insertElement";
 import { generateSamples } from "./generate";
 import { openCodeSetEditor } from "./codeSetEditor";
 import { CodeSetsProvider } from "./codesetsTree";
@@ -66,6 +68,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const validator = createValidator(context);
   registerCompletion(context, graph);
   registerChat(context, graph);
+  registerEditorToolbar(context);
+  registerInsertElement(context);
   const testBench = new TestBench(context);
 
   context.subscriptions.push(
@@ -208,12 +212,17 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("messagefoundry.newAlert", () => openAlertEditor(context)),
     vscode.commands.registerCommand("messagefoundry.generateSamples", () => generateSamples()),
     vscode.commands.registerCommand("messagefoundry.promote", () => promote(context)),
-    vscode.commands.registerCommand("messagefoundry.showAiPolicy", () => showAiPolicy()),
+    vscode.commands.registerCommand("messagefoundry.showAiPolicy", () => showAiPolicy(context)),
   );
 
   // Re-validate + refresh the graph (and thus completion names) whenever a Python file is saved.
+  // Skip when exec is gated (untrusted workspace) — cli.run() would refuse anyway; the early return
+  // just avoids a noisy error toast on every save (SEC-004).
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument((doc) => {
+      if (isExecGated()) {
+        return;
+      }
       if (doc.languageId === "python") {
         void validator.run();
         void graph.refresh();
@@ -221,7 +230,10 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
-  if (workspaceDir()) {
+  // Auto-run the CLI on activation only in a trusted workspace — never launch a workspace-supplied
+  // interpreter just because the folder was opened (SEC-004). The cli.ts gate also enforces this;
+  // this early return avoids firing three failing CLI calls in an untrusted workspace.
+  if (workspaceDir() && !isExecGated()) {
     void validator.run();
     void graph.refresh();
     void codeSets.refresh();

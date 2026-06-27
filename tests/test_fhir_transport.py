@@ -224,6 +224,49 @@ def test_resolve_non_json_body_is_permanent() -> None:
     assert ei.value.permanent is True
 
 
+# --- SSRF / path-redirection hardening (SEC-010) -----------------------------
+
+
+def test_resolve_rejects_path_traversal_resource_type() -> None:
+    # A resourceType carrying path metacharacters ('/', '..', '$') must dead-letter, never redirect the
+    # PHI-bearing write to a different path/operation on the same allow-listed host.
+    body = json.dumps({"resourceType": "Patient/../$reindex", "id": "p-1"})
+    with pytest.raises(NegativeAckError) as ei:
+        _dest(interaction="create")._resolve_request(body)
+    assert ei.value.permanent is True
+
+
+def test_resolve_rejects_metachar_id() -> None:
+    for bad in ("../$reindex", "a/b", "p?_query=1", "p#frag"):
+        body = json.dumps({"resourceType": "Patient", "id": bad})
+        with pytest.raises(NegativeAckError) as ei:
+            _dest(interaction="update")._resolve_request(body)
+        assert ei.value.permanent is True
+
+
+def test_resolve_encodes_segments() -> None:
+    # A benign id needing no encoding under the FHIR grammar produces the expected URL (no over-encoding),
+    # proving the grammar gate + quote round-trips a valid id.
+    body = json.dumps({"resourceType": "Patient", "id": "abc.123-DEF"})
+    method, url, extra = _dest(interaction="update")._resolve_request(body)
+    assert (method, url, extra) == ("PUT", f"{BASE}/Patient/abc.123-DEF", {})
+    # An id that was previously accepted (control-char-free) but carries a path separator is now rejected,
+    # confirming the grammar gate closed the redirection vector.
+    redir = json.dumps({"resourceType": "Patient", "id": "p/../$op"})
+    with pytest.raises(NegativeAckError):
+        _dest(interaction="update")._resolve_request(redir)
+
+
+def test_if_match_version_rejects_metachars() -> None:
+    # A meta.versionId carrying a '"' or '/' could break out of the W/"..." ETag — gate it to the id
+    # grammar (control-char-free but metachar-bearing must still be rejected).
+    for bad in ('3"evil', "3/../x"):
+        body = json.dumps({"resourceType": "Patient", "id": "p-1", "meta": {"versionId": bad}})
+        with pytest.raises(NegativeAckError) as ei:
+            _dest(conditional="if-match")._resolve_request(body)
+        assert ei.value.permanent is True
+
+
 # --- OperationOutcome / status classification -------------------------------
 
 

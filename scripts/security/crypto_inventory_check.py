@@ -41,6 +41,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/service.py": frozenset({"secrets"}),
     "messagefoundry/auth/tokens.py": frozenset({"hashlib", "secrets"}),
     "messagefoundry/auth/totp.py": frozenset({"hashlib", "hmac", "secrets"}),
+    # ADR 0041 (D1): SHA-256 content fingerprint of a loaded config bundle, recorded in the
+    # config_reload audit to bind reviewed-commit -> loaded-bytes (integrity/attribution, not a secret).
+    "messagefoundry/config/fingerprint.py": frozenset({"hashlib"}),
     "messagefoundry/config/tls_policy.py": frozenset({"ssl"}),
     "messagefoundry/config/wiring.py": frozenset({"hashlib"}),
     # CONSOLE-3: the console verifies the engine API server cert — the OS trust store
@@ -58,6 +61,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     # STOW-RS body, generated absent from the object bytes (RFC 2046 §5.1.1) — framing, not a secret.
     "messagefoundry/transports/dicomweb.py": frozenset({"secrets"}),
     "messagefoundry/transports/mllp.py": frozenset({"ssl"}),
+    # SEC-001 (CWE-295): FTPS (ftplib.FTP_TLS) builds a verifying ssl.create_default_context() for the
+    # remote-file connector's TLS control/data channel; CERT_NONE only under the insecure_tls_allowed()
+    # escape, mirroring mllp.py's outbound posture.
+    "messagefoundry/transports/remotefile.py": frozenset({"ssl"}),
     "messagefoundry/transports/rest.py": frozenset({"ssl"}),
     "messagefoundry/transports/signing.py": frozenset({"cryptography"}),
     # ADR 0024: a random `jti` for the SMART Backend Services client_assertion JWT (the JWT signing

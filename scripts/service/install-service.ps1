@@ -30,6 +30,13 @@ param(
     # LocalSystem (NSSM default) and a warning is printed. See docs/SERVICE.md.
     [string]$ServiceAccount,
     [SecureString]$ServiceAccountPassword,
+    # Opt-in: strip inherited ACEs from the config dir and lock it to SYSTEM + Administrators + the
+    # service account (RX). The in-process source-trust guard (SEC-003) refuses to load config from a
+    # dir/module a low-privileged principal can write, so this one flag satisfies that requirement.
+    # Default OFF because the config dir often lives inside a developer's repo, where stripping
+    # inheritance is surprising; for production point -Config at a dedicated admin-owned dir and pass
+    # this switch (see docs/SERVICE.md "Restrict the config directory").
+    [switch]$LockConfigDir,
     [ValidateSet("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")]
     [string]$LogLevel = "INFO",
     # Active environment NAME (ADR 0017): selects environments/<name>.toml + the instance's PHI
@@ -121,6 +128,30 @@ function Set-ConfigReadAcl {
     }
 }
 
+function Set-SecureConfigAcl {
+    <#
+      Lock the config directory down to SYSTEM + Administrators (+ the service account, RX), STRIPPING
+      inherited ACEs (/inheritance:r). The in-process source-trust guard (SEC-003) refuses to load any
+      config dir/module a broad/low-privilege principal can write, so this brings the on-disk ACL into
+      line with what the runtime enforces - inherited write/modify ACEs (e.g. from a parent profile or
+      ProgramData) are removed. Opt-in via -LockConfigDir because the config dir often lives in a repo
+      where stripping inheritance is surprising. Mirrors Set-SecureDataDirAcl: well-known SIDs (non-
+      English Windows), best-effort (warn, never abort).
+    #>
+    param([Parameter(Mandatory)][string]$Path, [string]$Account)
+    # *S-1-5-18 = SYSTEM, *S-1-5-32-544 = Administrators. Full control, inherited (OI)(CI) by children.
+    $grants = @("*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F")
+    # Service account: read+execute only (it loads, never writes, config) - matches the runtime guard,
+    # which treats a non-owner/non-admin WRITE grant as a refusal but allows read/execute.
+    if ($Account) { $grants += "${Account}:(OI)(CI)RX" }
+    & icacls $Path /inheritance:r /grant:r @grants | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning ("Could not lock down the config dir '$Path' (icacls exit $LASTEXITCODE); a " +
+            "low-privileged principal with write would cause the engine to REFUSE to load it (SEC-003, " +
+            "docs/SERVICE.md). Lock it manually or re-run elevated.")
+    }
+}
+
 # --- preflight ---------------------------------------------------------------
 
 # Active environment is REQUIRED (ADR 0017): `serve` won't start without it, so refuse early with a
@@ -165,7 +196,23 @@ New-Item -ItemType Directory -Force -Path $LogDir  | Out-Null
 Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount
 # Least-privilege (WP-11d): when running under a dedicated account, grant it read on the config dir so
 # it can actually load the config modules / DPAPI key file (LocalSystem already has access).
-if ($ServiceAccount) { Set-ConfigReadAcl -Path $Config -Account $ServiceAccount }
+# Config-source trust (SEC-003): -LockConfigDir strips inherited ACEs and locks the dir to SYSTEM/
+# Administrators (+ the account, RX), satisfying the in-process guard that refuses a config dir/module
+# any low-privilege principal can write. Without the switch we stay additive and WARN that the guard
+# will refuse to load if an inherited write ACE survives.
+if ($LockConfigDir) {
+    Set-SecureConfigAcl -Path $Config -Account $ServiceAccount
+    $cfgGrantees = if ($ServiceAccount) { "SYSTEM/Administrators (F) + $ServiceAccount (RX)" }
+                   else { "SYSTEM/Administrators (F)" }
+    Write-Host "  Config : locked to $cfgGrantees; inheritance disabled (SEC-003)."
+} else {
+    if ($ServiceAccount) { Set-ConfigReadAcl -Path $Config -Account $ServiceAccount }
+    Write-Warning ("The config dir '$Config' still inherits its parent's ACL. The engine's in-process " +
+        "source-trust guard (SEC-003) will REFUSE to load if a low-privileged principal (Everyone, " +
+        "Authenticated Users, Users, or any non-admin) has write/modify on the dir or any *.py in it. " +
+        "Re-run with -LockConfigDir, or point -Config at a dedicated admin-owned dir; see docs/SERVICE.md " +
+        "'Restrict the config directory'.")
+}
 
 $StdoutLog = Join-Path $LogDir "service.out.log"
 $StderrLog = Join-Path $LogDir "service.err.log"

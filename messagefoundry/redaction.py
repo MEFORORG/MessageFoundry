@@ -10,9 +10,12 @@ it, so HL7-structured content is scrubbed while the exception **type** (the usef
 kept.
 
 This is a conservative *redaction* of HL7-shaped content — **not** de-identification (that is a
-separate, centralized framework; see PHI.md §9). It errs toward over-redaction; the residual control
-for free-text PHI a user script invents (e.g. a bare ``"DOE^JANE"``) remains the "never put PHI in an
-exception message" convention. Pure stdlib (``re`` only), so it can be used from any engine package.
+separate, centralized framework; see PHI.md §9). It errs toward over-redaction. Beyond HL7-shaped
+spans it also applies a **conservative free-text heuristic** (date/DOB runs + multi-token name runs;
+see :func:`redact`), so a delimiter-free leak like ``raise ValueError("patient DOE JANE dob 1980-05-05
+not found")`` is narrowed too. The residual is now an adversarially-crafted *single-token* or non-name-
+shaped identifier, for which the "never put PHI in an exception message" convention remains the control.
+Pure stdlib (``re`` only), so it can be used from any engine package.
 """
 
 from __future__ import annotations
@@ -37,15 +40,42 @@ _HL7_SEGMENT = re.compile(r"\b([A-Z][A-Z0-9]{2})\|[^\r\n]*")
 #: (e.g. ``"a"*5000`` in a hostile exception string) can't trigger quadratic backtracking.
 _HL7_FIELD_RUN = re.compile(r"[^\s|^~&]*+[|^~&][^\s|^~&]*+(?:[|^~&][^\s|^~&]*+)+")
 
+#: A **date / birthdate run** in free text: an ISO ``YYYY-MM-DD`` / US ``MM-DD-YYYY`` (``-`` or ``/``
+#: separator) or a bare HL7 8-digit ``YYYYMMDD``. A DOB is a direct identifier, and a free-text leak like
+#: ``"... dob 1980-05-05 ..."`` carries no HL7 delimiter, so :func:`_HL7_FIELD_RUN` misses it. The
+#: alternatives use fixed-width digit runs (no unbounded repetition), so the scan stays linear.
+_DATE_RUN = re.compile(
+    r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b|\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b|\b(?:19|20)\d{6}\b"
+)
+#: A **multi-token name run**: 2–4 adjacent ``Capitalized`` (a capital then lowercase) *or* ``ALLCAPS``
+#: tokens — e.g. ``DOE JANE`` / ``Doe Jane``. Requiring **≥2** adjacent tokens is deliberate: a single
+#: capitalized operational word (``Connection``, ``Timeout``, ``ValueError``, a logger/class name) is
+#: NOT touched, so ordinary ops text survives; CamelCase-without-a-space is likewise untouched. Bounded
+#: ``{1,3}`` repetition over disjoint char classes keeps the scan linear (no catastrophic backtracking),
+#: mirroring the linear-scan rationale on :data:`_HL7_FIELD_RUN`. The literal ``[redacted]`` token can
+#: never re-match (its lowercase-led ``[redacted]`` is a single token wrapped in brackets, not a ≥2-token
+#: run), so :func:`redact` stays a fixed point.
+_NAME_RUN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b|\b[A-Z]{2,}(?:\s+[A-Z]{2,}){1,3}\b")
+
 
 def redact(text: str) -> str:
-    """Scrub HL7 segment/field content (potential PHI) from free text, keeping segment IDs. Conservative
-    (errs toward over-redaction); the goal is that a raw HL7 body embedded in an exception message can't
-    reach a log or the stored ``last_error``/``detail``. NOT de-identification (PHI.md §9)."""
+    """Scrub HL7 segment/field content (potential PHI) from free text, keeping segment IDs, then apply a
+    conservative free-text heuristic for delimiter-free identifiers. Conservative (errs toward over-
+    redaction); the goal is that a raw HL7 body — or a free-text name/DOB — embedded in an exception
+    message can't reach a log or the stored ``last_error``/``detail``. NOT de-identification (PHI.md §9).
+
+    Order matters: HL7-shaped content (:data:`_HL7_SEGMENT`, then :data:`_HL7_FIELD_RUN`) is handled
+    first, so the free-text passes (:data:`_DATE_RUN`, then :data:`_NAME_RUN`) only see delimiter-free
+    text. The free-text heuristic narrows the prior residual to adversarial *single-token* identifiers
+    (a lone name with no second token, no date) — for which the "never put PHI in an exception message"
+    convention remains the control. Idempotent: the literal ``[redacted]`` substituted in never re-
+    matches any pattern, so ``redact(redact(x)) == redact(x)``."""
     if not text:
         return text
     scrubbed = _HL7_SEGMENT.sub(lambda m: f"{m.group(1)}|{_REDACTED}", text)
-    return _HL7_FIELD_RUN.sub(_REDACTED, scrubbed)
+    scrubbed = _HL7_FIELD_RUN.sub(_REDACTED, scrubbed)
+    scrubbed = _DATE_RUN.sub(_REDACTED, scrubbed)
+    return _NAME_RUN.sub(_REDACTED, scrubbed)
 
 
 def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:

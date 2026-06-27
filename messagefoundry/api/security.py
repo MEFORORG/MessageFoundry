@@ -55,7 +55,11 @@ def bearer_token(request: Request) -> str | None:
 def _client_ip(request: Request) -> str | None:
     """The caller's client address, matching how login records it on the session (``_client`` in
     ``auth_routes``). Used by the WP-L3-13 new-client-IP risk signal so the comparison is
-    apples-to-apples. (Forwarded-header resolution behind a trusted proxy is WP-15, not yet built.)"""
+    apples-to-apples. Behind a declared trusted proxy this already resolves to the real client:
+    uvicorn runs with ``forwarded_allow_ips = settings.api.trusted_proxies`` (``__main__.py``;
+    defaults to ``[]`` = trust nothing), and an off-loopback proxied bind is gated to require it. The
+    residual is the inherent limit that an in-process per-IP limiter cannot stop pure source-IP
+    rotation by a directly-reachable attacker (SEC-024)."""
     return request.client.host if request.client else None
 
 

@@ -4,14 +4,14 @@
     "body": [
       "inbound(\"${1:name}\", MLLP(host=\"0.0.0.0\", port=${2:2575}), router=\"${3:router_name}\")"
     ],
-    "description": "Declare an inbound MessageFoundry connection"
+    "description": "Scaffold · Inbound connection"
   },
   "MEFOR outbound connection": {
     "prefix": "meforoutbound",
     "body": [
       "outbound(\"${1:name}\", File(directory=\"${2:./out}\", filename=\"{MSH-10}.hl7\"))"
     ],
-    "description": "Declare an outbound MessageFoundry connection"
+    "description": "Scaffold · Outbound connection"
   },
   "MEFOR router": {
     "prefix": "meforrouter",
@@ -22,7 +22,7 @@
       "\t\treturn []  # routed nowhere -> UNROUTED",
       "\treturn [\"${4:handler_name}\"]"
     ],
-    "description": "Define a MessageFoundry Router"
+    "description": "Scaffold · Router"
   },
   "MEFOR handler": {
     "prefix": "meforhandler",
@@ -32,6 +32,114 @@
       "\t${3:# filter / transform}",
       "\treturn Send(\"${4:outbound_name}\", msg)"
     ],
-    "description": "Define a MessageFoundry Handler"
+    "description": "Scaffold · Handler"
+  },
+  "MEFOR read a field": {
+    "prefix": "meforget",
+    "body": [
+      "${1:value} = msg[\"${2:PID-3.1}\"]"
+    ],
+    "description": "Field · Read a field (None if absent)"
+  },
+  "MEFOR set a field": {
+    "prefix": "meforset",
+    "body": [
+      "msg[\"${1:PID-3.1}\"] = \"${2:value}\""
+    ],
+    "description": "Field · Set a field value"
+  },
+  "MEFOR copy a field": {
+    "prefix": "meforcopy",
+    "body": [
+      "msg[\"${1:dest path}\"] = msg[\"${2:source path}\"] or \"\""
+    ],
+    "description": "Field · Copy one field into another"
+  },
+  "MEFOR add a repetition": {
+    "prefix": "meforaddrep",
+    "body": [
+      "msg.add_repetition(\"${1:PID-3}\", \"${2:value}\")"
+    ],
+    "description": "Field · Append a ~ repetition to a field"
+  },
+  "MEFOR add a segment": {
+    "prefix": "meforaddseg",
+    "body": [
+      "msg.add_segment(\"${1:ZAL|1|note}\")"
+    ],
+    "description": "Field · Add a whole segment (e.g. a Z-segment)"
+  },
+  "MEFOR if / else on a field": {
+    "prefix": "meforif",
+    "body": [
+      "if msg[\"${1:MSH-9.1}\"] == \"${2:ADT}\":",
+      "\t${3:pass}",
+      "else:",
+      "\t${4:pass}"
+    ],
+    "description": "Decision · Branch on a field value"
+  },
+  "MEFOR filter (drop the message)": {
+    "prefix": "meforfilter",
+    "body": [
+      "if ${1:not_wanted}:",
+      "\treturn None  # FILTERED — dropped (still logged)"
+    ],
+    "description": "Decision · Filter: drop the message"
+  },
+  "MEFOR loop over repetitions": {
+    "prefix": "meforforrep",
+    "body": [
+      "for ${1:rep} in msg.repetitions(\"${2:PID-3}\"):",
+      "\t${3:pass}"
+    ],
+    "description": "Loop · Iterate a field's ~ repetitions"
+  },
+  "MEFOR loop over segment occurrences": {
+    "prefix": "meforforseg",
+    "body": [
+      "for i in range(1, msg.count_segments(\"${1:OBX}\") + 1):",
+      "\t${2:value} = msg.field(\"${3:OBX-5}\", occurrence=i)"
+    ],
+    "description": "Loop · Iterate each occurrence of a segment"
+  },
+  "MEFOR code-set lookup": {
+    "prefix": "meforcodelookup",
+    "body": [
+      "${1:result} = code_set(\"${2:table}\").get(msg[\"${3:OBX-3.1}\"])",
+      "if ${1:result} is not None:",
+      "\tmsg[\"${4:OBX-3.2}\"] = ${1:result}"
+    ],
+    "description": "Lookup · Translate a code via a code set (no write on miss)"
+  },
+  "MEFOR database lookup": {
+    "prefix": "mefordblookup",
+    "body": [
+      "rows = db_lookup(\"${1:connection}\", \"SELECT ${2:name} FROM ${3:patients} WHERE ${4:mrn} = :${4:mrn}\", {\"${4:mrn}\": msg[\"${5:PID-3.1}\"]})",
+      "if rows:",
+      "\t${6:value} = rows[0][\"${2:name}\"]"
+    ],
+    "description": "Lookup · Live read-only DB lookup (Handler only)"
+  },
+  "MEFOR convert a timestamp": {
+    "prefix": "mefordate",
+    "body": [
+      "msg[\"${1:OBR-7}\"] = convert_hl7_timestamp(msg[\"${1:OBR-7}\"] or \"\", \"${2:America/Chicago}\")"
+    ],
+    "description": "Date · Convert / re-timezone an HL7 timestamp"
+  },
+  "MEFOR send to an outbound": {
+    "prefix": "meforsend",
+    "body": [
+      "return Send(\"${1:outbound_name}\", msg)"
+    ],
+    "description": "Send · Return a Send to one outbound"
+  },
+  "MEFOR split a batch and send each": {
+    "prefix": "meforsplit",
+    "body": [
+      "return [Send(\"${1:outbound_name}\", part) for part in split_by_obr(msg)]"
+    ],
+    "description": "Send · Split a batch by OBR and send each"
   }
 }

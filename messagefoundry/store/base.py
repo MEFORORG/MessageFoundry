@@ -70,6 +70,11 @@ class StoreLifecycle(Protocol):
 
     path: str
 
+    #: Which configured backend this handle is (``StoreSettings.backend``). Self-describing so a
+    #: capability gate (e.g. the PT allow-list in ``Engine.start``) can name the backend in its error
+    #: without re-threading ``StoreSettings`` through the engine.
+    backend: StoreBackend
+
     async def close(self) -> None: ...
 
 
@@ -92,6 +97,14 @@ class QueueStore(StoreLifecycle, Protocol):
     #: ``False`` makes the runner reject a capturing outbound at start (fail-closed) rather than drop
     #: captures.
     supports_response_capture: bool
+
+    #: Whether this backend implements pass-through (PT) re-ingress — the ``pt_deliveries`` branch of
+    #: :meth:`transform_handoff` (ConnectorType.PT, ADR 0013 generalized). **Allow-list semantics:**
+    #: ``False`` by default (this base, Postgres, SQL Server, and any future backend), ``True`` only on
+    #: the SQLite backend that ships the slice. The engine rejects a graph containing a PT inbound at
+    #: startup on any ``False`` backend (see :meth:`Engine.start`), so a Handler ``Send`` into a PT
+    #: connector can never reach the unimplemented ``transform_handoff`` branch at runtime.
+    supports_pt_reingress: bool = False
 
     # --- write path ----------------------------------------------------------
     async def enqueue_message(
@@ -183,6 +196,8 @@ class QueueStore(StoreLifecycle, Protocol):
         channel_id: str,
         deliveries: Sequence[tuple[str, str]],
         state_ops: Sequence[tuple[str, str, Any]] = (),
+        pt_deliveries: Sequence[tuple[str, str]] = (),
+        correlation_depth_cap: int = 8,
         now: float | None = None,
     ) -> bool:
         """Advance one handler assignment from the **routed** stage to outbound in one transaction (the
@@ -192,7 +207,12 @@ class QueueStore(StoreLifecycle, Protocol):
         disposition (this method never writes ``messages.status`` directly). The state writes commit
         atomically with the outbound rows, so a crash before commit leaves no state and a re-run applies
         them exactly-once (preserving the pure-re-run invariant). Idempotent against worker restart —
-        ``False`` if the routed row was already consumed."""
+        ``False`` if the routed row was already consumed.
+
+        ``pt_deliveries`` (ADR 0013, generalized) are ``(pass_through_inbound_name, body)`` Sends into an
+        internal pass-through inbound: each produces a new INGRESS-stage child message on the PT channel
+        **in this same transaction** (re-routed by the PT inbound's own router), bounded by
+        ``correlation_depth_cap``. Empty ``pt_deliveries`` is byte-identical to the pre-feature path."""
         ...
 
     def state_view(self) -> Mapping[tuple[str, str], Any]:
@@ -524,11 +544,19 @@ class QueueStore(StoreLifecycle, Protocol):
         kinds: Sequence[str] | None = None,
         since: float | None = None,
         limit: int = 100,
+        allowed_channels: Sequence[str] | None = None,
     ) -> list[ConnectionEvent]:
         """Read connection events newest-first, optionally filtered by ``connection``, an ``kinds``
         allow-set, and a ``since`` timestamp. ``reason`` is decrypted at the boundary. The read accessor
         for the engine ``GET /events`` route + the deferred console "Event Log" page; runs on the
-        lockfree read path. ``limit`` is clamped server-side."""
+        lockfree read path. ``limit`` is clamped server-side.
+
+        ``allowed_channels`` applies the same per-channel RBAC scope as :meth:`list_dead` /
+        :meth:`list_messages`: ``None`` = all channels (no restriction); a set restricts the read to
+        **inbound**-direction events whose ``connection`` is in the allow-set, and **excludes every
+        outbound-direction event** (an outbound spans channels, so a channel-scoped caller must not see
+        shared-outbound topology — the same boundary ``connection_metadata``/``test``/``purge`` enforce);
+        an empty set matches nothing."""
         ...
 
     async def stats(self) -> dict[str, int]: ...

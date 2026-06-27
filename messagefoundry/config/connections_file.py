@@ -91,6 +91,7 @@ _INBOUND_KEYS = frozenset(
         "source_ip_allowlist",
         "capture_ack",
         "capture_connection_errors",
+        "shard",
     }
 )
 _OUTBOUND_KEYS = frozenset(
@@ -162,6 +163,7 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         source_ip_allowlist=_optional_str_list(table, "source_ip_allowlist", where),
         capture_ack=_optional_bool(table, "capture_ack", where),
         capture_connection_errors=_optional_bool(table, "capture_connection_errors", where),
+        shard=_optional_str(table, "shard", where),
         source_file=source,
         source_line=None,
     )

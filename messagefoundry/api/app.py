@@ -123,7 +123,14 @@ from messagefoundry.config.settings import (
     StoreBackend,
     StoreSettings,
 )
-from messagefoundry.config.wiring import EnvRef, WiringError, load_config, redacted_settings
+from messagefoundry.config.fingerprint import config_fingerprint_detail
+from messagefoundry.config.wiring import (
+    EnvRef,
+    Registry,
+    WiringError,
+    load_config,
+    redacted_settings,
+)
 from messagefoundry.last_resort import install_loop_exception_handler
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
 from messagefoundry.pipeline.alert_sinks import notifier_from_settings
@@ -145,7 +152,7 @@ _RATE_WINDOW = 60.0  # seconds; window for the backlog throughput estimate
 _MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024  # 1 MiB cap on HTTP request bodies (API-INPUT)
 _CONNECTION_TEST_TIMEOUT = 35.0  # overall cap for a POST /connections/{name}/test probe (seconds)
 _MAX_WS_CONNECTIONS = 64  # cap concurrent /ws/stats sockets (API-WS)
-_WS_REVALIDATE_SECONDS = 30.0  # re-check the session on an open /ws/stats this often (API-WS)
+_WS_REVALIDATE_SECONDS = 3.0  # re-check the session on an open /ws/stats this often (API-WS)
 _log = logging.getLogger(__name__)
 
 
@@ -619,12 +626,14 @@ def create_app(
     @app.get("/channels", response_model=list[ChannelInfo])
     async def list_channels(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> list[ChannelInfo]:
         """Inbound connections as ChannelInfo (id = connection name) for the Log Search filter."""
         runner = engine.registry_runner
         if runner is None:
             return []
+        # Per-channel RBAC: a channel-scoped caller sees only their own inbound connections (the same
+        # tenant-isolation boundary connection_metadata/test/purge enforce); an unscoped caller sees all.
         return [
             ChannelInfo(
                 id=name,
@@ -635,6 +644,7 @@ def create_app(
                 destinations=[],
             )
             for name, ic in runner.registry.inbound.items()
+            if identity.can_access_channel(name)
         ]
 
     # --- connections (per-endpoint dashboard) --------------------------------
@@ -642,9 +652,14 @@ def create_app(
     @app.get("/connections", response_model=list[ConnectionRow])
     async def list_connections(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> list[ConnectionRow]:
         now = time.time()
+        # Per-channel RBAC: a channel-scoped caller sees only the source rows of their own inbound
+        # connections; shared-outbound (destination/degraded) rows are suppressed entirely, since an
+        # outbound spans channels — the same boundary connection_metadata/test/purge enforce. An
+        # unscoped caller (allowed_channels is None) sees the full estate, unchanged.
+        scoped = identity.allowed_channels is not None
         # Offset-adjusted: subtracts any operator stats-resets (in-memory baselines). Identical to the
         # raw store metrics when nothing has been reset.
         metrics = await engine.connection_metrics_view(now=now, rate_window=_RATE_WINDOW)
@@ -657,6 +672,8 @@ def create_app(
             reg = rr.registry
             rstatus = "running" if rr.running else "stopped"
             for iname, ic in reg.inbound.items():
+                if not identity.can_access_channel(iname):
+                    continue  # per-channel RBAC: hide an inbound outside the caller's scope
                 inb = metrics.inbound.get(iname)
                 speer, sport = _peer_port(ic.spec.type.value, ic.spec.settings)
                 ifail = rr.connection_failed(iname)  # ADR 0031: start failed → not listening
@@ -691,6 +708,10 @@ def create_app(
             for (cid, dname), dm in metrics.destinations.items():
                 if cid not in reg.inbound:
                     continue  # a declarative-channel edge, already emitted above
+                if scoped:
+                    # A channel-scoped user must not see shared-outbound topology (peer IP/port/state) —
+                    # the same denial connection_metadata/test/purge apply to a shared outbound.
+                    continue
                 emitted_dests.add(dname)
                 oc = reg.outbound.get(dname)
                 dfail = rr.connection_failed(dname)  # ADR 0031: built? or degraded?
@@ -735,6 +756,8 @@ def create_app(
             # routed to it, so it would be invisible above. Emit a standalone row for every still-failed
             # outbound not already shown, so a degraded lane is never silently hidden from the dashboard.
             for dname, reason in rr.degraded_connections().items():
+                if scoped:
+                    continue  # channel-scoped users never see shared-outbound topology (see above)
                 oc = reg.outbound.get(dname)
                 if oc is None or dname in emitted_dests:
                     continue  # inbound failures appear as their source row; shown dests are covered
@@ -1005,7 +1028,7 @@ def create_app(
     @app.get("/events", response_model=list[ConnectionEventInfo])
     async def list_connection_events(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require(Permission.MONITORING_READ)),
         connection: str | None = Query(None, max_length=256),
         kind: list[str] | None = Query(None),
         since: float | None = Query(None, ge=0),
@@ -1014,8 +1037,17 @@ def create_app(
         """The Corepoint-style connection/transport event log (#46), newest first — **metadata only,
         no PHI**, so it is gated by ``monitoring:read`` (not the PHI-read tier). Optionally filtered by
         ``connection``, one-or-more event ``kind``s, and a ``since`` epoch timestamp."""
+        # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
+        # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
+        if connection is not None and not identity.can_access_channel(connection):
+            await _audit_channel_denied(engine, identity, connection)
+            raise HTTPException(403, "connection is outside your channel scope")
         rows = await engine.store.list_connection_events(
-            connection=connection, kinds=kind, since=since, limit=limit
+            connection=connection,
+            kinds=kind,
+            since=since,
+            limit=limit,
+            allowed_channels=_scope(identity),
         )
         return [_conn_event_info(r) for r in rows]
 
@@ -1023,14 +1055,22 @@ def create_app(
     async def list_connection_events_for(
         name: str,
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require(Permission.MONITORING_READ)),
         kind: list[str] | None = Query(None),
         since: float | None = Query(None, ge=0),
         limit: int = Query(100, ge=1, le=1000),
     ) -> list[ConnectionEventInfo]:
         """The connection/transport event log scoped to one connection (#46), newest first."""
+        # Per-channel RBAC: 403 + audit an out-of-scope name (an outbound name isn't a channel a scoped
+        # user can access, so this also denies shared-outbound topology); the store scope is defense-in-
+        # depth on top of the guard.
+        await _control_guard(engine, identity, name)
         rows = await engine.store.list_connection_events(
-            connection=name, kinds=kind, since=since, limit=limit
+            connection=name,
+            kinds=kind,
+            since=since,
+            limit=limit,
+            allowed_channels=_scope(identity),
         )
         return [_conn_event_info(r) for r in rows]
 
@@ -1216,6 +1256,18 @@ def create_app(
                 ),
             )
             raise HTTPException(422, "invalid configuration") from exc
+        # Bind "what loaded" to a reviewable content digest (ADR 0041 D1): the prior detail recorded
+        # only counts, so two reloads of the same dir with different on-disk code were
+        # indistinguishable. Computed off the event loop (it reads files) and best-effort — a
+        # fingerprint failure must never block the audit of a successful reload.
+        fingerprint: dict[str, object] = {}
+        if engine.last_reload_dir is not None:
+            try:
+                fingerprint = await asyncio.to_thread(
+                    config_fingerprint_detail, engine.last_reload_dir
+                )
+            except OSError as exc:  # unreadable dir mid-reload — degrade, don't fail the audit
+                _log.warning("config fingerprint failed for %s: %s", engine.last_reload_dir, exc)
         await engine.store.record_audit(
             "config_reload_check" if req.dry_run else "config_reload",
             actor=user.username,
@@ -1225,6 +1277,7 @@ def create_app(
                     "inbound": len(registry.inbound),
                     "outbound": len(registry.outbound),
                     "dry_run": req.dry_run,
+                    **fingerprint,
                 }
             ),
         )
@@ -1649,17 +1702,35 @@ def create_app(
         token = ws_token(websocket)
         await websocket.accept()
         state.ws_count = getattr(state, "ws_count", 0) + 1
-        elapsed = 0.0
+
+        async def _still_authorized() -> bool:
+            """Re-validate the open socket's session (revocation/expiry/disable/downgrade/password-
+            change) without resetting the idle clock. True when no auth is enforced."""
+            if auth is None or not auth.enabled:
+                return True
+            # activity=False: this keepalive must not reset the session's idle clock.
+            current = await auth.identity_for_token(token, activity=False)
+            return (
+                current is not None
+                and current.has(Permission.MONITORING_READ)
+                and not current.must_change_password
+            )
+
         try:
+            # Re-check BEFORE the first push: a token revoked between the handshake authorize and
+            # accept() must not get even one frame (close the pre-first-send window — SEC-018).
+            if not await _still_authorized():
+                await websocket.close(code=1008)
+                return
+            last_revalidate = time.monotonic()
             while True:
                 await websocket.send_json({"outbox_by_status": await engine_obj.store.stats()})
                 await asyncio.sleep(1.0)
-                elapsed += 1.0
-                if auth is not None and auth.enabled and elapsed >= _WS_REVALIDATE_SECONDS:
-                    elapsed = 0.0
-                    # activity=False: this keepalive must not reset the session's idle clock.
-                    current = await auth.identity_for_token(token, activity=False)
-                    if current is None or not current.has(Permission.MONITORING_READ):
+                # Revalidate on an elapsed-time cadence (independent of the per-second send), so a
+                # revoked/downgraded token stops streaming within ~_WS_REVALIDATE_SECONDS.
+                if time.monotonic() - last_revalidate >= _WS_REVALIDATE_SECONDS:
+                    last_revalidate = time.monotonic()
+                    if not await _still_authorized():
                         await websocket.close(code=1008)
                         return
         except WebSocketDisconnect:
@@ -1679,11 +1750,22 @@ def _emit_bootstrap_admin(bootstrap: BootstrapAdmin, store_settings: StoreSettin
     """
     base = Path(store_settings.path or ".").resolve()
     secret_file = base.parent / "bootstrap-admin.txt"
-    secret_file.write_text(
-        f"username: {bootstrap.username}\npassword: {bootstrap.password}\n", encoding="utf-8"
-    )
-    # Reuse the store's platform-correct primitive: os.chmod(0o600) is a no-op on Windows (the NSSM
-    # deployment target), so _secure_file sets an owner-only DACL via icacls there, chmod on POSIX.
+    body = f"username: {bootstrap.username}\npassword: {bootstrap.password}\n"
+    # Create the file owner-only from the instant it exists, closing the POSIX create-then-chmod TOCTOU
+    # (SEC-020): O_EXCL + 0o600 means the secret is never group/world-readable even momentarily, and
+    # O_EXCL also refuses to follow a pre-planted symlink/file at that path. A second service start
+    # before the operator deletes the prior file would hit FileExistsError — remove the stale file we
+    # own, then re-create exclusively.
+    flags = os.O_CREAT | os.O_WRONLY | os.O_EXCL | os.O_TRUNC
+    try:
+        fd = os.open(str(secret_file), flags, 0o600)
+    except FileExistsError:
+        secret_file.unlink()  # the prior owner-only file we wrote; replace it under the same mode
+        fd = os.open(str(secret_file), flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    # On Windows os.open's mode is minimal, so still apply the icacls owner-only DACL (the store's
+    # platform-correct primitive: chmod on POSIX is a no-op here since O_EXCL already set 0o600).
     _secure_file(secret_file)
     _log.warning(
         "Created bootstrap admin %r; one-time password written to %s — sign in, change it, then "
@@ -1746,6 +1828,7 @@ def create_managed_app(
     approvals_settings: ApprovalsSettings | None = None,
     expose_docs: bool = False,
     ws_allowed_origins: Sequence[str] = (),
+    registry_filter: Callable[[Registry], Registry] | None = None,
 ) -> FastAPI:
     """Build an app that owns its engine for its whole lifespan (CLI server / sync tests).
 
@@ -1756,6 +1839,9 @@ def create_managed_app(
     backend-agnostic :func:`~messagefoundry.store.open_store`. ``api_listener`` is the engine's own
     ``(host, port)`` (from ``[api]``), reserved so no inbound listener can be wired onto the API's port
     — the CLI server passes it; in-process/test callers omit it (no separate API socket is bound).
+    ``registry_filter`` (L3 sharding) is an optional pure transform applied to the loaded graph at
+    startup AND on every reload — ``serve --shard X`` passes ``filter_registry_for_shard(.., X)`` so
+    this process owns only shard X's inbounds; ``None`` = the whole graph (unchanged default).
     """
     if store_settings is None:
         if db_path is None:
@@ -1809,9 +1895,15 @@ def create_managed_app(
             env_values_provider=env_values_provider,
             coordinator=coordinator,
             cluster_settings=cluster_settings,
+            registry_filter=registry_filter,
         )
         if config_dir is not None:
-            engine.add_registry(load_config(config_dir))
+            loaded = load_config(config_dir)
+            # L3 sharding: a `serve --shard X` process owns only shard X's inbounds (the filter is
+            # re-applied on every reload inside the engine). None = the whole graph (unchanged default).
+            if registry_filter is not None:
+                loaded = registry_filter(loaded)
+            engine.add_registry(loaded)
         await engine.start()
         app.state.engine = engine
         app.state.store_settings = resolved  # back GET /security/posture (M5)

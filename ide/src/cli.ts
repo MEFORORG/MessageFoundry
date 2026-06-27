@@ -14,23 +14,55 @@ function config() {
   return vscode.workspace.getConfiguration("messagefoundry");
 }
 
-export function pythonPath(): string {
-  const configured = config().get<string>("pythonPath", "python");
-  if (configured && configured !== "python") {
-    return configured; // user set it explicitly — respect it
+/**
+ * Pure interpreter selection (testable without the Extension Host). An explicitly-configured
+ * interpreter is always honored verbatim. The default ("python") auto-detects a workspace-local
+ * `.venv`, but ONLY in a trusted workspace: a checked-in/cloned repo can ship a trojaned
+ * `.venv/Scripts/python.exe` (Windows) or `.venv/bin/python` (POSIX), and silently preferring that
+ * repo-supplied binary over PATH would let an untrusted workspace run arbitrary code on the first
+ * CLI launch (SEC-004, CWE-426). When untrusted, we skip the .venv probe and fall through to PATH.
+ */
+export function resolvePythonPath(opts: {
+  configured: string;
+  workspace: string | undefined;
+  isTrusted: boolean;
+  venvExists: (candidate: string) => boolean;
+  platform: NodeJS.Platform;
+}): string {
+  if (opts.configured && opts.configured !== "python") {
+    return opts.configured; // user set it explicitly — respect it
   }
-  // Default: auto-detect a workspace .venv so the CLI resolves with no config.
-  const ws = workspaceDir();
-  if (ws) {
+  // Default: auto-detect a workspace .venv so the CLI resolves with no config — but never trust a
+  // workspace-supplied interpreter in an untrusted workspace.
+  if (opts.workspace && opts.isTrusted) {
     const candidate =
-      process.platform === "win32"
-        ? path.join(ws, ".venv", "Scripts", "python.exe")
-        : path.join(ws, ".venv", "bin", "python");
-    if (fs.existsSync(candidate)) {
+      opts.platform === "win32"
+        ? path.join(opts.workspace, ".venv", "Scripts", "python.exe")
+        : path.join(opts.workspace, ".venv", "bin", "python");
+    if (opts.venvExists(candidate)) {
       return candidate;
     }
   }
   return "python";
+}
+
+export function pythonPath(): string {
+  return resolvePythonPath({
+    configured: config().get<string>("pythonPath", "python"),
+    workspace: workspaceDir(),
+    isTrusted: vscode.workspace.isTrusted,
+    venvExists: (candidate) => fs.existsSync(candidate),
+    platform: process.platform,
+  });
+}
+
+/**
+ * True when there IS a workspace and it is NOT trusted: in that state the CLI must not exec a
+ * (possibly repo-supplied) interpreter. run()/runJson() short-circuit on this rather than launching
+ * anything, so neither activation nor save-triggered refreshes can run a workspace binary (SEC-004).
+ */
+export function isExecGated(): boolean {
+  return Boolean(workspaceDir()) && !vscode.workspace.isTrusted;
 }
 
 export function configDir(): string {
@@ -47,20 +79,50 @@ export function engineUrl(): string {
   return config().get<string>("engineUrl", "http://127.0.0.1:8765");
 }
 
-export interface EnvironmentTarget {
+/** One addressable engine instance within an environment (e.g. a horizontal shard / replica). */
+export interface Shard {
   name: string;
   url: string;
 }
 
+export interface EnvironmentTarget {
+  name: string;
+  url: string;
+  /**
+   * Optional engine instances (shards/replicas) within this environment. When an environment defines
+   * ≥2, promote asks WHICH shard to deploy to and uses that shard's url; 0 or 1 behaves exactly as a
+   * shard-less environment (the single shard, or `url`, is used with no extra prompt). Additive and
+   * backward-compatible: an environment that omits `shards` is unchanged.
+   */
+  shards?: Shard[];
+}
+
+/** Drop malformed {name,url} entries from a raw config array (shared by environments()/shards()). */
+function validTargets<T extends { name: string; url: string }>(raw: unknown): T[] {
+  return Array.isArray(raw)
+    ? (raw.filter((e) => e && typeof e.name === "string" && typeof e.url === "string") as T[])
+    : [];
+}
+
 /**
- * Configured promote targets (DEV/PROD/…), each a {name, url}. Empty (the default) means "no named
- * environments" — promote then falls back to the single `engineUrl`. Malformed entries are dropped.
+ * Configured promote targets (DEV/PROD/…), each a {name, url[, shards]}. Empty (the default) means "no
+ * named environments" — promote then falls back to the single `engineUrl`. Malformed entries are
+ * dropped; each kept entry carries its validated `shards` (see shardsOf), if any.
  */
 export function environments(): EnvironmentTarget[] {
-  const raw = config().get<EnvironmentTarget[]>("environments", []);
-  return Array.isArray(raw)
-    ? raw.filter((e) => e && typeof e.name === "string" && typeof e.url === "string")
-    : [];
+  const envs = validTargets<EnvironmentTarget>(config().get("environments", []));
+  return envs.map((e) => {
+    const shards = shardsOf(e);
+    return shards.length > 0 ? { ...e, shards } : { name: e.name, url: e.url };
+  });
+}
+
+/**
+ * The validated shards of one environment entry (malformed shard entries dropped). Pure — operates on
+ * the entry, not on vscode config — so the promote resolver and its tests can use it directly.
+ */
+export function shardsOf(env: EnvironmentTarget): Shard[] {
+  return validTargets<Shard>(env.shards);
 }
 
 export function messageSetsDir(): string {
@@ -84,6 +146,15 @@ export function workspaceDir(): string | undefined {
 
 /** Run `python -m messagefoundry <args>` and resolve with stdout/stderr/exit code (never rejects). */
 export function run(args: string[], cwd?: string): Promise<CliResult> {
+  if (isExecGated()) {
+    // Untrusted workspace: refuse to exec any (possibly repo-supplied) interpreter (SEC-004). Return
+    // a synthetic non-zero result; callers already treat a non-zero exit as the error path.
+    return Promise.resolve({
+      stdout: "",
+      stderr: "workspace not trusted — MessageFoundry CLI disabled until you trust this workspace",
+      code: 1,
+    });
+  }
   return new Promise((resolve) => {
     execFile(
       pythonPath(),

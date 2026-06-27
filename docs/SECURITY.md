@@ -436,6 +436,18 @@ audit trail on those routes; a throttled read is logged (never silent) and retur
 These are all **in-process** protections; an exposed or multi-host deployment must additionally front
 the API with a proxy/WAF limiter and TLS.
 
+**Per-IP limiter caveat (SEC-024).** The per-client-IP login window is in-process and keyed on the
+caller's source address, so an attacker who can rotate source addresses creates a fresh empty per-IP
+bucket each time and is bounded only by the **global** ceiling. The source IP is already proxy-aware —
+uvicorn runs with `forwarded_allow_ips = settings.api.trusted_proxies` (defaults to `[]` = trust
+nothing), and an off-loopback proxied bind is gated to require a declared trusted proxy — but an
+in-process per-IP limiter inherently cannot stop pure IP rotation by a **directly-reachable** attacker.
+The real anti-guessing controls that survive rotation are the **global ceiling** plus the **per-account
+argon2 lockout (5 / 15 min)**, which is applied to **both** the password and the MFA second-factor
+paths, so guessing of a specific account stays well-bounded. The default `127.0.0.1` bind makes IP
+rotation moot; for an off-loopback bind without a fronting WAF, deploy a global limiter / WAF in front
+(a modest unconditional global login/second-factor ceiling independent of IP is a backlog follow-up).
+
 ## Audit
 
 Every authentication and authorization event is written to the durable `audit_log` with the acting

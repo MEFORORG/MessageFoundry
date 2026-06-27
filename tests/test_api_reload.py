@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.config.fingerprint import config_fingerprint
 from messagefoundry.pipeline import Engine
 
 
@@ -174,6 +176,25 @@ async def test_reload_defaults_to_startup_config_dir_and_audits(tmp_path: Path) 
             assert r.json()["inbound"] == 1
             audit = await eng.store.list_audit()
             assert any(a["action"] == "config_reload" for a in audit)
+    finally:
+        await eng.stop()
+
+
+async def test_reload_audit_records_fingerprint(tmp_path: Path) -> None:
+    # ADR 0041 D1: a successful reload's audit detail carries the config content fingerprint, so a
+    # reviewer can prove which bytes the reload activated — not just the connection counts.
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    eng = await Engine.create(tmp_path / "a.db", poll_interval=0.05, config_dir=cfg)
+    try:
+        transport = httpx.ASGITransport(app=create_app(eng, allow_no_auth=True))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            assert (await c.post("/config/reload", json={})).status_code == 200
+            rows = [a for a in await eng.store.list_audit() if a["action"] == "config_reload"]
+            assert rows, "expected a config_reload audit row"
+            detail = json.loads(rows[-1]["detail"])
+            assert detail["fingerprint"] == config_fingerprint(cfg)
+            assert detail["files"] >= 1
     finally:
         await eng.stop()
 
