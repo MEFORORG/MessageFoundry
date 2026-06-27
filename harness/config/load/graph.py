@@ -69,10 +69,19 @@ _OTH_HANDLERS = _register_lane("OTH", _SHAPE.results_fanout, _SHAPE)
 
 
 # Three inbound MLLP hubs matching the load profiles' target ports. Each fans every received message
-# to its lane's full handler set (the sender sends only the matching types to each port).
-inbound("IB_Load_ADT", MLLP(port=_SHAPE.adt_port), router="adt_router")
-inbound("IB_Load_Results", MLLP(port=_SHAPE.results_port), router="results_router")
-inbound("IB_Load_Other", MLLP(port=_SHAPE.other_port), router="other_router")
+# to its lane's full handler set (the sender sends only the matching types to each port). Each hub may
+# be tagged to a `supervise` shard via MEFOR_LOAD_SHARD_* (default unset → shard=None → no tag → a
+# single implicit shard = byte-identical to the unsharded graph); see _shape.
+inbound("IB_Load_ADT", MLLP(port=_SHAPE.adt_port), router="adt_router", shard=_SHAPE.shard_adt)
+inbound(
+    "IB_Load_Results",
+    MLLP(port=_SHAPE.results_port),
+    router="results_router",
+    shard=_SHAPE.shard_results,
+)
+inbound(
+    "IB_Load_Other", MLLP(port=_SHAPE.other_port), router="other_router", shard=_SHAPE.shard_other
+)
 
 
 @router("adt_router")

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from typing import Sequence
 
 from messagefoundry.console.client import ApiError
 
@@ -45,6 +46,8 @@ async def run_load(
     sink_port: int = 2700,
     sink_ports: int = 1,
     db_backend: str | None = None,
+    skip_preflight: bool = False,
+    shard_engines: Sequence[str] = (),
 ) -> RunReport:
     ids = ControlIds(prefix=id_prefix)
     # Generate + parse the corpus off the event loop (hl7apy validation is slow) before anything runs.
@@ -60,7 +63,10 @@ async def run_load(
         host=sink_host,
         ports=tuple(sink_port + i for i in range(sink_ports)),
     )
-    poller = EnginePoller(engine_url, token, origin=time.perf_counter())
+    # Poll the primary --engine plus every --shard-engine and AGGREGATE (sum) their /stats, so the
+    # no-loss reconcile and drain see CLUSTER totals — not just the one shard the --engine names. With
+    # no shard_engines this is exactly [engine_url] = byte-identical to the single-shard behavior.
+    poller = EnginePoller([engine_url, *shard_engines], token, origin=time.perf_counter())
     pools = [
         (t, ConnectionPool(t, profile.pool_size, correlator, metrics)) for t in profile.targets
     ]
@@ -71,7 +77,14 @@ async def run_load(
     try:
         await sink.start()
         await poller.open()
-        await _preflight(poller, profile)  # raises PreflightError if unreachable / ports missing
+        if not skip_preflight:
+            await _preflight(
+                poller, profile
+            )  # raises PreflightError if unreachable / ports missing
+        # When skipped (multi-shard driving): one harness drives MLLP ports spread across several
+        # `supervise` shard engines, so no single --engine serves them all. The served-ports check is
+        # bypassed; the correlation sink still measures aggregate E2E + no-loss across every shard
+        # delivering to this run's --sink-port (set each shard's MEFOR_LOAD_SINK_PORT to match).
 
         dispatcher.start()
         poll_task = asyncio.create_task(poller.run(profile.poll_interval_s, poll_stop))

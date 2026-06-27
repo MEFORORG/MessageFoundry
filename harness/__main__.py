@@ -69,6 +69,24 @@ def main(argv: list[str] | None = None) -> int:
         "--sink-port", type=int, default=2700, help="load: base correlation-sink port"
     )
     parser.add_argument("--sink-ports", type=int, default=1, help="load: contiguous sink ports")
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="load: skip the 'engine serves all target ports' check — for driving a `supervise` "
+        "multi-shard cluster from one harness (the MLLP ports are spread across the shard engines, "
+        "so no single --engine serves them all). Point every shard's MEFOR_LOAD_SINK_PORT at this "
+        "run's --sink-port so the one correlation sink aggregates all shards' end-to-end throughput.",
+    )
+    parser.add_argument(
+        "--shard-engine",
+        action="append",
+        metavar="URL",
+        help="load: an EXTRA engine API base URL to poll + aggregate alongside --engine (repeatable). "
+        "Drives a `supervise` multi-shard cluster: pass --engine for the primary shard and one "
+        "--shard-engine per other shard, and the harness sums every shard's /stats so the no-loss "
+        "reconcile + drain see true cluster totals. Pair with --skip-preflight (no one engine serves "
+        "all MLLP ports). With none given the single --engine is polled exactly as before.",
+    )
     parser.add_argument("--report-json", help="load: write the JSON report to this path")
     parser.add_argument("--report-csv", help="load: write the per-phase CSV to this path")
     parser.add_argument("--baseline", help="load: compare against this saved JSON report")
@@ -166,6 +184,8 @@ def _run_load(args: argparse.Namespace) -> int:
                 sink_port=args.sink_port,
                 sink_ports=args.sink_ports,
                 db_backend=args.db_backend,
+                skip_preflight=args.skip_preflight,
+                shard_engines=tuple(args.shard_engine or ()),
             )
         )
     except PreflightError as exc:
