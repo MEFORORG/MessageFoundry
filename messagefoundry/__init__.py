@@ -61,7 +61,7 @@ from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.parsing.split import split_by_obr
 from messagefoundry.timezone import convert_hl7_timestamp, to_zone
 
-__version__ = "0.2.7"
+__version__ = "0.2.6"
 
 __all__ = [
     "Message",

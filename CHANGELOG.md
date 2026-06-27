@@ -6,30 +6,6 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.2.7] — 2026-06-27 — Early Access
-
-A docs/packaging release that fixes the broken badge images on the PyPI project page
-and adds a config-check pre-commit hook.
-
-### Fixed
-- **Broken badge images in the PyPI project description.** The CI and Security status
-  badges in the README pointed at the **private** source repo, so they rendered as
-  broken images on the public PyPI page — an anonymous viewer can't fetch a private
-  repo's GitHub Actions badge SVG (it 404s). The README now points at the public
-  mirror (`MEFORORG/MessageFoundry`), and the release build additionally rewrites any
-  remaining `wshallwshall`→`MEFORORG` repo slug in the README before it is embedded as
-  the PyPI `long_description`, so the rendered badges resolve anonymously. (#568)
-
-### Added
-- **`messagefoundry check` pre-commit hook.** A VS Code-extension-generated
-  `.mefor-hooks/pre-commit` runs `messagefoundry check` so a commit can't introduce a
-  broken config (skips cleanly if python or the package isn't importable; bypass with
-  `--no-verify`). (#568)
-
-### Docs
-- Backlog **#47** — base64 embedded-document (attachment) pruning (Mirth
-  attachment-handler / data-pruner parity); and a Changelog link in the README. (#568)
-
 ## [0.2.6] — 2026-06-27 — Early Access
 
 A large release: the **throughput-maximization build** (high-fan-out store-once, multi-process
@@ -299,8 +275,7 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.7...HEAD
-[0.2.7]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.6...v0.2.7
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.6...HEAD
 [0.2.6]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.3...v0.2.4
