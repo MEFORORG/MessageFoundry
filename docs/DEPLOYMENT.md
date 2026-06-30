@@ -9,7 +9,8 @@ first.
 Design rationale for the off-loopback posture is in
 [`adr/0002-phase2-transport-security-and-strong-auth.md`](adr/0002-phase2-transport-security-and-strong-auth.md);
 PHI-in-transit context is in [`PHI.md`](PHI.md) §4; clustering topology is in
-[`CLUSTERING.md`](CLUSTERING.md).
+[`CLUSTERING.md`](CLUSTERING.md). For the host-level antivirus exclusions and Windows Firewall rules
+the engine needs, see [`ANTIVIRUS-FIREWALL.md`](ANTIVIRUS-FIREWALL.md).
 
 ---
 

@@ -131,13 +131,6 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="active environment NAME passed to every shard (overrides each shard's [ai].environment)",
     )
-    supervise.add_argument(
-        "--project-root",
-        default=None,
-        help="anchor for each shard's environments/<env>.toml resolution, forwarded to every shard as "
-        "`serve --project-root`. Set this together with --env so the spawned shards resolve the env "
-        "value file regardless of their working directory (otherwise it resolves against the child CWD).",
-    )
 
     validate = sub.add_parser("validate", help="check a config dir and report all problems")
     validate.add_argument("--config", default="samples/config", help="config modules directory")
@@ -778,7 +771,6 @@ def _supervise(args: argparse.Namespace) -> int:
             base_port=args.base_port,
             env=args.env,
             service_config=args.service_config,
-            project_root=args.project_root,
         )
     )
 
