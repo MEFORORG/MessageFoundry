@@ -173,7 +173,8 @@ collision.
 | `tls_check_hostname` | out | `true` | require the server cert to match `host` (SNI + hostname check). |
 
 Plus on `inbound(...)`: `ack_mode` (`original`/`enhanced`/`none`), `strict`, `hl7_version`. On
-`outbound(...)`: `retry` (`RetryPolicy`), `ordering`, `internal_error`, `buildup`, and `simulate`
+`outbound(...)`: `retry` (`RetryPolicy`), `ordering`, `internal_error`, `buildup`, `stall`
+(`StallThreshold` — Corepoint "Max Message Stall", #50; off unless set, see below), and `simulate`
 (`bool`, default `false`). `simulate=True` puts the outbound in **shadow / parallel-run mode** (#15): it
 runs the full transform + count-and-log and finalizes the message `PROCESSED`, but **suppresses the real
 egress** (no bytes/SQL leave the box) and retains the would-send payload for parity comparison — so a
@@ -672,6 +673,50 @@ outbound(
 # The Handler returns ONLY the <Body> fragment, e.g. "<submitSingleMessage>…HL7…</submitSingleMessage>".
 ```
 
+### Email / SMTP — `Email(...)` / `SMTP(...)` (outbound send, ADR 0029)
+
+An **outbound destination only** — sends the Handler's output as a plain-text SMTP message (IMAP/POP read is
+a deferred Phase 2). The Handler produces the email **body** (content-agnostic — an HL7 string, a JSON/XML
+report, plain text); this connector delivers it to `host:port` from `sender` to `recipients` with a static
+`subject`. `Email(...)` and `SMTP(...)` are the same factory (`ConnectorType.EMAIL`).
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `host` | str / `env()` | — (required) | SMTP server host. |
+| `sender` | str / `env()` | — (required) | `From:` address. |
+| `recipients` | list[str] / str / `env()` | — (required) | `To:` address(es). |
+| `port` | int / `env()` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`). |
+| `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
+| `username` | str / `env()` / None | `None` | SMTP `AUTH` user — put the secret in `env()`. |
+| `password` | str / `env()` / None | `None` | SMTP `AUTH` password — `env()` only. AUTH is sent **over TLS only**; a cleartext-credential config is refused. |
+| `use_tls` | bool | `True` | STARTTLS by default. `False` (MITM-able) is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set (loud warning), like LDAPS / SQL Server / MLLP. |
+| `timeout_seconds` | float | `30.0` | |
+| `encoding` | str | `"utf-8"` | |
+
+The egress host is **gated by `[egress].allowed_smtp`** (deny-by-default — add the host or it is refused).
+Delivery is **at-least-once**: a retry re-sends the email, and since a mailbox has no idempotency key a rare
+duplicate is possible and **accepted by design** (a duplicate beats a drop). `test_connection` does
+connect/EHLO/NOOP only (reachability — it never sends `MAIL FROM`/`DATA`).
+
+```python
+# samples/config/connections.py (excerpt)
+from messagefoundry import outbound, Email, env
+
+outbound(
+    "OB_ALERTS_EMAIL",
+    Email(
+        host=env("SMTP_HOST"),
+        port=587,
+        sender="mefor@example.org",
+        recipients=["oncall@example.org"],
+        subject="MessageFoundry alert",
+        username=env("SMTP_USER"),
+        password=env("SMTP_PASS"),  # AUTH over STARTTLS
+    ),
+)
+# In config dir TOML: [egress] allowed_smtp = ["smtp.example.org"]
+```
+
 ### FHIR — `FHIR(...)`
 
 An **outbound** FHIR REST client ([ADR 0022](adr/0022-fhir-resource-codec-rest-client.md)) that delivers a
@@ -1009,6 +1054,90 @@ inbound("IB-LOOP_PAYER_ELIG", Loopback(), router="route_elig_result", content_ty
 # capturing outbound — declares BOTH "capture" and "where the reply re-enters" in one place.
 outbound("MLLP-OUT_PAYER_ELIG", MLLP(host=env("payer_host"), port=2575, reingress_to="IB-LOOP_PAYER_ELIG"))
 # a Handler Sends the eligibility query to MLLP-OUT_PAYER_ELIG; its reply re-ingresses into IB-LOOP_PAYER_ELIG.
+```
+
+## Per-connection retention, document pruning & diagnostics overrides
+
+A connection may **override** several service-wide `[…]` defaults for just itself. Each is set the same
+two ways as `retry`/`buildup` — **code-first** on `inbound(...)`/`outbound(...)`, **or** as a key in
+`connections.toml` (ADR 0007) — and each defaults to **inherit the global setting** when omitted.
+
+### Retention overrides ([ADR 0027](adr/0027-per-connection-retention.md))
+
+Override the global `[retention]` body-null windows per connection. `None` (omitted) = inherit the global
+window; `0` = keep this connection's bodies **forever**; `>0` = days.
+
+| Key | Dir | Type | Default | Meaning |
+|-----|-----|------|---------|---------|
+| `messages_days` | in | int | inherit `[retention].messages_days` | past N days, null this **inbound's** received message bodies (keyed on the receiving inbound), keeping the metadata row. `0` = keep forever |
+| `dead_letter_days` | out | int | inherit `[retention].dead_letter_days` | past N days, null the bodies of **this outbound's** dead-lettered rows (keyed on the outbound that dead-lettered them). A dead row stays replayable until its body is purged. `0` = keep forever |
+
+### Embedded-document pruning ([ADR 0042](adr/0042-embedded-document-pruning.md), #47)
+
+A separate **inbound** lever that evicts only the bulky base64 **embedded document** (a `mfb64:v1:`
+carriage value / an HL7 `OBX-5` ED embed) **in place** to a small tombstone — keeping the surrounding,
+readable message — distinct from `messages_days`, which nulls the **whole** body.
+
+| Key | Dir | Type | Default | Meaning |
+|-----|-----|------|---------|---------|
+| `prune_documents_after` | in | int | `None` = **never prune** (back-compat) | after N **days**, strip each embedded document for this inbound. Must be `> 0` |
+| `prune_documents_min_bytes` | in | int | `None` = strip **any** size | skip an embed whose decoded size is **below** this byte threshold (keep small embeds, evict only the bulky ones). Setting it **requires** `prune_documents_after` (else a wiring error) |
+
+### Diagnostics / event-log overrides ([ADR 0021](adr/0021-inbound-ack-nak-capture-response-sent.md), #46)
+
+Override the `[diagnostics]` master switches for one connection. **Tri-state:** omitted = inherit the
+matching master switch; `true`/`false` = explicit per-connection override.
+
+| Key | Dir | Type | Default | Meaning |
+|-----|-----|------|---------|---------|
+| `capture_ack` | in | bool | inherit `[diagnostics].response_sent` | record the **"Response Sent"** ACK/NAK metadata for this inbound (the AA body only on an encrypted store; a NAK body is never stored) |
+| `capture_connection_errors` | in | bool | inherit `[diagnostics].connection_events` | record this connection's **lifecycle + pre-ingress failure** events (established/closed, allowlist/capacity/oversize/peer-reset/framing) |
+
+### `stall` — Max Message Stall ([ADR 0014](adr/0014-alerting-rules-engine.md), #50)
+
+An **outbound** override of the `[delivery].stall_max_oldest_seconds` global: raise a `message_stall`
+alert when this lane's **oldest undelivered message** has waited too long.
+
+| Key | Dir | Type | Default | Meaning |
+|-----|-----|------|---------|---------|
+| `stall` | out | `StallThreshold` | inherit `[delivery]` (off unless set) | `StallThreshold(max_oldest_seconds=…)` — `None` keeps the stall alert **off** (it overlaps `buildup`'s age dimension, so it's opt-in to avoid double-paging). In `connections.toml` it is an `[outbound.stall]` table with `max_oldest_seconds` (see the example below) |
+
+```python
+from messagefoundry import MLLP, inbound, outbound
+from messagefoundry.config.models import StallThreshold
+
+# Inbound: keep this feed's bodies only 7 days, and prune embedded documents >256 KiB after 1 day.
+inbound("IB_ACME_RAD", MLLP(port=2576), router="rad_router",
+        messages_days=7, prune_documents_after=1, prune_documents_min_bytes=256 * 1024,
+        capture_ack=True)                         # force-capture the ACK even if the master switch is off
+
+# Outbound: keep this destination's dead-letter bodies 90 days; alert if a message stalls >10 min.
+outbound("OB_PACS_RAD", MLLP(host="pacs", port=11112),
+         dead_letter_days=90, stall=StallThreshold(max_oldest_seconds=600))
+```
+
+```toml
+# connections.toml — the same overrides as data.
+[[inbound]]
+name = "IB_ACME_RAD"
+transport = "mllp"
+router = "rad_router"
+messages_days = 7
+prune_documents_after = 1
+prune_documents_min_bytes = 262144
+capture_ack = true
+  [inbound.settings]
+  port = 2576
+
+[[outbound]]
+name = "OB_PACS_RAD"
+transport = "mllp"
+dead_letter_days = 90
+  [outbound.settings]
+  host = { env = "pacs_host" }
+  port = 11112
+  [outbound.stall]
+  max_oldest_seconds = 600
 ```
 
 ## Resource management & limits (ASVS 13.1.2 / 13.1.3 / 13.2.6)

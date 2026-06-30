@@ -58,7 +58,9 @@ from messagefoundry.config.models import (
     ContentType,
     InternalErrorPolicy,
     OrderingMode,
+    Priority,
     RetryPolicy,
+    StallThreshold,
     Validation,
 )
 from messagefoundry.parsing.message import Message, RawMessage
@@ -68,6 +70,7 @@ __all__ = [
     "MLLP",
     "Tcp",
     "X12",
+    "Http",
     "File",
     "Timer",
     "Loopback",
@@ -440,6 +443,83 @@ def DatabaseLookup(
     )
 
 
+# A FhirLookup declares a NAMED, read-only FHIR connection a Handler reads LIVE at run time via
+# fhir_lookup(name, query) (the read accessor lives in messagefoundry.config.fhir_lookup, ADR 0043). It
+# is the FHIR mirror of DatabaseLookup: only the connection (the FHIR service base URL + the SMART auth
+# seam the FHIR outbound uses); each call supplies its own read-by-id / search query. Unlike DatabaseLookup
+# it returns the spec so with_smart_backend(FhirLookup(...)) can compose SMART auth onto it (the registry
+# holds the same object), AND it self-registers — so the flat FhirLookup("epic", ...) form also lands in
+# the graph. The engine builds one read executor from these.
+
+
+@dataclass(frozen=True)
+class FhirLookupSpec:
+    """A declared live FHIR-lookup connection: ``name`` + connection ``settings`` (no query — the query is
+    supplied per :func:`~messagefoundry.config.fhir_lookup.fhir_lookup` call). ``settings`` may hold
+    :class:`EnvRef` values (put secrets like ``bearer_token`` / ``smart_private_key`` in :func:`env`).
+
+    Mutable ``settings`` dict so :func:`~messagefoundry.transports.smart.with_smart_backend` can compose
+    SMART auth onto it (the dataclass stays frozen — only the dict is mutated)."""
+
+    name: str
+    settings: dict[str, Any]
+
+
+def FhirLookup(
+    name: str,
+    *,
+    url: str | EnvRef,  # the FHIR service BASE url, e.g. https://host/fhir (may be env())
+    fhir_version: str = "R4B",  # "R4B" (default) | "R5" | "STU3" — explicit, no autodetect
+    headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
+    bearer_token: str
+    | EnvRef
+    | None = None,  # Authorization: Bearer … (static; or compose with_smart_backend)
+    basic_user: str
+    | EnvRef
+    | None = None,  # HTTP Basic (with basic_password); use env() for secrets
+    basic_password: str | EnvRef | None = None,
+    timeout_seconds: float = 30.0,
+    verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    encoding: str = "utf-8",
+) -> FhirLookupSpec:
+    """Declare a named live-lookup FHIR connection (ADR 0043). A Handler reads it at run time with
+    ``fhir_lookup(name, query)`` — a **read-only** read-by-id (``"Patient/123"``) or search
+    (``"Patient?identifier=MRN|123"``); the parsed resource / searchset ``Bundle`` comes back as a dict.
+    Side-effecting (it self-registers), like :func:`Reference` / :func:`inbound`, **and** returns the spec
+    so SMART auth can be composed onto it::
+
+        FhirLookup("epic", url=env("epic_fhir_base"))                  # static / no auth
+        with_smart_backend(                                           # SMART Backend Services bearer
+            FhirLookup("epic", url=env("epic_fhir_base")),
+            token_url=env("epic_token_url"), client_id=env("epic_client_id"),
+            private_key=env("epic_smart_key"), scope="system/*.rs",
+        )
+
+    The read is **GET-only** (structurally read-only — a Handler cannot mutate the FHIR server through it;
+    FHIR writes stay on the :func:`FHIR` outbound). The dial-out is gated by the **fail-closed**
+    ``[egress].allowed_http`` allowlist (the same arm the FHIR outbound + SMART token endpoint use) — point
+    the engine only at allowed hosts. Put secrets (``bearer_token`` / ``basic_*`` / SMART keys) in
+    :func:`env`. TLS is on by default; weakening it needs ``MEFOR_ALLOW_INSECURE_TLS``. The pure
+    ``parsing/fhir/`` codec parses the reply, so a ``FhirLookup``-declaring graph needs the optional
+    ``messagefoundry[fhir]`` extra."""
+    spec = FhirLookupSpec(
+        name,
+        {
+            "url": url,  # stored under "url" (NOT base_url) so the egress gate reads the same key as FHIR()
+            "fhir_version": fhir_version,
+            "headers": headers or {},
+            "bearer_token": bearer_token,
+            "basic_user": basic_user,
+            "basic_password": basic_password,
+            "timeout_seconds": timeout_seconds,
+            "verify_tls": verify_tls,
+            "encoding": encoding,
+        },
+    )
+    _active_registry().add_fhir_lookup(spec)
+    return spec
+
+
 def resolve_env_settings(settings: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:
     """Return a copy of ``settings`` with every :class:`EnvRef` resolved against ``values``.
 
@@ -750,6 +830,69 @@ def X12(
     )
 
 
+def Http(
+    *,
+    port: int | EnvRef,
+    # INBOUND only — the bind interface is a service setting ([inbound].bind_host), so there is no host.
+    encoding: str = "utf-8",  # charset the POSTed body is decoded with (non-binary content types)
+    # DoS guards (HTTP analogs of the MLLP frame/connection/idle caps; pass None/0 to disable):
+    max_connections: int | None = 256,  # cap concurrent clients (connection-flood guard)
+    receive_timeout: float
+    | None = 60.0,  # bound the whole-request read (slow-loris guard), seconds
+    max_body_bytes: int | None = 16 * 1024 * 1024,  # cap one request body's bytes (OOM guard)
+    max_header_bytes: int | None = 64 * 1024,  # cap the request line + headers (header-flood guard)
+    # --- TLS (WP-13b, ADR 0002 §0 / ADR 0023 D4) — per-connection HTTPS ---
+    tls: bool = False,  # turn TLS on (present a server cert; off-loopback without it is refused at start)
+    tls_cert_file: str | None = None,  # SERVER cert (required when tls)
+    tls_key_file: str | None = None,  # private key for tls_cert_file
+    tls_key_password: str
+    | EnvRef
+    | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
+    tls_ca_file: str | None = None,  # trust anchor — opt-in mTLS (require + verify a client cert)
+) -> ConnectionSpec:
+    """An **inbound HTTP/1.1 web-service listener** (ADR 0023) — a connector-owned bound socket that a
+    partner ``POST``s a body to (REST / SOAP-body / FHIR / webhook). Source-only: it never delivers. The
+    bind interface is the service's ``[inbound].bind_host`` (so it takes **no** ``host``, like MLLP/X12);
+    declare it ``Http(port=...)``. Pair it with ``inbound(..., content_type=...)`` (ADR 0004): ``hl7v2``
+    (the default) runs the HL7 peek/validate path and routes a :class:`Message`; ``json``/``xml``/``text``/
+    ``fhir`` route a :class:`~messagefoundry.parsing.message.RawMessage` parsed on demand in the Handler.
+
+    **Respond-with-receipt (first slice).** A ``POST`` is committed to the ingress stage and answered with
+    a ``202 Accepted`` carrying the engine ``message_id`` the instant it is durably committed — mirroring
+    MLLP's AA-on-receipt (ACK-on-receipt, ADR 0001). A post-ingress routing/transform/delivery failure
+    happens *after* the ``202`` and is **not** reflected in the HTTP status (it surfaces as the message's
+    ``ERROR``/dead-letter + the AlertSink). A pre-ingress refusal (oversize/malformed/allowlist) returns a
+    synchronous ``4xx`` + an ADR 0021 ``connection_event``. ``GET``/``HEAD`` are static health probes (no
+    ingress row). The synchronous downstream-reply (SOAP-envelope) path is a defined ADR 0013 follow-on,
+    not built here.
+
+    **DoS guards** are HTTP twins of MLLP's: ``max_connections`` (flood), ``receive_timeout`` (slow-loris
+    — bounds the whole-request read), ``max_body_bytes`` (the frame-cap twin — refused on the declared
+    ``Content-Length`` before a byte is buffered), and ``max_header_bytes`` (header flood).
+
+    **TLS (WP-13b).** ``tls=True`` presents ``tls_cert_file``/``tls_key_file`` as the HTTPS server
+    identity (``tls_ca_file`` adds opt-in mTLS); ``tls_key_password`` decrypts an encrypted key (supply via
+    ``env()``). The runner's exposed-gate refuses a **non-loopback** HTTP listener **without** TLS at start
+    (cleartext PHI can't cross an off-loopback socket by accident) — set ``tls=True`` or pass
+    ``serve --allow-insecure-bind`` on a trusted, firewalled segment."""
+    return ConnectionSpec(
+        ConnectorType.HTTP,
+        {
+            "port": port,
+            "encoding": encoding,
+            "max_connections": max_connections,
+            "receive_timeout": receive_timeout,
+            "max_body_bytes": max_body_bytes,
+            "max_header_bytes": max_header_bytes,
+            "tls": tls,
+            "tls_cert_file": tls_cert_file,
+            "tls_key_file": tls_key_file,
+            "tls_key_password": tls_key_password,
+            "tls_ca_file": tls_ca_file,
+        },
+    )
+
+
 def File(
     *,
     directory: str | EnvRef,
@@ -942,6 +1085,51 @@ def FHIR(
             "reingress_to": reingress_to,
         },
     )
+
+
+def Email(
+    *,
+    host: str | EnvRef,  # the SMTP server host (required; may be env())
+    sender: str | EnvRef,  # the From: address (required; may be env())
+    recipients: list[str] | str | EnvRef,  # To: address(es) — a list or a single string (required)
+    port: int | EnvRef = 587,  # 587 STARTTLS submission (default); 465 → implicit TLS (SMTP_SSL)
+    subject: str | EnvRef = "",  # static Subject (a per-message subject is a Phase-2 follow-up)
+    username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
+    password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
+    use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    timeout_seconds: float = 30.0,
+    encoding: str = "utf-8",
+) -> ConnectionSpec:
+    """An SMTP email endpoint (**outbound destination only** — IMAP/POP read is Phase 2, ADR 0029).
+    The Handler produces the email **body** (content-agnostic — an HL7 string, a JSON/XML report, plain
+    text); this delivers it as a plain-text SMTP message to ``host:port`` from ``sender`` to
+    ``recipients`` with a static ``subject``. STARTTLS by default (``use_tls=True``) on the ``587``
+    submission port; port ``465`` is implicit TLS (``SMTP_SSL``). Optional ``username``/``password`` do
+    SMTP ``AUTH`` (over TLS only — a cleartext-credential config is refused). Disabling TLS
+    (``use_tls=False``) is MITM-able and refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud
+    warning), like LDAPS / SQL Server / MLLP. The egress host is gated by ``[egress].allowed_smtp``. Put
+    secrets in ``env()`` (``username``/``password``), never inline. Delivery is at-least-once, so a retry
+    re-sends the email — a mailbox has no idempotency key, so a rare duplicate is possible and accepted
+    (a duplicate beats a drop). ADR 0029."""
+    return ConnectionSpec(
+        ConnectorType.EMAIL,
+        {
+            "host": host,
+            "sender": sender,
+            "recipients": recipients,
+            "port": port,
+            "subject": subject,
+            "username": username,
+            "password": password,
+            "use_tls": use_tls,
+            "timeout_seconds": timeout_seconds,
+            "encoding": encoding,
+        },
+    )
+
+
+#: Alias — ``SMTP`` reads naturally for the protocol-minded; ``Email`` for the use-case-minded.
+SMTP = Email
 
 
 def DICOM(
@@ -1439,6 +1627,27 @@ class InboundConnection:
     # capture_connection_errors → the inbound connection_event log (lifecycle + pre-ingress failures).
     capture_ack: bool | None = None
     capture_connection_errors: bool | None = None
+    # Per-connection retention override (#34, ADR 0027): None = inherit the global [retention].messages_days
+    # window; 0 = keep this connection's bodies forever; >0 = days. Keyed on the receiving inbound
+    # (purge_message_bodies keys by messages.channel_id = this inbound name). Same override idiom as
+    # capture_ack/RetryPolicy/BuildupThreshold — authored code-first AND via connections.toml (ADR 0007).
+    messages_days: int | None = None
+    # Per-connection embedded-document pruning (#47, ADR 0042): None = never strip embedded documents for
+    # this inbound (the back-compat default); >0 = after that many days, retention strips each base64
+    # embedded document (mfb64:v1: carriage value / HL7 OBX-5 ED embed) IN PLACE to a small tombstone,
+    # keeping the surrounding message. `prune_documents_min_bytes` (None = inherit the built-in 0 = strip
+    # any size) skips an embed smaller than that decoded-byte threshold. Distinct from `messages_days`
+    # (whole-body purge): this evicts only the bulky attachment while keeping the readable message. Same
+    # override idiom as messages_days — code-first AND via connections.toml (ADR 0007).
+    prune_documents_after: int | None = None
+    prune_documents_min_bytes: int | None = None
+    # Per-connection DR / priority tier (#61, ADR 0048): None = inherit the global [delivery].priority
+    # default; an explicit value overrides it (resolution in the RegistryRunner: per-connection override
+    # > [delivery] global default > built-in NORMAL). The DR run-profile starts only inbound listeners
+    # whose resolved tier rank >= [dr].priority_threshold rank — a below-threshold listener is NOT bound
+    # and reports status:"filtered" (distinct from ADR 0031's "failed"). Inbound + outbound tiers are
+    # INDEPENDENT. Same override idiom as messages_days/RetryPolicy — code-first AND via connections.toml.
+    priority: Priority | None = None
     # Multi-process sharding (L3): the shard this inbound belongs to. None = the implicit default
     # shard. The supervisor runs one engine subprocess per distinct shard, each owning a disjoint
     # subset of inbounds (so intake parallelizes across CPU cores); outbound/routers/handlers are
@@ -1459,9 +1668,22 @@ class OutboundConnection:
     ordering: OrderingMode | None = None
     internal_error: InternalErrorPolicy | None = None
     buildup: BuildupThreshold | None = None
+    stall: StallThreshold | None = None
     # Shadow / parallel-run egress suppression (#15). False = deliver normally; True = the delivery
     # worker suppresses the real egress + finalizes PROCESSED. [shadow].simulate_all_egress forces it on.
     simulate: bool = False
+    # Per-connection dead-letter retention override (#34, ADR 0027): None = inherit the global
+    # [retention].dead_letter_days window; 0 = keep this outbound's dead-letter bodies forever; >0 = days.
+    # Keyed on the outbound that dead-lettered the row (purge_dead_letters keys by queue.destination_name =
+    # this outbound name). Same override idiom as retry/ordering/buildup — code-first AND connections.toml.
+    dead_letter_days: int | None = None
+    # Per-connection DR / priority tier (#61, ADR 0048): None = inherit the global [delivery].priority
+    # default; an explicit value overrides it. The DR run-profile builds only outbound connectors whose
+    # resolved tier rank >= [dr].priority_threshold rank — a below-threshold outbound is NOT built and
+    # reports status:"filtered" (its delivery worker still spawns, so rows routed to it sit in the
+    # outbound stage and self-heal on the next full startup, exactly as an ADR-0031 degraded outbound).
+    # Inbound + outbound tiers are INDEPENDENT. Same override idiom as retry/ordering/stall.
+    priority: Priority | None = None
     metadata: Mapping[str, Any] | None = (
         None  # operability labels (Tier 4); API-surfaced, not routing
     )
@@ -1482,7 +1704,13 @@ class OutboundConnection:
 #: (the SQL server's), but it DIALS OUT — it must not be mistaken for a bind (a latent false positive
 #: the literal-port-only check used to have, now excluded by this filter).
 _LISTEN_TYPES: frozenset[ConnectorType] = frozenset(
-    {ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.X12, ConnectorType.DIMSE}
+    {
+        ConnectorType.MLLP,
+        ConnectorType.TCP,
+        ConnectorType.X12,
+        ConnectorType.DIMSE,
+        ConnectorType.HTTP,
+    }
 )
 
 #: Host spellings that mean "every interface": a wildcard bind contends with ANY host on the same port.
@@ -1650,6 +1878,10 @@ class Registry:
     # builds one pooled executor from these; db_lookup(name, ...) queries it at handler run time. Carried
     # with the graph so a reload re-arms the executor atomically.
     lookups: dict[str, DatabaseLookupSpec] = field(default_factory=dict)
+    # Live FHIR-lookup connection declarations (ADR 0043): name -> connection settings. Beside `lookups`
+    # (the SQL kind): the RegistryRunner builds one read executor from these; fhir_lookup(name, query)
+    # reads it at handler run time. Carried with the graph so a reload re-arms the executor atomically.
+    fhir_lookups: dict[str, FhirLookupSpec] = field(default_factory=dict)
 
     def add_inbound(self, conn: InboundConnection) -> None:
         self._add(self.inbound, conn.name, conn, "inbound connection")
@@ -1668,6 +1900,9 @@ class Registry:
 
     def add_lookup(self, spec: DatabaseLookupSpec) -> None:
         self._add(self.lookups, spec.name, spec, "database lookup")
+
+    def add_fhir_lookup(self, spec: FhirLookupSpec) -> None:
+        self._add(self.fhir_lookups, spec.name, spec, "fhir lookup")
 
     @staticmethod
     def _add(table: dict[str, Any], name: str, value: Any, kind: str) -> None:
@@ -1800,6 +2035,10 @@ def build_inbound_connection(
     source_ip_allowlist: list[str] | None = None,
     capture_ack: bool | None = None,
     capture_connection_errors: bool | None = None,
+    messages_days: int | None = None,
+    prune_documents_after: int | None = None,
+    prune_documents_min_bytes: int | None = None,
+    priority: Priority | None = None,
     shard: str | None = None,
     source_file: str | None = None,
     source_line: int | None = None,
@@ -1813,7 +2052,14 @@ def build_inbound_connection(
     raw string can't reach the pipeline and crash later."""
     content_type = _coerce_content_type(name, content_type)
     if (
-        spec.type in (ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.X12, ConnectorType.DIMSE)
+        spec.type
+        in (
+            ConnectorType.MLLP,
+            ConnectorType.TCP,
+            ConnectorType.X12,
+            ConnectorType.DIMSE,
+            ConnectorType.HTTP,
+        )
         and spec.settings.get("host") is not None
     ):
         # The bind interface is an environment/service decision (which NIC this instance exposes),
@@ -1872,13 +2118,14 @@ def build_inbound_connection(
         ConnectorType.TCP,
         ConnectorType.DIMSE,
         ConnectorType.X12,
+        ConnectorType.HTTP,
     )
     if bind_address is not None:
         if not listens:
-            # Only a listen source (MLLP/TCP/DIMSE/X12) binds an interface; File/DB/etc. have nothing.
+            # Only a listen source (MLLP/TCP/DIMSE/X12/HTTP) binds an interface; File/DB/etc. have none.
             raise WiringError(
-                f"inbound connection {name!r}: bind_address is only valid for an MLLP/TCP/DIMSE/X12 "
-                "listen source"
+                f"inbound connection {name!r}: bind_address is only valid for an "
+                "MLLP/TCP/DIMSE/X12/HTTP listen source"
             )
         if not bind_address.strip():
             # A present-but-blank bind_address would crash asyncio.start_server at boot (getaddrinfo
@@ -1902,6 +2149,33 @@ def build_inbound_connection(
             f"inbound connection {name!r}: capture_connection_errors=True is only valid for an "
             "MLLP/TCP listen source (a poll/file source has no per-connection framing/refuse failures)"
         )
+    if messages_days is not None and messages_days < 0:
+        # Per-connection retention override (#34, ADR 0027). None = inherit [retention].messages_days;
+        # 0 = keep forever; >0 = days. A negative window is meaningless — fail loud at wiring (caught in
+        # dry-run / `messagefoundry check`), mirroring RetentionSettings(messages_days=-1) rejection.
+        raise WiringError(
+            f"inbound connection {name!r}: messages_days must be >= 0 "
+            "(0 = keep forever, omit to inherit the global [retention] window)"
+        )
+    if prune_documents_after is not None and prune_documents_after <= 0:
+        # Per-connection embedded-document pruning (#47, ADR 0042). None = never strip; a window must be a
+        # POSITIVE day count (0/negative is meaningless — "never" is None, not 0). Fail loud at wiring so
+        # it's caught in dry-run / `messagefoundry check`.
+        raise WiringError(
+            f"inbound connection {name!r}: prune_documents_after must be > 0 days "
+            "(omit it to never strip embedded documents)"
+        )
+    if prune_documents_min_bytes is not None and prune_documents_min_bytes < 0:
+        raise WiringError(
+            f"inbound connection {name!r}: prune_documents_min_bytes must be >= 0 "
+            "(0 = strip any size, omit to inherit the default)"
+        )
+    if prune_documents_min_bytes is not None and prune_documents_after is None:
+        # A size threshold with no window does nothing — catch the likely-mistaken config loud.
+        raise WiringError(
+            f"inbound connection {name!r}: prune_documents_min_bytes is set but prune_documents_after "
+            "is not — the threshold has no effect without a pruning window"
+        )
     if shard is not None and not shard.strip():
         # A present-but-blank shard tag would silently collapse into its own nameless shard (the
         # supervisor would spawn a subprocess named ""), a config footgun — fail loud at wiring so
@@ -1923,6 +2197,10 @@ def build_inbound_connection(
         source_ip_allowlist=allowlist,
         capture_ack=capture_ack,
         capture_connection_errors=capture_connection_errors,
+        messages_days=messages_days,
+        prune_documents_after=prune_documents_after,
+        prune_documents_min_bytes=prune_documents_min_bytes,
+        priority=priority,
         shard=shard,
         source_file=source_file,
         source_line=source_line,
@@ -1944,6 +2222,10 @@ def inbound(
     source_ip_allowlist: list[str] | None = None,
     capture_ack: bool | None = None,
     capture_connection_errors: bool | None = None,
+    messages_days: int | None = None,
+    prune_documents_after: int | None = None,
+    prune_documents_min_bytes: int | None = None,
+    priority: Priority | None = None,
     shard: str | None = None,
 ) -> None:
     """Declare an inbound connection that feeds every received message to ``router``.
@@ -1965,10 +2247,29 @@ def inbound(
     overrides the service ``[inbound].bind_host`` for this MLLP/TCP listener only; ``source_ip_allowlist``
     restricts an MLLP/TCP listener to the given peer IPs / CIDR networks (absent/empty = no restriction).
 
+    ``messages_days`` (#34, ADR 0027) overrides the global ``[retention].messages_days`` window for this
+    inbound only: ``None`` (default) inherits the global window, ``0`` keeps this connection's message
+    bodies forever, ``>0`` prunes them after that many days — the Mirth per-channel storage lever. It is
+    also a ``connections.toml`` key (ADR 0007), so it stays hand-/GUI-editable.
+
+    ``prune_documents_after`` (#47, ADR 0042) strips bulky base64 **embedded documents** in place after
+    that many days: ``None`` (default) never strips; ``>0`` replaces each ``mfb64:v1:`` carriage value /
+    HL7 OBX-5 ED embed with a small size/content-type tombstone while keeping the surrounding message
+    parseable (distinct from ``messages_days``, which nulls the whole body). ``prune_documents_min_bytes``
+    (``None`` = strip any size) skips an embed below that decoded-byte threshold. Both are
+    ``connections.toml`` keys.
+
     ``shard`` (L3 multi-process sharding) tags this inbound for a named engine subprocess: ``messagefoundry
     supervise`` runs one subprocess per distinct shard, each owning a disjoint set of inbounds (intake
     parallelizes across CPU cores; outbound/routers/handlers stay shared). ``None`` = the implicit default
-    shard. It never affects routing — see :mod:`messagefoundry.pipeline.sharding`."""
+    shard. It never affects routing — see :mod:`messagefoundry.pipeline.sharding`.
+
+    ``priority`` (#61, ADR 0048) tags this inbound with a DR / priority tier (``critical``/``normal``/
+    ``low``): ``None`` inherits the global ``[delivery].priority`` default, an explicit value overrides
+    it. Under a DR run-profile the engine binds only inbound listeners whose resolved tier rank meets
+    ``[dr].priority_threshold`` — a below-threshold listener is **not bound** and reports
+    ``status:"filtered"`` (distinct from ADR 0031's ``"failed"``). It governs only **when** the
+    connection runs, never routing; also a ``connections.toml`` key (ADR 0007)."""
     file, line = _call_site()
     _active_registry().add_inbound(
         build_inbound_connection(
@@ -1985,6 +2286,10 @@ def inbound(
             source_ip_allowlist=source_ip_allowlist,
             capture_ack=capture_ack,
             capture_connection_errors=capture_connection_errors,
+            messages_days=messages_days,
+            prune_documents_after=prune_documents_after,
+            prune_documents_min_bytes=prune_documents_min_bytes,
+            priority=priority,
             shard=shard,
             source_file=file,
             source_line=line,
@@ -2000,7 +2305,10 @@ def build_outbound_connection(
     ordering: OrderingMode | None = None,
     internal_error: InternalErrorPolicy | None = None,
     buildup: BuildupThreshold | None = None,
+    stall: StallThreshold | None = None,
     simulate: bool = False,
+    dead_letter_days: int | None = None,
+    priority: Priority | None = None,
     metadata: Mapping[str, Any] | None = None,
     source_file: str | None = None,
     source_line: int | None = None,
@@ -2009,6 +2317,14 @@ def build_outbound_connection(
 
     The shared core of code-first :func:`outbound` **and** the ``connections.toml`` loader (ADR 0007).
     Pure — it does not touch the active registry; the caller is responsible for ``add_outbound``."""
+    if dead_letter_days is not None and dead_letter_days < 0:
+        # Per-connection dead-letter retention override (#34, ADR 0027). None = inherit
+        # [retention].dead_letter_days; 0 = keep forever; >0 = days. A negative window is meaningless —
+        # fail loud at wiring (caught in dry-run / `messagefoundry check`).
+        raise WiringError(
+            f"outbound connection {name!r}: dead_letter_days must be >= 0 "
+            "(0 = keep forever, omit to inherit the global [retention] window)"
+        )
     if (
         spec.type in (ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.X12)
         and spec.settings.get("host") is None
@@ -2096,7 +2412,10 @@ def build_outbound_connection(
         ordering=ordering,
         internal_error=internal_error,
         buildup=buildup,
+        stall=stall,
         simulate=simulate,
+        dead_letter_days=dead_letter_days,
+        priority=priority,
         metadata=metadata,
         source_file=source_file,
         source_line=source_line,
@@ -2111,18 +2430,31 @@ def outbound(
     ordering: OrderingMode | None = None,
     internal_error: InternalErrorPolicy | None = None,
     buildup: BuildupThreshold | None = None,
+    stall: StallThreshold | None = None,
     simulate: bool = False,
+    dead_letter_days: int | None = None,
+    priority: Priority | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> None:
     """Declare an outbound connection that Handlers can ``Send`` to.
 
-    ``retry``/``ordering``/``internal_error``/``buildup`` override the global ``[delivery]`` defaults
-    for this connection only (omit to inherit). ``ordering`` defaults to FIFO — strict in-order
+    ``retry``/``ordering``/``internal_error``/``buildup``/``stall`` override the global ``[delivery]``
+    defaults for this connection only (omit to inherit). ``ordering`` defaults to FIFO — strict in-order
     delivery per connection; ``internal_error`` defaults to continue (dead-letter a code-error row and
-    advance); ``buildup`` sets the ``queue_buildup`` alert thresholds for this lane. ``simulate=True``
+    advance); ``buildup`` sets the ``queue_buildup`` alert thresholds for this lane; ``stall`` sets the
+    ``message_stall`` oldest-undelivered-age threshold (Corepoint "Max Message Stall", off by default).
+    ``simulate=True``
     runs the full pipeline but **suppresses the real egress** (shadow / parallel-run mode, #15) — no
-    bytes leave the box and the message still finalizes PROCESSED. ``metadata`` attaches free-form
-    operator labels (Tier 4) surfaced by the API, never used for delivery."""
+    bytes leave the box and the message still finalizes PROCESSED. ``dead_letter_days`` (#34, ADR 0027)
+    overrides the global ``[retention].dead_letter_days`` window for this outbound's dead-lettered bodies:
+    ``None`` inherits the global window, ``0`` keeps them forever, ``>0`` prunes after that many days (also
+    a ``connections.toml`` key). ``priority`` (#61, ADR 0048) tags this outbound with a DR / priority
+    tier (``critical``/``normal``/``low``): ``None`` inherits the global ``[delivery].priority`` default,
+    an explicit value overrides it; under a DR run-profile the engine builds only outbound connectors
+    whose resolved tier rank meets ``[dr].priority_threshold`` — a below-threshold outbound reports
+    ``status:"filtered"`` and queues its routed rows for later delivery (also a ``connections.toml`` key).
+    ``metadata`` attaches free-form operator labels (Tier 4) surfaced by the API, never used for
+    delivery."""
     file, line = _call_site()
     _active_registry().add_outbound(
         build_outbound_connection(
@@ -2132,7 +2464,10 @@ def outbound(
             ordering=ordering,
             internal_error=internal_error,
             buildup=buildup,
+            stall=stall,
             simulate=simulate,
+            dead_letter_days=dead_letter_days,
+            priority=priority,
             metadata=metadata,
             source_file=file,
             source_line=line,

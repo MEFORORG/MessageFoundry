@@ -90,6 +90,19 @@ fhir = ["fhir.resources>=7.1.0", "fhirpathpy>=2.2.0"]
 # STOW-RS, Phase-2) is a SEPARATE extra — it drags numpy+pillow+requests, so it is added in the Phase-2 PR, never
 # folded into [dicom].
 dicom = ["pynetdicom>=3.0.4,<4", "pydicom>=3.0.2,<4"]
+# Opt-in STRICT X12 validation for parsing/x12/validate.py (ADR 0012, BACKLOG #32). Lazy-imported, so
+# the tolerant X12Peek/X12Message hot path (the default) never needs it. pyx12 is the reference
+# implementation-guide validator (e.g. 005010X222A1 for 837P) and also emits the 997/999 ack as a
+# by-product. Its SOLE runtime dependency is defusedxml (already in tree, used to parse pyx12's bundled
+# TRUSTED map XML — not attacker input). >=4.0.0 is the first py3.12+/modern-typing release.
+x12 = ["pyx12>=4.0.0"]
+# Optional XML/SOAP message accessor + schema validation + signature for parsing/xml/ (BACKLOG #31).
+# Lazy-imported, so installs that never touch XML skip it. lxml is the hardened XPath/serialize engine
+# (parser locked down directly — defusedxml does NOT cover lxml and defusedxml.lxml is deprecated);
+# xmlschema validates against XSD with remote schemaLocation fetch disabled; signxml does XML-DSig
+# (it drags cryptography — registered in scripts/security/crypto_inventory_check.py). Floors are the
+# current major lines (lxml 6.x dropped py<3.8 + bundled modern libxml2; xmlschema 4.x; signxml 4.x).
+xml = ["lxml>=6.0.0", "xmlschema>=4.0.0", "signxml>=4.0.0"]
 dev = [
     "pytest>=9.0.3",        # >=9.0.3 fixes CVE-2025-71176 (insecure /tmp dir perms, CWE-379; dev/UNIX-only)
     "pytest-asyncio>=0.26",  # >=0.26 adds asyncio_default_test_loop_scope (BACKLOG #17 shared-loop fix)
@@ -152,5 +165,5 @@ strict = true
 
 # Third-party libraries that ship no type stubs / py.typed marker.
 [[tool.mypy.overrides]]
-module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "defusedxml", "defusedxml.*"]
+module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "defusedxml", "defusedxml.*", "pyx12", "pyx12.*", "lxml", "lxml.*", "xmlschema", "xmlschema.*", "signxml", "signxml.*"]
 ignore_missing_imports = true

@@ -22,6 +22,10 @@ import pytest
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
+from messagefoundry.store.content_search import make_spec
+
+# A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
+_ADT_SEARCH = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN9001^^^H^MR||DOE^JANE\r"
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_POSTGRES"),
@@ -361,6 +365,37 @@ async def test_list_count_and_replay_dead(store) -> None:
     assert (await store.list_dead())[0]["destination_name"] == "OB2"
 
 
+async def test_content_search_scan_decrypt(store) -> None:
+    """ADR 0046 #51 backend parity: scan-and-decrypt content search behaves identically to SQLite —
+    metadata pre-filter bounds the scan, the decrypted body matches the needle, field-path resolves,
+    and the scan/result caps truncate. (Runs against a real Postgres in the gated CI leg.)"""
+    await store.enqueue_message(
+        channel_id="IB_A", raw=_ADT_SEARCH, deliveries=[], control_id="MSG1", message_type="ADT^A01"
+    )
+    await store.enqueue_message(
+        channel_id="IB_B", raw=RAW, deliveries=[], control_id="MSG2", message_type="ADT^A01"
+    )
+    # Substring on decrypted raw (a SQL LIKE could never match the at-rest ciphertext).
+    res = await store.search_messages(make_spec(content="JANE", field_path=None, field_value=None))
+    assert res.matched == 1 and res.rows[0]["control_id"] == "MSG1"
+    assert "raw" not in res.rows[0]  # metadata-only result
+    # Field-path resolver against the decrypted body.
+    res2 = await store.search_messages(
+        make_spec(content=None, field_path="PID-5.1", field_value="DOE")
+    )
+    assert res2.matched == 1 and res2.rows[0]["control_id"] == "MSG1"
+    # Metadata pre-filter narrows the candidate set before any decrypt.
+    res3 = await store.search_messages(
+        make_spec(content="ADT", field_path=None, field_value=None), channel_id="IB_A"
+    )
+    assert res3.scanned == 1 and res3.matched == 1
+    # Scan cap truncates.
+    res4 = await store.search_messages(
+        make_spec(content="zzz-no-match", field_path=None, field_value=None, scan_limit=1)
+    )
+    assert res4.scanned == 1 and res4.truncated is True
+
+
 async def test_replay_dead_only_dead_rows(store) -> None:
     mid = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB1", "p1"), ("OB2", "p2")], now=100.0
@@ -504,6 +539,17 @@ async def test_auth_users_roles_sessions(store) -> None:
     await store.delete_user("u1")
     assert await store.get_user("u1") is None
     assert await store.get_user_role_ids("u1") == []
+
+
+async def test_roles_permissions_contract(store) -> None:
+    """ADR 0045 custom-roles store contract on the real Postgres backend (parity with SQLite):
+    the additive ``roles.permissions`` column round-trips a custom role's JSON, ``get_role`` exposes
+    NULL permissions for a built-in, and ``delete_custom_role`` refuses a built-in / is idempotent.
+    Reuses the single source-of-truth assertion from the SQLite suite so the live-server CI leg
+    actually catches a Postgres regression in the new column/methods."""
+    from tests.test_custom_roles import _assert_roles_contract
+
+    await _assert_roles_contract(store)
 
 
 async def test_mark_session_reauthed_reanchors_client(store) -> None:

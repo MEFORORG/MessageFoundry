@@ -305,6 +305,11 @@ The console stays a **host-side process**; only its target URL changes.
    responsibility, per DEPLOYMENT.md "No-TLS channels — hazards"). A container that exposes those must
    keep them loopback-bound or front them with a TLS-terminating TCP proxy. The shipped image should
    **not** publish raw-TCP/X12 ports by default.
+   **[CORRECTION 2026-06-28 — ADR 0047]:** the raw-TCP/X12 startup TLS guard has since **shipped**
+   (`check_tcp_tls_exposure`, PR #558, 2026-06-26): a non-loopback raw-TCP/X12 bind without TLS and without
+   `--allow-insecure-bind` is now **refused at startup**, at parity with the MLLP/DICOM/HTTP guards. The
+   "operator responsibility / not refused" framing above is the point-in-time (pre-PR-558) record; keep the
+   loopback-or-TLS-proxy guidance, but the engine now enforces it rather than leaving it unchecked.
 
 6. **No Dockerfile/compose exists — the build task owns the container-runtime hardening**, none of
    which is security-logic the engine lacks, but all of which must be designed:

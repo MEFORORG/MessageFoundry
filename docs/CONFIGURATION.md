@@ -67,6 +67,9 @@ backend that consumes the server-DB keys lands incrementally (the settings + val
 | `encrypt`, `trust_server_certificate` | bool | `true`/`false` | TLS to the DB |
 | `pool_size` | int | 5 | server DBs |
 | `connect_timeout`, `command_timeout` | int (s) | 15 / 30 | server DBs |
+| `warm_pool` | bool | `true` | server DBs — pre-open pooled connections in the background on graph start/promotion so a connection burst (the post-promotion delivery workers, or a cold start) finds them warm instead of paying cold connects (TCP+TLS+login). Best-effort, self-releasing, **no-op on SQLite**. On by default (it touches no commit/correctness seam); set `false` to opt out on a connection-constrained/licensed site. |
+| `warm_pool_timeout` | num (s) | 15 | server DBs — upper bound on the background warm-up; on expiry it logs and continues with a partially warm pool. Must be `> 0`. A **clustered** server-DB node also rejects an **explicit** value `>= [cluster].leader_fence_timeout_seconds` (a warm should finish within the leadership term that started it); the default (15 < the 20 fence) never trips this. |
+| `warm_pool_target` | int | — | server DBs — how many connections to pre-open. Unset (default) = a safe fraction of the pool (`min(pool_size-1, pool_size//2)`), so the warm never pins more than half the pool; an explicit value is clamped to `pool_size-1`. A pool of 1 is never warmed. |
 | `db_schema`, `application_name` | str | — / `messagefoundry` | optional (`db_schema` ⇒ env `MEFOR_STORE_DB_SCHEMA`) |
 
 > Selecting `backend = "sqlserver"` validates that `server`/`database` (and `username` when
@@ -390,6 +393,7 @@ the rest are forward-compat placeholders for the future engine broker (accepted-
 |---|---|---|---|
 | `level` | enum | `info` | log level; never run prod at `debug` (PHI) — `serve` refuses it (Gate #1) |
 | `format` | enum | `text` | stdout rendering: `text` (default) or structured `json` (one object per line). Stdlib only — no structlog |
+| `log_dir` | str | _unset_ | the directory NSSM (or another supervisor) **rotates the engine's captured stdout/stderr into**. The engine never writes log **files** itself (it logs to stdout); set this only to tell it where the supervisor parks them, and `GET /status` then **meters that directory's total bytes + filesystem free space** alongside the DB metrics (#50). Unset = stdout-only, no metering. **Metadata only** — the file contents are never read. |
 | `forward_enabled` | bool | `false` | ship a copy of every record off-box to a syslog/SIEM collector (sec-offbox-log) so evidence survives a host compromise; requires `forward_host` |
 | `forward_host` | str | — | syslog/SIEM collector host (**required** when `forward_enabled`) |
 | `forward_port` | int | `514` | collector port (1–65535) |
@@ -412,16 +416,39 @@ so retention is opt-in.
 | `messages_days` | int | `0` | past N days, null inbound bodies (`raw`/`summary`/`error`) of **fully-resolved** messages (no `pending`/`inflight` delivery), keeping metadata. `0` = keep |
 | `dead_letter_days` | int | `0` | past N days, null the bodies of **dead-lettered** outbound rows (their own window — a dead row stays replayable until purged). `0` = keep |
 | `state_max_age_days` | int | `0` | past N days, **delete** transform-state entries (ADR 0005) last written before the cutoff — keeps the in-memory state cache + table bounded. A simple global age purge (by `set_at`); per-namespace policy is a follow-up. `0` = keep |
+| `connection_event_retention_hours` | int | `0` | past N **hours**, **delete** `connection_event` rows (the `[diagnostics]` #46 transport/lifecycle log — high-volume under a connect-per-message sender or a probe storm, so its own short window in **hours**, not days). `0` = inherit the `messages_days` body window (the ADR 0021 §7.5 default). |
 | `audit_days` | int | `0` | **reserved / not enforced.** The `audit_log` is a tamper-evident hash chain and HIPAA expects ~6-year retention, so audit is **keep-forever by design**; archive-first pruning is a tracked follow-up. Accepted so a forward-looking file still loads |
 | `max_db_mb` | int | `0` | advisory only: warn (WARNING log + an `AlertSink` `storage_threshold` event) when the DB (+ `-wal`/`-shm`) exceeds this. Never auto-deletes. `0` = off |
 | `purge_interval_seconds` | float | `3600` | how often the purge/maintenance loop runs a pass |
 | `wal_checkpoint_seconds` | float | `0` | `PRAGMA wal_checkpoint(TRUNCATE)` cadence (SQLite). `0` = off (rely on auto-checkpoint). Evaluated once per pass, so a value below `purge_interval_seconds` is effectively rounded up to it |
 | `vacuum_at` | str | `""` | daily local `"HH:MM"` to run `VACUUM` (SQLite; reclaims space freed by purges). `""` = off. A daily off-peak time, **not** a cron expression (no new dependency); VACUUM holds a write lock on the whole DB while it runs |
 
+> **Per-connection overrides ([ADR 0027](adr/0027-per-connection-retention.md)).** `messages_days` and
+> `dead_letter_days` are **global defaults** an individual connection may override: an **inbound** sets its
+> own `messages_days`, an **outbound** its own `dead_letter_days` (both `None` = inherit this global window,
+> `0` = keep that connection's bodies forever, `>0` = days). An inbound may also opt into **embedded-document
+> pruning** (`prune_documents_after` + `prune_documents_min_bytes`, [ADR 0042](adr/0042-embedded-document-pruning.md))
+> to strip bulky base64 attachments while keeping the readable message. These live on the connection (code-first
+> or in `connections.toml`) — see [CONNECTIONS.md](CONNECTIONS.md).
+
 > **SQLite-only.** Retention/maintenance runs on the SQLite backend. On the SQL Server
 > backend it is a DBA concern (TDE + a SQL Agent purge/shrink job). Each pass that does real work
 > writes one `retention_purge` `audit_log` entry (cutoffs + counts, **no** message content). Design:
 > [PHI.md §8](PHI.md#8-retention--purge).
+
+### `[update_check]`
+Engine-side version-update check ([ADR 0026](adr/0026-off-box-egress-update-check.md)). The MVP is a
+**no-network "pinned-vs-current" diff**: it compares the running `messagefoundry.__version__` against the
+version in the installed distribution metadata (`importlib.metadata`) / the bundled `requirements.lock` —
+**zero outbound traffic**. The result is one additive `/status` field and (optionally) one `update_available`
+AlertSink event that the console/IDE render as a dismissible banner — **the console/IDE never call PyPI**.
+Because the local diff is cheap and PHI-safe it is **on by default** (zero phone-home risk).
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `true` | emit the `/status` field + the `update_available` alert. `false` = suppress both |
+| `check_interval_seconds` | float | `86400` | diff cadence (the diff is trivial; daily is ample). Must be `> 0` |
+| `mode` | str | `"local"` | the no-network diff (the only MVP value). `"live"` (the constrained-egress path, ADR 0026 §2) is **defined but rejected at load**, so a config can never silently turn the check into a phone-home out of a PHI system |
+| `index_url`, `index_allowed_hosts` | str / list | unset | forward-compat for the future `"live"` mode only — **accepted-but-unused** in the MVP |
 
 ### `[delivery]`
 | Key | Type | Default | Notes |
@@ -432,6 +459,7 @@ so retention is opt-in.
 | `internal_error` | enum | `continue` | what a delivery worker does on an **internal/code error** (a non-`DeliveryError` exception from `send` — our bug, not the partner's): `continue` (dead-letter the row + advance) or `stop` (halt the connection's worker, preserve the message for replay, raise a `connection_stopped` alert). Per-outbound `internal_error=` overrides. Partner NAKs / transport failures are unaffected. |
 | `buildup_max_depth` | int | _unset_ | raise a `queue_buildup` alert when an outbound lane's pending depth reaches this. Unset = depth dimension off (a healthy ceiling is throughput-specific, so there's no safe default). Per-outbound `buildup=BuildupThreshold(...)` overrides. |
 | `buildup_max_oldest_seconds` | num | 300 | raise `queue_buildup` when the lane's **oldest** pending message has waited this long (a stuck/retry-forever head is the classic cause). On by default — a head stuck >5 min is a problem in any environment. Set to unset/`0`-disable via a per-outbound override. |
+| `stall_max_oldest_seconds` | num | _unset_ | raise a `message_stall` alert (Corepoint "Max Message Stall", [ADR 0014](adr/0014-alert-routing-rules.md)) when an outbound lane's **oldest undelivered message** has waited this long. **Unset (the default) = the stall alert is OFF** — deny-by-default/opt-in, because it overlaps `buildup_max_oldest_seconds`'s age dimension and would double-page if both fired. Set a threshold to turn it on; a per-outbound `stall=StallThreshold(...)` overrides it. The stall event routes through `[[alerts.rules]]` like any other ([ADR 0014](adr/0014-alerting-rules-engine.md)). |
 | `outbox_workers` | int | per-outbound | delivery concurrency (planned) |
 | `dead_letter` | enum | `keep` | `keep`/`drop`-after-N (planned) |
 
@@ -439,6 +467,22 @@ so retention is opt-in.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `max_correlation_depth` | int (≥1) | 8 | **Re-ingress loop cap** (ADR 0013 Increment 2). When a captured reply is re-ingressed (`reingress_to=`/`Loopback()`), the re-ingressed message carries a `correlation_depth`; a message at this depth still routes, but the next hop (depth+1) **dead-letters** its re-ingress work-row and marks the origin `ERROR`. Coarse by design — it bounds *total work*, not topology, so a chain that legitimately bounces A→B→A a few times needs headroom. 8 is safe for typical request→response→route feeds; raise it for deep correlation chains, lower it to fence a misbehaving loop. (A value of 0 would dead-letter every re-ingress, so the floor is 1.) |
+
+### `[diagnostics]`
+The Corepoint-style **event log** (#46) — a metadata-only record of connection lifecycle / pre-ingress
+failures and the ACK/NAK the engine returns. **Both master switches are on by default and safe to be:**
+they store only non-PHI metadata (connection name, peer IP, a scrubbed reason, the ACK disposition), and
+the AA-ACK *body* is stored only when the store is encrypted (else NULL); a NAK body is never persisted.
+A per-connection `capture_connection_errors` / `capture_ack` flag overrides the matching master switch for
+one connection (see [CONNECTIONS.md](CONNECTIONS.md)).
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `connection_events` | bool | `true` | master switch for the **connection/transport event log**: inbound lifecycle (established/closed) + pre-ingress failures (allowlist/capacity/oversize/peer-reset/framing) + outbound lane transitions (connection_lost/restored). Metadata-only, written off the hot path by a drain task. Per-connection `capture_connection_errors` overrides it. |
+| `response_sent` | bool | `true` | master switch for **"Response Sent"** — the ACK/NAK returned to an inbound sender. Always captures the disposition metadata (`ack_code`/`phase`/`outcome`); the AA body is stored only on an encrypted store, and every NAK body is NULL. Per-connection `capture_ack` overrides it. |
+
+> Retention for the event log has its own short window — `[retention].connection_event_retention_hours`
+> (in **hours**; `0` = inherit `messages_days`).
 
 ### `[egress]`
 Fail-closed **outbound destination allowlist** (WP-11c; ASVS 13.2.4/13.2.5/14.2.3) — bounds where the
@@ -484,7 +528,8 @@ bytes/SQL leave the box) and retains the would-send payload for parity compariso
 > the message just finalizes `PROCESSED`.
 
 ### `[alerts]`
-Where the delivery pipeline's operational alerts (`connection_stopped`, `queue_buildup`) are
+Where the delivery pipeline's operational alerts (e.g. `connection_stopped`, `queue_buildup`,
+`connection_error`, `message_stall`, `integrity_drift`) are
 delivered. **Both transports are off by default** — with neither configured, events are logged at
 `WARNING` (the `LoggingAlertSink`). A transport turns on when its essentials are present. Payloads
 carry the connection name + queue shape only — **never a message body** (no PHI). Delivery is
@@ -515,7 +560,7 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event: `any`, `connection_stopped`, `queue_buildup`, `storage_threshold`, or `cert_expiry` |
+| `event_type` | str | `any` | match this event: `any`, `connection_stopped`, `queue_buildup`, `storage_threshold`, `cert_expiry`, `connection_error`, `message_stall`, or `integrity_drift` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |
@@ -707,6 +752,21 @@ Optional **dual-control (maker-checker)** approval for high-value actions (ASVS 
 | `enabled` | bool | `false` | turn on dual-control; off = every action executes inline as before |
 | `operations` | list[str] | `["connection_purge", "dead_letter_replay"]` | which operations require approval; each must be a known op key (a typo is refused at startup) |
 | `expiry_hours` | num | 72 | a pending request can no longer be approved after this many hours (`0` = never expires) |
+
+### `[integrity]`
+Startup **self-attestation of the installed engine wheel** ([ADR 0041](adr/0041-load-path-attestation-and-change-attribution.md)
+D3) — a runtime in-place-tamper tripwire (`messagefoundry/integrity.py`). At startup (and on demand) the
+engine hashes every **loaded** first-party `messagefoundry` module file against the installed wheel's
+`*.dist-info/RECORD` baseline; on **drift** (a loaded module no longer matching its RECORD hash) it records
+a hash-chained `startup_integrity` audit row and fires the `AlertSink`. It complements ADR 0036 (which guards
+the *config dir*) by covering the installed *site-packages* an admin with venv-write + restart rights could
+edit in place. Both keys default **safe**: attestation is on but **alert-only** (it never blocks startup), and
+an **editable** install (`pip install -e .` — no RECORD baseline) is a **no-op**, so dev is never bricked.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `true` | run startup attestation at all. On by default (alert-only is harmless); a **no-op** off an editable install. Set `false` only to suppress the check entirely (e.g. an unusual packaging where RECORD is known-stale) — you then lose the in-place-tamper tripwire. |
+| `fail_closed_on_drift` | bool | `false` | when `true`, drift makes `serve` **refuse to start** (after recording the audit row + alerting). Default `false` = **alert-only**: a legitimate reviewed in-place security hotfix (the documented vendored-parser patch contingency) would itself trip a RECORD mismatch, so fail-closed-by-default would brick a legitimate patch. Opt in for hard enforcement on a locked-down instance. |
 
 ### `[engine]`
 | Key | Type | Default | Notes |

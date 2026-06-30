@@ -25,6 +25,8 @@ from messagefoundry.api.auth_models import (
     AuditList,
     ChannelScope,
     CurrentUser,
+    CustomRoleInfo,
+    CustomRoleRequest,
     LoginRequest,
     LoginResponse,
     MfaConfirmRequest,
@@ -62,6 +64,7 @@ from messagefoundry.auth import (
     Permission,
     Role,
 )
+from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.store.store import SessionRecord, UserRecord
@@ -153,10 +156,17 @@ def _user_summary(user: UserRecord, role_ids: list[str]) -> UserSummary:
     )
 
 
-def _validate_roles(roles: list[str]) -> None:
-    unknown = sorted(set(roles) - _VALID_ROLE_IDS)
+async def _validate_roles(service: AuthService, roles: list[str]) -> None:
+    """Reject any role id that is neither a fixed built-in nor an existing custom role (ADR 0045) —
+    so a user can be assigned a custom role, but never a non-existent / mistyped id (deny-by-default)."""
+    unknown = set(roles) - _VALID_ROLE_IDS
     if unknown:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unknown role(s): {', '.join(unknown)}")
+        custom_ids = {r.id for r in await service.list_custom_roles()}
+        unknown -= custom_ids
+    if unknown:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, f"unknown role(s): {', '.join(sorted(unknown))}"
+        )
 
 
 def add_auth_routes(app: FastAPI) -> None:
@@ -399,7 +409,10 @@ def add_auth_routes(app: FastAPI) -> None:
     # --- roles + user administration -----------------------------------------
 
     @app.get("/roles", response_model=list[RoleInfo])
-    async def list_roles(_: Identity = Depends(require(Permission.USERS_READ))) -> list[RoleInfo]:
+    async def list_roles(
+        service: AuthService = Depends(_service),
+        _: Identity = Depends(require(Permission.USERS_READ)),
+    ) -> list[RoleInfo]:
         out: list[RoleInfo] = []
         for role in Role:
             label, description = ROLE_METADATA[role]
@@ -409,9 +422,97 @@ def add_auth_routes(app: FastAPI) -> None:
                     display_name=label,
                     description=description,
                     permissions=sorted(p.value for p in BUILTIN_ROLE_PERMISSIONS[role]),
+                    builtin=True,
+                )
+            )
+        # Custom (admin-defined) roles overlay the built-ins (ADR 0045) — list them alongside so the
+        # admin UI renders the full assignable set. Permissions are defensively decoded by the service.
+        for custom in await service.list_custom_roles():
+            out.append(
+                RoleInfo(
+                    id=custom.id,
+                    display_name=custom.display_name,
+                    description=custom.description,
+                    permissions=sorted(p.value for p in custom.permissions),
+                    builtin=False,
                 )
             )
         return out
+
+    @app.get("/roles/custom", response_model=list[CustomRoleInfo])
+    async def list_custom_roles(
+        service: AuthService = Depends(_service),
+        _: Identity = Depends(require(Permission.USERS_READ)),
+    ) -> list[CustomRoleInfo]:
+        return [
+            CustomRoleInfo(
+                id=r.id,
+                display_name=r.display_name,
+                description=r.description,
+                permissions=sorted(p.value for p in r.permissions),
+            )
+            for r in await service.list_custom_roles()
+        ]
+
+    @app.post("/roles/custom", response_model=CustomRoleInfo, status_code=status.HTTP_201_CREATED)
+    async def create_custom_role(
+        body: CustomRoleRequest,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+    ) -> CustomRoleInfo:
+        try:
+            role = await service.create_custom_role(
+                display_name=body.display_name,
+                description=body.description,
+                permissions=body.permissions,
+                actor=identity.username,
+            )
+        except CustomRoleError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        return CustomRoleInfo(
+            id=role.id,
+            display_name=role.display_name,
+            description=role.description,
+            permissions=sorted(p.value for p in role.permissions),
+        )
+
+    @app.put("/roles/custom/{role_id}", response_model=CustomRoleInfo)
+    async def update_custom_role(
+        role_id: str,
+        body: CustomRoleRequest,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+    ) -> CustomRoleInfo:
+        try:
+            role = await service.update_custom_role(
+                role_id,
+                display_name=body.display_name,
+                description=body.description,
+                permissions=body.permissions,
+                actor=identity.username,
+            )
+        except CustomRoleError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        return CustomRoleInfo(
+            id=role.id,
+            display_name=role.display_name,
+            description=role.description,
+            permissions=sorted(p.value for p in role.permissions),
+        )
+
+    @app.delete("/roles/custom/{role_id}", response_model=SimpleMessage)
+    async def delete_custom_role(
+        role_id: str,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+    ) -> SimpleMessage:
+        try:
+            await service.delete_custom_role(role_id, actor=identity.username)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        return SimpleMessage(detail="custom role deleted")
 
     @app.get("/users", response_model=list[UserSummary])
     async def list_users(
@@ -430,7 +531,7 @@ def add_auth_routes(app: FastAPI) -> None:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> UserSummary:
-        _validate_roles(body.roles)
+        await _validate_roles(service, body.roles)
         if await service.store.get_user_by_username(body.username) is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, "username already exists")
         violations = service.password_violations(body.password, username=body.username)
@@ -523,7 +624,7 @@ def add_auth_routes(app: FastAPI) -> None:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
-        _validate_roles(body.roles)
+        await _validate_roles(service, body.roles)
         user = await service.store.get_user(user_id)
         if user is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
@@ -626,7 +727,7 @@ def add_auth_routes(app: FastAPI) -> None:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> SimpleMessage:
-        _validate_roles([e.role for e in body.entries])
+        await _validate_roles(service, [e.role for e in body.entries])
         await service.set_ad_group_map(
             [(e.ad_group, e.role) for e in body.entries], actor=identity.username
         )

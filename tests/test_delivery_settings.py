@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry import BuildupThreshold, InternalErrorPolicy, RetryPolicy
+from messagefoundry import BuildupThreshold, InternalErrorPolicy, RetryPolicy, StallThreshold
 from messagefoundry.config.settings import DeliverySettings, load_settings
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline import Engine
@@ -81,6 +81,43 @@ def test_buildup_threshold_default_and_toml_override(tmp_path: Path) -> None:
     bt = load_settings(config_path=cfg).delivery.buildup_threshold()
     assert bt.max_depth == 500
     assert bt.max_oldest_seconds == 60.0
+
+
+def test_stall_threshold_default_off_and_toml_override(tmp_path: Path) -> None:
+    # The [delivery] stall_max_oldest_seconds key mirrors StallThreshold; the message_stall alert is
+    # OFF by default (deny-by-default), and the file turns it on. (#50, Corepoint "Max Message Stall".)
+    assert DeliverySettings().stall_threshold() == StallThreshold()
+    assert DeliverySettings().stall_threshold().max_oldest_seconds is None  # off unless configured
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text("[delivery]\nstall_max_oldest_seconds = 120\n")
+    st = load_settings(config_path=cfg).delivery.stall_threshold()
+    assert st.max_oldest_seconds == 120.0
+
+
+def test_outbound_stall_override_kept_when_set(tmp_path: Path) -> None:
+    # A per-connection stall= is preserved on the OutboundConnection (resolution to the global default
+    # happens later in the runner, like retry/buildup).
+    cfgdir = tmp_path / "cfg"
+    cfgdir.mkdir()
+    (cfgdir / "c.py").write_text(
+        textwrap.dedent(
+            f"""
+            from messagefoundry import outbound, inbound, router, File, StallThreshold
+            outbound("ob_default", File(directory={str(tmp_path / "a")!r}, filename="{{MSH-10}}.hl7"))
+            outbound("ob_override", File(directory={str(tmp_path / "b")!r}, filename="{{MSH-10}}.hl7"),
+                     stall=StallThreshold(max_oldest_seconds=30))
+            inbound("in", File(directory={str(tmp_path / "in")!r}, pattern="*.hl7", poll_seconds=0.05),
+                    router="r")
+
+            @router("r")
+            def route(msg):
+                return []
+            """
+        )
+    )
+    reg = load_config(cfgdir)
+    assert reg.outbound["ob_default"].stall is None  # unset → inherit the global default later
+    assert reg.outbound["ob_override"].stall == StallThreshold(max_oldest_seconds=30)
 
 
 def test_internal_error_default_and_toml_override(tmp_path: Path) -> None:

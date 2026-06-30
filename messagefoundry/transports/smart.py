@@ -34,7 +34,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
@@ -46,12 +47,13 @@ from messagefoundry.transports.rest import _NO_REDIRECT_OPENER, _redact_url
 from messagefoundry.transports.signing import CompactJwtSigner
 
 if TYPE_CHECKING:  # only for the with_smart_backend() annotation — avoid importing heavy wiring
-    from messagefoundry.config.wiring import ConnectionSpec
+    from messagefoundry.config.wiring import ConnectionSpec, FhirLookupSpec
 
 __all__ = [
     "SmartAuthError",
     "SmartBackendTokenProvider",
     "token_provider_from_destination",
+    "token_provider_from_settings",
     "with_smart_backend",
 ]
 
@@ -220,13 +222,14 @@ class SmartBackendTokenProvider:
         return token, ttl
 
 
-def token_provider_from_destination(config: Destination) -> SmartBackendTokenProvider | None:
-    """The :class:`SmartBackendTokenProvider` for an outbound, or ``None`` when SMART auth is off.
+def token_provider_from_settings(s: Mapping[str, Any]) -> SmartBackendTokenProvider | None:
+    """The :class:`SmartBackendTokenProvider` for an already-``env()``-resolved settings mapping, or
+    ``None`` when SMART auth is off.
 
     SMART auth is OFF (``None``) unless ``smart_token_url`` is present (and ``smart_enabled`` is not
-    ``False``), so every existing outbound is byte-identical. Settings arrive already ``env()``-resolved
-    (the runner substitutes them before building the connector), exactly like the ``sign_*`` path."""
-    s = config.settings
+    ``False``), so any connection that didn't compose ``with_smart_backend`` is byte-identical. Shared by
+    the FHIR/REST outbound (:func:`token_provider_from_destination`) and the ``FhirLookup`` read executor
+    (ADR 0043) — both inject the minted bearer per request off-loop past the queue boundary."""
     if not s.get("smart_token_url"):
         return None
     if not s.get("smart_enabled", True):
@@ -247,8 +250,17 @@ def token_provider_from_destination(config: Destination) -> SmartBackendTokenPro
     )
 
 
+def token_provider_from_destination(config: Destination) -> SmartBackendTokenProvider | None:
+    """The :class:`SmartBackendTokenProvider` for an outbound, or ``None`` when SMART auth is off.
+
+    SMART auth is OFF (``None``) unless ``smart_token_url`` is present (and ``smart_enabled`` is not
+    ``False``), so every existing outbound is byte-identical. Settings arrive already ``env()``-resolved
+    (the runner substitutes them before building the connector), exactly like the ``sign_*`` path."""
+    return token_provider_from_settings(config.settings)
+
+
 def with_smart_backend(
-    spec: ConnectionSpec,
+    spec: ConnectionSpec | FhirLookupSpec,
     *,
     token_url: object,
     client_id: object,
@@ -261,8 +273,9 @@ def with_smart_backend(
     expiry_skew_seconds: float = _DEFAULT_EXPIRY_SKEW,
     timeout_seconds: float = _DEFAULT_TOKEN_TIMEOUT,
     enabled: bool = True,
-) -> ConnectionSpec:
-    """Enable SMART Backend Services client auth on a **REST/FHIR** outbound spec (ADR 0024).
+) -> ConnectionSpec | FhirLookupSpec:
+    """Enable SMART Backend Services client auth on a **REST/FHIR** outbound spec, or a **FhirLookup**
+    read-side spec (ADR 0024/0043).
 
     Compose it over the ``Rest()`` / ``FHIR()`` factory — which supplies every transport default — so
     SMART auth is one code-first call and nothing else about the connector changes::
@@ -283,10 +296,17 @@ def with_smart_backend(
     ``token_url`` / ``client_id`` / ``private_key`` / ``audience`` / ``private_key_password`` may be
     :func:`~messagefoundry.config.wiring.env` references — keep every secret in ``env()``. The minted
     bearer **overrides** any static ``bearer_token`` on the spec. Mutates ``spec`` in place and returns
-    it; SMART auth is OFF on any spec this was not called on."""
-    if spec.type not in (ConnectorType.REST, ConnectorType.FHIR):
+    it; SMART auth is OFF on any spec this was not called on. Accepts a ``FhirLookup`` read-side spec too
+    (ADR 0043) — the read executor reuses the same provider for the GET's ``Authorization`` header."""
+    # Lazy import avoids the transports -> config import cycle (config.wiring imports transports lazily).
+    from messagefoundry.config.wiring import FhirLookupSpec
+
+    if not isinstance(spec, FhirLookupSpec) and spec.type not in (
+        ConnectorType.REST,
+        ConnectorType.FHIR,
+    ):
         raise SmartAuthError(
-            f"SMART Backend Services auth applies to REST/FHIR outbound only, not "
+            f"SMART Backend Services auth applies to REST/FHIR outbound (or a FhirLookup) only, not "
             f"{spec.type.value!r} (ADR 0024)"
         )
     spec.settings.update(

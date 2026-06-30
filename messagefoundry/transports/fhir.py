@@ -42,6 +42,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
@@ -67,7 +68,7 @@ from messagefoundry.transports.rest import (
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
-__all__ = ["FhirDestination"]
+__all__ = ["FhirDestination", "FhirLookupExecutor"]
 
 logger = logging.getLogger(__name__)
 
@@ -469,3 +470,241 @@ class FhirDestination(DestinationConnector):
 
 
 register_destination(ConnectorType.FHIR, FhirDestination)
+
+
+# --- handler-callable live FHIR read (fhir_lookup, ADR 0043) ------------------
+# The read-side mirror of DatabaseLookupExecutor: a GET-only executor reused by the RegistryRunner from
+# the graph's FhirLookup specs. It reuses rest.py's hardened opener (TLS-verifying, no-redirect — a 3xx
+# can't divert a PHI-bearing read to another host; ASVS 15.3.2), the SMART bearer (ADR 0024), and the
+# pure parsing/fhir/ codec to parse the reply. Read-only is STRUCTURAL: it builds only a GET (no verb, no
+# body), so a Handler cannot mutate the FHIR server through it (FHIR writes stay on FhirDestination).
+
+
+def _resolve_read_url(base: str, query: str) -> str:
+    """Build a read-only ``GET`` URL from a ``FhirLookup`` ``query``: a read-by-id (``"Patient/123"``) or a
+    search (``"Patient?identifier=MRN|123"``).
+
+    Grammar-gates the resource-type and id **path segments** to the FHIR token/id grammars (the same gate
+    ``FhirDestination`` applies to a write path, CWE-918): a crafted query can't smuggle ``/``, ``..``,
+    ``#``, ``@`` (or a leading ``/`` / absolute URL) into the path and redirect the read to another
+    resource/operation — or off the allow-listed host. The optional search string (after ``?``) rides the
+    URL query verbatim after a control-char check (it never adds a path segment). Raises a PHI-safe
+    ``ValueError`` (it names only the offending shape/segment, never the query's parameter values)."""
+    raw = query.strip()
+    if not raw:
+        raise ValueError("FHIR read query is empty")
+    path_part, sep, search_part = raw.partition("?")
+    segments = path_part.split("/")
+    if not (1 <= len(segments) <= 2):
+        # Only {ResourceType} or {ResourceType}/{id} — never a nested/operation path.
+        raise ValueError("FHIR read path must be 'ResourceType' or 'ResourceType/id'")
+    resource_type = segments[0]
+    if not _FHIR_TYPE_RE.match(resource_type):
+        raise ValueError("FHIR read resourceType is not a valid FHIR token")
+    type_seg = urllib.parse.quote(resource_type, safe="")
+    path = type_seg
+    if len(segments) == 2:
+        resource_id = segments[1]
+        if not _FHIR_ID_RE.match(resource_id):
+            raise ValueError("FHIR read id is not a valid FHIR id")
+        path = f"{type_seg}/{urllib.parse.quote(resource_id, safe='')}"
+    url = f"{base.rstrip('/')}/{path}"
+    if sep:  # a search query string — control-char gate (it never adds a path segment)
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in search_part):
+            raise ValueError("FHIR read search query contains an illegal control character")
+        url = f"{url}?{search_part}"
+    return url
+
+
+class FhirLookupExecutor:
+    """GET-only executor for handler-callable **live** FHIR reads (``fhir_lookup``, ADR 0043).
+
+    Built by the :class:`~messagefoundry.pipeline.wiring_runner.RegistryRunner` from the graph's
+    ``FhirLookup`` specs (``env()``-resolved + ``[egress].allowed_http``-checked by the runner). For each
+    named connection it builds the hardened opener (TLS-verifying, no-redirect), the request headers, and
+    an optional SMART Backend Services token provider (the same provider/cache/401-invalidate the FHIR
+    outbound uses). :meth:`read` issues a read-by-id / search ``GET`` **off the event loop** and returns
+    the parsed result as a plain dict (a resource, or a searchset ``Bundle``); the Handler reads it via the
+    pure ``parsing/fhir/`` codec.
+
+    **PHI/secret-safe:** an error names only routing-safe identifiers (connection, HTTP status, an
+    ``OperationOutcome`` issue code, a redacted host) — never the returned body, the query's parameter
+    values, or the SMART token."""
+
+    def __init__(self, connections: Mapping[str, Mapping[str, Any]]) -> None:
+        # connections: name -> already-env-resolved settings (the runner substitutes env() first).
+        from messagefoundry.transports.smart import token_provider_from_settings
+
+        self._base: dict[str, str] = {}
+        self._headers: dict[str, dict[str, str]] = {}
+        self._timeout: dict[str, float] = {}
+        self._encoding: dict[str, str] = {}
+        self._opener: dict[str, urllib.request.OpenerDirector] = {}
+        self._token: dict[str, Any] = {}  # name -> SmartBackendTokenProvider | None
+        for cname, raw in connections.items():
+            s = dict(raw)
+            url = s.get("url")
+            if not isinstance(url, str) or not url:
+                raise ValueError(
+                    f"FhirLookup {cname!r} requires a 'url' setting (the FHIR base URL)"
+                )
+            scheme = urllib.parse.urlsplit(url).scheme.lower()
+            if scheme not in ("http", "https"):
+                raise ValueError(
+                    f"FhirLookup {cname!r} 'url' must be http or https, got scheme {scheme!r}"
+                )
+            self._base[cname] = url
+            self._timeout[cname] = float(s.get("timeout_seconds", 30.0))
+            self._encoding[cname] = str(s.get("encoding", "utf-8"))
+            headers = self._build_headers(s)
+            # The read sends Authorization (static or SMART) — refuse it over cleartext http.
+            token = token_provider_from_settings(s)
+            check_headers = {**headers, "Authorization": "Bearer"} if token is not None else headers
+            refuse_cleartext_credentials(scheme, check_headers, url)
+            self._headers[cname] = headers
+            self._token[cname] = token
+            if bool(s.get("verify_tls", True)):
+                self._opener[cname] = _NO_REDIRECT_OPENER
+            else:
+                if scheme == "https" and not insecure_tls_allowed():
+                    raise ValueError(
+                        f"FhirLookup {cname!r} verify_tls=false disables TLS certificate verification; "
+                        f"refused unless {INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only)"
+                    )
+                logger.warning(
+                    "FhirLookup %s has TLS verification DISABLED (verify_tls=false)",
+                    _redact_url(url),
+                )
+                self._opener[cname] = _insecure_opener()
+
+    @staticmethod
+    def _build_headers(s: Mapping[str, Any]) -> dict[str, str]:
+        """``Accept: application/fhir+json`` + static ``headers`` + optional static bearer/basic auth (a
+        SMART bearer, when composed, is injected per-request in :meth:`_get`, overriding any static one)."""
+        media = "application/fhir+json"
+        headers: dict[str, str] = {"Accept": media}
+        extra = s.get("headers") or {}
+        if isinstance(extra, dict):
+            headers.update({str(k): str(v) for k, v in extra.items()})
+        token = s.get("bearer_token")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        user, password = s.get("basic_user"), s.get("basic_password")
+        if user and password:
+            raw = f"{user}:{password}".encode()
+            headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+        return headers
+
+    @property
+    def connections(self) -> frozenset[str]:
+        """The declared lookup connection names."""
+        return frozenset(self._base)
+
+    async def read(self, connection: str, query: str) -> dict[str, Any]:
+        """Issue a read-only ``GET`` for ``query`` against ``connection`` and return the parsed result.
+
+        Runs the blocking GET **off the event loop** (the engine loop awaits this; ``fhir_lookup`` bridges
+        in from the handler's worker thread via ``run_coroutine_threadsafe``). Raises
+        :class:`~messagefoundry.config.fhir_lookup.FhirLookupError` (PHI/secret-safe) on an unknown
+        connection, an invalid query path, a non-2xx, an unparseable body, or a network/timeout error."""
+        # Lazy import keeps transports/ from importing config at module load (config imports transports).
+        from messagefoundry.config.fhir_lookup import FhirLookupError
+
+        if connection not in self._base:
+            known = ", ".join(sorted(self._base)) or "(none declared)"
+            raise FhirLookupError(
+                f"fhir_lookup: no FhirLookup connection named {connection!r} (declared: {known})"
+            )
+        try:
+            url = _resolve_read_url(self._base[connection], query)
+        except ValueError as exc:
+            # PHI-safe: _resolve_read_url names only the offending shape/segment, never the query values.
+            raise FhirLookupError(f"fhir_lookup on {connection!r}: {exc}") from exc
+        body, status = await asyncio.to_thread(self._get, connection, url)
+        return self._parse(connection, body, status)
+
+    def _get(self, connection: str, url: str) -> tuple[str, int]:
+        """The blocking GET (off-loop). Injects a fresh SMART bearer when composed; on a 401 invalidates
+        the cached token so the next read re-mints. PHI/secret-safe: errors name only the redacted host +
+        HTTP status, never the body or token."""
+        from messagefoundry.config.fhir_lookup import FhirLookupError
+
+        base = self._base[connection]
+        encoding = self._encoding[connection]
+        headers = dict(self._headers[connection])
+        token = self._token[connection]
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token.access_token()}"
+        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
+            url, headers=headers, method="GET"
+        )
+        try:
+            with self._opener[connection].open(req, timeout=self._timeout[connection]) as resp:
+                read_body = resp.read().decode(encoding, errors="replace")
+                status = int(getattr(resp, "status", 200))
+                return read_body, status
+        except urllib.error.HTTPError as exc:
+            if token is not None and exc.code == 401:
+                token.invalidate()  # the bearer may have expired between mint and use — drop it
+            raise FhirLookupError(
+                f"fhir_lookup on {connection!r}: FHIR {_redact_url(base)} returned HTTP {exc.code}"
+            ) from exc
+        except urllib.error.URLError as exc:  # DNS / connection refused / TLS / timeout
+            raise FhirLookupError(
+                f"fhir_lookup on {connection!r}: FHIR {_redact_url(base)} unreachable: {exc.reason}"
+            ) from exc
+        except (TimeoutError, OSError) as exc:
+            raise FhirLookupError(
+                f"fhir_lookup on {connection!r}: FHIR {_redact_url(base)} failed: {exc}"
+            ) from exc
+
+    def _parse(self, connection: str, body: str, status: int) -> dict[str, Any]:
+        """Parse a 2xx reply body into a resource / searchset ``Bundle`` dict via the pure codec. PHI-safe:
+        an unparseable body / error OperationOutcome names only the connection + a routing-safe issue
+        code/status, never the body."""
+        from messagefoundry.config.fhir_lookup import FhirLookupError
+
+        try:
+            return FhirPeek.parse(body).obj
+        except FhirPeekError as exc:
+            raise FhirLookupError(
+                f"fhir_lookup on {connection!r}: FHIR server returned an unparseable body (HTTP {status})"
+            ) from exc
+
+    async def test_connection(self, connection: str) -> None:
+        """Reachability probe: a ``GET {base}/metadata`` (the ``CapabilityStatement``) over the hardened
+        opener — reaches the server without reading a clinical resource. Any HTTP response means the host
+        answered; a 401/403 means the configured credentials would be rejected (mirrors
+        :meth:`FhirDestination._probe`). Runs off the event loop."""
+        await asyncio.to_thread(self._probe, connection)
+
+    def _probe(self, connection: str) -> None:
+        from messagefoundry.config.fhir_lookup import FhirLookupError
+
+        base = self._base[connection]
+        url = f"{base.rstrip('/')}/metadata"
+        headers = dict(self._headers[connection])
+        token = self._token[connection]
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token.access_token()}"
+        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
+            url, headers=headers, method="GET"
+        )
+        try:
+            with self._opener[connection].open(req, timeout=self._timeout[connection]) as resp:
+                resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise FhirLookupError(
+                    f"FhirLookup {connection!r}: FHIR {_redact_url(base)} returned HTTP {exc.code} "
+                    "(check credentials)"
+                ) from exc
+            return  # any other status (the host answered) → reachable
+        except urllib.error.URLError as exc:
+            raise FhirLookupError(
+                f"FhirLookup {connection!r}: FHIR {_redact_url(base)} unreachable: {exc.reason}"
+            ) from exc
+        except (TimeoutError, OSError) as exc:
+            raise FhirLookupError(
+                f"FhirLookup {connection!r}: FHIR {_redact_url(base)} failed: {exc}"
+            ) from exc

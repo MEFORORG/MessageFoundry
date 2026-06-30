@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Headless tests for the console Alerts page (BACKLOG #22, ADR 0014).
+"""Headless tests for the console Alerts page (BACKLOG #22, ADR 0014 + ADR 0044 #56).
 
-Drives ``AlertsPage`` against a fake client returning a sample ``AlertsConfig`` and asserts the
-transports summary and the rules table render. The page is read-only (consumes GET /alerts/rules);
-there is no action path to exercise.
+Drives ``AlertsPage`` against a fake client returning a sample ``AlertsConfig`` + active
+``AlertInstanceInfo`` list, and asserts the transports summary, the rules table, the active-alerts
+table, and the Acknowledge / Resolve actions (ADR 0044) render/fire correctly.
 """
 
 from __future__ import annotations
@@ -17,7 +17,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
 
-from messagefoundry.api.models import AlertRuleInfo, AlertsConfig  # noqa: E402
+from messagefoundry.api.models import (  # noqa: E402
+    AlertInstanceInfo,
+    AlertInstanceList,
+    AlertRuleInfo,
+    AlertsConfig,
+)
 from messagefoundry.console.client import ApiError  # noqa: E402
 
 
@@ -41,19 +46,64 @@ def _config(
     )
 
 
-class FakeClient:
-    """The EngineClient surface AlertsPage uses: a canned AlertsConfig + call recording."""
+def _instance(
+    alert_id: int,
+    *,
+    event_type: str = "connection_error",
+    connection: str = "OB_X",
+    severity: str = "critical",
+    status: str = "open",
+    count: int = 1,
+    reason: str | None = "refused",
+) -> AlertInstanceInfo:
+    return AlertInstanceInfo(
+        id=alert_id,
+        event_type=event_type,
+        connection=connection,
+        severity=severity,
+        status=status,
+        first_seen=100.0,
+        last_seen=150.0,
+        count=count,
+        reason=reason,
+    )
 
-    def __init__(self, config: AlertsConfig, *, error: ApiError | None = None) -> None:
+
+class FakeClient:
+    """The EngineClient surface AlertsPage uses: canned AlertsConfig + active alerts + call recording."""
+
+    def __init__(
+        self,
+        config: AlertsConfig,
+        *,
+        active: list[AlertInstanceInfo] | None = None,
+        error: ApiError | None = None,
+    ) -> None:
         self._config = config
+        self._active = active if active is not None else []
         self._error = error
         self.calls = 0
+        self.acked: list[int] = []
+        self.resolved: list[int] = []
 
     def alerts_rules(self) -> AlertsConfig:
         self.calls += 1
         if self._error is not None:
             raise self._error
         return self._config
+
+    def active_alerts(self) -> AlertInstanceList:
+        if self._error is not None:
+            raise self._error
+        return AlertInstanceList(alerts=list(self._active))
+
+    def ack_alert(self, alert_id: int) -> AlertInstanceInfo:
+        self.acked.append(alert_id)
+        return _instance(alert_id, status="acknowledged")
+
+    def resolve_alert(self, alert_id: int) -> AlertInstanceInfo:
+        self.resolved.append(alert_id)
+        return _instance(alert_id, status="resolved")
 
 
 @pytest.fixture(scope="module")
@@ -71,8 +121,10 @@ def _clean_table_settings(qapp):
     from PySide6.QtCore import QSettings
 
     QSettings().remove("alerts/header_state")
+    QSettings().remove("alerts/active_header_state")
     yield
     QSettings().remove("alerts/header_state")
+    QSettings().remove("alerts/active_header_state")
 
 
 def _settle(qapp, runner) -> None:
@@ -214,3 +266,64 @@ def test_load_after_stop_does_not_strand_loading(qapp) -> None:
     page.reload()  # after stop()
     assert client.calls == 0  # no read was started
     assert page._loading is False  # not stranded
+
+
+# --- active alerts table + ack/resolve actions (ADR 0044, #56) ---------------
+
+
+def test_active_alerts_table_renders(qapp) -> None:
+    from messagefoundry.console.alerts_page import AlertsPage
+
+    active = [
+        _instance(7, event_type="connection_error", connection="OB_X", severity="critical"),
+        _instance(
+            8,
+            event_type="queue_buildup",
+            connection="OB_Y",
+            severity="warning",
+            status="acknowledged",
+            count=3,
+        ),
+    ]
+    page = AlertsPage(FakeClient(_config(), active=active))  # type: ignore[arg-type]
+    page.reload()
+    _settle(qapp, page._runner)
+
+    assert page._active_table.rowCount() == 2
+    # Row 0 cells (Severity, Status, Event type, Connection, Count, ...).
+    assert page._active_table.item(0, 0).text() == "critical"
+    assert page._active_table.item(0, 1).text() == "open"
+    assert page._active_table.item(0, 2).text() == "connection_error"
+    assert page._active_table.item(0, 3).text() == "OB_X"
+    assert page._active_table.item(0, 4).text() == "1"
+    assert page._active_table.item(1, 1).text() == "acknowledged"
+    assert page._active_table.item(1, 4).text() == "3"
+    assert page._active_ids == [7, 8]
+    page.stop()
+
+
+def test_ack_and_resolve_actions_fire(qapp) -> None:
+    from messagefoundry.console.alerts_page import AlertsPage
+
+    client = FakeClient(_config(), active=[_instance(7), _instance(8, connection="OB_Y")])
+    page = AlertsPage(client)  # type: ignore[arg-type]
+    page.reload()
+    _settle(qapp, page._runner)
+
+    # No selection → actions disabled.
+    assert not page._ack_btn.isEnabled()
+    # Select row 0 (id 7) and acknowledge.
+    page._active_table.selectRow(0)
+    assert page._ack_btn.isEnabled()
+    page._ack_selected()
+    _settle(qapp, page._runner)  # the off-thread mutation + the reload it triggers
+    _settle(qapp, page._runner)
+    assert client.acked == [7]
+
+    # Select row 1 (id 8) and resolve.
+    page._active_table.selectRow(1)
+    page._resolve_selected()
+    _settle(qapp, page._runner)
+    _settle(qapp, page._runner)
+    assert client.resolved == [8]
+    page.stop()

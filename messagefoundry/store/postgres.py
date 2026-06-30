@@ -40,6 +40,7 @@ lazily in :meth:`PostgresStore.open` so SQLite-only installs never touch it. Pla
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -57,9 +58,12 @@ from messagefoundry.config.settings import (
     StoreSettings,
     insecure_tls_allowed,
 )
+from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
-from messagefoundry.store.base import Row
+from messagefoundry.store.base import Row, warm_pool_connections, warm_pool_target
+from messagefoundry.store.content_search import SearchSpec, row_matches
+from messagefoundry.store.document_strip import StripResult, cutoff_for
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -70,6 +74,7 @@ from messagefoundry.store.crypto import (
     cipher_info,
 )
 from messagefoundry.store.store import (
+    AlertInstance,
     ConnectionEvent,
     ConnectionMetrics,
     DbStatus,
@@ -77,6 +82,7 @@ from messagefoundry.store.store import (
     InboundMetrics,
     LatencyHistogram,
     CapturedResponse,
+    MessageSearchResult,
     MessageStatus,
     MessageStore,
     OutboxItem,
@@ -121,7 +127,8 @@ _SCHEMA: list[str] = [
         status       TEXT NOT NULL,
         error        TEXT,
         summary      TEXT,
-        metadata     TEXT
+        metadata     TEXT,
+        documents_pruned DOUBLE PRECISION
     )""",
     "CREATE INDEX IF NOT EXISTS ix_messages_channel ON messages(channel_id, received_at)",
     "CREATE INDEX IF NOT EXISTS ix_messages_control ON messages(channel_id, control_id)",
@@ -250,6 +257,28 @@ _SCHEMA: list[str] = [
         reason      TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS ix_connection_event_conn ON connection_event(connection, ts)",
+    # Operator alert-state (ADR 0044, #56) — resolvable alert INSTANCES (open/acknowledged/resolved +
+    # first/last_seen + count). METADATA-ONLY: type/connection/severity/scrubbed reason (cipher-encrypted
+    # at rest, rides the id-keyed _CIPHER_COLUMNS loops). De-duped on ADR 0014's (event_type, connection)
+    # throttle key via the partial unique index (one LIVE instance per key; resolved rows drop out so the
+    # key re-opens). id-keyed (NOT a queue stage → invisible to the finalizer's `FROM queue` scan).
+    """CREATE TABLE IF NOT EXISTS alert_instance (
+        id          BIGSERIAL PRIMARY KEY,
+        event_type  TEXT NOT NULL,
+        connection  TEXT NOT NULL,
+        severity    TEXT NOT NULL,
+        status      TEXT NOT NULL,
+        first_seen  DOUBLE PRECISION NOT NULL,
+        last_seen   DOUBLE PRECISION NOT NULL,
+        count       BIGINT NOT NULL,
+        reason      TEXT,
+        acked_by    TEXT,
+        acked_at    DOUBLE PRECISION,
+        resolved_at DOUBLE PRECISION
+    )""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_instance_open
+        ON alert_instance(event_type, connection) WHERE status <> 'resolved'""",
+    "CREATE INDEX IF NOT EXISTS ix_alert_instance_status ON alert_instance(status, connection)",
     """CREATE TABLE IF NOT EXISTS audit_log (
         id         BIGSERIAL PRIMARY KEY,
         ts         DOUBLE PRECISION NOT NULL,
@@ -299,7 +328,8 @@ _SCHEMA: list[str] = [
         id           TEXT PRIMARY KEY,
         display_name TEXT NOT NULL,
         description  TEXT,
-        builtin      BOOLEAN NOT NULL DEFAULT TRUE
+        builtin      BOOLEAN NOT NULL DEFAULT TRUE,
+        permissions  TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS user_roles (
         user_id     TEXT NOT NULL REFERENCES users(id),
@@ -428,6 +458,10 @@ class PostgresStore:
             "connection_event",
             "reason",
         ),  # #46: scrubbed event reason — id-keyed (BIGSERIAL), rides the loops
+        (
+            "alert_instance",
+            "reason",
+        ),  # #56 (ADR 0044): scrubbed alert reason — id-keyed (BIGSERIAL), rides the loops
         # NB: the `response` table (ADR 0013) is cipher-covered (body, detail) but has a COMPOSITE PK,
         # so it rides the composite helpers below, not this id-keyed list (like state/reference).
         # The `shared_body` table (store-once-deliver-many) is cipher-covered (`body`, hash-keyed) on the
@@ -609,9 +643,44 @@ class PostgresStore:
         # claim_next_fifo reclaims a stranded head from the queue table directly. IF EXISTS is a no-op on
         # a fresh DB / a DB already migrated; runs under the schema advisory lock alongside the CREATEs.
         await conn.execute("DROP TABLE IF EXISTS lane_leases")
+        # #47/ADR 0042: messages.documents_pruned (the "embedded doc evicted vs never present" flag) on a
+        # pre-existing DB. information_schema-gated like the others; NULL on existing rows = never pruned.
+        messages_has_pruned = await conn.fetch(
+            "SELECT 1 FROM information_schema.columns"
+            " WHERE table_name='messages' AND column_name='documents_pruned'"
+        )
+        if not messages_has_pruned:
+            await conn.execute("ALTER TABLE messages ADD COLUMN documents_pruned DOUBLE PRECISION")
+        # --- custom RBAC roles (ADR 0045): roles.permissions on a pre-existing DB. information_schema-
+        # gated like the others; NULL on existing built-in rows = resolves from code (byte-identical).
+        roles_has_perms = await conn.fetch(
+            "SELECT 1 FROM information_schema.columns"
+            " WHERE table_name='roles' AND column_name='permissions'"
+        )
+        if not roles_has_perms:
+            await conn.execute("ALTER TABLE roles ADD COLUMN permissions TEXT")
+        # --- end custom RBAC roles (ADR 0045) --------------------------------
 
     async def close(self) -> None:
         await self._pool.close()
+
+    async def warm_pool(self) -> None:
+        # Pre-open pooled connections so a connection burst (the post-promotion delivery workers, or a
+        # cold start) finds them warm rather than paying asyncpg reconnects on the hot path. asyncpg
+        # reconnects are cheaper than ODBC's TCP+TLS+login, so the win is smaller than on SQL Server, but
+        # it still shaves the post-promotion drain. Gated by [store].warm_pool; the target is capped so a
+        # warm never pins more than half the pool (leaving slots for the coordinator heartbeat,
+        # on-promotion recovery, and the first delivery workers). See QueueStore.warm_pool.
+        if not self._settings.warm_pool:
+            return
+        warmed = await warm_pool_connections(
+            self._pool,
+            target=warm_pool_target(self._pool.get_max_size(), self._settings.warm_pool_target),
+            timeout=self._settings.warm_pool_timeout,
+            backend="postgres",
+        )
+        if warmed:
+            log.info("postgres: pre-warmed %d pooled connection(s)", warmed)
 
     # --- PHI-at-rest cipher seam for nullable text columns (WP-5) -------------
 
@@ -2439,6 +2508,143 @@ class PostgresStore:
             for r in rows
         ]
 
+    # --- operator alert-state (ADR 0044, #56) --------------------------------
+    # >>> alert_instance block (#56) — self-contained; the coordinator integrates the store files <<<
+    async def upsert_alert_instance(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        severity: str,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
+        # (event_type, connection) key. ON CONFLICT on the partial unique index folds a re-fire into the
+        # live instance (bump last_seen + count, refresh severity/reason); an acknowledged instance stays
+        # acknowledged (COALESCE keeps acked_*). Atomic upsert in one statement. reason rides safe_text +
+        # the cipher. The caller wraps it fail-soft.
+        now = time.time() if now is None else now
+        reason_enc = self._enc(safe_text(reason)[:200]) if reason else None
+        await self._pool.execute(
+            "INSERT INTO alert_instance"
+            " (event_type, connection, severity, status, first_seen, last_seen, count, reason)"
+            " VALUES ($1,$2,$3,'open',$4,$4,1,$5)"
+            " ON CONFLICT (event_type, connection) WHERE status <> 'resolved' DO UPDATE SET"
+            " last_seen=EXCLUDED.last_seen, count=alert_instance.count+1,"
+            " severity=EXCLUDED.severity, reason=EXCLUDED.reason",
+            event_type,
+            connection,
+            severity,
+            now,
+            reason_enc,
+        )
+
+    async def list_active_alert_instances(
+        self,
+        *,
+        limit: int = 200,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> list[AlertInstance]:
+        limit = max(1, min(limit, 1000))  # server-side clamp
+        where = ["status IN ('open','acknowledged')"]
+        params: list[Any] = []
+        if allowed_channels is not None:
+            _append_channel_scope_pg(where, params, "connection", allowed_channels)
+        clause = " WHERE " + " AND ".join(where)
+        params.append(limit)
+        rows = await self._pool.fetch(
+            "SELECT id, event_type, connection, severity, status, first_seen, last_seen, count,"
+            f" reason, acked_by, acked_at, resolved_at FROM alert_instance{clause}"
+            f" ORDER BY last_seen DESC, id DESC LIMIT ${len(params)}",
+            *params,
+        )
+        return [self._alert_instance_row(r) for r in rows]
+
+    async def get_alert_instance(
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+    ) -> AlertInstance | None:
+        where = ["id=$1"]
+        params: list[Any] = [alert_id]
+        if allowed_channels is not None:
+            _append_channel_scope_pg(where, params, "connection", allowed_channels)
+        clause = " WHERE " + " AND ".join(where)
+        row = await self._pool.fetchrow(
+            "SELECT id, event_type, connection, severity, status, first_seen, last_seen, count,"
+            f" reason, acked_by, acked_at, resolved_at FROM alert_instance{clause}",
+            *params,
+        )
+        return self._alert_instance_row(row) if row is not None else None
+
+    def _alert_instance_row(self, r: Any) -> AlertInstance:
+        return AlertInstance(
+            id=r["id"],
+            event_type=r["event_type"],
+            connection=r["connection"],
+            severity=r["severity"],
+            status=r["status"],
+            first_seen=r["first_seen"],
+            last_seen=r["last_seen"],
+            count=int(r["count"]),
+            reason=self._dec(r["reason"]),
+            acked_by=r["acked_by"],
+            acked_at=r["acked_at"],
+            resolved_at=r["resolved_at"],
+        )
+
+    async def ack_alert_instance(
+        self, alert_id: int, *, actor: str, now: float | None = None
+    ) -> bool:
+        now = time.time() if now is None else now
+        result = await self._pool.execute(
+            "UPDATE alert_instance SET status='acknowledged', acked_by=$1, acked_at=$2"
+            " WHERE id=$3 AND status<>'resolved'",
+            actor,
+            now,
+            alert_id,
+        )
+        return _rowcount(result) > 0
+
+    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        result = await self._pool.execute(
+            "UPDATE alert_instance SET status='resolved', resolved_at=$1"
+            " WHERE id=$2 AND status<>'resolved'",
+            now,
+            alert_id,
+        )
+        return _rowcount(result) > 0
+
+    async def resolve_alert_instances_for(
+        self, *, event_type: str, connection: str, now: float | None = None
+    ) -> int:
+        now = time.time() if now is None else now
+        result = await self._pool.execute(
+            "UPDATE alert_instance SET status='resolved', resolved_at=$1"
+            " WHERE event_type=$2 AND connection=$3 AND status<>'resolved'",
+            now,
+            event_type,
+            connection,
+        )
+        return _rowcount(result)
+
+    async def count_open_alerts_by_connection(self) -> dict[str, int]:
+        rows = await self._pool.fetch(
+            "SELECT connection, COUNT(*) AS n FROM alert_instance"
+            " WHERE status='open' GROUP BY connection"
+        )
+        return {r["connection"]: int(r["n"]) for r in rows}
+
+    async def purge_alert_instances(self, *, older_than: float, now: float | None = None) -> int:
+        result = await self._pool.execute(
+            "DELETE FROM alert_instance WHERE status='resolved' AND resolved_at IS NOT NULL"
+            " AND resolved_at < $1",
+            older_than,
+        )
+        return _rowcount(result)
+
+    # <<< end alert_instance block (#56) >>>
+
     async def mark_failed(
         self, outbox_id: str, error: str, retry: RetryPolicy, now: float | None = None
     ) -> None:
@@ -2883,6 +3089,58 @@ class PostgresStore:
         )
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM messages{where}", *params)
         return int(row["n"]) if row else 0
+
+    async def search_messages(
+        self,
+        spec: SearchSpec,
+        *,
+        channel_id: str | None = None,
+        status: str | None = None,
+        message_type: str | None = None,
+        control_id: str | None = None,
+        limit: int = 50,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> MessageSearchResult:
+        """Scan-and-decrypt content search (ADR 0046 #51) — see ``MessageStore.search_messages``.
+        Pre-filter on the indexed metadata, then decrypt + match each candidate body in memory off the
+        event loop (a plain SQL ``LIKE`` can't match the at-rest AES-GCM ciphertext)."""
+        where, params = self._message_filter(
+            channel_id, status, message_type, control_id, allowed_channels
+        )
+        rows = await self._fetchall(
+            "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
+            " status, error, summary, metadata, raw,"
+            " (SELECT event FROM message_events e WHERE e.message_id = messages.id"
+            "  ORDER BY e.id DESC LIMIT 1) AS last_event"
+            f" FROM messages{where}"
+            " ORDER BY received_at DESC, id DESC",
+            *params,
+        )
+        return await asyncio.to_thread(self._scan_rows, spec, rows, limit)
+
+    def _scan_rows(
+        self, spec: SearchSpec, candidates: Sequence[Any], limit: int
+    ) -> MessageSearchResult:
+        """Off-loop decrypt+match loop (mirrors ``MessageStore._scan_rows``). Bounded by
+        ``spec.scan_limit`` decrypts and ``limit`` matches; returns metadata-only rows (the decrypted
+        ``raw`` is dropped, so the PHI surface equals ``list_messages``)."""
+        out: list[dict[str, Any]] = []
+        scanned = 0
+        truncated = False
+        for cand in candidates:
+            if scanned >= spec.scan_limit:
+                truncated = True
+                break
+            scanned += 1
+            raw = self._dec(cand["raw"])
+            summary = self._dec(cand["summary"])
+            if row_matches(spec, raw=raw, summary=summary):
+                d = self._decode_record(cand, "error", "summary", "metadata")
+                d.pop("raw", None)
+                out.append(d)
+                if len(out) >= limit:
+                    break
+        return MessageSearchResult(rows=out, scanned=scanned, matched=len(out), truncated=truncated)
 
     async def list_dead(
         self,
@@ -3397,19 +3655,40 @@ class PostgresStore:
         display_name: str,
         description: str | None = None,
         builtin: bool = True,
+        permissions: str | None = None,
     ) -> None:
         await self._execute(
-            "INSERT INTO roles (id, display_name, description, builtin) VALUES ($1,$2,$3,$4)"
+            "INSERT INTO roles (id, display_name, description, builtin, permissions)"
+            " VALUES ($1,$2,$3,$4,$5)"
             " ON CONFLICT (id) DO UPDATE SET display_name=excluded.display_name,"
-            " description=excluded.description, builtin=excluded.builtin",
+            " description=excluded.description, builtin=excluded.builtin,"
+            " permissions=excluded.permissions",
             role_id,
             display_name,
             description,
             builtin,
+            permissions,
         )
 
     async def list_roles(self) -> Sequence[Row]:
         return await self._fetchall("SELECT * FROM roles ORDER BY id")
+
+    async def get_role(self, role_id: str) -> Row | None:
+        rows = await self._fetchall("SELECT * FROM roles WHERE id=$1", role_id)
+        return rows[0] if rows else None
+
+    async def delete_custom_role(self, role_id: str) -> bool:
+        """Delete a custom (``builtin=FALSE``) role and its user/AD-group assignments in one
+        transaction (ADR 0045 D4); never touches a built-in row. Returns ``True`` if removed."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("SELECT builtin FROM roles WHERE id=$1", role_id)
+                if row is None or bool(row["builtin"]):
+                    return False
+                await conn.execute("DELETE FROM user_roles WHERE role_id=$1", role_id)
+                await conn.execute("DELETE FROM ad_group_role_map WHERE role_id=$1", role_id)
+                await conn.execute("DELETE FROM roles WHERE id=$1", role_id)
+                return True
 
     async def get_user_role_ids(self, user_id: str) -> list[str]:
         rows = await self._fetchall(
@@ -3615,72 +3894,165 @@ class PostgresStore:
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
 
-    async def purge_message_bodies(self, *, older_than: float, now: float | None = None) -> int:
+    async def purge_message_bodies(
+        self,
+        *,
+        older_than: float,
+        now: float | None = None,
+        connection_cutoffs: Mapping[str, float] | None = None,
+    ) -> int:
         """Null the PHI **bodies** of fully-resolved messages received before ``older_than`` while
         keeping their metadata rows (the Mirth Data-Pruner pattern). Eligible only when the message has
         no queue row still ``pending``/``inflight``. Ported, not stubbed — Postgres supports retention.
-        Returns the number of messages whose body was nulled."""
+        Returns the number of messages whose body was nulled.
+
+        ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``channel_id``
+        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical to
+        the prior behaviour. AND-ed with the unchanged in-flight guard."""
         now = time.time() if now is None else now
         inflight = [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value]
-        # A message past the cutoff with nothing still in flight. This subquery is embedded in three
-        # UPDATEs below; it consumes exactly $1 (older_than) and $2 (inflight[]), so each outer query
-        # must keep passing those two FIRST and continue its own binds from $3. Don't add/remove a bind
-        # here without re-numbering the outer queries.
-        eligible = (
-            "SELECT id FROM messages m WHERE m.received_at < $1"
-            " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = m.id"
-            " AND q.status = ANY($2::text[]))"
+        # Per-connection cutoff (#34): bare "$1" (global) when no override, else a CASE on
+        # m.channel_id; the inflight[] array follows at the next free placeholder. The two together are
+        # the LEADING binds (cutoff params then inflight) shared by every UPDATE below; each outer query
+        # continues numbering from `nxt` for its own binds (stage/status arrays).
+        cutoff_sql, cutoff_params, idx = _pg_cutoff_case(
+            "m.channel_id", older_than, connection_cutoffs
         )
+        inflight_ph = idx  # placeholder index for the inflight[] array
+        nxt = idx + 1  # first free placeholder for an outer query's own binds
+        # A message past its (per-connection-or-global) cutoff with nothing still in flight. Embedded in
+        # the UPDATEs below; its binds (cutoff_params + inflight) lead, so each outer query passes them
+        # FIRST and continues its own binds from $nxt.
+        eligible = (
+            f"SELECT id FROM messages m WHERE m.received_at < {cutoff_sql}"
+            f" AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = m.id"
+            f" AND q.status = ANY(${inflight_ph}::text[]))"
+        )
+        lead = [*cutoff_params, inflight]
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 result = await conn.execute(
                     f"UPDATE messages SET raw='', summary=NULL, error=NULL"
                     f" WHERE raw <> '' AND id IN ({eligible})",
-                    older_than,
-                    inflight,
+                    *lead,
                 )
                 purged = _rowcount(result)
                 await conn.execute(
                     f"UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE stage=$3 AND status = ANY($4::text[]) AND payload <> ''"
+                    f" WHERE stage=${nxt} AND status = ANY(${nxt + 1}::text[]) AND payload <> ''"
                     f" AND message_id IN ({eligible})",
-                    older_than,
-                    inflight,
+                    *lead,
                     Stage.OUTBOUND.value,
                     [OutboxStatus.DONE.value, OutboxStatus.CANCELLED.value],
                 )
                 await conn.execute(
                     f"UPDATE message_events SET detail=NULL"
                     f" WHERE detail IS NOT NULL AND message_id IN ({eligible})",
-                    older_than,
-                    inflight,
+                    *lead,
                 )
                 # Captured replies (ADR 0013) are PHI on the same window as the body; null in place
                 # (row kept, FK to messages(id) never violated — purge keeps the messages row).
                 await conn.execute(
                     f"UPDATE response SET body=NULL, detail=NULL"
                     f" WHERE (body IS NOT NULL OR detail IS NOT NULL) AND message_id IN ({eligible})",
-                    older_than,
-                    inflight,
+                    *lead,
                 )
         return purged
+
+    async def strip_embedded_documents(
+        self,
+        *,
+        older_than: float,
+        now: float | None = None,
+        connection_cutoffs: Mapping[str, float] | None = None,
+        min_bytes: int = 0,
+        content_types: Mapping[str, str] | None = None,
+    ) -> StripResult:
+        """Strip bulky base64 embedded documents in place (#47, ADR 0042 D2) — the Postgres port of the
+        select → codec-transform → write-back path. Replaces each ``mfb64:v1:`` carriage value / HL7
+        OBX-5 ED embed with a self-describing tombstone, keeps the message parseable, and sets
+        ``documents_pruned``. Eligibility mirrors :meth:`purge_message_bodies` (per-connection-or-global
+        cutoff AND not in-flight). Returns a :class:`StripResult` (counts + bytes; no PHI)."""
+        now = time.time() if now is None else now
+        content_types = content_types or {}
+        inflight = [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value]
+        # Bound the candidate scan with the LOOSEST finite cutoff (a keep-forever -inf never widens it);
+        # the precise per-connection cutoff is re-checked per row in Python (cutoff_for).
+        finite = [
+            c for c in [older_than, *(connection_cutoffs or {}).values()] if c != float("-inf")
+        ]
+        if not finite:
+            return StripResult()  # everything keep-forever ⇒ nothing to scan
+        scan_cutoff = max(finite)
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT m.id, m.channel_id, m.raw, m.received_at FROM messages m"
+                " WHERE m.raw <> '' AND m.documents_pruned IS NULL AND m.received_at < $1"
+                " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = m.id"
+                " AND q.status = ANY($2::text[]))",
+                scan_cutoff,
+                inflight,
+            )
+            msgs = 0
+            docs = 0
+            reclaimed = 0
+            updates: list[tuple[str, float, str]] = []
+            for row in rows:
+                cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
+                if row["received_at"] >= cutoff:
+                    continue
+                raw = self._cipher.decrypt(row["raw"])
+                new_raw, n_docs, n_bytes = _strip_documents(
+                    raw,
+                    pruned_at=now,
+                    min_bytes=min_bytes,
+                    content_type=content_types.get(row["channel_id"]),
+                )
+                if n_docs == 0:
+                    continue
+                updates.append((self._cipher.encrypt(new_raw), now, row["id"]))
+                msgs += 1
+                docs += n_docs
+                reclaimed += n_bytes
+            if updates:
+                async with conn.transaction():
+                    await conn.executemany(
+                        "UPDATE messages SET raw=$1, documents_pruned=$2 WHERE id=$3", updates
+                    )
+        return StripResult(
+            messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
+        )
 
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
         # #46: metadata-only rows (no body/FK) — age-DELETE on their own window (RetentionRunner-driven).
         result = await self._pool.execute("DELETE FROM connection_event WHERE ts < $1", older_than)
         return _rowcount(result)
 
-    async def purge_dead_letters(self, *, older_than: float, now: float | None = None) -> int:
+    async def purge_dead_letters(
+        self,
+        *,
+        older_than: float,
+        now: float | None = None,
+        connection_cutoffs: Mapping[str, float] | None = None,
+    ) -> int:
         """Null the bodies of dead-lettered **outbound** rows last updated before ``older_than`` (their
         own retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
-        Ported, not stubbed. Returns the number of dead rows purged."""
+        Ported, not stubbed. Returns the number of dead rows purged.
+
+        ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``destination_name``
+        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical to
+        the prior behaviour."""
         now = time.time() if now is None else now
+        # stage/status are $1/$2; the cutoff CASE (#34) numbers from $3 onward.
+        cutoff_sql, cutoff_params, _ = _pg_cutoff_case(
+            "destination_name", older_than, connection_cutoffs, start=3
+        )
         result = await self._pool.execute(
             "UPDATE queue SET payload='', last_error=NULL"
-            " WHERE stage=$1 AND status=$2 AND payload <> '' AND updated_at < $3",
+            f" WHERE stage=$1 AND status=$2 AND payload <> '' AND updated_at < {cutoff_sql}",
             Stage.OUTBOUND.value,
             OutboxStatus.DEAD.value,
-            older_than,
+            *cutoff_params,
         )
         return _rowcount(result)
 
@@ -3731,6 +4103,18 @@ class PostgresStore:
     async def vacuum(self) -> None:
         """No-op on Postgres — autovacuum reclaims space; manual VACUUM is a DBA operation here, not
         an engine concern. Present for ``Store`` protocol completeness."""
+
+    async def snapshot_to(self, dest_path: str | object, *, method: str = "vacuum_into") -> None:
+        """**DBA-delegated** on Postgres (ADR 0049 / BACKLOG #52): the engine never takes a DB-tier
+        backup of a server-DB store — ``pg_dump`` / PITR are infra-owned. Raises
+        :class:`~messagefoundry.store.base.DbaDelegatedError`; the BackupRunner / ``backup`` CLI catch it
+        and fall back to a config-only backup (or skip) per ``[backup].config_only_on_server_db``."""
+        from messagefoundry.store.base import DbaDelegatedError
+
+        raise DbaDelegatedError(
+            "the postgres store backup is DBA-delegated (pg_dump / PITR, BACKLOG #52); the engine backs "
+            "up the config bundle only on a server-DB store (set [backup].config_only_on_server_db)"
+        )
 
     # --- store health / metrics ----------------------------------------------
 
@@ -3908,6 +4292,37 @@ def _rowcount(command_tag: str) -> int:
         return int(token)
     except ValueError:
         return 0
+
+
+def _pg_cutoff_case(
+    column: str,
+    global_cutoff: float,
+    connection_cutoffs: Mapping[str, float] | None,
+    start: int = 1,
+) -> tuple[str, list[Any], int]:
+    """Build a ``$N``-placeholder cutoff expression for the per-connection retention override (#34,
+    ADR 0027) on Postgres, numbering its binds from ``$start``.
+
+    With no override (``connection_cutoffs`` empty/None) this returns ``("$start", [global_cutoff],
+    start + 1)`` — **byte-identical** to the single global ``$1`` cutoff today. With overrides it returns
+    a ``CASE <column> WHEN $a THEN $b ... ELSE $z END`` whose per-connection ``THEN`` cutoffs come from
+    the map and whose ``ELSE`` is the global cutoff (a connection absent from the map inherits the global
+    window); a keep-forever override is carried as ``float('-inf')`` (``received_at < -inf`` always
+    false). Returns ``(sql, params, next_index)`` where ``next_index`` is the first free placeholder so
+    the caller can continue numbering its own binds after it."""
+    if not connection_cutoffs:
+        return f"${start}", [global_cutoff], start + 1
+    whens: list[str] = []
+    params: list[Any] = []
+    idx = start
+    for name, cutoff in connection_cutoffs.items():
+        whens.append(f"WHEN ${idx} THEN ${idx + 1}")
+        params.append(name)
+        params.append(cutoff)
+        idx += 2
+    params.append(global_cutoff)  # ELSE — connections with no override use the global window
+    sql = f"(CASE {column} {' '.join(whens)} ELSE ${idx} END)"
+    return sql, params, idx + 1
 
 
 def _append_channel_scope_pg(

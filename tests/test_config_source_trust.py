@@ -165,6 +165,11 @@ def test_world_writable_config_dir_refused_windows(
         ["icacls", str(tmp_path), "/grant", "*S-1-5-11:(OI)(CI)M"],
         capture_output=True,
         text=True,
+        # Bound the subprocess (#55): icacls is normally sub-second, but an unbounded subprocess.run
+        # blocks in a C-level wait that --timeout-method=thread CANNOT interrupt, so a wedged child
+        # (AV scan / locked DACL on a CI runner) would hang the leg silently. A timeout raises
+        # TimeoutExpired = a fast, named failure instead.
+        timeout=30,
     )
     assert proc.returncode == 0, f"icacls grant failed: {proc.stdout}{proc.stderr}"
     with pytest.raises(WiringError, match="writable-by-others|write access|see docs/SERVICE.md"):
@@ -188,6 +193,11 @@ def test_world_writable_config_dir_warns_with_escape_windows(
         ["icacls", str(tmp_path), "/grant", "*S-1-5-11:(OI)(CI)M"],
         capture_output=True,
         text=True,
+        # Bound the subprocess (#55): icacls is normally sub-second, but an unbounded subprocess.run
+        # blocks in a C-level wait that --timeout-method=thread CANNOT interrupt, so a wedged child
+        # (AV scan / locked DACL on a CI runner) would hang the leg silently. A timeout raises
+        # TimeoutExpired = a fast, named failure instead.
+        timeout=30,
     )
     assert proc.returncode == 0, f"icacls grant failed: {proc.stdout}{proc.stderr}"
     with caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"):

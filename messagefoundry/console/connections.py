@@ -241,10 +241,15 @@ class ConnectionsPage(QWidget):
                     item.setData(Qt.ItemDataRole.UserRole, key)
                 elif c == _LOGS_COL:
                     _style_link(item)
-                elif c == _STATUS_COL and row.status == "failed":
-                    # A connection that failed to start (ADR 0031): surface the reason on hover so a
-                    # degraded lane is unmissable. The status badge already colours it red.
-                    item.setToolTip(row.error or "failed to start")
+                elif c == _STATUS_COL and row.status in ("failed", "filtered"):
+                    # A connection that failed to start (ADR 0031) OR was parked by the DR run-profile
+                    # below the priority threshold (#61, ADR 0048): surface the reason on hover so a
+                    # degraded/parked lane is unmissable. The status badge already colours it (red for
+                    # failed, amber for filtered).
+                    item.setToolTip(
+                        row.error
+                        or ("failed to start" if row.status == "failed" else "DR-filtered")
+                    )
                 if c in _RIGHT_ALIGN_COLS:
                     item.setTextAlignment(
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter

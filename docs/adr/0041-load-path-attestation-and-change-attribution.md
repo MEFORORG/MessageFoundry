@@ -162,13 +162,42 @@ fingerprint+git-HEAD covers more cheaply for now.
 - **AC-4** — WHEN an operator applies a non-dry-run `POST /config/reload`, THE SYSTEM SHALL include the
   config `fingerprint` in the `config_reload` audit detail, matching `config_fingerprint(dir)`.
   → `tests/test_api_reload.py::test_reload_audit_records_fingerprint`
-- **AC-5** — WHERE dual-control gates `config:deploy`, WHEN a reload is requested, THE SYSTEM SHALL hold it
-  for a distinct second approver and SHALL refuse requester self-approval. *(D2, planned)*
-  → `tests/test_approvals.py::test_config_reload_requires_second_approver`
-- **AC-6** — IF the loaded engine module bytes do not match the wheel's `dist-info/RECORD` at startup, THEN
-  THE SYSTEM SHALL record a `startup_integrity` audit row and (per policy) fail-closed or alert. *(D3,
-  planned)*
-  → `tests/test_startup_attestation.py::test_drift_is_recorded`
+**D2 — dual-control `config:deploy`** *(planned — BACKLOG #53)*
+
+- **AC-5** — WHERE `config_reload` is in `[approvals].operations` and `[approvals].enabled` is true, WHEN an
+  operator applies a non-dry-run `POST /config/reload`, THE SYSTEM SHALL hold it as a pending request and
+  respond `202` (the live graph is **not** swapped) until a second approver releases it.
+  → `tests/test_approvals.py::test_config_reload_is_held_for_approval`
+- **AC-6** — WHERE a `config_reload` reload is pending approval, IF the requester attempts to approve their
+  own request, THEN THE SYSTEM SHALL refuse it (`403`) and the reload SHALL NOT execute — only a **distinct**
+  second user holding `approvals:approve` may release it.
+  → `tests/test_approvals.py::test_config_reload_requires_distinct_second_approver`
+- **AC-7** — WHEN a `config_reload` request is released by a distinct approver, THE SYSTEM SHALL re-execute
+  the captured reload and SHALL record **both** the requester and the approver identities in the
+  hash-chained audit (`approval.requested` + `approval.approved`).
+  → `tests/test_approvals.py::test_config_reload_audits_both_identities`
+- **AC-8** — WHILE `config_reload` is **not** in `[approvals].operations` (the deny-by-default shipping
+  posture), WHEN an authorized operator applies a reload, THE SYSTEM SHALL execute it inline exactly as
+  before — single-operator deployments are unchanged until dual-control is opted in.
+  → `tests/test_approvals.py::test_config_reload_inline_when_not_gated`
+
+**D3 — startup self-attestation + enforced non-editable wheel** *(planned — BACKLOG #54)*
+
+- **AC-9** — WHEN the engine starts (and on demand) on a non-editable wheel install, THE SYSTEM SHALL hash
+  every loaded `messagefoundry` module file and compare it against the wheel's `*.dist-info/RECORD` baseline.
+  → `tests/test_startup_attestation.py::test_attests_loaded_modules_against_record`
+- **AC-10** — IF a loaded engine module's content does not match its `dist-info/RECORD` hash at startup, THEN
+  THE SYSTEM SHALL write a `startup_integrity` row into the hash-chained, off-box-teed audit and fire the
+  `AlertSink` (the **default** alert-only posture; the engine still starts).
+  → `tests/test_startup_attestation.py::test_drift_alerts_and_records_by_default`
+- **AC-11** — WHERE `[integrity].fail_closed_on_drift` is true, IF startup attestation detects drift, THEN
+  THE SYSTEM SHALL record the `startup_integrity` row, fire the `AlertSink`, and **refuse to start** (hard
+  fail) rather than run unattested engine bytes.
+  → `tests/test_startup_attestation.py::test_drift_fails_closed_when_opted_in`
+- **AC-12** — WHERE the install is editable (`pip install -e .`, no `dist-info/RECORD` baseline), WHEN the
+  engine starts, THE SYSTEM SHALL treat attestation as a no-op/advisory and SHALL NOT fail or alert — dev is
+  never bricked.
+  → `tests/test_startup_attestation.py::test_editable_install_is_noop`
 
 ## Options considered
 

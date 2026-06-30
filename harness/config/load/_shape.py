@@ -18,6 +18,14 @@ Knobs (all optional, with safe defaults so ``serve`` works with none set):
 * ``MEFOR_LOAD_ADT_PORT``       — ADT hub inbound MLLP port (default 2600).
 * ``MEFOR_LOAD_RESULTS_PORT``   — results hub inbound MLLP port (default 2601).
 * ``MEFOR_LOAD_OTHER_PORT``     — other hub inbound MLLP port (default 2602).
+* ``MEFOR_LOAD_SHARD_ADT``      — ``supervise`` shard id for the ADT hub (default unset → no tag).
+* ``MEFOR_LOAD_SHARD_RESULTS``  — ``supervise`` shard id for the results hub (default unset → no tag).
+* ``MEFOR_LOAD_SHARD_OTHER``    — ``supervise`` shard id for the other hub (default unset → no tag).
+
+Shards (all optional): tagging a hub with ``shard=`` routes it to a named ``messagefoundry supervise``
+subprocess. **Unset (the default) = no tag = a single implicit shard**, so the SAME load graph serves
+both unsharded (default) and sharded (e.g. ``MEFOR_LOAD_SHARD_ADT=a`` / ``_RESULTS=b`` / ``_OTHER=b``
+→ a 2-shard layout) with no other change. The tags never affect routing.
 
 The graph is **synthetic and generic** — it models the *shape* of a high-fan-out estate (one big ADT
 hub plus results/orders hubs), never a real site. See ``docs/LOAD-TESTING.md``.
@@ -64,6 +72,13 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
     return value
 
 
+def _env_shard(name: str) -> str | None:
+    """A shard id from the environment, or ``None`` when unset/blank (= no shard tag)."""
+    raw = os.environ.get(name)
+    raw = raw.strip() if raw else ""
+    return raw or None
+
+
 @dataclass(frozen=True)
 class Shape:
     """Resolved load-graph parameters (read once from the environment at load time)."""
@@ -78,6 +93,9 @@ class Shape:
     adt_port: int
     results_port: int
     other_port: int
+    shard_adt: str | None
+    shard_results: str | None
+    shard_other: str | None
 
     def sink_endpoint(self, index: int) -> tuple[str, int]:
         """Round-robin a destination index across the contiguous sink port range."""
@@ -101,6 +119,9 @@ def load_shape() -> Shape:
         adt_port=_env_int("MEFOR_LOAD_ADT_PORT", 2600, minimum=1),
         results_port=_env_int("MEFOR_LOAD_RESULTS_PORT", 2601, minimum=1),
         other_port=_env_int("MEFOR_LOAD_OTHER_PORT", 2602, minimum=1),
+        shard_adt=_env_shard("MEFOR_LOAD_SHARD_ADT"),
+        shard_results=_env_shard("MEFOR_LOAD_SHARD_RESULTS"),
+        shard_other=_env_shard("MEFOR_LOAD_SHARD_OTHER"),
     )
 
 

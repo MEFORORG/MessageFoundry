@@ -10,7 +10,7 @@ error/dead-letter path catches them without special-casing X12.
 
 from __future__ import annotations
 
-__all__ = ["X12Error", "X12PeekError", "X12FrameError"]
+__all__ = ["X12Error", "X12PeekError", "X12FrameError", "X12ValidationError"]
 
 
 class X12Error(ValueError):
@@ -28,3 +28,14 @@ class X12FrameError(X12Error):
     """A streaming interchange exceeded its byte cap before the closing ``IEA`` segment — signals the
     transport to drop the connection rather than buffer without bound (the X12 analog of
     :class:`~messagefoundry.transports.framing.FrameError`)."""
+
+
+class X12ValidationError(X12Error):
+    """The opt-in strict validator (``pyx12``, ADR 0012) could not run a structural validation pass at
+    all — e.g. the bytes are not a parseable X12 data file, so there is no envelope to walk. The X12
+    analog of :class:`~messagefoundry.parsing.fhir.errors.FhirValidationError`. A *failed validation*
+    (a parseable interchange that violates its implementation guide) is **not** this — it is reported
+    as data on :class:`~messagefoundry.parsing.x12.validate.X12ValidationResult` (``valid=False`` +
+    structural :class:`~messagefoundry.parsing.x12.validate.X12SegmentError` items + a 997/999 ack), so
+    a Handler can route the *message* to the error path while still emitting the negative ack. Its
+    message is **PHI-safe**: it names only the failure mode, never the input bytes."""

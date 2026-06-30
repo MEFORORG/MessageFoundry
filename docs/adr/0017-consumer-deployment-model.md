@@ -215,3 +215,42 @@ installs use the pinned wheel. That migration already had to repurpose the built
   the security-posture tier — both Blocker rows must land together.
 - Most of the model already works; the remaining effort is **packaging, documentation, scaffolding, one
   env-name lift, and a few isolation/drift guards** — not a redesign of the config or value layers.
+
+## Amendment (2026-06-27) — non-editable wheel from recommendation to enforced production default
+
+> Append-only amendment from the **insider-code-tampering review** (see
+> [ADR 0041](0041-load-path-attestation-and-change-attribution.md) D3, BACKLOG #54). It **does not rewrite**
+> the accepted three-tier model or the eight ratified decisions above — it **tightens** Ratified Decision 5
+> ("Boundary enforcement → packaging-primary") from a documented *recommendation* into an **enforced
+> production default**.
+
+**What changes.** The original decision said the non-editable wheel is the *recommended* boundary and an
+optional Windows venv ACL-lock is *defense-in-depth*. ADR 0041 D3 adds a **runtime tripwire** that converts
+this from advice into an enforced posture:
+
+- The **non-editable, hash-locked wheel is the production default.** Editable `pip install -e .` is
+  **retired from production deployment docs** ([EARLY-ADOPTER-GUIDE.md](../EARLY-ADOPTER-GUIDE.md),
+  [DEPLOYMENT.md](../DEPLOYMENT.md), SERVICE.md): editable installs are documented **only** for engine
+  co-development, never for a deployed instance. The two-repo consumer model (pinned wheel + org config repo)
+  is now the single documented production install path.
+- Enforcement is **startup self-attestation** (ADR 0041 D3): the engine hashes its loaded `messagefoundry`
+  module files against the wheel's `*.dist-info/RECORD` baseline at boot. On drift the **default is
+  alert-only** (a `startup_integrity` audit row + `AlertSink`); an **opt-in** `[integrity].fail_closed_on_drift`
+  hard-refuses to start. This makes the read-only-engine boundary **detectable at runtime**, not merely
+  enforced by file packaging.
+
+**Implemented as a no-op on editable dev installs.** An editable install has **no `dist-info/RECORD`**
+baseline to attest against, so the tripwire is a **no-op/advisory** there — `pip install -e ../MessageFoundry`
+during co-development (the workflow named in *First instance of the pattern* above) is **byte-for-byte
+unchanged** and never bricked. The enforcement applies precisely where it should: a **deployed, wheel-installed
+production instance**.
+
+**Why the default is alert-only, not fail-closed.** The documented vendored-patch contingency for the dormant
+`python-hl7`/`hl7apy` parsers (a legitimate, reviewed security hotfix applied in place) would itself trip a
+`RECORD` mismatch. A fail-closed-by-default posture would therefore **brick a legitimate security patch** at
+the worst moment. Alert-only-by-default detects-and-attributes the drift while keeping the service up;
+operators who want hard enforcement opt in via `[integrity].fail_closed_on_drift`.
+
+**What this does not change.** The accepted three-tier ownership model, the same-commit-everywhere promotion
+model (Decision 4), the env-name decoupling Blockers, and the AGPL/licensing posture (Decision 6) are all
+unchanged. This amendment narrows **only** the install/boundary-enforcement surface of Decision 5.

@@ -20,6 +20,7 @@ from messagefoundry.config.models import (
     Destination,
     InternalErrorPolicy,
     RetryPolicy,
+    StallThreshold,
     Validation,
 )
 from messagefoundry.config.wiring import (
@@ -822,6 +823,7 @@ class _RecordingAlertSink:
     def __init__(self) -> None:
         self.stopped: list[tuple[str, str]] = []
         self.buildups: list[tuple[str, int, float]] = []
+        self.stalls: list[tuple[str, float]] = []
         self.errors: list[tuple[str, str]] = []
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
@@ -830,8 +832,13 @@ class _RecordingAlertSink:
     def queue_buildup(self, name: str, *, depth: int, oldest_age_seconds: float) -> None:
         self.buildups.append((name, depth, oldest_age_seconds))
 
+    def message_stall(self, name: str, *, oldest_age_seconds: float) -> None:
+        self.stalls.append((name, oldest_age_seconds))
+
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
         self.errors.append((name, kind))
+
+    def connection_restored(self, name: str) -> None: ...
 
 
 def _stop_registry(inbox: Path, outdir: Path, internal_error) -> Registry:  # type: ignore[no-untyped-def]
@@ -1170,6 +1177,104 @@ async def test_transform_buildup_alert_is_stage_aware(store: MessageStore, tmp_p
         "IB", stage=Stage.ROUTED.value, threshold=runner._buildup_default
     )
     assert sink.buildups and sink.buildups[0][0] == "IB" and sink.buildups[0][1] >= 2
+
+
+async def test_message_stall_alert_fires_over_threshold(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #50 (Corepoint "Max Message Stall"): when an outbound lane's oldest undelivered message ages past
+    # the global StallThreshold, _maybe_alert_stall fires message_stall, reusing the same oldest-pending
+    # age (delivered_age) the dashboard reports. pending_depth is stubbed to control depth + oldest age.
+    import time as _time
+
+    reg = Registry()
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        stall_default=StallThreshold(max_oldest_seconds=60.0),
+        alert_sink=sink,
+    )
+    old = _time.time() - 120.0  # oldest pending row created 120s ago → over the 60s threshold
+
+    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+        return (3, old)
+
+    monkeypatch.setattr(store, "pending_depth", _stub)
+    await runner._maybe_alert_stall("OB_X")
+    assert sink.stalls and sink.stalls[0][0] == "OB_X"
+    assert sink.stalls[0][1] >= 60.0  # carries the oldest-undelivered age
+
+
+async def test_message_stall_alert_silent_under_threshold(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Under the threshold (a young oldest message) the stall alert must NOT fire.
+    import time as _time
+
+    reg = Registry()
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        stall_default=StallThreshold(max_oldest_seconds=60.0),
+        alert_sink=sink,
+    )
+    young = _time.time() - 5.0  # 5s old → well under the 60s threshold
+
+    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+        return (3, young)
+
+    monkeypatch.setattr(store, "pending_depth", _stub)
+    await runner._maybe_alert_stall("OB_X")
+    assert sink.stalls == []
+
+
+async def test_message_stall_alert_off_by_default(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Deny-by-default: with no stall threshold configured (StallThreshold() → max_oldest_seconds=None),
+    # the alert never fires even for a very old oldest message.
+    import time as _time
+
+    reg = Registry()
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink)  # no stall_default
+    old = _time.time() - 9999.0
+
+    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+        return (3, old)
+
+    monkeypatch.setattr(store, "pending_depth", _stub)
+    await runner._maybe_alert_stall("OB_X")
+    assert sink.stalls == []
+
+
+async def test_message_stall_per_connection_override(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A per-connection stall= overrides the global default (same idiom as buildup/retry): the global
+    # default is OFF, but OB_TIGHT's own 10s threshold fires on a 30s-old oldest message.
+    import time as _time
+
+    reg = Registry()
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(reg, store, poll_interval=0.02, alert_sink=sink)  # global stall OFF
+    runner._stall["OB_TIGHT"] = StallThreshold(max_oldest_seconds=10.0)  # per-connection override
+    old = _time.time() - 30.0
+
+    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+        return (1, old)
+
+    monkeypatch.setattr(store, "pending_depth", _stub)
+    # The lane that inherits the OFF global default stays silent...
+    await runner._maybe_alert_stall("OB_LOOSE")
+    assert sink.stalls == []
+    # ...while the per-connection override fires.
+    await runner._maybe_alert_stall("OB_TIGHT")
+    assert sink.stalls and sink.stalls[0][0] == "OB_TIGHT"
 
 
 async def test_transform_worker_dead_letters_missing_handler(

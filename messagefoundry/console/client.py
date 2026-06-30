@@ -30,6 +30,7 @@ from messagefoundry.api.auth_models import (
     AuditList,
     ChannelScope,
     CurrentUser,
+    CustomRoleInfo,
     LoginResponse,
     MfaConfirmResponse,
     MfaEnrollResponse,
@@ -42,6 +43,8 @@ from messagefoundry.api.auth_models import (
     UserSummary,
 )
 from messagefoundry.api.models import (
+    AlertInstanceInfo,
+    AlertInstanceList,
     AlertsConfig,
     ChannelInfo,
     ClusterNodeList,
@@ -54,6 +57,7 @@ from messagefoundry.api.models import (
     IntegrityResult,
     MessageDetail,
     MessageList,
+    MessageSearchResults,
     PurgeResult,
     ReloadResult,
     ReplayResult,
@@ -417,6 +421,40 @@ class EngineClient:
         )
         return _decode(response, MessageList)
 
+    def search_messages(
+        self,
+        *,
+        content: str | None = None,
+        field_path: str | None = None,
+        field_value: str | None = None,
+        target: str = "both",
+        channel_id: str | None = None,
+        status: str | None = None,
+        message_type: str | None = None,
+        control_id: str | None = None,
+        limit: int = 50,
+        scan_limit: int | None = None,
+    ) -> MessageSearchResults:
+        """Content search (ADR 0046 #51): match by an HL7 field path or a raw/summary substring. The
+        engine scans-and-decrypts off the event loop, bounded by ``scan_limit`` + ``limit`` (the result
+        reports ``truncated`` when the scan ceiling was hit). Requires a stepped-up session server-side."""
+        return _decode(
+            self._get(
+                "/messages/search",
+                content=content,
+                field_path=field_path,
+                field_value=field_value,
+                target=target,
+                channel_id=channel_id,
+                status=status,
+                message_type=message_type,
+                control_id=control_id,
+                limit=limit,
+                scan_limit=scan_limit,
+            ),
+            MessageSearchResults,
+        )
+
     def get_message(self, message_id: str) -> MessageDetail:
         return _decode(self._get(f"/messages/{message_id}"), MessageDetail)
 
@@ -485,6 +523,19 @@ class EngineClient:
         """Read-only view of the loaded ``[alerts]`` transports + rule set (ADR 0014, BACKLOG #22b).
         No secrets/recipients are returned. Gated by ``monitoring:read`` like :meth:`stats`."""
         return _decode(self._get("/alerts/rules"), AlertsConfig)
+
+    def active_alerts(self) -> AlertInstanceList:
+        """The open + acknowledged operator-alert instances (ADR 0044, #56), newest first — metadata
+        only. Gated by ``monitoring:diagnose``."""
+        return _decode(self._get("/alerts/active"), AlertInstanceList)
+
+    def ack_alert(self, alert_id: int) -> AlertInstanceInfo:
+        """Acknowledge an open alert instance (ADR 0044). Gated by ``monitoring:diagnose``."""
+        return _decode(self._request("POST", f"/alerts/{alert_id}/ack"), AlertInstanceInfo)
+
+    def resolve_alert(self, alert_id: int) -> AlertInstanceInfo:
+        """Resolve an open/acknowledged alert instance (ADR 0044). Gated by ``monitoring:diagnose``."""
+        return _decode(self._request("POST", f"/alerts/{alert_id}/resolve"), AlertInstanceInfo)
 
     def status(self) -> SystemStatus:
         return _decode(self._get("/status"), SystemStatus)
@@ -585,6 +636,40 @@ class EngineClient:
 
     def list_roles(self) -> list[RoleInfo]:
         return _decode_list(self._get("/roles"), RoleInfo)
+
+    # --- custom RBAC roles (ADR 0045): thin admin hooks ----------------------
+
+    def list_custom_roles(self) -> list[CustomRoleInfo]:
+        return _decode_list(self._get("/roles/custom"), CustomRoleInfo)
+
+    def create_custom_role(
+        self, display_name: str, permissions: list[str], *, description: str | None = None
+    ) -> CustomRoleInfo:
+        """Define a custom role = a SUBSET of the existing Permission catalog (ADR 0045)."""
+        body = {
+            "display_name": display_name,
+            "description": description,
+            "permissions": permissions,
+        }
+        return _decode(self._request("POST", "/roles/custom", json=body), CustomRoleInfo)
+
+    def update_custom_role(
+        self,
+        role_id: str,
+        display_name: str,
+        permissions: list[str],
+        *,
+        description: str | None = None,
+    ) -> CustomRoleInfo:
+        body = {
+            "display_name": display_name,
+            "description": description,
+            "permissions": permissions,
+        }
+        return _decode(self._request("PUT", f"/roles/custom/{role_id}", json=body), CustomRoleInfo)
+
+    def delete_custom_role(self, role_id: str) -> str:
+        return _decode(self._request("DELETE", f"/roles/custom/{role_id}"), SimpleMessage).detail
 
     def list_users(self) -> list[UserSummary]:
         return _decode_list(self._get("/users"), UserSummary)

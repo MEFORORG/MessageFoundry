@@ -20,6 +20,7 @@ from messagefoundry.store.base import (
     open_store,
     sqlite_settings,
 )
+from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.store import (
     MessageStatus,
     MessageStore,
@@ -41,6 +42,7 @@ __all__ = [
     "Stage",
     "Store",
     "StoreLifecycle",
+    "StripResult",
     "open_store",
     "sqlite_settings",
 ]

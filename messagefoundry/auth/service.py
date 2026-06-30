@@ -42,7 +42,15 @@ from messagefoundry.auth.notifications import (
     SecurityNotifier,
 )
 from messagefoundry.auth.passwords import hash_password, needs_rehash, verify_password
-from messagefoundry.auth.permissions import ROLE_METADATA, Permission, Role
+from messagefoundry.auth.permissions import (
+    CUSTOM_ROLE_ID_PREFIX,
+    ROLE_METADATA,
+    Permission,
+    Role,
+    decode_custom_role_permissions,
+    is_custom_role_id,
+    validate_custom_role_permissions,
+)
 from messagefoundry.auth.policy import PasswordPolicy, _operator_corpus
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import hash_token, mint_token
@@ -133,6 +141,22 @@ class BootstrapAdmin:
 
     username: str
     password: str
+
+
+@dataclass(frozen=True)
+class CustomRoleInfo:
+    """An admin-defined custom role and its resolved permission subset (ADR 0045)."""
+
+    id: str
+    display_name: str
+    description: str | None
+    permissions: frozenset[Permission]
+
+
+def _row_builtin(row: Any) -> bool:
+    """Whether a ``roles`` row is a built-in. Tolerant of each backend's truthy representation of the
+    ``builtin`` column (SQLite ``int`` 0/1, Postgres ``bool``, SQL Server ``bit``)."""
+    return bool(row["builtin"])
 
 
 def _roles_from_ids(ids: Iterable[str]) -> frozenset[Role]:
@@ -539,6 +563,7 @@ class AuthService:
             )
         await self._store.record_login_success(user.id)
         ad_roles = _roles_from_ids(role_ids)
+        ad_custom_permissions = await self._custom_permissions_for_ids(role_ids)
         user = await self._sync_ad_channel_scope(user, ad_roles, principal.groups)
         identity = Identity.build(
             user_id=user.id,
@@ -546,6 +571,7 @@ class AuthService:
             auth_provider=AuthProvider.AD,
             roles=ad_roles,
             allowed_channels=_allowed_channels(user, ad_roles),
+            extra_permissions=ad_custom_permissions,
         )
         # AD/Kerberos MFA is delegated to the directory (Entra Conditional Access / MFA proxy), so the
         # session is MFA-satisfied at issuance — an engine TOTP is never prompted for a directory login.
@@ -722,9 +748,25 @@ class AuthService:
         )
         return revoked
 
+    async def _custom_permissions_for_ids(self, role_ids: Iterable[str]) -> frozenset[Permission]:
+        """Resolve the permission overlay for any custom (``custom:``-prefixed) role ids the user holds
+        (ADR 0045 D3). Each is looked up in the ``roles`` table and its persisted ``permissions`` JSON
+        defensively decoded (unknown/forbidden values dropped — deny-by-default). A built-in id, an
+        unknown id, or a row with no permissions contributes nothing."""
+        granted: set[Permission] = set()
+        for rid in role_ids:
+            if not is_custom_role_id(rid):
+                continue
+            row = await self._store.get_role(rid)
+            if row is None:
+                continue  # custom role deleted since assignment → grants nothing (deny-by-default)
+            granted |= decode_custom_role_permissions(row["permissions"])
+        return frozenset(granted)
+
     async def _build_identity(self, user: UserRecord) -> Identity:
         role_ids = await self._store.get_user_role_ids(user.id)
         roles = _roles_from_ids(role_ids)
+        custom_permissions = await self._custom_permissions_for_ids(role_ids)
         provider = (
             AuthProvider(user.auth_provider)
             if user.auth_provider in (AuthProvider.LOCAL.value, AuthProvider.AD.value)
@@ -737,6 +779,7 @@ class AuthService:
             roles=roles,
             must_change_password=user.must_change_password,
             allowed_channels=_allowed_channels(user, roles),
+            extra_permissions=custom_permissions,
         )
 
     # --- password management -------------------------------------------------
@@ -1201,6 +1244,117 @@ class AuthService:
                 email=user.email,
                 detail={"roles": list(roles)},
             )
+
+    # --- custom RBAC roles (ADR 0045, gated by USERS_MANAGE) -----------------
+
+    async def list_custom_roles(self) -> list[CustomRoleInfo]:
+        """Every admin-defined custom role with its (defensively-decoded) permission set. Built-in rows
+        are excluded — they resolve from ``BUILTIN_ROLE_PERMISSIONS``, not the ``permissions`` column."""
+        out: list[CustomRoleInfo] = []
+        for row in await self._store.list_roles():
+            if _row_builtin(row):
+                continue
+            perms = decode_custom_role_permissions(row["permissions"])
+            out.append(
+                CustomRoleInfo(
+                    id=str(row["id"]),
+                    display_name=str(row["display_name"]),
+                    description=(None if row["description"] is None else str(row["description"])),
+                    permissions=frozenset(perms),
+                )
+            )
+        return out
+
+    async def create_custom_role(
+        self,
+        *,
+        display_name: str,
+        description: str | None,
+        permissions: Sequence[str],
+        actor: str,
+    ) -> CustomRoleInfo:
+        """Define a new custom role: a named SUBSET of the existing ``Permission`` catalog (ADR 0045).
+
+        The permission set is validated (recognized catalog perms only, non-empty, no carved-out
+        escalation primitive); a :class:`CustomRoleError` is raised otherwise. The role id is namespaced
+        with ``custom:`` so it can never collide with a built-in. Audited (records the permission
+        *names*, never PHI)."""
+        perms = validate_custom_role_permissions(permissions)  # raises CustomRoleError
+        role_id = CUSTOM_ROLE_ID_PREFIX + uuid4().hex
+        await self._store.upsert_role(
+            role_id=role_id,
+            display_name=display_name,
+            description=description,
+            builtin=False,
+            permissions=_json([p.value for p in perms]),
+        )
+        await self._audit(
+            "role.created",
+            actor=actor,
+            detail=_json({"role_id": role_id, "permissions": [p.value for p in perms]}),
+        )
+        return CustomRoleInfo(
+            id=role_id,
+            display_name=display_name,
+            description=description,
+            permissions=frozenset(perms),
+        )
+
+    async def update_custom_role(
+        self,
+        role_id: str,
+        *,
+        display_name: str,
+        description: str | None,
+        permissions: Sequence[str],
+        actor: str,
+    ) -> CustomRoleInfo:
+        """Edit a custom role's name/description/permission set. Validates the new permission subset and
+        rejects editing a built-in (or unknown) role. A permission *reduction* takes effect immediately:
+        every user holding the role has their live sessions revoked so a narrowed set can't linger on an
+        active token (ADR 0045 D3, mirroring :meth:`set_roles`). Audited. Raises :class:`ValueError` for
+        an unknown/built-in role and :class:`CustomRoleError` for an invalid permission set."""
+        existing = await self._store.get_role(role_id)
+        if existing is None or _row_builtin(existing):
+            raise ValueError("no such custom role")
+        perms = validate_custom_role_permissions(permissions)  # raises CustomRoleError
+        await self._store.upsert_role(
+            role_id=role_id,
+            display_name=display_name,
+            description=description,
+            builtin=False,
+            permissions=_json([p.value for p in perms]),
+        )
+        await self._revoke_sessions_for_role(role_id)
+        await self._audit(
+            "role.updated",
+            actor=actor,
+            detail=_json({"role_id": role_id, "permissions": [p.value for p in perms]}),
+        )
+        return CustomRoleInfo(
+            id=role_id,
+            display_name=display_name,
+            description=description,
+            permissions=frozenset(perms),
+        )
+
+    async def delete_custom_role(self, role_id: str, *, actor: str) -> None:
+        """Delete a custom role; its user/AD-group assignments are removed in the same transaction, and
+        every assigned user's live sessions are revoked so the now-gone permissions don't linger on an
+        active token. Raises :class:`ValueError` for an unknown or built-in role. Audited."""
+        existing = await self._store.get_role(role_id)
+        if existing is None or _row_builtin(existing):
+            raise ValueError("no such custom role")
+        await self._revoke_sessions_for_role(role_id)  # before the rows are gone
+        await self._store.delete_custom_role(role_id)
+        await self._audit("role.deleted", actor=actor, detail=_json({"role_id": role_id}))
+
+    async def _revoke_sessions_for_role(self, role_id: str) -> None:
+        """Revoke the live sessions of every user currently holding ``role_id`` so a permission
+        reduction / role deletion re-resolves on their next request (ADR 0045 D3)."""
+        for user in await self._store.list_users():
+            if role_id in await self._store.get_user_role_ids(user.id):
+                await self._store.revoke_user_sessions(user.id)
 
     async def admin_reset_password(self, user_id: str, *, actor: str) -> str:
         """Admin-initiated password reset (ASVS 6.4.6 / WP-L3-12). Generate a CSPRNG one-time password

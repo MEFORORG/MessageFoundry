@@ -18,10 +18,17 @@ so :func:`normalize` collapses them to ``\\r`` before parsing.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
+from typing import cast
 
 import hl7
+
+import messagefoundry.parsing._backend as _backend
+import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "Peek",
@@ -107,11 +114,14 @@ def normalize(raw: str | bytes, *, encoding: str = "utf-8", errors: str = "repla
 class Peek:
     """A parsed view over an inbound message exposing routing fields + path access.
 
-    Construct via :meth:`parse`. ``message`` is the underlying ``python-hl7`` parse;
-    ``raw`` is the normalized (``\\r``-delimited) text it was parsed from.
+    Construct via :meth:`parse`. ``message`` is the underlying parse — either a built-ins
+    :data:`~messagefoundry.parsing._builtin_hl7.ParsedMessage` (ADR 0054, the default backend) or a
+    legacy ``python-hl7`` :class:`hl7.Message` (when ``_backend.USE_BUILTIN`` is off or the built-ins
+    path fell back). ``raw`` is the normalized (``\\r``-delimited) text it was parsed from. Field
+    access dispatches on the backing type, so the public surface is identical either way.
     """
 
-    message: hl7.Message
+    message: _builtin_hl7.ParsedMessage | hl7.Message
     raw: str
 
     @classmethod
@@ -128,6 +138,17 @@ class Peek:
         enforce_size_limits(norm, max_bytes=max_bytes, max_segments=max_segments)
         if not norm.lstrip().startswith("MSH"):
             raise HL7PeekError("message does not start with an MSH segment")
+        if _backend.use_builtin():
+            try:
+                return cls(message=_builtin_hl7.parse(norm), raw=norm)
+            except Exception:  # noqa: BLE001 — fallback guard: any unexpected built-ins error
+                # The contract guards (empty/no-MSH) already ran above and raised HL7PeekError, so
+                # anything here is an *internal* built-ins fault. Fall back to the proven python-hl7
+                # path rather than failing a connection, and log so the gap is visible (ADR 0054
+                # Phase-1 fallback guard).
+                logger.warning(
+                    "built-ins HL7 parse failed; falling back to python-hl7", exc_info=True
+                )
         try:
             message = hl7.parse(norm)
         except Exception as exc:  # python-hl7 raises a variety of ValueErrors
@@ -146,8 +167,36 @@ class Peek:
         return self._resolve(seg, fld, comp, sub)
 
     def _resolve(self, seg: str, fld: int, comp: int | None, sub: int | None) -> str | None:
+        if isinstance(self.message, dict):
+            return self._resolve_builtin(
+                cast("_builtin_hl7.ParsedMessage", self.message), seg, fld, comp, sub
+            )
+        return self._resolve_hl7(self.message, seg, fld, comp, sub)
+
+    @staticmethod
+    def _resolve_builtin(
+        msg: _builtin_hl7.ParsedMessage, seg: str, fld: int, comp: int | None, sub: int | None
+    ) -> str | None:
+        # python-hl7 resolves the segment through its ``segments()`` scan, which blows up with an
+        # IndexError on any blank/empty segment *before* the value extraction — and that error is NOT
+        # caught by the legacy path's inner ``except IndexError`` (which only wraps ``extract_field``).
+        # Run the equivalent scan first, outside the catch, so a blank-segment error propagates exactly
+        # like the legacy path while a genuine invalid-depth over-index still maps to None below.
+        _builtin_hl7.raise_if_blank_segment_scan(msg)
+        # The built-ins ``extract_field`` mirrors python-hl7's ``Segment.extract_field`` exactly,
+        # including the whole-value-no-component rule and the ""-vs-IndexError asymmetry; an
+        # invalid-depth index surfaces here as IndexError, mapped to None like the python-hl7 path.
         try:
-            segment = self.message.segment(seg)
+            return _builtin_hl7.extract_field(msg, seg, fld, comp, sub)
+        except IndexError:
+            return None
+
+    @staticmethod
+    def _resolve_hl7(
+        message: hl7.Message, seg: str, fld: int, comp: int | None, sub: int | None
+    ) -> str | None:
+        try:
+            segment = message.segment(seg)
         except KeyError:
             return None
         try:
@@ -161,7 +210,7 @@ class Peek:
         # separator — manual indexing would otherwise walk into the *string* and return a single
         # character (e.g. "ORC-2.1" of "PLACER123" => "P"). Out-of-range parts raise IndexError.
         try:
-            value = self.message.extract_field(seg, 1, fld, 1, comp, sub if sub is not None else 1)
+            value = message.extract_field(seg, 1, fld, 1, comp, sub if sub is not None else 1)
         except IndexError:
             return None
         return value or None
@@ -234,4 +283,6 @@ class Peek:
 
     def segments(self) -> list[str]:
         """Ordered segment ids, e.g. ``["MSH", "EVN", "PID", "PV1"]``."""
+        if isinstance(self.message, dict):
+            return _builtin_hl7.segment_ids(cast("_builtin_hl7.ParsedMessage", self.message))
         return [str(seg[0]) for seg in self.message]

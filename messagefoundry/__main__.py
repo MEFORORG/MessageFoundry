@@ -24,6 +24,10 @@ import argparse
 import json
 import logging
 import sys
+import tomllib  # stdlib; used to classify a malformed <env>.toml at serve startup (clean error, not a traceback)
+from pathlib import (
+    Path,
+)  # stdlib, imported at interpreter startup — no cost to the fast subcommands
 from typing import Any
 
 from messagefoundry import __version__
@@ -131,17 +135,27 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="active environment NAME passed to every shard (overrides each shard's [ai].environment)",
     )
+    supervise.add_argument(
+        "--project-root",
+        default=None,
+        help="anchor for each shard's environments/<env>.toml resolution, forwarded to every shard as "
+        "`serve --project-root`. Set this together with --env so the spawned shards resolve the env "
+        "value file regardless of their working directory (otherwise it resolves against the child CWD).",
+    )
 
     validate = sub.add_parser("validate", help="check a config dir and report all problems")
     validate.add_argument("--config", default="samples/config", help="config modules directory")
+    _add_anchor_flags(validate)
     validate.add_argument("--json", action="store_true", help="emit JSON")
 
     graph = sub.add_parser("graph", help="print the wired Connection/Router/Handler graph")
     graph.add_argument("--config", default="samples/config", help="config modules directory")
+    _add_anchor_flags(graph)
     graph.add_argument("--json", action="store_true", help="emit JSON")
 
     dryrun = sub.add_parser("dryrun", help="run messages through the config without sending")
     dryrun.add_argument("--config", default="samples/config", help="config modules directory")
+    _add_anchor_flags(dryrun)
     dryrun.add_argument(
         "--messages", required=True, nargs="+", help="HL7 file(s) or directories of *.hl7"
     )
@@ -157,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         "check", help="run validate + dryrun (+ advisory ruff/mypy) as a commit/CI gate"
     )
     check.add_argument("--config", default="samples/config", help="config modules directory")
+    _add_anchor_flags(check)
     check.add_argument(
         "--messages", default=None, help="HL7 fixtures dir (dryrun gates when it has *.hl7)"
     )
@@ -268,6 +283,32 @@ def main(argv: list[str] | None = None) -> int:
     )
     init.add_argument("--json", action="store_true", help="emit JSON")
 
+    support_bundle = sub.add_parser(
+        "support-bundle",
+        help="write a SECRET-FREE / PHI-free support zip (engine version + config summary + a "
+        "/status snapshot + a REDACTED app-log tail) to hand to support (#49)",
+    )
+    support_bundle.add_argument(
+        "--out", required=True, help="path to write the support-bundle .zip"
+    )
+    support_bundle.add_argument(
+        "--config",
+        default=None,
+        help="config modules directory — drives the secret-free graph summary (counts/names only)",
+    )
+    support_bundle.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present) — drives the status "
+        "snapshot + the redacted log tail",
+    )
+    support_bundle.add_argument(
+        "--log-tail-lines",
+        type=int,
+        default=None,
+        help="number of trailing app-log lines to include (redacted); default 500",
+    )
+
     sub.add_parser(
         "gen-key", help="generate a base64 key for MEFOR_STORE_ENCRYPTION_KEY (PHI-at-rest)"
     )
@@ -318,6 +359,60 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     rotate_key.add_argument("--db", default=None, help="store path (overrides [store].path)")
+
+    backup = sub.add_parser(
+        "backup",
+        help="take an on-demand DR backup now: snapshot the store + bundle the config, encrypt to a "
+        ".mfbak archive at the destination, restore-verify, prune to keep-N (ADR 0049, #60)",
+    )
+    backup.add_argument(
+        "--config", default="samples/config", help="config modules dir bundled into the archive"
+    )
+    backup.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present) — [backup] + the "
+        "store key source",
+    )
+    backup.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    backup.add_argument(
+        "--destination",
+        default=None,
+        help="LOCAL or UNC destination dir (overrides [backup].destination). No cloud target.",
+    )
+    backup.add_argument(
+        "--no-verify", action="store_true", help="skip the restore-verify after writing the archive"
+    )
+    backup.add_argument(
+        "--full-verify",
+        action="store_true",
+        help="also run the heavier full restore-verify (open the snapshot through open_store)",
+    )
+    backup.add_argument(
+        "--config-only",
+        action="store_true",
+        help="back up the config bundle only (no store snapshot) — forced on a server-DB store",
+    )
+    backup.add_argument("--json", action="store_true", help="emit JSON")
+
+    restore_verify = sub.add_parser(
+        "restore-verify",
+        help="verify an existing .mfbak archive WITHOUT activating it: key-fingerprint precheck "
+        "(KEY_MISMATCH before decrypt) -> decrypt -> integrity_check + row-count (ADR 0049, #60)",
+    )
+    restore_verify.add_argument("archive", help="path to the .mfbak archive to verify")
+    restore_verify.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present) — the store key source",
+    )
+    restore_verify.add_argument("--db", default=None, help="store path (overrides [store].path)")
+    restore_verify.add_argument(
+        "--full",
+        action="store_true",
+        help="run the heavier full restore-verify (open the embedded store through open_store)",
+    )
+    restore_verify.add_argument("--json", action="store_true", help="emit JSON")
 
     ai_policy = sub.add_parser(
         "ai-policy", help="print the effective AI-assistance policy (for the IDE gate)"
@@ -378,17 +473,260 @@ def main(argv: list[str] | None = None) -> int:
     return _DISPATCH[args.command](args)
 
 
+def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
+    """Add the project-root / active-env / service-config trio to an OFFLINE subcommand (ADR 0050 §3).
+
+    ``validate``/``graph``/``dryrun``/``check`` carried only ``--config`` before, so the commit/CI gate
+    could resolve a DIFFERENT environment view than ``serve`` (review C3). These flags let the gate
+    anchor the same bundle root and select the same active environment ``serve`` does — value
+    resolution only, WITHOUT adopting serve's required-active-env / explicit-posture refusal (AC-6).
+    """
+    p.add_argument(
+        "--project-root",
+        default=None,
+        help="anchor for the config bundle (overrides [environments].base_dir): the config-repo root "
+        "that a relative --config / --service-config / environments/<env>.toml resolves against. "
+        "Default = the working directory (unchanged). Match serve so the gate validates the same view.",
+    )
+    p.add_argument(
+        "--env",
+        default=None,
+        help="active environment NAME (selects environments/<env>.toml values). With no --env the gate "
+        "behaves exactly as before (no env values loaded); it never adopts serve's required-env refusal.",
+    )
+    p.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present). When passed (or with "
+        "--project-root) check suppresses its messagefoundry.toml upward-walk and uses this instead.",
+    )
+
+
+def _resolve_offline_anchor(args: argparse.Namespace) -> tuple[str, str | None] | int:
+    """Apply the ADR 0050 project-root anchor to an offline subcommand's paths, and fail loud on the
+    one scoped missing-value-file case. Returns ``(config_dir, service_config)`` resolved under the
+    root, or a non-zero exit code (already reported to stderr) on the hard failure.
+
+    Precedence (explicit absolute > project-root > CWD) matches ``serve``: a relative ``--config`` /
+    ``--service-config`` resolves under ``--project-root`` (or ``[environments].base_dir`` when only the
+    service config is given); an absolute one is used as-is. The fail-loud trigger (AC-3) fires ONLY
+    when an *explicit* ``--project-root`` is set AND the loaded graph references ``env()`` AND the
+    selected ``<env>.toml`` is absent — a zero-``env()`` deployment, or a no-root launch, never trips it.
+    """
+    from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
+
+    cwd = Path.cwd()
+    # --project-root is the explicit anchor; absent it, an explicit --service-config may still carry a
+    # [environments].base_dir, but for the OFFLINE gate we only anchor against the explicit flag (no
+    # settings load here — load_config below stays settings-free, like validate/graph/dryrun today).
+    root = resolve_project_root(args.project_root, cwd=cwd)
+    config_dir = anchor_under_root(args.config, root, cwd=cwd)
+    assert config_dir is not None  # args.config always has a string default
+    service_config = anchor_under_root(args.service_config, root, cwd=cwd)
+    # Under an explicit root with no --service-config, the consumer-model messagefoundry.toml sits at
+    # the repo root (a sibling of --config, ADR 0017). Point the posture check there so it resolves the
+    # same file serve would — but ONLY if it exists, so a bundle that ships no service toml still SKIPs
+    # (never a spurious failure).
+    if service_config is None and root is not None:
+        root_toml = root / "messagefoundry.toml"
+        if root_toml.is_file():
+            service_config = str(root_toml)
+
+    # Fail loud only under an EXPLICIT root with an env name AND an env-referencing graph AND no file
+    # (ADR 0050 §2, ratified). Without --env there is no value file to require; without --project-root
+    # the silent-empty default is preserved; a zero-env() graph is never failed.
+    if args.project_root is not None and args.env is not None and root is not None:
+        env_dir = _env_dir_name(service_config)
+        rc = _check_env_file_present(config_dir, root, args.env, env_dir)
+        if rc is not None:
+            return rc
+    return config_dir, service_config
+
+
+def _env_dir_name(service_config: str | None) -> str:
+    """The ``[environments].dir`` value-dir name (default ``"environments"``).
+
+    Read from the resolved ``service_config`` TOML (a tiny, settings-free tomllib read) so the offline
+    AC-3 check honors a CUSTOM ``dir = "envs"`` instead of false-positive-failing on the hardcoded
+    literal. Best-effort: no/unreadable/malformed file -> the default. The full ``load_settings`` is
+    deliberately avoided here (the offline gate stays settings-free, like validate/graph/dryrun)."""
+    if service_config is None:
+        return "environments"
+    try:
+        with Path(service_config).open("rb") as fh:
+            data = tomllib.load(fh)
+    except (tomllib.TOMLDecodeError, OSError):
+        return "environments"
+    env_section = data.get("environments")
+    if isinstance(env_section, dict):
+        name = env_section.get("dir")
+        if isinstance(name, str) and name:
+            return name
+    return "environments"
+
+
+def _check_env_file_present(config_dir: str, root: Path, env_name: str, env_dir: str) -> int | None:
+    """Hard-fail (return exit 2) if the graph references ``env()`` but ``<root>/<env_dir>/<env>.toml``
+    is absent; otherwise ``None``. ``env_dir`` is ``[environments].dir`` (default ``environments``),
+    read from the resolved service config so a custom value-dir name is honored, not false-failed."""
+    from messagefoundry.config.anchor import graph_references_env
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    try:
+        reg = load_config(config_dir)
+    except (WiringError, FileNotFoundError, OSError):
+        # A config that doesn't load is reported by the subcommand's own validate/load path with a
+        # precise message; don't pre-empt it here (and don't claim a missing env file for it). OSError
+        # (e.g. an unreadable codesets dir) is swallowed best-effort, matching _graph_references_env_safe
+        # — the subcommand's own load reports the real error, this pre-check must never raise a traceback.
+        return None
+    if not graph_references_env(reg):
+        return None  # zero-env() deployment: the silent-empty contract is preserved (AC-3).
+    env_file = root / env_dir / f"{env_name}.toml"
+    if not env_file.is_file():
+        print(
+            f"error: the graph references env() but no value file was found at {env_file} under the "
+            f"explicit --project-root {str(root)!r} for --env {env_name!r}. Create "
+            f"{env_dir}/{env_name}.toml under the project root (or drop --project-root to use the "
+            "working directory).",
+            file=sys.stderr,
+        )
+        return 2
+    return None
+
+
+def _graph_references_env_safe(config_dir: str) -> bool:
+    """Whether the loaded graph references ``env()`` — best-effort, never raises. A config that doesn't
+    load returns ``False`` (the engine's own load reports the real error); used only to gate the ADR
+    0050 advisory/fail-loud diagnostics, so a load hiccup must not abort serve here."""
+    from messagefoundry.config.anchor import graph_references_env
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    try:
+        return graph_references_env(load_config(config_dir))
+    except (WiringError, FileNotFoundError, OSError):
+        return False
+
+
+def _is_under(path: str, base: Path) -> bool:
+    """Whether ``path`` resolves at or under ``base`` (best-effort; never raises).
+
+    Used by the AC-5 NSSM diagnostic to ask "does the CWD look like the repo root?" against the
+    --config target — robust to an ABSOLUTE --config (the NSSM case), where a bare ``Path(config).is_dir()``
+    is True no matter where serve was launched. A relative --config (resolved against the CWD) is always
+    under it; an absolute one is under the CWD only when serve really was launched from the repo.
+    """
+    try:
+        return Path(path).resolve().is_relative_to(base.resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def _emit_anchor_diagnostics(
+    *,
+    root: Path | None,
+    cwd: Path,
+    config_dir: str,
+    env_file: Path,
+    service_config: str | None,
+    store_path: str,
+    env_values_empty: bool,
+) -> int | None:
+    """The three ADR 0050 §2 startup diagnostics (paths only, PHI-safe; once at boot, not per reload).
+
+    Returns a non-zero exit code for the one scoped hard failure (AC-3), else ``None`` after emitting at
+    most one advisory WARNING:
+
+    * **AC-3 (ERROR / exit 2):** an EXPLICIT root is set, the graph references ``env()``, and the
+      resolved ``<env>.toml`` is absent. The only new hard failure — scoped so a zero-``env()`` graph or
+      a no-root launch keeps the shipped silent-empty contract.
+    * **AC-4 (WARNING):** a root is set and CWD ≠ the resolved root — name the four members so an
+      operator can confirm they agree (the wrong-DB / wrong-root footgun made visible, not refused).
+    * **AC-5 (WARNING):** NO root, the launch dir is detectably not a config root, and the resolved
+      ``env()`` values are empty (the NSSM silent miss) — point at ``--project-root``.
+    """
+    log = logging.getLogger(__name__)
+    if root is not None:
+        # AC-3: the one new hard failure, scoped to an explicit root + an env()-referencing graph.
+        if not env_file.is_file() and _graph_references_env_safe(config_dir):
+            print(
+                f"error: the graph references env() but no value file was found at {env_file} under "
+                f"the project root {str(root)!r}. Create it, or correct --project-root / "
+                "[environments].base_dir (drop the root to fall back to the working directory).",
+                file=sys.stderr,
+            )
+            return 2
+        # AC-4: a deliberate cross-root layout is allowed but announced (paths only).
+        if cwd.resolve() != root.resolve():
+            log.warning(
+                "project root %s differs from the working directory %s; bundle members resolve under "
+                "the root: env values=%s, service config=%s, store db=%s. Confirm these are the "
+                "intended locations.",
+                root,
+                cwd,
+                env_file,
+                service_config or "(default ./messagefoundry.toml)",
+                store_path,
+            )
+        return None
+
+    # AC-5: no root. The NSSM silent miss = launch dir is not a config root AND env values resolve
+    # empty. "Not a config root" must be judged against the CWD, NOT the (possibly absolute) --config
+    # path: an NSSM launch passes an ABSOLUTE --config that exists, so testing `Path(config_dir).is_dir()`
+    # was always True and the warning never fired (the flagship-scenario dead branch). Instead ask
+    # whether the CWD itself looks like the repo root: the config dir lives UNDER it, OR the env value
+    # dir is under it (env_file.parent == cwd/<dir> when no root is set), OR a messagefoundry.toml sits
+    # in it — any of which means serve was launched from the repo, not from an unrelated dir.
+    if env_values_empty:
+        launch_is_config_root = (
+            _is_under(config_dir, cwd)
+            or env_file.parent.is_dir()
+            or (cwd / _DEFAULT_SERVICE_TOML).is_file()
+        )
+        if not launch_is_config_root:
+            log.warning(
+                "no env() values resolved and the working directory %s does not look like a config "
+                "root (no %s, no %s, no %s). If serve was launched from elsewhere (e.g. under NSSM), "
+                "set --project-root / [environments].base_dir to the config-repo root so env() values "
+                "and the store DB are found there.",
+                cwd,
+                config_dir,
+                env_file.parent,
+                _DEFAULT_SERVICE_TOML,
+            )
+    return None
+
+
+#: The default per-instance service-settings filename (mirrors config.settings._DEFAULT_FILE; named
+#: here so the anchor diagnostics don't import a private settings symbol).
+_DEFAULT_SERVICE_TOML = "messagefoundry.toml"
+
+
 def _serve(args: argparse.Namespace) -> int:
     import uvicorn
     from pydantic import ValidationError
 
     from messagefoundry.api import create_managed_app
+    from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
     from messagefoundry.config.settings import StoreBackend, load_settings
+
+    # Single project-root anchor (ADR 0050): --project-root (== [environments].base_dir) is the bundle
+    # root; a relative --config / --service-config / [store].path resolves UNDER it, an absolute one is
+    # used as-is, and an unset root keeps every member's CWD-relative default (unchanged). The flag is
+    # also the env-value anchor, so write it into [environments].base_dir below.
+    cwd = Path.cwd()
+    root = resolve_project_root(args.project_root, cwd=cwd)
+    config_dir = anchor_under_root(args.config, root, cwd=cwd)
+    assert config_dir is not None  # args.config always has a string default
+    service_config = anchor_under_root(args.service_config, root, cwd=cwd)
 
     # Only pass flags the user actually supplied so they override env/file but an unset flag doesn't.
     cli: dict[str, dict[str, object]] = {}
     if args.db is not None:
-        cli.setdefault("store", {})["path"] = args.db
+        # A relative --db follows the root; an absolute one is honored as-is (AC-7). Resolved here so
+        # it lands in [store].path the same way a file-set relative path is anchored below.
+        anchored_db = anchor_under_root(args.db, root, cwd=cwd)
+        cli.setdefault("store", {})["path"] = anchored_db
     if args.host is not None:
         cli.setdefault("api", {})["host"] = args.host
     if args.port is not None:
@@ -402,10 +740,26 @@ def _serve(args: argparse.Namespace) -> int:
         cli.setdefault("environments", {})["base_dir"] = args.project_root
 
     try:
-        settings = load_settings(config_path=args.service_config, cli=cli)
+        settings = load_settings(config_path=service_config, cli=cli)
     except (FileNotFoundError, ValueError, ValidationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+    # The bundle root from BOTH sources (ADR 0050 §1 "the same merged value"): --project-root is already
+    # written into cli["environments"]["base_dir"] above, so the MERGED settings.environments.base_dir
+    # carries the CLI flag OR a file/env-set base_dir. Derive the effective root from it so a file-only
+    # [environments].base_dir anchors [store].path + drives the AC-3/AC-4 diagnostics exactly like
+    # --project-root — not a half-anchored bundle. (Scoped limit: --config / --service-config are resolved
+    # BEFORE load_settings, so a FILE-set base_dir cannot retro-anchor THOSE two members — use
+    # --project-root to anchor them; see config/anchor.py. The DB + env values + diagnostics, all resolved
+    # post-load, honor either source.)
+    effective_root = resolve_project_root(settings.environments.base_dir or None, cwd=cwd)
+
+    # Anchor a relative [store].path under the root too (whether it came from --db or the settings
+    # file): one DB location follows the project root, an absolute path stays put (AC-1/AC-7). Done on
+    # the loaded settings so a file-authored relative path is anchored exactly like a relative --db.
+    if effective_root is not None and not Path(settings.store.path).is_absolute():
+        settings.store.path = str(effective_root / settings.store.path)
 
     # Fail closed: with auth disabled the API answers as a full-privilege system identity, so a
     # non-loopback bind would publish admin access to the network. Loopback is the only no-auth posture.
@@ -576,11 +930,10 @@ def _serve(args: argparse.Namespace) -> int:
     # Anchor for the per-environment value dir: [environments].base_dir (or --project-root) when set,
     # else the working directory (unchanged default). Resolved once here so the startup log shows the
     # exact file env() values come from — the standalone-repo / NSSM footgun is a silently-wrong path.
-    from pathlib import Path
-
     from messagefoundry.config.environments import resolve_values_base_dir
 
-    env_base = resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd())
+    env_base = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
+    env_file = env_base / settings.environments.dir / f"{env_name}.toml"
     # Announce the active environment + posture so an operator can see which env() values resolve and
     # the PHI posture in effect (the env is required — there is no silent default).
     logging.getLogger(__name__).info(
@@ -588,7 +941,7 @@ def _serve(args: argparse.Namespace) -> int:
         env_name,
         data_class.value,
         production,
-        env_base / settings.environments.dir / f"{env_name}.toml",
+        env_file,
     )
     # A non-loopback API bind puts bearer tokens + PHI on the wire. The exposed-gate (ADR 0002 §0):
     # TLS configured → the first-class secure path (allow); no TLS but --allow-insecure-bind → a loud
@@ -675,6 +1028,36 @@ def _serve(args: argparse.Namespace) -> int:
             environ=os.environ,
         )
 
+    # ADR 0050 anchoring diagnostics. Emitted ONCE here at startup (NOT inside env_values(), which is
+    # re-invoked on every reload), and they log resolved file PATHS only — never env() values or
+    # bodies — so they are PHI-safe at INFO/WARNING. The one eager env_values() evaluation here is the
+    # only place the empty-values (NSSM-silent-miss) state is observable; the provider re-reads later.
+    # Guard it: a malformed/unreadable <env>.toml makes tomllib raise here (TOMLDecodeError/OSError) —
+    # without this, that surfaced as a raw traceback (the lazy lifespan used to swallow it). Route it to
+    # a clean error like every other serve gate. The value file is named (path only, PHI-safe).
+    try:
+        env_values_empty = not env_values()
+    except (tomllib.TOMLDecodeError, ValueError, OSError) as exc:
+        print(
+            f"error: could not read environment values from {env_file}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    # Drive the diagnostics off the MERGED root (effective_root), so a file/env-set [environments].base_dir
+    # raises the AC-3 fail-loud + AC-4 cross-root WARNING exactly like an explicit --project-root (ADR §1
+    # "the same merged value"); with neither source, effective_root is None and the AC-5 no-root path runs.
+    rc = _emit_anchor_diagnostics(
+        root=effective_root,
+        cwd=cwd,
+        config_dir=config_dir,
+        env_file=env_file,
+        service_config=service_config,
+        store_path=settings.store.path,
+        env_values_empty=env_values_empty,
+    )
+    if rc is not None:
+        return rc
+
     # L3 multi-process sharding (ADR-pending; messagefoundry/pipeline/sharding.py): with --shard the
     # loaded graph is filtered to that shard's inbounds before the Engine is built (and re-filtered on
     # every reload), so this process owns a disjoint slice of intake. Without it, the whole graph runs
@@ -691,7 +1074,7 @@ def _serve(args: argparse.Namespace) -> int:
 
     app = create_managed_app(
         store_settings=settings.store,
-        config_dir=args.config,
+        config_dir=config_dir,
         registry_filter=registry_filter,
         config_reload_roots=settings.api.config_reload_roots,
         inbound_bind_host=settings.inbound.bind_host,
@@ -700,7 +1083,9 @@ def _serve(args: argparse.Namespace) -> int:
         ordering_default=settings.delivery.ordering,
         internal_error_default=settings.delivery.internal_error,
         buildup_default=settings.delivery.buildup_threshold(),
+        stall_default=settings.delivery.stall_threshold(),
         ack_after_default=settings.inbound.ack_after,
+        priority_default=settings.delivery.priority,
         max_correlation_depth=settings.pipeline.max_correlation_depth,
         connection_events=settings.diagnostics.connection_events,
         response_sent_default=settings.diagnostics.response_sent,
@@ -710,6 +1095,9 @@ def _serve(args: argparse.Namespace) -> int:
         alerts_settings=settings.alerts,
         retention_settings=settings.retention,
         cert_monitor_settings=settings.cert_monitor,
+        update_check_settings=settings.update_check,
+        backup_settings=settings.backup,
+        dr_settings=settings.dr,
         api_tls_cert_file=settings.api.tls_cert_file,
         # Reserve the engine's own API listener so no inbound can be wired onto it (it would collide
         # with uvicorn at bind); surfaced as a clear PortConflictError at check/start instead.
@@ -719,8 +1107,10 @@ def _serve(args: argparse.Namespace) -> int:
         shadow_settings=settings.shadow,
         cluster_settings=settings.cluster,
         approvals_settings=settings.approvals,
+        integrity_settings=settings.integrity,
         expose_docs=settings.api.expose_docs,
         ws_allowed_origins=settings.api.ws_allowed_origins,
+        log_dir=settings.logging.log_dir,  # GET /status app-log disk metering (#50)
     )
     # log_config=None: uvicorn's loggers propagate to the handler configure_logging installed,
     # so everything shares one format/stream (and one log file under NSSM).
@@ -761,16 +1151,31 @@ def _supervise(args: argparse.Namespace) -> int:
     (default) shard yields a single subprocess — identical to a plain `serve`."""
     import asyncio
 
+    from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
     from messagefoundry.pipeline.supervisor import supervise
 
     configure_logging("INFO")
+
+    # ADR 0050 AC-9: anchor the discovery --config and the --db base under the project root HERE, before
+    # discover_shard_specs runs load_config() — so `supervise --project-root R --config <relative>` from a
+    # non-root CWD discovers shards under R, and each shard's <stem>_<shard>.db composes under R in the
+    # supervisor (not only via each child re-anchoring a relative --db). --service-config is forwarded raw
+    # and each child serve resolves it under the forwarded --project-root (same precedence as serve).
+    cwd = Path.cwd()
+    root = resolve_project_root(args.project_root, cwd=cwd)
+    config = anchor_under_root(args.config, root, cwd=cwd)
+    assert config is not None  # args.config always has a string default
+    db_base = anchor_under_root(args.db, root, cwd=cwd)
+    assert db_base is not None  # supervise --db has a string default ("messagefoundry.db")
+
     return asyncio.run(
         supervise(
-            args.config,
-            db_base=args.db,
+            config,
+            db_base=db_base,
             base_port=args.base_port,
             env=args.env,
             service_config=args.service_config,
+            project_root=args.project_root,
         )
     )
 
@@ -778,7 +1183,11 @@ def _supervise(args: argparse.Namespace) -> int:
 def _validate(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import validate_config
 
-    diags = validate_config(args.config)
+    resolved = _resolve_offline_anchor(args)
+    if isinstance(resolved, int):
+        return resolved
+    config_dir, _ = resolved
+    diags = validate_config(config_dir)
     if args.json:
         print(
             json.dumps(
@@ -796,8 +1205,12 @@ def _validate(args: argparse.Namespace) -> int:
 def _graph(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError, display_settings, load_config
 
+    resolved = _resolve_offline_anchor(args)
+    if isinstance(resolved, int):
+        return resolved
+    config_dir, _ = resolved
     try:
-        reg = load_config(args.config)
+        reg = load_config(config_dir)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     data = {
@@ -886,8 +1299,12 @@ def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, read_messages
 
+    resolved = _resolve_offline_anchor(args)
+    if isinstance(resolved, int):
+        return resolved
+    config_dir, _ = resolved
     try:
-        reg = load_config(args.config)
+        reg = load_config(config_dir)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     try:
@@ -1181,6 +1598,135 @@ def _rotate_key(args: argparse.Namespace) -> int:
     return 0
 
 
+def _backup(args: argparse.Namespace) -> int:
+    """Take an on-demand DR backup now (ADR 0049, #60): resolve settings + the store key, snapshot the
+    store, bundle the config dir, encrypt to a ``.mfbak`` archive at the destination, restore-verify,
+    and prune to keep-N. PHI-safe output (paths/counts/fingerprints only — never a body or key bytes).
+    Run any time; it is read-only against the live store and writes one ``dr_backup`` audit row."""
+    import asyncio
+
+    from pydantic import ValidationError
+
+    from messagefoundry import __version__
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.pipeline.dr_backup import BackupError, BackupResult
+    from messagefoundry.pipeline.dr_backup import BackupRunner as _BackupRunner
+    from messagefoundry.store.base import open_store
+
+    cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        cli.setdefault("store", {})["path"] = args.db
+    if args.destination is not None:
+        cli.setdefault("backup", {})["destination"] = args.destination
+    # On-demand backup is opt-in by invocation, so enable it for this run regardless of [backup].enabled
+    # (the file flag governs only the SCHEDULED loop). The destination must still resolve.
+    cli.setdefault("backup", {})["enabled"] = True
+    try:
+        settings = load_settings(config_path=args.service_config, cli=cli)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        return _emit_error(str(exc), as_json=args.json)
+    if not settings.backup.destination.strip():
+        return _emit_error(
+            "no backup destination — pass --destination or set [backup].destination (a LOCAL/UNC path)",
+            as_json=args.json,
+        )
+
+    backup_settings = settings.backup.model_copy(
+        update={
+            "verify_after_backup": not args.no_verify,
+            "full_restore_verify": args.full_verify or settings.backup.full_restore_verify,
+        }
+    )
+
+    async def run() -> BackupResult | None:
+        store = await open_store(settings.store)
+        try:
+            runner = _BackupRunner(
+                store,
+                backup_settings,
+                store_settings=settings.store,
+                config_dir=args.config,
+                engine_version=__version__,
+                instance=settings.ai.environment or "",
+            )
+            return await runner.run_once(force_config_only=args.config_only)
+        finally:
+            await store.close()
+
+    try:
+        result = asyncio.run(run())
+    except BackupError as exc:
+        return _emit_error(f"backup failed ({exc.kind}): {exc}", as_json=args.json)
+    if result is None:  # leader-gated no-op (never on the single-node CLI path) — defensive
+        return _emit_error("backup did not run (not leader)", as_json=args.json)
+    payload = {
+        "archive": result.archive_path,
+        "archive_bytes": result.archive_bytes,
+        "encrypted": result.encrypted,
+        "config_only": result.config_only,
+        "snapshot_method": result.snapshot_method,
+        "key_id": result.key_id,
+        "config_fingerprint": result.config_fingerprint,
+        "snapshot_sha256": result.snapshot_sha256,
+        "row_counts": result.row_counts,
+        "verify": result.verify.status if result.verify is not None else "skipped",
+        "pruned": result.pruned,
+    }
+    if args.json:
+        _print_json(payload, compact=True)
+    else:
+        print(f"OK: wrote {result.archive_path} ({result.archive_bytes} bytes)")
+        print(
+            f"  encrypted={result.encrypted} config_only={result.config_only} key_id={result.key_id}"
+        )
+        print(f"  verify={payload['verify']} row_counts={result.row_counts} pruned={result.pruned}")
+    return 0
+
+
+def _restore_verify(args: argparse.Namespace) -> int:
+    """Verify an existing ``.mfbak`` archive WITHOUT activating it (ADR 0049, #60 — 0049's owned
+    primitive that ADR 0048's cold-seed activation calls): key-fingerprint precheck (a clean
+    ``KEY_MISMATCH`` before any decrypt) -> decrypt -> open the embedded store read-only ->
+    ``integrity_check`` + per-table row-count vs the manifest. Reports ``PASS``/``FAIL``/
+    ``KEY_MISMATCH``; PHI-safe (counts + a reason only, never a body)."""
+    import asyncio
+    from pathlib import Path
+
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.pipeline.dr_backup import run_restore_verify
+
+    if not Path(args.archive).is_file():
+        return _emit_error(f"no archive at {args.archive}", as_json=args.json)
+    cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        cli.setdefault("store", {})["path"] = args.db
+    try:
+        settings = load_settings(config_path=args.service_config, cli=cli)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        return _emit_error(str(exc), as_json=args.json)
+
+    result = asyncio.run(
+        run_restore_verify(args.archive, store_settings=settings.store, full=args.full)
+    )
+    payload = {
+        "status": result.status,
+        "integrity_ok": result.integrity_ok,
+        "row_counts": result.row_counts,
+        "manifest_counts": result.manifest_counts,
+        "reason": result.reason,
+    }
+    if args.json:
+        _print_json(payload, compact=True)
+    else:
+        print(f"{result.status}: {result.reason or 'archive verified'}")
+        if result.row_counts:
+            print(f"  row_counts={result.row_counts}")
+    # exit 0 only on PASS; FAIL/KEY_MISMATCH are non-zero so a script/cold-seed activation can gate on it.
+    return 0 if result.ok else 1
+
+
 def _ai_policy(args: argparse.Namespace) -> int:
     """Print the effective AI-assistance policy resolved from local service settings.
 
@@ -1267,7 +1813,21 @@ def _check(args: argparse.Namespace) -> int:
     """Commit/CI gate: exit 0 iff every *required* check passed (advisory failures only print)."""
     from messagefoundry.checks import run_checks
 
-    report = run_checks(args.config, messages_dir=args.messages, run_lint=not args.no_lint)
+    resolved = _resolve_offline_anchor(args)
+    if isinstance(resolved, int):
+        return resolved
+    config_dir, service_config = resolved
+    # ADR 0050 §3 / AC-6: when --service-config or --project-root is supplied, the explicit service
+    # config takes precedence and check's messagefoundry.toml upward-walk is suppressed; with neither,
+    # service_config is None and _find_service_toml keeps its legacy walk (no regression for the
+    # documented `messagefoundry check --config config` invocation).
+    report = run_checks(
+        config_dir,
+        messages_dir=args.messages,
+        run_lint=not args.no_lint,
+        service_config=service_config,
+        suppress_service_toml_search=args.project_root is not None,
+    )
     if args.json:
         _print_json(report.to_json(), compact=True)
     else:
@@ -1387,8 +1947,6 @@ def _codeset(args: argparse.Namespace) -> int:
     touches no network, starts no server, loads no config modules — validating a code set means
     "does this file load as a CodeSet", done by re-running the code_sets.py loader on the candidate.
     ``upsert`` writes ``.csv`` atomically with owner-only perms and rolls back on a load failure."""
-    from pathlib import Path
-
     from messagefoundry.config import codeset_edit
     from messagefoundry.config.code_sets import CodeSetError, load_code_set
     from messagefoundry.config.wiring import WiringError
@@ -1495,14 +2053,54 @@ def _verify(args: argparse.Namespace) -> int:
     return exit_code(results)
 
 
+def _support_bundle(args: argparse.Namespace) -> int:
+    """Write a secret-free / PHI-free support zip (#49): engine version + a config summary (registry
+    COUNTS/names only — never settings values or secrets) + a ``/status`` snapshot built from the real
+    status models + a REDACTED app-log tail. Offline: touches no network, starts no server. The status
+    snapshot + log tail come from the service settings (the configured store + ``[logging].log_dir``);
+    the config summary comes from ``--config``. A missing service config or store is tolerated — the
+    bundle is still produced (support is most wanted when something is already broken)."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.support import build_bundle
+
+    settings = None
+    try:
+        settings = load_settings(config_path=args.service_config)
+    except FileNotFoundError:
+        # An explicit --service-config that doesn't exist is a user error; a default (None) just means
+        # "no settings" — the bundle then carries version + config summary only.
+        if args.service_config is not None:
+            print(f"error: service config not found: {args.service_config}", file=sys.stderr)
+            return 2
+    except (ValueError, ValidationError) as exc:
+        # A broken settings file shouldn't block the bundle, but warn so the operator knows the status
+        # snapshot/log tail are absent because of it.
+        print(
+            f"warning: could not load service settings ({exc}); status/log omitted", file=sys.stderr
+        )
+
+    kwargs: dict[str, Any] = {"config_dir": args.config, "settings": settings}
+    if args.log_tail_lines is not None:
+        kwargs["log_tail_lines"] = args.log_tail_lines
+    try:
+        result = build_bundle(args.out, **kwargs)
+    except OSError as exc:
+        print(f"error: could not write support bundle: {exc}", file=sys.stderr)
+        return 2
+    print(f"Wrote support bundle to {result.path} ({len(result.members)} members):")
+    for name in result.members:
+        print(f"  {name}")
+    return 0
+
+
 def _alert(args: argparse.Namespace) -> int:
     """Manage the operator-authored ``[[alerts.rules]]`` in the service-settings TOML (ADR 0014):
     ``list`` to populate the VS Code editor, ``add``/``remove`` to save (a developer can also hand-
     edit the file). ``add``/``remove`` re-load the whole settings file BEFORE persisting and roll
     back on failure. Offline: touches no network, starts no server. Rules apply on engine restart
     (the settings TOML is read at startup, not by ``POST /config/reload``)."""
-    from pathlib import Path
-
     from pydantic import ValidationError
 
     from messagefoundry.config import alerts_edit
@@ -1581,8 +2179,11 @@ _DISPATCH = {
     "protect-key": _protect_key,
     "audit-verify": _audit_verify,
     "rotate-key": _rotate_key,
+    "backup": _backup,
+    "restore-verify": _restore_verify,
     "ai-policy": _ai_policy,
     "verify": _verify,
+    "support-bundle": _support_bundle,
 }
 
 

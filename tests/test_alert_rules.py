@@ -104,6 +104,50 @@ def test_oldest_seconds_threshold() -> None:
     assert rules.decide(under).severity == "warning"  # below → no match → default
 
 
+def test_message_stall_event_type_matches_and_severity() -> None:
+    # #50: message_stall is a first-class event type a rule can target with severity/transport routing.
+    rules = AlertRuleSet(
+        [AlertRule(event_type="message_stall", connection="OB_*", severity=AlertSeverity.CRITICAL)]
+    )
+    assert rules.decide({"type": "message_stall", "connection": "OB_ACME"}).severity == "critical"
+    # other event types untouched → default
+    assert (
+        rules.decide({"type": "connection_stopped", "connection": "OB_ACME"}).severity == "warning"
+    )
+
+
+def test_oldest_seconds_threshold_applies_to_message_stall() -> None:
+    # The age threshold (min_oldest_seconds) matches BOTH age-carrying events — queue_buildup AND
+    # message_stall (#50) — since both fire on the same oldest-undelivered age (delivered_age).
+    rules = AlertRuleSet(
+        [
+            AlertRule(
+                event_type="message_stall",
+                min_oldest_seconds=300.0,
+                severity=AlertSeverity.CRITICAL,
+            )
+        ]
+    )
+    over = {"type": "message_stall", "connection": "OB_X", "oldest_age_seconds": 600.0}
+    under = {"type": "message_stall", "connection": "OB_X", "oldest_age_seconds": 10.0}
+    assert rules.decide(over).severity == "critical"  # at/over → match
+    assert rules.decide(under).severity == "warning"  # below → default
+
+
+def test_message_stall_notifier_emits_event() -> None:
+    # The NotifierAlertSink turns message_stall into a fan-out event carrying the (rounded) age.
+    transport = _RecordingTransport("webhook")
+    sink = NotifierAlertSink([transport], realert_seconds=0.0)
+    sink.message_stall("OB_X", oldest_age_seconds=123.456)
+    asyncio.run(_drain(sink))
+    assert len(transport.events) == 1
+    ev = transport.events[0]
+    assert ev["type"] == "message_stall"
+    assert ev["connection"] == "OB_X"
+    assert ev["oldest_age_seconds"] == 123.5  # rounded to 1 dp
+    assert "depth" not in ev  # stall is age-only, never carries a depth
+
+
 def test_oldest_seconds_zero_boundary_matches() -> None:
     # min_oldest_seconds=0.0 is valid (ge=0, unlike min_depth's ge=1) and an age of exactly 0.0
     # matches (0.0 < 0.0 is False, so the guard doesn't reject it).

@@ -31,7 +31,7 @@ import shutil
 import stat
 import subprocess
 import time
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -44,8 +44,11 @@ import aiosqlite
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import StoreBackend
+from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
+from messagefoundry.store.content_search import SearchSpec, row_matches
+from messagefoundry.store.document_strip import StripResult, cutoff_for
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -64,6 +67,205 @@ log = logging.getLogger(__name__)
 # A small bounded pool — readers are short and SQLite reads scale poorly past a handful of connections;
 # this is intentionally not a tunable setting (kept off config/settings.py while another lane owns it).
 _READ_POOL_SIZE = 4
+
+
+class _AbortMember(Exception):  # noqa: N818 — control-flow signal, not an error condition
+    """Raised inside a grouped member body to short-circuit it WITHOUT failing the batch.
+
+    A grouped stage-handoff returns early in its idempotent no-op cases (an INFLIGHT-guarded DELETE
+    that matched 0 rows, a vanished row, an absent ``_row`` read) — in the inline path that does
+    ``rollback(); return <sentinel>``. Under group-commit a single member cannot roll back the shared
+    transaction, but every such early-exit runs **only read-only or zero-mutation** statements before it
+    (the guarded DELETE matched nothing; the SELECT/``_row`` is a read), so the member contributes no net
+    write and is safe to leave in the committing batch. The body raises this carrying its logical result;
+    the committer/inline wrapper unwraps ``result`` and stops the body, leaving the batch intact."""
+
+    __slots__ = ("result",)
+
+    def __init__(self, result: Any) -> None:
+        super().__init__("member aborted")
+        self.result = result
+
+
+@dataclass
+class _Member:
+    """One mutation enrolled in the open group-commit batch.
+
+    ``run`` executes the member's prepared statements on the shared write connection between the
+    committer's single ``BEGIN`` and ``COMMIT`` (it must NOT issue BEGIN/commit/rollback itself). Its
+    return value (or an :class:`_AbortMember`'s ``result``) is delivered via ``future`` once the batch
+    commits; on a group rollback every member's ``future`` is rejected so each caller re-runs."""
+
+    run: "Callable[[], Awaitable[Any]]"
+    future: "asyncio.Future[Any]"
+    # Optional post-commit hook run synchronously in the COMMITTER's frame the instant the batch
+    # commits, BEFORE the future resolves — used to publish a read-through cache delta atomically with
+    # the durable write. Living here (not in the caller's frame after `await fut`) means a committed
+    # write's cache publish can never be skipped by the caller being cancelled while parked on the
+    # future (e.g. a transform worker cancelled on reload). Only ever invoked on commit success; a
+    # rolled-back member's hook never runs, so an uncommitted delta never leaks into the cache.
+    on_commit: "Callable[[Any], None] | None" = None
+
+
+class _GroupCommitter:
+    """App-side group-commit committer for the SQLite write connection (ADR 0055).
+
+    Coalesces N grouped stage-handoff mutations into ONE ``COMMIT`` under the store's single writer
+    lock, amortizing the per-commit fsync (a large win under ``synchronous=FULL``). A member is
+    enrolled via :meth:`submit`; the committer coroutine drains the open batch under ``self._lock``,
+    runs each member's statements inside one ``BEGIN`` … ``COMMIT``, then resolves every member's
+    future. If ANY member raises (other than :class:`_AbortMember`), or the commit itself fails, the
+    whole batch is rolled back and EVERY member's future is rejected — each caller re-runs (a
+    coordinated form of the crash-re-run the INFLIGHT-guarded idempotent handoffs already tolerate).
+
+    Enabled only when ``window_ms > 0``; otherwise the store never constructs one and each grouped
+    method commits inline (byte-identical to the pre-feature path)."""
+
+    def __init__(
+        self,
+        db: aiosqlite.Connection,
+        lock: asyncio.Lock,
+        *,
+        window_ms: float,
+        max_batch: int,
+    ) -> None:
+        self._db = db
+        self._lock = lock
+        self._window = max(window_ms, 0.0) / 1000.0
+        self._max_batch = max(max_batch, 1)
+        self._pending: list[_Member] = []
+        self._wake = asyncio.Event()
+        self._closed = False
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run(), name="store-group-committer")
+
+    async def aclose(self) -> None:
+        """Stop the committer, flushing any enrolled members first so nothing is stranded."""
+        self._closed = True
+        self._wake.set()
+        if self._task is not None:
+            await self._task
+            self._task = None
+
+    async def submit(
+        self,
+        run: "Callable[[], Awaitable[Any]]",
+        *,
+        on_commit: "Callable[[Any], None] | None" = None,
+    ) -> Any:
+        """Enrol a member's statements in the open batch and await its committed result.
+
+        The returned awaitable resolves to the member body's value once the batch commits, or raises
+        whatever the body raised (group rollback re-raises the body's own exception in every member).
+
+        ``on_commit`` (a read-through cache publish) runs in the COMMITTER's frame at commit, before the
+        future resolves — so it cannot be skipped by this caller being cancelled while parked on the
+        future, and it never runs for a rolled-back member (see :class:`_Member`)."""
+        if self._closed:
+            raise RuntimeError("group committer is closed")
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        self._pending.append(_Member(run=run, future=fut, on_commit=on_commit))
+        self._wake.set()
+        return await fut
+
+    async def _run(self) -> None:
+        while True:
+            await self._wake.wait()
+            self._wake.clear()
+            if not self._pending:
+                if self._closed:
+                    return
+                continue
+            # Coalescing window: let siblings arrive (bounded by max_batch) before committing, so one
+            # fsync covers several handoffs. A zero window degenerates to "commit what's here now".
+            if self._window > 0 and len(self._pending) < self._max_batch and not self._closed:
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=self._window)
+                    self._wake.clear()
+                except TimeoutError:
+                    pass
+            await self._flush()
+            if self._closed and not self._pending:
+                return
+            # A single _flush commits at most max_batch members; any remainder (a burst larger than
+            # one batch, or members that enrolled while the batch ran) must NOT be stranded. Re-arm
+            # _wake so the loop drains the next chunk immediately instead of blocking on _wake.wait()
+            # until the next submit() — which, on the close path where no further submit arrives, would
+            # deadlock aclose() and hang every awaiting member's future (the ACK gate). The window-wait
+            # above re-clears _wake, so re-arming here is the sole guarantee the tail gets flushed.
+            if self._pending:
+                self._wake.set()
+
+    async def _flush(self) -> None:
+        # Claim the current batch (cap at max_batch; the remainder rides the next flush).
+        batch = self._pending[: self._max_batch]
+        if not batch:
+            return
+        self._pending = self._pending[len(batch) :]
+        results: list[Any] = []
+        async with self._lock:
+            try:
+                await self._db.execute("BEGIN")
+                for member in batch:
+                    try:
+                        results.append((member, await member.run(), None))
+                    except _AbortMember as abort:
+                        # Zero-mutation early exit (idempotent no-op) — stays in the batch.
+                        results.append((member, abort.result, None))
+                    except Exception as exc:  # noqa: BLE001 — captured to fail the whole group
+                        results.append((member, None, exc))
+                # If ANY member raised a real error, the shared transaction is poisoned: roll the whole
+                # batch back and reject EVERY member's future (each re-runs). We cannot selectively keep
+                # the good members — they share one transaction with the failed mutation.
+                first_error = next((e for _, _, e in results if e is not None), None)
+                if first_error is not None:
+                    await self._db.rollback()
+                    self._reject_all(batch, results)
+                    return
+                await self._db.commit()
+            except Exception as exc:  # noqa: BLE001 — commit/rollback failure fails the whole group
+                try:
+                    await self._db.rollback()
+                except Exception:  # noqa: BLE001 — best-effort; the connection may be unusable
+                    log.warning("group-commit rollback failed", exc_info=True)
+                self._reject_all(batch, results, fallback=exc)
+                return
+        # Commit succeeded → publish each member's read-through cache delta (committer frame, durable
+        # write in hand) then resolve its future, OUTSIDE the lock. The publish runs BEFORE the future
+        # resolves so a co-batched sibling that wakes on its own result already sees this delta, and so
+        # a caller cancelled while parked on the future never causes a committed write to skip the cache.
+        # A failing hook must not strand siblings, so it is isolated per member (logged, never raised).
+        for member, value, _ in results:
+            if member.on_commit is not None:
+                try:
+                    member.on_commit(value)
+                except Exception:  # noqa: BLE001 — a cache-publish fault must not strand the batch
+                    log.warning("group-commit post-commit cache publish failed", exc_info=True)
+            if not member.future.done():
+                member.future.set_result(value)
+
+    @staticmethod
+    def _reject_all(
+        batch: "list[_Member]",
+        results: "list[tuple[_Member, Any, Exception | None]]",
+        *,
+        fallback: Exception | None = None,
+    ) -> None:
+        """Reject every member's future on a group rollback so each caller re-runs.
+
+        A member that itself raised gets its OWN exception (so its caller sees the true cause); the
+        rest get a coordinated rollback error (or the commit failure) and re-run idempotently."""
+        own: dict[int, Exception | None] = {id(m): e for m, _, e in results}
+        group_err = fallback or RuntimeError("group commit rolled back (sibling member failed)")
+        for member in batch:
+            if member.future.done():
+                continue
+            err = own.get(id(member)) or group_err
+            member.future.set_exception(err)
 
 
 class MessageStatus(str, Enum):
@@ -197,6 +399,28 @@ class ConnectionEvent:
 
 
 @dataclass(frozen=True)
+class AlertInstance:
+    """One resolvable operator-alert instance (ADR 0044, #56), as returned by
+    ``list_active_alert_instances`` for the ``GET /alerts/active`` read surface. De-duped on ADR 0014's
+    ``(event_type, connection)`` throttle key, with an open → acknowledged → resolved lifecycle and a
+    first_seen/last_seen window + occurrence ``count``. **Metadata only** — ``reason`` is
+    ``safe_text``-scrubbed and decrypted here; it never carries a message body or HL7 field value."""
+
+    id: int
+    event_type: str
+    connection: str
+    severity: str
+    status: str  # 'open' | 'acknowledged' | 'resolved'
+    first_seen: float
+    last_seen: float
+    count: int
+    reason: str | None
+    acked_by: str | None
+    acked_at: float | None
+    resolved_at: float | None
+
+
+@dataclass(frozen=True)
 class InboundMetrics:
     """Per-channel inbound aggregates for the connections dashboard."""
 
@@ -239,6 +463,21 @@ class LatencyHistogram:
 class ConnectionMetrics:
     inbound: dict[str, InboundMetrics]  # by channel_id
     destinations: dict[tuple[str, str], DestinationMetrics]  # by (channel_id, destination_name)
+
+
+@dataclass(frozen=True)
+class MessageSearchResult:
+    """The outcome of a scan-and-decrypt content search (ADR 0046 #51). ``rows`` are matched message
+    summaries (the same metadata-only shape ``list_messages`` returns — never a decrypted body, so the
+    PHI exposure equals the metadata list, gated by the same ``view_summary`` redaction). ``scanned``
+    is how many candidate rows were decrypted; ``matched`` == ``len(rows)`` before the result cap;
+    ``truncated`` is True when the scan stopped at ``scan_limit`` before exhausting the candidate set
+    (so the caller should narrow filters) — the truncate-and-tell signal."""
+
+    rows: list[dict[str, Any]]
+    scanned: int
+    matched: int
+    truncated: bool
 
 
 @dataclass(frozen=True)
@@ -416,6 +655,33 @@ def _current_user() -> str | None:
         return None
 
 
+def _qmark_cutoff_case(
+    column: str,
+    global_cutoff: float,
+    connection_cutoffs: Mapping[str, float] | None,
+) -> tuple[str, list[Any]]:
+    """Build a ``?``-placeholder cutoff expression for the per-connection retention override (#34,
+    ADR 0027), shared by the SQLite and SQL Server backends (both use ``?`` binds).
+
+    With no per-connection override (``connection_cutoffs`` empty/None) this returns the bare
+    ``("?", [global_cutoff])`` — **byte-identical** to the single global cutoff today. With overrides it
+    returns a ``CASE <column> WHEN ? THEN ? ... ELSE ? END`` whose per-connection ``THEN`` cutoffs come
+    from the map and whose ``ELSE`` is the global cutoff (a connection absent from the map inherits the
+    global window). A keep-forever override is carried as ``float('-inf')`` so ``received_at < -inf`` is
+    always false → that connection is never purged. The returned fragment is meant to sit on the RIGHT of
+    a ``received_at <`` / ``updated_at <`` comparison; the bind list is in placeholder order."""
+    if not connection_cutoffs:
+        return "?", [global_cutoff]
+    whens: list[str] = []
+    params: list[Any] = []
+    for name, cutoff in connection_cutoffs.items():
+        whens.append("WHEN ? THEN ?")
+        params.append(name)
+        params.append(cutoff)
+    params.append(global_cutoff)  # ELSE — connections with no override use the global window
+    return f"(CASE {column} {' '.join(whens)} ELSE ? END)", params
+
+
 def _secure_file(path: Path, *, extra_read_grants: Sequence[str] | None = None) -> None:
     """Restrict a store file to its owner — it holds PHI at rest.
 
@@ -497,7 +763,8 @@ CREATE TABLE IF NOT EXISTS messages (
     status       TEXT NOT NULL,
     error        TEXT,
     summary      TEXT,             -- ingest-derived (MRN/name/order) — PHI, cipher-encrypted at rest (EF-3)
-    metadata     TEXT              -- code/operator-attached values — PHI, cipher-encrypted at rest (EF-3)
+    metadata     TEXT,             -- code/operator-attached values — PHI, cipher-encrypted at rest (EF-3)
+    documents_pruned REAL          -- #47/ADR 0042: epoch ts an embedded doc was stripped in place (NULL=never)
 );
 CREATE INDEX IF NOT EXISTS ix_messages_channel  ON messages(channel_id, received_at);
 CREATE INDEX IF NOT EXISTS ix_messages_control  ON messages(channel_id, control_id);
@@ -671,6 +938,33 @@ CREATE TABLE IF NOT EXISTS connection_event (
 );
 CREATE INDEX IF NOT EXISTS ix_connection_event_conn ON connection_event(connection, ts);
 
+-- Operator alert-state (ADR 0044, #56) — resolvable alert INSTANCES with an open/acknowledged/resolved
+-- lifecycle. METADATA-ONLY (no body, no HL7 field value): the row carries the alert's type, connection
+-- label, effective severity, the first/last-seen window + occurrence count, and a safe_text-scrubbed
+-- `reason` (encrypted at rest, _CIPHER_COLUMNS — like connection_event.reason). De-duped on ADR 0014's
+-- (event_type, connection) throttle key: the partial unique index pins ONE non-resolved instance per
+-- key so the upsert folds re-fires into it (resolved rows drop out of the index, leaving the key free to
+-- re-open). id-keyed (NOT a `queue` stage → invisible to _maybe_finalize_message's `FROM queue` scan):
+-- an alert-instance write is a pure side observer, never pinning a message disposition.
+CREATE TABLE IF NOT EXISTS alert_instance (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type  TEXT NOT NULL,        -- AlertSink event name (bounded engine enum)
+    connection  TEXT NOT NULL,        -- connection/cert/db label (config metadata, never payload)
+    severity    TEXT NOT NULL,        -- effective ADR 0014 severity (info|warning|critical), last write wins
+    status      TEXT NOT NULL,        -- 'open' | 'acknowledged' | 'resolved'
+    first_seen  REAL NOT NULL,
+    last_seen   REAL NOT NULL,
+    count       INTEGER NOT NULL,     -- occurrences folded into this open instance
+    reason      TEXT,                 -- safe_text-scrubbed diagnostic, encrypted at rest
+    acked_by    TEXT,                 -- operator who acknowledged (NULL until acked)
+    acked_at    REAL,
+    resolved_at REAL                  -- when it resolved (NULL while open/acknowledged)
+);
+-- One LIVE (non-resolved) instance per throttle key; resolved rows leave the index so the key re-opens.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_instance_open
+    ON alert_instance(event_type, connection) WHERE status != 'resolved';
+CREATE INDEX IF NOT EXISTS ix_alert_instance_status ON alert_instance(status, connection);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          REAL NOT NULL,
@@ -719,10 +1013,11 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS roles (
-    id           TEXT PRIMARY KEY,             -- Role value, e.g. 'administrator'
+    id           TEXT PRIMARY KEY,             -- Role value, e.g. 'administrator' (or 'custom:<name>')
     display_name TEXT NOT NULL,
     description  TEXT,
-    builtin      INTEGER NOT NULL DEFAULT 1
+    builtin      INTEGER NOT NULL DEFAULT 1,
+    permissions  TEXT                          -- custom roles (ADR 0045): JSON array of Permission wire values; NULL = built-in (resolves from code)
 );
 
 CREATE TABLE IF NOT EXISTS user_roles (
@@ -761,7 +1056,10 @@ CREATE INDEX IF NOT EXISTS ix_sessions_expires ON sessions(expires_at);
 """
 
 # Columns added after the initial release; ALTER-ed in on open for existing DBs.
-_MESSAGE_MIGRATIONS = {"summary": "TEXT", "metadata": "TEXT"}
+# `documents_pruned` (#47, ADR 0042): a nullable epoch timestamp set when retention strips an embedded
+# document in place (NULL = never pruned / no document was ever present). Orthogonal to `status` — it
+# alters no disposition/count; it is the message-level "evicted vs never present" signal a raw-view reads.
+_MESSAGE_MIGRATIONS = {"summary": "TEXT", "metadata": "TEXT", "documents_pruned": "REAL"}
 
 
 class MessageStore:
@@ -790,6 +1088,8 @@ class MessageStore:
         *,
         path: str | Path = ":memory:",
         cipher: Cipher | None = None,
+        group_commit_window_ms: float = 0.0,
+        group_commit_max_batch: int = 64,
     ) -> None:
         self._db = db
         self.path = str(path)
@@ -797,6 +1097,22 @@ class MessageStore:
         # Serialise multi-statement transactions: aiosqlite serialises single
         # executes, but a txn spanning awaits could otherwise interleave.
         self._lock = asyncio.Lock()
+        # App-side group-commit committer (ADR 0055), SQLite only. Disabled (None) by default: with
+        # window == 0 each grouped method commits inline under self._lock, byte-identical to the
+        # pre-feature path. When enabled, the grouped stage-handoffs enrol their statements in this
+        # committer (one BEGIN…COMMIT per batch); claim*/reference-snapshot/audit stay STANDALONE.
+        # Created here but only STARTED by open() (which has a running loop); a bare cls() in a test
+        # without open() therefore never spins a committer task it can't await on close.
+        self._group_commit: _GroupCommitter | None = (
+            _GroupCommitter(
+                db,
+                self._lock,
+                window_ms=group_commit_window_ms,
+                max_batch=group_commit_max_batch,
+            )
+            if group_commit_window_ms > 0
+            else None
+        )
         # Dedicated read-only connection pool (lockfree-reads). Populated by open() for a file-backed
         # WAL store; stays None for ":memory:" (a second connection to ":memory:" is a *different*
         # empty database and WAL doesn't apply), where reads fall back to the writer under self._lock.
@@ -846,7 +1162,13 @@ class MessageStore:
 
     @classmethod
     async def open(
-        cls, path: str | Path, *, synchronous: str = "NORMAL", cipher: Cipher | None = None
+        cls,
+        path: str | Path,
+        *,
+        synchronous: str = "NORMAL",
+        cipher: Cipher | None = None,
+        group_commit_window_ms: float = 0.0,
+        group_commit_max_batch: int = 64,
     ) -> "MessageStore":
         sync = synchronous.upper()
         if sync not in ("NORMAL", "FULL"):
@@ -872,7 +1194,13 @@ class MessageStore:
             for f in (main, main.with_name(main.name + "-wal"), main.with_name(main.name + "-shm")):
                 if f.exists():
                     _secure_file(f)
-        store = cls(db, path=path, cipher=cipher)
+        store = cls(
+            db,
+            path=path,
+            cipher=cipher,
+            group_commit_window_ms=group_commit_window_ms,
+            group_commit_max_batch=group_commit_max_batch,
+        )
         await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
         await store._backfill_audit_chain()  # chain any pre-existing (unhashed) audit rows
         await (
@@ -880,6 +1208,8 @@ class MessageStore:
         )  # populate the in-memory state read-through cache (ADR 0005)
         await store._load_reference_cache()  # populate the reference-snapshot read cache (ADR 0006)
         await store._open_read_pool(str(path))  # dedicated read-only WAL pool (lockfree-reads)
+        if store._group_commit is not None:
+            store._group_commit.start()  # spin the committer coroutine (needs the running loop)
         return store
 
     async def _open_read_pool(self, path: str) -> None:
@@ -933,6 +1263,51 @@ class MessageStore:
                 raise
         finally:
             pool.put_nowait(conn)
+
+    async def _run_grouped(
+        self,
+        body: "Callable[[], Awaitable[Any]]",
+        *,
+        on_commit: "Callable[[Any], None] | None" = None,
+    ) -> Any:
+        """Run one grouped stage-handoff ``body`` (statements only — NO BEGIN/commit/rollback).
+
+        Group-commit DISABLED (the default, ``window == 0``): run ``body`` inline under ``self._lock``
+        inside its own ``BEGIN`` … ``commit`` with an except-rollback — byte-identical to the
+        pre-feature path. An :class:`_AbortMember` (the idempotent no-op early-exit) rolls back and
+        returns its carried result, exactly mirroring the old explicit ``rollback(); return <sentinel>``.
+
+        Group-commit ENABLED: enrol ``body`` in the committer, which runs it between the batch's single
+        ``BEGIN`` … ``COMMIT`` and resolves this caller's future post-commit (so an inbound ACK waiting on
+        the returned value never releases before the data is durable — Hazard B). A group rollback
+        rejects the future and the caller re-runs (licensed by the INFLIGHT-guarded idempotent handoffs).
+
+        ``on_commit`` is an optional read-through cache publish run AFTER a successful commit and only
+        then (a rolled-back/aborted body never runs it, so an uncommitted delta never leaks — AC-4). In
+        the disabled path it runs in this frame after the lock is released (byte-identical to the old
+        post-``_run_grouped`` publish in the caller); enabled, the committer runs it the instant the
+        batch commits — so neither path can skip a committed write's publish if the caller is later
+        cancelled (the disabled path never awaits between commit and publish; the enabled publish is
+        detached into the committer)."""
+        gc = self._group_commit
+        if gc is None:
+            async with self._lock:
+                try:
+                    await self._db.execute("BEGIN")
+                    result = await body()
+                    await self._db.commit()
+                except _AbortMember as abort:
+                    await self._db.rollback()
+                    return abort.result  # zero-mutation no-op: nothing committed → no publish
+                except Exception:
+                    await self._db.rollback()
+                    raise
+            # Commit landed and the lock is released — publish the committed delta in this same frame,
+            # with no await between commit and publish, so a cancel can't interpose and strand the cache.
+            if on_commit is not None:
+                on_commit(result)
+            return result
+        return await gc.submit(body, on_commit=on_commit)
 
     async def _load_state_cache(self) -> None:
         """Populate the in-memory transform-state cache from the ``state`` table (ADR 0005).
@@ -1014,6 +1389,10 @@ class MessageStore:
             "connection_event",
             "reason",
         ),  # #46: scrubbed event reason — id-keyed, rides the loops below
+        (
+            "alert_instance",
+            "reason",
+        ),  # #56 (ADR 0044): scrubbed alert reason — id-keyed, rides the loops below
         # NB: the `response` table (ADR 0013) is cipher-covered too, but it has a COMPOSITE PK (no
         # `id`), so it can't ride the id-keyed loops below — it has its own passes, like state/reference.
         # The `shared_body` table (store-once-deliver-many) is likewise cipher-covered (`body`) but keyed
@@ -1317,6 +1696,14 @@ class MessageStore:
         user_cols = {row["name"] for row in await cur.fetchall()}
         if "channel_scope" not in user_cols:
             await db.execute("ALTER TABLE users ADD COLUMN channel_scope TEXT")
+        # --- custom RBAC roles (ADR 0045) ------------------------------------
+        # roles.permissions: a custom role's JSON permission-subset. A pre-existing DB's roles predate
+        # the column — ALTER it in (NULL on every existing built-in row is byte-identical to today:
+        # built-ins resolve from BUILTIN_ROLE_PERMISSIONS, never this column). Idempotent.
+        cur = await db.execute("PRAGMA table_info(roles)")
+        if "permissions" not in {row["name"] for row in await cur.fetchall()}:
+            await db.execute("ALTER TABLE roles ADD COLUMN permissions TEXT")
+        # --- end custom RBAC roles (ADR 0045) --------------------------------
         # MFA (WP-14): a pre-existing DB's users predate the TOTP columns — ALTER them in (NULL/0 on
         # existing rows = "not enrolled", correct). Idempotent: skipped once present.
         for column, decl in (
@@ -1414,6 +1801,14 @@ class MessageStore:
             )
 
     async def close(self) -> None:
+        # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members and
+        # resolves their futures before the write connection is closed — otherwise an in-flight handoff
+        # would hang forever on a future no committer will ever complete.
+        if self._group_commit is not None:
+            try:
+                await self._group_commit.aclose()
+            except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
+                log.warning("error closing group-commit committer", exc_info=True)
         # Close every pooled read connection (tracked in _read_conns regardless of pool checkout
         # state), then the writer. Best-effort: one failing close must not strand the rest.
         for conn in self._read_conns:
@@ -1686,51 +2081,53 @@ class MessageStore:
         ingress worker then routes+transforms it and calls :meth:`handoff`. Returns the message id."""
         now = time.time() if now is None else now
         mid = uuid4().hex
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                await self._insert_message(
+
+        async def _body() -> str:
+            await self._insert_message(
+                mid,
+                channel_id=channel_id,
+                raw=raw,
+                status=MessageStatus.RECEIVED.value,
+                control_id=control_id,
+                message_type=message_type,
+                source_type=source_type,
+                summary=summary,
+                metadata=metadata,
+                error=None,
+                now=now,
+            )
+            ingress_created_at = await self._fifo_created_at(
+                Stage.INGRESS.value, "channel_id", channel_id, now
+            )
+            await self._db.execute(
+                "INSERT INTO queue"
+                " (id, message_id, stage, channel_id, destination_name, payload,"
+                "  status, attempts, next_attempt_at, created_at, updated_at)"
+                " VALUES (?,?,?,?,NULL,?,?,0,?,?,?)",
+                (
+                    uuid4().hex,
                     mid,
-                    channel_id=channel_id,
-                    raw=raw,
-                    status=MessageStatus.RECEIVED.value,
-                    control_id=control_id,
-                    message_type=message_type,
-                    source_type=source_type,
-                    summary=summary,
-                    metadata=metadata,
-                    error=None,
-                    now=now,
-                )
-                ingress_created_at = await self._fifo_created_at(
-                    Stage.INGRESS.value, "channel_id", channel_id, now
-                )
-                await self._db.execute(
-                    "INSERT INTO queue"
-                    " (id, message_id, stage, channel_id, destination_name, payload,"
-                    "  status, attempts, next_attempt_at, created_at, updated_at)"
-                    " VALUES (?,?,?,?,NULL,?,?,0,?,?,?)",
-                    (
-                        uuid4().hex,
-                        mid,
-                        Stage.INGRESS.value,
-                        channel_id,
-                        self._cipher.encrypt(raw),
-                        OutboxStatus.PENDING.value,
-                        now,
-                        ingress_created_at,
-                        now,
-                    ),
-                )
-                await self._db.execute(
-                    "INSERT INTO message_events (message_id, ts, event, detail) VALUES (?,?,?,?)",
-                    (mid, now, "received", self._enc("ingress")),
-                )
-                await self._db.commit()
-            except Exception:
-                await self._db.rollback()
-                raise
-        return mid
+                    Stage.INGRESS.value,
+                    channel_id,
+                    self._cipher.encrypt(raw),
+                    OutboxStatus.PENDING.value,
+                    now,
+                    ingress_created_at,
+                    now,
+                ),
+            )
+            await self._db.execute(
+                "INSERT INTO message_events (message_id, ts, event, detail) VALUES (?,?,?,?)",
+                (mid, now, "received", self._enc("ingress")),
+            )
+            return mid
+
+        # HAZARD B: the inbound ACK / HTTP-202 is built only after this returns, so under group-commit
+        # _run_grouped must not return until the ingress member's batch is durably committed (the
+        # committer resolves the future post-commit). We never ACK data a crash could still lose.
+        result = await self._run_grouped(_body)
+        assert isinstance(result, str)  # nosec B101 — _body returns mid (str)
+        return result
 
     async def handoff(
         self,
@@ -1813,34 +2210,30 @@ class MessageStore:
         It sets only the **intermediate** ``ROUTED``/``UNROUTED`` disposition; the terminal
         ``PROCESSED``/``FILTERED``/``ERROR`` is owned entirely by :meth:`_maybe_finalize_message`."""
         now = time.time() if now is None else now
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                cur = await self._db.execute(
-                    "DELETE FROM queue WHERE id=? AND stage=? AND status=?",
-                    (ingress_id, Stage.INGRESS.value, OutboxStatus.INFLIGHT.value),
-                )
-                if not cur.rowcount:
-                    # Already handed off by a prior run (crash-restart) — idempotent no-op.
-                    await self._db.rollback()
-                    return False
-                # Insert in handler-list order: routed rows share this handoff's created_at, so the
-                # transform worker's FIFO (created_at, rowid) falls back to rowid = insertion order,
-                # preserving the router's handler order to a shared outbound (see the worker docs).
-                for handler_name, payload in handlers:
-                    await self._insert_routed_row(
-                        message_id, channel_id, handler_name, payload, now
-                    )
-                await self._db.execute(
-                    "UPDATE messages SET status=? WHERE id=?", (disposition.value, message_id)
-                )
-                event = "routed" if disposition is MessageStatus.ROUTED else "unrouted"
-                await self._event(message_id, event, None, f"{len(handlers)} handler(s)", now)
-                await self._db.commit()
-            except Exception:
-                await self._db.rollback()
-                raise
-        return True
+
+        async def _body() -> bool:
+            cur = await self._db.execute(
+                "DELETE FROM queue WHERE id=? AND stage=? AND status=?",
+                (ingress_id, Stage.INGRESS.value, OutboxStatus.INFLIGHT.value),
+            )
+            if not cur.rowcount:
+                # Already handed off by a prior run (crash-restart) — idempotent no-op. The guarded
+                # DELETE matched nothing (zero net mutation), so under group-commit this member stays
+                # in the batch harmlessly; _AbortMember just short-circuits the rest of the body.
+                raise _AbortMember(False)
+            # Insert in handler-list order: routed rows share this handoff's created_at, so the
+            # transform worker's FIFO (created_at, rowid) falls back to rowid = insertion order,
+            # preserving the router's handler order to a shared outbound (see the worker docs).
+            for handler_name, payload in handlers:
+                await self._insert_routed_row(message_id, channel_id, handler_name, payload, now)
+            await self._db.execute(
+                "UPDATE messages SET status=? WHERE id=?", (disposition.value, message_id)
+            )
+            event = "routed" if disposition is MessageStatus.ROUTED else "unrouted"
+            await self._event(message_id, event, None, f"{len(handlers)} handler(s)", now)
+            return True
+
+        return bool(await self._run_grouped(_body))
 
     def state_view(self) -> Mapping[tuple[str, str], Any]:
         """A read-only view of the transform-state read-through cache (ADR 0005).
@@ -1986,73 +2379,87 @@ class MessageStore:
         one that persists (exactly-once *per message*). The in-memory read cache is updated **only after
         ``commit()`` succeeds**, so a rolled-back op never leaks into a synchronous ``state_get``."""
         now = time.time() if now is None else now
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                cur = await self._db.execute(
-                    "DELETE FROM queue WHERE id=? AND stage=? AND status=?",
-                    (routed_id, Stage.ROUTED.value, OutboxStatus.INFLIGHT.value),
+        # The state delta to publish to the read-through cache — built INSIDE the body but published
+        # in THIS frame only after the batch commits (see below). Captured via closure so the committer
+        # (which can only touch the DB) never publishes it; a rolled-back member raises out of
+        # _run_grouped and skips the publish, so an uncommitted state op never leaks (AC-4).
+        applied: list[tuple[tuple[str, str], Any]] = []
+
+        async def _body() -> bool:
+            cur = await self._db.execute(
+                "DELETE FROM queue WHERE id=? AND stage=? AND status=?",
+                (routed_id, Stage.ROUTED.value, OutboxStatus.INFLIGHT.value),
+            )
+            if not cur.rowcount:
+                # Already handed off by a prior run (crash-restart) — idempotent no-op (zero net
+                # mutation; safe to leave in the batch). applied stays empty → nothing published.
+                raise _AbortMember(False)
+            await self._insert_outbound_deliveries(message_id, channel_id, deliveries, now)
+            # Pass-through re-ingress (ADR 0013, generalized): produce each PT child + the parent's
+            # done marker in THIS same transaction as the routed-row DELETE, so the handoff is atomic
+            # and re-run-idempotent. Read the parent's correlation lineage once (absent → depth 0).
+            if pt_deliveries:
+                pcur = await self._db.execute(
+                    "SELECT metadata FROM messages WHERE id=?", (message_id,)
                 )
-                if not cur.rowcount:
-                    # Already handed off by a prior run (crash-restart) — idempotent no-op.
-                    await self._db.rollback()
-                    return False
-                await self._insert_outbound_deliveries(message_id, channel_id, deliveries, now)
-                # Pass-through re-ingress (ADR 0013, generalized): produce each PT child + the parent's
-                # done marker in THIS same transaction as the routed-row DELETE, so the handoff is atomic
-                # and re-run-idempotent. Read the parent's correlation lineage once (absent → depth 0).
-                if pt_deliveries:
-                    pcur = await self._db.execute(
-                        "SELECT metadata FROM messages WHERE id=?", (message_id,)
+                prow = await pcur.fetchone()
+                parent_meta: dict[str, Any] = {}
+                pmeta_json = self._dec(prow["metadata"]) if prow else None
+                if pmeta_json:
+                    loaded = json.loads(pmeta_json)
+                    if isinstance(loaded, dict):
+                        parent_meta = loaded
+                for pt_name, body in pt_deliveries:
+                    produced = await self._insert_passthrough_child(
+                        routed_id,
+                        message_id,
+                        pt_name,
+                        body,
+                        parent_meta,
+                        correlation_depth_cap,
+                        now,
                     )
-                    prow = await pcur.fetchone()
-                    parent_meta: dict[str, Any] = {}
-                    pmeta_json = self._dec(prow["metadata"]) if prow else None
-                    if pmeta_json:
-                        loaded = json.loads(pmeta_json)
-                        if isinstance(loaded, dict):
-                            parent_meta = loaded
-                    for pt_name, body in pt_deliveries:
-                        produced = await self._insert_passthrough_child(
-                            routed_id,
-                            message_id,
-                            pt_name,
-                            body,
-                            parent_meta,
-                            correlation_depth_cap,
-                            now,
-                        )
-                        # The parent's disposition for this Send: a marker outbound row keyed by the PT
-                        # inbound, already terminal (DONE = delivered into the PT, or DEAD = depth-cap
-                        # breach → parent ERROR). It is never claimed (no delivery worker for a PT name;
-                        # claims take PENDING rows only), so it is inert; it exists solely so the
-                        # finalizer counts the Send as delivered/errored rather than collapsing FILTERED.
-                        await self._insert_passthrough_marker(message_id, pt_name, produced, now)
-                # JSON-encode + apply each declared state write in the SAME transaction as the outbound
-                # rows. Encoding is done up front so a (shouldn't-happen) serialization error aborts the
-                # whole handoff cleanly rather than after some rows were inserted. SetState validated
-                # JSON-serializability at construction, so this is belt-and-suspenders.
-                applied: list[tuple[tuple[str, str], Any]] = []
-                for namespace, key, value in state_ops:
-                    value_json = json.dumps(value)
-                    await self._apply_state_op(namespace, key, value_json, message_id, now)
-                    applied.append(((namespace, key), value))
-                total_targets = len(deliveries) + len(pt_deliveries)
-                await self._event(
-                    message_id, "transformed", None, f"{total_targets} destination(s)", now
-                )
-                # Finalizer owns the terminal disposition (incl. the ROUTED→FILTERED collapse when this
-                # was the last handler and nothing delivered anywhere). Runs in this same transaction.
-                await self._maybe_finalize_message(message_id, now)
-                await self._db.commit()
-            except Exception:
-                await self._db.rollback()
-                raise
-        # Commit succeeded → publish the committed writes to the read-through cache (never before: a
-        # rolled-back op above would have raised and skipped this, leaving the cache untouched).
-        for ck, cv in applied:
-            self._state_cache[ck] = cv
-        return True
+                    # The parent's disposition for this Send: a marker outbound row keyed by the PT
+                    # inbound, already terminal (DONE = delivered into the PT, or DEAD = depth-cap
+                    # breach → parent ERROR). It is never claimed (no delivery worker for a PT name;
+                    # claims take PENDING rows only), so it is inert; it exists solely so the
+                    # finalizer counts the Send as delivered/errored rather than collapsing FILTERED.
+                    await self._insert_passthrough_marker(message_id, pt_name, produced, now)
+            # JSON-encode + apply each declared state write in the SAME transaction as the outbound
+            # rows. Encoding is done up front so a (shouldn't-happen) serialization error aborts the
+            # whole handoff cleanly rather than after some rows were inserted. SetState validated
+            # JSON-serializability at construction, so this is belt-and-suspenders.
+            for namespace, key, value in state_ops:
+                value_json = json.dumps(value)
+                await self._apply_state_op(namespace, key, value_json, message_id, now)
+                applied.append(((namespace, key), value))
+            total_targets = len(deliveries) + len(pt_deliveries)
+            await self._event(
+                message_id, "transformed", None, f"{total_targets} destination(s)", now
+            )
+            # Finalizer owns the terminal disposition (incl. the ROUTED→FILTERED collapse when this
+            # was the last handler and nothing delivered anywhere). Runs in this same transaction.
+            await self._maybe_finalize_message(message_id, now)
+            return True
+
+        # Publish the committed state delta to the read-through cache ONLY on commit success, via the
+        # committer's post-commit hook (see _run_grouped on_commit). The hook runs in the committing
+        # frame the instant the batch commits — never before (a rolled-back/aborted body skips it, so an
+        # uncommitted op never leaks — AC-4) and never skipped (it is NOT in this caller's post-await
+        # frame, so a transform worker cancelled while parked on the committer future can no longer leave
+        # a committed write absent from _state_cache).
+        #
+        # NOTE (cross-lane staleness, ADR 0055): a sibling transform worker enrolled in the SAME batch
+        # cannot observe this op via state_get until the batch commits and the hook runs. The SAFETY
+        # property is unchanged from the pre-feature path: a sibling sees the OLD/absent value (stale,
+        # never torn), never a leak of rolled-back state — a bounded widening of the pre-existing
+        # "uncommitted state is invisible" property.
+        def _publish(_committed: Any) -> None:
+            for ck, cv in applied:
+                self._state_cache[ck] = cv
+
+        result = bool(await self._run_grouped(_body, on_commit=_publish))
+        return result
 
     async def _insert_message(
         self,
@@ -2193,7 +2600,11 @@ class MessageStore:
                 items.append(await self._outbox_item_from_row(row))
             except Exception as exc:
                 log.warning("dead-lettering undecryptable outbox row %s: %s", row["id"], exc)
-                await self.dead_letter_now(row["id"], f"undecryptable payload: {exc}")
+                # STANDALONE: this runs post-claim-commit; force an immediate inline commit so it never
+                # tries to join a group batch (Hazard A — a claim's dead-letter must not group).
+                await self.dead_letter_now(
+                    row["id"], f"undecryptable payload: {exc}", _standalone=True
+                )
         return items
 
     async def _outbox_item_from_row(self, row: aiosqlite.Row) -> OutboxItem:
@@ -2221,6 +2632,12 @@ class MessageStore:
         # SQLite (build_coordinator returns the NullCoordinator, whose current_epoch() is None), so this
         # is only ever called with epoch=None in practice; accept and ignore any value for protocol
         # uniformity.
+        return None
+
+    async def warm_pool(self) -> None:
+        # No-op: SQLite uses a single connection, so there is no pool to pre-establish (see
+        # QueueStore.warm_pool). Single-node SQLite never goes through the active-passive promotion path
+        # this optimizes anyway.
         return None
 
     async def claim_next_fifo(
@@ -2312,44 +2729,79 @@ class MessageStore:
             # The dead-letter records the message ERROR (visible in the tracking view); a push alert
             # for a poison ingress row is a documented follow-up (the store can't reach the AlertSink).
             log.warning("dead-lettering undecryptable queue row %s: %s", claimed["id"], exc)
-            await self.dead_letter_now(claimed["id"], f"undecryptable payload: {exc}")
+            # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
+            await self.dead_letter_now(
+                claimed["id"], f"undecryptable payload: {exc}", _standalone=True
+            )
             return None
 
-    async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
+    async def dead_letter_now(
+        self,
+        outbox_id: str,
+        error: str,
+        now: float | None = None,
+        *,
+        _standalone: bool = False,
+    ) -> None:
         """Force a row terminal (``DEAD``) immediately without consuming a retry — **fail-fast**.
 
         For a delivery that can never succeed as-is and must not hold the FIFO lane: a permanent
         partner reject (``AR``), an internal/code error under the error-and-continue policy, or an
         undecryptable payload (corrupt blob / rotated key). Unlike :meth:`mark_failed`, there's no
-        backoff/retry — such a row would just fail identically forever and stall its worker (H-1)."""
+        backoff/retry — such a row would just fail identically forever and stall its worker (H-1).
+
+        ``_standalone`` (internal): force an IMMEDIATE inline commit rather than enrolling in the
+        group-commit batch. It is set when this is called from inside a STANDALONE claim's
+        undecryptable-row path (:meth:`claim_ready` / :meth:`claim_next_fifo`), which already holds its
+        own commit and must NOT try to join a batch (and never shares a claim's rollback fate). Direct
+        callers (a worker dead-lettering a permanent reject) leave it False so the write groups."""
         error = safe_text(
             error
         )  # PHI chokepoint (#120) — incl. the f"undecryptable payload: {exc}" callers
         now = time.time() if now is None else now
-        async with self._lock:
+
+        async def _body() -> None:
             row = await self._row(outbox_id)
             if row is None:
-                return
+                raise _AbortMember(None)
             await self._db.execute(
                 "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=? WHERE id=?",
                 (OutboxStatus.DEAD.value, now, self._enc(error), now, outbox_id),
             )
             await self._event(row["message_id"], "dead", row["destination_name"], error, now)
             await self._maybe_finalize_message(row["message_id"], now)
-            await self._db.commit()
+
+        if _standalone:
+            # Inline immediate commit (mirrors the disabled path) — never enrol in the committer.
+            async with self._lock:
+                try:
+                    await self._db.execute("BEGIN")
+                    await _body()
+                    await self._db.commit()
+                except _AbortMember:
+                    await self._db.rollback()
+                except Exception:
+                    await self._db.rollback()
+                    raise
+            return
+        await self._run_grouped(_body)
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        async with self._lock:
+
+        async def _body() -> None:
+            # _row is a read; under group-commit it runs inside the batch's BEGIN. A vanished row is an
+            # idempotent no-op (zero mutation) — abort without failing the batch.
             row = await self._row(outbox_id)
             if row is None:
-                return
+                raise _AbortMember(None)
             await self._db.execute(
                 "UPDATE queue SET status=?, last_error=NULL, updated_at=? WHERE id=?",
                 (OutboxStatus.DONE.value, now, outbox_id),
             )
-            # H2: record the idempotency-ledger row in THIS same (implicit) transaction as the DONE
-            # flip, so the ledger and the row's terminal state commit or roll back together.
+            # H2: record the idempotency-ledger row in THIS same transaction as the DONE flip, so the
+            # ledger and the row's terminal state commit or roll back together. (Previously this rode
+            # aiosqlite's implicit txn; the committer now owns BEGIN/commit — same atomicity.)
             await self._record_delivered_key(
                 outbox_id=outbox_id,
                 message_id=row["message_id"],
@@ -2365,7 +2817,8 @@ class MessageStore:
                 now,
             )
             await self._maybe_finalize_message(row["message_id"], now)
-            await self._db.commit()
+
+        await self._run_grouped(_body)
 
     async def complete_with_response(
         self,
@@ -2387,102 +2840,99 @@ class MessageStore:
         destination_name)`` pair, assigned inside this transaction, so it is **replay-stable** (
         :meth:`replay` resets ``queue.attempts=0`` — an attempts-keyed row would collide) and each
         capture is a plain ``INSERT`` that never overwrites a prior reply (immutability is the PRIMARY
-        KEY). Uses an **explicit** ``BEGIN`` (it does more writes than ``mark_done``'s implicit-txn
-        single commit), matching :meth:`route_handoff`; **no** intermediate commit. The ``response``
+        KEY). Runs through :meth:`_run_grouped` (a single ``BEGIN`` … ``commit`` inline when group-commit
+        is off; enrolled in the committer's batch when on); **no** intermediate commit. The ``response``
         table is invisible to :meth:`_maybe_finalize_message` (it scans ``queue`` only), so disposition
         is unaffected — a delivered row finalizes ``PROCESSED`` exactly as a non-capturing one does."""
         now = time.time() if now is None else now
-        async with self._lock:
-            try:
-                await self._db.execute("BEGIN")
-                cur = await self._db.execute(
-                    "SELECT message_id, destination_name, handler_name, attempts FROM queue WHERE id=?",
-                    (outbox_id,),
+
+        async def _body() -> None:
+            cur = await self._db.execute(
+                "SELECT message_id, destination_name, handler_name, attempts FROM queue WHERE id=?",
+                (outbox_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                # Row vanished (cancelled mid-flight) — nothing to complete; no response written.
+                # Zero-mutation read so far → idempotent no-op (safe to leave in a group batch).
+                raise _AbortMember(None)
+            message_id = row["message_id"]
+            destination_name = row["destination_name"]
+            await self._db.execute(
+                "UPDATE queue SET status=?, last_error=NULL, updated_at=? WHERE id=?",
+                (OutboxStatus.DONE.value, now, outbox_id),
+            )
+            cur = await self._db.execute(
+                "SELECT COALESCE(MAX(response_seq), 0) AS m FROM response"
+                " WHERE message_id=? AND destination_name=?",
+                (message_id, destination_name),
+            )
+            seq_row = await cur.fetchone()
+            # COALESCE(...,0) always returns one row, so seq_row is never None; guard for the type.
+            seq = (int(seq_row["m"]) if seq_row else 0) + 1
+            await self._db.execute(
+                "INSERT INTO response"
+                " (message_id, destination_name, response_seq, body, outcome, detail, captured_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    message_id,
+                    destination_name,
+                    seq,
+                    self._enc(body),
+                    outcome,
+                    self._enc(detail),
+                    now,
+                ),
+            )
+            if reingress_to is not None:
+                # ADR 0013 Increment 2: this reply is to be re-ingressed. Produce a drainable
+                # Stage.RESPONSE work-row in the SAME transaction as the artifact (orphan-free): a
+                # token referencing the immutable artifact by its (message_id, destination_name,
+                # response_seq) PK, encrypted like any payload. channel_id = the loopback inbound (the
+                # FIFO lane); message_id = the ORIGIN (so the finalizer holds it in flight until the
+                # reply is handed off). The re-ingress worker drains it via ingress_handoff.
+                artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
+                work_created = await self._fifo_created_at(
+                    Stage.RESPONSE.value, "channel_id", reingress_to, now
                 )
-                row = await cur.fetchone()
-                if row is None:
-                    # Row vanished (cancelled mid-flight) — nothing to complete; no response written.
-                    await self._db.rollback()
-                    return
-                message_id = row["message_id"]
-                destination_name = row["destination_name"]
                 await self._db.execute(
-                    "UPDATE queue SET status=?, last_error=NULL, updated_at=? WHERE id=?",
-                    (OutboxStatus.DONE.value, now, outbox_id),
-                )
-                cur = await self._db.execute(
-                    "SELECT COALESCE(MAX(response_seq), 0) AS m FROM response"
-                    " WHERE message_id=? AND destination_name=?",
-                    (message_id, destination_name),
-                )
-                seq_row = await cur.fetchone()
-                # COALESCE(...,0) always returns one row, so seq_row is never None; guard for the type.
-                seq = (int(seq_row["m"]) if seq_row else 0) + 1
-                await self._db.execute(
-                    "INSERT INTO response"
-                    " (message_id, destination_name, response_seq, body, outcome, detail, captured_at)"
-                    " VALUES (?,?,?,?,?,?,?)",
+                    "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
+                    " handler_name, payload, status, attempts, next_attempt_at, created_at,"
+                    " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
+                        uuid4().hex,
                         message_id,
-                        destination_name,
-                        seq,
-                        self._enc(body),
-                        outcome,
-                        self._enc(detail),
+                        Stage.RESPONSE.value,
+                        reingress_to,
+                        None,
+                        None,
+                        self._enc(artifact_ref),
+                        OutboxStatus.PENDING.value,
+                        0,
+                        now,
+                        work_created,
                         now,
                     ),
                 )
-                if reingress_to is not None:
-                    # ADR 0013 Increment 2: this reply is to be re-ingressed. Produce a drainable
-                    # Stage.RESPONSE work-row in the SAME transaction as the artifact (orphan-free): a
-                    # token referencing the immutable artifact by its (message_id, destination_name,
-                    # response_seq) PK, encrypted like any payload. channel_id = the loopback inbound (the
-                    # FIFO lane); message_id = the ORIGIN (so the finalizer holds it in flight until the
-                    # reply is handed off). The re-ingress worker drains it via ingress_handoff.
-                    artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
-                    work_created = await self._fifo_created_at(
-                        Stage.RESPONSE.value, "channel_id", reingress_to, now
-                    )
-                    await self._db.execute(
-                        "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
-                        " handler_name, payload, status, attempts, next_attempt_at, created_at,"
-                        " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            uuid4().hex,
-                            message_id,
-                            Stage.RESPONSE.value,
-                            reingress_to,
-                            None,
-                            None,
-                            self._enc(artifact_ref),
-                            OutboxStatus.PENDING.value,
-                            0,
-                            now,
-                            work_created,
-                            now,
-                        ),
-                    )
-                # H2: the idempotency-ledger row joins this SAME explicit transaction as the DONE flip +
-                # the response artifact (single atomic completion — no second store).
-                await self._record_delivered_key(
-                    outbox_id=outbox_id,
-                    message_id=message_id,
-                    destination_name=destination_name,
-                    handler_name=row["handler_name"],
-                    now=now,
-                )
-                await self._event(
-                    message_id,
-                    "delivered",
-                    destination_name,
-                    f"attempt {row['attempts']} (response {outcome})",
-                    now,
-                )
-                await self._maybe_finalize_message(message_id, now)
-                await self._db.commit()
-            except Exception:
-                await self._db.rollback()
-                raise
+            # H2: the idempotency-ledger row joins this SAME transaction as the DONE flip + the
+            # response artifact (single atomic completion — no second store).
+            await self._record_delivered_key(
+                outbox_id=outbox_id,
+                message_id=message_id,
+                destination_name=destination_name,
+                handler_name=row["handler_name"],
+                now=now,
+            )
+            await self._event(
+                message_id,
+                "delivered",
+                destination_name,
+                f"attempt {row['attempts']} (response {outcome})",
+                now,
+            )
+            await self._maybe_finalize_message(message_id, now)
+
+        await self._run_grouped(_body)
 
     @staticmethod
     def _passthrough_message_id(routed_id: str, pt_channel: str, body: str) -> str:
@@ -2964,10 +3414,11 @@ class MessageStore:
         """Reschedule with exponential backoff, or dead-letter if retries are exhausted."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        async with self._lock:
+
+        async def _body() -> None:
             row = await self._row(outbox_id)
             if row is None:
-                return
+                raise _AbortMember(None)
             attempts = row["attempts"]
             # max_attempts None = retry forever (never dead-letter here); a finite cap dead-letters
             # once exhausted. attempts is post-increment (the claim bumped it before this send).
@@ -2993,7 +3444,8 @@ class MessageStore:
             )
             if status == OutboxStatus.DEAD.value:
                 await self._maybe_finalize_message(row["message_id"], now)
-            await self._db.commit()
+
+        await self._run_grouped(_body)
 
     async def pending_depth(
         self, name: str, *, stage: str = Stage.OUTBOUND.value
@@ -3360,6 +3812,71 @@ class MessageStore:
             row = await cur.fetchone()
         return int(row["n"]) if row else 0
 
+    async def search_messages(
+        self,
+        spec: SearchSpec,
+        *,
+        channel_id: str | None = None,
+        status: str | None = None,
+        message_type: str | None = None,
+        control_id: str | None = None,
+        limit: int = 50,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> MessageSearchResult:
+        """Scan-and-decrypt content search (ADR 0046 #51): pre-filter on the indexed metadata, then
+        decrypt + match each candidate body **in memory** (a plain SQL ``LIKE`` is impossible while the
+        cipher is on — the at-rest bytes are per-row random-nonced AES-GCM ciphertext).
+
+        The metadata ``WHERE`` (``_message_filter`` + per-channel RBAC) narrows the candidate set before
+        any decrypt; rows are walked newest-first and decrypt+match runs **off the event loop** (the
+        per-row AES-GCM decrypt + HL7 parse is CPU work). The scan stops after ``spec.scan_limit``
+        decrypts (``truncated=True``) or ``limit`` matches, whichever first — the hard cost ceiling that
+        keeps this slow-by-construction read safe to expose."""
+        where, params = self._message_filter(
+            channel_id, status, message_type, control_id, allowed_channels
+        )
+        # Stream candidates newest-first under one read snapshot; decrypt+match each off the loop. We
+        # select only id + the two cipher-covered columns we match on — never a whole detail row.
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
+                " status, error, summary, metadata, raw,"
+                " (SELECT event FROM message_events e WHERE e.message_id = messages.id"
+                "  ORDER BY e.id DESC LIMIT 1) AS last_event"
+                f" FROM messages{where}"
+                " ORDER BY received_at DESC, id DESC",
+                params,
+            )
+            candidates = list(await cur.fetchall())
+        return await asyncio.to_thread(self._scan_rows, spec, candidates, limit)
+
+    def _scan_rows(
+        self, spec: SearchSpec, candidates: Sequence[aiosqlite.Row], limit: int
+    ) -> MessageSearchResult:
+        """The off-loop decrypt+match loop (run via ``asyncio.to_thread``). Decrypts each candidate's
+        ``raw``/``summary`` and tests the content predicate; bounded by ``spec.scan_limit`` decrypts and
+        ``limit`` matches. The returned rows are metadata-only (the decrypted ``raw`` is dropped — the
+        result has the same PHI surface as ``list_messages``)."""
+        rows: list[dict[str, Any]] = []
+        scanned = 0
+        truncated = False
+        for cand in candidates:
+            if scanned >= spec.scan_limit:
+                truncated = True
+                break
+            scanned += 1
+            raw = self._dec(cand["raw"])
+            summary = self._dec(cand["summary"])
+            if row_matches(spec, raw=raw, summary=summary):
+                d = self._decode_row(cand, "error", "summary", "metadata")
+                d.pop("raw", None)  # never return the decrypted body in a list-shaped result
+                rows.append(d)
+                if len(rows) >= limit:
+                    break
+        return MessageSearchResult(
+            rows=rows, scanned=scanned, matched=len(rows), truncated=truncated
+        )
+
     async def list_dead(
         self,
         *,
@@ -3562,6 +4079,171 @@ class MessageStore:
                 )
                 for r in await cur.fetchall()
             ]
+
+    # --- operator alert-state (ADR 0044, #56) --------------------------------
+    # >>> alert_instance block (#56) — self-contained; the coordinator integrates the store files <<<
+    async def upsert_alert_instance(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        severity: str,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        # Pure observer (ADR 0044 D2): a single short upsert under the write lock — NO queue row, NO
+        # finalizer call (alert_instance is invisible to _maybe_finalize_message's `FROM queue` scan), so
+        # it can never pin a message disposition. De-dup grain = ADR 0014's (event_type, connection)
+        # throttle key. If a live (open/acknowledged) instance exists, fold the re-fire into it (bump
+        # last_seen + count, refresh severity/reason; an acknowledged instance STAYS acknowledged — the
+        # operator already owns it). Otherwise insert a fresh `open` row. reason rides safe_text (#120) +
+        # the cipher. Never raises into the _emit caller (the caller wraps fail-soft).
+        now = time.time() if now is None else now
+        reason_enc = self._enc(safe_text(reason)[:200]) if reason else None
+        async with self._lock:
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET last_seen=?, count=count+1, severity=?, reason=?"
+                " WHERE event_type=? AND connection=? AND status!='resolved'",
+                (now, severity, reason_enc, event_type, connection),
+            )
+            if cur.rowcount == 0:
+                await self._db.execute(
+                    "INSERT INTO alert_instance"
+                    " (event_type, connection, severity, status, first_seen, last_seen, count, reason)"
+                    " VALUES (?,?,?,'open',?,?,1,?)",
+                    (event_type, connection, severity, now, now, reason_enc),
+                )
+            await self._db.commit()
+
+    async def list_active_alert_instances(
+        self,
+        *,
+        limit: int = 200,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> list[AlertInstance]:
+        # The read accessor for GET /alerts/active: open + acknowledged instances, newest last_seen
+        # first. Runs on the lockfree read path. `allowed_channels` applies the SAME per-channel RBAC
+        # scope as list_connection_events (None = unrestricted; a set restricts to instances whose
+        # connection is in the allow-set). limit is clamped server-side.
+        limit = max(1, min(limit, 1000))
+        where = ["status IN ('open','acknowledged')"]
+        params: list[Any] = []
+        if allowed_channels is not None:
+            _append_channel_scope(where, params, "connection", allowed_channels)
+        clause = " WHERE " + " AND ".join(where)
+        params.append(limit)
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, event_type, connection, severity, status, first_seen, last_seen, count,"
+                f" reason, acked_by, acked_at, resolved_at FROM alert_instance{clause}"
+                " ORDER BY last_seen DESC, id DESC LIMIT ?",
+                params,
+            )
+            return [self._alert_instance_row(r) for r in await cur.fetchall()]
+
+    async def get_alert_instance(
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+    ) -> AlertInstance | None:
+        # Read one instance by id (any status) — the API echo for ack/resolve. RBAC-scoped exactly like
+        # list_active_alert_instances (a scoped caller can't read an instance outside its channels).
+        where = ["id=?"]
+        params: list[Any] = [alert_id]
+        if allowed_channels is not None:
+            _append_channel_scope(where, params, "connection", allowed_channels)
+        clause = " WHERE " + " AND ".join(where)
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, event_type, connection, severity, status, first_seen, last_seen, count,"
+                f" reason, acked_by, acked_at, resolved_at FROM alert_instance{clause}",
+                params,
+            )
+            row = await cur.fetchone()
+            return self._alert_instance_row(row) if row is not None else None
+
+    def _alert_instance_row(self, r: aiosqlite.Row) -> AlertInstance:
+        return AlertInstance(
+            id=r["id"],
+            event_type=r["event_type"],
+            connection=r["connection"],
+            severity=r["severity"],
+            status=r["status"],
+            first_seen=r["first_seen"],
+            last_seen=r["last_seen"],
+            count=r["count"],
+            reason=self._dec(r["reason"]),
+            acked_by=r["acked_by"],
+            acked_at=r["acked_at"],
+            resolved_at=r["resolved_at"],
+        )
+
+    async def ack_alert_instance(
+        self, alert_id: int, *, actor: str, now: float | None = None
+    ) -> bool:
+        # Operator ack: open|acknowledged → acknowledged, recording acked_by/acked_at. Idempotent (a
+        # re-ack is a no-op update). Returns True iff a non-resolved instance with this id existed (so
+        # the API can 404 a resolved/unknown id). Ack'ing a resolved instance is refused (no-op → False).
+        now = time.time() if now is None else now
+        async with self._lock:
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
+                " WHERE id=? AND status!='resolved'",
+                (actor, now, alert_id),
+            )
+            await self._db.commit()
+            return cur.rowcount > 0
+
+    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
+        # Operator resolve: open|acknowledged → resolved, recording resolved_at. Returns True iff a
+        # non-resolved instance with this id existed.
+        now = time.time() if now is None else now
+        async with self._lock:
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET status='resolved', resolved_at=?"
+                " WHERE id=? AND status!='resolved'",
+                (now, alert_id),
+            )
+            await self._db.commit()
+            return cur.rowcount > 0
+
+    async def resolve_alert_instances_for(
+        self, *, event_type: str, connection: str, now: float | None = None
+    ) -> int:
+        # Auto-resolution (ADR 0044 D2): an inverse lifecycle signal (e.g. connection_restored) resolves
+        # the matching live instance(s) for a (event_type, connection) key. Returns the count resolved.
+        now = time.time() if now is None else now
+        async with self._lock:
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET status='resolved', resolved_at=?"
+                " WHERE event_type=? AND connection=? AND status!='resolved'",
+                (now, event_type, connection),
+            )
+            await self._db.commit()
+            return int(cur.rowcount)
+
+    async def count_open_alerts_by_connection(self) -> dict[str, int]:
+        # Back ConnectionRow.alerts_active (ADR 0044 D4): the OPEN (not acknowledged, not resolved)
+        # instance count per connection, joined to the dashboard rows by connection name. Lockfree read.
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT connection, COUNT(*) AS n FROM alert_instance"
+                " WHERE status='open' GROUP BY connection"
+            )
+            return {r["connection"]: int(r["n"]) for r in await cur.fetchall()}
+
+    async def purge_alert_instances(self, *, older_than: float, now: float | None = None) -> int:
+        # Retention (ADR 0044 D5): age-DELETE RESOLVED instances whose resolved_at predates older_than —
+        # metadata-only, on their own window, driven by the RetentionRunner. NEVER touches an
+        # open/acknowledged instance. A single short transaction.
+        async with self._lock:
+            cur = await self._db.execute(
+                "DELETE FROM alert_instance WHERE status='resolved' AND resolved_at IS NOT NULL"
+                " AND resolved_at < ?",
+                (older_than,),
+            )
+            await self._db.commit()
+            return int(cur.rowcount)
+
+    # <<< end alert_instance block (#56) >>>
 
     async def record_view(
         self, message_id: str, *, actor: str | None = None, now: float | None = None
@@ -3986,13 +4668,16 @@ class MessageStore:
         display_name: str,
         description: str | None = None,
         builtin: bool = True,
+        permissions: str | None = None,
     ) -> None:
         async with self._lock:
             await self._db.execute(
-                "INSERT INTO roles (id, display_name, description, builtin) VALUES (?,?,?,?)"
+                "INSERT INTO roles (id, display_name, description, builtin, permissions)"
+                " VALUES (?,?,?,?,?)"
                 " ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,"
-                " description=excluded.description, builtin=excluded.builtin",
-                (role_id, display_name, description, 1 if builtin else 0),
+                " description=excluded.description, builtin=excluded.builtin,"
+                " permissions=excluded.permissions",
+                (role_id, display_name, description, 1 if builtin else 0, permissions),
             )
             await self._db.commit()
 
@@ -4000,6 +4685,32 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute("SELECT * FROM roles ORDER BY id")
             return list(await cur.fetchall())
+
+    async def get_role(self, role_id: str) -> aiosqlite.Row | None:
+        async with self._read() as db:
+            cur = await db.execute("SELECT * FROM roles WHERE id=?", (role_id,))
+            return await cur.fetchone()
+
+    async def delete_custom_role(self, role_id: str) -> bool:
+        """Delete a custom (``builtin=0``) role and any user/AD-group assignments of it in one
+        transaction (ADR 0045 D4); never touches a built-in row. Returns ``True`` if a custom role was
+        removed. Idempotent."""
+        async with self._lock:
+            try:
+                await self._db.execute("BEGIN")
+                cur = await self._db.execute("SELECT builtin FROM roles WHERE id=?", (role_id,))
+                row = await cur.fetchone()
+                if row is None or int(row["builtin"]) != 0:
+                    await self._db.rollback()
+                    return False
+                await self._db.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
+                await self._db.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
+                await self._db.execute("DELETE FROM roles WHERE id=?", (role_id,))
+                await self._db.commit()
+                return True
+            except Exception:
+                await self._db.rollback()
+                raise
 
     async def get_user_role_ids(self, user_id: str) -> list[str]:
         async with self._read() as db:
@@ -4291,7 +5002,13 @@ class MessageStore:
 
     # --- retention / purge + maintenance (PHI.md §8, ASVS 14.2.x) -------------
 
-    async def purge_message_bodies(self, *, older_than: float, now: float | None = None) -> int:
+    async def purge_message_bodies(
+        self,
+        *,
+        older_than: float,
+        now: float | None = None,
+        connection_cutoffs: Mapping[str, float] | None = None,
+    ) -> int:
         """Null the PHI **bodies** of fully-resolved messages received before ``older_than`` while
         **keeping their metadata rows** — the Mirth Data-Pruner pattern (count-and-log + audit stay
         intact; nothing is accepted-and-dropped retroactively).
@@ -4304,13 +5021,27 @@ class MessageStore:
         :meth:`purge_dead_letters` (a dead row stays replayable until its own window) — and because
         replay re-queues a row's *own* payload, never ``messages.raw``, nulling the message body here
         can't break a later dead-row replay. Idempotent (guards on a non-blank body); returns the
-        number of messages whose body was nulled."""
+        number of messages whose body was nulled.
+
+        ``connection_cutoffs`` (#34, ADR 0027) is an optional ``{channel_id -> cutoff}`` map of
+        per-connection retention overrides: a message received by a connection in the map is purged at
+        that connection's own cutoff (``float('-inf')`` = keep forever) instead of the global
+        ``older_than``; a connection absent from the map falls back to ``older_than``. Default empty ⇒
+        a single global cutoff, byte-identical to the prior behaviour. The per-connection cutoff is
+        AND-ed with the unchanged ``NOT EXISTS (pending/inflight)`` in-flight guard, so a body still in
+        the pipeline is never purged regardless of its connection's window."""
         now = time.time() if now is None else now
         inflight = (OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value)
-        # A message past the cutoff with nothing still in flight. Embedded in each UPDATE below so the
-        # three tables are purged for exactly the same set, in one transaction.
+        # Per-connection cutoff (#34): bare "?" (global) when no override, else a CASE keyed on
+        # messages.channel_id. Embedded inside the `eligible` subquery, so its binds lead each UPDATE's
+        # params in placeholder order (replacing the single leading `older_than` bind).
+        cutoff_sql, cutoff_params = _qmark_cutoff_case(
+            "m.channel_id", older_than, connection_cutoffs
+        )
+        # A message past its (per-connection-or-global) cutoff with nothing still in flight. Embedded in
+        # each UPDATE below so the three tables are purged for exactly the same set, in one transaction.
         eligible = (
-            "SELECT id FROM messages m WHERE m.received_at < ? "
+            f"SELECT id FROM messages m WHERE m.received_at < {cutoff_sql} "
             "AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = m.id AND q.status IN (?, ?))"
         )
         async with self._lock:
@@ -4319,7 +5050,7 @@ class MessageStore:
                 cur = await self._db.execute(
                     f"UPDATE messages SET raw='', summary=NULL, error=NULL "
                     f"WHERE raw <> '' AND id IN ({eligible})",
-                    (older_than, *inflight),
+                    (*cutoff_params, *inflight),
                 )
                 purged = cur.rowcount
                 # store-once: release the shared bodies the eligible delivered/cancelled rows reference
@@ -4332,7 +5063,7 @@ class MessageStore:
                         Stage.OUTBOUND.value,
                         OutboxStatus.DONE.value,
                         OutboxStatus.CANCELLED.value,
-                        older_than,
+                        *cutoff_params,
                         *inflight,
                     ),
                 )
@@ -4347,14 +5078,14 @@ class MessageStore:
                         Stage.OUTBOUND.value,
                         OutboxStatus.DONE.value,
                         OutboxStatus.CANCELLED.value,
-                        older_than,
+                        *cutoff_params,
                         *inflight,
                     ),
                 )
                 await self._db.execute(
                     f"UPDATE message_events SET detail=NULL "
                     f"WHERE detail IS NOT NULL AND message_id IN ({eligible})",
-                    (older_than, *inflight),
+                    (*cutoff_params, *inflight),
                 )
                 # Captured request/response replies (ADR 0013) are PHI on the same window as the body:
                 # null body+detail in place (the row is kept, like messages.raw). The FK to messages(id)
@@ -4362,13 +5093,114 @@ class MessageStore:
                 await self._db.execute(
                     f"UPDATE response SET body=NULL, detail=NULL "
                     f"WHERE (body IS NOT NULL OR detail IS NOT NULL) AND message_id IN ({eligible})",
-                    (older_than, *inflight),
+                    (*cutoff_params, *inflight),
                 )
                 await self._db.commit()
             except Exception:
                 await self._db.rollback()
                 raise
         return int(purged)
+
+    async def strip_embedded_documents(
+        self,
+        *,
+        older_than: float,
+        now: float | None = None,
+        connection_cutoffs: Mapping[str, float] | None = None,
+        min_bytes: int = 0,
+        content_types: Mapping[str, str] | None = None,
+    ) -> StripResult:
+        """Strip bulky base64 embedded documents from stored message bodies **in place** (#47, ADR 0042
+        D2) — a sibling to :meth:`purge_message_bodies` that, instead of nulling the whole body, replaces
+        only each embedded document with a small self-describing tombstone (size + content-type + pruned
+        ts) and leaves the surrounding message byte-stable and parseable.
+
+        Both carriage forms are targeted, codec-driven (never raw string-slicing, §8): a whole-body
+        ``mfb64:v1:`` carriage value (ADR 0028) and HL7 OBX-5 ED embeds (edited via the parsed model and
+        re-encoded). Each stripped message gets its ``documents_pruned`` timestamp set (the distinct
+        "evicted vs never present" flag, D4) — orthogonal to ``status`` (no disposition/count changes,
+        the row is never deleted). Idempotent: an already-tombstoned body is skipped.
+
+        Eligibility mirrors the purge: a message is a candidate only when it is past its
+        per-connection-or-global cutoff AND has **no** queue row still ``pending``/``inflight`` (never
+        strip an in-flight body — at-least-once relies on a re-run re-deriving the body). ``min_bytes``
+        skips an embed below the size threshold; ``content_types`` (channel_id -> declared content_type)
+        labels a bare-mfb64 tombstone. Returns a :class:`StripResult` (counts + bytes reclaimed, no PHI).
+
+        ``connection_cutoffs`` (#34/ADR 0027 plumbing reuse) overrides the cutoff per ``channel_id``
+        (``float('-inf')`` = keep forever); empty ⇒ a single global cutoff."""
+        now = time.time() if now is None else now
+        content_types = content_types or {}
+        inflight = (OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value)
+        # Bound the candidate scan with the LOOSEST finite cutoff (the global one OR the largest override
+        # — a keep-forever -inf never widens it). The precise per-connection cutoff is re-checked in
+        # Python per row via cutoff_for, so this SQL bound only narrows the set we materialize+decrypt.
+        finite = [
+            c for c in ([older_than, *(connection_cutoffs or {}).values()]) if c != float("-inf")
+        ]
+        scan_cutoff = max(finite) if finite else float("-inf")
+        rows: list[aiosqlite.Row] = []
+        if finite:  # nothing finite ⇒ everything is keep-forever ⇒ no candidate to scan
+            async with self._read() as db:
+                cur = await db.execute(
+                    "SELECT m.id, m.channel_id, m.raw, m.received_at FROM messages m "
+                    "WHERE m.raw <> '' AND m.documents_pruned IS NULL AND m.received_at < ? "
+                    "AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id = m.id "
+                    "AND q.status IN (?, ?))",
+                    (scan_cutoff, *inflight),
+                )
+                rows = list(await cur.fetchall())
+        return await self._apply_document_strips(
+            rows, now, older_than, connection_cutoffs, min_bytes, content_types
+        )
+
+    async def _apply_document_strips(
+        self,
+        rows: Sequence[aiosqlite.Row],
+        now: float,
+        older_than: float,
+        connection_cutoffs: Mapping[str, float] | None,
+        min_bytes: int,
+        content_types: Mapping[str, str],
+    ) -> StripResult:
+        """Codec-transform each candidate row and write back the stripped raw + ``documents_pruned``, in
+        one transaction. The per-connection cutoff is re-checked here (cutoff_for) so a row past the loose
+        scan bound but NOT past its own (tighter / keep-forever) cutoff is left intact."""
+        msgs = 0
+        docs = 0
+        reclaimed = 0
+        updates: list[tuple[str, float, str]] = []
+        for row in rows:
+            cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
+            if row["received_at"] >= cutoff:
+                continue  # not past its own (per-connection) window — skip
+            raw = self._cipher.decrypt(row["raw"])
+            new_raw, n_docs, n_bytes = _strip_documents(
+                raw,
+                pruned_at=now,
+                min_bytes=min_bytes,
+                content_type=content_types.get(row["channel_id"]),
+            )
+            if n_docs == 0:
+                continue  # no embedded document in this body — leave it (and its NULL flag) untouched
+            updates.append((self._cipher.encrypt(new_raw), now, row["id"]))
+            msgs += 1
+            docs += n_docs
+            reclaimed += n_bytes
+        if updates:
+            async with self._lock:
+                try:
+                    await self._db.execute("BEGIN")
+                    await self._db.executemany(
+                        "UPDATE messages SET raw=?, documents_pruned=? WHERE id=?", updates
+                    )
+                    await self._db.commit()
+                except Exception:
+                    await self._db.rollback()
+                    raise
+        return StripResult(
+            messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
+        )
 
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
         # #46: connection events are metadata-only (no body to null, no FK), so they are age-DELETEd on
@@ -4378,28 +5210,42 @@ class MessageStore:
             await self._db.commit()
             return int(cur.rowcount)
 
-    async def purge_dead_letters(self, *, older_than: float, now: float | None = None) -> int:
+    async def purge_dead_letters(
+        self,
+        *,
+        older_than: float,
+        now: float | None = None,
+        connection_cutoffs: Mapping[str, float] | None = None,
+    ) -> int:
         """Null the bodies of dead-lettered **outbound** rows last updated before ``older_than`` —
         their own retention window, separate from :meth:`purge_message_bodies` because a dead row stays
         replayable (re-queueing its stored ``payload``) until purged. Keeps the row + ``dead`` status
         (counts/disposition intact) and blanks ``payload`` + ``last_error``; after this the row can no
         longer be meaningfully replayed (its body is gone — the intended retention trade-off).
-        Idempotent (guards on a non-blank payload); returns the number of dead rows purged."""
+        Idempotent (guards on a non-blank payload); returns the number of dead rows purged.
+
+        ``connection_cutoffs`` (#34, ADR 0027) is an optional ``{destination_name -> cutoff}`` map of
+        per-connection overrides: a dead row is purged at its outbound's own cutoff (``float('-inf')`` =
+        keep forever) instead of the global ``older_than``; an outbound absent from the map falls back to
+        ``older_than``. Default empty ⇒ a single global cutoff, byte-identical to the prior behaviour."""
         now = time.time() if now is None else now
+        cutoff_sql, cutoff_params = _qmark_cutoff_case(
+            "destination_name", older_than, connection_cutoffs
+        )
         async with self._lock:
             try:
                 await self._db.execute("BEGIN")
                 # store-once: release shared bodies these dead rows reference (refcount-/GC/null body_ref)
                 # before blanking, so a shared body outlives its last dead referrer no longer than this.
                 await self._release_outbound_body_refs(
-                    "stage=? AND status=? AND body_ref IS NOT NULL AND updated_at < ?",
-                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, older_than),
+                    f"stage=? AND status=? AND body_ref IS NOT NULL AND updated_at < {cutoff_sql}",
+                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 cur = await self._db.execute(
                     "UPDATE queue SET payload='', last_error=NULL "
                     "WHERE stage=? AND status=? AND (payload <> '' OR last_error IS NOT NULL) "
-                    "AND updated_at < ?",
-                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, older_than),
+                    f"AND updated_at < {cutoff_sql}",
+                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 await self._db.commit()
             except Exception:
@@ -4447,6 +5293,66 @@ class MessageStore:
         async with self._lock:
             await self._db.commit()  # VACUUM cannot run inside a transaction
             await self._db.execute("VACUUM")
+
+    async def snapshot_to(self, dest_path: str | Path, *, method: str = "vacuum_into") -> None:
+        """Write a consistent single-file snapshot of the store to ``dest_path`` for the DR backup
+        (ADR 0049). **Non-mutating + read-only against the staged queue**: it checkpoints the WAL then
+        copies the DB *as it is* — it never claims/mutates/resets/completes/dead-letters a queue row, and
+        never touches the leader lease or audit chain. The result is a single file with no ``-wal``/
+        ``-shm`` sidecars (on restore, the startup ``reset_stale_inflight`` + pure-stage replay recover
+        any in-flight rows — at-least-once spans the restore).
+
+        ``method``:
+
+        * ``"vacuum_into"`` (default) — ``VACUUM INTO`` on the **writer** connection under the store
+          lock (it is a WRITE statement and cannot run on a ``query_only`` read connection). It contends
+          the store write lock for its duration, exactly like :meth:`vacuum`, so the BackupRunner must
+          schedule it OFF-PEAK (mandatory, not advisory). Produces a fresh, fully-checkpointed,
+          defragmented copy.
+        * ``"online_backup"`` — SQLite's Online Backup API (``Connection.backup``), which copies pages
+          incrementally and yields between batches, so it does NOT hold the write lock for the whole
+          copy. The low-contention option for a large/busy store.
+
+        ``VACUUM INTO`` and the Online Backup API both run on the aiosqlite connection's own worker
+        thread (off the event loop). Refuses an existing destination file (a stale ``-wal``/``-shm`` next
+        to it would corrupt the copy) and an in-memory store (nothing to snapshot)."""
+        if self.path == ":memory:":
+            raise ValueError("cannot snapshot an in-memory store (no file to copy)")
+        dest = Path(dest_path)
+        if dest.exists():
+            raise FileExistsError(f"snapshot destination already exists: {dest}")
+        if method not in ("vacuum_into", "online_backup"):
+            raise ValueError(
+                f"unknown snapshot method {method!r}; expected 'vacuum_into' or 'online_backup'"
+            )
+        async with self._lock:
+            # Fold the latest committed WAL frames into the main DB so the snapshot is point-in-time and
+            # the -wal sidecar is empty. Commit first so no open transaction blocks the checkpoint, and
+            # fully drain the PRAGMA's result cursor (an open cursor would leave "SQL statements in
+            # progress" and abort the VACUUM INTO below).
+            await self._db.commit()
+            cur = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            await cur.fetchall()
+            await cur.close()
+            if method == "vacuum_into":
+                # VACUUM INTO is a WRITE statement on the writer connection; it cannot run inside a
+                # transaction or with another statement in progress. Parameter-bound so the path can't
+                # inject. Holds the write lock for its duration (off-peak scheduling is the caller's job).
+                await self._db.commit()
+                await self._db.execute("VACUUM INTO ?", (str(dest),))
+            else:
+                # SQLite Online Backup API: open a fresh destination connection and copy pages into it,
+                # page-batched + yielding, then close it. aiosqlite.Connection.backup runs the underlying
+                # sqlite3 backup on the source connection's worker thread (off the event loop).
+                target = await aiosqlite.connect(str(dest))
+                try:
+                    await self._db.backup(target)
+                finally:
+                    await target.close()
+        # Tighten the snapshot file's permissions: it is a full copy of the (PHI-bearing) store. The
+        # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
+        # plaintext snapshot must not be world-readable either.
+        _secure_file(dest)
 
     async def stats(self) -> dict[str, int]:
         """Outbound-queue depth by status — feeds the monitoring/queue-depth view. Scoped to outbound

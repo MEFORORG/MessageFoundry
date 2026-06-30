@@ -6,6 +6,276 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.11] — 2026-06-29 — Early Access
+
+The **Plan-6 disaster-recovery + cloud/HA wave** — turnkey DR backup/restore-verify and a third-tier DR
+standby, Kubernetes/cloud HA deployment packaging, and a frozen zero-Python Windows console installer —
+alongside the free-threading-keystone built-ins HL7 parser and the first SQLite durable-write group-commit
+lever. All on-prem and code-first; new behavior is opt-in / off-by-default unless noted.
+
+### Added
+- **Turnkey DR backup + restore-verify** (#60, [ADR 0049](docs/adr/0049-turnkey-dr-backup-restore-verify.md)) —
+  an engine-managed scheduled/on-demand backup that bundles the loaded `--config` dir + a consistent SQLite store
+  snapshot into one AES-256-GCM-encrypted `.mfbak` archive (chunked-AEAD, fail-closed on tamper/truncate/reorder,
+  keyed by the existing store DEK — no new key), to an operator-set **local/UNC path (no cloud target)** under
+  keep-N retention. The snapshot runs read-only off the event loop and never touches a staged-queue row; each run
+  restore-verifies the archive (decrypt → `integrity_check` → row-count) and audits a PHI-free `dr_backup` row.
+  New `messagefoundry backup` / `restore-verify` CLI. **Off by default** (`[backup].enabled = false`); SQLite-only
+  (server-DB stores are DBA-delegated, backed up config-only); leader-gated under HA; a keyless PHI instance
+  refuses to write a cleartext archive unless the audited `[backup].allow_unencrypted` escape is set.
+- **Third-tier DR standby** (#61, [ADR 0048](docs/adr/0048-third-tier-disaster-recovery-standby.md)) —
+  a right-sized disaster-recovery box that activates **only** when the whole active-passive HA pair/site (or its
+  shared store) is gone, running a reduced high-priority feed set in an accepted degraded mode. Adds: a
+  per-connection **`priority` tier** (`critical`/`normal`/`low`, `[delivery].priority` default `normal` +
+  per-connection override); a startup **DR run-profile** (`[dr]`) that starts only connections at/above
+  `priority_threshold` (default `critical`), the rest reporting `status:"filtered"`, behind an acquire-VIP-or-abort
+  takeover; and a **cold seed** from #60's encrypted `.mfbak` (restore-verify, local/UNC only). Activation is
+  **manual only** — audited `POST /dr/activate` / `/dr/release` gated by a new `dr:operate` permission;
+  `activation_mode='auto'` is rejected at config load. No `[dr]` section = a no-op, unaffected.
+- **Cloud / Kubernetes HA deployment packaging** (#41, [ADR 0047](docs/adr/0047-cloud-kubernetes-ha-deployment-packaging.md)) —
+  packages the already-shipped active-passive HA into a copyable cloud target. **Packaging + docs only — no engine
+  code changed.** Adds a Postgres-backed multi-replica k8s reference manifest (`docker/k8s/ha-postgres.yaml`:
+  `replicas: 3`, `[cluster].enabled`, a PodDisruptionBudget, `terminationGracePeriodSeconds` > `leader_lease_ttl_seconds`
+  so a drained leader releases its lease before SIGKILL, hardened `securityContext`, secrets via `secretKeyRef`) — no
+  PVC, since durability lives in external Postgres. The default `compose.yaml` stays single-node SQLite; a new `ha`
+  profile runs Postgres + warm standby locally. New `docs/CLOUD-DEPLOYMENT.md` (primary-only L4 NLB MLLP recipe; no
+  L7/HPA for MLLP; SQL Server AG variant) and `docs/CLOUD-PHI-HIPAA.md` (BAA, KMS CMEK layered with the engine's own
+  AES-256-GCM, PrivateLink). Active-passive only; demand-gated.
+- **Frozen zero-Python Windows console installer** (#39, [ADR 0032 Phase B](docs/adr/0032-console-desktop-launch.md)) —
+  the PySide6 admin **console** now ships as a self-contained Windows installer (a PyInstaller `--onedir` freeze
+  wrapped in an Inno Setup `.exe`) with Desktop/Start-Menu shortcuts and an Add/Remove-Programs uninstall entry —
+  **no Python, venv, or `pip install` on the box**. **Per-user / no-elevation by default** (opt-in all-users via
+  `/ALLUSERS`); this packages the **console client only** — the engine NSSM service and the `127.0.0.1:8765` API
+  boundary are unchanged. Frozen from the same wheel the release publishes, by an isolated job that never reds an
+  engine release. **Authenticode signing is gated on an owner-provisioned cert** — until that secret lands the
+  installer ships **unsigned** (SmartScreen "Unknown publisher"). Windows-only; no MSIX/Store, no auto-update.
+- **SQLite app-side group-commit committer** (#64, [ADR 0055](docs/adr/0055-group-commit-durable-write.md)) —
+  an opt-in durable-write lever for the single-writer SQLite backend: a committer coroutine coalesces the grouped
+  staged-queue handoffs into one commit under the writer lock, amortizing fsyncs/msg, while the claim /
+  reference-snapshot / audit writes stay standalone and every staged-queue invariant (count-and-log, at-least-once,
+  FIFO) is preserved. **Off by default** — `[store].group_commit_window_ms = 0.0` builds no committer and is
+  byte-identical to today; set it (with `group_commit_max_batch`, default 64) to enable. The win is largest under
+  `synchronous=FULL` and muted under the default NORMAL. **SQLite only** — the server-DB backends ignore these knobs
+  (native concurrent-pool group-commit is a later increment); the absolute enterprise throughput figure stays
+  pending hardware-matched measurement.
+- **Background store connection-pool pre-warm** (#661) — on graph start/promotion the engine fires a best-effort
+  background task that pre-opens pooled connections on the **server-DB backends** (Postgres / SQL Server), so a
+  connection burst — the post-promotion delivery workers in active-passive HA, or a cold start — finds them warm
+  instead of paying cold connects (TCP+TLS+login). **On by default** via `[store].warm_pool` (+ `warm_pool_timeout`
+  / `warm_pool_target`), capped to ≤ half the pool; a **no-op on SQLite**. Cancellation- and shutdown-safe — it
+  never strands or hangs the engine on a failover to a dead node.
+- **Single project-root config anchoring** (#33-A, [ADR 0050](docs/adr/0050-single-project-root-config-anchoring.md)) —
+  one opt-in `--project-root` (= `[environments].base_dir`) anchors the whole config bundle (the `--config`
+  graph, `environments/<env>.toml`, `messagefoundry.toml`, and `[store].path`) under one root with a single
+  precedence (explicit-absolute > project-root > CWD), so a `serve` launched from a non-repo CWD (the NSSM
+  case) no longer silently reads empty `env()` values or creates the DB in the wrong place. Three PHI-safe
+  startup diagnostics: a hard-fail when an explicit root + an `env()`-referencing graph is missing its
+  `<env>.toml`, a WARNING when CWD differs from the root, and a WARNING for the NSSM silent-miss. The
+  `--project-root` / `--env` / `--service-config` flags are extended to the offline `validate` / `graph` /
+  `dryrun` / `check` subcommands (value resolution only — not `serve`'s required-env / posture refusal), and
+  `check` suppresses its `messagefoundry.toml` upward-walk when those flags are passed.
+
+### Changed
+- **Tolerant HL7 parser re-backed by a low-allocation built-ins model** (#88, [ADR 0054](docs/adr/0054-low-allocation-builtins-hl7-parser.md)) —
+  the hot-path `Peek`/`Message` tolerant tier now parses over native `dict`/`list`/`str` instead of python-hl7, a
+  **behaviour-identical drop-in** (public API, field-path semantics, escape rules, MSH-1/2 raw handling, and
+  `encode()` round-trips all byte-parity-verified against python-hl7 over the golden corpus). MSH parses eagerly,
+  other segments lazily on first field-path touch. **On by default**, with a per-parse python-hl7 fallback kept for
+  this release — a contract `HL7PeekError` still raises and dead-letters, while an unexpected internal error falls
+  back to python-hl7 and is logged, never crashing a connection. The free-threading keystone for
+  [ADR 0053](docs/adr/0053-free-threaded-multicore-engine.md) and a large single-thread parse win; the strict hl7apy
+  `validate()` tier and `parse_tree` / `RawMessage` are untouched. python-hl7 stays a dependency for the fallback
+  window (removal is a follow-up release).
+- **A set project root (`--project-root` or `[environments].base_dir`) now anchors the store DB too, not
+  just `environments/`.** A deployment that runs `serve`/`supervise` with a project root **and** a relative
+  `--db` / `[store].path` (or relies on the default relative `messagefoundry.db`) will now find/create the DB
+  under the root instead of the process CWD — including each shard's `<stem>_<shard>.db`. `--project-root`
+  additionally anchors a relative `--config` / `--service-config` (a file-only `[environments].base_dir`
+  anchors the DB + env values but not those two, since they are resolved before the settings load). This is
+  the intended fix for the split-store footgun, but it **relocates an existing relative DB**: pass an
+  **absolute** `[store].path` / `--db` to keep the DB where it is (absolute paths bypass the root), or accept
+  the new location. Deployments with no project root, or with an absolute DB path, are unaffected. The new
+  CWD-mismatch WARNING surfaces any move at startup.
+
+## [0.2.10] — 2026-06-27 — Early Access
+
+The **Plan-5 "v0.3 candidate" wave** — completing the deferred connector/codec set and the Corepoint
+parity gaps, built across two multisession waves (L1–L9) and adversarially reviewed. All on-prem,
+code-first, no behavior change to existing graphs.
+
+### Added
+- **Inbound HTTP / REST listener** (#7, [ADR 0023](docs/adr/0023-inbound-http-listener.md)) — a
+  connector-owned bound `asyncio` HTTP/1.1 socket **source** in `transports/` (not `api/`), feeding the
+  payload-agnostic ingress (ADR 0004) as a `RawMessage`. ACK-on-receipt (respond-with-receipt **after** the
+  raw is durably committed), with oversize/malformed/slow-loris hardening surfaced as `connection_event`s;
+  new `ConnectorType.HTTP`. The substrate for the future inbound FHIR facade (#20) / DICOMweb receiver (#24).
+  *(SOAP-envelope sync-reply, intake-socket auth, and method/path routing metadata are deferred follow-ons.)*
+- **`fhir_lookup(connection, query)`** (#58, [ADR 0043](docs/adr/0043-fhir-read-lookup.md)) — a Handler-callable,
+  **read-only** FHIR read/search that extends the ADR 0010 `db_lookup` carve-out to FHIR: off the event loop,
+  raises on a Router / in dry-run, reuses the SMART Backend bearer (ADR 0024) + `[egress].allowed_http`, GET-only.
+- **Email / SMTP outbound destination** (#23, [ADR 0029](docs/adr/0029-email-smtp-destination.md)) — a stdlib
+  `Email()`/`SMTP()` connector; STARTTLS-by-default, AUTH-over-TLS-only, a new deny-by-default
+  `[egress].allowed_smtp` arm. (IMAP/POP read + XOAUTH2 is a deferred Phase 2.)
+- **X12 strict implementation-guide validation** via `pyx12` (#32) behind the tolerant `X12Peek`/`X12Message`
+  hot path (`messagefoundry[x12]`; yields 997/999 acks), and a **structured `[xml]` codec layer** (#31) —
+  `XmlMessage` (XPath read/set + ns-aware re-encode) over **hardened lxml** + optional `xmlschema`/`signxml`
+  (`messagefoundry[xml]`; XXE / entity-expansion / external-DTD refused).
+- **Operator alert-state** (#56, [ADR 0044](docs/adr/0044-operator-alert-state.md)) — a new `alert_instance`
+  store table (open / acknowledged / resolved + first/last-seen + count) across all three backends, de-duped on
+  the ADR-0014 throttle key; `GET /alerts/active` + ack/resolve (RBAC `MONITORING_DIAGNOSE`); the per-connection
+  `alerts_active` count is now real; a console Alerts tab. Metadata-only.
+- **User-definable custom RBAC roles** (#57, [ADR 0045](docs/adr/0045-custom-rbac-roles.md)) — an admin-defined
+  named role = a chosen **subset** of the existing Permission catalog (no new permission kinds), persisted via an
+  additive `roles` migration (3 backends), gated by `USERS_MANAGE`; the six built-ins stay; narrowing revokes on
+  live sessions.
+- **Message-content search** (#51, [ADR 0046](docs/adr/0046-message-content-search.md)) — HL7 field-path /
+  raw-content matching by **scan-and-decrypt-per-row** (the store is AES-GCM-encrypted at rest, so a plain `LIKE`
+  is impossible): metadata-pre-filtered, hard row/result caps (truncate-and-tell), decrypt off the event loop,
+  behind `messages:view_*` + **step-up** + a `message_search` audit row that never logs the search needle.
+- **HL7 timestamp helpers on `Message`** (#59) — `age`-from-DOB, length-of-stay, and the tolerant HL7-TS parse
+  surfaced on the `Message` API (reusing `timezone.py`; no duplicate parser).
+- **`messagefoundry support-bundle`** CLI (#49) — a PHI-safe diagnostic zip (no message bodies, no secrets;
+  redacted log tail) — and a **zero-egress version update-check** (#30,
+  [ADR 0026](docs/adr/0026-off-box-egress-update-check.md)): a no-network pinned-vs-current diff surfaced as a
+  `/status` field + an `update_available` alert + a console banner (on by default; `mode=live` rejected at load).
+
+### Changed
+- `[egress]` gains `allowed_smtp` (email); the read-only-lookup carve-out (CLAUDE.md §2/§8) now names
+  `fhir_lookup` alongside `db_lookup`.
+- New connectors/codecs are documented in [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md) and the update-check in
+  [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) (`[update_check]`).
+
+### Security
+- All new live-lookup / search paths stay on-prem and gated: `fhir_lookup` and the update-check are zero-/
+  allow-listed-egress; content search is step-up-gated + audited and never weakens at-rest encryption (the
+  cleartext key-field index was **declined**; a keyed-token index is a deferred 2nd slice). New crypto sites
+  (`transports/http_listener.py` TLS) are registered in the ASVS-11.1.3 crypto inventory.
+
+### Dependencies
+- New optional extras only: `messagefoundry[x12]` (`pyx12`) and `messagefoundry[xml]`
+  (`lxml`/`xmlschema`/`signxml`); the base install is unchanged. Lockfile re-exported.
+
+## [0.2.9] — 2026-06-27 — Early Access
+
+A retention + security-hardening + observability release: per-connection retention and
+embedded-document pruning windows, dual-control config reloads with startup code-attestation,
+operational-health metrics, and a fix for the intermittent Windows listener-teardown / CI hang.
+
+### Added
+- **Per-connection retention windows (ADR 0027).** Optional `messages_days` (inbound) and
+  `dead_letter_days` (outbound) on a connection, layered over the global `[retention]` window and
+  authored on the connection spec or `connections.toml` (the same override idiom as the delivery
+  knobs): `None` inherits the global window, `0` keeps forever. The `RetentionRunner` threads a
+  per-connection cutoff through the body and dead-letter purge on **all three** store backends; the
+  never-purge-an-in-flight-body guard and the single per-pass audit row (now recording the overrides)
+  are unchanged. (#34)
+- **Embedded-document pruning (ADR 0042).** Optional `prune_documents_after` (+ a size threshold)
+  per inbound connection: after the window, bulky **base64 embedded documents** — HL7 **OBX-5 ED**
+  and the generic `mfb64:v1:` carriage — are stripped **in place** to a small size/content-type
+  tombstone (via the parsed model / codec, **never** string-slicing HL7), keeping the rest of the
+  message parseable; the row is never deleted and a `documents_pruned` flag is set. All three
+  backends. (The ingest-time offload variant remains deferred.) (#47)
+- **Dual-control `config:reload` (ADR 0041 D2).** `config_reload` is now a gateable
+  `[approvals].operations` op — a **distinct** second approver must release a live config reload
+  (the requester can never self-approve; both identities land in the hash-chained audit). Opt-in /
+  deny-by-default, so single-operator deployments are unchanged. (#53)
+- **Startup code self-attestation (ADR 0041 D3).** At startup the engine hashes its loaded modules
+  against the wheel's `dist-info/RECORD`; on drift it records a hash-chained, off-box-teed
+  `startup_integrity` audit row and raises an alert (**alert-only by default**; opt-in
+  `[integrity].fail_closed_on_drift` refuses to start). A no-op on an editable (`pip install -e .`)
+  install, so development is never bricked. (#54)
+- **Operational-health metrics.** `GET /status` now meters the app-log directory's disk usage
+  alongside the database, and a per-connection **message-stall** alert rule fires when a connection's
+  oldest-undelivered age crosses a configurable threshold. (#50)
+
+### Changed
+- **Non-editable, hash-locked wheel is the enforced production default (ADR 0017 amendment).** The
+  prior recommendation is now the default for production deployments; editable installs remain a
+  no-op for development. (#54)
+
+### Fixed
+- **Intermittent Windows listener-teardown hang.** `MLLPSource` / `TcpSource` / `X12Source` no longer
+  `await server.wait_closed()` / `writer.wait_closed()` **unbounded** on the Windows Proactor loop
+  during teardown — a wait that never completes can no longer stall a shared event loop (the same
+  class as the resolved py3.11 hang). Added CI guards (a per-test `faulthandler` stack dump and a
+  step-level watchdog) so a future hang fails fast and names itself instead of silently timing out. (#55)
+
+### Docs
+- Refreshed `benchmarks/TUNING-BASELINE.md` with measured multi-process sharding throughput from the
+  Windows Server 2025 box (η ≈ 0.85 speedup shape; per-shard E_core ≈ 42 msg/s — a test-box SQLite
+  floor), plus the still-unmeasured hardware-gated follow-ups (enterprise E_core, the shared-DB
+  commit-wall sweep). (#28, #29)
+- Authored **ADR 0027** (per-connection retention) and **ADR 0042** (embedded-document pruning); added
+  EARS acceptance criteria to **ADR 0041** D2/D3; amended **ADR 0017** for the enforced wheel.
+
+### CI
+- Locked the smoke job's config directory (#603) and skipped a mirror-only Dependabot guardrail test
+  on the OSS mirror (#606), greening `main` CI post-0.2.8.
+
+## [0.2.8] — 2026-06-27 — Early Access
+
+A tooling/ops release: the load harness gains a **multi-shard driver** so one harness can drive a
+`supervise` cluster (unblocking the multi-core throughput measurement), `supervise` resolves
+`--env` files for its shards, and a prominent upgrade note for the config-directory permission
+guard introduced in 0.2.6.
+
+> ### ⚠ Upgrading from ≤ 0.2.5 — tighten config-dir ACLs first
+> The config-directory permission guard (SEC-003 / ADR 0036), added in **0.2.6**, refuses to load a
+> `--config` directory that is **writable by a broad principal** (e.g. `Authenticated Users` /
+> `S-1-5-11`). A deployment whose config dir inherits that write — common under `C:\srv\…` — will
+> **fail to start on first upgrade to ≥ 0.2.6** with *"refusing to load config from writable-by-others
+> path …"*. **Before upgrading**, tighten the directory (elevated):
+> ```powershell
+> icacls "<config-dir>" /inheritance:d /T
+> icacls "<config-dir>" /remove:g *S-1-5-11 /T          # drop Authenticated Users
+> icacls "<config-dir>" /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F /T  # SYSTEM + Admins
+> ```
+> See [`docs/SERVICE.md`](docs/SERVICE.md) → *Update to a new build* and *Lock down the config
+> directory (CONFIG-2)*.
+
+### Added
+- **Multi-shard load driving (`messagefoundry-harness`).** `python -m harness` gains
+  **`--skip-preflight`** (drive shard MLLP ports that no single `--engine` owns) and a repeatable
+  **`--shard-engine <url>`**: the engine poller now takes a list of shard APIs and **sums** each
+  shard's `/stats` (read/written/backlog/in_pipeline/queue_depth/dead) into one cluster sample, so
+  the no-loss reconcile and drain are **cluster-aggregate** — a healthy K-shard run reports pass,
+  not a false "lost on intake". With no `--shard-engine` the behavior is byte-identical to before.
+  Two sample graphs ship for the throughput suite: `harness/config/store_once` (the
+  dedup-triggering one-handler-`list[Send]`-of-identical-body shape for store-once) and
+  `harness/config/passthrough` (an internal `PassThrough()` re-ingress hop); the load graph
+  (`harness/config/load`) is now shard-taggable via `MEFOR_LOAD_SHARD_ADT`/`_RESULTS`/`_OTHER`. (#604)
+
+### Fixed
+- **`supervise --project-root`.** `supervise` now accepts `--project-root` and forwards it to each
+  spawned `serve --shard`, so `supervise --config <dir> --env <env>` resolves each shard's
+  `environments/<env>.toml` (previously the shards resolved nothing from their spawned cwd and
+  required an explicit `--service-config` posture). Backward compatible — no `--project-root` is
+  unchanged. (#602)
+
+## [0.2.7] — 2026-06-27 — Early Access
+
+A docs/packaging release that fixes the broken badge images on the PyPI project page
+and adds a config-check pre-commit hook.
+
+### Fixed
+- **Broken badge images in the PyPI project description.** The CI and Security status
+  badges in the README pointed at the **private** source repo, so they rendered as
+  broken images on the public PyPI page — an anonymous viewer can't fetch a private
+  repo's GitHub Actions badge SVG (it 404s). The README now points at the public
+  mirror (`MEFORORG/MessageFoundry`), and the release build additionally rewrites any
+  remaining `wshallwshall`→`MEFORORG` repo slug in the README before it is embedded as
+  the PyPI `long_description`, so the rendered badges resolve anonymously. (#568)
+
+### Added
+- **`messagefoundry check` pre-commit hook.** A VS Code-extension-generated
+  `.mefor-hooks/pre-commit` runs `messagefoundry check` so a commit can't introduce a
+  broken config (skips cleanly if python or the package isn't importable; bypass with
+  `--no-verify`). (#568)
+
+### Docs
+- Backlog **#47** — base64 embedded-document (attachment) pruning (Mirth
+  attachment-handler / data-pruner parity); and a Changelog link in the README. (#568)
+
 ## [0.2.6] — 2026-06-27 — Early Access
 
 A large release: the **throughput-maximization build** (high-fan-out store-once, multi-process
@@ -275,7 +545,11 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.10...HEAD
+[0.2.10]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.9...v0.2.10
+[0.2.9]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.8...v0.2.9
+[0.2.8]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.7...v0.2.8
+[0.2.7]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.3...v0.2.4

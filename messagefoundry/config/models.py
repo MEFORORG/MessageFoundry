@@ -26,6 +26,9 @@ class ConnectorType(str, Enum):
 
     MLLP = "mllp"
     TCP = "tcp"  # raw TCP with configurable delimiter framing (X12 over TCP, ADR 0003)
+    HTTP = (
+        "http"  # inbound HTTP/1.1 listen source — connector-owned web-service receiver (ADR 0023)
+    )
     FILE = "file"
     REST = "rest"  # generic HTTP destination (ADR 0003)
     DATABASE = "database"  # SQL destination — SQL Server first (ADR 0003)
@@ -38,9 +41,14 @@ class ConnectorType(str, Enum):
     FHIR = "fhir"  # FHIR REST destination — POST/PUT a resource or transaction Bundle to a server (ADR 0022)
     DIMSE = "dimse"  # raw DICOM upper-layer — C-STORE SCP source + C-STORE SCU/C-ECHO destination (ADR 0025)
     DICOMWEB = "dicomweb"  # DICOMweb STOW-RS over HTTP — outbound store/send destination (ADR 0025 Phase 2)
+    EMAIL = (
+        "email"  # SMTP-send outbound email destination — plain-text message via smtplib (ADR 0029)
+    )
     # DATABASE also has an inbound poll source (DatabasePoll, ADR 0003 §3 + 0004); REMOTEFILE is both
-    # source and destination. TIMER is source-only (it generates, never delivers). REST/SOAP sources
-    # (HTTP listeners) and TCP are future. (FHIR is destination-only here; its inbound facade is ADR 0023.)
+    # source and destination. TIMER is source-only (it generates, never delivers). HTTP is the inbound
+    # web-service LISTEN source (ADR 0023) — a connector-owned bound HTTP/1.1 socket, NOT a route in
+    # api/ (that would break the one-way transports/ ↛ api/ rule); REST/SOAP/FHIR/DICOMWEB stay outbound
+    # destinations and the inbound FHIR (#20) / DICOMweb STOW-RS (#24) facades are HTTP-source consumers.
     # DIMSE is the C-STORE SCP source (gated by the TCP egress arm as a raw socket) AND the C-STORE SCU
     # destination; DICOMWEB is the STOW-RS destination (gated by the HTTP egress arm, like REST/SOAP/FHIR).
     # An inbound DICOMweb (STOW-RS) receiver is destination-only here — it awaits the HTTP listener (ADR 0023).
@@ -118,6 +126,31 @@ class OrderingMode(str, Enum):
     UNORDERED = "unordered"
 
 
+class Priority(str, Enum):
+    """Per-connection DR / priority tier (ADR 0048, #61). Governs **when a connection runs** (whether
+    its listener binds / its connector builds in a given run of the engine under a DR run-profile),
+    **never what it does** — routing/filtering stays code-first in Handlers. Layered as the same
+    global-default + per-connection-override idiom proven for ``RetryPolicy`` / ``OrderingMode`` /
+    per-connection retention (#34) / embedded-doc pruning (#47).
+
+    An ``Enum`` is not orderable by default, so the tier carries an **explicit total order** (a backing
+    ``rank``) so a threshold comparison is unambiguous. The total order is ``CRITICAL > NORMAL > LOW``;
+    a DR run-profile starts a connection iff ``resolved.rank >= threshold.rank``. The signal is reusable
+    beyond DR (load-shedding, ordered startup, alert severity), but ADR 0048 only specifies its DR
+    run-profile use.
+    """
+
+    CRITICAL = "critical"
+    NORMAL = "normal"
+    LOW = "low"
+
+    @property
+    def rank(self) -> int:
+        """The tier's place in the total order — higher = more critical. The DR run-profile compares
+        ranks (``resolved.rank >= threshold.rank``) so the threshold semantics are unambiguous."""
+        return {"critical": 2, "normal": 1, "low": 0}[self.value]
+
+
 class InternalErrorPolicy(str, Enum):
     """What an outbound delivery worker does when an **internal/code error** (a non-``DeliveryError``
     exception escaping a connector's ``send`` — our bug, not the partner's) hits a message.
@@ -169,6 +202,21 @@ class BuildupThreshold(BaseModel):
 
     max_depth: int | None = None
     max_oldest_seconds: float | None = 300.0
+
+
+class StallThreshold(BaseModel):
+    """When to raise a ``message_stall`` alert for an outbound lane (Corepoint "Max Message Stall"):
+    the lane's **oldest undelivered message** has been waiting too long. Modeled on
+    :class:`BuildupThreshold` but a single age dimension — it reuses the same oldest-pending age
+    (``delivered_age``) that drives the connections dashboard, not a new metric.
+
+    A lane crosses when its oldest pending message's age reaches ``max_oldest_seconds``. ``None`` (the
+    default) **disables** the stall alert for the connection — deny-by-default/off unless an operator
+    configures a threshold (it overlaps ``queue_buildup``'s age dimension, so it is opt-in to avoid
+    double-paging by default). Resolution mirrors the other per-lane policies: per-connection
+    ``stall=`` override > the ``[delivery]`` global default > built-in (off)."""
+
+    max_oldest_seconds: float | None = None
 
 
 class SignatureAlgorithm(str, Enum):

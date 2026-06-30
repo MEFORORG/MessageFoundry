@@ -26,10 +26,17 @@ On Windows the stdlib has no system tz database, so :mod:`zoneinfo` needs the ``
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-__all__ = ["convert_hl7_timestamp", "to_zone"]
+__all__ = [
+    "convert_hl7_timestamp",
+    "to_zone",
+    "parse_hl7_timestamp",
+    "hl7_now",
+    "age_from_dob",
+    "length_of_stay",
+]
 
 #: HL7 v2 timestamp grammar: a contiguous date/time stem at variable precision (4-, 6-, 8-, 10-, 12-,
 #: or 14-digit: year → seconds), an optional ``.``-prefixed fractional-seconds run, and an optional
@@ -103,6 +110,22 @@ def _parse_hl7_timestamp(ts: str) -> tuple[datetime, str, str | None]:
         microsecond=microsecond,
     )
     return naive, precision, m.group("offset")
+
+
+def parse_hl7_timestamp(ts: str) -> tuple[datetime, str, str | None]:
+    """Public alias for :func:`_parse_hl7_timestamp`.
+
+    Parse an HL7 v2 timestamp (``YYYYMMDD[HHMM[SS[.S+]]][+/-ZZZZ]`` at variable precision) into a
+    naive :class:`datetime`, a precision token (one of ``"year"``/``"month"``/``"day"``/``"hour"``/
+    ``"minute"``/``"second"`` — the longest populated stem field), and the embedded ``±HHMM`` offset
+    (or None). A code-first Router/Handler may call this directly to inspect a timestamp's instant and
+    declared precision without re-implementing the tolerant grammar.
+
+    Raises:
+        ValueError: ``ts`` is malformed (bad grammar, impossible date, a precision gap, or fractional
+            seconds without seconds).
+    """
+    return _parse_hl7_timestamp(ts)
 
 
 def _offset_to_timedelta(offset: str) -> timedelta:
@@ -205,3 +228,131 @@ def _frac_of(ts: str) -> str | None:
     conversion never alters sub-second value, only the offset/wall-clock)."""
     m = _HL7_TS.match(ts.strip())
     return m.group("frac") if m is not None else None
+
+
+# --- derived-value helpers (age / length-of-stay / now) ----------------------
+#
+# These build on the tolerant parser above so a code-first Handler can compute the common derived
+# fields (a patient's age from PID-7, a length-of-stay from PV1-44/PV1-45) without re-implementing HL7
+# timestamp handling. They are pure — no I/O, no wall-clock read unless one is passed in — so they stay
+# safe under the at-least-once re-run invariant; ``hl7_now()`` is the one that reads the clock and is
+# meant for stamping an output, not for a routing decision.
+
+
+def hl7_now(*, precision: str = "second", tz: str | None = None) -> str:
+    """Render the current instant as an HL7 v2 timestamp at ``precision``.
+
+    Args:
+        precision: the lowest field to emit — ``"year"``/``"month"``/``"day"``/``"hour"``/``"minute"``/
+            ``"second"`` (default ``"second"``, the usual MSH-7 form). Higher fields are always
+            included; lower ones are omitted (so ``"day"`` yields ``YYYYMMDD`` with no offset/time).
+        tz: an IANA zone name (e.g. ``"America/Chicago"``) to stamp the local wall-clock + that zone's
+            numeric offset; ``None`` (the default) uses the host's local time **without** an offset
+            suffix (a bare local stamp). An offset is only appended when ``tz`` is given **and**
+            ``precision`` includes a time field (``hour``/``minute``/``second``) — HL7 attaches an
+            offset to a date-only value nonsensically.
+
+    This is the **one** clock-reading helper; keep it out of routing/transform decisions (it would
+    break re-run purity) — use it to stamp a freshly built outbound message.
+
+    Raises:
+        ValueError: ``precision`` is not one of the six field names.
+        zoneinfo.ZoneInfoNotFoundError: ``tz`` is unknown (on Windows, also if ``tzdata`` is missing).
+    """
+    if precision not in ("year", "month", "day", "hour", "minute", "second"):
+        raise ValueError(f"precision must be a stem field name, got {precision!r}")
+    has_time = precision in ("hour", "minute", "second")
+    if tz is not None and has_time:
+        # _render appends the zone's DST-correct numeric offset; only meaningful with a time field.
+        return _render(datetime.now(ZoneInfo(tz)), precision, None)
+    now = datetime.now(ZoneInfo(tz)) if tz is not None else datetime.now()
+    return _stem(now, precision)
+
+
+def _stem(dt: datetime, precision: str) -> str:
+    """The date/time stem of ``dt`` rendered to ``precision`` (no offset). Shared by the local-time
+    ``hl7_now`` path; the zoned path reuses :func:`_render`."""
+    stem = f"{dt.year:04d}"
+    if precision in ("month", "day", "hour", "minute", "second"):
+        stem += f"{dt.month:02d}"
+    if precision in ("day", "hour", "minute", "second"):
+        stem += f"{dt.day:02d}"
+    if precision in ("hour", "minute", "second"):
+        stem += f"{dt.hour:02d}"
+    if precision in ("minute", "second"):
+        stem += f"{dt.minute:02d}"
+    if precision == "second":
+        stem += f"{dt.second:02d}"
+    return stem
+
+
+def age_from_dob(dob_ts: str, asof: str | date | datetime | None = None) -> int:
+    """Whole years between a date of birth and a reference date (default: today, host-local).
+
+    ``dob_ts`` is an HL7 v2 timestamp; only its **date** is used (any time/offset is ignored), and
+    **partial precision is accepted** — a year-only ``"1990"`` or year+month ``"199006"`` DOB is
+    treated as the first of the missing fields (Jan 1 / the 1st), the conservative reading that never
+    over-states age. ``asof`` may be another HL7 timestamp string, a :class:`datetime.date`, or a
+    :class:`datetime.datetime`; ``None`` uses today's local date.
+
+    Returns the age in completed years (the birthday-aware difference — not yet had this year's
+    birthday ⇒ one less).
+
+    Raises:
+        ValueError: ``dob_ts`` is malformed, ``asof`` is a malformed timestamp string, or the
+            resulting age is negative (DOB after the reference date — a data error worth surfacing,
+            not silently clamping).
+    """
+    born = _parse_hl7_timestamp(dob_ts)[0].date()
+    ref = _coerce_date(asof)
+    # Completed-years: subtract the year, then take one off if this year's birthday hasn't passed.
+    years = ref.year - born.year - ((ref.month, ref.day) < (born.month, born.day))
+    if years < 0:
+        raise ValueError(
+            f"date of birth {born.isoformat()} is after the reference date {ref.isoformat()}"
+        )
+    return years
+
+
+def _coerce_date(asof: str | date | datetime | None) -> date:
+    """Resolve the ``asof`` reference into a plain :class:`date` (today's local date when None)."""
+    if asof is None:
+        return datetime.now().date()
+    if isinstance(asof, datetime):
+        return asof.date()
+    if isinstance(asof, date):
+        return asof
+    return _parse_hl7_timestamp(asof)[0].date()
+
+
+def length_of_stay(admit_ts: str, discharge_ts: str) -> timedelta:
+    """The elapsed time between an admit and a discharge HL7 timestamp, as a :class:`timedelta`.
+
+    A :class:`~datetime.timedelta` is returned (not a bare day count) so the caller keeps full
+    resolution and chooses how to express it — ``.days`` for whole inpatient days,
+    ``.total_seconds() / 3600`` for hours, etc. Both timestamps are parsed at whatever precision they
+    carry; if **both** bear an embedded offset the difference is the true elapsed time across any DST/
+    zone change, and if neither does it is the naive wall-clock difference. A **mixed** pair (one
+    offset, one not) is rejected — the elapsed time would be ambiguous.
+
+    Raises:
+        ValueError: either timestamp is malformed, exactly one carries an offset, or the discharge is
+            **before** the admit (a negative stay — a data error, surfaced rather than returned).
+    """
+    admit_dt, _ap, admit_off = _parse_hl7_timestamp(admit_ts)
+    discharge_dt, _dp, discharge_off = _parse_hl7_timestamp(discharge_ts)
+    if (admit_off is None) != (discharge_off is None):
+        raise ValueError(
+            "length_of_stay needs both timestamps with an offset or both without; "
+            f"got admit offset {admit_off!r} and discharge offset {discharge_off!r}"
+        )
+    if admit_off is not None and discharge_off is not None:
+        admit_dt = admit_dt.replace(tzinfo=timezone(_offset_to_timedelta(admit_off)))
+        discharge_dt = discharge_dt.replace(tzinfo=timezone(_offset_to_timedelta(discharge_off)))
+    delta = discharge_dt - admit_dt
+    if delta < timedelta(0):
+        raise ValueError(
+            f"discharge {discharge_ts.strip()!r} is before admit {admit_ts.strip()!r} "
+            "(negative length of stay)"
+        )
+    return delta

@@ -35,6 +35,9 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "MEFOR_LOAD_SINK_HOST",
         "MEFOR_LOAD_SINK_PORT",
         "MEFOR_LOAD_SINK_PORTS",
+        "MEFOR_LOAD_SHARD_ADT",
+        "MEFOR_LOAD_SHARD_RESULTS",
+        "MEFOR_LOAD_SHARD_OTHER",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -47,6 +50,32 @@ def test_graph_loads_and_validates() -> None:
     reg = load_config(_CONFIG)
     reg.validate()
     assert set(reg.inbound) == {"IB_Load_ADT", "IB_Load_Results", "IB_Load_Other"}
+
+
+def test_inbounds_carry_no_shard_by_default() -> None:
+    # Unset MEFOR_LOAD_SHARD_* (the _clean_env default) = no tag = a single implicit shard =
+    # byte-identical to the unsharded graph.
+    reg = load_config(_CONFIG)
+    assert all(reg.inbound[name].shard is None for name in reg.inbound)
+
+
+def test_shard_env_tags_each_hub(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The box's 2-shard layout: ADT on shard "a", results+other on shard "b".
+    monkeypatch.setenv("MEFOR_LOAD_SHARD_ADT", "a")
+    monkeypatch.setenv("MEFOR_LOAD_SHARD_RESULTS", "b")
+    monkeypatch.setenv("MEFOR_LOAD_SHARD_OTHER", "b")
+    reg = load_config(_CONFIG)
+    assert reg.inbound["IB_Load_ADT"].shard == "a"
+    assert reg.inbound["IB_Load_Results"].shard == "b"
+    assert reg.inbound["IB_Load_Other"].shard == "b"
+
+
+def test_blank_shard_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A present-but-blank knob must NOT tag (and must not trip the wiring's blank-shard guard) — it
+    # collapses to None, identical to omitting it.
+    monkeypatch.setenv("MEFOR_LOAD_SHARD_ADT", "   ")
+    reg = load_config(_CONFIG)
+    assert reg.inbound["IB_Load_ADT"].shard is None
 
 
 def test_adt_fans_out_to_fanout_destinations(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -156,7 +185,7 @@ def _load_scan_forbidden() -> object:
 _SF = _load_scan_forbidden()
 _FORBIDDEN_SUBSTRINGS = list(_SF.ESTATE_TOKENS)  # type: ignore[attr-defined]
 _SITE_CODE = _SF.SITE_CODE_RE  # type: ignore[attr-defined]
-_SCANNED_DIRS = ["harness/config/load", "harness/load/profiles"]
+_SCANNED_DIRS = ["harness/config/load", "harness/config/store_once", "harness/load/profiles"]
 _SCANNED_SUFFIXES = {".py", ".toml", ".md"}
 
 

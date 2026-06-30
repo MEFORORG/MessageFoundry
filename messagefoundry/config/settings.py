@@ -35,7 +35,9 @@ from messagefoundry.config.models import (
     BuildupThreshold,
     InternalErrorPolicy,
     OrderingMode,
+    Priority,
     RetryPolicy,
+    StallThreshold,
 )
 from messagefoundry.config.tls_policy import validate_tls_ciphers
 from messagefoundry.logging_setup import LOG_LEVELS
@@ -66,6 +68,10 @@ __all__ = [
     "AlertsSettings",
     "ClusterSettings",
     "ApprovalsSettings",
+    "IntegritySettings",
+    "BackupSettings",
+    "DrSettings",
+    "DrActivationMode",
     "ServiceSettings",
     "load_settings",
 ]
@@ -87,7 +93,10 @@ _SECTIONS = (
     "alerts",
     "cluster",
     "approvals",
+    "integrity",
     "diagnostics",
+    "backup",
+    "dr",
 )
 _ENV_PREFIX = "MEFOR_"
 _DEFAULT_FILE = "messagefoundry.toml"
@@ -174,6 +183,22 @@ class StoreSettings(_Section):
     # --- SQLite (default backend) -------------------------------------------
     path: str = "messagefoundry.db"
     synchronous: SqliteSync = SqliteSync.NORMAL
+    # App-side group-commit (ADR 0055, SQLite only). When > 0, the SQLite store runs a dedicated
+    # committer coroutine that COALESCES the grouped stage-handoff mutations (enqueue_ingress,
+    # route_handoff, transform_handoff, mark_done, complete_with_response, dead_letter_now, mark_failed)
+    # into ONE durable commit, amortizing the per-commit fsync (a large win under synchronous=FULL,
+    # muted under the default NORMAL). A member waits up to this window (milliseconds) for siblings to
+    # join before the batch commits; the claim*/reference-snapshot/audit writes stay STANDALONE (never
+    # grouped — Hazard A / hash-chain). The window is bounded above by `command_timeout`-class latency,
+    # but in practice a few ms is plenty. DEFAULT 0 = DISABLED → byte-identical to the inline-commit
+    # path (no committer coroutine, each method commits as it always has). Off-by-default is mandatory:
+    # this is reliability-core code (ADR 0055). Ignored by the server-DB backends (they use native
+    # commit_delay + concurrent submission, a later increment).
+    group_commit_window_ms: float = 0.0
+    # Flush threshold for the group-commit committer: once this many members are enrolled in the open
+    # batch, it commits immediately without waiting out the rest of `group_commit_window_ms` (bounds
+    # batch size / latency under load). Ignored when group-commit is disabled (window == 0).
+    group_commit_max_batch: int = 64
 
     # --- PHI-at-rest encryption (both backends; STORE-1 / WP-5) -------------
     # Base64 32-byte ACTIVE key; when set, PHI columns (raw bodies + summary/metadata + error/
@@ -250,11 +275,62 @@ class StoreSettings(_Section):
     # set it comfortably larger than expected clock skew + the renew interval.
     lease_ttl_seconds: float = 60.0
 
+    # --- Store connection-pool pre-warm (server-DB backends only; no-op on SQLite) ----------
+    # On graph start/promotion the engine fires a best-effort BACKGROUND task that pre-opens pooled
+    # connections so a connection burst (the post-promotion delivery workers in active-passive HA, or a
+    # cold start) finds them warm instead of paying cold connects (TCP+TLS+login — the dogfood box
+    # measured 340-958 ms ODBC acquires stretching failover recovery). UNLIKE group-commit this is
+    # ON-by-default: it touches no message-handling/commit seam (it only pre-acquires then releases
+    # connections, is bounded, self-releasing, never raises), so the reliability-core off-by-default rule
+    # does not apply — but a connection-constrained/licensed site can set this false to opt out.
+    warm_pool: bool = True
+    # Upper bound (seconds) on the background warm-up; on expiry it logs and continues with a partially
+    # warm pool. Default 15.0 = connect_timeout (a warm acquire IS a connect), comfortably below the
+    # cluster's leader_fence_timeout_seconds (default 20.0) so a warm can't outlive the leadership term
+    # that started it. A clustered server-DB node rejects an EXPLICIT value that violates that bound
+    # (ServiceSettings._warm_pool_timeout_under_fence); the default never breaks a config.
+    warm_pool_timeout: float = 15.0
+    # How many connections to pre-open. None (default) = a safe fraction of the pool
+    # (min(pool_size-1, pool_size//2)) so the warm never pins more than half the pool while the concurrent
+    # startup work (on-promotion recovery, the coordinator heartbeat, the first delivery workers) keeps
+    # slots; an explicit value is clamped to pool_size-1. A pool of 1 is never warmed.
+    warm_pool_target: int | None = None
+
     @field_validator("lease_ttl_seconds")
     @classmethod
     def _positive_lease_ttl(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("lease_ttl_seconds must be > 0")
+        return value
+
+    @field_validator("group_commit_window_ms")
+    @classmethod
+    def _nonneg_group_commit_window(cls, value: float) -> float:
+        # 0 = disabled (the default); a negative window is meaningless and would otherwise enable an
+        # always-flush committer with no coalescing benefit.
+        if value < 0:
+            raise ValueError("group_commit_window_ms must be >= 0 (0 disables group-commit)")
+        return value
+
+    @field_validator("group_commit_max_batch")
+    @classmethod
+    def _positive_group_commit_max_batch(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("group_commit_max_batch must be > 0")
+        return value
+
+    @field_validator("warm_pool_timeout")
+    @classmethod
+    def _positive_warm_pool_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("warm_pool_timeout must be > 0")
+        return value
+
+    @field_validator("warm_pool_target")
+    @classmethod
+    def _positive_warm_pool_target(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("warm_pool_target must be > 0 (or unset for the pool-size default)")
         return value
 
     @field_validator("server", "database", "username", "application_name")
@@ -451,6 +527,16 @@ class DeliverySettings(_Section):
     # sync); buildup_max_depth unset = depth dimension off; per-connection buildup= overrides.
     buildup_max_depth: int | None = None
     buildup_max_oldest_seconds: float | None = 300.0
+    # message_stall alert threshold (Corepoint "Max Message Stall") for every outbound. Mirror
+    # StallThreshold (a test guards the sync); None (the default) = the stall alert is OFF — deny-by-
+    # default, opt-in because it overlaps queue_buildup's age dimension. Per-connection stall= overrides.
+    stall_max_oldest_seconds: float | None = None
+    # Global DR / priority tier default for every connection (#61, ADR 0048). A connection that declares
+    # no priority= of its own inherits this (resolution order: per-connection override > [delivery]
+    # global default > built-in NORMAL); the DR run-profile then starts only connections whose resolved
+    # tier rank >= [dr].priority_threshold rank. NORMAL keeps every connection at the same tier by default
+    # (so a deployment that never enables DR is byte-unchanged). An unknown value fails config load.
+    priority: Priority = Priority.NORMAL
 
     def retry_policy(self) -> RetryPolicy:
         """The global default :class:`RetryPolicy` an outbound inherits when it sets none."""
@@ -467,6 +553,11 @@ class DeliverySettings(_Section):
             max_depth=self.buildup_max_depth,
             max_oldest_seconds=self.buildup_max_oldest_seconds,
         )
+
+    def stall_threshold(self) -> StallThreshold:
+        """The global default :class:`StallThreshold` an outbound inherits when it sets none (#50,
+        Corepoint "Max Message Stall"). ``None`` keeps the stall alert off by default."""
+        return StallThreshold(max_oldest_seconds=self.stall_max_oldest_seconds)
 
 
 class PipelineSettings(_Section):
@@ -542,6 +633,12 @@ class LoggingSettings(_Section):
     # stdout rendering: "text" (default, unchanged) or "json" (one JSON object per line, friendlier to
     # a log shipper tailing NSSM's captured stdout).
     format: LogFormat = LogFormat.TEXT
+    # Optional directory NSSM (or another supervisor) rotates the engine's captured stdout/stderr into.
+    # We never write log FILES ourselves (the engine logs to stdout — see logging_setup), but if an
+    # operator tells us where the supervisor parks them, GET /status meters that directory's total bytes
+    # + filesystem free space alongside the DB metrics (#50). None (the default) = stdout-only, no
+    # metering. Metadata only — the contents are never read.
+    log_dir: str | None = None
 
     # --- Off-box forwarding to a syslog/SIEM collector (ASVS 16.x) ----------
     # Ship a copy of every log record to a remote syslog collector so log evidence survives a host
@@ -965,6 +1062,8 @@ class EgressSettings(_Section):
     # Allowed REMOTEFILE (SFTP/FTP/FTPS) hosts — gates the connector in BOTH directions (the source
     # dials out to poll, the destination dials out to upload). Each entry is "host" or "host:port".
     allowed_remote: list[str] = []
+    # Allowed EMAIL (SMTP) outbound hosts: each entry is "host" (any port) or "host:port" (ADR 0029).
+    allowed_smtp: list[str] = []
 
     # Opt-in deny-by-default (Q5b): when true, a transport with an EMPTY allowlist refuses every
     # destination of that type instead of allowing any. A global on-ramp to fail-closed egress without
@@ -979,6 +1078,7 @@ class EgressSettings(_Section):
         "allowed_http",
         "allowed_db",
         "allowed_remote",
+        "allowed_smtp",
         mode="before",
     )
     @classmethod
@@ -1020,6 +1120,10 @@ _ALERT_EVENT_TYPES = frozenset(
         "storage_threshold",
         "cert_expiry",
         "connection_error",  # #46: an outbound lane went down (connection_lost), throttled per lane
+        "message_stall",  # #50: an outbound lane's oldest undelivered message aged past the threshold
+        "integrity_drift",  # #54: startup attestation found in-place-tampered engine module(s)
+        "update_available",  # #30: a newer MessageFoundry version is pinned than is running (ADR 0026)
+        "backup_failed",  # #60 (ADR 0049): a scheduled/on-demand DR backup failed (snapshot/encrypt/verify)
     }
 )
 #: The transport names a rule may route to; mirror ``AlertTransport.name``.
@@ -1035,12 +1139,12 @@ class AlertRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # --- match (all conditions must hold) ---
-    event_type: str = "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry | connection_error
+    event_type: str = "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry | connection_error | message_stall | integrity_drift | update_available | backup_failed
     connection: str = "*"  # fnmatch glob over the connection name; "*" = all
     min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
     min_oldest_seconds: float | None = Field(
         None, ge=0
-    )  # queue_buildup: …or oldest-message age (s)
+    )  # queue_buildup/message_stall: …or oldest-message age (s)
     # --- outcome ---
     severity: AlertSeverity = AlertSeverity.WARNING
     transports: list[str] | None = (
@@ -1244,9 +1348,85 @@ class CertMonitorSettings(_Section):
         return v
 
 
+class UpdateCheckSettings(_Section):
+    """Engine-side version-update check (``[update_check]``, ADR 0026 §3). The MVP is a **no-network**
+    "pinned-vs-current" diff: it compares the running :data:`messagefoundry.__version__` against the
+    version recorded in the installed distribution metadata (``importlib.metadata``) / the bundled
+    ``requirements.lock`` — **zero outbound traffic**. The result is surfaced as one additive
+    ``/status`` field and (optionally) one ``update_available`` AlertSink event.
+
+    The no-network local diff is cheap and PHI-safe, so it is **on by default**; set ``enabled=false``
+    to suppress the ``/status`` field + the alert entirely. ``mode`` is clamped to ``"local"`` — the
+    ``"live"`` egress path (ADR 0026 §2) is **defined but rejected at load** so a config can never
+    silently turn the check into a phone-home. ``index_*`` are forward-compat, accepted-but-unused."""
+
+    enabled: bool = True
+    check_interval_seconds: float = 86_400.0  # diff cadence (the diff is trivial; daily is ample)
+    mode: str = "local"  # "local" (no-network diff, the only MVP value); "live" rejected at load
+    # Forward-compat (§2 live mode only); accepted-but-unused in the MVP — like AiSettings' broker keys.
+    index_url: str | None = None
+    index_allowed_hosts: list[str] = Field(default_factory=list)
+
+    @field_validator("check_interval_seconds")
+    @classmethod
+    def _check_interval(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("update_check.check_interval_seconds must be > 0")
+        return v
+
+    @field_validator("mode")
+    @classmethod
+    def _check_mode(cls, v: str) -> str:
+        # ADR 0026 §3: "live" is DEFINED but rejected-at-load until the §2 constrained-egress envelope is
+        # built, so the value can never silently become a phone-home out of a PHI system.
+        if v == "live":
+            raise ValueError(
+                "update_check.mode='live' is not implemented — the live egress update-check (ADR 0026 "
+                "§2) is deferred; use mode='local' (the no-network pinned-vs-current diff)"
+            )
+        if v != "local":
+            raise ValueError(f"update_check.mode must be 'local'; got {v!r}")
+        return v
+
+
 #: The high-value operations dual-control can gate (registry keys). Confining ``[approvals].operations``
 #: to this set catches a typo'd op name at startup rather than silently never gating it.
-APPROVABLE_OPERATIONS: frozenset[str] = frozenset({"dead_letter_replay", "connection_purge"})
+#: ``config_reload`` (ADR 0041 D2) is the broadest-blast-radius runtime action — one re-authenticated
+#: person reloads the entire live graph (the loader EXECUTES config Python) — so it is gateable; it is
+#: NOT in the default ``operations`` set below, so single-operator deployments stay byte-unchanged until
+#: an operator opts it in (deny-by-default, pairs with the ADR 0041 D1 reload fingerprint).
+APPROVABLE_OPERATIONS: frozenset[str] = frozenset(
+    {"dead_letter_replay", "connection_purge", "config_reload"}
+)
+
+#: The subset enabled by DEFAULT when ``[approvals].enabled`` is true. ``config_reload`` is deliberately
+#: excluded (opt-in) so turning dual-control on for replay/purge does not also start holding every
+#: reload — an operator must add ``config_reload`` to ``[approvals].operations`` explicitly.
+_DEFAULT_APPROVABLE_OPERATIONS: frozenset[str] = frozenset(
+    {"dead_letter_replay", "connection_purge"}
+)
+
+
+class IntegritySettings(_Section):
+    """``[integrity]`` — startup self-attestation of the installed engine wheel (ADR 0041 D3).
+
+    At startup (and on demand) the engine hashes its loaded ``messagefoundry`` module files against the
+    installed wheel's ``*.dist-info/RECORD`` baseline; on drift it writes a hash-chained
+    ``startup_integrity`` audit row + fires the AlertSink. Both keys default safe: attestation is **on**
+    but **alert-only** (it never blocks startup), so an existing deployment is unchanged. An EDITABLE
+    install (``pip install -e .`` — no RECORD baseline) is a NO-OP regardless, so dev is never bricked
+    (see messagefoundry/integrity.py)."""
+
+    # Run startup attestation at all. On by default (alert-only is harmless); a no-op off an editable
+    # install. Set false only to suppress the check entirely (e.g. an unusual packaging where RECORD is
+    # known-stale) — you then lose the in-place-tamper tripwire.
+    enabled: bool = True
+    # When true, drift (a loaded engine module not matching its RECORD hash) makes serve REFUSE to start
+    # (after recording the audit row + alerting). Default false = alert-only: a legitimate reviewed
+    # in-place security hotfix (the documented vendored-parser patch contingency) would itself trip a
+    # RECORD mismatch, so fail-closed-by-default would brick a legitimate patch. Opt in for hard
+    # enforcement on a locked-down instance.
+    fail_closed_on_drift: bool = False
 
 
 class ApprovalsSettings(_Section):
@@ -1257,7 +1437,7 @@ class ApprovalsSettings(_Section):
     ``expiry_hours`` can no longer be approved."""
 
     enabled: bool = False
-    operations: list[str] = Field(default_factory=lambda: sorted(APPROVABLE_OPERATIONS))
+    operations: list[str] = Field(default_factory=lambda: sorted(_DEFAULT_APPROVABLE_OPERATIONS))
     expiry_hours: float = (
         72.0  # a pending request expires this many hours after it's made (0 = never)
     )
@@ -1281,6 +1461,221 @@ class ApprovalsSettings(_Section):
         return v
 
 
+#: The two snapshot mechanisms for the SQLite store backup (ADR 0049). ``vacuum_into`` (default) writes
+#: a fresh, fully-checkpointed, defragmented single-file copy under the store write lock — mandatory
+#: off-peak. ``online_backup`` uses SQLite's page-batched Online Backup API (low-contention) for a
+#: large/busy store.
+_SNAPSHOT_METHODS = frozenset({"vacuum_into", "online_backup"})
+
+#: Cloud-URL schemes the destination must NEVER be (ADR 0049 — local/UNC only, no new egress surface).
+_CLOUD_DEST_SCHEMES = ("s3://", "gs://", "gcs://", "azure://", "http://", "https://", "ftp://")
+
+
+class BackupSettings(_Section):
+    """``[backup]`` — engine-managed scheduled + on-demand DR backup of the config bundle + the SQLite
+    store, written as one AES-256-GCM ``.mfbak`` archive to a local/UNC destination (ADR 0049, #60).
+
+    **Opt-in:** ``enabled = false`` (the default) is a complete no-op — a deployment with no ``[backup]``
+    is unaffected. When enabled the :class:`~messagefoundry.pipeline.dr_backup.BackupRunner` (leader-gated,
+    daily-clock like the RetentionRunner) takes a **consistent SQLite snapshot** (read-only against the
+    live store — never claims/mutates a staged-queue row), bundles the loaded ``--config`` dir, encrypts
+    to ``.mfbak`` under the existing store DEK (ADR 0019 KeyProvider), applies keep-N retention, runs a
+    lightweight restore-verify (open + integrity_check + row-count), and records one PHI-free
+    ``dr_backup`` audit row. **No cloud target** (local/UNC only — no new egress). For a server-DB store
+    (postgres/sqlserver) the store backup is **DBA-delegated** (#52): config-only or skip per
+    ``config_only_on_server_db``."""
+
+    # Opt-in master switch; a deployment with no [backup] is unaffected (no-op default).
+    enabled: bool = False
+    # Operator-set LOCAL or UNC destination path, e.g. "D:/mefor-backups" or r"\\nas\mefor\backups".
+    # REQUIRED (non-empty) when enabled. A cloud URL (s3://, https://, ...) is REJECTED — no cloud target.
+    destination: str = ""
+    # Daily local "HH:MM" at which the scheduled backup runs (reusing the RetentionSettings clock parser).
+    # "" = on-demand only (the `messagefoundry backup` CLI), no scheduled pass.
+    schedule_at: str = "02:00"
+    # keep-N: after a successful, verified new archive, prune the oldest archives beyond the newest N at
+    # the destination. 0 = keep all (never prune). A verify-FAILED archive is never counted as a good
+    # backup when pruning (so a failing run can't evict the last good one).
+    retention_keep: int = 7
+    # "vacuum_into" (default; writer-lock under the off-peak schedule) | "online_backup" (low-contention,
+    # page-batched). See ADR 0049 §"New store surface".
+    snapshot_method: str = "vacuum_into"
+    # Bundle the loaded --config dir into the archive (so the cold seed is self-sufficient — store + the
+    # config that interprets it — without assuming the DR box can reach the org git repo, ADR 0048).
+    include_config: bool = True
+    # Run the lightweight restore-verify after every backup (open + integrity_check + row-count). On by
+    # default — a backup nobody has opened is a backup that silently doesn't restore.
+    verify_after_backup: bool = True
+    # The heavier full restore-verify (restore the snapshot to a throwaway temp DB and open it through the
+    # real open_store path). On-demand / opt-in extra; off by default (it is not the per-backup default).
+    full_restore_verify: bool = False
+    # On a server-DB store (postgres/sqlserver) the DB backup is DBA-delegated (#52); back up the config
+    # bundle ONLY. False = skip the backup entirely on a server-DB store (no config-only archive either).
+    config_only_on_server_db: bool = True
+    # Audited escape: permit a CLEARTEXT archive ONLY for a no-key synthetic instance (parallel to
+    # [store].allow_unencrypted_phi). A PHI instance with no key still REFUSES to write an unencrypted
+    # archive (fail-closed) regardless of this flag — see the BackupRunner's key check.
+    allow_unencrypted: bool = False
+
+    @field_validator("schedule_at")
+    @classmethod
+    def _valid_schedule(cls, value: str) -> str:
+        # Reuse the RetentionSettings clock parser so [backup].schedule_at and [retention].vacuum_at
+        # accept exactly the same "HH:MM" grammar (empty = on-demand only).
+        value = value.strip()
+        if value and RetentionSettings._parse_clock(value) is None:
+            raise ValueError(f"[backup].schedule_at must be empty or 'HH:MM' (24h), got {value!r}")
+        return value
+
+    @field_validator("retention_keep")
+    @classmethod
+    def _non_negative_keep(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("[backup].retention_keep must be >= 0 (0 = keep all)")
+        return value
+
+    @field_validator("snapshot_method")
+    @classmethod
+    def _known_snapshot_method(cls, value: str) -> str:
+        if value not in _SNAPSHOT_METHODS:
+            raise ValueError(
+                f"[backup].snapshot_method must be one of {sorted(_SNAPSHOT_METHODS)}, got {value!r}"
+            )
+        return value
+
+    @field_validator("destination")
+    @classmethod
+    def _no_cloud_destination(cls, value: str) -> str:
+        # No cloud target / no new egress surface (ADR 0049, owner-locked). Reject a cloud-URL destination
+        # at config load rather than silently treating it as a (bogus) local path at 02:00.
+        low = value.strip().lower()
+        if low and any(low.startswith(scheme) for scheme in _CLOUD_DEST_SCHEMES):
+            raise ValueError(
+                f"[backup].destination must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
+                "MessageFoundry DR backups have no cloud target (ADR 0049 — no new egress)"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _require_destination_when_enabled(self) -> "BackupSettings":
+        # A backup with nowhere to write is a misconfiguration; fail loud at config load, not at 02:00.
+        if self.enabled and not self.destination.strip():
+            raise ValueError(
+                "[backup].enabled=true requires a non-empty [backup].destination (a LOCAL or UNC path)"
+            )
+        return self
+
+    def schedule_time(self) -> tuple[int, int] | None:
+        """The configured daily backup time as ``(hour, minute)`` local, or ``None`` for on-demand only."""
+        return RetentionSettings._parse_clock(self.schedule_at) if self.schedule_at else None
+
+
+class DrActivationMode(str, Enum):
+    """How a third-tier DR standby box takes over (ADR 0048, #61). ``MANUAL`` is the **only** mode built
+    in this slice — the DR box promotes only on the explicit, RBAC-gated ``POST /dr/activate`` operator
+    action; no health-probe ever activates it. ``AUTO`` (the DR box detects HA-pair loss and self-promotes)
+    is a **deferred future mode**: it is named so a forward-looking config is explicit, but config load
+    **rejects** it with a clear "not yet supported" error until that mode lands — never a silent no-op."""
+
+    MANUAL = "manual"
+    AUTO = "auto"
+
+
+class DrSettings(_Section):
+    """``[dr]`` — third-tier disaster-recovery standby (ADR 0048, #61).
+
+    A **right-sized DR box** that activates only when the whole HA pair / site is gone and runs **only
+    the high-priority feeds** in a deliberately degraded mode — the inverse of the dropped active-active
+    scale-out (this runs *less*, not more). **Opt-in:** ``enabled = false`` (the default) is a complete
+    no-op; a deployment with no ``[dr]`` is byte-unchanged.
+
+    The engine owns two halves: the **per-connection priority tier** (``[delivery].priority`` +
+    per-connection ``priority=``) and the **selective-startup DR run-profile** here. On activation it
+    cold-seeds the store from a #60 ``.mfbak`` backup (fail-closed if the KeyProvider/DEK is unavailable
+    at the DR site), starts only connections whose resolved tier rank >= ``priority_threshold`` (the rest
+    report ``status:"filtered"``), and is fenced by **acquire-VIP-or-abort** (the passive ADR-0047 LB is
+    the fence; ``takeover_hook`` is optional belt-and-braces for non-LB topologies). **Activation is
+    MANUAL** (``POST /dr/activate``, gated by the ``dr:operate`` permission); ``auto`` is rejected at load.
+
+    ``enabled``/``activate`` are read at engine start (the DR run-profile is a startup decision, ADR
+    0048); a deployment is either a DR box (``enabled = true``) or it is not. ``activate = true`` (or
+    the operator endpoint) declares this box should run under the DR profile this boot.
+    """
+
+    # Opt-in master switch: is this deployment a DR standby box at all? false = the engine runs the
+    # NORMAL run-profile (every connection starts subject only to ADR 0031), byte-unchanged.
+    enabled: bool = False
+    # Whether this DR box should come up UNDER the DR run-profile on this boot (the startup activation
+    # latch — distinct from the runtime POST /dr/activate endpoint, which re-evaluates the graph). When
+    # enabled but activate=false the box is provisioned-but-passive: it does NOT bind the priority feeds
+    # until an operator activates it. A no-op unless enabled.
+    activate: bool = False
+    activation_mode: DrActivationMode = DrActivationMode.MANUAL
+    # The DR run-profile threshold: start ONLY connections whose resolved priority rank >= this tier's
+    # rank. CRITICAL (the default, owner-locked) starts only the critical feeds; NORMAL would also start
+    # normal-tier feeds. A below-threshold connection reports status:"filtered" (distinct from ADR 0031's
+    # "failed"). An unknown value fails config load.
+    priority_threshold: Priority = Priority.CRITICAL
+    # acquire-VIP-or-abort (ADR 0048): an OPTIONAL operator command run before binding the priority
+    # listeners — exit 0 / success = "VIP acquired", any non-zero / timeout = "not acquired" (activation
+    # ABORTS). For an ADR-0047 LB topology the passive LB is the fence and this is belt-and-braces only;
+    # "" (the default) = no hook (rely on the passive LB). Whitespace-only is rejected at load.
+    takeover_hook: str = ""
+    # The symmetric release command run on POST /dr/release (release the VIP back to the recovered
+    # primary). "" = no hook. Whitespace-only is rejected at load.
+    release_hook: str = ""
+    # Bound (seconds) on the takeover/release hook AND on the KeyProvider-reachability check at the DR
+    # site: a hook or key probe that does not succeed within this aborts activation closed (no hang, no
+    # silent retry-forever — ADR 0048 AC-14). Must be > 0.
+    takeover_timeout_seconds: float = 30.0
+    # The #60 .mfbak backup archive to cold-seed the DR store from on activation. "" = the operator
+    # supplies the archive path in the POST /dr/activate request body instead (the runbook path). A
+    # cloud URL is rejected (the seed is local/UNC only, like the backup destination — no new egress).
+    seed_archive: str = ""
+
+    @field_validator("takeover_hook", "release_hook")
+    @classmethod
+    def _hook_not_blank(cls, value: str) -> str:
+        # "" disables the hook; a present-but-whitespace-only command is a config footgun (it would run
+        # an empty shell and "succeed") — fail loud at load, mirroring InboundConnection.bind_address.
+        if value and not value.strip():
+            raise ValueError(
+                "[dr] takeover_hook/release_hook must be a non-blank command (or omit it)"
+            )
+        return value
+
+    @field_validator("takeover_timeout_seconds")
+    @classmethod
+    def _positive_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("[dr].takeover_timeout_seconds must be > 0")
+        return value
+
+    @field_validator("seed_archive")
+    @classmethod
+    def _no_cloud_seed(cls, value: str) -> str:
+        low = value.strip().lower()
+        if low and any(low.startswith(scheme) for scheme in _CLOUD_DEST_SCHEMES):
+            raise ValueError(
+                f"[dr].seed_archive must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
+                "the DR cold seed has no cloud source (ADR 0048 — no new egress)"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _reject_auto_mode(self) -> "DrSettings":
+        # ADR 0048: auto-probe activation is a DEFERRED future mode — config rejects it with a clear
+        # "not yet supported" error (never a silent no-op / fallback to manual), so a config can never
+        # quietly believe it has automatic site failover that this slice does not build.
+        if self.activation_mode is DrActivationMode.AUTO:
+            raise ValueError(
+                "[dr].activation_mode='auto' is not yet supported — automatic HA-pair-loss detection "
+                "and self-promotion are deferred to a future ADR (ADR 0048); use activation_mode='manual' "
+                "(the default) and the RBAC-gated POST /dr/activate operator action"
+            )
+        return self
+
+
 class ServiceSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")  # tolerate forward-looking/unknown sections
 
@@ -1300,8 +1695,12 @@ class ServiceSettings(BaseModel):
     shadow: ShadowSettings = Field(default_factory=ShadowSettings)
     alerts: AlertsSettings = Field(default_factory=AlertsSettings)
     cert_monitor: CertMonitorSettings = Field(default_factory=CertMonitorSettings)
+    update_check: UpdateCheckSettings = Field(default_factory=UpdateCheckSettings)
     cluster: ClusterSettings = Field(default_factory=ClusterSettings)
     approvals: ApprovalsSettings = Field(default_factory=ApprovalsSettings)
+    integrity: IntegritySettings = Field(default_factory=IntegritySettings)
+    backup: BackupSettings = Field(default_factory=BackupSettings)
+    dr: DrSettings = Field(default_factory=DrSettings)
 
     @model_validator(mode="after")
     def _cluster_requires_server_db(self) -> "ServiceSettings":
@@ -1331,6 +1730,32 @@ class ServiceSettings(BaseModel):
                     "workers) against the pool, so a pool of 1 would serialize everything — prefer "
                     "pool_size >= 3 for a clustered node (Postgres or SQL Server)"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _warm_pool_timeout_under_fence(self) -> "ServiceSettings":
+        """A pool warm-up should finish within the leadership term that started it, so a clustered
+        server-DB node rejects an **explicit** ``[store].warm_pool_timeout >= [cluster].
+        leader_fence_timeout_seconds``. Only an explicitly-set value is rejected: a slow warm past the
+        fence is benign by construction (it self-releases, a re-promotion cancels it, and a demoted node
+        only ever holds its OWN pool's idle connections — never the incoming leader's separate pool), so
+        the default must not break an otherwise-valid config that merely lowered the fence. Spans two
+        sections, so it lives here; SQLite warms nothing and single-node has no fence, so both are
+        exempt."""
+        if (
+            self.cluster.enabled
+            and self.store.warm_pool
+            and self.store.backend in (StoreBackend.POSTGRES, StoreBackend.SQLSERVER)
+            and "warm_pool_timeout" in self.store.model_fields_set
+            and self.store.warm_pool_timeout >= self.cluster.leader_fence_timeout_seconds
+        ):
+            raise ValueError(
+                "[store].warm_pool_timeout must be < [cluster].leader_fence_timeout_seconds "
+                f"(got warm_pool_timeout={self.store.warm_pool_timeout}, "
+                f"leader_fence_timeout_seconds={self.cluster.leader_fence_timeout_seconds}); a pool "
+                "warm-up must finish within the leadership term that started it. Lower warm_pool_timeout, "
+                "or set [store].warm_pool=false to opt out."
+            )
         return self
 
 

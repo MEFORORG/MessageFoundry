@@ -86,13 +86,27 @@ def run_checks(
     *,
     messages_dir: str | Path | None = None,
     run_lint: bool = True,
+    service_config: str | Path | None = None,
+    suppress_service_toml_search: bool = False,
 ) -> CheckReport:
     """Run the gate against ``config_dir``; ``messages_dir`` enables the dry-run check when it has
-    fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass."""
+    fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass.
+
+    ``service_config`` / ``suppress_service_toml_search`` plumb the ADR 0050 anchor (AC-6): an explicit
+    ``messagefoundry.toml`` path (from ``--service-config``, resolved under ``--project-root``) is used
+    directly for the posture check, and ``suppress_service_toml_search`` (set when ``--project-root`` is
+    given) suppresses the legacy upward-walk so ``check`` matches ``serve``'s resolution. With both
+    defaulted (today's ``messagefoundry check --config config``), the upward-walk is preserved — no
+    regression.
+    """
     results = [
         _check_validate(config_dir),
         _check_dryrun(config_dir, messages_dir),
-        _check_posture(config_dir),
+        _check_posture(
+            config_dir,
+            service_config=service_config,
+            suppress_search=suppress_service_toml_search,
+        ),
     ]
     if run_lint:
         results.append(_run_tool("ruff", ["ruff", "check", str(config_dir)]))
@@ -293,10 +307,20 @@ def _find_service_toml(config_dir: str | Path) -> Path | None:
     return None
 
 
-def _check_posture(config_dir: str | Path) -> CheckResult:
+def _check_posture(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
     """Catch the ADR-0017 foot-gun at commit/CI time: a CUSTOM active-environment name (not
     dev/staging/prod) with no explicit ``[ai].data_class`` / ``[ai].production`` makes ``serve`` fail
     closed at runtime (``settings.ai.require_posture()``). Mirror that fail-closed check here.
+
+    Service-toml resolution (ADR 0050 AC-6): an explicit ``service_config`` is used as-is; otherwise,
+    when ``suppress_search`` is set (``--project-root`` was given) the upward-walk is skipped — so
+    ``check`` matches ``serve`` only when the flags are given. With neither, the legacy
+    ``_find_service_toml`` upward-walk runs, unchanged.
 
     Best-effort: no ``messagefoundry.toml`` → SKIP (this gate also runs against a bare config dir).
     No active environment set → SKIP (``serve`` reports that separately; not this check's concern).
@@ -305,7 +329,14 @@ def _check_posture(config_dir: str | Path) -> CheckResult:
 
     from messagefoundry.config.settings import load_settings
 
-    toml = _find_service_toml(config_dir)
+    if service_config is not None:
+        toml: Path | None = Path(service_config) if Path(service_config).is_file() else None
+    elif suppress_search:
+        # --project-root given but no --service-config: anchor at the root, don't walk up (AC-6).
+        candidate = Path(config_dir) / "messagefoundry.toml"
+        toml = candidate if candidate.is_file() else None
+    else:
+        toml = _find_service_toml(config_dir)
     if toml is None:
         return CheckResult(
             "posture", ok=True, required=True, skipped=True, detail="no messagefoundry.toml"

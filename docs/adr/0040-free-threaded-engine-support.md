@@ -1,11 +1,14 @@
 # 0040 — Free-threaded (no-GIL / cp314t) engine support (L6) — evaluated, not adopted now
 
-- **Status:** **Rejected for now (declined-by-design, 2026-06-27)** — *evaluated and not adopted*. This
-  is a deliberate **deferral with a revisit gate**, not a permanent close: the GIL build stays the
-  shipped, supported interpreter; L3 sharding (ADR 0037) remains the recommended multi-core path. The
-  only thing built is a **weekly, non-blocking cp314t CI canary** (an early-warning signal). Revisit
-  **only** if a measured load comparison on the harness shows free-threading wins on our workload.
-  Assessment landed in PR #589.
+- **Status:** **Superseded by [0053](0053-free-threaded-multicore-engine.md)** (2026-06-29). The enterprise
+  unified-store scale commitment ([0052](0052-enterprise-scale-target.md)) plus the early-phase timing
+  argument reverse this decline: free-threading is now the **committed path** (feasibility-spike-gated; ADR
+  0037 sharding + cross-shard observability as the fallback). The assessment in this ADR (the compiled-wheel
+  readiness survey + the GIL-correctness audit) remains **valid input** to 0053 — only the *conclusion* is
+  superseded.
+  *Original decision (history, 2026-06-27, PR #589): **Rejected for now / declined-by-design** — evaluated
+  and not adopted; the GIL build stays the shipped interpreter, L3 sharding (ADR 0037) the recommended
+  multi-core path, with a weekly non-blocking cp314t CI canary; revisit only on a measured harness win.*
 - **Date:** 2026-06-27
 - **Related:** [docs/design/freethread.md](../design/freethread.md) (full assessment) · ADR 0037 (L3
   multi-process sharding — the across-processes alternative this is weighed against) ·

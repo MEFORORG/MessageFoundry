@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
@@ -32,6 +33,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     HTTPException,
@@ -47,6 +49,8 @@ from messagefoundry import __version__
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
 from messagefoundry.api.models import (
     AiPolicy,
+    AlertInstanceInfo,
+    AlertInstanceList,
     AlertRuleInfo,
     AlertsConfig,
     ApprovalDecisionResult,
@@ -65,13 +69,17 @@ from messagefoundry.api.models import (
     DeadLetterReplayRequest,
     DeadLetterReplayResult,
     DeadLetterRow,
+    DrActionResult,
+    DrStatus,
     EngineInfo,
     EventInfo,
     Health,
     IntegrityResult,
+    LogInfo,
     MessageDetail,
     MessageList,
     MessageResponses,
+    MessageSearchResults,
     MessageSummary,
     OutboundPayloadInfo,
     OutboundPayloads,
@@ -87,6 +95,7 @@ from messagefoundry.api.models import (
     StatsResetResult,
     StatsResponse,
     SystemStatus,
+    UpdateInfo,
 )
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.field_authz import count_exposed, redact_unauthorized
@@ -107,21 +116,27 @@ from messagefoundry.config.models import (
     BuildupThreshold,
     InternalErrorPolicy,
     OrderingMode,
+    Priority,
     RetryPolicy,
+    StallThreshold,
 )
 from messagefoundry.config.settings import (
     AiSettings,
     AlertsSettings,
     ApprovalsSettings,
     AuthSettings,
+    BackupSettings,
     CertMonitorSettings,
     ClusterSettings,
+    DrSettings,
     EgressSettings,
+    IntegritySettings,
     ReferenceSettings,
     RetentionSettings,
     ShadowSettings,
     StoreBackend,
     StoreSettings,
+    UpdateCheckSettings,
 )
 from messagefoundry.config.fingerprint import config_fingerprint_detail
 from messagefoundry.config.wiring import (
@@ -131,9 +146,12 @@ from messagefoundry.config.wiring import (
     load_config,
     redacted_settings,
 )
+from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
+from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.cluster import build_coordinator
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
@@ -143,6 +161,18 @@ from messagefoundry.transports.base import (
     TestNotSupportedError,
 )
 from messagefoundry.store import Row, open_store, sqlite_settings
+from messagefoundry.store.content_search import (
+    DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
+)
+from messagefoundry.store.content_search import (
+    MAX_SCAN_LIMIT as MAX_CONTENT_SCAN_LIMIT,
+)
+from messagefoundry.store.content_search import (
+    ContentSearchError,
+    SearchSpec,
+    SearchTarget,
+    make_spec,
+)
 from messagefoundry.store.base import Store
 from messagefoundry.store.store import _secure_file
 
@@ -202,6 +232,34 @@ def _backlog(depth: int, recent: int) -> float | None:
     return depth * _RATE_WINDOW / recent if recent > 0 else None
 
 
+def _log_storage(log_dir: str | None) -> LogInfo | None:
+    """Meter the configured app-log directory (#50): its regular-file byte total (one level, non-
+    recursive — supervisors like NSSM rotate flat into one dir) plus the free space on its filesystem,
+    mirroring :class:`DbInfo`'s ``size_bytes`` / ``disk_free_bytes``. **Metadata only — no file
+    content is ever read** (no PHI). Returns ``None`` when no directory is configured (stdout-only) or
+    the directory is missing/unreadable, so ``/status`` degrades gracefully and never raises. Blocking
+    (``stat`` per entry + ``disk_usage``) — the caller runs it off the event loop."""
+    if not log_dir:
+        return None
+    path = Path(log_dir)
+    try:
+        free = shutil.disk_usage(path).free
+    except OSError:
+        return None  # directory absent/unreadable → absent, never raise
+    total = 0
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue  # a vanished/locked rotation file is skipped, not fatal
+    except OSError:
+        return None
+    return LogInfo(path=str(path), size_bytes=total, disk_free_bytes=free)
+
+
 def _get_engine(request: Request) -> Engine:
     engine: Engine | None = getattr(request.app.state, "engine", None)
     if engine is None:
@@ -232,9 +290,54 @@ def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> Approva
         )
         return {"cancelled": cancelled}
 
+    async def _config_reload(p: Mapping[str, Any]) -> dict[str, Any]:
+        # ADR 0041 D2: a held config:deploy is re-executed here, on the second approver's release. It
+        # is a NON-dry-run reload (a dry_run is never held — it swaps nothing), so propagate=True bumps
+        # the cluster config version exactly like the inline path. The captured config_dir is replayed
+        # verbatim; the loader re-confines it to an allowed reload root (ConfigReloadDenied -> the
+        # gate surfaces it). The same fingerprint-bearing config_reload audit row is written so the
+        # released reload is bound to the bytes that actually loaded (defeating attribution-laundering).
+        config_dir = p.get("config_dir")
+        registry = await engine.reload(config_dir, dry_run=False, propagate=True)
+        await _record_reload_audit(engine, actor=str(p["requester"]), dir_arg=config_dir)
+        return {
+            "inbound": len(registry.inbound),
+            "outbound": len(registry.outbound),
+        }
+
     gate.register("dead_letter_replay", "Replay dead-lettered deliveries", _replay)
     gate.register("connection_purge", "Purge queued deliveries to an outbound connection", _purge)
+    gate.register("config_reload", "Reload the live config graph (config:deploy)", _config_reload)
     return gate
+
+
+async def _record_reload_audit(engine: Engine, *, actor: str, dir_arg: object) -> None:
+    """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
+
+    Shared by the inline reload endpoint and the dual-control executor so a held-then-approved reload
+    records the same fingerprint-bearing row as an ungated one. The fingerprint is computed off the
+    event loop and is best-effort — a fingerprint failure must never block the audit of a successful
+    reload. ``dir_arg`` is the requested config_dir (advisory; the row keys on engine.last_reload_dir)."""
+    fingerprint: dict[str, object] = {}
+    if engine.last_reload_dir is not None:
+        try:
+            fingerprint = await asyncio.to_thread(config_fingerprint_detail, engine.last_reload_dir)
+        except OSError as exc:  # unreadable dir mid-reload — degrade, don't fail the audit
+            _log.warning("config fingerprint failed for %s: %s", engine.last_reload_dir, exc)
+    rr = engine.registry_runner
+    await engine.store.record_audit(
+        "config_reload",
+        actor=actor,
+        detail=json.dumps(
+            {
+                "dir": str(engine.last_reload_dir) if engine.last_reload_dir else None,
+                "inbound": len(rr.registry.inbound) if rr else 0,
+                "outbound": len(rr.registry.outbound) if rr else 0,
+                "dry_run": False,
+                **fingerprint,
+            }
+        ),
+    )
 
 
 def _summary(row: Row) -> MessageSummary:
@@ -254,6 +357,55 @@ def _summary(row: Row) -> MessageSummary:
         summary=d.get("summary"),
         metadata=d.get("metadata"),
     )
+
+
+def _needle_shape(needle: str) -> str:
+    """A PHI-safe, coarse classifier of a search needle's *shape* for the audit (NEVER its value).
+
+    An operator's needle may itself be PHI — an MRN, a patient name (ADR 0046 §4/AC-6). The audit must
+    record *that a content search ran and roughly what kind of term*, never the term verbatim. We emit
+    only a structural class (all-digits / alphanumeric / has-separators / other) — not the characters —
+    so even a 9-digit MRN logs as ``digits`` with a length, never the number itself."""
+    if needle.isdigit():
+        return "digits"
+    if needle.isalnum():
+        return "alnum"
+    if needle.isalpha():
+        return "alpha"
+    return "mixed"
+
+
+def _search_audit_detail(
+    spec: SearchSpec, result: object, *, filters: dict[str, str | None]
+) -> dict[str, object]:
+    """Build the ``message_search`` audit detail — metadata filters + needle SHAPE + scan counts, with
+    **no** needle value (AC-6). The HL7 ``field_path`` (e.g. ``PID-3``) is a structural locator, not PHI,
+    so it is recorded; the matched VALUE is never recorded."""
+    # `result` is a MessageSearchResult (kept loosely-typed to avoid importing the store dataclass here).
+    scanned = getattr(result, "scanned", None)
+    matched = getattr(result, "matched", None)
+    truncated = getattr(result, "truncated", None)
+    detail: dict[str, object] = {
+        "filters": {k: v for k, v in filters.items() if v is not None},
+        "scanned": scanned,
+        "matched": matched,
+        "truncated": truncated,
+        "scan_limit": spec.scan_limit,
+        "target": spec.target.value,
+    }
+    if spec.substring is not None:
+        detail["needle_kind"] = "substring"
+        detail["needle_shape"] = _needle_shape(spec.substring)
+        detail["needle_len"] = len(spec.substring)
+    else:
+        detail["needle_kind"] = "field_path"
+        detail["field_path"] = spec.field_path  # structural locator, not PHI
+        # Whether a value predicate was supplied (presence-test vs value-contains), but never the value.
+        detail["field_value_present"] = spec.field_value is not None
+        if spec.field_value is not None:
+            detail["needle_shape"] = _needle_shape(spec.field_value)
+            detail["needle_len"] = len(spec.field_value)
+    return detail
 
 
 def _dead_row(row: Row) -> DeadLetterRow:
@@ -425,6 +577,7 @@ def create_app(
     expose_docs: bool = False,
     allow_no_auth: bool = False,
     ws_allowed_origins: Sequence[str] = (),
+    log_dir: str | None = None,
 ) -> FastAPI:
     # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
@@ -454,6 +607,9 @@ def create_app(
     # Loaded [alerts] config for the read-only /alerts/rules view (independent of engine; may be None,
     # in which case the route falls back to all-off defaults). The lifespan path sets the live value.
     app.state.alerts_settings = alerts_settings
+    # Configured [logging].log_dir for the GET /status app-log metering (#50). None = stdout-only (no
+    # metering). The managed-app lifespan sets the live value; here it backs the direct-construction path.
+    app.state.log_dir = log_dir
     app.state.ws_count = 0  # live /ws/stats connection count (API-WS cap)
     app.state.ws_allowed_origins = tuple(
         ws_allowed_origins
@@ -663,6 +819,10 @@ def create_app(
         # Offset-adjusted: subtracts any operator stats-resets (in-memory baselines). Identical to the
         # raw store metrics when nothing has been reset.
         metrics = await engine.connection_metrics_view(now=now, rate_window=_RATE_WINDOW)
+        # ADR 0044 (#56): the real open-alert count per connection, joined to the rows below by name.
+        # One grouped read on the lockfree path, replacing the stubbed alerts_active=0. A connection with
+        # no open instances is simply absent from the map (→ 0).
+        open_alerts = await engine.store.count_open_alerts_by_connection()
         rows: list[ConnectionRow] = []
 
         # A source row per inbound connection, and a destination row per (inbound → outbound)
@@ -677,6 +837,7 @@ def create_app(
                 inb = metrics.inbound.get(iname)
                 speer, sport = _peer_port(ic.spec.type.value, ic.spec.settings)
                 ifail = rr.connection_failed(iname)  # ADR 0031: start failed → not listening
+                ifiltered = rr.connection_filtered(iname)  # #61 ADR 0048: DR-parked below threshold
                 rows.append(
                     ConnectionRow(
                         role="source",
@@ -687,7 +848,11 @@ def create_app(
                         status=(
                             "failed"
                             if ifail
-                            else ("running" if rr.inbound_running(iname) else "stopped")
+                            else (
+                                "filtered"
+                                if ifiltered
+                                else ("running" if rr.inbound_running(iname) else "stopped")
+                            )
                         ),
                         direction="in",
                         method=_method_label(ic.spec.type.value),
@@ -695,13 +860,15 @@ def create_app(
                         port=sport,
                         queue_depth=None,
                         idle_seconds=(now - inb.last_at) if inb and inb.last_at else None,
-                        alerts_active=0,
+                        alerts_active=open_alerts.get(iname, 0),
                         errored=inb.errored if inb else 0,
                         read=inb.read if inb else 0,
                         written=None,
                         backlog_seconds=None,
                         delivered_age_seconds=None,
-                        error=ifail,
+                        # The failure reason (ADR 0031) or the DR-parked reason (#61) — whichever set
+                        # the status; ifail takes precedence (a failed connection is never also parked).
+                        error=ifail or ifiltered,
                     )
                 )
             emitted_dests: set[str] = set()
@@ -715,13 +882,14 @@ def create_app(
                 emitted_dests.add(dname)
                 oc = reg.outbound.get(dname)
                 dfail = rr.connection_failed(dname)  # ADR 0031: built? or degraded?
+                dfiltered = rr.connection_filtered(dname)  # #61 ADR 0048: DR-parked below threshold
                 # An outbound the live graph no longer declares (removed by a reload) keeps draining
                 # its queued rows — report it honestly as "draining" with an unknown method, rather
                 # than mislabeling it as a running File connector.
                 if oc is not None:
                     dmethod = _method_label(oc.spec.type.value)
                     dpeer, dport = _peer_port(oc.spec.type.value, oc.spec.settings)
-                    dstatus = "failed" if dfail else rstatus
+                    dstatus = "failed" if dfail else ("filtered" if dfiltered else rstatus)
                 else:
                     dmethod, dpeer, dport, dstatus = "—", None, None, "draining"
                 rows.append(
@@ -738,7 +906,7 @@ def create_app(
                         port=dport,
                         queue_depth=dm.queue_depth,
                         idle_seconds=(now - dm.last_done_at) if dm.last_done_at else None,
-                        alerts_active=0,
+                        alerts_active=open_alerts.get(dname, 0),
                         errored=dm.dead,
                         read=None,
                         written=dm.written,
@@ -749,13 +917,21 @@ def create_app(
                         # Effective simulate flag — queried even for a draining (removed) outbound,
                         # whose suppression persists in the runner until full shutdown (#15).
                         simulated=rr.outbound_simulated(dname),
-                        error=dfail if oc is not None else None,
+                        error=(dfail or dfiltered) if oc is not None else None,
                     )
                 )
-            # ADR 0031: an outbound that failed to build at start has no metrics edge until traffic is
-            # routed to it, so it would be invisible above. Emit a standalone row for every still-failed
-            # outbound not already shown, so a degraded lane is never silently hidden from the dashboard.
-            for dname, reason in rr.degraded_connections().items():
+            # ADR 0031 / #61 ADR 0048: an outbound that FAILED to build (0031) or was DR-PARKED below the
+            # threshold (0048) has no metrics edge until traffic is routed to it, so it would be invisible
+            # above. Emit a standalone row for every still-failed/filtered outbound not already shown, so
+            # a degraded or parked lane is never silently hidden from the dashboard. A failed connection
+            # is also in degraded_connections; a filtered one is in filtered_connections — the two reasons
+            # map to the distinct "failed" vs "filtered" status (a connection is never in both).
+            standalone: dict[str, tuple[str, str]] = {
+                name: ("failed", reason) for name, reason in rr.degraded_connections().items()
+            }
+            for name, reason in rr.filtered_connections().items():
+                standalone.setdefault(name, ("filtered", reason))
+            for dname, (dstatus, reason) in standalone.items():
                 if scoped:
                     continue  # channel-scoped users never see shared-outbound topology (see above)
                 oc = reg.outbound.get(dname)
@@ -770,14 +946,14 @@ def create_app(
                         channel_name=dname,
                         destination=dname,
                         name=f"{dname} ▸ out",
-                        status="failed",
+                        status=dstatus,
                         direction="out",
                         method=dmethod,
                         peer=dpeer,
                         port=dport,
                         queue_depth=None,
                         idle_seconds=None,
-                        alerts_active=0,
+                        alerts_active=open_alerts.get(dname, 0),
                         errored=None,
                         read=None,
                         written=None,
@@ -858,7 +1034,8 @@ def create_app(
                 router=ic.router,
                 metadata=dict(ic.metadata) if ic.metadata else None,
                 settings=redacted_settings(ic.spec.settings),
-                error=rr.connection_failed(name),  # ADR 0031
+                # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
+                error=rr.connection_failed(name) or rr.connection_filtered(name),
             )
         oc = rr.registry.outbound.get(name)
         if oc is not None:
@@ -877,7 +1054,8 @@ def create_app(
                 metadata=dict(oc.metadata) if oc.metadata else None,
                 settings=redacted_settings(oc.spec.settings),
                 simulated=rr.outbound_simulated(name),
-                error=rr.connection_failed(name),  # ADR 0031
+                # ADR 0031 failure reason, or the #61 (ADR 0048) DR-parked reason — whichever applies.
+                error=rr.connection_failed(name) or rr.connection_filtered(name),
             )
         raise HTTPException(404, f"no such connection: {name}")
 
@@ -1074,6 +1252,105 @@ def create_app(
         )
         return [_conn_event_info(r) for r in rows]
 
+    # --- operator alert-state (ADR 0044, #56) --------------------------------
+
+    def _alert_instance_info(a: Any) -> AlertInstanceInfo:
+        return AlertInstanceInfo(
+            id=a.id,
+            event_type=a.event_type,
+            connection=a.connection,
+            severity=a.severity,
+            status=a.status,
+            first_seen=a.first_seen,
+            last_seen=a.last_seen,
+            count=a.count,
+            reason=a.reason,
+            acked_by=a.acked_by,
+            acked_at=a.acked_at,
+            resolved_at=a.resolved_at,
+        )
+
+    @app.get("/alerts/active", response_model=AlertInstanceList)
+    async def list_active_alerts(
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
+        limit: int = Query(200, ge=1, le=1000),
+    ) -> AlertInstanceList:
+        """The open + acknowledged operator-alert instances (ADR 0044, #56), newest ``last_seen`` first —
+        **metadata only, no PHI**. Diagnostic operator state, so gated by ``monitoring:diagnose`` (the
+        ack/resolve tier), with the same per-channel RBAC scope as ``GET /events``."""
+        rows = await engine.store.list_active_alert_instances(
+            limit=limit, allowed_channels=_scope(identity)
+        )
+        return AlertInstanceList(alerts=[_alert_instance_info(r) for r in rows])
+
+    @app.post("/alerts/{alert_id}/ack", response_model=AlertInstanceInfo)
+    async def ack_alert(
+        alert_id: int,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
+    ) -> AlertInstanceInfo:
+        """Acknowledge an open alert instance (ADR 0044): set ``acknowledged`` + ``acked_by``/``acked_at``
+        and exclude it from ``alerts_active``. Writes one metadata-only ``alert_ack`` audit row (no
+        message content). 404 if the id is unknown or already resolved."""
+        # AC-7: a channel-scoped operator may only mutate instances within its scope. Resolve the
+        # instance scoped FIRST so an out-of-scope id is refused with no state change and no audit row
+        # (a scoped read returns None for an instance on another connection). This mirrors the mutating-
+        # route convention (replay_dead_letters pre-checks scope + raises 403 before mutating).
+        await _require_alert_scope(engine, identity, alert_id)
+        ok = await engine.store.ack_alert_instance(alert_id, actor=identity.username)
+        if not ok:
+            raise HTTPException(404, "alert instance not found or already resolved")
+        await engine.store.record_audit(
+            "alert_ack", actor=identity.username, detail=json.dumps({"alert_id": alert_id})
+        )
+        return await _alert_instance_echo(engine, identity, alert_id)
+
+    @app.post("/alerts/{alert_id}/resolve", response_model=AlertInstanceInfo)
+    async def resolve_alert(
+        alert_id: int,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
+    ) -> AlertInstanceInfo:
+        """Resolve an open/acknowledged alert instance (ADR 0044): set ``resolved`` + ``resolved_at``.
+        Writes one metadata-only ``alert_resolve`` audit row. 404 if the id is unknown or already
+        resolved."""
+        # AC-7: scope-check before mutating (see ack_alert) — an out-of-scope id is refused with no
+        # state change and no audit row.
+        await _require_alert_scope(engine, identity, alert_id)
+        ok = await engine.store.resolve_alert_instance(alert_id)
+        if not ok:
+            raise HTTPException(404, "alert instance not found or already resolved")
+        await engine.store.record_audit(
+            "alert_resolve", actor=identity.username, detail=json.dumps({"alert_id": alert_id})
+        )
+        return await _alert_instance_echo(engine, identity, alert_id)
+
+    async def _require_alert_scope(engine: Engine, identity: Identity, alert_id: int) -> None:
+        # AC-7 pre-mutation RBAC gate for ack/resolve: a scoped read of the instance must succeed before
+        # any state change. get_alert_instance returns None for both an unknown id AND an in-existence-but-
+        # out-of-scope id (its connection isn't in the caller's channels), so we 404 either way — refusing
+        # the mutation without leaking whether the id exists outside the caller's scope, and (because we
+        # raise before any UPDATE or record_audit) writing no state change and no audit row. An unscoped
+        # caller (allowed_channels is None) passes through. Already-resolved ids are still surfaced as 404
+        # by the mutating store call itself (this read includes any status).
+        if identity.allowed_channels is None:
+            return
+        a = await engine.store.get_alert_instance(alert_id, allowed_channels=_scope(identity))
+        if a is None:
+            raise HTTPException(404, "alert instance not found")
+
+    async def _alert_instance_echo(
+        engine: Engine, identity: Identity, alert_id: int
+    ) -> AlertInstanceInfo:
+        # Echo the just-mutated instance's new state. RBAC-scoped to the caller's channels (defense in
+        # depth on top of the mutation having already succeeded). A resolved instance is no longer in the
+        # active list, so the read includes any status.
+        a = await engine.store.get_alert_instance(alert_id, allowed_channels=_scope(identity))
+        if a is None:  # vanished (e.g. concurrent retention purge of a just-resolved row)
+            raise HTTPException(404, "alert instance not found")
+        return _alert_instance_info(a)
+
     @app.get("/dead-letters", response_model=DeadLetterList)
     async def list_dead_letters(
         request: Request,
@@ -1201,12 +1478,14 @@ def create_app(
 
     # --- config promote / reload ---------------------------------------------
 
-    @app.post("/config/reload", response_model=ReloadResult)
+    @app.post("/config/reload", response_model=ReloadResult | PendingApprovalResponse)
     async def reload_config(
         req: ReloadRequest,
+        response: Response,
         engine: Engine = Depends(_get_engine),
         user: Identity = Depends(require_step_up(Permission.CONFIG_DEPLOY)),
-    ) -> ReloadResult:
+        gate: ApprovalGate | None = Depends(_get_gate),
+    ) -> ReloadResult | PendingApprovalResponse:
         """Load the code-first graph and atomically apply it to the running engine (quiesce-and-swap;
         in-flight outbox deliveries keep draining). ``config_dir`` defaults to the server's startup
         --config dir and must resolve within an allowed reload root — the loader executes Python, so
@@ -1216,8 +1495,30 @@ def create_app(
         ``dry_run=true`` is the promote pre-flight: it validates the graph against THIS environment's
         values (a missing ``env()`` value → 422) and reports the would-be graph **without** swapping.
 
+        Dual-control (ADR 0041 D2): WHERE ``config_reload`` is in ``[approvals].operations`` and
+        ``[approvals].enabled``, a NON-dry-run reload is **held** (202) for a *distinct* second approver
+        — the requester can never release their own — rather than swapping the live graph inline. A
+        dry_run is never held (it swaps nothing). Deny-by-default: ungated deployments reload inline.
+
         Error responses are intentionally generic (the detail is logged server-side, not returned)
         so a config:deploy holder can't probe the filesystem via reload error text."""
+        # Hold a real (non-dry-run) reload for a second approver when dual-control gates it. A dry_run
+        # is a read-only pre-flight (no swap), so it is never held. The guard runs AFTER the caller's
+        # own step-up + config:deploy check (above) — the second approver is an additional control, not
+        # a replacement. On hold, 202 + the pending id; the captured config_dir is replayed on release.
+        if gate is not None and not req.dry_run:
+            pending = await gate.guard(
+                "config_reload",
+                {"config_dir": req.config_dir, "requester": user.username},
+                requester=user.username,
+            )
+            if pending is not None:
+                response.status_code = 202
+                return PendingApprovalResponse(
+                    approval_id=pending,
+                    operation="config_reload",
+                    detail="held for a second approver (dual-control)",
+                )
         try:
             # propagate=True on the real apply so an operator reload on one node bumps the cluster-wide
             # config version and every other node converges (Track B Step 6); a dry_run never propagates
@@ -1259,28 +1560,35 @@ def create_app(
         # Bind "what loaded" to a reviewable content digest (ADR 0041 D1): the prior detail recorded
         # only counts, so two reloads of the same dir with different on-disk code were
         # indistinguishable. Computed off the event loop (it reads files) and best-effort — a
-        # fingerprint failure must never block the audit of a successful reload.
-        fingerprint: dict[str, object] = {}
-        if engine.last_reload_dir is not None:
-            try:
-                fingerprint = await asyncio.to_thread(
-                    config_fingerprint_detail, engine.last_reload_dir
-                )
-            except OSError as exc:  # unreadable dir mid-reload — degrade, don't fail the audit
-                _log.warning("config fingerprint failed for %s: %s", engine.last_reload_dir, exc)
-        await engine.store.record_audit(
-            "config_reload_check" if req.dry_run else "config_reload",
-            actor=user.username,
-            detail=json.dumps(
-                {
-                    "dir": str(engine.last_reload_dir) if engine.last_reload_dir else None,
-                    "inbound": len(registry.inbound),
-                    "outbound": len(registry.outbound),
-                    "dry_run": req.dry_run,
-                    **fingerprint,
-                }
-            ),
-        )
+        # fingerprint failure must never block the audit of a successful reload. The non-dry-run path
+        # shares _record_reload_audit with the dual-control executor so a held-then-approved reload
+        # records the identical fingerprint-bearing row.
+        if req.dry_run:
+            fingerprint: dict[str, object] = {}
+            if engine.last_reload_dir is not None:
+                try:
+                    fingerprint = await asyncio.to_thread(
+                        config_fingerprint_detail, engine.last_reload_dir
+                    )
+                except OSError as exc:  # unreadable dir mid-reload — degrade, don't fail the audit
+                    _log.warning(
+                        "config fingerprint failed for %s: %s", engine.last_reload_dir, exc
+                    )
+            await engine.store.record_audit(
+                "config_reload_check",
+                actor=user.username,
+                detail=json.dumps(
+                    {
+                        "dir": str(engine.last_reload_dir) if engine.last_reload_dir else None,
+                        "inbound": len(registry.inbound),
+                        "outbound": len(registry.outbound),
+                        "dry_run": True,
+                        **fingerprint,
+                    }
+                ),
+            )
+        else:
+            await _record_reload_audit(engine, actor=user.username, dir_arg=req.config_dir)
         rr = engine.registry_runner
         return ReloadResult(
             inbound=len(registry.inbound),
@@ -1331,6 +1639,90 @@ def create_app(
                 engine.store, identity.username, channel_id, exposed, time.time()
             )
         return MessageList(total=total, limit=limit, offset=offset, messages=messages)
+
+    @app.get("/messages/search", response_model=MessageSearchResults)
+    async def search_messages(
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        # Step-up (NOT just require_phi_read): content search decrypts bodies the caller never explicitly
+        # "opened" — a bulk-PHI operation, like replay (ADR 0046 D1 §4). It therefore demands a fresh
+        # re-verification + the second factor on top of the MESSAGES_READ permission.
+        identity: Identity = Depends(require_step_up(Permission.MESSAGES_READ)),
+        content: str | None = Query(None, max_length=512),
+        field_path: str | None = Query(None, max_length=32),
+        field_value: str | None = Query(None, max_length=512),
+        target: str = Query("both", pattern="^(raw|summary|both)$"),
+        channel_id: str | None = Query(None, max_length=256),
+        status: str | None = Query(None, max_length=64),
+        message_type: str | None = Query(None, max_length=64),
+        control_id: str | None = Query(None, max_length=256),
+        limit: int = Query(50, ge=1, le=500),
+        scan_limit: int = Query(DEFAULT_CONTENT_SCAN_LIMIT, ge=1, le=MAX_CONTENT_SCAN_LIMIT),
+    ) -> MessageSearchResults:
+        """Search messages by what is *in* them — an HL7 field path (``PID-3``) or a raw/summary
+        substring (ADR 0046 #51). Because the store is encrypted at rest, this scans-and-decrypts: it
+        pre-filters on the indexed metadata, then decrypts + matches each candidate body in memory off
+        the event loop, bounded by ``scan_limit`` decrypts and ``limit`` matches (truncate-and-tell). It
+        sits behind step-up (a bulk-PHI read), inherits the ``view_summary`` redaction, and writes a
+        dedicated ``message_search`` audit row that never records an MRN-shaped needle."""
+        try:
+            spec = make_spec(
+                content=content,
+                field_path=field_path,
+                field_value=field_value,
+                target=SearchTarget(target),
+                scan_limit=scan_limit,
+            )
+        except ContentSearchError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        allowed = _scope(identity)  # per-channel RBAC: only the caller's channels (None = all)
+        result = await engine.store.search_messages(
+            spec,
+            channel_id=channel_id,
+            status=status,
+            message_type=message_type,
+            control_id=control_id,
+            limit=limit,
+            allowed_channels=allowed,
+        )
+        messages = [_summary(r) for r in result.rows]
+        # Same per-property PHI redaction as /messages: a caller without view_summary gets summary/error
+        # nulled. The result rows are metadata-only (no body), so the exposure equals the metadata list.
+        messages = [redact_unauthorized(m, identity) for m in messages]
+        # A dedicated, tamper-evident message_search audit row — the actor + metadata filters + the
+        # needle's SHAPE (never its value; an MRN needle is PHI, ADR 0046 §4/AC-6) + how much it touched.
+        await engine.store.record_audit(
+            "message_search",
+            actor=identity.username,
+            channel_id=channel_id,
+            detail=json.dumps(
+                _search_audit_detail(
+                    spec,
+                    result,
+                    filters=dict(
+                        channel_id=channel_id,
+                        status=status,
+                        message_type=message_type,
+                        control_id=control_id,
+                    ),
+                )
+            ),
+        )
+        # The summary exposure (matched rows actually carrying a summary) is ALSO coalesced into the
+        # standard summary_access audit, mirroring /messages — so a search-then-harvest can't dodge it.
+        exposed = count_exposed(messages)
+        if exposed:
+            await request.app.state.summary_auditor.note(
+                engine.store, identity.username, channel_id, exposed, time.time()
+            )
+        return MessageSearchResults(
+            messages=messages,
+            scanned=result.scanned,
+            matched=result.matched,
+            truncated=result.truncated,
+            limit=limit,
+            scan_limit=spec.scan_limit,
+        )
 
     @app.get("/messages/{message_id}", response_model=MessageDetail)
     async def get_message(
@@ -1585,6 +1977,7 @@ def create_app(
 
     @app.get("/status", response_model=SystemStatus)
     async def system_status(
+        request: Request,
         engine: Engine = Depends(_get_engine),
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> SystemStatus:
@@ -1594,6 +1987,23 @@ def create_app(
             total = len(rr.registry.inbound)
             running = sum(1 for name in rr.registry.inbound if rr.inbound_running(name))
         db = await engine.store.db_status()
+        # App-log disk metering (#50), alongside the DB metrics — only when a log dir is configured.
+        # Run the blocking stat()s off the event loop (the DB metering is itself off-loop in the store);
+        # None when stdout-only or the directory is unreadable, so /status never raises on it.
+        logs = await asyncio.to_thread(_log_storage, getattr(request.app.state, "log_dir", None))
+        # No-network version-update signal (#30, ADR 0026): the engine's latest local diff (version
+        # strings only, no PHI). None when [update_check] is disabled / no pass has run — additive, so
+        # the existing payload is unchanged when off.
+        uc = engine.update_check_result
+        update = (
+            UpdateInfo(
+                current_version=uc.current_version,
+                pinned_version=uc.pinned_version,
+                update_available=uc.update_available,
+            )
+            if uc is not None
+            else None
+        )
         return SystemStatus(
             engine=EngineInfo(
                 version=__version__,
@@ -1615,6 +2025,8 @@ def create_app(
                 events=db.events,
                 audit=db.audit,
             ),
+            logs=logs,
+            update=update,
         )
 
     # --- cluster observability (Track B Step 7) ------------------------------
@@ -1670,6 +2082,91 @@ def create_app(
             leader_node_id=leader,
             lease_owner=lease_owner,
             lease_expires_at=lease_expires_at,
+        )
+
+    # --- third-tier DR standby (#61, ADR 0048) -------------------------------
+
+    @app.get("/dr/status", response_model=DrStatus)
+    async def dr_status(
+        engine: Engine = Depends(_get_engine),
+        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+    ) -> DrStatus:
+        """This box's third-tier DR posture (#61, ADR 0048): whether it is a DR standby at all
+        (``[dr].enabled``), whether it is currently serving under the DR run-profile, the priority
+        threshold, and the activation mode (always ``manual`` this slice). Read-only — gated by
+        ``monitoring:read`` (carries no PHI)."""
+        dr = engine.dr_settings
+        return DrStatus(
+            enabled=dr.enabled,
+            active=engine.dr_active,
+            threshold=dr.priority_threshold.value,
+            activation_mode=dr.activation_mode.value,
+        )
+
+    @app.post("/dr/activate", response_model=DrActionResult)
+    async def dr_activate(
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.DR_OPERATE)),
+        body: Mapping[str, Any] | None = Body(default=None),
+    ) -> DrActionResult:
+        """**Manually promote** this DR standby (#61, ADR 0048). Gated by the dedicated ``dr:operate``
+        permission (held by ADMINISTRATOR — NOT a reuse of ``connections:control``) and audited (every
+        action + every abort via ``auth/service.py``'s ``record_audit``). The fixed ordering is
+        cold-seed restore-verify (**fail-closed** if the KeyProvider/DEK is unavailable at the DR site) →
+        a new audit-chain segment → acquire-VIP-or-abort → serve under the DR run-profile. An optional
+        ``{"archive": "<path>"}`` body overrides ``[dr].seed_archive`` (the runbook may pass the chosen
+        #60 backup). Aborts return a 4xx/5xx with the failing phase; the box stays passive."""
+        coord = engine.dr_coordinator
+        if coord is None:
+            raise HTTPException(503, "this deployment is not a DR standby ([dr].enabled is false)")
+        archive = None
+        if isinstance(body, Mapping):
+            raw = body.get("archive")
+            if raw is not None and not isinstance(raw, str):
+                raise HTTPException(422, "archive must be a string path")
+            archive = raw
+        try:
+            result = await coord.activate(archive=archive, actor=identity.username)
+        except DrActivationError as exc:
+            # The coordinator already recorded a dr_activation_aborted audit row. Map the failing phase
+            # to an HTTP status: a missing/unverified seed or a not-this-box state is the client's input
+            # (409/422); a key-unavailable / VIP-not-acquired / profile failure is an environment
+            # condition (503 — retry once the cause is fixed). Never echo a body (the message is scrubbed).
+            status_code = {"state": 409, "seed": 422}.get(exc.kind, 503)
+            raise HTTPException(status_code, str(exc)) from exc
+        return DrActionResult(
+            action=result.action,
+            active=result.active,
+            threshold=result.threshold,
+            archive=result.archive,
+            verify_status=result.verify_status,
+            seed_segment=result.seed_segment,
+            vip_hook_ran=result.vip_hook_ran,
+        )
+
+    @app.post("/dr/release", response_model=DrActionResult)
+    async def dr_release(
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.DR_OPERATE)),
+    ) -> DrActionResult:
+        """**Fail back** from this DR standby to the recovered primary (#61, ADR 0048) — drain-then-hand-
+        back, gated by ``dr:operate`` and audited. Releases the VIP (the optional release hook / the
+        passive LB returns it to the primary), unbinds all inbound listeners, and drains the staged queue
+        to completion before returning success (no dual-accept window while the VIP moves). Cross-store
+        reconciliation with the recovered primary is operator-verified per the runbook (the engine gives
+        no cross-store loss/duplicate guarantee)."""
+        coord = engine.dr_coordinator
+        if coord is None:
+            raise HTTPException(503, "this deployment is not a DR standby ([dr].enabled is false)")
+        try:
+            result = await coord.release(actor=identity.username)
+        except DrActivationError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        return DrActionResult(
+            action=result.action,
+            active=result.active,
+            threshold=result.threshold,
+            vip_hook_ran=result.vip_hook_ran,
         )
 
     @app.post("/status/integrity-check", response_model=IntegrityResult)
@@ -1808,6 +2305,7 @@ def create_managed_app(
     ordering_default: OrderingMode | None = None,
     internal_error_default: InternalErrorPolicy | None = None,
     buildup_default: BuildupThreshold | None = None,
+    stall_default: StallThreshold | None = None,
     ack_after_default: AckAfter | None = None,
     max_correlation_depth: int = 8,
     connection_events: bool = True,
@@ -1817,8 +2315,12 @@ def create_managed_app(
     auth_settings: AuthSettings | None = None,
     ai_settings: AiSettings | None = None,
     alerts_settings: AlertsSettings | None = None,
+    priority_default: Priority | None = None,
     retention_settings: RetentionSettings | None = None,
     cert_monitor_settings: CertMonitorSettings | None = None,
+    update_check_settings: UpdateCheckSettings | None = None,
+    backup_settings: BackupSettings | None = None,
+    dr_settings: DrSettings | None = None,
     api_tls_cert_file: str | None = None,
     api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
@@ -1826,9 +2328,11 @@ def create_managed_app(
     shadow_settings: ShadowSettings | None = None,
     cluster_settings: ClusterSettings | None = None,
     approvals_settings: ApprovalsSettings | None = None,
+    integrity_settings: IntegritySettings | None = None,
     expose_docs: bool = False,
     ws_allowed_origins: Sequence[str] = (),
     registry_filter: Callable[[Registry], Registry] | None = None,
+    log_dir: str | None = None,
 ) -> FastAPI:
     """Build an app that owns its engine for its whole lifespan (CLI server / sync tests).
 
@@ -1861,7 +2365,32 @@ def create_managed_app(
         # lifespan: started here, drained + stopped after the engine in the finally below.
         notifier = notifier_from_settings(alerts_settings) if alerts_settings is not None else None
         if notifier is not None:
+            # Durable operator alert-state (ADR 0044, #56): wire the open store so every emit upserts a
+            # resolvable alert instance (GET /alerts/active) and an inverse signal auto-resolves it. A
+            # pure side observer off the emit path — never gates a disposition, never blocks a worker.
+            notifier.set_store(store)
             notifier.start()
+        # Startup self-attestation of the installed engine wheel (ADR 0041 D3) — runs BEFORE the engine
+        # binds listeners. On drift it records a hash-chained `startup_integrity` audit row + alerts;
+        # under [integrity].fail_closed_on_drift it raises IntegrityError here (refusing to start) so
+        # the store is closed in the except below and no listener ever binds. A no-op off an editable
+        # install (no RECORD baseline), so dev is never bricked. Off only if [integrity].enabled=false.
+        integ = integrity_settings or IntegritySettings()
+        if integ.enabled:
+            try:
+                await run_startup_attestation(
+                    store,
+                    notifier or LoggingAlertSink(),
+                    fail_closed_on_drift=integ.fail_closed_on_drift,
+                )
+            except BaseException:
+                # Fail-closed drift (or an unexpected error) before the engine starts: tear down what we
+                # already brought up (the notifier task + the open store) so we don't leak them, then
+                # re-raise to abort the lifespan startup (uvicorn exits non-zero).
+                if notifier is not None:
+                    await notifier.aclose()
+                await store.close()
+                raise
         # Cluster coordinator (Track B Step 3) — built from the opened store so a Postgres-backed
         # store can reach its pool. Returns the no-op NullCoordinator unless [cluster].enabled on a
         # Postgres store, so single-node is byte-identical. The Engine owns its lifecycle (start/stop
@@ -1881,10 +2410,21 @@ def create_managed_app(
             ordering_default=ordering_default,
             internal_error_default=internal_error_default,
             buildup_default=buildup_default,
+            stall_default=stall_default,
             ack_after_default=ack_after_default,
+            priority_default=priority_default,
             alert_sink=notifier,
             retention_settings=retention_settings,
             cert_monitor_settings=cert_monitor_settings,
+            update_check_settings=update_check_settings,
+            backup_settings=backup_settings,
+            # [dr] third-tier DR standby run-profile + cold-seed (#61, ADR 0048). When dr.enabled AND
+            # dr.activate, the engine binds only connections at/above dr.priority_threshold this boot.
+            dr_settings=dr_settings,
+            # [backup] DR archive is encrypted under the store DEK (its KEY SOURCE) and bundles the
+            # config dir; pass the resolved store settings (the KeyProvider seam) + version metadata.
+            store_settings=resolved,
+            engine_version=__version__,
             api_tls_cert_file=api_tls_cert_file,
             api_listener=api_listener,
             reference_settings=reference_settings,
@@ -1908,6 +2448,7 @@ def create_managed_app(
         app.state.engine = engine
         app.state.store_settings = resolved  # back GET /security/posture (M5)
         app.state.alerts_settings = alerts_settings
+        app.state.log_dir = log_dir  # back GET /status app-log metering (#50)
         app.state.approval_gate = _build_approval_gate(
             engine, approvals_settings or ApprovalsSettings()
         )

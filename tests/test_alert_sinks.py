@@ -88,6 +88,33 @@ async def test_events_carry_no_message_body_only_queue_shape() -> None:
         }
 
 
+async def test_notifier_integrity_drift_fans_out_phi_free() -> None:
+    # #54: the dedicated integrity_drift channel emits a fan-out event carrying only a label, a
+    # PHI-free reason string, and the drifted-module count — never any file content.
+    t = _RecordingTransport("t")
+    sink = NotifierAlertSink([t])
+    sink.integrity_drift("engine-integrity", reason="3 module(s) drifted", drift_count=3)
+    await _drain(sink)
+    assert len(t.events) == 1
+    ev = t.events[0]
+    assert ev["type"] == "integrity_drift"
+    assert ev["connection"] == "engine-integrity"
+    assert ev["reason"] == "3 module(s) drifted"
+    assert ev["drift_count"] == 3
+    assert set(ev) <= {"type", "connection", "reason", "drift_count", "ts", "severity"}
+
+
+def test_logging_sink_integrity_drift(caplog: pytest.LogCaptureFixture) -> None:
+    # The default LoggingAlertSink logs the tamper signal at WARNING (no file content — name + count).
+    from messagefoundry.pipeline.alerts import LoggingAlertSink
+
+    with caplog.at_level("WARNING"):
+        LoggingAlertSink().integrity_drift(
+            "engine-integrity", reason="2 module(s) drifted", drift_count=2
+        )
+    assert any("integrity_drift" in r.getMessage() for r in caplog.records)
+
+
 def test_webhook_transport_posts_json(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 

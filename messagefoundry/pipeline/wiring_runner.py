@@ -30,6 +30,7 @@ import logging
 import time
 import urllib.parse
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -43,10 +44,16 @@ from messagefoundry.config.models import (
     InternalErrorPolicy,
     OrderingMode,
     OutboundSigning,
+    Priority,
     RetryPolicy,
     Source,
+    StallThreshold,
 )
 from messagefoundry.config.db_lookup import DbLookupError, activated as db_lookup_activated
+from messagefoundry.config.fhir_lookup import (
+    FhirLookupError,
+    activated as fhir_lookup_activated,
+)
 from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.settings import EgressSettings, StoreBackend
 from messagefoundry.config.wiring import (
@@ -77,6 +84,7 @@ from messagefoundry.transports import (
 )
 from messagefoundry.transports.base import ConnectionEventSink
 from messagefoundry.transports.database import DatabaseLookupExecutor
+from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
 
 __all__ = ["RegistryRunner"]
@@ -159,7 +167,10 @@ class RegistryRunner:
         ordering_default: OrderingMode | None = None,
         internal_error_default: InternalErrorPolicy | None = None,
         buildup_default: BuildupThreshold | None = None,
+        stall_default: StallThreshold | None = None,
         ack_after_default: AckAfter | None = None,
+        priority_default: Priority | None = None,
+        dr_threshold: Priority | None = None,
         alert_sink: AlertSink | None = None,
         egress: EgressSettings | None = None,
         simulate_all: bool = False,
@@ -192,9 +203,22 @@ class RegistryRunner:
         self._ordering_default = ordering_default or OrderingMode.FIFO
         self._internal_error_default = internal_error_default or InternalErrorPolicy.CONTINUE
         self._buildup_default = buildup_default or BuildupThreshold()
+        # message_stall threshold default (#50). StallThreshold() is OFF (max_oldest_seconds=None), so a
+        # connection inherits "no stall alert" unless [delivery].stall_max_oldest_seconds or a per-
+        # connection stall= sets one — deny-by-default.
+        self._stall_default = stall_default or StallThreshold()
         # Global inbound ACK-timing default (from [inbound]); a connection's own ack_after overrides
         # it. Step A only supports INGEST (ACK-on-receipt); a resolved DELIVERED fails loud at start.
         self._ack_after_default = ack_after_default or AckAfter.INGEST
+        # DR run-profile (#61, ADR 0048). _priority_default is the global [delivery].priority a
+        # connection inherits when it declares no priority= (resolution: per-connection override >
+        # global default > built-in NORMAL). _dr_threshold is the THIS-RUN run-profile gate: when set
+        # (a DR box under the DR profile), start() binds only connections whose resolved tier rank >=
+        # the threshold rank — the rest are recorded in _filtered and report status:"filtered" (distinct
+        # from ADR 0031's "failed"). None (the default, every normal deployment) = no DR filtering, so
+        # every connection starts subject only to ADR 0031 — byte-identical to before this seam.
+        self._priority_default = priority_default or Priority.NORMAL
+        self._dr_threshold = dr_threshold
         # Where the delivery workers report operational stalls (a stopped connection, a building
         # backlog). Defaults to the logging sink until a real notifier is wired (docs/BACKLOG.md item 5).
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
@@ -241,6 +265,7 @@ class RegistryRunner:
         self._ordering: dict[str, OrderingMode] = {}
         self._internal_error: dict[str, InternalErrorPolicy] = {}
         self._buildup: dict[str, BuildupThreshold] = {}
+        self._stall: dict[str, StallThreshold] = {}
         # Effective per-connection egress-suppression (#15): per-connection simulate= OR simulate_all.
         self._simulate: dict[str, bool] = {}
         # Per-outbound-lane health (#46), for the edge-triggered connection_lost/restored events. True
@@ -255,13 +280,27 @@ class RegistryRunner:
         # dropped) and a reload/restart that builds it self-heals the lane; a failed INBOUND simply
         # isn't listening. Cleared when the connection later builds/binds (reload, start_inbound).
         self._failed: dict[str, str] = {}
+        # Connections SKIPPED by the DR run-profile (#61, ADR 0048): name → reason (e.g. "DR profile
+        # threshold=critical: connection tier=normal is below threshold"). Distinct from _failed (ADR
+        # 0031): a filtered connection did not FAIL to build/bind — it was deliberately not started
+        # because its resolved priority tier is below [dr].priority_threshold. Surfaced as
+        # status:"filtered" on /connections + /connections/{name}/metadata so an operator can tell a
+        # deliberately-parked DR feed from a broken one. Empty unless a DR run-profile is active.
+        self._filtered: dict[str, str] = {}
         # Per-connection re-alert throttle: the earliest time a queue_buildup alert may fire again.
         self._next_buildup_alert: dict[str, float] = {}
+        # Same per-connection re-alert throttle for the message_stall alert (#50), kept independent so a
+        # buildup alert can't suppress a stall alert (and vice-versa) on the same lane.
+        self._next_stall_alert: dict[str, float] = {}
         # Live-lookup executor (db_lookup, ADR 0010): built from registry.lookups at start/reload, None
         # when the graph declares no DatabaseLookup — in which case the transform path stays byte-identical
         # (inline call, no thread hop, no runner). The engine loop is captured at start so a handler's
         # worker thread can bridge a db_lookup back onto it (run_coroutine_threadsafe).
         self._lookup_executor: DatabaseLookupExecutor | None = None
+        # Live FHIR-lookup executor (fhir_lookup, ADR 0043): the read-side sibling of _lookup_executor,
+        # built from registry.fhir_lookups at start/reload, None when the graph declares no FhirLookup.
+        # When either executor is set, the transform runs off-loop with the matching runner(s) activated.
+        self._fhir_lookup_executor: FhirLookupExecutor | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop = asyncio.Event()
         # Per-stage wake events so a producer wakes only its own downstream consumer class. A single
@@ -412,6 +451,12 @@ class RegistryRunner:
             message_id=None,
             reason=None,
         )
+        # Auto-resolve the matching open alert instance (ADR 0044, #56) — no notification (a recovery
+        # needs no page); the sink resolves the connection_error instance when alert-state is wired.
+        try:
+            self._alert_sink.connection_restored(name)
+        except Exception:
+            log.warning("alert sink raised on connection_restored for %r", name)
 
     def _capture_ack_enabled(self, ic: InboundConnection) -> bool:
         """Whether to record the "Response Sent" ACK for this inbound (ADR 0021, #46). Only a reply-
@@ -454,6 +499,34 @@ class RegistryRunner:
         )
         return future.result(_LOOKUP_RESULT_TIMEOUT_SECONDS)
 
+    def _build_fhir_lookup_executor(self) -> FhirLookupExecutor | None:
+        """Build the live FHIR-read executor from the current graph's ``FhirLookup`` specs, or ``None`` if
+        the graph declares none (so ``fhir_lookup`` is unavailable and its runner is not activated). Mirrors
+        :meth:`_build_lookup_executor`: resolves ``env()`` in each spec and fail-closed egress-checks the
+        FHIR host against ``[egress].allowed_http`` (ADR 0043), exactly as the FHIR outbound is gated."""
+        if not self.registry.fhir_lookups:
+            return None
+        resolved: dict[str, dict[str, Any]] = {}
+        for name, spec in self.registry.fhir_lookups.items():
+            settings = resolve_env_settings(spec.settings, self._env_values)
+            check_fhir_lookup_allowed(name, settings, self._egress)
+            resolved[name] = settings
+        return FhirLookupExecutor(resolved)
+
+    def _run_fhir_lookup(self, connection: str, query: str) -> dict[str, Any]:
+        """The FHIR-lookup runner published to Handlers (``fhir_lookup`` → this). Called FROM the handler's
+        worker thread, it bridges the async GET onto the engine loop via ``run_coroutine_threadsafe`` and
+        blocks the WORKER THREAD — never the loop — for the result (bounded by
+        ``_LOOKUP_RESULT_TIMEOUT_SECONDS``)."""
+        executor = self._fhir_lookup_executor
+        loop = self._loop
+        if executor is None or loop is None:  # only published when both exist; guard defensively
+            raise FhirLookupError(
+                "fhir_lookup is unavailable — no FhirLookup connections are configured"
+            )
+        future = asyncio.run_coroutine_threadsafe(executor.read(connection, query), loop)
+        return future.result(_LOOKUP_RESULT_TIMEOUT_SECONDS)
+
     # --- per-connection control (console operations) -------------------------
 
     def inbound_running(self, name: str) -> bool:
@@ -469,6 +542,55 @@ class RegistryRunner:
         """Snapshot of ``{connection: reason}`` for connections that failed to start (ADR 0031).
         Empty when every connection came up — the API/console use it to flag a degraded engine."""
         return dict(self._failed)
+
+    def connection_filtered(self, name: str) -> str | None:
+        """The reason this connection was skipped by the DR run-profile (its resolved priority tier is
+        below ``[dr].priority_threshold``), else ``None`` (#61, ADR 0048). A filtered connection is
+        **not** failed (ADR 0031) — it was deliberately not started; the two are surfaced as the distinct
+        ``status:"filtered"`` vs ``status:"failed"`` so an operator can tell a parked DR feed from a
+        broken one."""
+        return self._filtered.get(name)
+
+    def filtered_connections(self) -> dict[str, str]:
+        """Snapshot of ``{connection: reason}`` for connections the DR run-profile parked below the
+        priority threshold (#61, ADR 0048). Empty unless a DR run-profile is active — the sibling of
+        :meth:`degraded_connections`, kept distinct so a parked DR feed is never confused with an
+        ADR-0031 failure."""
+        return dict(self._filtered)
+
+    def resolved_priority(self, name: str) -> Priority:
+        """The connection's resolved DR / priority tier (#61, ADR 0048): its own ``priority=`` override,
+        else the global ``[delivery].priority`` default, else the built-in ``NORMAL`` (resolution order:
+        per-connection override > global default > built-in). Defined for both an inbound and an
+        outbound; unknown names resolve to the global default."""
+        ic = self.registry.inbound.get(name)
+        if ic is not None:
+            return ic.priority or self._priority_default
+        oc = self.registry.outbound.get(name)
+        if oc is not None:
+            return oc.priority or self._priority_default
+        return self._priority_default
+
+    def _dr_filters_out(self, name: str, declared: Priority | None) -> bool:
+        """Whether the DR run-profile parks this connection (its resolved tier is below the threshold).
+
+        ``False`` when no DR run-profile is active (``_dr_threshold is None``) — every normal deployment,
+        so the start path is byte-identical to before this seam. When a DR profile IS active, records the
+        reason in ``_filtered`` and returns ``True`` for a below-threshold connection so :meth:`start`
+        skips binding/building it. The comparison is on the explicit total order (``rank``), so it is
+        unambiguous: a connection runs iff ``resolved.rank >= threshold.rank``."""
+        threshold = self._dr_threshold
+        if threshold is None:
+            return False
+        resolved = declared or self._priority_default
+        if resolved.rank >= threshold.rank:
+            self._filtered.pop(name, None)  # at/above threshold — not parked
+            return False
+        self._filtered[name] = (
+            f"DR run-profile threshold={threshold.value}: connection tier={resolved.value} is below "
+            f"threshold — not started (status:filtered, ADR 0048)"
+        )
+        return True
 
     def outbound_simulated(self, name: str) -> bool:
         """Whether the named outbound is in **simulate** mode — egress suppressed (#15). The *effective*
@@ -596,6 +718,7 @@ class RegistryRunner:
         check_mllp_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
         check_dimse_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
         check_tcp_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
+        check_http_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
         source = build_source(source_cfg)
         # Inject the connection-event sink (#46) BEFORE start so a listen source can emit accept/refuse/
         # close. None when capture is off (byte-identical). transports/ stays store-agnostic — the sink
@@ -609,8 +732,13 @@ class RegistryRunner:
         # single-node (NullCoordinator) is_leader is always True, so every poll source scans as before.
         # Bind BEFORE registering: a failed bind (e.g. port in use) must not leave a dead source in
         # _sources, where inbound_running() would report True and a retry would no-op (review M-9).
+        # The HTTP listen source (ADR 0023) gets a receipt handler returning the committed message_id for
+        # its 202; every other source gets the standard handler whose str return is a wire reply/ACK.
+        make_handler = (
+            self._make_http_handler if ic.spec.type is ConnectorType.HTTP else self._make_handler
+        )
         try:
-            await source.start(self._make_handler(ic), leader_gate=self._coordinator.is_leader)
+            await source.start(make_handler(ic), leader_gate=self._coordinator.is_leader)
         except OSError as exc:
             # Classify a bind failure (port already taken by an EXTERNAL process, an unavailable
             # bind_address, a privileged port) into a named PortConflictError so the operator sees which
@@ -633,6 +761,9 @@ class RegistryRunner:
         self._failed.pop(
             name, None
         )  # bound successfully — clear any prior start failure (ADR 0031)
+        # An operator that explicitly starts a DR-parked inbound (POST /connections/{name}/start) is
+        # overriding the run-profile, so it is no longer "filtered" — clear that marker too (#61).
+        self._filtered.pop(name, None)
         # Once the source is live, note (start-time only, never per-tick) that a poll source's intake
         # is leader-gated, so an operator reading the log knows only the leader polls this resource.
         if getattr(source, "polls_shared_resource", False):
@@ -689,7 +820,22 @@ class RegistryRunner:
         self._ordering[name] = oc.ordering or self._ordering_default
         self._internal_error[name] = oc.internal_error or self._internal_error_default
         self._buildup[name] = oc.buildup or self._buildup_default
+        self._stall[name] = oc.stall or self._stall_default
         self._simulate[name] = self._resolve_simulate(name, oc)
+        # DR run-profile (#61, ADR 0048): a below-threshold outbound is NOT built — but its delivery
+        # worker still spawns (the retry/ordering/etc. above are set regardless), so a row routed to it
+        # sits in the outbound stage and backs off via the retry policy, self-healing on the next full
+        # (non-DR) startup. This is exactly the ADR-0031 degraded-outbound branch (the worker's "no
+        # connector for a claimed row" path), so the count-and-log + at-least-once invariants hold: the
+        # row is queued + retried + buildup-alerted, never silently dropped. status:"filtered" (not
+        # "failed") tells the operator it was deliberately parked.
+        if self._dr_filters_out(name, oc.priority):
+            self._destinations.pop(name, None)  # no live connector for a parked lane
+            self._spawn_worker(name)
+            return
+        self._filtered.pop(
+            name, None
+        )  # at/above threshold this run — clear any prior parked marker
         try:
             dest = _dest_config(oc, self._env_values)
             check_egress_allowed(dest, self._egress)  # fail-closed egress allowlist (WP-11c)
@@ -737,7 +883,19 @@ class RegistryRunner:
                 # None when no DatabaseLookup is declared, keeping the transform path byte-identical. A
                 # failure here is graph-wide (not one connection), so let it hit the backstop below.
                 self._lookup_executor = self._build_lookup_executor()
+                self._fhir_lookup_executor = self._build_fhir_lookup_executor()
                 for ic in self.registry.inbound.values():
+                    # DR run-profile (#61, ADR 0048): a below-threshold inbound LISTENER is NOT bound
+                    # (no source.start) — but its router + transform workers are still spawned below, so
+                    # any crash-recovered ingress/routed backlog carried in the (cold-restored) store
+                    # still drains. The listener simply isn't accepting NEW work — the operator intent of
+                    # a DR box running only its critical feeds. status:"filtered" (not "failed")
+                    # distinguishes it from an ADR-0031 bind failure.
+                    if self._dr_filters_out(ic.name, ic.priority):
+                        continue
+                    self._filtered.pop(
+                        ic.name, None
+                    )  # at/above threshold this run — clear the marker
                     try:
                         await self._start_inbound_unsafe(ic.name)
                     except Exception as exc:
@@ -746,8 +904,9 @@ class RegistryRunner:
                         # guard still refused; we just don't also kill the engine over it.
                         self._record_failed(ic.name, exc, kind="inbound")
                 # A router + transform worker per inbound — spawned even for an inbound whose source
-                # failed to bind, so any crash-recovered ingress/routed backlog still drains (the source
-                # just isn't listening). They drain ingress→routed→outbound, independent of listen state.
+                # failed to bind OR was DR-filtered, so any crash-recovered ingress/routed backlog still
+                # drains (the source just isn't listening). They drain ingress→routed→outbound,
+                # independent of listen state (AC-3: a filtered inbound still drains its backlog).
                 for name in self.registry.inbound:
                     self._ensure_inbound_workers(name)
             except Exception:
@@ -758,6 +917,21 @@ class RegistryRunner:
                 await self._teardown_unsafe()
                 raise
             self._running = True
+            if self._dr_threshold is not None:
+                # DR run-profile filter summary (#61, ADR 0048): log the curated critical set up front so
+                # an operator can audit which feeds are live and which are deliberately parked on EVERY
+                # failover, rather than discovering a mis-tagged feed only when it is absent under load.
+                total = len(self.registry.inbound) + len(self.registry.outbound)
+                started = total - len(self._filtered)
+                log.warning(
+                    "DR run-profile threshold=%s: %d of %d connection(s) started; %d below-threshold "
+                    "filtered (status:filtered, not failed): %s",
+                    self._dr_threshold.value,
+                    started,
+                    total,
+                    len(self._filtered),
+                    ", ".join(sorted(self._filtered)) or "(none)",
+                )
             if self._failed:
                 log.warning(
                     "wiring started DEGRADED: %d inbound, %d outbound connection(s); "
@@ -949,9 +1123,23 @@ class RegistryRunner:
             self._ordering[name] = oc.ordering or self._ordering_default
             self._internal_error[name] = oc.internal_error or self._internal_error_default
             self._buildup[name] = oc.buildup or self._buildup_default
+            self._stall[name] = oc.stall or self._stall_default
             self._simulate[name] = self._resolve_simulate(name, oc)
             worker = self._workers.get(name)
             failed = name in self._failed  # ADR 0031: live worker, but no connector (start failed)
+            # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
+            # below-threshold outbound keeps (or gets) its delivery worker but NO live connector — its
+            # routed rows queue + back off + self-heal on the next full startup, exactly the parked-lane
+            # behavior. Close any live connector from a prior (non-DR) run so it stops delivering.
+            if self._dr_filters_out(name, oc.priority):
+                stale = self._destinations.pop(name, None)
+                if stale is not None:
+                    await stale.aclose()
+                self._failed.pop(name, None)
+                if worker is None or worker.done():
+                    self._spawn_worker(name)
+                continue
+            self._filtered.pop(name, None)
             if worker is None or worker.done():
                 # added (or replacing a crashed worker): close any stale connector, build + spawn.
                 stale = self._destinations.pop(name, None)
@@ -1014,7 +1202,17 @@ class RegistryRunner:
                 self._lookup_executor = self._build_lookup_executor()
                 if old_lookup_executor is not None:
                     await old_lookup_executor.aclose()
+                # The FHIR-read executor holds no pools (a shared, stateless opener), so no aclose: just
+                # rebuild it from the new graph (None when the new graph declares no FhirLookup).
+                self._fhir_lookup_executor = self._build_fhir_lookup_executor()
                 for ic in new_registry.inbound.values():
+                    # DR run-profile (#61, ADR 0048): a reload re-evaluates the whole graph against the
+                    # threshold (the profile is a per-run decision read at start/reload), so a
+                    # below-threshold inbound stays parked (status:"filtered") and is not re-bound; its
+                    # workers below still drain any backlog. No DR profile → byte-identical to before.
+                    if self._dr_filters_out(ic.name, ic.priority):
+                        continue
+                    self._filtered.pop(ic.name, None)
                     await self._start_inbound_unsafe(ic.name)
                 # 2b. Ensure the router + transform workers run for every inbound in the new graph.
                 # Workers read self.registry live, so a Router/Handler change applies to rows processed
@@ -1060,6 +1258,129 @@ class RegistryRunner:
             return await self._handle_inbound(ic, raw)
 
         return on_message
+
+    def _make_http_handler(self, ic: InboundConnection):  # type: ignore[no-untyped-def]
+        # The HTTP listen source (ADR 0023) needs the engine message_id back so its 202 respond-with-
+        # receipt can carry it (AC-2) — distinct from the MLLP/TCP handler, whose str return is a wire
+        # REPLY to frame. So HTTP gets its own handler returning the committed message_id (or None when
+        # the body was NOT committed: a recorded ERROR from a decode/size guard). The receipt semantics
+        # (which the source maps to 202/4xx) are HTTP's own response logic, exactly as the HL7 ACK is
+        # MLLP's — the ingress commit + count-and-log + disposition machine are the SAME as _handle_inbound.
+        async def on_request(raw: bytes) -> str | None:
+            return await self._handle_inbound_http(ic, raw)
+
+        return on_request
+
+    async def _handle_inbound_http(self, ic: InboundConnection, raw: bytes) -> str | None:
+        """Commit a POSTed HTTP body to the ingress stage and return the engine ``message_id`` (the
+        first-slice receipt, ADR 0023 D3). Returns ``None`` when the body was NOT committed — a
+        decode/size-guard failure that recorded an ``ERROR`` (count-and-log: still persisted, never
+        accepted-and-dropped). The source maps a returned id to a ``202`` and a ``None`` here to a ``202``
+        without an id (the engine guard already recorded the disposition; a pre-ingress
+        oversize/malformed/allowlist refusal is the source's own synchronous ``4xx`` BEFORE this runs).
+
+        Shares the SAME store calls, size ceiling, decode handling, and disposition machine as
+        :meth:`_handle_inbound`; it differs only in returning the id instead of a wire ACK and in not
+        building an HL7 ACK frame (HTTP is the carrier, the 202 is the receipt)."""
+        src = ic.spec.type.value
+        hl7v2 = ic.content_type is ContentType.HL7V2
+
+        if not hl7v2 and ic.content_type.is_binary:
+            # Binary ingress (ADR 0028) — base64-carry at the boundary; never text-decode. Engine size
+            # ceiling on the RAW bytes (SEC-017), mirroring _handle_inbound. ERROR + None on overrun.
+            if len(raw) > _INGRESS_MAX_BYTES:
+                await self.store.record_received(
+                    channel_id=ic.name,
+                    raw=raw.decode("latin-1"),
+                    status=MessageStatus.ERROR,
+                    error=f"ingress exceeds max size ({len(raw)} > {_INGRESS_MAX_BYTES} bytes)",
+                    source_type=src,
+                    message_type=ic.content_type.value,
+                )
+                return None
+            mid = await self.store.enqueue_ingress(
+                channel_id=ic.name,
+                raw=RawMessage.from_bytes(raw, ic.content_type.value).raw,
+                control_id=None,
+                message_type=ic.content_type.value,
+                source_type=src,
+                summary=None,
+            )
+            self._ingress_work.set()
+            return mid
+
+        encoding = ic.spec.settings.get("encoding", "utf-8")
+        try:
+            text = (
+                normalize(raw, encoding=encoding, errors="strict")
+                if hl7v2
+                else raw.decode(encoding)
+            )
+        except UnicodeDecodeError as exc:
+            await self.store.record_received(
+                channel_id=ic.name,
+                raw=raw.decode("latin-1"),  # lossless byte view — the declared encoding rejected it
+                status=MessageStatus.ERROR,
+                error=f"decode error ({encoding}): {safe_exc(exc)}",
+                source_type=src,
+                message_type=None if hl7v2 else ic.content_type.value,
+            )
+            return None
+
+        if not hl7v2:
+            if len(text) > _INGRESS_MAX_BYTES:
+                await self.store.record_received(
+                    channel_id=ic.name,
+                    raw=text,
+                    status=MessageStatus.ERROR,
+                    error=f"ingress exceeds max size ({len(text)} > {_INGRESS_MAX_BYTES} bytes)",
+                    source_type=src,
+                    message_type=ic.content_type.value,
+                )
+                return None
+            mid = await self.store.enqueue_ingress(
+                channel_id=ic.name,
+                raw=text,
+                control_id=None,
+                message_type=ic.content_type.value,
+                source_type=src,
+                summary=None,
+            )
+            self._ingress_work.set()
+            return mid
+
+        # HL7-over-HTTP: parse (+ optional strict validate) before committing, recording ERROR on a
+        # malformed message exactly as MLLP does — but the synchronous response is the source's 202/4xx,
+        # not an HL7 ACK frame (the HL7-ACK-over-HTTP / SOAP-reply path is the deferred ADR 0013 seam).
+        try:
+            peek = Peek.parse(text)
+        except HL7PeekError as exc:
+            await self.store.record_received(
+                channel_id=ic.name,
+                raw=text,
+                status=MessageStatus.ERROR,
+                error=f"parse error: {safe_exc(exc)}",
+                source_type=src,
+            )
+            return None
+        if ic.validation.strict:
+            result = await asyncio.to_thread(
+                validate, text, expected_version=ic.validation.hl7_version
+            )
+            if not result.ok:
+                persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
+                await self._record(ic, peek, text, MessageStatus.ERROR, error=persisted)
+                return None
+        mid = await self.store.enqueue_ingress(
+            channel_id=ic.name,
+            raw=text,
+            control_id=peek.control_id,
+            message_type=peek.message_type,
+            source_type=src,
+            summary=summarize(peek) or None,
+        )
+        self._ingress_work.set()
+        return mid
 
     async def _handle_inbound(self, ic: InboundConnection, raw: bytes) -> str | None:
         ack_mode = ic.ack_mode
@@ -1339,6 +1660,7 @@ class RegistryRunner:
                         )
                         await self.store.mark_failed(item.id, detail, retry)
                         await self._maybe_alert_buildup(name)
+                        await self._maybe_alert_stall(name)
                         continue
                     # L1 pre-send leadership re-check (active-passive HA). The graph runs on the leader
                     # ONLY, but leadership can be lost (a self-fence) BETWEEN claiming this row and the
@@ -1379,11 +1701,13 @@ class RegistryRunner:
                         else:
                             await self.store.mark_failed(item.id, safe_exc(exc), retry)
                             await self._maybe_alert_buildup(name)
+                            await self._maybe_alert_stall(name)
                     except DeliveryError as exc:
                         # Transport failure (connect/IO/timeout/unparseable ACK) — transient; retry
                         # per policy (retry-forever by default, so nothing is silently lost).
                         await self.store.mark_failed(item.id, safe_exc(exc), retry)
                         await self._maybe_alert_buildup(name)
+                        await self._maybe_alert_stall(name)
                         # #46: edge-trigger connection_lost (+ throttled alert) on the lane going down.
                         self._note_lane_unhealthy(name, item.id, exc)
                     except Exception as exc:
@@ -1713,26 +2037,23 @@ class RegistryRunner:
                         # with attacker-influenced content (ReDoS, O(n^2) build, large fan-out); the old
                         # no-lookup fast-path ran it inline on the single loop, so one pathological message
                         # could stall every listener, worker, and the API. asyncio.to_thread copies THIS
-                        # context (the run_contexts views, plus the lookup runner when activated) into the
-                        # worker thread, so code_set()/reference()/state_get()/current_environment() — and
-                        # db_lookup() on the lookup path — all resolve there while the loop stays free.
+                        # context (the run_contexts views, plus the lookup runner(s) when activated) into
+                        # the worker thread, so code_set()/reference()/state_get()/current_environment() —
+                        # and db_lookup()/fhir_lookup() on the lookup path — resolve there while the loop
+                        # stays free.
                         content_type = self.registry.inbound[name].content_type.value
-                        if self._lookup_executor is not None:
-                            # The graph declares ≥1 DatabaseLookup, so a Handler may call db_lookup() — a
-                            # LIVE, synchronous DB read (ADR 0010). The runner bridges back onto the loop
-                            # (run_coroutine_threadsafe). db_lookup is the deliberate re-run-stability
-                            # exception (ADR 0009) and raises in dry-run.
-                            with db_lookup_activated(self._run_lookup):
-                                deliveries_preview, state_preview = await asyncio.to_thread(
-                                    transform_one,
-                                    self.registry,
-                                    hname,
-                                    item.payload,
-                                    content_type,
+                        # Activate whichever live-lookup runner(s) the graph declares so a Handler call to
+                        # db_lookup()/fhir_lookup() resolves inside the worker thread, bridging back onto the
+                        # loop (run_coroutine_threadsafe). Both are the deliberate re-run-stability exception
+                        # (ADR 0009/0010/0043) and raise in dry-run (no runner published there). When neither
+                        # is declared the transform still hops off the loop (SEC-013) and both calls raise.
+                        with ExitStack() as lookup_stack:
+                            if self._lookup_executor is not None:
+                                lookup_stack.enter_context(db_lookup_activated(self._run_lookup))
+                            if self._fhir_lookup_executor is not None:
+                                lookup_stack.enter_context(
+                                    fhir_lookup_activated(self._run_fhir_lookup)
                                 )
-                        else:
-                            # No DatabaseLookup declared → db_lookup() is unavailable (raises if called),
-                            # but the transform still hops off the loop for availability (no inline path).
                             deliveries_preview, state_preview = await asyncio.to_thread(
                                 transform_one,
                                 self.registry,
@@ -1848,6 +2169,34 @@ class RegistryRunner:
         except Exception:
             log.exception("alert sink raised on queue_buildup for %r", name)
 
+    async def _maybe_alert_stall(self, name: str) -> None:
+        """Raise a ``message_stall`` alert if an outbound lane's **oldest undelivered message** has aged
+        past the connection's resolved :class:`StallThreshold` (#50, Corepoint "Max Message Stall").
+
+        Modeled exactly on :meth:`_maybe_alert_buildup` but a single age dimension, and it **reuses the
+        same metric** — the oldest pending row's age (``delivered_age``) from ``store.pending_depth`` —
+        rather than inventing a new one. Off by default: ``StallThreshold.max_oldest_seconds is None``
+        disables it, so nothing fires unless an operator configures a threshold (deny-by-default). The
+        re-alert is throttled per connection so an ongoing stall reminds without spamming; the sink must
+        never raise (contract), but we guard so an alerting bug can't kill the worker."""
+        threshold = self._stall.get(name) or self._stall_default
+        if threshold.max_oldest_seconds is None:
+            return  # stall alerting disabled for this lane (deny-by-default)
+        now = time.time()
+        if now < self._next_stall_alert.get(name, 0.0):
+            return  # re-alert throttled
+        depth, oldest_created = await self.store.pending_depth(name, stage=Stage.OUTBOUND.value)
+        if depth == 0 or oldest_created is None:
+            return
+        oldest_age = now - oldest_created
+        if oldest_age < threshold.max_oldest_seconds:
+            return  # oldest message hasn't stalled long enough yet
+        self._next_stall_alert[name] = now + _BUILDUP_REALERT_SECONDS
+        try:
+            self._alert_sink.message_stall(name, oldest_age_seconds=oldest_age)
+        except Exception:
+            log.exception("alert sink raised on message_stall for %r", name)
+
     async def _wait_for_work(self, event: asyncio.Event) -> None:
         """Wait up to ``poll_interval`` for ``event`` (this worker class's wake event), then clear it.
         Per-class events mean a worker only clears its own signal, so one class can't swallow another's
@@ -1876,12 +2225,13 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
     # bind to the per-connection bind_address if set, else the service-level [inbound].bind_host. File
     # and other inbounds have no host and ignore this. A peer-IP allowlist rides into the connector's
     # settings so the listener can reject a non-allowlisted peer at accept time. (bind_address and the
-    # allowlist are MLLP/TCP/DIMSE/X12-only at wiring; all four are LISTEN types that bind an interface.)
+    # allowlist are MLLP/TCP/DIMSE/X12/HTTP-only at wiring; all five are LISTEN types that bind an iface.)
     if ic.spec.type in (
         ConnectorType.MLLP,
         ConnectorType.TCP,
         ConnectorType.X12,
         ConnectorType.DIMSE,
+        ConnectorType.HTTP,
     ):
         settings["host"] = ic.bind_address or bind_host
         if ic.source_ip_allowlist:
@@ -1966,6 +2316,16 @@ def build_check_registry(
         if resolved_lookups:
             # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
             DatabaseLookupExecutor(resolved_lookups)
+        resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
+        for fname, fspec in registry.fhir_lookups.items():
+            fsettings = resolve_env_settings(fspec.settings, env_values)
+            check_fhir_lookup_allowed(
+                fname, fsettings, egress
+            )  # fail-closed egress allowlist (ADR 0043)
+            resolved_fhir_lookups[fname] = fsettings
+        if resolved_fhir_lookups:
+            # Construct (and discard): validates each FHIR URL/TLS/SMART-auth without issuing a read.
+            FhirLookupExecutor(resolved_fhir_lookups)
     except WiringError:
         raise
     except Exception as exc:
@@ -2027,6 +2387,8 @@ def _allowlist_for(conn_type: ConnectorType, egress: EgressSettings) -> list[str
         return egress.allowed_db
     if conn_type is ConnectorType.REMOTEFILE:
         return egress.allowed_remote
+    if conn_type is ConnectorType.EMAIL:
+        return egress.allowed_smtp  # SMTP destination (ADR 0029)
     return []
 
 
@@ -2105,6 +2467,34 @@ def check_lookup_allowed(name: str, settings: Mapping[str, Any], egress: EgressS
             )
 
 
+def check_fhir_lookup_allowed(
+    name: str, settings: Mapping[str, Any], egress: EgressSettings
+) -> None:
+    """Fail-closed egress allowlist for a ``FhirLookup`` (it dials out to an HTTP(S) FHIR host for a live,
+    read-only ``fhir_lookup``, ADR 0043). Reuses ``[egress].allowed_http`` — the **exact arm** the FHIR
+    outbound + SMART token endpoint use (a read is an egress host) — checked at load/reload/start so the
+    engine is never pointed at a non-allowlisted FHIR server. ``settings`` are the already-``env()``-resolved
+    connection settings. Under ``[egress].deny_by_default`` an empty ``allowed_http`` refuses the read
+    outright — an un-allowlisted FHIR read can never dial out (the SSRF-shaped fail-open is closed)."""
+    if egress.deny_by_default and not egress.allowed_http:
+        raise WiringError(
+            f"FhirLookup {name!r}: [egress].deny_by_default is set and [egress].allowed_http is "
+            "empty — list the FHIR host to permit it"
+        )
+    if egress.allowed_http:
+        url = str(settings.get("url", ""))
+        if not _http_egress_allowed(
+            url, egress.allowed_http
+        ):  # same host[:port] matching as the FHIR outbound
+            host = urllib.parse.urlsplit(url).hostname or url
+            log.warning(
+                "connect denied: FhirLookup %r host %r not in [egress].allowed_http", name, host
+            )
+            raise WiringError(
+                f"FhirLookup {name!r}: host {host!r} is not in the [egress].allowed_http allowlist"
+            )
+
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
 
@@ -2131,6 +2521,35 @@ def check_mllp_tls_exposure(source: Source, name: str, *, allow_insecure_bind: b
         "cross the network in cleartext. Set tls=true (+ tls_cert_file/tls_key_file) on the MLLP "
         "connection, or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
         "firewalled network."
+    )
+
+
+def check_http_tls_exposure(source: Source, name: str, *, allow_insecure_bind: bool) -> None:
+    """Exposed-gate (ADR 0002 §0 / ADR 0023 §D4, HTTP side): refuse a **non-loopback inbound HTTP
+    listener without TLS** — it would put POSTed bodies (frequently PHI: HL7-over-HTTP, FHIR, X12) on the
+    wire in cleartext. The HTTP sibling of :func:`check_mllp_tls_exposure`. Like MLLP/DICOM the HTTP
+    source *does* support TLS, so the escape hatch is ``tls=true`` (+ cert) on the ``Http(...)``
+    connection; otherwise bind loopback or pass ``serve --allow-insecure-bind`` to accept the risk on a
+    trusted segment (then warn). Loopback binds and TLS-on binds pass unconditionally."""
+    if source.type is not ConnectorType.HTTP:
+        return
+    host = str(source.settings.get("host", "127.0.0.1"))
+    if host in _LOOPBACK_HOSTS or source.settings.get("tls"):
+        return
+    if allow_insecure_bind:
+        log.warning(
+            "inbound %r binds non-loopback host %r for an HTTP listener without TLS "
+            "(--allow-insecure-bind); POSTed bodies (frequently PHI) cross the network in cleartext — "
+            "set tls=true (+ tls_cert_file/tls_key_file) on the Http connection.",
+            name,
+            host,
+        )
+        return
+    raise WiringError(
+        f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; POSTed bodies "
+        "(frequently PHI) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
+        "tls_key_file) on the Http connection, or pass `serve --allow-insecure-bind` to accept the "
+        "cleartext risk on a trusted, firewalled network."
     )
 
 
@@ -2354,6 +2773,21 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
             raise WiringError(
                 f"outbound {dest.name!r}: REMOTEFILE host {host!r} is not in the "
                 "[egress].allowed_remote allowlist"
+            )
+    elif dest.type is ConnectorType.EMAIL and egress.allowed_smtp:
+        # SMTP destination (ADR 0029): the SMTP host is gated with the same host[:port] matching as
+        # MLLP/TCP/DB, so a fat-fingered or hostile mail relay can't exfiltrate PHI.
+        host = str(dest.settings.get("host", ""))
+        port = dest.settings.get("port", 587)
+        if not _mllp_egress_allowed(host, port, egress.allowed_smtp):  # same host[:port] matching
+            log.warning(
+                "egress denied: outbound %r EMAIL host %r not in [egress].allowed_smtp",
+                dest.name,
+                host,
+            )
+            raise WiringError(
+                f"outbound {dest.name!r}: EMAIL host {host!r} is not in the "
+                "[egress].allowed_smtp allowlist"
             )
 
 

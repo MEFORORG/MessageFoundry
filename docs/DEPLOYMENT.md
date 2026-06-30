@@ -137,6 +137,12 @@ MEFOR designs for the VIP and exposes the health-check/role endpoints, but **doe
 balancer** — you stand it up (keepalived, HAProxy, F5, a cloud NLB, …). Single-node deployments need
 none of this.
 
+**Cloud / Kubernetes HA:** for a multi-replica, Postgres-backed HA deployment on k8s — the copyable
+`replicas: 3` manifest, the L4-NLB-per-MLLP-port recipe (primary-only health check, no L7/HPA for MLLP),
+and the hybrid edge-relay topology — see [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md); for the cloud PHI /
+HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`](CLOUD-PHI-HIPAA.md)
+(both per [ADR 0047](adr/0047-cloud-kubernetes-ha-deployment-packaging.md)).
+
 ---
 
 ## Before you expose off-loopback
@@ -146,8 +152,11 @@ none of this.
    Keep `[auth].enabled = true` (a non-loopback bind with auth disabled is refused).
 2. **MLLP inbound** — set `tls = true` + `tls_cert_file`/`tls_key_file` per connection. A non-loopback
    MLLP bind without `tls` is refused (`check_mllp_tls_exposure`).
-3. **Raw TCP / X12 inbound** — **no transport TLS exists.** Keep these on loopback, or front them with a
-   TLS-terminating proxy / restrict to a trusted segment. See [no-TLS hazards](#no-tls-channels--hazards).
+3. **Raw TCP / X12 inbound** — **no transport TLS exists** (these connectors are plaintext-only). They
+   are, however, **exposed-gated** (since PR #558): a non-loopback raw-TCP/X12 bind is **refused at
+   startup** (`check_tcp_tls_exposure`), parity with the MLLP/DICOM/HTTP guards. Because there is no TLS
+   to enable, the only ways past the gate are a loopback bind, OS-level firewall/segmentation, or
+   `serve --allow-insecure-bind` (dev-only). See [no-TLS hazards](#no-tls-channels--hazards).
 4. **Outbound connectors** — they default to verified TLS where the protocol supports it. Do **not** set
    `MEFOR_ALLOW_INSECURE_TLS` in production (it is what lets you weaken verification — see
    [the escape hatch](#the-mefor_allow_insecure_tls-escape-hatch)).
@@ -172,8 +181,8 @@ authentication on the channel · **Egress gate** = the `[egress]` allow-list tha
 |---|---|---|---|---|---|
 | **Engine API** (FastAPI/uvicorn) | `[api].host` = `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC (required) | — (auth-gated) | **Yes** — refused without TLS or a trusted terminator; also refused if auth is disabled on a non-loopback bind |
 | **MLLP source** | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`; ≥TLS 1.2. **Plaintext by default** | None (MLLP has no app auth) | — | **Yes** — non-loopback plaintext refused (`check_mllp_tls_exposure`) |
-| **Raw TCP source** | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only | None | — | **No transport guard** — keep loopback or proxy-terminate |
-| **X12 source** (ISA/IEA framed) | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only (same socket plumbing as raw TCP) | None | — | **No transport guard** — keep loopback or proxy-terminate |
+| **Raw TCP source** | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only | None | — | **Yes** — non-loopback plaintext refused (`check_tcp_tls_exposure`, PR #558); no TLS to enable, so keep loopback / firewall-segment / proxy-terminate |
+| **X12 source** (ISA/IEA framed) | `[inbound].bind_host` = `127.0.0.1` | **No** — plaintext only (same socket plumbing as raw TCP) | None | — | **Yes** — non-loopback plaintext refused (`check_tcp_tls_exposure`, PR #558); keep loopback / firewall-segment / proxy-terminate |
 | **File source** | local filesystem | n/a (no network) | n/a | — | n/a |
 | **Database poll source** | connects to `[store]` DB | **Yes** — inherits the store DB connection TLS (`[store].encrypt` default true) | Store DB auth | `[egress].allowed_db` | n/a (outbound DB connection) |
 
@@ -212,8 +221,10 @@ there is for MLLP:
 
 **Deployment requirement:** run these on **loopback only**, or behind a **TLS-terminating proxy / on a
 trusted, isolated network segment**. If PHI flows over one of them off-host without that protection, it
-is exposed in cleartext. There is no startup guard that refuses a non-loopback raw-TCP/X12 bind, so this
-is an **operator responsibility**.
+is exposed in cleartext. A non-loopback raw-TCP/X12 bind **is refused at startup** (`check_tcp_tls_exposure`,
+PR #558) — but because these connectors have no TLS to enable, the gate's only passes are a loopback bind,
+OS-level firewall/segmentation, or the dev-only `serve --allow-insecure-bind`; choosing one of those (and
+keeping PHI off the cleartext wire) is the **operator responsibility**. Plain FTP has no such gate.
 
 ---
 
@@ -266,6 +277,11 @@ deny-by-default behavior is per-list, activated by populating it.)
 - **MLLP inbound** ([`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py),
   `check_mllp_tls_exposure`): a non-loopback MLLP source without `tls=true` raises a `WiringError` at
   wiring time (before the engine starts). Override (dev only): `serve --allow-insecure-bind`.
+- **DICOM C-STORE SCP / HTTP / raw-TCP / X12 inbound** (same module): siblings of the MLLP guard —
+  `check_dimse_tls_exposure`, `check_http_tls_exposure`, and `check_tcp_tls_exposure` (raw-TCP **and** X12,
+  shipped in PR #558) — each refuses a non-loopback bind without TLS at wiring time. raw-TCP/X12 are
+  plaintext-only, so for them the only passes are loopback, OS firewall/segmentation, or the dev-only
+  `--allow-insecure-bind`. So every inbound listen type is now exposed-gated.
 
 ---
 

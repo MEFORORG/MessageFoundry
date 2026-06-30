@@ -5,9 +5,27 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Nightly (03:17 UTC — off the top-of-hour rush) run of the long load-smoke legs ONLY. These were
+    # previously run on EVERY push to main; main still gets the full functional `test` matrix + the
+    # server-DB suites per push, but the multi-minute load runs (serve an engine + drive a load profile,
+    # x2 for the SQL Server majors) now run once a night instead of once per commit.
+    #   IMPORTANT: this cron must NOT drag the rest of the workflow along. Only `load-test` and
+    #   `load-test-sqlserver` fire on `schedule` (their `if:` is `schedule || workflow_dispatch`). Every
+    #   OTHER heavy job (test, ide, sqlserver-store, postgres-store, windows-service-smoke, docker-smoke)
+    #   gates its push/dispatch arm as `push || workflow_dispatch` — deliberately EXCLUDING `schedule` —
+    #   so the nightly run does not re-execute the full functional matrix + server-DB + 2x-Windows
+    #   service smoke (which would COST more than the per-push load savings; the original `!= 'pull_request'`
+    #   form would have swept them all into the cron). Trigger an on-demand load run with
+    #   `gh workflow run ci.yml --ref main` (workflow_dispatch) — that DOES run everything, by design.
+    - cron: "17 3 * * *"
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Per-ref group so a new push/PR-update supersedes its own in-flight run. The nightly `schedule` run
+  # gets a SEPARATE group (…-nightly): without this it would share `ci-refs/heads/main` with push-to-main
+  # and a routine daytime push would cancel-in-progress the in-flight nightly LOAD run — silently killing
+  # the very long-running coverage the cron exists to provide. Scheduled and push runs no longer collide.
+  group: ci-${{ github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
   cancel-in-progress: true
 
 # Least privilege: every job here only reads the repo and runs tests/builds (no gh writes, no git push,
@@ -22,10 +40,18 @@ jobs:
   # version we ship on the OS we ship it on is worth the minutes.
   test:
     name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    # `needs: changes` for the docs-only short-circuit ONLY — this REQUIRED job still RUNS on every PR
+    # and ALWAYS reports its context. On a docs-only PR `changes.outputs.code == 'false'` and the
+    # expensive steps (install/lint/type/test) are skipped, so the leg goes green in seconds; the
+    # required `test (…, py3.14)` context stays present + green. (changes never fails, so this needs
+    # edge can't wedge the required context.)
+    needs: changes
     runs-on: ${{ matrix.os }}
-    # Wall-clock backstop: bound each leg so a hung test fails in minutes, not the 6h default. The
-    # pytest-timeout watchdog (60s/test) should catch a culprit first; this is the belt-and-suspenders cap
-    # if a whole process ever deadlocks below pytest.
+    # Wall-clock backstop: bound each leg so a hung test fails in minutes, not the 6h default. Three
+    # nested watchdogs catch a hang at increasing scope (#55): the pytest-timeout per-test cap (60s,
+    # pyproject addopts) + the faulthandler belt fire FIRST and name the stuck frame; the pytest STEP
+    # has its own `timeout-minutes: 13` so a process-level deadlock below pytest fails the step fast;
+    # this job cap is the outermost belt if even that is somehow out-raced.
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -46,17 +72,32 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: pyproject.toml
+          # Key the pip cache on BOTH the project metadata and the resolved lockfile, so a dep bump (or a
+          # re-lock that only moves transitive pins) busts the cache and a no-op change reuses it. The
+          # install is `pip install -e ".[...]"` (reads pyproject); requirements.lock tracks the resolved
+          # graph CI actually exercises, so hashing it keeps the cache correct across re-locks.
+          cache-dependency-path: |
+            pyproject.toml
+            requirements.lock
+
+      # Everything below is gated on `code` (docs-only short-circuit) OR a push-to-main / on-demand run
+      # (full coverage). On a docs-only PR these steps no-op and the REQUIRED leg reports green in seconds.
+      # The job itself (and the Python/cache setup above) still runs, so the required context is always
+      # present. NB: the gate is duplicated per-step (a job-level `if` would SKIP the whole job and remove
+      # the required context) — keep the condition identical on each. The push/dispatch arm is written
+      # `push || workflow_dispatch` (NOT `!= 'pull_request'`) so the nightly `schedule` event does NOT
+      # re-run this full functional matrix — the cron is reserved for the long load legs only.
 
       # PySide6's offscreen platform plugin needs a few system libraries even
       # headless. Linux-only; Windows runners need no equivalent.
       - name: Install Qt offscreen system libraries
-        if: runner.os == 'Linux'
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
 
-      - name: Install project (dev + console + fhir + dicom extras)
+      - name: Install project (dev + console + fhir + dicom + x12 + xml extras)
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: |
           python -m pip install --upgrade pip
           # [fhir] so the FHIR typed-tier tests (incl. the PHI-no-leak invariant, ADR 0022) actually
@@ -64,21 +105,44 @@ jobs:
           # [dicom] (pydicom + pynetdicom; ADR 0025) does the same for the DICOM codec + C-STORE SCP
           # tests, and lets mypy type-check transports/dicom.py + parsing/dicom/ against the real
           # (py.typed) libraries rather than treating them as Any.
-          pip install -e ".[dev,console,fhir,dicom]"
+          # [x12] (pyx12) + [xml] (lxml/xmlschema/signxml) likewise so the strict X12 validation (#32)
+          # and the hardened XML/SOAP codec (#31) tests run their assertions instead of importorskip-skipping.
+          pip install -e ".[dev,console,fhir,dicom,x12,xml]"
 
       - name: Lint (ruff)
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: ruff check messagefoundry tests
 
       - name: Format check (ruff)
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: ruff format --check .
 
       - name: Type-check (mypy, strict)
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: mypy messagefoundry
 
+      # Step-level watchdog UNDER the 15-min job cap (#55): the windows-2022 leg intermittently
+      # wedges ~25% in (a Windows ProactorEventLoop listener-teardown / socket wait that the shared
+      # session event loop can't get past), emits no output for ~12 min, then the JOB cap CANCELS it
+      # — a red ✗ with no stack and no named test. Two belts make that fail FAST and NAMED instead:
+      #   * `--timeout-method=thread` (the ONLY method on Windows — SIGALRM is POSIX-only) dumps ALL
+      #     thread stacks at the per-test cap (60s, set in pyproject addopts), naming the stuck frame.
+      #   * PYTHONFAULTHANDLER=1 + `-o faulthandler_timeout=90` is the belt that fires even when the
+      #     thread-timer CANNOT interrupt a main-thread C-level wait (a Proactor overlapped op /
+      #     blocking accept / subprocess.wait): pytest's faulthandler plugin arms a separate watchdog
+      #     thread that dumps the NATIVE stack of every thread at 90s (> the 60s pytest-timeout, so the
+      #     per-test dump is attributed first; this is the last-resort stack when the thread method is
+      #     itself out-raced). NB the plugin exposes this as the `faulthandler_timeout` ini key, not a
+      #     `--faulthandler-*` CLI flag, so it is passed with `-o`; it only DUMPS (never kills), safe.
+      # The step `timeout-minutes: 13` is the outer backstop, well under the job's 15-min cap, so a
+      # hang both watchdogs somehow miss still fails the STEP (not the whole job at the silent cap).
       - name: Tests (pytest)
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        timeout-minutes: 13
         env:
           QT_QPA_PLATFORM: offscreen
-        run: pytest -q
+          PYTHONFAULTHANDLER: "1"
+        run: pytest -q -o faulthandler_timeout=90
 
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
   # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise
@@ -89,6 +153,13 @@ jobs:
   # deployment target.
   ide:
     name: ide build (${{ matrix.os }})
+    # `ide` is NOT a required check, so it may be SKIPPED at the job level on a docs-only PR (saves a
+    # Linux + a 2x-billed Windows leg every docs PR). It still runs on push-to-main / on-demand and on
+    # any code PR. ci-gate does NOT `needs: ide`, so a job-level skip here can't wedge any required
+    # context. The push/dispatch arm is `push || workflow_dispatch` (NOT `!= 'pull_request'`) so the
+    # nightly `schedule` event does NOT re-run the IDE build — the cron is reserved for the load legs.
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -134,18 +205,45 @@ jobs:
     outputs:
       serverdb: ${{ steps.f.outputs.serverdb }}
       docker: ${{ steps.f.outputs.docker }}
+      # `code` is the docs-only short-circuit signal: TRUE unless this PR touches ONLY non-code paths
+      # (Markdown / docs / licence / editorconfig / git metadata). It gates the EXPENSIVE STEPS of the
+      # required `test` legs (and the whole `ide` job) — the jobs still run + report their (required)
+      # context, but on a docs-only PR they skip install+lint+type+test and go green in seconds. TRUE on
+      # push-to-main / workflow_dispatch (full coverage); FALSE on the nightly `schedule` (load-legs-only
+      # cron — the functional matrix must not re-run nightly).
+      code: ${{ steps.f.outputs.code }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
       - id: f
+        # Hoist the two workflow expressions into env (zizmor: no `${{ }}` interpolated into the run body
+        # — a branch name / base sha is attacker-influenceable on a fork PR, so it must arrive as data).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          # Full coverage on a push-to-main or a manual dispatch: force every gate true so the whole
+          # workflow runs. The NIGHTLY `schedule` event is deliberately NOT here — on the cron only the
+          # two load legs should run, so `changes` reports code/serverdb/docker=FALSE and every job that
+          # ORs in one of these outputs (test steps, sqlserver-store, docker-smoke) stays skipped. This is
+          # the source-of-truth half of the "cron runs only the load legs" guard (the other half is each
+          # heavy job gating its push arm as `push || workflow_dispatch`, never `!= 'pull_request'`).
+          if [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
             echo "docker=true" >> "$GITHUB_OUTPUT"
+            echo "code=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          changed=$(git diff --name-only "${{ github.event.pull_request.base.sha }}...HEAD")
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            # Nightly load-only run: nothing here should trigger the functional / container legs.
+            echo "serverdb=false" >> "$GITHUB_OUTPUT"
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Remaining case: pull_request. Compute the path-based filters from the PR diff.
+          changed=$(git diff --name-only "$BASE_SHA...HEAD")
           if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/cluster|messagefoundry/transports/database|tests/test_(sqlserver|postgres|cluster|database_connector)|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
@@ -158,6 +256,26 @@ jobs:
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
           fi
+          # `code`: CONSERVATIVE docs-only detector. Default to running everything (code=true), and only
+          # short-circuit when EVERY changed path matches the docs/non-code allowlist below. We compute it
+          # by inverting: list the files that are NOT docs-only; if that list is empty (and the diff is
+          # non-empty), it's a docs-only PR. Anything outside the allowlist — any *.py, ide/**, config,
+          # lockfiles, OTHER workflows, scripts, samples, harness — counts as CODE and runs the full suite.
+          # A path appears in `changed` even if only deleted/renamed, so a pure doc rename still short-
+          # circuits, and a code deletion still runs.
+          #   Allowlisted (docs-only) paths: any *.md anywhere, docs/**, top-level LICENSE/NOTICE/AUTHORS,
+          #   .editorconfig, .gitignore/.gitattributes, .github/{ISSUE_TEMPLATE,PULL_REQUEST_TEMPLATE,...}.md.
+          # Be conservative: when in doubt a path is CODE. Empty diff (shouldn't happen on a PR) => code=true.
+          noncode='(\.md$|^docs/|^LICENSE$|^NOTICE$|^AUTHORS$|^\.editorconfig$|^\.gitignore$|^\.gitattributes$|^\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE))'
+          if [ -z "$changed" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          elif echo "$changed" | grep -qvE "$noncode"; then
+            # At least one changed path is NOT docs-only -> run the full suite.
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            # Every changed path is docs-only -> short-circuit the expensive steps.
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # SQL Server service-container leg: runs the gated suites that need a real SQL Server (Linux, so 1x
   # minutes) — the PRODUCTION store backend suite AND the PRODUCTION DATABASE connector round-trip
@@ -169,7 +287,10 @@ jobs:
   sqlserver-store:
     name: sql server (store + connector) ${{ matrix.label }}
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.serverdb == 'true'
+    # push-to-main / on-demand (full coverage), or a PR that touches the server-DB surface. NOT on the
+    # nightly `schedule` (the cron is reserved for the load legs only) — so written `push ||
+    # workflow_dispatch`, not `!= 'pull_request'`, which would have swept this container leg into the cron.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true'
     runs-on: ubuntu-latest
     # Matrix the gated suite across every supported SQL Server major (2022 = 16.x, 2025 = 17.x) so a
     # version-specific T-SQL / engine regression can't merge. fail-fast: false keeps a 2025-only hiccup
@@ -317,7 +438,9 @@ jobs:
   # LOCKED + advisory-lock concurrency the SQLite tests can't reach.
   postgres-store:
     name: postgres store
-    if: github.event_name != 'pull_request'
+    # push-to-main + on-demand only (NOT the nightly `schedule`, which is reserved for the load legs —
+    # `push || workflow_dispatch`, not `!= 'pull_request'`, keeps this container leg out of the cron).
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -390,7 +513,11 @@ jobs:
   # docs/LOAD-TESTING.md.
   load-test:
     name: load test (smoke, sqlite)
-    if: github.event_name != 'pull_request'
+    # Nightly schedule + on-demand only (was: every push to main). The PR gate is the in-process
+    # tests/test_load_runner.py in the `test` job; push-to-main keeps full functional + server-DB
+    # coverage. This multi-minute serve+load run no longer fires once per commit. NOT a required check,
+    # so dropping it from push is safe; ci-gate `needs` it but counts a `skipped` leg as a pass.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -446,7 +573,10 @@ jobs:
   # runs on push to main + on-demand (workflow_dispatch). Heavier SQL Server profiles run manually.
   load-test-sqlserver:
     name: load test (smoke, sqlserver) ${{ matrix.label }}
-    if: github.event_name != 'pull_request'
+    # Nightly schedule + on-demand only (was: every push to main); same rationale as `load-test`. The
+    # end-to-end SQL Server store path is still smoked nightly (x2 majors) + on demand, and the per-push
+    # SQL Server functional coverage stays in `sqlserver-store`. NOT required; ci-gate treats skip as pass.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     # Smoke the end-to-end SQL Server store path on every supported major (2022/2025). Push/dispatch-only,
     # so no PR cost; fail-fast: false keeps the two legs independent.
@@ -546,7 +676,10 @@ jobs:
   # minutes; runs on push to main and on-demand (workflow_dispatch).
   windows-service-smoke:
     name: windows service smoke (${{ matrix.os }}, py${{ matrix.python-version }})
-    if: github.event_name != 'pull_request'
+    # push-to-main + on-demand only (2x-billed Windows legs). NOT on the nightly `schedule` — the cron
+    # is reserved for the load legs, so this is `push || workflow_dispatch`, not `!= 'pull_request'`
+    # (which would have run these 2x-Windows legs every night for no added signal).
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -592,7 +725,14 @@ jobs:
           # install-service.ps1 -Environment threads it into the service command + resolves
           # environments/prod.toml). INFO not DEBUG: `serve` refuses DEBUG in prod (Gate #1 — DEBUG can
           # surface PHI); INFO is enough to smoke service start + MLLP.
-          .\scripts\service\install-service.ps1 -AppExe $exe -LogLevel INFO -Environment prod
+          # -LockConfigDir: the runner checks out samples/config with the default ACL, which grants
+          # BUILTIN\Users (S-1-5-32-545) write. The in-process config-source trust guard (SEC-003,
+          # wiring._assert_safe_config_source_windows) then REFUSES to load it ("writable-by-others
+          # path") and `serve` crash-loops to SERVICE_PAUSED, so /health never comes up. Locking the
+          # config dir (strip inheritance -> SYSTEM/Administrators only; the LocalSystem service still
+          # reads it) is the production-correct posture docs/SERVICE.md prescribes, and exercises the
+          # real -LockConfigDir install path rather than the MEFOR_ALLOW_INSECURE_CONFIG_SOURCE dev escape.
+          .\scripts\service\install-service.ps1 -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir
           # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
           # connector LOADS its client cert at wiring time, so the engine refuses to start the graph
           # without a readable cert+key. Mint a throwaway pair for the smoke — the smoke sends only an
@@ -705,7 +845,10 @@ jobs:
   docker-smoke:
     name: docker image smoke (slim, linux)
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.docker == 'true'
+    # push-to-main / on-demand (full coverage), or a PR that touches the image/locks/packaging. NOT on
+    # the nightly `schedule` (reserved for the load legs) — `push || workflow_dispatch`, not
+    # `!= 'pull_request'`, keeps the image build out of the cron.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

@@ -144,6 +144,25 @@ class RoleInfo(BaseModel):
     display_name: str
     description: str | None = None
     permissions: list[str]
+    #: True for the six fixed built-in roles, False for an admin-defined custom role (ADR 0045).
+    builtin: bool = True
+
+
+class CustomRoleRequest(BaseModel):
+    """Create/update an admin-defined custom role (ADR 0045): a named SUBSET of the existing Permission
+    catalog. The engine validates the subset (recognized perms only, non-empty, no carved-out
+    escalation primitive) and rejects otherwise."""
+
+    display_name: str = Field(max_length=_NAME_MAX)
+    description: str | None = Field(default=None, max_length=_NAME_MAX)
+    permissions: list[str] = Field(max_length=64)
+
+
+class CustomRoleInfo(BaseModel):
+    id: str
+    display_name: str
+    description: str | None = None
+    permissions: list[str]
 
 
 class AdGroupMapEntry(BaseModel):

@@ -76,8 +76,11 @@ Corepoint/Rhapsody, aligned with Mirth/IRIS. The gap is **packaging**, not capab
 5. **(nice-to-have) Off-box log/audit shipping is built but off-by-default + the syslog hop is plaintext.**
    Ephemeral pods mean local logs vanish — provide a reference TLS-forwarding sidecar/agent and flip it on
    in the prod-posture HA manifest. Also: **API TLS cert rotation needs a pod restart** (uvicorn builds the
-   context once; only MLLP certs hot-reload on `/config/reload`) — note it for rolling renewals. And add a
-   **startup TLS guard for raw-TCP/X12** listeners (today unguarded, unlike MLLP/DICOM/API).
+   context once; only MLLP certs hot-reload on `/config/reload`) — note it for rolling renewals. ~~And add a
+   **startup TLS guard for raw-TCP/X12** listeners (today unguarded, unlike MLLP/DICOM/API).~~
+   **[CORRECTION 2026-06-28 — ADR 0047]:** the raw-TCP/X12 startup TLS guard has since **shipped**
+   (`check_tcp_tls_exposure`, PR #558, 2026-06-26): a non-loopback raw-TCP/X12 listener is now refused at
+   start, parity with MLLP/DICOM/HTTP. This item is **done**, not a gap.
 
 **PHI/cloud posture is largely process, not code.** Loopback default, off-loopback bind guards, in-process
 TLS, MLLP-over-TLS, AES-256-GCM at-rest (`MEFOR_STORE_ENCRYPTION_KEY` + fail-closed `REQUIRE_ENCRYPTION`),
@@ -121,8 +124,11 @@ k8s-capable, hybrid-cloud via edge relay, no Windows, no per-comm-point license.
 4. **Cloud PHI/HIPAA secure-architecture doc** (BAA, HIPAA-eligible services, KMS at-rest, region pinning,
    private subnets/PrivateLink, no public MLLP) — anticipate the 2025 HIPAA Security Rule NPRM
    encryption/segmentation/inventory floor *(not finalized as of 2026-06, medium confidence)*.
-5. **Startup TLS guard for raw-TCP/X12/DICOM** (parallel to `check_mllp_tls_exposure`) + flip on TLS off-box
-   log forwarding in the prod-posture HA manifest.
+5. ~~**Startup TLS guard for raw-TCP/X12/DICOM** (parallel to `check_mllp_tls_exposure`)~~ **— DONE, see the
+   CORRECTION at §4 item 5: `check_tcp_tls_exposure` (raw-TCP/X12) shipped in PR #558 and the DICOM SCP guard
+   (`check_dimse_tls_exposure`) was already built.** Off-box log forwarding is **NOT** flipped on in the HA
+   manifest (ADR 0047): the `[logging]` syslog forwarder is plaintext (no TLS variant), so it must be paired
+   with a TLS sidecar/collector before any enablement — it is deliberately left out of the cloud manifest.
 
 **Relevant code/docs:** `docker/Dockerfile`, `docker/k8s/statefulset.yaml`, `docker/compose.yaml`,
 `docs/DEPLOYMENT.md`, `docs/CLUSTERING.md`, `docs/CONTAINER-EXPOSURE-EVALUATION.md`,

@@ -540,6 +540,74 @@ async def test_status_reports_engine_and_db(engine: Engine, client: httpx.AsyncC
     assert body["db"]["size_bytes"] > 0
 
 
+async def test_status_log_metering_absent_when_no_log_dir(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    # #50: with no [logging].log_dir configured (the engine logs to stdout under NSSM), the app-log
+    # metering field is absent/None — /status must degrade gracefully, never raise.
+    body = (await client.get("/status")).json()
+    assert body.get("logs") is None
+
+
+async def test_status_log_metering_present_when_log_dir_set(engine: Engine, tmp_path: Path) -> None:
+    # #50: with a log dir configured, /status meters its total file bytes + filesystem free space,
+    # mirroring the DB metrics' size_bytes / disk_free_bytes shape. Metadata only — no log content.
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_text("x" * 1234)
+    (log_dir / "engine.log.1").write_text("y" * 766)
+    app = create_app(engine, allow_no_auth=True, log_dir=str(log_dir))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        body = (await c.get("/status")).json()
+    assert body["logs"] is not None
+    assert body["logs"]["path"] == str(log_dir)
+    assert body["logs"]["size_bytes"] == 2000  # 1234 + 766
+    assert body["logs"]["disk_free_bytes"] > 0
+
+
+async def test_status_log_metering_graceful_when_dir_missing(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # A configured-but-missing log dir must not raise — the field comes back None.
+    app = create_app(engine, allow_no_auth=True, log_dir=str(tmp_path / "does_not_exist"))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        body = (await c.get("/status")).json()
+    assert body.get("logs") is None
+
+
+async def test_status_update_field_absent_by_default(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    # #30 (ADR 0026): with no update-check runner wired/passed (the default test engine), the additive
+    # /status `update` field is None — the existing payload is unchanged when off.
+    body = (await client.get("/status")).json()
+    assert body.get("update") is None
+
+
+async def test_status_update_field_surfaces_diff(engine: Engine, client: httpx.AsyncClient) -> None:
+    # #30 (ADR 0026): when the no-network diff finds a newer pinned version, /status carries the
+    # version strings + the bool (PHI-free). Drive the runner with an injected pinned source so the
+    # test doesn't depend on the installed distribution metadata.
+    from messagefoundry.config.settings import UpdateCheckSettings
+    from messagefoundry.pipeline.update_check import UpdateCheckRunner
+
+    runner = UpdateCheckRunner(
+        UpdateCheckSettings(),
+        current_version="0.0.1",
+        pinned_source=lambda: "9.9.9",
+    )
+    runner.run_once()
+    engine._update_check_runner = runner  # the engine would wire this in start()
+    body = (await client.get("/status")).json()
+    assert body["update"] == {
+        "current_version": "0.0.1",
+        "pinned_version": "9.9.9",
+        "update_available": True,
+    }
+
+
 async def test_integrity_check_endpoint(engine: Engine, client: httpx.AsyncClient) -> None:
     r = await client.post("/status/integrity-check")
     assert r.status_code == 200

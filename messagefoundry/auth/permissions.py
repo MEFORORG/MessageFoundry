@@ -15,6 +15,7 @@ endpoints can be gated the moment they land, without a roles migration.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from enum import Enum
 
@@ -33,6 +34,7 @@ class Permission(str, Enum):
     CONNECTIONS_TEST = (
         "connections:test"  # probe a connection's reachability (POST /connections/{name}/test)
     )
+    DR_OPERATE = "dr:operate"  # promote/release a third-tier DR standby (POST /dr/activate|release, ADR 0048)
     CONFIG_DEPLOY = "config:deploy"  # endpoint lands in a later effort
     CONFIG_VALIDATE = "config:validate"  # endpoint lands in a later effort
     CODE_EDIT = "code:edit"  # endpoint lands in a later effort
@@ -120,4 +122,90 @@ def permissions_for_roles(roles: Iterable[Role]) -> frozenset[Permission]:
     granted: set[Permission] = set()
     for role in roles:
         granted |= BUILTIN_ROLE_PERMISSIONS.get(role, frozenset())
+    return frozenset(granted)
+
+
+# --- custom (admin-defined) roles (ADR 0045) ---------------------------------
+# A custom role is an admin-defined named SUBSET of the EXISTING Permission catalog (no new permission
+# kinds). It is an *additive overlay*: the six fixed built-ins above stay verbatim; a custom role can
+# only ever grant capabilities the catalog already defines. These helpers are the single resolver +
+# validator for that subset so deny-by-default is enforced in exactly one place.
+
+#: Prefix a custom role id must carry, so it can never collide with a built-in :class:`Role` value and
+#: be mis-routed to the built-in resolver (ADR 0045 "Built-in id collision").
+CUSTOM_ROLE_ID_PREFIX = "custom:"
+
+#: Permissions a custom role may **not** grant — privilege-escalation primitives the fixed
+#: ``ADMINISTRATOR`` deliberately gates (ADR 0045 D1). ``USERS_MANAGE`` is the permission that mints
+#: roles (a custom role holding it could grant itself admin-equivalent power); ``APPROVALS_APPROVE`` is
+#: dual-control release; ``DR_OPERATE`` (ADR 0048) promotes/releases a whole third-tier DR standby box
+#: (a site-failover-grade action). All stay admin-only.
+CUSTOM_ROLE_FORBIDDEN_PERMISSIONS: frozenset[Permission] = frozenset(
+    {Permission.USERS_MANAGE, Permission.APPROVALS_APPROVE, Permission.DR_OPERATE}
+)
+
+
+def is_custom_role_id(role_id: str) -> bool:
+    """True iff ``role_id`` is a custom-role id (carries :data:`CUSTOM_ROLE_ID_PREFIX`) and is therefore
+    resolved from the persisted ``roles.permissions`` set rather than :data:`BUILTIN_ROLE_PERMISSIONS`."""
+    return role_id.startswith(CUSTOM_ROLE_ID_PREFIX)
+
+
+class CustomRoleError(ValueError):
+    """A proposed custom-role permission set is invalid (empty, unknown, or a carved-out capability)."""
+
+
+def validate_custom_role_permissions(values: Iterable[str]) -> list[Permission]:
+    """Validate an admin-proposed custom-role permission set and return it as sorted ``Permission``s.
+
+    Enforces the ADR 0045 D1 rules on write (the API gates this behind ``USERS_MANAGE``):
+    every value must be a recognized catalog ``Permission`` (no new permission kinds), the set may
+    not be empty, and it may not contain a carved-out escalation primitive
+    (:data:`CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`). Raises :class:`CustomRoleError` otherwise.
+    """
+    perms: set[Permission] = set()
+    unknown: list[str] = []
+    for value in values:
+        try:
+            perms.add(Permission(value))
+        except ValueError:
+            unknown.append(value)
+    if unknown:
+        raise CustomRoleError(f"unknown permission(s): {', '.join(sorted(set(unknown)))}")
+    if not perms:
+        raise CustomRoleError("a custom role must grant at least one permission")
+    forbidden = perms & CUSTOM_ROLE_FORBIDDEN_PERMISSIONS
+    if forbidden:
+        raise CustomRoleError(
+            "permission(s) not assignable to a custom role: "
+            + ", ".join(sorted(p.value for p in forbidden))
+        )
+    return sorted(perms, key=lambda p: p.value)
+
+
+def decode_custom_role_permissions(raw: str | None) -> frozenset[Permission]:
+    """Decode a persisted ``roles.permissions`` JSON array into a deny-by-default ``Permission`` set.
+
+    Defensive against an untrusted/hand-edited DB row (ADR 0045 D3): a missing/malformed/non-list JSON
+    yields the empty set, and any value not in the current ``Permission`` catalog — or a carved-out
+    escalation primitive that somehow reached storage — is **dropped** (grants nothing). A custom role
+    is never trusted to widen the trust surface, only to re-bundle existing capabilities.
+    """
+    if not raw:
+        return frozenset()
+    try:
+        values = json.loads(raw)
+    except (ValueError, TypeError):
+        return frozenset()
+    if not isinstance(values, list):
+        return frozenset()
+    granted: set[Permission] = set()
+    for value in values:
+        try:
+            perm = Permission(value)
+        except ValueError:
+            continue
+        if perm in CUSTOM_ROLE_FORBIDDEN_PERMISSIONS:
+            continue  # belt-and-braces: a forbidden perm in storage still grants nothing
+        granted.add(perm)
     return frozenset(granted)

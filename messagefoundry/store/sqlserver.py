@@ -36,8 +36,11 @@ from messagefoundry.config.settings import (
     StoreSettings,
     insecure_tls_allowed,
 )
+from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
+from messagefoundry.store.base import warm_pool_connections, warm_pool_target
+from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -47,7 +50,9 @@ from messagefoundry.store.crypto import (
     IdentityCipher,
     cipher_info,
 )
+from messagefoundry.store.document_strip import StripResult, cutoff_for
 from messagefoundry.store.store import (
+    AlertInstance,
     ConnectionEvent,
     ConnectionMetrics,
     DbStatus,
@@ -55,6 +60,7 @@ from messagefoundry.store.store import (
     InboundMetrics,
     LatencyHistogram,
     CapturedResponse,
+    MessageSearchResult,
     MessageStatus,
     MessageStore,
     OutboxItem,
@@ -63,6 +69,7 @@ from messagefoundry.store.store import (
     Stage,
     UserRecord,
     _append_channel_scope,
+    _qmark_cutoff_case,
     audit_row_hash,
     delivery_key,
 )
@@ -82,7 +89,8 @@ _SCHEMA: list[str] = [
         id NVARCHAR(64) NOT NULL PRIMARY KEY, channel_id NVARCHAR(256) NOT NULL,
         received_at FLOAT NOT NULL, source_type NVARCHAR(64) NULL, control_id NVARCHAR(256) NULL,
         message_type NVARCHAR(64) NULL, raw NVARCHAR(MAX) NOT NULL, status NVARCHAR(32) NOT NULL,
-        error NVARCHAR(MAX) NULL, summary NVARCHAR(MAX) NULL, metadata NVARCHAR(MAX) NULL)""",
+        error NVARCHAR(MAX) NULL, summary NVARCHAR(MAX) NULL, metadata NVARCHAR(MAX) NULL,
+        documents_pruned FLOAT NULL)""",
     """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_channel','IndexID') IS NULL
         CREATE INDEX ix_messages_channel ON messages(channel_id, received_at)""",
     """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_control','IndexID') IS NULL
@@ -134,6 +142,10 @@ _SCHEMA: list[str] = [
     # Sch-M lock on the hot queue table (review). lock_escalation 2 = DISABLE.
     """IF (SELECT lock_escalation FROM sys.tables WHERE object_id=OBJECT_ID('queue')) <> 2
         ALTER TABLE queue SET (LOCK_ESCALATION = DISABLE)""",
+    # #47/ADR 0042: messages.documents_pruned (the "embedded doc evicted vs never present" flag). NULL on
+    # existing rows = never pruned; COL_LENGTH-gated like the others so a re-open is a no-op.
+    """IF COL_LENGTH('messages','documents_pruned') IS NULL
+        ALTER TABLE messages ADD documents_pruned FLOAT NULL""",
     # Store-once-deliver-many (L2b): body_ref on a pre-existing queue (NULL = body inline, byte-identical).
     """IF COL_LENGTH('queue','body_ref') IS NULL
         ALTER TABLE queue ADD body_ref NVARCHAR(64) NULL""",
@@ -159,6 +171,23 @@ _SCHEMA: list[str] = [
         peer_host NVARCHAR(256) NULL, message_id NVARCHAR(64) NULL, reason NVARCHAR(MAX) NULL)""",
     """IF INDEXPROPERTY(OBJECT_ID('connection_event'),'ix_connection_event_conn','IndexID') IS NULL
         CREATE INDEX ix_connection_event_conn ON connection_event(connection, ts)""",
+    # Operator alert-state (ADR 0044, #56) — resolvable alert INSTANCES (open/acknowledged/resolved +
+    # first/last_seen + count). METADATA-ONLY: type/connection/severity/scrubbed reason (CIPHERED at rest,
+    # rides the id-keyed nullable cipher loop, like connection_event.reason). De-duped on ADR 0014's
+    # (event_type, connection) throttle key via the FILTERED unique index (one LIVE instance per key;
+    # resolved rows drop out so the key re-opens). id-keyed BIGINT IDENTITY (NOT a queue stage → invisible
+    # to the finalizer's `FROM queue` scan). count is [count] (reserved-ish; bracket-quoted for parity).
+    """IF OBJECT_ID('alert_instance','U') IS NULL CREATE TABLE alert_instance (
+        id BIGINT IDENTITY(1,1) PRIMARY KEY, event_type NVARCHAR(64) NOT NULL,
+        connection NVARCHAR(256) NOT NULL, severity NVARCHAR(16) NOT NULL,
+        status NVARCHAR(16) NOT NULL, first_seen FLOAT NOT NULL, last_seen FLOAT NOT NULL,
+        [count] BIGINT NOT NULL, reason NVARCHAR(MAX) NULL, acked_by NVARCHAR(256) NULL,
+        acked_at FLOAT NULL, resolved_at FLOAT NULL)""",
+    """IF INDEXPROPERTY(OBJECT_ID('alert_instance'),'ux_alert_instance_open','IndexID') IS NULL
+        CREATE UNIQUE INDEX ux_alert_instance_open ON alert_instance(event_type, connection)
+        WHERE status <> 'resolved'""",
+    """IF INDEXPROPERTY(OBJECT_ID('alert_instance'),'ix_alert_instance_status','IndexID') IS NULL
+        CREATE INDEX ix_alert_instance_status ON alert_instance(status, connection)""",
     # Transform-accessible state (ADR 0005). Written here via transform_handoff (parity with SQLite/
     # Postgres): the read-through cache is loaded at open and refreshed post-commit, so a Handler's
     # cross-message state_get(...) resolves in-process. Schema matches SQLite.
@@ -209,7 +238,12 @@ _SCHEMA: list[str] = [
         ALTER TABLE users ADD last_totp_step INT NULL""",
     """IF OBJECT_ID('roles','U') IS NULL CREATE TABLE roles (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, display_name NVARCHAR(128) NOT NULL,
-        description NVARCHAR(512) NULL, builtin BIT NOT NULL DEFAULT 1)""",
+        description NVARCHAR(512) NULL, builtin BIT NOT NULL DEFAULT 1,
+        permissions NVARCHAR(MAX) NULL)""",
+    # Custom RBAC roles (ADR 0045): roles.permissions on a pre-existing DB. COL_LENGTH-gated; NULL on
+    # existing built-in rows = resolves from code (byte-identical). Idempotent.
+    """IF COL_LENGTH('roles','permissions') IS NULL
+        ALTER TABLE roles ADD permissions NVARCHAR(MAX) NULL""",
     """IF OBJECT_ID('user_roles','U') IS NULL CREATE TABLE user_roles (
         user_id NVARCHAR(64) NOT NULL, role_id NVARCHAR(64) NOT NULL, assigned_at FLOAT NOT NULL,
         assigned_by NVARCHAR(256) NULL, CONSTRAINT pk_user_roles PRIMARY KEY (user_id, role_id))""",
@@ -494,6 +528,7 @@ class SqlServerStore:
             ("queue", "last_error"),
             ("message_events", "detail"),
             ("connection_event", "reason"),  # #46: id-keyed (BIGINT IDENTITY), nullable — H4 parity
+            ("alert_instance", "reason"),  # #56 (ADR 0044): id-keyed (BIGINT IDENTITY), nullable
         ):
             while True:
                 rows = await self._fetchall(
@@ -624,6 +659,23 @@ class SqlServerStore:
     async def close(self) -> None:
         self._pool.close()
         await self._pool.wait_closed()
+
+    async def warm_pool(self) -> None:
+        # Pre-open pooled ODBC connections so the post-promotion delivery burst (or a cold start) doesn't
+        # pay cold connects (TCP + TLS + SQL login — the 340-958 ms acquires the dogfood box measured
+        # stretching failover recovery) on the hot path. Gated by [store].warm_pool; the target is capped
+        # so a warm never pins more than half the pool, leaving slots for the concurrent startup work
+        # (reset_stale_inflight / reference materialize / the coordinator). See QueueStore.warm_pool.
+        if not self._settings.warm_pool:
+            return
+        warmed = await warm_pool_connections(
+            self._pool,
+            target=warm_pool_target(self._pool.maxsize, self._settings.warm_pool_target),
+            timeout=self._settings.warm_pool_timeout,
+            backend="sqlserver",
+        )
+        if warmed:
+            log.info("sqlserver: pre-warmed %d pooled connection(s)", warmed)
 
     # --- helpers -------------------------------------------------------------
 
@@ -1651,6 +1703,169 @@ class SqlServerStore:
             for r in rows
         ]
 
+    # --- operator alert-state (ADR 0044, #56) --------------------------------
+    # >>> alert_instance block (#56) — self-contained; the coordinator integrates the store files <<<
+    async def upsert_alert_instance(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        severity: str,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
+        # (event_type, connection) key. UPDATE-then-conditional-INSERT in one serializable transaction
+        # (matching the SQLite path): the filtered unique index keeps it to one LIVE instance per key. The
+        # caller wraps it fail-soft. reason rides safe_text + the cipher.
+        now = time.time() if now is None else now
+        reason_enc = self._enc(safe_text(reason)[:200]) if reason else None
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "UPDATE alert_instance SET last_seen=?, [count]=[count]+1, severity=?, reason=?"
+                    " WHERE event_type=? AND connection=? AND status<>'resolved'",
+                    (now, severity, reason_enc, event_type, connection),
+                )
+                if cur.rowcount == 0:
+                    await cur.execute(
+                        "INSERT INTO alert_instance"
+                        " (event_type, connection, severity, status, first_seen, last_seen,"
+                        " [count], reason) VALUES (?,?,?,'open',?,?,1,?)",
+                        (event_type, connection, severity, now, now, reason_enc),
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def list_active_alert_instances(
+        self,
+        *,
+        limit: int = 200,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> list[AlertInstance]:
+        limit = max(1, min(limit, 1000))  # server-side clamp
+        where = ["status IN ('open','acknowledged')"]
+        params: list[Any] = [limit]  # TOP (?) is the first placeholder
+        if allowed_channels is not None:
+            _append_channel_scope(where, params, "connection", allowed_channels)
+        clause = " WHERE " + " AND ".join(where)
+        rows = await self._fetchall(
+            "SELECT TOP (?) id, event_type, connection, severity, status, first_seen, last_seen,"
+            f" [count] AS count, reason, acked_by, acked_at, resolved_at FROM alert_instance{clause}"
+            " ORDER BY last_seen DESC, id DESC",
+            tuple(params),
+        )
+        return [self._alert_instance_row(r) for r in rows]
+
+    async def get_alert_instance(
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+    ) -> AlertInstance | None:
+        where = ["id=?"]
+        params: list[Any] = [alert_id]
+        if allowed_channels is not None:
+            _append_channel_scope(where, params, "connection", allowed_channels)
+        clause = " WHERE " + " AND ".join(where)
+        row = await self._fetchone(
+            "SELECT id, event_type, connection, severity, status, first_seen, last_seen,"
+            f" [count] AS count, reason, acked_by, acked_at, resolved_at FROM alert_instance{clause}",
+            tuple(params),
+        )
+        return self._alert_instance_row(row) if row is not None else None
+
+    def _alert_instance_row(self, r: dict[str, Any]) -> AlertInstance:
+        return AlertInstance(
+            id=int(r["id"]),
+            event_type=r["event_type"],
+            connection=r["connection"],
+            severity=r["severity"],
+            status=r["status"],
+            first_seen=float(r["first_seen"]),
+            last_seen=float(r["last_seen"]),
+            count=int(r["count"]),
+            reason=self._dec(r["reason"]),
+            acked_by=r["acked_by"],
+            acked_at=r["acked_at"],
+            resolved_at=r["resolved_at"],
+        )
+
+    async def ack_alert_instance(
+        self, alert_id: int, *, actor: str, now: float | None = None
+    ) -> bool:
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "UPDATE alert_instance SET status='acknowledged', acked_by=?, acked_at=?"
+                    " WHERE id=? AND status<>'resolved'",
+                    (actor, now, alert_id),
+                )
+                changed = cur.rowcount
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(changed) > 0
+
+    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "UPDATE alert_instance SET status='resolved', resolved_at=?"
+                    " WHERE id=? AND status<>'resolved'",
+                    (now, alert_id),
+                )
+                changed = cur.rowcount
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(changed) > 0
+
+    async def resolve_alert_instances_for(
+        self, *, event_type: str, connection: str, now: float | None = None
+    ) -> int:
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "UPDATE alert_instance SET status='resolved', resolved_at=?"
+                    " WHERE event_type=? AND connection=? AND status<>'resolved'",
+                    (now, event_type, connection),
+                )
+                changed = cur.rowcount
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(changed)
+
+    async def count_open_alerts_by_connection(self) -> dict[str, int]:
+        rows = await self._fetchall(
+            "SELECT connection, COUNT(*) AS n FROM alert_instance"
+            " WHERE status='open' GROUP BY connection"
+        )
+        return {r["connection"]: int(r["n"]) for r in rows}
+
+    async def purge_alert_instances(self, *, older_than: float, now: float | None = None) -> int:
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "DELETE FROM alert_instance WHERE status='resolved' AND resolved_at IS NOT NULL"
+                    " AND resolved_at < ?",
+                    (older_than,),
+                )
+                purged = cur.rowcount
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return int(purged)
+
+    # <<< end alert_instance block (#56) >>>
+
     async def ingress_handoff(
         self,
         *,
@@ -1978,6 +2193,7 @@ class SqlServerStore:
             ("queue", "last_error"),
             ("message_events", "detail"),
             ("connection_event", "reason"),  # #46: rotate the scrubbed event reason too (H4 parity)
+            ("alert_instance", "reason"),  # #56 (ADR 0044): rotate the scrubbed alert reason too
         ):
             while True:
                 rows = await self._fetchall(
@@ -2068,12 +2284,27 @@ class SqlServerStore:
             log.info("re-encrypted %d row(s) to the active key", total)
         return total
 
-    async def purge_message_bodies(self, *, older_than: float, now: float | None = None) -> int:
+    async def purge_message_bodies(
+        self,
+        *,
+        older_than: float,
+        now: float | None = None,
+        connection_cutoffs: Mapping[str, float] | None = None,
+    ) -> int:
         """Blank message bodies (and terminal outbound payloads + event details) for messages received
         before ``older_than`` whose queue rows are all terminal — retention (PHI.md §8). Bodies are
         blanked to '' (not deleted) so the cipher re-encrypt scans skip them and the FK to messages
         stays intact. The eligible set is materialized ONCE so all three tables purge exactly the same
-        messages. Returns the number of message bodies blanked."""
+        messages. Returns the number of message bodies blanked.
+
+        ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``channel_id``
+        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical to
+        the prior behaviour. The per-connection cutoff only narrows the #eligible set (AND-ed with the
+        unchanged in-flight guard), so the downstream UPDATEs are untouched."""
+        # Per-connection cutoff (#34): bare "?" (global) when no override, else a CASE on m.channel_id.
+        cutoff_sql, cutoff_params = _qmark_cutoff_case(
+            "m.channel_id", older_than, connection_cutoffs
+        )
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 # CREATE (no params) so the temp table lives at CONNECTION scope; a parameterized
@@ -2081,10 +2312,10 @@ class SqlServerStore:
                 # before the UPDATEs). The parameterized INSERT below still populates it.
                 await cur.execute("CREATE TABLE #eligible (id NVARCHAR(64) PRIMARY KEY)")
                 await cur.execute(
-                    "INSERT INTO #eligible SELECT id FROM messages m WHERE m.received_at < ?"
+                    f"INSERT INTO #eligible SELECT id FROM messages m WHERE m.received_at < {cutoff_sql}"
                     " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id=m.id"
                     " AND q.status IN (?, ?))",
-                    (older_than, OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value),
+                    (*cutoff_params, OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value),
                 )
                 await cur.execute(
                     "UPDATE messages SET raw='', summary=NULL, error=NULL"
@@ -2114,6 +2345,73 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         return int(purged) if purged is not None else 0
+
+    async def strip_embedded_documents(
+        self,
+        *,
+        older_than: float,
+        now: float | None = None,
+        connection_cutoffs: Mapping[str, float] | None = None,
+        min_bytes: int = 0,
+        content_types: Mapping[str, str] | None = None,
+    ) -> StripResult:
+        """Strip bulky base64 embedded documents in place (#47, ADR 0042 D2) — the SQL Server port of the
+        select → codec-transform → write-back path. Replaces each ``mfb64:v1:`` carriage value / HL7
+        OBX-5 ED embed with a self-describing tombstone, keeps the message parseable, and sets
+        ``documents_pruned``. Eligibility mirrors :meth:`purge_message_bodies` (per-connection-or-global
+        cutoff AND not in-flight). Returns a :class:`StripResult` (counts + bytes; no PHI)."""
+        now = time.time() if now is None else now
+        content_types = content_types or {}
+        # Bound the candidate scan with the LOOSEST finite cutoff (a keep-forever -inf never widens it);
+        # the precise per-connection cutoff is re-checked per row in Python (cutoff_for).
+        finite = [
+            c for c in [older_than, *(connection_cutoffs or {}).values()] if c != float("-inf")
+        ]
+        if not finite:
+            return StripResult()  # everything keep-forever ⇒ nothing to scan
+        scan_cutoff = max(finite)
+        rows = await self._fetchall(
+            "SELECT m.id, m.channel_id, m.raw, m.received_at FROM messages m"
+            " WHERE m.raw <> '' AND m.documents_pruned IS NULL AND m.received_at < ?"
+            " AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.message_id=m.id"
+            " AND q.status IN (?, ?))",
+            (scan_cutoff, OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value),
+        )
+        msgs = 0
+        docs = 0
+        reclaimed = 0
+        updates: list[tuple[str, float, str]] = []
+        for row in rows:
+            cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
+            if row["received_at"] >= cutoff:
+                continue
+            raw = self._cipher.decrypt(row["raw"])
+            new_raw, n_docs, n_bytes = _strip_documents(
+                raw,
+                pruned_at=now,
+                min_bytes=min_bytes,
+                content_type=content_types.get(row["channel_id"]),
+            )
+            if n_docs == 0:
+                continue
+            updates.append((self._cipher.encrypt(new_raw), now, row["id"]))
+            msgs += 1
+            docs += n_docs
+            reclaimed += n_bytes
+        if updates:
+            async with self._acquire() as conn, self._cursor(conn) as cur:
+                try:
+                    for params in updates:
+                        await cur.execute(
+                            "UPDATE messages SET raw=?, documents_pruned=? WHERE id=?", params
+                        )
+                    await conn.commit()
+                except Exception:
+                    await conn.rollback()
+                    raise
+        return StripResult(
+            messages_stripped=msgs, documents_stripped=docs, bytes_reclaimed=reclaimed
+        )
 
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
         # #46: metadata-only rows (no body/FK) — age-DELETE on their own window (RetentionRunner-driven).
@@ -2148,15 +2446,27 @@ class SqlServerStore:
             self._state_cache.pop(ck, None)
         return len(purged_keys)
 
-    async def purge_dead_letters(self, *, older_than: float, now: float | None = None) -> int:
+    async def purge_dead_letters(
+        self,
+        *,
+        older_than: float,
+        now: float | None = None,
+        connection_cutoffs: Mapping[str, float] | None = None,
+    ) -> int:
         """Blank the payload of dead outbound rows updated before ``older_than`` (retention). Keeps the
-        dead row + 'dead' status (counts/disposition) but frees the body; idempotent (payload <> '')."""
+        dead row + 'dead' status (counts/disposition) but frees the body; idempotent (payload <> '').
+
+        ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``destination_name``
+        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical."""
+        cutoff_sql, cutoff_params = _qmark_cutoff_case(
+            "destination_name", older_than, connection_cutoffs
+        )
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    " WHERE stage=? AND status=? AND payload <> '' AND updated_at < ?",
-                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, older_than),
+                    f" WHERE stage=? AND status=? AND payload <> '' AND updated_at < {cutoff_sql}",
+                    (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 purged = cur.rowcount
                 await conn.commit()
@@ -2172,6 +2482,19 @@ class SqlServerStore:
     async def vacuum(self) -> None:
         """No-op on SQL Server — file compaction is a DBA operation here, not an engine concern (the
         engine never calls this on this backend; present for ``Store`` protocol completeness)."""
+
+    async def snapshot_to(self, dest_path: str | object, *, method: str = "vacuum_into") -> None:
+        """**DBA-delegated** on SQL Server (ADR 0049 / BACKLOG #52): the engine never takes a DB-tier
+        backup of a server-DB store — native BACKUP DATABASE / Always On are infra-owned. Raises
+        :class:`~messagefoundry.store.base.DbaDelegatedError`; the BackupRunner / ``backup`` CLI catch it
+        and fall back to a config-only backup (or skip) per ``[backup].config_only_on_server_db``."""
+        from messagefoundry.store.base import DbaDelegatedError
+
+        raise DbaDelegatedError(
+            "the SQL Server store backup is DBA-delegated (BACKUP DATABASE / Always On, BACKLOG #52); "
+            "the engine backs up the config bundle only on a server-DB store (set "
+            "[backup].config_only_on_server_db)"
+        )
 
     async def record_received(
         self,
@@ -2835,6 +3158,61 @@ class SqlServerStore:
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM messages{where}", params)
         return int(row["n"]) if row else 0
 
+    async def search_messages(
+        self,
+        spec: SearchSpec,
+        *,
+        channel_id: str | None = None,
+        status: str | None = None,
+        message_type: str | None = None,
+        control_id: str | None = None,
+        limit: int = 50,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> MessageSearchResult:
+        """Scan-and-decrypt content search (ADR 0046 #51) — see ``MessageStore.search_messages``.
+        Pre-filter on the indexed metadata, then decrypt + match each candidate body in memory off the
+        event loop (the at-rest AES-GCM ciphertext can't be matched by a SQL ``LIKE``)."""
+        where, params = self._message_filter(
+            channel_id, status, message_type, control_id, allowed_channels
+        )
+        rows = await self._fetchall(
+            "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
+            " status, error, summary, metadata, raw,"
+            " (SELECT TOP 1 event FROM message_events e WHERE e.message_id = messages.id"
+            "  ORDER BY e.id DESC) AS last_event"
+            f" FROM messages{where}"
+            " ORDER BY received_at DESC, id DESC",
+            params,
+        )
+        return await asyncio.to_thread(self._scan_rows, spec, rows, limit)
+
+    def _scan_rows(
+        self, spec: SearchSpec, candidates: list[dict[str, Any]], limit: int
+    ) -> MessageSearchResult:
+        """Off-loop decrypt+match loop (mirrors ``MessageStore._scan_rows``). Bounded by
+        ``spec.scan_limit`` decrypts and ``limit`` matches; returns metadata-only rows (the decrypted
+        ``raw`` is dropped, so the PHI surface equals ``list_messages``)."""
+        out: list[dict[str, Any]] = []
+        scanned = 0
+        truncated = False
+        for cand in candidates:
+            if scanned >= spec.scan_limit:
+                truncated = True
+                break
+            scanned += 1
+            raw = self._dec(cand.get("raw"))
+            summary = self._dec(cand.get("summary"))
+            if row_matches(spec, raw=raw, summary=summary):
+                d = dict(cand)
+                d["error"] = self._dec(d.get("error"))
+                d["summary"] = self._dec(d.get("summary"))
+                d["metadata"] = self._dec(d.get("metadata"))
+                d.pop("raw", None)
+                out.append(d)
+                if len(out) >= limit:
+                    break
+        return MessageSearchResult(rows=out, scanned=scanned, matched=len(out), truncated=truncated)
+
     async def list_dead(
         self,
         *,
@@ -3317,22 +3695,47 @@ class SqlServerStore:
         display_name: str,
         description: str | None = None,
         builtin: bool = True,
+        permissions: str | None = None,
     ) -> None:
         # Single atomic MERGE under HOLDLOCK (range-locks the key) so two concurrent seeders can't both
         # find the row absent and both INSERT the same PK -> violation (the UPDATE-then-INSERT race).
         await self._execute(
             "MERGE roles WITH (HOLDLOCK) AS t"
-            " USING (SELECT ? AS id, ? AS display_name, ? AS description, ? AS builtin) AS s"
+            " USING (SELECT ? AS id, ? AS display_name, ? AS description, ? AS builtin,"
+            " ? AS permissions) AS s"
             " ON t.id=s.id"
             " WHEN MATCHED THEN UPDATE SET display_name=s.display_name,"
-            " description=s.description, builtin=s.builtin"
-            " WHEN NOT MATCHED THEN INSERT (id, display_name, description, builtin)"
-            " VALUES (s.id, s.display_name, s.description, s.builtin);",
-            (role_id, display_name, description, 1 if builtin else 0),
+            " description=s.description, builtin=s.builtin, permissions=s.permissions"
+            " WHEN NOT MATCHED THEN INSERT (id, display_name, description, builtin, permissions)"
+            " VALUES (s.id, s.display_name, s.description, s.builtin, s.permissions);",
+            (role_id, display_name, description, 1 if builtin else 0, permissions),
         )
 
     async def list_roles(self) -> list[dict[str, Any]]:
         return await self._fetchall("SELECT * FROM roles ORDER BY id")
+
+    async def get_role(self, role_id: str) -> dict[str, Any] | None:
+        rows = await self._fetchall("SELECT * FROM roles WHERE id=?", (role_id,))
+        return rows[0] if rows else None
+
+    async def delete_custom_role(self, role_id: str) -> bool:
+        """Delete a custom (``builtin=0``) role and its user/AD-group assignments in one transaction
+        (ADR 0045 D4); never touches a built-in row. Returns ``True`` if removed."""
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute("SELECT builtin FROM roles WHERE id=?", (role_id,))
+                row = await cur.fetchone()
+                if row is None or int(row[0]) != 0:
+                    await conn.rollback()
+                    return False
+                await cur.execute("DELETE FROM user_roles WHERE role_id=?", (role_id,))
+                await cur.execute("DELETE FROM ad_group_role_map WHERE role_id=?", (role_id,))
+                await cur.execute("DELETE FROM roles WHERE id=?", (role_id,))
+                await conn.commit()
+                return True
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def get_user_role_ids(self, user_id: str) -> list[str]:
         rows = await self._fetchall(

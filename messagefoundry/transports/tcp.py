@@ -233,8 +233,15 @@ class TcpSource(SourceConnector):
                 await asyncio.gather(*still_running, return_exceptions=True)
         self._clients.clear()
         self._client_tasks.clear()
+        # Bound wait_closed() so a Windows ProactorEventLoop overlapped-op wedge can't hang teardown on
+        # the suite's shared session loop (#55, mirrors MLLPSource.stop()). The listener is closed and
+        # every client task is resolved, so a wait_closed() past the grace is an OS wedge, not in-flight
+        # work — abandoning it is safe (the socket is closed) and bounds an otherwise infinite teardown.
         if self._server is not None:
-            await self._server.wait_closed()
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
+            except asyncio.TimeoutError:
+                logger.warning("TCP server.wait_closed() exceeded shutdown grace; abandoning")
             self._server = None
 
     async def _emit_event(
@@ -330,8 +337,10 @@ class TcpSource(SourceConnector):
                 self._client_tasks.discard(task)
             writer.close()
             try:
-                await writer.wait_closed()
-            except OSError:
+                # Bound the close (see stop()): an unbounded Proactor writer.wait_closed() would never
+                # let the per-client task finish, so stop()'s grace never sees it done (#55).
+                await asyncio.wait_for(writer.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
+            except (OSError, asyncio.TimeoutError):
                 pass
             if established and not failed:
                 await self._emit_event("closed", peer_host=peer_host, reason=close_reason)

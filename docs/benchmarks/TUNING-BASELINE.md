@@ -124,6 +124,49 @@ round-trip per stage) is the binding constraint, not the engine's CPU. A properl
 link, and the pooled-connector improvement ([#291](https://github.com/MEFORORG/MessageFoundry/issues/291)),
 both lift this materially. SQLite (local file, no network) is fastest and did not even reach its knee here.
 
+### Multi-process sharding scale-out (WIN2025 box — measured 2026-06-27)
+
+A separate, later measurement of **multi-process sharding** (`supervise`, ADR
+[0037](../adr/0037-multi-process-sharding-l3.md) — L3) on the dedicated **WIN2025 test box**. This is a
+**different question** from the Gate #3 ceiling above: not "what is the single-node rate" but "**does adding
+shards scale**". The Gate #3 baseline (CI Linux, co-located DB) is unchanged and stands alongside this.
+
+| Field | Value |
+|---|---|
+| Host | WIN2025 test box — AMD Ryzen 7 7730U (8c / 16t), Windows Server 2025 |
+| Store | per-shard SQLite (one store file per shard — **no shared DB**, no shared-DB commit contention by design) |
+| Workload | edit-transform, **closed-loop** driver |
+| Harness | 0.2.8 multi-shard driver (`supervise` multi-process sharding) |
+| Source / provenance | WIN2025 box §7 / J4 / S7.3 (`Z:\HANDOFF-throughput-build-test-coverage.md`) |
+
+| Shards (`supervise`) | Aggregate msg/s | Per-shard | Speedup |
+|---|---|---|---|
+| 1 process | **~50** (single-process ceiling observed 39–51 msg/s) | ~50 | 1× |
+| 2 shards | **88.7** | ~44 | 1.78× |
+| 4 shards | **165.5** | ~41 | 3.3× |
+
+**Result:** `supervise` scales **~linearly**. The aggregate fits `aggregate ≈ K · E_core · η`, with a
+per-shard core rate **E_core ≈ 42 msg/s/shard** and a scaling efficiency **η ≈ 0.85**.
+
+> **Read these two numbers very differently — do not overstate:**
+> - The **absolute** `E_core` (~42 msg/s/shard) is **test-box SQLite on a consumer Ryzen APU + a consumer
+>   SSD** — a deliberately **conservative FLOOR**, **not** the enterprise number. Production hardware
+>   (enterprise NVMe with power-loss protection + a faster core) lands materially higher; treat ~42 as a
+>   lower bound, not a target.
+> - The **portable** result is the **speedup shape** — **η ≈ 0.85, ~linear** — *not* the absolute msg/s.
+>   That shape (each added shard buys ~0.85× of a core) is what transfers across hardware; multiply it by
+>   **your** measured single-shard `E_core` to size a multi-process deployment.
+
+**Still unmeasured (hardware-gated follow-ups):**
+1. **Absolute enterprise `E_core`** — the per-shard rate on enterprise NVMe-PLP hardware + a faster core.
+   Only the *floor* (~42, consumer APU/SSD) is measured; the production absolute is still open and needs a
+   real server-DB run to pin.
+2. **The shared-DB commit-wall sweep** — K shards against **one shared** PostgreSQL / SQL Server (not
+   per-shard SQLite). This is the **ADR [0039](../adr/0039-database-tier-sharding-l5.md) / L5 (DBSHARD)
+   activation trigger** and is **currently unmeasured**: per-shard SQLite has **no shared-DB contention by
+   design**, so this run never exercises the commit wall L5 exists to relieve. L5 stays **shelved** until a
+   measured shared-DB commit wall exists.
+
 ### Active-passive failover (kill primary mid-load)
 
 The `failover` profile (two nodes share the DB; the harness SIGKILLs the primary mid-load). All conformance

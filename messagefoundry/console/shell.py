@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QMenu,
+    QPushButton,
     QStackedWidget,
     QToolButton,
     QVBoxLayout,
@@ -136,6 +137,45 @@ class PlaceholderPage(QWidget):
 
     def reload(self) -> None:
         return
+
+
+class _UpdateBanner(QWidget):
+    """A thin, non-blocking, dismissible strip announcing that a newer MessageFoundry version is
+    available (#30, ADR 0026). It is purely a view over the engine's no-network ``/status`` signal —
+    the console NEVER calls PyPI. ``dismissed`` fires with ``(current, pinned)`` when the operator
+    closes it so the shell can suppress re-showing the same update."""
+
+    dismissed = Signal(str, str)  # (current_version, pinned_version)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("updateBanner")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # A muted amber strip (brand "Foundry" amber lives in the wordmark only; this is an advisory
+        # info tone, not the accent), readable on the light theme.
+        self.setStyleSheet(
+            "#updateBanner { background: #fff7e6; border-bottom: 1px solid #f0c674; }"
+        )
+        self._current = ""
+        self._pinned = ""
+        self._label = QLabel("")
+        dismiss = QPushButton("Dismiss")
+        dismiss.setFlat(True)
+        dismiss.setCursor(Qt.CursorShape.PointingHandCursor)
+        dismiss.clicked.connect(lambda: self.dismissed.emit(self._current, self._pinned))
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 6, 12, 6)
+        row.addWidget(self._label, stretch=1)
+        row.addWidget(dismiss)
+        self.setVisible(False)
+
+    def set_versions(self, current: str, pinned: str) -> None:
+        self._current = current
+        self._pinned = pinned
+        self._label.setText(
+            f"A newer MessageFoundry version is available: running {current}, {pinned} is installed/"
+            f"pinned. Update the engine to pick it up."
+        )
 
 
 class AppWindow(QWidget):
@@ -313,10 +353,19 @@ class AppWindow(QWidget):
         self._status.setObjectName("statusline")  # themed (danger-coloured error text)
         self._health_error = ""  # the reachability error the poll currently owns (low-14)
 
+        # Non-blocking, dismissible "update available" banner (#30, ADR 0026). Hidden until the engine's
+        # no-network /status diff reports a newer pinned/installed version; the console never calls PyPI.
+        # Dismissal is per-(current,pinned) so a NEW update re-shows after the operator dismissed an
+        # older one.
+        self._update_banner = _UpdateBanner()
+        self._update_banner.dismissed.connect(self._on_update_banner_dismissed)
+        self._dismissed_update: tuple[str, str] | None = None
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(header)
+        layout.addWidget(self._update_banner)
         layout.addLayout(body)
         layout.addWidget(self._status)
 
@@ -529,16 +578,29 @@ class AppWindow(QWidget):
         self._health_loading = True
         self._health_runner.submit(self._fetch_health, on_done=self._apply_health)
 
-    def _fetch_health(self) -> tuple[str, float | None, ApiError | None]:
-        """Runs on a worker thread — only blocking I/O. Returns (service_state, free_disk, error)."""
+    def _fetch_health(
+        self,
+    ) -> tuple[str, float | None, ApiError | None, tuple[str, str] | None]:
+        """Runs on a worker thread — only blocking I/O. Returns
+        (service_state, free_disk, error, update). ``update`` is ``(current, pinned)`` when the engine
+        reports a newer version is available (#30, ADR 0026), else ``None``. The console NEVER calls
+        PyPI — this is purely the engine's no-network /status signal, rendered as a banner."""
         svc = service_control.service_state(self._service_name)
         try:
             status = self._poll_client.status()  # read-only poll client (never the main-thread one)
         except ApiError as exc:
-            return svc, None, exc
-        return svc, float(status.db.disk_free_bytes), None
+            return svc, None, exc, None
+        update = status.update
+        avail = (
+            (update.current_version, update.pinned_version or "?")
+            if update is not None and update.update_available
+            else None
+        )
+        return svc, float(status.db.disk_free_bytes), None, avail
 
-    def _apply_health(self, data: tuple[str, float | None, ApiError | None]) -> None:
+    def _apply_health(
+        self, data: tuple[str, float | None, ApiError | None, tuple[str, str] | None]
+    ) -> None:
         """Drive the nav heart and own the engine-reachability status line (main thread).
 
         Service-aware: if the Windows service is installed it is the source of truth — a stopped
@@ -547,7 +609,10 @@ class AppWindow(QWidget):
         when the engine answers we clear any stale 'could not reach engine' error; while it's
         down we show it."""
         self._health_loading = False
-        svc, free_disk, exc = data
+        svc, free_disk, exc, update = data
+        # Surface the engine's no-network update signal (#30) as a dismissible banner. The console
+        # never calls PyPI; this only reflects /status.
+        self._apply_update_banner(update)
         reachable = False
         low_disk = False
         if exc is not None:
@@ -577,6 +642,25 @@ class AppWindow(QWidget):
         else:
             self._heart.set_state("green")
             self._heart.setToolTip("Engine and database healthy")
+
+    def _apply_update_banner(self, update: tuple[str, str] | None) -> None:
+        """Show/hide the dismissible update banner from the engine's /status signal (#30).
+
+        ``update`` is ``(current, pinned)`` when a newer version is available, else ``None``. The
+        banner stays hidden once the operator dismisses a given (current, pinned) pair, but a DIFFERENT
+        pair (a genuinely newer pinned version) re-shows it."""
+        if update is None or update == self._dismissed_update:
+            self._update_banner.setVisible(False)
+            return
+        current, pinned = update
+        self._update_banner.set_versions(current, pinned)
+        self._update_banner.setVisible(True)
+
+    def _on_update_banner_dismissed(self, current: str, pinned: str) -> None:
+        """Remember this (current, pinned) as dismissed so the banner doesn't re-show for the same
+        update; a later, different pinned version re-shows it."""
+        self._dismissed_update = (current, pinned)
+        self._update_banner.setVisible(False)
 
     def _apply_interval(self) -> None:
         if self._interval > 0:

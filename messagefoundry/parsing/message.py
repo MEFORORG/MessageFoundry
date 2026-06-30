@@ -23,14 +23,21 @@ re-encode.
 from __future__ import annotations
 
 import json
+import logging
 import re
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import hl7
 from defusedxml.ElementTree import fromstring as _xml_fromstring
 
+import messagefoundry.parsing._backend as _backend
+import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 import messagefoundry.parsing.binary as _binary
 from messagefoundry.parsing.peek import normalize, parse_path
+from messagefoundry.timezone import age_from_dob, length_of_stay
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # the SegmentGroup view imports Message back; keep the cycle out of runtime
     from xml.etree.ElementTree import (  # nosec B405 — type-only import; all XML parsing goes through defusedxml
@@ -51,13 +58,36 @@ class Message:
     #: Symmetry with :class:`RawMessage` — a Router/Handler can branch on ``msg.content_type``.
     content_type = "hl7v2"
 
-    def __init__(self, message: hl7.Message) -> None:
-        self._m = message
+    def __init__(self, message: hl7.Message | _builtin_hl7.ParsedMessage) -> None:
+        # ``message`` is either a legacy python-hl7 ``hl7.Message`` or a built-ins
+        # ``ParsedMessage`` dict (ADR 0054). All mutate/read helpers dispatch on ``_builtin``.
+        # Stored as ``Any`` because the python-hl7 path indexes/mutates it dynamically (no stubs);
+        # the built-ins path narrows it back via :meth:`_pm`.
+        self._m: Any = message
+        self._builtin: bool = isinstance(message, dict)
 
     @classmethod
     def parse(cls, raw: str | bytes) -> Message:
-        """Parse ``raw`` (line endings normalized to ``\\r``) into a mutable message."""
-        return cls(hl7.parse(normalize(raw)))
+        """Parse ``raw`` (line endings normalized to ``\\r``) into a mutable message.
+
+        Uses the built-ins parser (ADR 0054) when ``_backend.USE_BUILTIN`` is on (the default); an
+        unexpected internal built-ins fault falls back to python-hl7 and is logged (Phase-1 fallback
+        guard), so a connection is never crashed by a parser bug — the proven path takes over.
+        """
+        norm = normalize(raw)
+        if _backend.use_builtin():
+            try:
+                return cls(_builtin_hl7.parse(norm))
+            except hl7.ParseException:
+                # The no-MSH-leading rejection is the built-ins parser deliberately matching
+                # python-hl7's contract (not an internal fault), so re-raise it as-is rather than
+                # falling back — the python-hl7 path would only raise the identical error again.
+                raise
+            except Exception:  # noqa: BLE001 — fallback guard: any unexpected built-ins error
+                logger.warning(
+                    "built-ins HL7 parse failed; falling back to python-hl7", exc_info=True
+                )
+        return cls(hl7.parse(norm))
 
     # --- read ----------------------------------------------------------------
 
@@ -121,6 +151,8 @@ class Message:
 
     def count_segments(self, segment_id: str) -> int:
         """How many segments of ``segment_id`` the message has (0 if none)."""
+        if self._builtin:
+            return sum(1 for sid in _builtin_hl7.segment_ids(self._m) if sid == segment_id)
         return sum(1 for seg in self._m if str(seg[0]) == segment_id)
 
     @property
@@ -141,7 +173,69 @@ class Message:
 
     def segments(self) -> list[str]:
         """Ordered segment ids, e.g. ``["MSH", "EVN", "PID"]``."""
+        if self._builtin:
+            return _builtin_hl7.segment_ids(self._m)
         return [str(seg[0]) for seg in self._m]
+
+    # --- derived HL7 timestamp values ---------------------------------------
+    #
+    # Thin, convenience wrappers over the pure helpers in messagefoundry.timezone, reading the
+    # conventional fields (PID-7 DOB, PV1-44/PV1-45 admit/discharge). They keep a Handler from
+    # re-implementing HL7 timestamp math; for an unusual field a Handler can read it with field()/
+    # repetitions() and call age_from_dob()/length_of_stay() directly.
+
+    def age(
+        self,
+        asof: str | date | datetime | None = None,
+        *,
+        path: str = "PID-7",
+        occurrence: int = 1,
+    ) -> int | None:
+        """The patient's age in completed years from the DOB at ``path`` (default PID-7).
+
+        Reads the timestamp's first component (HL7 DTM/TS), tolerating partial precision (a year- or
+        year+month-only DOB), and returns whole years as of ``asof`` (an HL7 timestamp string, a
+        :class:`datetime.date`/:class:`datetime.datetime`, or — the default — today's local date).
+        Returns None when the field is absent/empty. ``occurrence`` selects the segment as elsewhere.
+
+        Raises:
+            ValueError: the DOB (or an ``asof`` string) is a malformed HL7 timestamp, or the DOB is
+                after the reference date.
+        """
+        dob = self.field(f"{path}.1", occurrence=occurrence) or self.field(
+            path, occurrence=occurrence
+        )
+        if not dob:
+            return None
+        return age_from_dob(dob, asof)
+
+    def length_of_stay(
+        self,
+        *,
+        admit_path: str = "PV1-44",
+        discharge_path: str = "PV1-45",
+        occurrence: int = 1,
+    ) -> timedelta | None:
+        """The encounter length of stay as a :class:`~datetime.timedelta`, from the admit and discharge
+        timestamps (default PV1-44 / PV1-45).
+
+        Reads each field's first component, parses both at whatever precision they carry, and returns
+        the elapsed time (use ``.days`` for whole inpatient days). Returns None if **either** timestamp
+        is absent/empty (an open, not-yet-discharged encounter). ``occurrence`` selects the segment.
+
+        Raises:
+            ValueError: a timestamp is malformed, exactly one carries a zone offset, or the discharge
+                precedes the admit.
+        """
+        admit = self.field(f"{admit_path}.1", occurrence=occurrence) or self.field(
+            admit_path, occurrence=occurrence
+        )
+        discharge = self.field(f"{discharge_path}.1", occurrence=occurrence) or self.field(
+            discharge_path, occurrence=occurrence
+        )
+        if not admit or not discharge:
+            return None
+        return length_of_stay(admit, discharge)
 
     # --- mutate --------------------------------------------------------------
 
@@ -172,7 +266,7 @@ class Message:
         if repetition is not None and repetition < 1:
             raise ValueError("repetition is 1-based (>= 1)")
         seg, fld, comp, sub = parse_path(path)
-        if self._segment_obj(seg, occurrence) is None:
+        if not self._segment_present(seg, occurrence):
             where = f"{seg!r}" + (f" occurrence {occurrence}" if occurrence > 1 else "")
             raise KeyError(f"cannot set absent segment {where}")
 
@@ -245,7 +339,7 @@ class Message:
         seg, fld, comp, _sub = parse_path(path)
         if comp is not None:
             raise ValueError("add_repetition takes a whole-field path (no component)")
-        if self._segment_obj(seg, occurrence) is None:
+        if not self._segment_present(seg, occurrence):
             where = f"{seg!r}" + (f" occurrence {occurrence}" if occurrence > 1 else "")
             raise KeyError(f"cannot add a repetition to absent segment {where}")
         field_sep, _comp_sep, rep_sep, _esc, _sub_sep = self._encoding_chars()
@@ -281,6 +375,14 @@ class Message:
             raise ValueError(f"segment must begin with a 3-char segment id, got {segment_id!r}")
         if segment_id == "MSH":
             raise ValueError("refusing to add a second MSH segment")
+        if self._builtin:
+            seg_count = len(_builtin_hl7.segment_ids(self._m))
+            if index is not None and (index < 1 or index > seg_count):
+                raise ValueError(
+                    f"index {index} out of range (1..{seg_count}); index 1 is after MSH"
+                )
+            _builtin_hl7.add_segment_line(self._m, segment_id, tokens, index)
+            return
         new_segment = self._m.create_segment([self._m.create_field([tok]) for tok in tokens])
         if index is None:
             self._m.append(new_segment)
@@ -300,6 +402,13 @@ class Message:
         if segment_id == "MSH":
             raise ValueError("refusing to delete the MSH segment")
         removed = 0
+        if self._builtin:
+            ids = _builtin_hl7.segment_ids(self._m)
+            for i in range(len(ids) - 1, -1, -1):  # back-to-front keeps indices valid
+                if ids[i] == segment_id:
+                    _builtin_hl7.delete_segment_at(self._m, i)
+                    removed += 1
+            return removed
         for i in range(len(self._m) - 1, -1, -1):  # back-to-front keeps indices valid
             if str(self._m[i][0]) == segment_id:
                 del self._m[i]
@@ -314,6 +423,14 @@ class Message:
         position, not by id (an ``OBX`` may belong to any order), so id-based
         :meth:`delete_segments` can't target one order's segments. Deleting MSH (position 0) is
         refused so the header always survives. Raises ``ValueError`` on an out-of-range position."""
+        if self._builtin:
+            seg_count = len(_builtin_hl7.segment_ids(self._m))
+            if position < 1 or position >= seg_count:
+                raise ValueError(
+                    f"position {position} out of range (1..{seg_count - 1}); position 1 is after MSH"
+                )
+            _builtin_hl7.delete_segment_at(self._m, position)
+            return
         if position < 1 or position >= len(self._m):
             raise ValueError(
                 f"position {position} out of range (1..{len(self._m) - 1}); position 1 is after MSH"
@@ -338,6 +455,8 @@ class Message:
 
     def encode(self) -> str:
         """Serialize back to a ``\\r``-delimited HL7 string."""
+        if self._builtin:
+            return _builtin_hl7.encode(self._m)
         return str(self._m)
 
     def __str__(self) -> str:
@@ -348,6 +467,8 @@ class Message:
     def _raw_field(self, seg: str, fld: int, occurrence: int = 1) -> str:
         """Raw field text (``""`` if the segment/field/occurrence is absent) — for component
         rebuilds. ``occurrence`` (1-based) picks which segment of that id."""
+        if self._builtin:
+            return _builtin_hl7.raw_field(self._m, seg, fld, occurrence)
         segment = self._segment_obj(seg, occurrence)
         if segment is None:
             return ""
@@ -356,8 +477,24 @@ class Message:
         except (KeyError, IndexError):
             return ""
 
+    def _segment_present(self, segment_id: str, occurrence: int = 1) -> bool:
+        """Whether the ``occurrence``-th (1-based) segment with ``segment_id`` exists — backend-
+        agnostic presence check used by the write/repetition guards."""
+        if self._builtin:
+            seen = 0
+            for sid in _builtin_hl7.segment_ids(self._m):
+                if sid == segment_id:
+                    seen += 1
+                    if seen == occurrence:
+                        return True
+            return False
+        return self._segment_obj(segment_id, occurrence) is not None
+
     def _segment_obj(self, segment_id: str, occurrence: int = 1) -> Any:
-        """The ``occurrence``-th (1-based) segment object with ``segment_id``, or None if absent."""
+        """The ``occurrence``-th (1-based) segment object with ``segment_id``, or None if absent.
+
+        python-hl7 backend only — the built-ins backend has no per-segment object (presence is
+        checked via :meth:`_segment_present`)."""
         seen = 0
         for segment in self._m:
             if str(segment[0]) == segment_id:
@@ -373,6 +510,11 @@ class Message:
         occurrence is written on its segment object directly, padding empty fields up to ``fld``
         first (a bare index assignment past the end raises). The string content (components,
         repetitions) round-trips verbatim and re-parses into structure either way."""
+        if self._builtin:
+            # The built-ins backend stores the raw field verbatim and auto-extends the field list,
+            # for any occurrence, mirroring python-hl7's auto-extend on assignment.
+            _builtin_hl7.set_field(self._m, seg, fld, raw_value, occurrence)
+            return
         if occurrence == 1:
             self._m[f"{seg}.F{fld}"] = raw_value
             return
@@ -388,6 +530,10 @@ class Message:
     ) -> str | None:
         """The component/subcomponent value within a single repetition's text, unescaped, or None
         if that part is absent."""
+        if self._builtin:
+            # Built-ins ``extract_part`` is the same string-level split with byte-parity unescape,
+            # reading the message's own separators (in built-ins order: field, comp, rep, sub, esc).
+            return _builtin_hl7.extract_part(rep_text, comp, sub, _builtin_hl7.separators(self._m))
         comps = rep_text.split(comp_sep)
         if comp > len(comps):
             return None

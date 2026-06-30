@@ -77,6 +77,140 @@ def test_inbound_and_outbound_round_trip(tmp_path: Path) -> None:
     assert ob.retry is not None and ob.retry.max_attempts == 5
 
 
+def test_retention_override_roundtrips_toml(tmp_path: Path) -> None:
+    """AC-7 (#34, ADR 0027): the per-connection retention overrides — inbound ``messages_days`` and
+    outbound ``dead_letter_days`` — desugar through the same build_* factories as code-first, so a TOML
+    entry resolves to the identical InboundConnection/OutboundConnection field (None = inherit, 0 = keep
+    forever, >0 = days). Authored data-first, edited by hand or the ADR 0007 GUI."""
+    reg = load_config(
+        _config(
+            tmp_path,
+            """
+            [[inbound]]
+            name = "IB"
+            transport = "mllp"
+            router = "r"
+            messages_days = 90
+              [inbound.settings]
+              port = 2600
+
+            [[inbound]]
+            name = "IB_KEEP"
+            transport = "mllp"
+            router = "r"
+            messages_days = 0
+              [inbound.settings]
+              port = 2601
+
+            [[inbound]]
+            name = "IB_INHERIT"
+            transport = "mllp"
+            router = "r"
+              [inbound.settings]
+              port = 2602
+
+            [[outbound]]
+            name = "OB"
+            transport = "mllp"
+            dead_letter_days = 7
+              [outbound.settings]
+              host = "epic.example"
+              port = 2700
+            """,
+        )
+    )
+    assert reg.inbound["IB"].messages_days == 90  # explicit window
+    assert reg.inbound["IB_KEEP"].messages_days == 0  # 0 = keep forever (distinct from None)
+    assert reg.inbound["IB_INHERIT"].messages_days is None  # absent = inherit the global window
+    assert reg.outbound["OB"].dead_letter_days == 7
+
+
+def test_document_pruning_override_roundtrips_toml(tmp_path: Path) -> None:
+    """AC-7 (#47, ADR 0042): the per-connection embedded-document-pruning override —
+    ``prune_documents_after`` (+ optional ``prune_documents_min_bytes``) — desugars through the same
+    build_inbound_connection factory as code-first (None = never strip, >0 = days)."""
+    reg = load_config(
+        _config(
+            tmp_path,
+            """
+            [[inbound]]
+            name = "IB_DOC"
+            transport = "mllp"
+            router = "r"
+            prune_documents_after = 30
+            prune_documents_min_bytes = 4096
+              [inbound.settings]
+              port = 2600
+
+            [[inbound]]
+            name = "IB_NONE"
+            transport = "mllp"
+            router = "r"
+              [inbound.settings]
+              port = 2601
+            """,
+        )
+    )
+    assert reg.inbound["IB_DOC"].prune_documents_after == 30
+    assert reg.inbound["IB_DOC"].prune_documents_min_bytes == 4096
+    assert reg.inbound["IB_NONE"].prune_documents_after is None  # absent = never strip
+    assert reg.inbound["IB_NONE"].prune_documents_min_bytes is None
+
+
+def test_document_pruning_rejects_non_positive_window(tmp_path: Path) -> None:
+    """``prune_documents_after`` must be > 0 days — "never" is None, not 0 (fail loud at load)."""
+    with pytest.raises(WiringError, match="prune_documents_after must be > 0 days"):
+        load_config(
+            _config(
+                tmp_path,
+                """
+                [[inbound]]
+                name = "IB"
+                transport = "mllp"
+                router = "r"
+                prune_documents_after = 0
+                  [inbound.settings]
+                  port = 2600
+                """,
+            )
+        )
+
+
+def test_retention_override_rejects_negative_and_non_int(tmp_path: Path) -> None:
+    """A negative window is meaningless (fail loud at load, like RetentionSettings(messages_days=-1));
+    a non-integer / bool value is rejected by the connections.toml decoder."""
+    with pytest.raises(WiringError, match="messages_days must be >= 0"):
+        load_config(
+            _config(
+                tmp_path,
+                """
+                [[inbound]]
+                name = "IB"
+                transport = "mllp"
+                router = "r"
+                messages_days = -1
+                  [inbound.settings]
+                  port = 2600
+                """,
+            )
+        )
+    with pytest.raises(WiringError, match="must be an integer number of days"):
+        load_config(
+            _config(
+                tmp_path,
+                """
+                [[outbound]]
+                name = "OB"
+                transport = "mllp"
+                dead_letter_days = true
+                  [outbound.settings]
+                  host = "epic.example"
+                  port = 2700
+                """,
+            )
+        )
+
+
 def test_timer_inbound_from_toml(tmp_path: Path) -> None:
     # A timer source (ADR 0011) is connection transport config, so it is declarable as data too —
     # transport = "timer" desugars through the same Timer() factory as code-first inbound(..., Timer()).

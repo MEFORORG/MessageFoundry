@@ -587,9 +587,18 @@ class MLLPSource(SourceConnector):
                 await asyncio.gather(*still_running, return_exceptions=True)
         self._clients.clear()
         self._client_tasks.clear()
-        # Now that no client handlers are in flight, this completes promptly instead of hanging.
+        # Now that no client handlers are in flight, this should complete promptly — but on the Windows
+        # ProactorEventLoop a still-pending overlapped accept/read can make wait_closed() never return,
+        # which (on the suite's single shared session loop) wedges every subsequent test with no output
+        # until the CI job cap cancels it (#55, same class as the #17 Windows teardown hang). Bound it:
+        # the listener is already .close()'d and every client task is done/cancelled, so a wait_closed()
+        # that hasn't returned within the grace is the OS-level overlapped-op wedge, not work in flight —
+        # abandoning it is safe (the socket is closed) and converts an infinite teardown into a bounded one.
         if self._server is not None:
-            await self._server.wait_closed()
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
+            except asyncio.TimeoutError:
+                logger.warning("MLLP server.wait_closed() exceeded shutdown grace; abandoning")
             self._server = None
 
     async def _emit_event(
@@ -687,8 +696,12 @@ class MLLPSource(SourceConnector):
                 self._client_tasks.discard(task)
             writer.close()
             try:
-                await writer.wait_closed()
-            except OSError:
+                # Bound the close (see stop()): an unbounded writer.wait_closed() on the Windows
+                # Proactor can never complete on a pending overlapped op, and the per-client task then
+                # never finishes — so stop()'s `asyncio.wait(pending, ...)` grace never sees it done and
+                # the whole shutdown wedges. Bounding it here makes the task always terminate (#55).
+                await asyncio.wait_for(writer.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
+            except (OSError, asyncio.TimeoutError):
                 pass
             # Pair every `established` with one `closed` (clean EOF / idle). Emitted last (after the
             # socket is closed) so a cancel during shutdown can't skip the writer cleanup.

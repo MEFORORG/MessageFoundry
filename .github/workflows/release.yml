@@ -244,3 +244,192 @@ jobs:
           packages-dir: harness-dist/
           skip-existing: true
           attestations: true
+
+  release-console-installer:
+    # Build the FOURTH distribution artifact — the frozen, zero-Python Windows admin-console installer
+    # (PyInstaller --onedir + Inno Setup, OPTIONALLY Authenticode-signed). ADR 0032 Phase B, BACKLOG #39.
+    #
+    # This is a job INSIDE release.yml (not a separate workflow) with `needs: release`, mirroring
+    # `release-harness`: the engine ships first and `gh release create` (in the `release` job) has run, so
+    # the GitHub release provably EXISTS before this job's `gh release upload` attaches the installer to it
+    # (a separate workflow on the same tag would race release creation). A failure here is ISOLATED — it
+    # never reds the engine wheel/PyPI flow (that all completes in `release` before this starts).
+    #
+    # The ~150 MB Windows freeze runs only on a tag push (uploads the installer as a release asset) and on
+    # workflow_dispatch (builds it as an inspectable artifact, no upload) — NEVER on a PR. The console is
+    # frozen from the SAME wheel the `release` job built + smoke-checked (downloaded via the
+    # release-artifacts upload), so the frozen console and the PyPI wheel are byte-identical packaging —
+    # a source-vs-wheel resource bug can't slip through.
+    #
+    # Signing is CONDITIONAL: if WINDOWS_SIGN_CERT_BASE64 is present the exe + installer are signed; if not,
+    # the leg STILL produces an UNSIGNED installer and does NOT fail (the owner provisions the cert later —
+    # ADR 0032 §(c)). Reproducibility: PyInstaller comes from the locked deps; ISCC (Inno Setup) is pinned;
+    # signtool (Windows SDK) is the runner-provided external the ADR flags as a residual.
+    needs: release
+    runs-on: windows-2025  # x64 Windows; the Windows SDK (signtool) + choco are preinstalled
+    permissions:
+      contents: write  # `gh release upload` attaches the installer to the tag's release (tag runs only)
+    # Map the signing-cert secret to a job-level boolean env ONCE, then gate the sign step on `env`.
+    # The `secrets` context is allowed in a job-level `env:` expression but NOT in a step-level `if:`
+    # (the linter/runtime reject `if: secrets.X != ''`), so this is the canonical lint-clean gate:
+    # "false" until WINDOWS_SIGN_CERT_BASE64 is provisioned -> the sign step skips, build stays green.
+    env:
+      SIGN_CONFIGURED: ${{ secrets.WINDOWS_SIGN_CERT_BASE64 != '' }}
+      # Pinned Inno Setup version (Chocolatey package `innosetup`). Bump deliberately; keep the installer
+      # reproducible alongside the wheel (ADR 0032 §(d) reproducibility hole).
+      INNO_SETUP_VERSION: "6.3.3"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false  # gh upload uses GH_TOKEN env, never the persisted git credential
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Resolve the single-sourced version (messagefoundry.__version__)
+        id: ver
+        run: |
+          # The installer AppVersion is single-sourced from messagefoundry/__init__.py __version__ — never
+          # hard-coded in the .iss. Read it WITHOUT importing the package (no deps installed yet) so this
+          # step is cheap and import-error-proof: parse the literal from the module file.
+          $line = Select-String -Path messagefoundry/__init__.py -Pattern '^__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $line) { throw "could not read __version__ from messagefoundry/__init__.py" }
+          $version = $line.Matches[0].Groups[1].Value
+          Write-Host "version: $version"
+          # On a tag push, the built installer version MUST equal the tag (single-source check, mirrors
+          # the wheel smoke in the release job).
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $want = $env:GITHUB_REF_NAME.TrimStart('v')
+            if ($version -ne $want) { throw "::error::__version__ $version != tag $want" }
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # Pull the wheel the `release` job built + smoke-checked (release-artifacts, uploaded on always()).
+      # Freezing from the SAME wheel that ships to PyPI (not the source tree) keeps the frozen console and
+      # the published wheel byte-identical packaging — ADR 0032 §(d) "install … from the just-built wheel".
+      - name: Download the just-built wheel (from the release job)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-artifacts
+          path: release-artifacts
+
+      - name: Install the console (+ PyInstaller) from the just-built wheel
+        run: |
+          python -m pip install --upgrade pip
+          # Install the engine wheel with its [console] extra (PySide6 pinned 6.11.1 in requirements.lock,
+          # keyring, httpx, truststore), then PyInstaller for the freeze. Installing the package itself
+          # makes `messagefoundry.console` importable to PyInstaller's analysis. Resolve the wheel the
+          # release job staged under release-artifacts/dist/.
+          $wheel = Get-ChildItem release-artifacts -Recurse -Filter "messagefoundry-*.whl" | Select-Object -First 1
+          if (-not $wheel) { throw "no messagefoundry wheel found in the release-artifacts download" }
+          Write-Host "freezing from wheel: $($wheel.FullName)"
+          pip install "$($wheel.FullName)[console]" pyinstaller
+
+      - name: Freeze the console (PyInstaller --onedir, windowed)
+        run: |
+          pyinstaller --noconfirm --clean packaging/console-installer/messagefoundry-console.spec
+          if (-not (Test-Path "dist/messagefoundry-console/messagefoundry-console.exe")) {
+            throw "PyInstaller did not produce dist/messagefoundry-console/messagefoundry-console.exe"
+          }
+          Get-ChildItem dist/messagefoundry-console | Select-Object -First 20 Name, Length
+
+      # Exercise the ACTUAL frozen exe (AC-B4 offline-launch + AC-B5 bundled-icon/nav-asset). These tests
+      # skip everywhere the freeze is absent, so they run only here, pointed at the bundle dir.
+      # -p no:cacheprovider keeps the runner workspace clean; the smoke launches Qt windowed (offscreen)
+      # so no display is needed.
+      - name: Frozen-exe launch smoke (AC-B4 / AC-B5)
+        env:
+          MEFOR_FROZEN_CONSOLE_DIR: dist/messagefoundry-console
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          # pytest-timeout is required: the repo's pyproject `addopts` sets `--timeout=60
+          # --timeout-method=thread`, so a bare `pip install pytest` aborts the run with
+          # "unrecognized arguments: --timeout" before the smoke ever executes (it leaves the per-test
+          # watchdog intact instead of stripping addopts).
+          pip install pytest pytest-timeout
+          python -m pytest tests/test_frozen_launch_smoke.py -v -p no:cacheprovider
+
+      - name: Install Inno Setup (pinned)
+        run: |
+          choco install innosetup --version=$env:INNO_SETUP_VERSION --no-progress -y
+          # ISCC.exe is not on PATH after a choco install; resolve + export it for the next step.
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc after choco install" }
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build the installer (ISCC, AppVersion injected)
+        # Pass the resolved version through the step env (NOT a ${{ }} expansion inside the run script) so
+        # the value can never be interpolated into the shell — zizmor template-injection hardening.
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          & "$env:ISCC" "/DAppVersion=$env:APP_VERSION" packaging/console-installer/messagefoundry-console.iss
+          $setup = "dist/messagefoundry-console-setup-$env:APP_VERSION.exe"
+          if (-not (Test-Path $setup)) { throw "Inno Setup did not produce $setup" }
+          "SETUP_EXE=$setup" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Authenticode signing — CONDITIONAL on the cert secret. If WINDOWS_SIGN_CERT_BASE64 is absent the
+      # whole step is skipped (the `if:` is false), so the build NEVER fails for lack of a cert; the
+      # installer simply ships UNSIGNED until the owner provisions one (ADR 0032 §(c), AC-B3). The cert
+      # lives ONLY in CI secrets and is written to a temp file that is deleted in the same step — it
+      # never touches the workspace. Pure CI tooling (signtool) — NO Python crypto import, so the ASVS
+      # 11.1.3 crypto-inventory gate is not tripped.
+      - name: Authenticode-sign the exe + installer (if a cert secret is configured)
+        if: ${{ env.SIGN_CONFIGURED == 'true' }}
+        env:
+          SIGN_CERT_B64: ${{ secrets.WINDOWS_SIGN_CERT_BASE64 }}
+          SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGN_CERT_PASSWORD }}
+        run: |
+          # signtool ships with the Windows SDK on the windows-2025 image; resolve the newest one by SDK
+          # build number (sort the numeric version dir, not the lexical path, so 10.0.26100 > 10.0.9999).
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]($_.Directory.Parent.Name) } | Select-Object -Last 1
+          if (-not $signtool) { throw "signtool.exe not found (Windows SDK missing on the runner)" }
+          Write-Host "using signtool: $($signtool.FullName)"
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_CERT_B64))
+            # $signArgs, not $args ($args is a PowerShell automatic variable — avoid the collision).
+            $signArgs = @('sign', '/f', $pfx, '/fd', 'SHA256',
+                          '/tr', 'http://timestamp.digicert.com', '/td', 'SHA256')
+            if ($env:SIGN_CERT_PASSWORD) { $signArgs += @('/p', $env:SIGN_CERT_PASSWORD) }
+            # Sign the inner frozen exe first, then the installer that wraps it.
+            & $signtool.FullName @signArgs "dist/messagefoundry-console/messagefoundry-console.exe"
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed on the frozen exe" }
+            & $signtool.FullName @signArgs "$env:SETUP_EXE"
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed on the installer" }
+            Write-Host "Signed the frozen exe + installer (timestamped)."
+          } finally {
+            if (Test-Path $pfx) { Remove-Item $pfx -Force }  # never leave the cert on disk
+          }
+
+      - name: Note signing status
+        run: |
+          if ($env:SIGN_CONFIGURED -eq 'true') {
+            Write-Host "Installer is SIGNED."
+          } else {
+            Write-Warning "No signing cert secret configured — the installer is UNSIGNED (SmartScreen may warn). Provision WINDOWS_SIGN_CERT_BASE64 to sign (ADR 0032 Phase B)."
+          }
+
+      # Always upload the installer as a workflow artifact (inspectable on workflow_dispatch dry-runs).
+      - name: Upload the installer artifact (dry-run / always)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: console-installer
+          path: dist/messagefoundry-console-setup-*.exe
+          if-no-files-found: warn
+
+      # Attach to the GitHub release — TAG-GATED only (a workflow_dispatch dry-run skips this). `needs:
+      # release` guarantees `release`'s `gh release create` already ran, so the release exists; --clobber
+      # lets a re-run replace the asset.
+      - name: Attach the installer to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$env:GITHUB_REF_NAME" "$env:SETUP_EXE" --clobber

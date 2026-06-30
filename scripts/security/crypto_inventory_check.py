@@ -50,7 +50,24 @@ INVENTORY: dict[str, frozenset[str]] = {
     # (truststore.SSLContext) by default, or a pinned PEM via --cacert (ssl.create_default_context),
     # plus opt-in client-cert mTLS (load_cert_chain). Builds the client-side TLS verification context.
     "messagefoundry/console/client.py": frozenset({"ssl"}),
+    # ADR 0041 (D3): SHA-256 hashes of the loaded first-party modules vs the wheel dist-info/RECORD at
+    # startup self-attestation — drift detection (integrity/tamper-evidence, not a secret); the engine
+    # alerts by default and (opt-in) fails closed on drift.
+    "messagefoundry/integrity.py": frozenset({"hashlib"}),
+    # BACKLOG #31: XML-DSig signature verification for the XML codec runs via signxml (which pulls in
+    # cryptography + hashlib for the DSig digest/signature primitives). The hashlib import in
+    # signature.py is the crypto-inventory anchor making that otherwise-transitive provenance visible.
+    "messagefoundry/parsing/xml/signature.py": frozenset({"hashlib"}),
     "messagefoundry/pipeline/cert_expiry.py": frozenset({"cryptography"}),
+    # ADR 0049 (#60): the DR BackupRunner SHA-256s the consistent store snapshot (recorded in the
+    # manifest + the dr_backup audit row as a PHI-free integrity fingerprint) and re-derives the key_id
+    # fingerprint via the backup codec; the AEAD itself lives in store/backup_codec.py.
+    "messagefoundry/pipeline/dr_backup.py": frozenset({"hashlib"}),
+    # ADR 0049 (#60): the .mfbak DR-backup archive codec — a chunked AES-256-GCM streaming framing
+    # (cryptography AESGCM) keyed by the existing store DEK, with a SHA-256 (hashlib) header digest bound
+    # as per-frame AAD + the one-way key_id fingerprint. Net-new crypto surface; the store DEK key source
+    # is reused, the cipher mechanism is new.
+    "messagefoundry/store/backup_codec.py": frozenset({"hashlib", "cryptography"}),
     "messagefoundry/store/crypto.py": frozenset({"hashlib", "cryptography"}),
     "messagefoundry/store/postgres.py": frozenset({"ssl"}),
     "messagefoundry/store/store.py": frozenset({"hashlib"}),
@@ -60,6 +77,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0025 Phase 2: a per-request random multipart boundary (secrets.token_hex) for the DICOMweb
     # STOW-RS body, generated absent from the object bytes (RFC 2046 §5.1.1) — framing, not a secret.
     "messagefoundry/transports/dicomweb.py": frozenset({"secrets"}),
+    # ADR 0023: the inbound HTTP/1.1 listen source reuses MLLP's _mllp_ssl_context (server=True) to
+    # build its per-connection HTTPS server identity (+ opt-in mTLS) — the same MLLP inbound-TLS posture.
+    "messagefoundry/transports/http_listener.py": frozenset({"ssl"}),
     "messagefoundry/transports/mllp.py": frozenset({"ssl"}),
     # SEC-001 (CWE-295): FTPS (ftplib.FTP_TLS) builds a verifying ssl.create_default_context() for the
     # remote-file connector's TLS control/data channel; CERT_NONE only under the insecure_tls_allowed()

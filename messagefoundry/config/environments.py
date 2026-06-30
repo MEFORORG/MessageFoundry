@@ -31,12 +31,30 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-__all__ = ["VALUE_ENV_PREFIX", "load_environment_values", "resolve_values_base_dir"]
+__all__ = [
+    "VALUE_ENV_PREFIX",
+    "is_drive_relative",
+    "load_environment_values",
+    "resolve_values_base_dir",
+]
 
 #: Env-var prefix for environment values (esp. secrets): MEFOR_VALUE_EPIC_HOST -> key "epic_host".
 VALUE_ENV_PREFIX = "MEFOR_VALUE_"
 
 _log = logging.getLogger(__name__)
+
+
+def is_drive_relative(value: str) -> bool:
+    """Whether ``value`` is rooted-looking (leading ``/`` or ``\\``) but not *truly* absolute here.
+
+    The classic Windows footgun: ``/repo`` parses as **drive-relative**, so ``cwd / "/repo"`` silently
+    inherits ``cwd``'s drive (``C:\\repo``) and any path built on it again depends on the launch
+    directory — defeating an anchor. POSIX has no such case (a leading ``/`` *is* absolute there), so
+    this is ``False`` off Windows. Shared by :func:`resolve_values_base_dir` (the root) and the
+    bundle-member anchor (``config.anchor.anchor_under_root``) so the same guard covers both (ADR 0050
+    AC-8, generalized from the root to every member).
+    """
+    return bool(value) and value[0] in ("/", "\\") and not Path(value).is_absolute()
 
 
 def resolve_values_base_dir(base_dir: str, *, cwd: Path) -> Path:
@@ -60,7 +78,7 @@ def resolve_values_base_dir(base_dir: str, *, cwd: Path) -> Path:
     # A rooted-looking anchor that isn't truly absolute on this platform (the classic case: a
     # drive-relative "/repo" on Windows) still resolves against cwd, re-introducing the very
     # launch-directory dependence the anchor exists to remove. Surface it loud instead of silently.
-    if base_dir[0] in ("/", "\\") and not Path(base_dir).is_absolute():
+    if is_drive_relative(base_dir):
         _log.warning(
             "environments base_dir %r is not fully absolute on this platform — it resolves against "
             "the working directory (%s), so env-value resolution still depends on where the process "

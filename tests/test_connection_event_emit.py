@@ -68,7 +68,9 @@ async def test_emits_established_then_closed() -> None:
         writer.close()
         await writer.wait_closed()
     finally:
-        await source.stop()
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
     assert cap.kinds()[0] == "established"
     assert "closed" in cap.kinds()
     closed = next((p, r) for k, p, r in cap.events if k == "closed")
@@ -87,7 +89,9 @@ async def test_no_sink_is_a_noop() -> None:
         assert await asyncio.wait_for(reader.read(100), 2.0)  # ACK still returned
         writer.close()
     finally:
-        await source.stop()
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
 
 
 async def test_emits_peer_not_allowlisted() -> None:
@@ -100,7 +104,9 @@ async def test_emits_peer_not_allowlisted() -> None:
         assert await asyncio.wait_for(reader.read(), 2.0) == b""  # refused → EOF
         writer.close()
     finally:
-        await source.stop()
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
     assert "peer_not_allowlisted" in cap.kinds()
     assert "established" not in cap.kinds() and "closed" not in cap.kinds()
 
@@ -119,7 +125,9 @@ async def test_emits_at_capacity() -> None:
         w1.close()
         w2.close()
     finally:
-        await source.stop()
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
 
 
 async def test_emits_frame_oversize() -> None:
@@ -135,7 +143,9 @@ async def test_emits_frame_oversize() -> None:
         assert await _wait_for(lambda: "frame_oversize" in cap.kinds())
         writer.close()
     finally:
-        await source.stop()
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
     # the connection was accepted (established) then failed — no redundant clean 'closed'
     assert "established" in cap.kinds() and "closed" not in cap.kinds()
 
@@ -150,7 +160,9 @@ async def test_idle_timeout_close_reason() -> None:
         assert await asyncio.wait_for(reader.read(), 2.0) == b""  # idle close
         writer.close()
     finally:
-        await source.stop()
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
     assert await _wait_for(lambda: "closed" in cap.kinds())
     closed_reason = next(r for k, _, r in cap.events if k == "closed")
     assert closed_reason == "idle_timeout"
@@ -175,7 +187,9 @@ async def test_tcp_emits_established_then_closed() -> None:
         writer.close()
         await writer.wait_closed()
     finally:
-        await source.stop()
+        # Bound teardown so a listener-stop regression (the #55 Windows Proactor wedge) fails LOUD as a
+        # fast timeout instead of silently hanging the shared session loop — mirrors test_connection_resilience.
+        await asyncio.wait_for(source.stop(), timeout=5.0)
     assert cap.kinds()[0] == "established"
     assert "closed" in cap.kinds()
 
@@ -203,7 +217,10 @@ async def test_runner_writes_connection_events_to_store(tmp_path: Path) -> None:
             writer.close()
             await writer.wait_closed()
         finally:
-            await runner.stop()  # stops the source (closed emitted) then flushes the drain queue
+            # Bounded for the same #55 reason as the source-level tests above.
+            await asyncio.wait_for(
+                runner.stop(), timeout=5.0
+            )  # stops the source (closed emitted) then flushes the drain queue
         events = await store.list_connection_events(connection="IB_T_ADT")
         kinds = {e.kind for e in events}
         assert "established" in kinds and "closed" in kinds

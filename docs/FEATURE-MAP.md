@@ -165,7 +165,7 @@ IDE are separate surfaces over the localhost API.
 | Delivery/audit trail + replay | ✅ | |
 | Dead-letter list + replay (via API/CLI) | ✅ | Console **Dead Letters page** shipped — #22a / PR #413 |
 | Cluster/leader status surface | 🔨 | Consumes `GET /cluster/status` |
-| Off-thread API polling (no UI freeze on a slow node) | 🔨 | BACKLOG #2 / M-25 |
+| Off-thread API polling (no UI freeze on a slow node) | ✅ | BACKLOG #2 (DONE) — periodic pollers + per-page refreshes off the main thread (#299/#341); dedicated read-only poll client |
 | Dead Letters page (list + replay) | ✅ | #22a / PR #413 |
 | Alerts page (rules view over `GET /alerts/rules`) | ✅ | #22 / PR #420 |
 | Multi-engine switcher | ⏭️ | CLI/API equivalents exist |
@@ -181,7 +181,7 @@ IDE are separate surfaces over the localhost API.
 | Stage → Promote to a running engine | ✅ | |
 | `@messagefoundry` chat participant (provider-agnostic, PHI-safe) | ✅ | code + schema + graph only |
 | `connections.toml` GUI editor | ✅ | ADR 0007 (#193) |
-| Functional/runtime test harness | ⏭️ | BACKLOG #6 — build + type-check only today |
+| Functional/runtime test harness | ✅ | BACKLOG #6 (DONE) — `@vscode/test-electron` + mocha headless harness; ubuntu + windows `ide` CI legs (#351) |
 
 ## 12. Config & Operations
 

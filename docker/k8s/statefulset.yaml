@@ -81,8 +81,10 @@ spec:
           ports:
             - { name: api, containerPort: 8443 }
             - { name: mllp, containerPort: 2575 }
-            # Do NOT expose raw-TCP / X12 ports without TLS: those listeners have NO startup transport
-            # guard (MLLP and the DICOM C-STORE SCP are guarded — a non-loopback bind without TLS is refused).
+            # Do NOT expose raw-TCP / X12 ports without TLS. Those listeners are PLAINTEXT-ONLY (no tls=
+            # option), but they ARE exposed-gated since PR #558: MLLP, the DICOM C-STORE SCP, HTTP, raw-TCP,
+            # and X12 all refuse a non-loopback bind without TLS at startup. For raw-TCP/X12 there is no TLS
+            # escape — keep them loopback-bound or front them with a TLS-terminating TCP proxy.
           env:
             - { name: MEFOR_API_HOST, value: "0.0.0.0" }
             - { name: MEFOR_API_PORT, value: "8443" }

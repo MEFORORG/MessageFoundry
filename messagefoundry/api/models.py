@@ -47,6 +47,21 @@ class MessageList(BaseModel):
     messages: list[MessageSummary]
 
 
+class MessageSearchResults(BaseModel):
+    """Result of a scan-and-decrypt content search (ADR 0046 #51). ``messages`` are the matched message
+    summaries (metadata only — same shape + PHI redaction as ``MessageList``, never a decrypted body).
+    ``scanned`` is how many candidate rows were decrypted; ``matched`` the number that matched (==
+    ``len(messages)`` before the result cap); ``truncated`` is True when the scan stopped at the
+    ``scan_limit`` ceiling before exhausting the candidate set — the "narrow your filters" signal."""
+
+    messages: list[MessageSummary]
+    scanned: int
+    matched: int
+    truncated: bool
+    limit: int
+    scan_limit: int
+
+
 class OutboxInfo(BaseModel):
     id: str
     destination_name: str
@@ -159,6 +174,32 @@ class ConnectionEventInfo(BaseModel):
     reason: str | None = None
 
 
+class AlertInstanceInfo(BaseModel):
+    """One resolvable operator-alert instance (ADR 0044, #56) — **metadata only, no PHI**: the alert
+    type, connection label, severity, lifecycle status (open/acknowledged/resolved), the
+    first/last-seen window + occurrence count, a scrubbed reason, and the ack/resolve audit fields.
+    Read via the ``monitoring:diagnose``-gated ``GET /alerts/active`` route."""
+
+    id: int
+    event_type: str
+    connection: str
+    severity: str
+    status: str  # 'open' | 'acknowledged' | 'resolved'
+    first_seen: float
+    last_seen: float
+    count: int
+    reason: str | None = None
+    acked_by: str | None = None
+    acked_at: float | None = None
+    resolved_at: float | None = None
+
+
+class AlertInstanceList(BaseModel):
+    """The active (open + acknowledged) operator-alert instances, newest ``last_seen`` first (ADR 0044)."""
+
+    alerts: list[AlertInstanceInfo]
+
+
 class DeadLetterReplayRequest(BaseModel):
     # Connection names; bounded so an over-long value can't reach the store query (ASVS 1.3.3).
     channel_id: str | None = Field(None, max_length=256)  # scope replay to one inbound (None = all)
@@ -240,14 +281,14 @@ class ConnectionRow(BaseModel):
     channel_name: str
     destination: str | None  # destination name; None for the source row
     name: str  # display name
-    status: str  # "running" | "stopped" | "failed" (start failed, ADR 0031) | "draining"
+    status: str  # "running" | "stopped" | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining"
     direction: str  # "in" (source) | "out" (destination)
     method: str  # connection method/protocol, e.g. MLLP / File / TCP / REST
     peer: str | None  # MLLP host or file directory
     port: int | None
     queue_depth: int | None
     idle_seconds: float | None
-    alerts_active: int  # stubbed 0 until the alerts feature exists
+    alerts_active: int  # count of OPEN alert instances for this connection (ADR 0044, #56)
     errored: int | None  # source: inbound errors; destination: dead-lettered
     read: int | None  # source only: inbound received
     written: int | None  # destination only: delivered
@@ -255,7 +296,7 @@ class ConnectionRow(BaseModel):
     delivered_age_seconds: float | None  # destination only; age of oldest queued item
     simulated: bool | None = None  # destination only; True = egress-suppressed shadow lane (#15)
     error: str | None = (
-        None  # set when status == "failed": why the connection failed to start (ADR 0031)
+        None  # set when status == "failed" (why it failed to start, ADR 0031) or "filtered" (why the DR run-profile parked it, #61 ADR 0048)
     )
 
 
@@ -314,9 +355,39 @@ class DbInfo(BaseModel):
     audit: int
 
 
+class LogInfo(BaseModel):
+    """App-log storage metering for the configured ``[logging].log_dir`` (#50), mirroring
+    :class:`DbInfo`'s DB-side ``size_bytes`` / ``disk_free_bytes``. **Metadata only — never any log
+    content** (no PHI). Present only when a log directory is configured; when the engine logs to stdout
+    (captured off-process by NSSM) the ``logs`` field on :class:`SystemStatus` is ``None``."""
+
+    path: str
+    size_bytes: int  # total bytes of regular files under the log directory (one level)
+    disk_free_bytes: int  # free space on the log directory's filesystem
+
+
+class UpdateInfo(BaseModel):
+    """No-network version-update result (#30, ADR 0026): the running version vs the installed/pinned
+    one + the derived ``update_available`` bool. Carries **only version strings** — no PHI, no
+    dependency list. Present on :class:`SystemStatus` only when ``[update_check]`` is enabled and the
+    runner has produced a result; ``None``/absent otherwise (so the payload is unchanged when off)."""
+
+    current_version: str
+    pinned_version: (
+        str | None
+    )  # None in a source/checkout run with no installed-distribution metadata
+    update_available: bool
+
+
 class SystemStatus(BaseModel):
     engine: EngineInfo
     db: DbInfo
+    # App-log disk metering (#50), alongside the DB metrics. ``None`` when no [logging].log_dir is
+    # configured (the engine logs to stdout under NSSM) or the directory is unreadable — never raises.
+    logs: LogInfo | None = None
+    # No-network version-update signal (#30, ADR 0026). Additive + ``None`` when [update_check] is
+    # disabled or the runner hasn't produced a result yet, so the existing payload is unchanged when off.
+    update: UpdateInfo | None = None
 
 
 class IntegrityResult(BaseModel):
@@ -366,6 +437,34 @@ class ClusterNodeList(BaseModel):
     leader_node_id: str | None
     lease_owner: str | None
     lease_expires_at: float | None
+
+
+class DrStatus(BaseModel):
+    """Third-tier DR standby posture (#61, ADR 0048). ``enabled`` = this deployment is a DR box at all
+    (``[dr].enabled``); ``active`` = it is currently serving under the DR run-profile (the priority feeds
+    are bound, the rest report ``status:"filtered"``); ``threshold`` is ``[dr].priority_threshold``;
+    ``activation_mode`` is always ``"manual"`` in this slice (``auto`` is rejected at config load). A
+    non-DR deployment reports ``enabled=false`` / ``active=false``."""
+
+    enabled: bool
+    active: bool
+    threshold: str
+    activation_mode: str
+
+
+class DrActionResult(BaseModel):
+    """The PHI-free outcome of a ``POST /dr/activate`` or ``/dr/release`` (#61, ADR 0048): the new
+    posture plus, for an activation, the verified cold-seed archive name + restore-verify status + the
+    new audit-chain segment marker hash. Paths/counts/one-way fingerprints only — never a body or key
+    bytes."""
+
+    action: str  # "activate" | "release"
+    active: bool
+    threshold: str
+    archive: str | None = None
+    verify_status: str | None = None
+    seed_segment: str | None = None
+    vip_hook_ran: bool = False
 
 
 class AiPolicy(BaseModel):

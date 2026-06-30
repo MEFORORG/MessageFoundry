@@ -47,15 +47,23 @@ class Identity:
         roles: Iterable[Role],
         must_change_password: bool = False,
         allowed_channels: frozenset[str] | None = None,
+        extra_permissions: Iterable[Permission] = (),
     ) -> Identity:
-        """Construct an identity, resolving ``roles`` to their union of permissions."""
+        """Construct an identity, resolving ``roles`` to their union of permissions.
+
+        ``extra_permissions`` are unioned on top of the built-in role permissions — the additive
+        custom-role overlay (ADR 0045): a user's effective set is *built-in-role ∪ custom-role*
+        permissions. The flat ``permissions`` set is what every authorization check consults, so where
+        a permission came from is invisible downstream.
+        """
         role_set = frozenset(roles)
+        permissions = permissions_for_roles(role_set) | frozenset(extra_permissions)
         return cls(
             user_id=user_id,
             username=username,
             auth_provider=auth_provider,
             roles=role_set,
-            permissions=permissions_for_roles(role_set),
+            permissions=permissions,
             must_change_password=must_change_password,
             allowed_channels=allowed_channels,
         )

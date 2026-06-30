@@ -288,7 +288,7 @@ def test_health_poll_401_emits_session_expired(qapp, monkeypatch) -> None:
     expired: list[bool] = []
     window.session_expired.connect(lambda: expired.append(True))
     # Drive the apply step directly with a 401 — the off-thread fetch already returned it.
-    window._apply_health(("not installed", None, ApiError("expired", status=401)))
+    window._apply_health(("not installed", None, ApiError("expired", status=401), None))
     assert expired == [True]  # M-26: 401 -> session_expired, not a generic "unreachable"
     window.close()
 

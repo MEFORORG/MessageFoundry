@@ -23,20 +23,33 @@ the callers caring.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import SqliteSync, StoreBackend, StoreSettings
+from messagefoundry.store.content_search import (
+    DEFAULT_SCAN_LIMIT,
+    MAX_SCAN_LIMIT,
+    ContentSearchError,
+    SearchSpec,
+    SearchTarget,
+    make_spec,
+)
 from messagefoundry.store.crypto import CipherInfo, make_cipher
+from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.store import (
+    AlertInstance,
     CapturedResponse,
     ConnectionEvent,
     ConnectionMetrics,
     DbStatus,
     LatencyHistogram,
+    MessageSearchResult,
     MessageStatus,
     MessageStore,
     OutboxItem,
@@ -45,17 +58,38 @@ from messagefoundry.store.store import (
     UserRecord,
 )
 
+log = logging.getLogger(__name__)
+
 __all__ = [
     "AdminStore",
     "AuditStore",
     "AuthStore",
+    "ContentSearchError",
+    "DbaDelegatedError",
+    "DEFAULT_SCAN_LIMIT",
+    "MAX_SCAN_LIMIT",
+    "MessageSearchResult",
     "QueueStore",
     "Row",
+    "SearchSpec",
+    "SearchTarget",
     "Store",
     "StoreLifecycle",
+    "make_spec",
     "open_store",
     "sqlite_settings",
+    "warm_pool_connections",
+    "warm_pool_target",
 ]
+
+
+class DbaDelegatedError(RuntimeError):
+    """A store operation that is **DBA-delegated** for the server-DB backends (BACKLOG #52) was invoked
+    on a ``postgres``/``sqlserver`` store — today only :meth:`Store.snapshot_to` (ADR 0049 DR backup).
+    DB-tier backup / restore / PITR on those backends is owned by infra (``pg_dump`` / Always On), not
+    reimplemented in the engine, so the snapshot raises this rather than producing a half-baked copy. The
+    BackupRunner / ``backup`` CLI catch it and fall back to a config-only backup (or skip) per
+    ``[backup].config_only_on_server_db``."""
 
 
 class Row(Protocol):
@@ -76,6 +110,23 @@ class StoreLifecycle(Protocol):
     backend: StoreBackend
 
     async def close(self) -> None: ...
+
+    async def snapshot_to(self, dest_path: str | Path, *, method: str = "vacuum_into") -> None:
+        """Produce a **consistent single-file snapshot** of the store at ``dest_path`` (ADR 0049 DR
+        backup) — never a raw file copy under WAL. **SQLite only**: on the server-DB backends
+        (postgres/sqlserver) this raises :class:`DbaDelegatedError` (DB-tier backup is DBA-delegated,
+        #52). ``method`` is ``"vacuum_into"`` (default — ``VACUUM INTO`` on the writer connection under
+        the store lock, mandatory off-peak) or ``"online_backup"`` (the page-batched SQLite Online Backup
+        API, low-contention).
+
+        The snapshot is **point-in-time consistent and non-mutating**: it first checkpoints the WAL, then
+        copies the DB **as it is** — it never claims, mutates, resets, completes, or dead-letters a
+        staged-queue row, and never touches the leader lease or audit chain (the reliability +
+        count-and-log invariants hold; on restore, the startup ``reset_stale_inflight`` + pure-stage
+        replay recover any in-flight rows). Runs OFF the event loop (a worker thread), like the store's
+        other long PRAGMA work, so it never blocks asyncio. The resulting file has no ``-wal``/``-shm``
+        sidecars to reconcile."""
+        ...
 
 
 class QueueStore(StoreLifecycle, Protocol):
@@ -309,6 +360,20 @@ class QueueStore(StoreLifecycle, Protocol):
         (single active node — no second writer to fence)."""
         ...
 
+    async def warm_pool(self) -> None:
+        """Pre-establish pooled connections so a connection-burst — notably the post-promotion delivery
+        workers in active-passive HA — does not pay cold connects (TCP + TLS + login) on the hot path.
+        It is a **recovery/drain optimization, not intake**: the inbound listener binds before this
+        matters, so the engine fires it as a **background task** on graph start/promotion and never
+        blocks listener bring-up on it.
+
+        **Best-effort and safe by construction:** it leaves headroom below the pool maximum so a
+        concurrent startup caller is never starved while connections are held, never strands a pooled
+        connection (every connection it acquires is released even on timeout/cancellation), and never
+        raises. A **no-op on SQLite** (a single connection — there is no pool to warm). The server
+        backends share :func:`warm_pool_connections`."""
+        ...
+
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None: ...
 
     async def complete_with_response(
@@ -481,6 +546,22 @@ class QueueStore(StoreLifecycle, Protocol):
         allowed_channels: Sequence[str] | None = None,
     ) -> int: ...
 
+    async def search_messages(
+        self,
+        spec: SearchSpec,
+        *,
+        channel_id: str | None = None,
+        status: str | None = None,
+        message_type: str | None = None,
+        control_id: str | None = None,
+        limit: int = 50,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> MessageSearchResult:
+        """Scan-and-decrypt content search (ADR 0046 #51): metadata pre-filter in SQL, then decrypt +
+        match each candidate body in memory off the event loop — the only mechanism that works while the
+        store cipher is on (the at-rest bytes are per-row random-nonced AES-GCM ciphertext)."""
+        ...
+
     async def list_dead(
         self,
         *,
@@ -559,6 +640,79 @@ class QueueStore(StoreLifecycle, Protocol):
         an empty set matches nothing."""
         ...
 
+    # --- operator alert-state (resolvable alert instances, ADR 0044 #56) ------
+    async def upsert_alert_instance(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        severity: str,
+        reason: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Record/fold one operator-alert occurrence into a resolvable ``alert_instance`` (ADR 0044),
+        de-duped on ADR 0014's ``(event_type, connection)`` throttle key: if a live (``open`` or
+        ``acknowledged``) instance for the key exists, bump ``last_seen`` + ``count`` (refresh
+        ``severity``/``reason``; an acknowledged instance stays acknowledged); otherwise insert a fresh
+        ``open`` row.
+
+        A **pure observer** (like :meth:`record_connection_event`): a single short upsert in its own
+        transaction, touching no ``queue`` row and calling no finalizer, so it can never pin a message's
+        disposition. ``reason`` is ``safe_text``-scrubbed (#120) and encrypted at rest on every backend;
+        no message body is ever passed here. The caller (the ``_emit`` chokepoint) wraps it fail-soft, so
+        a store error here can never wedge a delivery worker."""
+        ...
+
+    async def list_active_alert_instances(
+        self,
+        *,
+        limit: int = 200,
+        allowed_channels: Sequence[str] | None = None,
+    ) -> list[AlertInstance]:
+        """Read **open + acknowledged** alert instances newest-``last_seen`` first — the read accessor for
+        the ``GET /alerts/active`` route. Runs on the lockfree read path; ``limit`` clamped server-side.
+        ``allowed_channels`` applies the same per-channel RBAC scope as :meth:`list_connection_events`
+        (``None`` = all; a set restricts to instances whose ``connection`` is in the allow-set)."""
+        ...
+
+    async def ack_alert_instance(
+        self, alert_id: int, *, actor: str, now: float | None = None
+    ) -> bool:
+        """Acknowledge a live instance (``open``/``acknowledged`` → ``acknowledged``), recording
+        ``acked_by``/``acked_at``. Idempotent. Returns ``True`` iff a non-resolved instance with this id
+        existed (so the API 404s a resolved/unknown id)."""
+        ...
+
+    async def resolve_alert_instance(self, alert_id: int, *, now: float | None = None) -> bool:
+        """Resolve a live instance (``open``/``acknowledged`` → ``resolved``), recording ``resolved_at``.
+        Returns ``True`` iff a non-resolved instance with this id existed."""
+        ...
+
+    async def resolve_alert_instances_for(
+        self, *, event_type: str, connection: str, now: float | None = None
+    ) -> int:
+        """Auto-resolve the live instance(s) for a ``(event_type, connection)`` key on the inverse
+        lifecycle signal (e.g. ``connection_restored``). Returns the count resolved."""
+        ...
+
+    async def get_alert_instance(
+        self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
+    ) -> AlertInstance | None:
+        """Read one alert instance by id (any status), RBAC-scoped like
+        :meth:`list_active_alert_instances` — the API echo after an ack/resolve. ``None`` if unknown or
+        outside the caller's channels."""
+        ...
+
+    async def count_open_alerts_by_connection(self) -> dict[str, int]:
+        """The **open** (not acknowledged, not resolved) instance count per ``connection`` — backs
+        ``ConnectionRow.alerts_active`` (ADR 0044 D4). Lockfree read."""
+        ...
+
+    async def purge_alert_instances(self, *, older_than: float, now: float | None = None) -> int:
+        """Age-DELETE **resolved** instances whose ``resolved_at`` predates ``older_than`` (ADR 0044 D5
+        retention) — metadata-only, never an open/acknowledged instance. Returns the number purged."""
+        ...
+
     async def stats(self) -> dict[str, int]: ...
 
     async def in_pipeline_depth(self) -> int:
@@ -571,9 +725,50 @@ class QueueStore(StoreLifecycle, Protocol):
     async def reencrypt_to_active(self, *, batch: int = 500) -> int: ...
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
-    async def purge_message_bodies(self, *, older_than: float, now: float | None = None) -> int: ...
+    async def purge_message_bodies(
+        self,
+        *,
+        older_than: float,
+        now: float | None = None,
+        connection_cutoffs: Mapping[str, float] | None = None,
+    ) -> int:
+        """Null PHI message bodies received before ``older_than`` (keeping metadata rows; the Mirth
+        Data-Pruner pattern). ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff
+        per ``channel_id`` (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff,
+        byte-identical to the prior behaviour. Returns the number purged."""
+        ...
 
-    async def purge_dead_letters(self, *, older_than: float, now: float | None = None) -> int: ...
+    async def strip_embedded_documents(
+        self,
+        *,
+        older_than: float,
+        now: float | None = None,
+        connection_cutoffs: Mapping[str, float] | None = None,
+        min_bytes: int = 0,
+        content_types: Mapping[str, str] | None = None,
+    ) -> StripResult:
+        """Strip bulky base64 embedded documents from stored message bodies **in place** (#47, ADR 0042):
+        replace each ``mfb64:v1:`` carriage value / HL7 OBX-5 ED embed with a small self-describing
+        tombstone (size + content-type + pruned ts) via the codec, keep the surrounding message
+        byte-stable + parseable, and set the message's ``documents_pruned`` flag. Eligibility mirrors
+        :meth:`purge_message_bodies` (per-connection-or-global cutoff AND not in-flight); ``min_bytes``
+        skips a sub-threshold embed; ``content_types`` (channel_id -> declared content_type) labels a
+        bare-mfb64 tombstone. Idempotent (an already-tombstoned body is skipped). Returns a
+        :class:`StripResult` (counts + bytes reclaimed; no message content)."""
+        ...
+
+    async def purge_dead_letters(
+        self,
+        *,
+        older_than: float,
+        now: float | None = None,
+        connection_cutoffs: Mapping[str, float] | None = None,
+    ) -> int:
+        """Null dead-lettered outbound bodies updated before ``older_than`` (their own window).
+        ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``destination_name``
+        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff. Returns the number
+        purged."""
+        ...
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries (ADR 0005) last written before ``older_than`` (age-based
@@ -757,9 +952,20 @@ class AuthStore(Protocol):
         display_name: str,
         description: str | None = None,
         builtin: bool = True,
-    ) -> None: ...
+        permissions: str | None = None,
+    ) -> None:
+        """Create-or-update a role. ``permissions`` is a JSON array of ``Permission`` wire values for a
+        custom role (ADR 0045), or ``None`` for a built-in row (which resolves from code)."""
+        ...
 
     async def list_roles(self) -> Sequence[Row]: ...
+
+    async def get_role(self, role_id: str) -> Row | None: ...
+
+    async def delete_custom_role(self, role_id: str) -> bool:
+        """Delete a custom (``builtin`` false) role + its user/AD-group assignments in one transaction;
+        a built-in row is never removed. Returns ``True`` iff a custom role was deleted (ADR 0045)."""
+        ...
 
     async def get_user_role_ids(self, user_id: str) -> list[str]: ...
 
@@ -865,6 +1071,33 @@ def resolve_active_key(settings: StoreSettings) -> str | None:
     return resolve_key_provider(settings).active_key()
 
 
+def resolve_decrypt_keys(settings: StoreSettings) -> list[str]:
+    """The full **decrypt-capable** base64 keyring for this store — the active key followed by every
+    retired (decrypt-only) key — sourced through the same :class:`KeyProvider` seam as
+    :func:`resolve_active_key`/``open_store`` (ADR 0019). This is exactly the set the store cipher can
+    decrypt with (``make_cipher(active, retired)`` in ``open_store``), so a caller that must decrypt
+    *any* value the store could read — e.g. the DR restore-verify checking a backup taken under a
+    now-retired key after a rotation (ADR 0049 AC-5: "incl. retired keys") — uses this, not just the
+    active key. Order is active-first; duplicates and empties are dropped; an unset active key yields an
+    empty list (identity cipher)."""
+    provider = resolve_key_provider(settings)
+    ordered: list[str] = []
+    active = provider.active_key()
+    if active:
+        ordered.append(active)
+    for retired in provider.retired_keys():
+        if retired:
+            ordered.append(retired)
+    # De-dup while preserving order (active first) so a key listed both active + retired isn't tried twice.
+    seen: set[str] = set()
+    keyring: list[str] = []
+    for k in ordered:
+        if k not in seen:
+            seen.add(k)
+            keyring.append(k)
+    return keyring
+
+
 async def open_store(settings: StoreSettings) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
 
@@ -878,7 +1111,11 @@ async def open_store(settings: StoreSettings) -> Store:
     cipher = make_cipher(resolve_active_key(settings), retired)
     if settings.backend is StoreBackend.SQLITE:
         return await MessageStore.open(
-            settings.path, synchronous=settings.synchronous.value, cipher=cipher
+            settings.path,
+            synchronous=settings.synchronous.value,
+            cipher=cipher,
+            group_commit_window_ms=settings.group_commit_window_ms,
+            group_commit_max_batch=settings.group_commit_max_batch,
         )
     if settings.backend is StoreBackend.SQLSERVER:
         from messagefoundry.store.sqlserver import SqlServerStore  # lazy: optional aioodbc dep
@@ -894,3 +1131,141 @@ async def open_store(settings: StoreSettings) -> Store:
 def sqlite_settings(path: str | Path, *, synchronous: str = "NORMAL") -> StoreSettings:
     """Build a SQLite ``StoreSettings`` (convenience for callers that only have a path)."""
     return StoreSettings(path=str(path), synchronous=SqliteSync(synchronous.lower()))
+
+
+# Upper bound (seconds) on the background pool warm-up's release cleanup. A release over a dead
+# connection (failover to a gone node) can hang; this bounds it so a stuck release can never hang
+# stop()/re-promotion — on expiry a bounded partial strand is accepted (see _release_held). Generous
+# headroom over a healthy release (sub-second) so we never abort a slow-but-live one and strand it.
+_CLEANUP_TIMEOUT_SECONDS = 5.0
+
+
+def warm_pool_target(maxsize: int, configured: int | None) -> int:
+    """Resolve how many connections :func:`warm_pool_connections` should pre-open for a pool of
+    ``maxsize``. An explicit ``configured`` count is clamped to ``maxsize - 1`` (always leave the pool a
+    free slot); otherwise the default is ``min(maxsize - 1, maxsize // 2)`` so a warm never pins more than
+    half the pool — leaving slots for the concurrent startup work (on-promotion recovery, the coordinator
+    heartbeat, the first delivery workers). A pool of ``maxsize <= 1`` is never warmed (returns 0)."""
+    if maxsize <= 1:
+        return 0
+    if configured is not None:
+        return min(configured, maxsize - 1)
+    # maxsize >= 2 here, so maxsize // 2 >= 1 — no lower clamp needed.
+    return min(maxsize - 1, maxsize // 2)
+
+
+async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backend: str) -> int:
+    """Pre-establish up to ``target`` pooled connections CONCURRENTLY, then release them all, so a later
+    burst (e.g. the post-promotion delivery workers in active-passive HA) finds them warm instead of
+    paying a cold connect (TCP + TLS + login) on the hot path. Holding the connections **simultaneously**
+    is what forces the pool to create them — a sequential acquire/release would only ever reuse one.
+    Shared by the server backends (their pools differ only in how the maximum size is read); SQLite has
+    no pool and overrides :meth:`QueueStore.warm_pool` with a no-op.
+
+    Safe by construction: a per-connection connect failure is absorbed (the pool is left partially
+    warm), the whole warm-up is bounded by ``timeout``, and every connection actually acquired is
+    **always** released — even if a cancellation is delivered mid-cleanup — so warming can never strand a
+    connection out of the pool. Returns the number warmed. The caller leaves headroom below the pool
+    maximum so a concurrent startup caller is never starved while connections are held (see
+    :func:`warm_pool_target`).
+
+    **Cancellation-safe, bounded cleanup** (reliability-core): a re-fire (demote→re-promote) or ``stop()``
+    cancel can land while we are suspended in ``await pool.release(...)`` — a real suspension point for
+    both drivers (asyncpg reset / aioodbc rollback). Because the pool persists across a failover flap, an
+    interrupted release would strand a slot the incoming leader term then can't use. So the drain+release
+    runs as a **shielded** sub-task (a cancel can't interrupt it mid-loop) that is also **bounded** (a
+    release stuck on a *dead* connection can't hang ``stop()``/re-promotion — both callers gather this
+    task with no timeout). On the bound lapsing we accept a *bounded* partial strand rather than hang. See
+    :func:`_release_held`.
+
+    **Relied-upon invariant** (leak-freedom of the acquire side rests on it): ``pool.acquire()`` must
+    mark the connection in-use atomically with returning it — true for ``asyncpg>=0.29`` and
+    ``aioodbc>=0.5``. Combined with CPython's cancellation semantics (a ``CancelledError`` delivered while
+    suspended at the ``await`` *raises* rather than yielding the already-resolved connection, so the
+    post-``await`` append never runs), no half-acquired connection can escape ``held`` and leak.
+
+    **Acquire-and-release ONLY** — this deliberately opens NO cursor and runs NO statement, so it neither
+    needs nor uses the EF-6 ``_cursor`` close-before-release discipline. If a liveness probe (``SELECT 1``)
+    is ever wanted on a warmed connection, route it through the backend's own ``_acquire``/``_cursor``
+    wrapper, never the raw pool here."""
+    if target <= 0:
+        return 0
+    held: list[Any] = []
+
+    async def _acquire_one() -> None:
+        # Append the instant it is acquired (a list append between awaits is atomic on the loop) so the
+        # cleanup below releases it even if the gather is cancelled or times out mid-flight.
+        held.append(await pool.acquire())
+
+    tasks = [asyncio.create_task(_acquire_one()) for _ in range(target)]
+    try:
+        # return_exceptions=True: a single failed connect is a partial warm, not a raise.
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout)
+    except TimeoutError:
+        log.warning(
+            "%s: pool warm-up did not finish within %gs; continuing with a partially warm pool",
+            backend,
+            timeout,
+        )
+    finally:
+        for task in tasks:
+            task.cancel()
+        await _release_held(pool, tasks, held, backend)
+    return len(held)
+
+
+async def _release_held(
+    pool: Any, tasks: list[asyncio.Task[None]], held: list[Any], backend: str
+) -> None:
+    """Drain the (now-cancelled) acquire tasks and release every held connection, **shielded** so a
+    cancellation delivered to the caller (a re-fire or ``stop()`` cancel) can't interrupt the release
+    mid-way and strand a slot the incoming leader then needs. The release is **bounded** inside
+    :func:`_drain_and_release` (so a release stuck on a dead node can't hang ``stop()``/re-promotion —
+    both callers gather this task with no timeout), which lets ``cleanup`` resolve normally here; we just
+    wait it out and re-raise any cancellation once the pool is clean."""
+    cleanup = asyncio.ensure_future(_drain_and_release(pool, tasks, held, backend))
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True  # caller cancelled us; keep waiting for the (bounded) shielded cleanup
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+async def _drain_and_release(
+    pool: Any, tasks: list[asyncio.Task[None]], held: list[Any], backend: str
+) -> None:
+    # Drain cancellations/exceptions so none are left unretrieved, then release every held connection
+    # CONCURRENTLY (a sibling stuck on a dead connection must not block freeing the live ones) and
+    # BOUNDED (``_CLEANUP_TIMEOUT_SECONDS``) so a release that hangs on a dead node can't hang stop()/
+    # re-promotion. On the bound lapsing the stuck release(s) are abandoned — a bounded partial strand
+    # the pool discards (the pool is closing at stop(), or re-grown at re-fire). The bound lives HERE so
+    # the caller's ``cleanup`` task always resolves normally (a TimeoutError escaping a *shielded* future
+    # would otherwise be logged at ERROR by the loop).
+    await asyncio.gather(*tasks, return_exceptions=True)
+    if not held:
+        return
+    releases = [asyncio.ensure_future(_release_one(pool, conn, backend)) for conn in held]
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*releases, return_exceptions=True), _CLEANUP_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        log.warning(
+            "%s: pool warm-up release did not finish within %gs; abandoning the stuck release(s) "
+            "(a bounded partial strand the pool discards)",
+            backend,
+            _CLEANUP_TIMEOUT_SECONDS,
+        )
+        for release in releases:
+            release.cancel()
+        await asyncio.gather(*releases, return_exceptions=True)
+
+
+async def _release_one(pool: Any, conn: Any, backend: str) -> None:
+    try:
+        await pool.release(conn)
+    except Exception as exc:  # noqa: BLE001 - best-effort: a release error must not propagate
+        log.warning("%s: pool warm-up connection release failed: %s", backend, exc)

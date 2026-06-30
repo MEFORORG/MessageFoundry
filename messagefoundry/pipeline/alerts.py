@@ -42,6 +42,15 @@ class AlertSink(Protocol):
         retry-forever head is blocking the lane. (Emitted by the buildup detector — ordering Layer 4b.)"""
         ...
 
+    def message_stall(self, name: str, *, oldest_age_seconds: float) -> None:
+        """An outbound connection's **oldest undelivered message** aged past the configured
+        ``StallThreshold`` (Corepoint "Max Message Stall", #50). Fired off the same oldest-pending age
+        (``delivered_age``) as :meth:`queue_buildup`, but on a dedicated age-only threshold so an
+        operator can page on "a message stuck > N seconds" independently of backlog *depth*. Off by
+        default (deny-by-default — only fires when a threshold is configured). No PHI — the connection
+        name + age only."""
+        ...
+
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
         """An outbound connection's delivery lane went **down** — the first transport failure
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
@@ -63,6 +72,44 @@ class AlertSink(Protocol):
         Emitted by the :class:`~messagefoundry.pipeline.cert_expiry.CertExpiryRunner`."""
         ...
 
+    def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
+        """Startup self-attestation found loaded engine module(s) that do not match the installed
+        wheel ``RECORD`` baseline — a runtime in-place tamper tripwire (ADR 0041 D3, #54). ``name``
+        labels the source (``"engine-integrity"``); ``reason`` is a PHI-free summary string;
+        ``drift_count`` is how many module files drifted. Carries no file content (no PHI, nothing
+        sensitive). Emitted by :func:`~messagefoundry.integrity.run_startup_attestation`. Dedicated
+        rather than reusing :meth:`connection_stopped` so an operator can route/triage a tamper signal
+        independently of a stalled delivery lane."""
+        ...
+
+    def update_available(self, name: str, *, current_version: str, pinned_version: str) -> None:
+        """A newer MessageFoundry version is pinned/installed than is running (#30, ADR 0026). ``name``
+        labels the package (``"messagefoundry"``); ``current_version`` is the running
+        :data:`messagefoundry.__version__`; ``pinned_version`` is what the install pins. Carries **only**
+        version strings — no PHI, no dependency list, no host data. Emitted by
+        :class:`~messagefoundry.pipeline.update_check.UpdateCheckRunner` (the no-network local diff)."""
+        ...
+
+    def connection_restored(self, name: str) -> None:
+        """An outbound lane recovered — the **inverse** of :meth:`connection_error` (``connection_lost``).
+        Emits **no** notification (a recovery needs no page); it exists so durable alert-state (ADR 0044,
+        #56) can **auto-resolve** the matching open ``connection_error`` instance when wired. The default
+        :class:`LoggingAlertSink` and any state-less sink treat it as a no-op. ``name`` is the connection
+        label only (no PHI)."""
+        ...
+
+    def backup_failed(self, name: str, *, kind: str, detail: str | None = None) -> None:
+        """A scheduled or on-demand DR backup failed (ADR 0049, #60) — the snapshot, encrypt, write, or
+        restore-verify step. ``name`` labels the source (``"dr_backup"``); ``kind`` is the failing phase
+        (``snapshot``/``encrypt``/``write``/``verify``/``destination``); ``detail`` is a PHI-free,
+        ``safe_exc``-scrubbed error **class/reason** — never a message body or key material. Dedicated
+        (not reusing :meth:`storage_threshold`) so an operator can route/triage a backup failure
+        independently of a store-size alert. Emitted by the
+        :class:`~messagefoundry.pipeline.dr_backup.BackupRunner` (and the ``backup`` CLI), so a silent
+        backup failure surfaces as an alert + the ``dr_backup`` ERROR disposition, not as a missing
+        archive discovered during a disaster."""
+        ...
+
 
 class LoggingAlertSink:
     """Default :class:`AlertSink`: log each event at ``WARNING``. No PHI — only the connection name
@@ -78,6 +125,13 @@ class LoggingAlertSink:
             "ALERT queue_buildup: outbound %r backlog depth=%d oldest=%.0fs",
             name,
             depth,
+            oldest_age_seconds,
+        )
+
+    def message_stall(self, name: str, *, oldest_age_seconds: float) -> None:
+        log.warning(
+            "ALERT message_stall: outbound %r oldest undelivered message stalled %.0fs",
+            name,
             oldest_age_seconds,
         )
 
@@ -109,3 +163,27 @@ class LoggingAlertSink:
                 days_remaining,
                 not_after,
             )
+
+    def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
+        log.warning(
+            "ALERT integrity_drift: %r detected %d drifted engine module(s): %s",
+            name,
+            drift_count,
+            reason,
+        )
+
+    def update_available(self, name: str, *, current_version: str, pinned_version: str) -> None:
+        log.warning(
+            "ALERT update_available: %r running %s but %s is pinned/installed — update available",
+            name,
+            current_version,
+            pinned_version,
+        )
+
+    def connection_restored(self, name: str) -> None:
+        # State-less sink: a recovery needs no page and there is no instance to auto-resolve, so this is
+        # a no-op (the connection_event lifecycle row is recorded by the runner, not here). ADR 0044 #56.
+        return
+
+    def backup_failed(self, name: str, *, kind: str, detail: str | None = None) -> None:
+        log.warning("ALERT backup_failed: %r %s backup failed: %s", name, kind, detail or "")

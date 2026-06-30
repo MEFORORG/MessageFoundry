@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from messagefoundry.api.models import MessageDetail, MessageList
+from messagefoundry.api.models import MessageDetail, MessageSummary
 from messagefoundry.console._async import AsyncRunner
 from messagefoundry.console.client import ApiError, EngineClient
 from messagefoundry.console.theme import ERROR_TEXT
@@ -321,10 +321,14 @@ class MessageDetailPanel(QWidget):
 
 @dataclass(frozen=True)
 class _MessagesSnapshot:
-    """One off-thread message-list read, applied on the main thread. ``error`` set ⇒ the read failed
-    (the table is left as-is); otherwise ``result`` holds the page of messages to render."""
+    """One off-thread message-list (or content-search) read, applied on the main thread. ``error`` set
+    ⇒ the read failed (the table is left as-is); otherwise ``messages`` is the page to render,
+    ``count_text`` the status-bar label, and ``truncated`` whether a content search hit its scan cap (so
+    the label can prompt the operator to narrow filters)."""
 
-    result: MessageList | None
+    messages: list[MessageSummary] | None
+    count_text: str
+    truncated: bool
     error: str | None
 
 
@@ -367,15 +371,29 @@ class MessagesPanel(QWidget):
         self._channel_filter.setPlaceholderText("channel id")
         self._status_filter = QLineEdit()
         self._status_filter.setPlaceholderText("status")
+        # Content search (ADR 0046 #51): an HL7 field path (e.g. PID-3) OR a raw/summary substring. When
+        # set, the panel switches from the metadata list to the scan-and-decrypt /messages/search route
+        # (step-up gated server-side). The field-path box, when filled, takes precedence over content.
+        self._content_filter = QLineEdit()
+        self._content_filter.setPlaceholderText("content contains…")
+        self._field_path_filter = QLineEdit()
+        self._field_path_filter.setPlaceholderText("HL7 field (e.g. PID-3)")
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(lambda: self.refresh(audit=True))
-        self._channel_filter.returnPressed.connect(lambda: self.refresh(audit=True))
-        self._status_filter.returnPressed.connect(lambda: self.refresh(audit=True))
+        for box in (
+            self._channel_filter,
+            self._status_filter,
+            self._content_filter,
+            self._field_path_filter,
+        ):
+            box.returnPressed.connect(lambda: self.refresh(audit=True))
 
         filters = QHBoxLayout()
         filters.addWidget(QLabel("Search"))
         filters.addWidget(self._channel_filter)
         filters.addWidget(self._status_filter)
+        filters.addWidget(self._content_filter)
+        filters.addWidget(self._field_path_filter)
         filters.addWidget(refresh)
 
         self._table = ConfigurableTable(self.COLUMNS, settings_key="logsearch/header_state")
@@ -392,6 +410,8 @@ class MessagesPanel(QWidget):
         """Filter to one channel and refresh (used by the Connections 'Logs' link)."""
         self._channel_filter.setText(channel_id)
         self._status_filter.clear()
+        self._content_filter.clear()
+        self._field_path_filter.clear()
         self.refresh(audit=True)
 
     def refresh(self, *, audit: bool = False) -> None:
@@ -408,10 +428,12 @@ class MessagesPanel(QWidget):
         summary_shown = not self._table.isColumnHidden(self._SUMMARY_COL)
         channel = self._channel_filter.text().strip() or None
         status = self._status_filter.text().strip() or None
+        content = self._content_filter.text().strip() or None
+        field_path = self._field_path_filter.text().strip() or None
         audit_summary = audit and summary_shown
         self._loading = True
         self._runner.submit(
-            lambda: self._fetch(channel, status, audit_summary),
+            lambda: self._fetch(channel, status, content, field_path, audit_summary),
             on_done=lambda snap: self._apply(snap, autosize=audit),
             on_error=self._on_error,
         )
@@ -437,16 +459,44 @@ class MessagesPanel(QWidget):
         return True
 
     def _fetch(
-        self, channel: str | None, status: str | None, audit_summary: bool
+        self,
+        channel: str | None,
+        status: str | None,
+        content: str | None,
+        field_path: str | None,
+        audit_summary: bool,
     ) -> _MessagesSnapshot:
-        """Runs on a worker thread — only blocking I/O, no widget access."""
+        """Runs on a worker thread — only blocking I/O, no widget access.
+
+        With a content/field-path needle this routes to the scan-and-decrypt /messages/search endpoint
+        (ADR 0046 #51) instead of the metadata list; the field-path box wins over the content box."""
         try:
+            if field_path or content:
+                # The field-path box, when filled, is the needle (the content box becomes its value
+                # predicate); otherwise the content box is a raw/summary substring.
+                search = self._poll.search_messages(
+                    content=content if not field_path else None,
+                    field_path=field_path,
+                    field_value=content if field_path else None,
+                    channel_id=channel,
+                    status=status,
+                    limit=200,
+                )
+                count = f"{search.matched} matched of {search.scanned} scanned"
+                if search.truncated:
+                    count += " — narrow your filters (scan cap hit)"
+                return _MessagesSnapshot(list(search.messages), count, search.truncated, None)
             result = self._poll.list_messages(
                 channel_id=channel, status=status, limit=200, audit_summary=audit_summary
             )
-            return _MessagesSnapshot(result, None)
+            return _MessagesSnapshot(
+                list(result.messages),
+                f"{len(result.messages)} shown of {result.total}",
+                False,
+                None,
+            )
         except ApiError as exc:
-            return _MessagesSnapshot(None, str(exc))
+            return _MessagesSnapshot(None, "", False, str(exc))
 
     def _apply(self, snap: _MessagesSnapshot, *, autosize: bool = False) -> None:
         """Runs on the main thread (result slot) — safe to touch widgets."""
@@ -458,12 +508,12 @@ class MessagesPanel(QWidget):
         if snap.error is not None:
             self.error.emit(snap.error)
             return
-        result = snap.result
-        assert result is not None
+        messages = snap.messages
+        assert messages is not None
         previously_selected = self._selected_id()
         self._table.begin_populate()
-        self._table.setRowCount(len(result.messages))
-        for r, m in enumerate(result.messages):
+        self._table.setRowCount(len(messages))
+        for r, m in enumerate(messages):
             cells = [
                 fmt_ts(m.received_at),
                 m.channel_id,
@@ -481,7 +531,7 @@ class MessagesPanel(QWidget):
                 self._table.setItem(r, c, item)
         self._table.end_populate(autosize=(autosize or not self._loaded))
         self._loaded = True
-        self._count.setText(f"{len(result.messages)} shown of {result.total}")
+        self._count.setText(snap.count_text)
         if previously_selected is not None and not self._reselect(previously_selected):
             # The selected message rolled off the list (deleted / filtered / aged past the 200-row
             # limit); tell the detail pane to clear so it stops showing a now-absent message (M2).

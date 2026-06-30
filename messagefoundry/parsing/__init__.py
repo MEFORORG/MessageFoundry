@@ -28,6 +28,14 @@ from messagefoundry.parsing.split import split_batch, split_by_obr
 from messagefoundry.parsing.summary import summarize
 from messagefoundry.parsing.tree import TreeNode, parse_tree
 from messagefoundry.parsing.validate import ValidationResult, validate
+from messagefoundry.timezone import (
+    age_from_dob,
+    convert_hl7_timestamp,
+    hl7_now,
+    length_of_stay,
+    parse_hl7_timestamp,
+    to_zone,
+)
 from messagefoundry.parsing.dicom import DicomDataset, DicomPeek, DicomPeekError
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError, FhirResource
 from messagefoundry.parsing.x12 import (
@@ -36,6 +44,18 @@ from messagefoundry.parsing.x12 import (
     X12Message,
     X12Peek,
     X12PeekError,
+    X12SegmentError,
+    X12ValidationError,
+    X12ValidationResult,
+)
+from messagefoundry.parsing.x12 import validate as validate_x12
+from messagefoundry.parsing.xml import (
+    XmlError,
+    XmlMessage,
+    XmlParseError,
+    XmlPathError,
+    XmlSecurityError,
+    XmlValidationError,
 )
 
 __all__ = [
@@ -59,6 +79,20 @@ __all__ = [
     "X12Message",
     "X12FrameReader",
     "X12PeekError",
+    # X12 strict validation (ADR 0012, opt-in [x12] extra) — re-exported as `validate_x12` to avoid
+    # colliding with the HL7 `validate`; full surface under messagefoundry.parsing.x12.validate.
+    "validate_x12",
+    "X12ValidationResult",
+    "X12SegmentError",
+    "X12ValidationError",
+    # XML/SOAP codec (BACKLOG #31) — headline types; full surface (schema/signature helpers) under
+    # messagefoundry.parsing.xml. Hardened lxml (XXE/DTD-locked) behind the optional [xml] extra.
+    "XmlMessage",
+    "XmlError",
+    "XmlParseError",
+    "XmlPathError",
+    "XmlValidationError",
+    "XmlSecurityError",
     # FHIR codec (ADR 0022) — headline types; full surface under messagefoundry.parsing.fhir.
     "FhirPeek",
     "FhirResource",
@@ -74,6 +108,14 @@ __all__ = [
     "BinaryCarriageError",
     "embed_obx_document",
     "extract_obx_document",
+    # HL7 v2 timestamp helpers (messagefoundry.timezone) — tolerant TS parse, DST-aware zone
+    # conversion, and the derived-value helpers (age / length-of-stay / now). Pure; console-importable.
+    "convert_hl7_timestamp",
+    "to_zone",
+    "parse_hl7_timestamp",
+    "hl7_now",
+    "age_from_dob",
+    "length_of_stay",
 ]
 
 # Defense-in-depth for review finding C-1: python-hl7 logs raw field values at ERROR on

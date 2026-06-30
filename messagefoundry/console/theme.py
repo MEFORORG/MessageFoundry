@@ -241,7 +241,9 @@ def badge_palette(status: str, t: Tokens) -> tuple[str, str, str]:
         bg, fg = t.success_bg, t.success
     elif base in {"stopped", "failed", "error", "errored", "dead", "down"}:
         bg, fg = t.danger_bg, t.danger
-    elif base in {"degraded", "starting", "stopping", "retrying", "connecting"}:
+    elif base in {"degraded", "starting", "stopping", "retrying", "connecting", "filtered"}:
+        # "filtered" (#61, ADR 0048): the DR run-profile deliberately parked this feed below the priority
+        # threshold — a degraded-but-expected state, amber (not the danger red a "failed" connection gets).
         bg, fg = t.warning_bg, t.warning
     else:
         bg, fg = t.bg_elevated, t.text_secondary

@@ -22,15 +22,21 @@ from messagefoundry.config.models import (
     BuildupThreshold,
     InternalErrorPolicy,
     OrderingMode,
+    Priority,
     RetryPolicy,
+    StallThreshold,
 )
 from messagefoundry.config.settings import (
+    BackupSettings,
     CertMonitorSettings,
     ClusterSettings,
+    DrSettings,
     EgressSettings,
     ReferenceSettings,
     RetentionSettings,
     ShadowSettings,
+    StoreSettings,
+    UpdateCheckSettings,
 )
 from messagefoundry.config.wiring import (
     API_LISTENER_LABEL,
@@ -42,10 +48,13 @@ from messagefoundry.pipeline.alerts import AlertSink
 from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
+from messagefoundry.pipeline.dr import DrCoordinator
+from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
+from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckRunner
 from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
     check_pt_backend_supported,
@@ -88,10 +97,17 @@ class Engine:
         ordering_default: OrderingMode | None = None,
         internal_error_default: InternalErrorPolicy | None = None,
         buildup_default: BuildupThreshold | None = None,
+        stall_default: StallThreshold | None = None,
         ack_after_default: AckAfter | None = None,
+        priority_default: Priority | None = None,
         alert_sink: AlertSink | None = None,
         retention_settings: RetentionSettings | None = None,
         cert_monitor_settings: CertMonitorSettings | None = None,
+        update_check_settings: UpdateCheckSettings | None = None,
+        backup_settings: BackupSettings | None = None,
+        dr_settings: DrSettings | None = None,
+        store_settings: StoreSettings | None = None,
+        engine_version: str = "",
         api_tls_cert_file: str | None = None,
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
@@ -164,6 +180,25 @@ class Engine:
             else ()
         )
         self._cert_expiry_runner: CertExpiryRunner | None = None
+        # [update_check] no-network version diff (#30, ADR 0026). None (embedding/tests) → no task. A
+        # maintenance task like cert_monitor: independent of the message graph, surviving reloads, a no-op
+        # when disabled. Its latest result feeds the additive /status `update` field.
+        self._update_check_settings = update_check_settings
+        self._update_check_runner: UpdateCheckRunner | None = None
+        # [backup] turnkey DR backup (ADR 0049, #60). None (embedding/tests) → no backup task; the runner
+        # itself is a no-op when disabled or on-demand-only. It needs the StoreSettings (the KeyProvider
+        # KEY SOURCE for the .mfbak archive) + the config dir (bundled into the archive) + a version string
+        # (manifest metadata). A leader-only WRITE singleton (writes audit rows + the shared archive dir +
+        # prunes keep-N), so it is coordinator-gated like retention.
+        self._backup_settings = backup_settings
+        self._store_settings = store_settings
+        self._engine_version = engine_version
+        self._backup_runner: BackupRunner | None = None
+        # [dr] third-tier DR standby coordinator (#61, ADR 0048). Built lazily on first access (it needs
+        # the store + StoreSettings — the cold-seed KeyProvider seam — both present here). Owns the
+        # manual, audited activate/release: cold-seed restore-verify (fail-closed) → new audit-chain
+        # segment → acquire-VIP-or-abort → serve under the DR run-profile. None until first accessed.
+        self._dr_coordinator: DrCoordinator | None = None
         # [reference] enforcement (ADR 0006). None (embedding/tests) → default settings; the reference
         # sync runner is a no-op when the graph declares no reference sets.
         self._reference_settings = reference_settings
@@ -184,8 +219,22 @@ class Engine:
         self._ordering_default = ordering_default
         self._internal_error_default = internal_error_default
         self._buildup_default = buildup_default
+        self._stall_default = stall_default
         # Global [inbound] ACK-timing default (ADR 0001); every runner inherits it.
         self._ack_after_default = ack_after_default
+        # DR run-profile (#61, ADR 0048). The global [delivery].priority default a connection inherits
+        # when it declares no priority= (every runner inherits it). The DR run-profile THRESHOLD is
+        # active only when this box is a DR standby that has been activated for THIS boot (dr.enabled
+        # AND dr.activate): then the runner binds only connections whose resolved tier rank >=
+        # dr.priority_threshold. A non-DR deployment (the default) passes dr_threshold=None to the runner
+        # → no filtering, byte-identical to before. Held so reload re-applies the same threshold.
+        self._priority_default = priority_default
+        self._dr_settings = dr_settings or DrSettings()
+        # Whether THIS boot runs under the DR run-profile (#61, ADR 0048). Latched from
+        # [dr].enabled AND [dr].activate at construction; flipped True by the DR coordinator on a
+        # successful POST /dr/activate (which then reloads the graph so the run-profile filter applies)
+        # and back False on POST /dr/release. The runner reads dr_threshold from _dr_run_threshold().
+        self._dr_active = bool(self._dr_settings.enabled and self._dr_settings.activate)
         # This instance's environment values (DEV/PROD), shared with every runner the engine builds —
         # so env() references in a reloaded graph resolve against THIS environment (and a missing
         # value is refused here, on this engine, not on the box the graph was authored on). The
@@ -209,6 +258,12 @@ class Engine:
         self._graph_stop = asyncio.Event()
         self._graph_lock = asyncio.Lock()
         self._graph_reconcile_interval = 1.0
+        # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
+        # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
+        # in flight (a re-promotion cancels the prior one — see _fire_pool_warm); tracked only so stop()
+        # can cancel it. Best-effort and self-releasing; a no-op on SQLite (no pool) and when
+        # [store].warm_pool is off.
+        self._warm_pool_task: asyncio.Task[None] | None = None
         # Set when start() runs; the "since" for since-engine-start metric counts.
         self.started_at: float = 0.0
         # Console stats-reset baselines (in-memory; dropped on restart, like the counts they offset).
@@ -248,10 +303,12 @@ class Engine:
         ordering_default: OrderingMode | None = None,
         internal_error_default: InternalErrorPolicy | None = None,
         buildup_default: BuildupThreshold | None = None,
+        stall_default: StallThreshold | None = None,
         ack_after_default: AckAfter | None = None,
         alert_sink: AlertSink | None = None,
         retention_settings: RetentionSettings | None = None,
         cert_monitor_settings: CertMonitorSettings | None = None,
+        update_check_settings: UpdateCheckSettings | None = None,
         api_tls_cert_file: str | None = None,
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
@@ -283,10 +340,12 @@ class Engine:
             ordering_default=ordering_default,
             internal_error_default=internal_error_default,
             buildup_default=buildup_default,
+            stall_default=stall_default,
             ack_after_default=ack_after_default,
             alert_sink=alert_sink,
             retention_settings=retention_settings,
             cert_monitor_settings=cert_monitor_settings,
+            update_check_settings=update_check_settings,
             api_tls_cert_file=api_tls_cert_file,
             api_listener=api_listener,
             reference_settings=reference_settings,
@@ -302,6 +361,104 @@ class Engine:
 
     # --- code-first wiring ---------------------------------------------------
 
+    def _dr_run_threshold(self) -> Priority | None:
+        """The DR run-profile threshold for the runner (#61, ADR 0048): ``[dr].priority_threshold`` when
+        this boot is running under the DR profile (``_dr_active``), else ``None`` (no DR filtering — a
+        normal deployment is byte-identical). Read at every runner construction (start + reload) so the
+        threshold is consistently applied across reloads."""
+        return self._dr_settings.priority_threshold if self._dr_active else None
+
+    @property
+    def dr_active(self) -> bool:
+        """Whether the engine is running under the DR run-profile this boot (#61, ADR 0048)."""
+        return self._dr_active
+
+    @property
+    def dr_settings(self) -> DrSettings:
+        """The resolved ``[dr]`` settings (#61, ADR 0048) — read by the DR coordinator + the API."""
+        return self._dr_settings
+
+    @property
+    def dr_coordinator(self) -> DrCoordinator | None:
+        """The manual DR promotion/fail-back coordinator (#61, ADR 0048), or ``None`` when this is not a
+        DR box (``[dr].enabled`` is false) or the store settings were not supplied (embedding/tests with
+        no KeyProvider seam — the cold seed can't be verified). Built lazily on first access; the API
+        ``POST /dr/activate`` / ``/dr/release`` endpoints drive it."""
+        if self._dr_coordinator is None:
+            if not self._dr_settings.enabled or self._store_settings is None:
+                return None
+            cfg_fp: str | None = None
+            if self.config_dir is not None:
+                from messagefoundry.config.fingerprint import config_fingerprint
+
+                try:
+                    cfg_fp = config_fingerprint(self.config_dir)
+                except OSError:
+                    cfg_fp = None
+            self._dr_coordinator = DrCoordinator(
+                self.store,
+                self._dr_settings,
+                store_settings=self._store_settings,
+                activate_profile=self._dr_activate_profile,
+                deactivate_profile=self._dr_release_drain,
+                config_fingerprint=cfg_fp,
+                alert_sink=self._alert_sink,
+            )
+        return self._dr_coordinator
+
+    async def _dr_activate_profile(self) -> None:
+        """Engine callback the DR coordinator runs to BEGIN serving under the DR run-profile (#61, ADR
+        0048 step 4): latch the run-profile ON and reload the graph so the runner binds only connections
+        at/above ``[dr].priority_threshold`` (the rest report ``status:"filtered"``). A reload (not a
+        cold start) so a box already serving its full graph drops to the critical set in place, with
+        in-flight rows preserved (the reload is quiesce-and-swap)."""
+        self._dr_active = True
+        rr = self._registry_runner
+        if rr is None:
+            return
+        # Re-apply the (now-active) threshold over the SAME graph so the runner parks the below-threshold
+        # feeds. Prefer a full engine reload (re-reads the config dir, picks up any priority edits) when a
+        # config dir is configured; otherwise (embedding) re-run the runner over its current registry,
+        # which re-evaluates the DR filter in place. propagate=False — a local DR decision, never a
+        # cluster-wide config bump.
+        if self.config_dir is not None:
+            await self.reload(self.config_dir, propagate=False)
+        else:
+            await rr.reload(rr.registry)
+
+    async def _dr_release_drain(self) -> None:
+        """Engine callback the DR coordinator runs to FAIL BACK (#61, ADR 0048): unbind all inbound
+        listeners (stop accepting new intake), drain the staged queue to completion (every NOT-DONE row
+        delivered or dead-lettered), then latch the run-profile OFF. Within the DR store at-least-once +
+        idempotency make the drain safe; cross-store reconciliation is operator-verified per the runbook.
+        Returns only once intake is unbound and the pipeline is drained (no dual-accept window)."""
+        rr = self._registry_runner
+        if rr is not None:
+            for name in list(rr.registry.inbound):
+                await rr.stop_inbound(
+                    name
+                )  # unbind every listener — no new intake during fail-back
+            rr.notify_work()  # wake every stage so the workers drain the residual backlog promptly
+            await self._drain_pipeline()
+        self._dr_active = False
+
+    async def _drain_pipeline(self, *, timeout: float = 120.0, poll: float = 0.1) -> None:
+        """Wait until the staged queue is fully drained (no NOT-DONE rows across ingress/routed/outbound)
+        — the fail-back hand-back gate (#61, ADR 0048). Bounded by ``timeout`` so a permanently-stuck row
+        (a retry-forever head against a dead peer) doesn't hang the release forever; on timeout it returns
+        (the remaining rows stay queued + replayable, and the runbook reconciliation accounts for them)."""
+        elapsed = 0.0
+        while elapsed < timeout:
+            if await self.store.in_pipeline_depth() == 0:
+                return
+            await asyncio.sleep(poll)
+            elapsed += poll
+        log.warning(
+            "DR release: staged queue not fully drained within %.0fs; remaining rows stay queued + "
+            "replayable (the fail-back reconciliation runbook accounts for them)",
+            timeout,
+        )
+
     def add_registry(self, registry: Registry) -> RegistryRunner:
         """Run a code-first Connection/Router/Handler graph (one runner for the whole graph)."""
         runner = RegistryRunner(
@@ -315,7 +472,10 @@ class Engine:
             ordering_default=self._ordering_default,
             internal_error_default=self._internal_error_default,
             buildup_default=self._buildup_default,
+            stall_default=self._stall_default,
             ack_after_default=self._ack_after_default,
+            priority_default=self._priority_default,
+            dr_threshold=self._dr_run_threshold(),
             alert_sink=self._alert_sink,
             egress=self._egress_settings,
             simulate_all=self._shadow_settings.simulate_all_egress,
@@ -332,6 +492,14 @@ class Engine:
     @property
     def registry_runner(self) -> RegistryRunner | None:
         return self._registry_runner
+
+    @property
+    def update_check_result(self) -> UpdateCheckResult | None:
+        """The latest no-network version-diff result (#30, ADR 0026), or ``None`` when [update_check]
+        is disabled / no pass has run yet. Read by the ``/status`` endpoint to surface the additive
+        ``update`` field — version strings only, no PHI."""
+        runner = self._update_check_runner
+        return runner.latest if runner is not None else None
 
     def _monitored_certs(self) -> list[MonitoredCert]:
         """The TLS certs the engine serves with right now: the ``[api]`` cert + the wired graph's MLLP
@@ -458,8 +626,35 @@ class Engine:
                 self._retention_settings,
                 alert_sink=self._alert_sink,
                 coordinator=self._coordinator,
+                # Per-connection retention overrides (#34, ADR 0027) are read from the LIVE registry each
+                # pass — a lambda over the registry_runner so a config reload (which swaps the runner's
+                # registry) takes effect on the next pass, without the runner importing the engine.
+                registry_source=lambda: (
+                    self._registry_runner.registry if self._registry_runner is not None else None
+                ),
             )
             self._retention_runner.start()
+        # [backup] turnkey DR backup (ADR 0049, #60) — a maintenance task like retention: independent of
+        # the message graph, surviving reloads, a no-op when disabled or on-demand-only. A leader-only
+        # WRITE singleton (writes audit rows + the shared archive dir + prunes keep-N), so it is
+        # coordinator-gated: in a cluster only the leader backs up the shared destination. It needs the
+        # StoreSettings (the KeyProvider KEY SOURCE) — without it (embedding/tests) no backup task runs.
+        if (
+            self._backup_settings is not None
+            and self._backup_settings.enabled
+            and self._store_settings is not None
+        ):
+            self._backup_runner = BackupRunner(
+                self.store,
+                self._backup_settings,
+                store_settings=self._store_settings,
+                config_dir=self.config_dir,
+                engine_version=self._engine_version,
+                instance=self._active_environment or "",
+                alert_sink=self._alert_sink,
+                coordinator=self._coordinator,
+            )
+            self._backup_runner.start()
         # [cert_monitor] TLS-cert expiry monitor (Q5c) — a maintenance task like retention, independent
         # of the message graph and surviving reloads; a no-op when warn_days=0. NOT leader-gated: certs
         # are node-local files, so each node alerts on its own (the per-cert realert throttle bounds
@@ -471,6 +666,17 @@ class Engine:
                 alert_sink=self._alert_sink,
             )
             self._cert_expiry_runner.start()
+        # [update_check] no-network version diff (#30, ADR 0026) — a maintenance task like cert_monitor:
+        # independent of the message graph, surviving reloads, a no-op when disabled. NOT leader-gated:
+        # it reads node-local metadata, writes no store rows, and only reports drift (the per-package
+        # realert throttle bounds any alert spam), so each node may run it. Its latest result feeds the
+        # additive /status `update` field.
+        if self._update_check_settings is not None:
+            self._update_check_runner = UpdateCheckRunner(
+                self._update_check_settings,
+                alert_sink=self._alert_sink,
+            )
+            self._update_check_runner.start()
         # Leader lease-reclaim sweep (Track B Step 4) — only in clustered mode (reclaims_inflight()),
         # so single-node / SQLite never spawns it. It is itself leader-gated each pass, so a follower's
         # runner ticks but no-ops; the current leader recovers crashed nodes' expired-lease rows.
@@ -595,8 +801,26 @@ class Engine:
         # — already started on every node in start() for clustered followers to converge). Leader-gated
         # materialize inside the runner; a sync failure is isolated per-set and never blocks intake.
         await self._reconcile_reference_sync(startup=True)
+        # Pre-warm the store pool in the BACKGROUND now that the on-promotion recovery above is done (so
+        # the warm never competes with recover_on_promotion/reset_stale_inflight for the pool) and just
+        # before the workers start — the delivery burst it actually targets. Fire-and-forget so it never
+        # blocks bring-up; a no-op on SQLite or when [store].warm_pool is off.
+        await self._fire_pool_warm()
         await self._registry_runner.start()
         log.info("engine graph started — this node is processing")
+
+    async def _fire_pool_warm(self) -> None:
+        """(Re)fire the best-effort background store-pool warm-up. ``_start_graph`` re-runs on every
+        leadership acquire, so cancel any warm still in flight from a prior term FIRST — otherwise a
+        promote→demote→re-promote flap would orphan it from ``stop()``'s cancel and let two warms contend
+        for the pool (up to ``2*(maxsize-1)`` connections, starving the very recovery this speeds up). The
+        guard keeps at most one warm alive and guarantees ``stop()`` can always reach it. Named for
+        diagnosability. A no-op on SQLite / when ``[store].warm_pool`` is off (the store's ``warm_pool``
+        returns immediately)."""
+        if self._warm_pool_task is not None and not self._warm_pool_task.done():
+            self._warm_pool_task.cancel()
+            await asyncio.gather(self._warm_pool_task, return_exceptions=True)
+        self._warm_pool_task = asyncio.create_task(self.store.warm_pool(), name="store-pool-warm")
 
     async def _stop_graph(self) -> None:
         """Tear the graph down on loss of leadership: stop the listeners + workers so a demoted node
@@ -735,7 +959,10 @@ class Engine:
                 ordering_default=self._ordering_default,
                 internal_error_default=self._internal_error_default,
                 buildup_default=self._buildup_default,
+                stall_default=self._stall_default,
                 ack_after_default=self._ack_after_default,
+                priority_default=self._priority_default,
+                dr_threshold=self._dr_run_threshold(),
                 alert_sink=self._alert_sink,
                 egress=self._egress_settings,
                 simulate_all=self._shadow_settings.simulate_all_egress,
@@ -896,8 +1123,12 @@ class Engine:
                 await asyncio.gather(supervisor, return_exceptions=True)
         if self._retention_runner is not None:
             await self._retention_runner.stop()
+        if self._backup_runner is not None:
+            await self._backup_runner.stop()
         if self._cert_expiry_runner is not None:
             await self._cert_expiry_runner.stop()
+        if self._update_check_runner is not None:
+            await self._update_check_runner.stop()
         # Stop the leader sweep before deregistering membership (it consults the coordinator's gate, so
         # it must quiesce while the coordinator is still up). A no-op when single-node (never spawned).
         if self._leader_maintenance is not None:
@@ -919,4 +1150,10 @@ class Engine:
         # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
         # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.
         await self._coordinator.stop()
+        # Cancel the background pool warm-up if still running (best-effort; the store is about to close).
+        # It releases any connections it holds in its own finally, but at shutdown the pool closes anyway.
+        if self._warm_pool_task is not None:
+            self._warm_pool_task.cancel()
+            await asyncio.gather(self._warm_pool_task, return_exceptions=True)
+            self._warm_pool_task = None
         await self.store.close()

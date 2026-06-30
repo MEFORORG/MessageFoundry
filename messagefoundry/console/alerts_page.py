@@ -1,24 +1,31 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Alerts page — the loaded ``[alerts]`` transport config + rule set (ADR 0014), read-only.
+"""Alerts page — active operator alert instances (ADR 0044, #56) + the loaded ``[alerts]`` transport
+config + rule set (ADR 0014), with Acknowledge / Resolve actions on the active alerts.
 
-A thin view over ``GET /alerts/rules`` (BACKLOG #22b): it shows whether the webhook/email transports
-are configured (present-or-not — the endpoint deliberately returns **no** secrets or recipient
-addresses), the global re-alert interval, and the ordered list of operator-authored alert rules.
+The **Active alerts** section is a table over ``GET /alerts/active`` (open + acknowledged instances,
+newest first) with Acknowledge / Resolve buttons that call ``POST /alerts/{id}/ack`` and
+``/resolve``. The **Transports + Rules** section below is the read-only ``GET /alerts/rules`` view
+(BACKLOG #22b): which transports are configured (present-or-not — no secrets/recipients), the global
+re-alert interval, and the ordered rules.
 
-The read runs OFF the main thread (a slow/wedged engine would otherwise freeze the GUI for the whole
-``/alerts/rules`` call); the result is applied on the main thread. Unlike Dead Letters this payload
-carries **no PHI** and the route is a cheap in-memory read with no server-side audit, so it is safe to
-re-read on the silent auto-refresh tick. There is no action button — the page is purely read-only.
+Both reads run OFF the main thread (a slow/wedged engine would otherwise freeze the GUI); the result
+is applied on the main thread. Both payloads carry **no PHI**, so the silent auto-refresh tick re-reads
+safely. Per CLAUDE.md §10 the page imports only the ``api/`` Pydantic models + the HTTP client, never
+the engine.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
 
 from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QTableWidgetItem,
     QVBoxLayout,
@@ -26,7 +33,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Signal
 
-from messagefoundry.api.models import AlertRuleInfo, AlertsConfig
+from messagefoundry.api.models import AlertInstanceInfo, AlertRuleInfo, AlertsConfig
 from messagefoundry.console._async import AsyncRunner
 from messagefoundry.console.client import EngineClient
 from messagefoundry.console.widgets import ConfigurableTable
@@ -37,8 +44,23 @@ def _fmt_secs(value: float) -> str:
     return f"{value:g}"
 
 
+def _fmt_ts(value: float) -> str:
+    """An epoch rendered as a local short timestamp; blank for a falsy/None value."""
+    if not value:
+        return ""
+    return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+
+
+@dataclass(frozen=True)
+class _AlertsData:
+    """The combined alerts read (active instances + the rules config) applied on the main thread."""
+
+    active: list[AlertInstanceInfo]
+    config: AlertsConfig
+
+
 class AlertsPage(QWidget):
-    """Transports summary + a table of alert rules loaded from ``[alerts]`` (read-only, ADR 0014)."""
+    """Active alert instances (ack/resolve, ADR 0044) + the read-only ``[alerts]`` rules (ADR 0014)."""
 
     error = Signal(str)
 
@@ -52,11 +74,22 @@ class AlertsPage(QWidget):
         "Cooldown (s)",
     ]
 
+    ACTIVE_COLUMNS = [
+        "Severity",
+        "Status",
+        "Event type",
+        "Connection",
+        "Count",
+        "First seen",
+        "Last seen",
+        "Reason",
+    ]
+
     def __init__(self, client: EngineClient, *, poll_client: EngineClient | None = None) -> None:
         super().__init__()
-        # Read-only page: the alert-rules read runs off the main thread, so it goes through the
-        # read-only poll client (never the handler-bearing main-thread client). There are no actions,
-        # so the main-thread client is unused here beyond the default fallback.
+        # The off-thread reads go through the read-only poll client; the ack/resolve MUTATIONS go
+        # through the handler-bearing main-thread client (poll client is read-only).
+        self._client = client
         self._poll = poll_client or client
         self._runner = AsyncRunner(self)
         self._loading = False  # in-flight read guard (don't pile up during a slow call)
@@ -65,12 +98,26 @@ class AlertsPage(QWidget):
         # autosizes once it actually runs.
         self._pending = False
         self._pending_autosize = False
+        self._acting = False  # in-flight ack/resolve guard
+        self._active_ids: list[int] = []  # row -> alert id, for the action buttons
 
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.reload)
+        self._ack_btn = QPushButton("Acknowledge")
+        self._ack_btn.clicked.connect(self._ack_selected)
+        self._resolve_btn = QPushButton("Resolve")
+        self._resolve_btn.clicked.connect(self._resolve_selected)
         buttons = QHBoxLayout()
         buttons.addWidget(refresh_btn)
+        buttons.addWidget(self._ack_btn)
+        buttons.addWidget(self._resolve_btn)
         buttons.addStretch(1)
+
+        # Active alerts (ADR 0044): open + acknowledged instances with the ack/resolve actions above.
+        self._active_table = ConfigurableTable(
+            self.ACTIVE_COLUMNS, settings_key="alerts/active_header_state"
+        )
+        self._active_table.itemSelectionChanged.connect(self._sync_action_buttons)
 
         # Transports summary. The endpoint reports each transport present-or-not with its non-secret
         # settings only (no webhook URL, no SMTP credentials, no recipient addresses).
@@ -90,9 +137,12 @@ class AlertsPage(QWidget):
 
         layout = QVBoxLayout(self)
         layout.addLayout(buttons)
+        layout.addWidget(QLabel("Active alerts (open + acknowledged):"))
+        layout.addWidget(self._active_table, stretch=1)
         layout.addWidget(summary)
         layout.addWidget(QLabel("Rules (first match wins):"))
         layout.addWidget(self._table, stretch=1)
+        self._sync_action_buttons()
 
     # --- page interface (auto-refresh timer + nav) ---------------------------
 
@@ -128,9 +178,11 @@ class AlertsPage(QWidget):
         """Stop the background runner (call on window close) so a late result can't touch dead widgets."""
         self._runner.stop()
 
-    def _fetch(self) -> AlertsConfig:
+    def _fetch(self) -> _AlertsData:
         """Runs on a worker thread — only blocking I/O, no widget access."""
-        return self._poll.alerts_rules()
+        active = self._poll.active_alerts().alerts
+        config = self._poll.alerts_rules()
+        return _AlertsData(active=active, config=config)
 
     def _on_error(self, exc: BaseException) -> None:
         self._loading = False
@@ -147,18 +199,93 @@ class AlertsPage(QWidget):
         self._load(autosize=autosize)
         return True
 
-    def _apply(self, data: AlertsConfig, *, autosize: bool) -> None:
+    def _apply(self, data: _AlertsData, *, autosize: bool) -> None:
         """Runs on the main thread (result slot) — safe to touch widgets."""
         self._loading = False
         if self._drain_pending():
             return  # a load was requested mid-flight — re-fire it, skip this superseded result
-        self._render_summary(data)
+        self._render_active(data.active, autosize=autosize)
+        self._render_summary(data.config)
         self._table.begin_populate()
-        self._table.setRowCount(len(data.rules))
-        for row, rule in enumerate(data.rules):
+        self._table.setRowCount(len(data.config.rules))
+        for row, rule in enumerate(data.config.rules):
             for col, text in enumerate(self._rule_cells(rule)):
                 self._table.setItem(row, col, QTableWidgetItem(text))
         self._table.end_populate(autosize=autosize)
+
+    def _render_active(self, active: list[AlertInstanceInfo], *, autosize: bool) -> None:
+        self._active_ids = [a.id for a in active]
+        self._active_table.begin_populate()
+        self._active_table.setRowCount(len(active))
+        for row, a in enumerate(active):
+            for col, text in enumerate(self._active_cells(a)):
+                self._active_table.setItem(row, col, QTableWidgetItem(text))
+        self._active_table.end_populate(autosize=autosize)
+        self._sync_action_buttons()
+
+    @staticmethod
+    def _active_cells(a: AlertInstanceInfo) -> list[str]:
+        """The eight display cells for one active-alert row (in ``ACTIVE_COLUMNS`` order)."""
+        return [
+            a.severity,
+            a.status,
+            a.event_type,
+            a.connection,
+            str(a.count),
+            _fmt_ts(a.first_seen),
+            _fmt_ts(a.last_seen),
+            a.reason or "",
+        ]
+
+    # --- ack / resolve actions (ADR 0044) ------------------------------------
+
+    def _selected_alert_id(self) -> int | None:
+        rows = {i.row() for i in self._active_table.selectedItems()}
+        if len(rows) != 1:
+            return None
+        (row,) = rows
+        if 0 <= row < len(self._active_ids):
+            return self._active_ids[row]
+        return None
+
+    def _sync_action_buttons(self) -> None:
+        enabled = (not self._acting) and self._selected_alert_id() is not None
+        self._ack_btn.setEnabled(enabled)
+        self._resolve_btn.setEnabled(enabled)
+
+    def _ack_selected(self) -> None:
+        self._act("ack")
+
+    def _resolve_selected(self) -> None:
+        self._act("resolve")
+
+    def _act(self, action: str) -> None:
+        # Run the mutation OFF the main thread (it goes through the handler-bearing main-thread client),
+        # then reload the active list on completion. Guarded so a double-click can't fire twice.
+        if self._acting or self._runner._stopped:
+            return
+        alert_id = self._selected_alert_id()
+        if alert_id is None:
+            return
+        self._acting = True
+        self._sync_action_buttons()
+
+        def run() -> None:
+            if action == "ack":
+                self._client.ack_alert(alert_id)
+            else:
+                self._client.resolve_alert(alert_id)
+
+        self._runner.submit(run, on_done=lambda _r: self._on_acted(), on_error=self._on_act_error)
+
+    def _on_acted(self) -> None:
+        self._acting = False
+        self.reload()  # refresh the active list (the acted instance moved/left)
+
+    def _on_act_error(self, exc: BaseException) -> None:
+        self._acting = False
+        self._sync_action_buttons()
+        QMessageBox.warning(self, "Alert action failed", str(exc))
 
     def _render_summary(self, data: AlertsConfig) -> None:
         if data.webhook_configured:

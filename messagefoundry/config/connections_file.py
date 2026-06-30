@@ -33,7 +33,9 @@ from messagefoundry.config.models import (
     ContentType,
     InternalErrorPolicy,
     OrderingMode,
+    Priority,
     RetryPolicy,
+    StallThreshold,
 )
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -41,6 +43,7 @@ from messagefoundry.config.wiring import (
     DatabasePoll,
     File,
     Ftp,
+    Http,
     InboundConnection,
     MLLP,
     OutboundConnection,
@@ -64,6 +67,7 @@ CONNECTIONS_FILE_NAME = "connections.toml"
 _TRANSPORTS: dict[str, Callable[..., ConnectionSpec]] = {
     "mllp": MLLP,
     "tcp": Tcp,
+    "http": Http,
     "file": File,
     "timer": Timer,
     "rest": Rest,
@@ -91,6 +95,10 @@ _INBOUND_KEYS = frozenset(
         "source_ip_allowlist",
         "capture_ack",
         "capture_connection_errors",
+        "messages_days",
+        "prune_documents_after",
+        "prune_documents_min_bytes",
+        "priority",
         "shard",
     }
 )
@@ -103,13 +111,16 @@ _OUTBOUND_KEYS = frozenset(
         "ordering",
         "internal_error",
         "buildup",
+        "stall",
         "simulate",
+        "dead_letter_days",
+        "priority",
         "metadata",
     }
 )
 
 _E = TypeVar("_E", bound=Enum)
-_M = TypeVar("_M")  # a policy model (RetryPolicy/BuildupThreshold) — not an Enum
+_M = TypeVar("_M")  # a policy model (RetryPolicy/BuildupThreshold/StallThreshold) — not an Enum
 
 
 def load_connections_file(path: Path, registry: Registry) -> None:
@@ -163,6 +174,12 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         source_ip_allowlist=_optional_str_list(table, "source_ip_allowlist", where),
         capture_ack=_optional_bool(table, "capture_ack", where),
         capture_connection_errors=_optional_bool(table, "capture_connection_errors", where),
+        messages_days=_optional_int(table, "messages_days", where),
+        prune_documents_after=_optional_int(table, "prune_documents_after", where),
+        prune_documents_min_bytes=_optional_int(table, "prune_documents_min_bytes", where),
+        priority=_enum(Priority, table["priority"], "priority", where)
+        if table.get("priority") is not None
+        else None,
         shard=_optional_str(table, "shard", where),
         source_file=source,
         source_line=None,
@@ -185,7 +202,12 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
         if table.get("internal_error") is not None
         else None,
         buildup=_policy(BuildupThreshold, table.get("buildup"), "buildup", where),
+        stall=_policy(StallThreshold, table.get("stall"), "stall", where),
         simulate=_require_bool(table, "simulate", where),
+        dead_letter_days=_optional_int(table, "dead_letter_days", where),
+        priority=_enum(Priority, table["priority"], "priority", where)
+        if table.get("priority") is not None
+        else None,
         metadata=_optional_table(table, "metadata", where),
         source_file=source,
         source_line=None,
@@ -283,6 +305,19 @@ def _optional_bool(table: dict[str, Any], key: str, where: str) -> bool | None:
     value = table[key]
     if not isinstance(value, bool):
         raise WiringError(f"{where}: {key!r} must be true or false")
+    return value
+
+
+def _optional_int(table: dict[str, Any], key: str, where: str) -> int | None:
+    """A tri-state int: absent/None → ``None`` (inherit the global default), else the int. Used for the
+    per-connection retention overrides (#34, ADR 0027) ``messages_days``/``dead_letter_days``, where
+    ``None`` means "inherit the ``[retention]`` window", ``0`` = keep forever, ``>0`` = days. A ``bool``
+    is rejected (TOML ``true``/``false`` is an int subclass but never a valid window)."""
+    if key not in table or table[key] is None:
+        return None
+    value = table[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise WiringError(f"{where}: {key!r} must be an integer number of days (0 = keep forever)")
     return value
 
 

@@ -565,3 +565,156 @@ def test_cluster_heartbeat_must_be_below_fence(tmp_path: Path) -> None:
     )
     with pytest.raises(ValidationError, match="leader_fence_timeout_seconds"):
         load_settings(config_path=cfg, environ={})
+
+
+# --- [integrity] startup self-attestation (ADR 0041 D3) + dual-control config_reload (D2) ----
+
+
+def test_integrity_defaults_are_safe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Safe defaults: attestation ON but alert-only (never blocks startup) — an existing deployment is
+    # byte-unchanged. (The check is a no-op off an editable install regardless; see integrity.py.)
+    monkeypatch.chdir(tmp_path)
+    s = load_settings(environ={})
+    assert s.integrity.enabled is True
+    assert s.integrity.fail_closed_on_drift is False
+
+
+def test_integrity_fail_closed_loads_from_file(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        "[integrity]\nenabled = true\nfail_closed_on_drift = true\n",
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert s.integrity.fail_closed_on_drift is True
+
+
+def test_config_reload_is_gateable_but_not_a_default_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ADR 0041 D2: config_reload is a VALID gated operation, but NOT enabled by default — turning
+    # [approvals] on for replay/purge must not silently start holding every reload (deny-by-default).
+    monkeypatch.chdir(tmp_path)
+    default = load_settings(environ={})
+    assert "config_reload" not in default.approvals.operations
+    # ...and it can be opted in explicitly without a validation error.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[approvals]\nenabled = true\noperations = ["config_reload", "connection_purge"]\n',
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert "config_reload" in s.approvals.operations
+
+
+# --- [backup] DR backup settings (ADR 0049, #60) ----------------------------
+
+
+def test_backup_defaults() -> None:
+    s = load_settings(environ={})
+    b = s.backup
+    assert b.enabled is False
+    assert b.schedule_at == "02:00"
+    assert b.retention_keep == 7
+    assert b.snapshot_method == "vacuum_into"
+    assert b.verify_after_backup is True
+    assert b.full_restore_verify is False
+    assert b.config_only_on_server_db is True
+
+
+def test_backup_env_resolution_via_mefor_backup_prefix(tmp_path: Path) -> None:
+    # AC: 'backup' is in _SECTIONS, so MEFOR_BACKUP_* env overrides resolve.
+    env = {
+        "MEFOR_BACKUP_ENABLED": "true",
+        "MEFOR_BACKUP_DESTINATION": str(tmp_path / "nas"),
+        "MEFOR_BACKUP_RETENTION_KEEP": "3",
+        "MEFOR_BACKUP_SNAPSHOT_METHOD": "online_backup",
+    }
+    s = load_settings(environ=env)
+    assert s.backup.enabled is True
+    assert s.backup.destination == str(tmp_path / "nas")
+    assert s.backup.retention_keep == 3
+    assert s.backup.snapshot_method == "online_backup"
+
+
+def test_invalid_backup_settings_rejected(tmp_path: Path) -> None:
+    # AC-8: enabled with an empty destination is rejected.
+    cfg = _write(tmp_path / "a.toml", "[backup]\nenabled = true\ndestination = ''\n")
+    with pytest.raises((ValueError, ValidationError)):
+        load_settings(config_path=cfg, environ={})
+
+    # An unknown snapshot_method is rejected.
+    cfg = _write(
+        tmp_path / "b.toml",
+        f"[backup]\nenabled = true\ndestination = '{tmp_path.as_posix()}'\nsnapshot_method = 'rsync'\n",
+    )
+    with pytest.raises((ValueError, ValidationError)):
+        load_settings(config_path=cfg, environ={})
+
+    # A non-HH:MM schedule_at is rejected.
+    cfg = _write(
+        tmp_path / "c.toml",
+        f"[backup]\nenabled = true\ndestination = '{tmp_path.as_posix()}'\nschedule_at = '25:99'\n",
+    )
+    with pytest.raises((ValueError, ValidationError)):
+        load_settings(config_path=cfg, environ={})
+
+    # A negative retention_keep is rejected.
+    cfg = _write(
+        tmp_path / "d.toml",
+        f"[backup]\nenabled = true\ndestination = '{tmp_path.as_posix()}'\nretention_keep = -1\n",
+    )
+    with pytest.raises((ValueError, ValidationError)):
+        load_settings(config_path=cfg, environ={})
+
+    # A cloud-URL destination is rejected (no cloud target — no new egress).
+    cfg = _write(
+        tmp_path / "e.toml",
+        "[backup]\nenabled = true\ndestination = 's3://my-bucket/backups'\n",
+    )
+    with pytest.raises((ValueError, ValidationError)):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_backup_failed_is_a_valid_alert_rule_event_type(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "f.toml",
+        '[[alerts.rules]]\nevent_type = "backup_failed"\nseverity = "critical"\n',
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert s.alerts.rules[0].event_type == "backup_failed"
+
+
+def test_delivery_priority_default_and_dr_section(tmp_path: Path) -> None:
+    # [delivery].priority + [dr] load and default as decided (ADR 0048, #61).
+    s = load_settings(config_path=_write(tmp_path / "g.toml", ""), environ={})
+    assert s.delivery.priority.value == "normal"  # global default
+    assert s.dr.enabled is False and s.dr.activate is False  # opt-in, no-op by default
+    assert s.dr.priority_threshold.value == "critical"  # owner-locked default
+    assert s.dr.activation_mode.value == "manual"  # only mode built this slice
+
+    cfg = _write(
+        tmp_path / "h.toml",
+        "[delivery]\npriority = 'critical'\n"
+        "[dr]\nenabled = true\nactivate = true\npriority_threshold = 'normal'\n"
+        "takeover_hook = 'echo ok'\ntakeover_timeout_seconds = 5\n",
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert s.delivery.priority.value == "critical"
+    assert s.dr.enabled and s.dr.activate and s.dr.priority_threshold.value == "normal"
+    assert s.dr.takeover_hook == "echo ok"
+
+
+def test_invalid_priority_and_dr_settings_rejected(tmp_path: Path) -> None:
+    # AC-10: an unknown [delivery].priority, an unknown/not-yet-supported [dr] value, an invalid
+    # threshold, a blank hook, or a cloud-URL seed all FAIL config load (never a silent default).
+    bad_configs = [
+        "[delivery]\npriority = 'urgent'\n",  # unknown tier
+        "[dr]\npriority_threshold = 'bogus'\n",  # invalid threshold
+        "[dr]\nenabled = true\nactivation_mode = 'auto'\n",  # not-yet-supported (deferred) mode
+        "[dr]\ntakeover_hook = '   '\n",  # blank-but-present hook
+        "[dr]\ntakeover_timeout_seconds = 0\n",  # non-positive timeout
+        "[dr]\nseed_archive = 's3://bucket/seed.mfbak'\n",  # cloud seed source
+    ]
+    for i, body in enumerate(bad_configs):
+        cfg = _write(tmp_path / f"bad_dr_{i}.toml", body)
+        with pytest.raises((ValueError, ValidationError)):
+            load_settings(config_path=cfg, environ={})

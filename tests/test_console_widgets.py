@@ -28,6 +28,7 @@ from messagefoundry.api.models import (  # noqa: E402
     IntegrityResult,
     MessageDetail,
     MessageList,
+    MessageSearchResults,
     MessageSummary,
     OutboxInfo,
     PurgeResult,
@@ -63,6 +64,7 @@ class StubClient:
         self.reset_calls: list[tuple[bool, list[tuple[str, str, str | None]]]] = []
         self.detail_loads = 0
         self.last_audit_summary: object = None
+        self.search_calls: list[dict[str, object]] = []
         # Thread each read ran on, so tests can prove the per-page refresh now runs off the main
         # thread (the off-thread conversion of Connections / Log Search, M-25 / backlog #2).
         self.connections_thread: int | None = None
@@ -96,6 +98,25 @@ class StubClient:
             metadata=None,
         )
         return MessageList(total=1, limit=200, offset=0, messages=[msg])
+
+    def search_messages(self, **kw: object) -> MessageSearchResults:
+        self.search_calls.append(kw)
+        msg = MessageSummary(
+            id="s1",
+            channel_id="ch1",
+            received_at=1_700_000_000.0,
+            source_type="mllp",
+            control_id="MSGS",
+            message_type="ADT^A01",
+            status="processed",
+            error=None,
+            event="delivered",
+            summary="MRN 100001 · DOE, JANE",
+            metadata=None,
+        )
+        return MessageSearchResults(
+            messages=[msg], scanned=5, matched=1, truncated=True, limit=200, scan_limit=2000
+        )
 
     def get_message(self, message_id: str) -> MessageDetail:
         self.detail_loads += 1
@@ -636,10 +657,46 @@ def test_messages_panel_latches_refresh_while_loading(qapp) -> None:
     panel.refresh(audit=True)
     assert panel._pending is True  # latched, not dropped
     # The in-flight read completes: _apply drains the pending request and re-fires it off-thread.
-    panel._apply(panel._fetch(None, None, False))
+    panel._apply(panel._fetch(None, None, None, None, False))
     _settle(qapp, panel._runner)
     assert panel._pending is None  # drained
     assert panel._table.rowCount() == 1  # the latched refresh actually ran + rendered
+    panel.stop()
+
+
+def test_messages_panel_content_search_routes_to_search_endpoint(qapp) -> None:
+    # ADR 0046 #51: when the content box is filled the panel calls /messages/search (scan-and-decrypt),
+    # not the metadata list, and surfaces the truncated "narrow your filters" signal.
+    from messagefoundry.console.widgets import MessagesPanel
+
+    client = StubClient()
+    panel = MessagesPanel(client)
+    panel._content_filter.setText("JANE")
+    panel.refresh(audit=True)
+    _settle(qapp, panel._runner)
+    assert client.search_calls, "content needle must route to search_messages"
+    assert client.search_calls[0]["content"] == "JANE"
+    assert client.search_calls[0]["field_path"] is None
+    assert panel._table.rowCount() == 1
+    assert "narrow your filters" in panel._count.text()  # truncated signal shown
+    panel.stop()
+
+
+def test_messages_panel_field_path_search_passes_path_and_value(qapp) -> None:
+    # A filled field-path box is the needle; the content box becomes its value predicate.
+    from messagefoundry.console.widgets import MessagesPanel
+
+    client = StubClient()
+    panel = MessagesPanel(client)
+    panel._field_path_filter.setText("PID-3")
+    panel._content_filter.setText("100001")
+    panel.refresh(audit=True)
+    _settle(qapp, panel._runner)
+    assert client.search_calls[0]["field_path"] == "PID-3"
+    assert client.search_calls[0]["field_value"] == "100001"
+    assert (
+        client.search_calls[0]["content"] is None
+    )  # content folds into field_value, not a substring
     panel.stop()
 
 

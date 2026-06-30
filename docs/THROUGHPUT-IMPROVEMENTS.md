@@ -1,6 +1,9 @@
 # Throughput improvements
 
-*Status: analysis / backlog (targeted for 0.2). Last updated 2026-06-15.*
+*Status: analysis / roadmap. Last refreshed 2026-06-28 — multi-process sharding (L3, ADR 0037) and
+store-once (L2b) have **shipped**; the Corepoint-anchored path-to-parity is now **§5**, with the strategy
++ no-rewrite decision recorded in [ADR 0051](adr/0051-corepoint-throughput-parity-strategy.md) and tracked
+as [BACKLOG #64](BACKLOG.md).*
 
 How to make MessageFoundry faster, grounded in the current code and in our own
 [throughput research](marketing/throughput-research-2026-06-13.md) (local/private) and
@@ -87,9 +90,9 @@ latency isolation, not throughput.
 
 | Approach | Fit | Verdict |
 |---|---|---|
-| **Multiple engine processes, sharded by inbound** | Each process = own loop + own core, with **disjoint inbound ownership** (each process owns a distinct set of inbounds, so no two processes drain the same lane) against the shared server-DB store via `claim_next_fifo` / `SKIP LOCKED`. *(Note: this is a future direction, not built machinery — the per-lane lane-owner gating that would have made concurrent same-lane multi-node draining safe was part of the dropped active-active feature and its code was removed; engine HA today is single-leader active-passive, the graph runs on the leader only.)* | **Promising**, but needs a design: shard inbounds across processes without relying on the removed lane-ownership infra. |
+| **Multiple engine processes, sharded by inbound** | Each process = own loop + own core, owning a **disjoint** set of inbound connections — each shard with its own SQLite file + API port. | **BUILT** — ADR 0037 (`messagefoundry supervise` / `serve --shard`, PR #584): K subprocesses at ~0.85 linear efficiency. Sharding is **per-connection, not per-message** (per-message-key was rejected to preserve per-channel FIFO), so a *single hot feed* is pinned to one core — the one gap sharding can't close. |
 | **`ProcessPoolExecutor` for heavy transforms** | Transforms are *required to be pure* (re-run-safe for at-least-once) → embarrassingly parallel → ideal pool candidates. | Workable, but per-message serialization cost + `db_lookup` (which bridges back to the loop) complicate it. Use only for genuinely heavy transforms. |
-| **Free-threaded Python 3.13+ (no-GIL, PEP 703)** | Would make the existing `to_thread` / thread-pool path *actually* parallel with minimal code change. | Promising; **dependency-compat risk** (hl7apy, python-hl7, pydantic, PySide6). Track it, don't bet a release on it. |
+| **Free-threaded Python 3.14 (no-GIL, cp314t; PEP 703/779)** | Would make the worker threads *actually* parallel in one process — the only lever that lifts the single-hot-feed cap. | **Declined-for-now — [ADR 0040](adr/0040-free-threaded-engine-support.md)**: a weekly cp314t canary runs; the core compiled wheels (pydantic-core, cryptography, argon2/cffi) ship cp314t, but the single-thread tax + per-thread C-extension thread-safety are **unmeasured**. A deferred contingency, not a default. |
 
 The purity invariant is the gift: because routers/transforms must be pure, parallelizing them across
 processes is safe by construction.
@@ -130,15 +133,65 @@ peek. High payoff, but only after confirming parsing is the bottleneck.
 
 ## 4. Recommended order
 
-1. **Measure** with the load harness (`cheap`/`edit`/`slow`; SQLite vs Postgres) to confirm the
-   binding axis per representative feed.
-2. **Lazy MSH-only peek** (§3b) — cheap code change, immediate per-message win.
-3. **Group-commit** (§2) — the single-node durable-write win; stays on existing backends.
-4. **Multi-process sharding by inbound** (§3a) — the real core-axis ceiling-breaker; a future direction
-   (disjoint inbound ownership over the shared store's `SKIP LOCKED`), now that the active-active
-   lane-owner machinery has been removed — needs its own design.
-5. Author-side transform discipline (§3c) as standing guidance.
-6. Park PyPy/Cython (§3d) and free-threaded Python (§3a) as "if parse-bound" / "when the ecosystem
-   catches up."
+1. **Measure** with the load harness (`cheap`/`edit`/`slow`; SQLite vs server DB) to confirm the binding
+   axis per representative feed — now anchored to the **Corepoint target** (§5).
+2. **Group-commit** (§2) — the single-node durable-write win; the **#1 unbuilt lever**; stays on existing
+   backends. Lands under its **own ADR** when built (it touches the most invariant-dense code).
+3. **Lean-writes / carriage** — VARBINARY ciphertext ([#62](BACKLOG.md)), the `message_events` verbosity
+   knob ([#63](BACKLOG.md)), embedded-doc pruning ([#47](BACKLOG.md) / ADR 0042), retention
+   ([#34](BACKLOG.md)).
+4. **Multi-process sharding by inbound** (§3a) — **BUILT** (ADR 0037); the multi-core path. For the
+   shared-server backend, a **multi-DB log split** (move event/audit churn off the queue's writer) is a
+   further I/O-isolation step — but the **atomic staged-queue transaction cannot be split**.
+5. **Lazy MSH-only peek** (§3b) + author-side transform discipline (§3c) — but the L2a parse-dedup pass
+   found single-parse a **non-win** for HL7, so **confirm parse-bound** before investing.
+6. Park **PyPy/Cython** (§3d), the **scoped native engine-service core**, and **free-threaded Python**
+   ([ADR 0040](adr/0040-free-threaded-engine-support.md)) as contingencies, revisited only on the
+   measurement.
 
-Each of 2–4 is real work and gets its own plan + tests before building.
+Each lever is real work and gets its own plan + tests before building. The full Corepoint-anchored
+ordering is **§5** / [ADR 0051](adr/0051-corepoint-throughput-parity-strategy.md) /
+[BACKLOG #64](BACKLOG.md).
+
+---
+
+## 5. Path to Corepoint throughput parity (2026-06-28)
+
+The forcing artifact is the **qualified Corepoint 45M-msg/day spec**: a 20-core app server + a **16-core /
+128 GB / 15 TB-RAID10-Tier-1** SQL Server qualified for **9,200 8 KB-random-write IOPS**, multi-DB
+(Queues/Logs 9 TB + Audit + PerfStats) under **AlwaysOn AG**, ~**11 KB/msg** durable — and Corepoint's own
+doc names **DB durable-write I/O as the leading performance driver**. The decision + rationale are in
+[ADR 0051](adr/0051-corepoint-throughput-parity-strategy.md); this is the engineering note.
+
+**Honest verdict — NOT at demonstrated parity at 45M/day** (an earlier "at parity" claim was measured
+against Rhapsody *marketing*, not this spec):
+
+- **Compute** — *unvalidated*. Only `E_core ≈ 42 msg/s` is measured (under-powered box); 84/400 are
+  estimates, so sizing swings ~5×. Sharding (ADR 0037) reaches the published figure at the conservative
+  `E_core`, but per-connection — a single hot feed is one-core-bound.
+- **Durable-write** — *behind*: ~7 commits/msg, **group-commit unbuilt**.
+- **Storage** — runs higher, but mostly **by construction, not inefficiency**. The "~2× vs Corepoint" was
+  estimate-vs-brochure and is **retracted**. The real, code-confirmed drivers are **carriage**
+  (`NVARCHAR(MAX)` 2 B/char + base64 of the `mfenc` ciphertext → ~2.66·B on SQL Server; VARBINARY ciphertext
+  ≈ B+28, ~Corepoint-class — [#62](BACKLOG.md)) and **encrypt-by-default** (AES-256-GCM at rest, key outside
+  the DB — a stronger PHI posture than Corepoint's plaintext-+-optional-TDE; ciphertext also can't compress).
+- **HA / multi-DB maturity** — *behind*. **Cost / openness** — *ahead*.
+
+**The measure-first path (each step gated on the one before):**
+
+1. **Measure (the gate).** An enterprise-hardware `E_core` + sustained durable-write IOPS run — the local
+   **Windows Server 2025 + SQL Server 2025 box** ([#40](BACKLOG.md)) via the load harness
+   ([#28](BACKLOG.md)/[#29](BACKLOG.md)) — against the **9,200-IOPS / ~11 KB-msg / 20 + 16-core** target.
+   Pins `E_core` and the binding axis. **Nothing builds before it.**
+2. **Group-commit** (§2) — *iff* durable-write-bound. Its own ADR.
+3. **Lean-writes / carriage** — the [#62](BACKLOG.md)/[#63](BACKLOG.md)/[#47](BACKLOG.md)/[#34](BACKLOG.md)
+   cluster.
+4. **Multi-DB log split** — shared-server backend only.
+5. **Deferred contingencies** — the scoped native engine-service core, free-threading
+   ([ADR 0040](adr/0040-free-threaded-engine-support.md)), DBSHARD ([ADR 0039](adr/0039-database-tier-sharding-l5.md)) —
+   revisited only if the measurement shows machinery-bound and/or the single-hot-feed case matters.
+
+**Not on the path:** a full language rewrite (guts the code-first-Python differentiator + re-proves the
+correctness/PHI core; doesn't raise the per-server ceiling) and an external broker (solves a non-bottleneck
+on enterprise hw; forfeits single-system-of-record + exact FIFO + broker-less on-prem) — both declined in
+[ADR 0051](adr/0051-corepoint-throughput-parity-strategy.md).

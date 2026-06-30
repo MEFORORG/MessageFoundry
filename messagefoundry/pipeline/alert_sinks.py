@@ -28,7 +28,7 @@ import smtplib
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar
@@ -55,6 +55,36 @@ log = logging.getLogger(__name__)
 # Bound the in-memory backlog so a wedged transport (unreachable webhook) can't grow without limit;
 # excess events are dropped with a warning rather than stalling the worker that enqueues them.
 _MAX_QUEUE = 1000
+
+
+class _AlertStateStore(Protocol):
+    """The narrow alert-state slice (ADR 0044, #56) the sink uses — a structural subset of the store's
+    ``QueueStore`` protocol, kept inline so this module stays dependency-light. The upsert/auto-resolve
+    are pure observers (no queue row, no finalizer) and are scheduled fail-soft off ``_emit``."""
+
+    async def upsert_alert_instance(
+        self,
+        *,
+        event_type: str,
+        connection: str,
+        severity: str,
+        reason: str | None = ...,
+        now: float | None = ...,
+    ) -> None: ...
+
+    async def resolve_alert_instances_for(
+        self, *, event_type: str, connection: str, now: float | None = ...
+    ) -> int: ...
+
+
+#: Auto-resolution map (ADR 0044 D2): an inverse lifecycle event type resolves the matching open
+#: instance(s) of the failure event type it cancels. ``connection_restored`` cancels the
+#: ``connection_error`` raised on ``connection_lost``; a re-emitted ``connection_started`` clears a
+#: ``connection_stopped``. Keyed by the inverse event's ``type`` → the failure event ``type`` it resolves.
+_AUTO_RESOLVE: dict[str, str] = {
+    "connection_restored": "connection_error",
+    "connection_started": "connection_stopped",
+}
 
 _T = TypeVar("_T")
 
@@ -328,13 +358,15 @@ class AlertRuleSet:
         # Case-sensitive, OS-independent glob (connection names are case-sensitive).
         if not fnmatch.fnmatchcase(str(event.get("connection", "")), rule.connection):
             return False
-        # Depth/age thresholds apply only to queue_buildup — a rule that sets one never matches another
-        # event type (you can't be "over depth" on a stopped connection).
+        # Depth applies only to queue_buildup (you can't be "over depth" on a stopped connection); the
+        # age threshold applies to BOTH age-carrying events — queue_buildup and message_stall (#50) —
+        # since both fire on the same oldest-undelivered age (delivered_age). A rule setting a threshold
+        # never matches an event type that lacks it.
         if rule.min_depth is not None:
             if etype != "queue_buildup" or int(event.get("depth", 0)) < rule.min_depth:
                 return False
         if rule.min_oldest_seconds is not None:
-            if etype != "queue_buildup" or (
+            if etype not in ("queue_buildup", "message_stall") or (
                 float(event.get("oldest_age_seconds", 0.0)) < rule.min_oldest_seconds
             ):
                 return False
@@ -356,12 +388,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         *,
         realert_seconds: float = 300.0,
         rules: Sequence[AlertRule] | None = None,
+        store: "_AlertStateStore | None" = None,
     ) -> None:
         super().__init__()
         self._transports = transports
         self._realert_seconds = realert_seconds
         self._rules = AlertRuleSet(rules or [])
         self._last_sent: dict[str, float] = {}
+        # Durable alert-state (ADR 0044, #56): when wired, every emit upserts a resolvable instance on
+        # the (type, connection) key BEFORE the throttle, and an inverse signal auto-resolves it. None =
+        # state tracking off (byte-identical to pre-#56 — fire-and-forget only).
+        self._store = store
+        self._state_tasks: set[asyncio.Task[None]] = set()
 
     # --- AlertSink emit methods (sync, non-blocking) -------------------------
 
@@ -374,6 +412,17 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "type": "queue_buildup",
                 "connection": name,
                 "depth": depth,
+                "oldest_age_seconds": round(oldest_age_seconds, 1),
+            }
+        )
+
+    def message_stall(self, name: str, *, oldest_age_seconds: float) -> None:
+        # #50: the oldest undelivered message aged past the StallThreshold. The shared _emit throttle
+        # keys on (type, connection), so an ongoing stall collapses to one notification per cooldown.
+        self._emit(
+            {
+                "type": "message_stall",
+                "connection": name,
                 "oldest_age_seconds": round(oldest_age_seconds, 1),
             }
         )
@@ -408,8 +457,57 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
+        # #54: startup attestation found in-place-tampered engine module(s). The label ("engine-
+        # integrity") stands in for "connection" so the realert throttle + subject keying + rule
+        # matching work uniformly; the payload carries only a PHI-free reason + the drifted count.
+        self._emit(
+            {
+                "type": "integrity_drift",
+                "connection": name,
+                "reason": reason,
+                "drift_count": drift_count,
+            }
+        )
+
+    def update_available(self, name: str, *, current_version: str, pinned_version: str) -> None:
+        # #30 (ADR 0026): a newer version is pinned than is running. The package name ("messagefoundry")
+        # stands in for "connection" so the realert throttle + subject keying + rule matching work
+        # uniformly; the payload carries ONLY version strings (no PHI, no dependency list).
+        self._emit(
+            {
+                "type": "update_available",
+                "connection": name,
+                "current_version": current_version,
+                "pinned_version": pinned_version,
+            }
+        )
+
+    def backup_failed(self, name: str, *, kind: str, detail: str | None = None) -> None:
+        # #60 (ADR 0049): a DR backup failed. The source label ("dr_backup") stands in for "connection"
+        # so the realert throttle + subject keying + rule matching work uniformly; the payload carries
+        # only the failing phase (kind) + a PHI-free, safe_exc-scrubbed reason (no body, no key bytes).
+        self._emit({"type": "backup_failed", "connection": name, "kind": kind, "detail": detail})
+
+    def set_store(self, store: "_AlertStateStore | None") -> None:
+        """Wire (or clear) the alert-state store (ADR 0044, #56). The lifespan calls this once the store
+        is open, since :func:`notifier_from_settings` builds the sink from settings before the store
+        exists. None disables state tracking (fire-and-forget only)."""
+        self._store = store
+
+    def connection_restored(self, name: str) -> None:
+        """An outbound lane recovered (the inverse of ``connection_error``/``connection_lost``). Records
+        NO notification (a recovery needs no page — the runner only stores the lifecycle row) but, when
+        alert-state is wired (ADR 0044), **auto-resolves** the matching open ``connection_error`` instance
+        so the dashboard clears. A no-op when no store is set (byte-identical to pre-#56)."""
+        self._record_state({"type": "connection_restored", "connection": name}, "info")
+
     def _emit(self, event: dict[str, Any]) -> None:
         decision = self._rules.decide(event)
+        # Durable alert-state (ADR 0044, #56) is recorded BEFORE the suppression/throttle returns: an
+        # instance reflects the open *condition*, which a notification choice (suppress/throttle) must
+        # not hide (AC-3). connection_restored/started auto-resolve their matching open instance instead.
+        self._record_state(event, decision.severity)
         if decision.transports is not None and not decision.transports:
             return  # a rule suppressed this event (transports = [])
         cooldown = (
@@ -430,6 +528,48 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         if decision.transports is not None:
             event["_transports"] = list(decision.transports)  # internal routing; popped before send
         self._enqueue(event, dropped=f"{event['type']} for {event['connection']!r}")
+
+    # --- durable alert-state side observer (ADR 0044, #56) -------------------
+
+    def _record_state(self, event: dict[str, Any], severity: str) -> None:
+        """Schedule the alert-instance upsert (or auto-resolve) off ``_emit`` — a fail-soft side observer
+        (ADR 0044 D2). Synchronous + non-blocking: it only creates a background task, never awaits the
+        store. A no-op when no store is wired (state tracking off). The store write never raises into the
+        ``_emit`` caller — a failure is swallowed/logged in :meth:`_run_state` so it can't wedge a worker."""
+        store = self._store
+        if store is None:
+            return
+        etype = str(event.get("type", ""))
+        connection = str(event.get("connection", ""))
+        inverse_of = _AUTO_RESOLVE.get(etype)
+        coro: Coroutine[Any, Any, Any]
+        if inverse_of is not None:
+            coro = store.resolve_alert_instances_for(event_type=inverse_of, connection=connection)
+        else:
+            # reason: prefer the safe, PHI-free diagnostic the event already carries (detail/reason).
+            raw_reason = event.get("detail") or event.get("reason")
+            reason = str(raw_reason) if raw_reason is not None else None
+            coro = store.upsert_alert_instance(
+                event_type=etype, connection=connection, severity=severity, reason=reason
+            )
+        try:
+            task = asyncio.ensure_future(self._run_state(coro))
+        except RuntimeError:
+            # No running loop (e.g. an emit on a non-async test path) — the state write is best-effort,
+            # so drop it rather than raise into the caller. The notification path is unaffected.
+            coro.close()
+            return
+        self._state_tasks.add(task)
+        task.add_done_callback(self._state_tasks.discard)
+
+    @staticmethod
+    async def _run_state(coro: Any) -> None:
+        try:
+            await coro
+        except Exception:
+            # The alert-instance write is a side observer: a store error must never wedge a delivery
+            # worker or drop the notification. Log metadata only (no event body).
+            log.warning("alert-instance state write failed", exc_info=True)
 
     async def _handle(self, event: dict[str, Any]) -> None:
         targets = event.pop("_transports", None)  # a rule's transport subset (None = all)

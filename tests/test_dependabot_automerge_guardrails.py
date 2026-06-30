@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 _WORKFLOW = (
@@ -96,6 +97,12 @@ def test_enable_automerge_gates_on_both_guards_and_preserves_auto_merge() -> Non
 def test_cooldown_aging_window_lengthened() -> None:
     """Posture-review step 3: the uv-ecosystem routine cooldown is widened to >= 5 days."""
     dependabot = Path(__file__).resolve().parent.parent / ".github" / "dependabot.yml"
+    if not dependabot.exists():
+        # Private-only: .github/dependabot.yml is deny-listed on the OSS mirror (dependency updates
+        # are managed on the private source repo). Skip where it's absent — the sibling tests assert
+        # the shipped dependabot-auto-merge.yml workflow and still run on the mirror. Mirrors the
+        # skip-if-absent guard in tests/test_anon_parity.py and tests/test_load_config.py.
+        pytest.skip("dependabot.yml is private-only (OSS-mirror deny-list)")
     doc = yaml.safe_load(dependabot.read_text(encoding="utf-8"))
     uv = next(u for u in doc["updates"] if u["package-ecosystem"] == "uv")
     assert uv["cooldown"]["default-days"] >= 5

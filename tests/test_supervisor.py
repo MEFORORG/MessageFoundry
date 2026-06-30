@@ -8,6 +8,7 @@ deterministically and fast, without launching real engine subprocesses (Windows-
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 
 import pytest
@@ -56,6 +57,78 @@ def test_spec_argv_includes_env_and_service_config_when_given() -> None:
     assert "--env" in argv and "prod" in argv
     assert "--service-config" in argv and "svc.toml" in argv
     assert argv[:4] == (specs[0].argv[0], "-m", "messagefoundry", "serve")
+
+
+def test_spec_argv_includes_project_root_when_given() -> None:
+    # --project-root is forwarded to EVERY shard so a spawned `serve --env <e>` resolves
+    # environments/<e>.toml against the given root, not the child's working directory.
+    specs = build_shard_specs(
+        ["a", "b"],
+        config="cfg",
+        db_base="m.db",
+        base_port=8765,
+        env="prod",
+        project_root="C:/srv/mefor",
+    )
+    for spec in specs:
+        argv = spec.argv
+        assert "--project-root" in argv
+        assert argv[argv.index("--project-root") + 1] == "C:/srv/mefor"
+
+
+def test_spec_argv_omits_project_root_when_not_given() -> None:
+    specs = build_shard_specs(["a"], config="cfg", db_base="m.db", base_port=8765)
+    assert "--project-root" not in specs[0].argv
+
+
+def test_shard_db_composes_under_project_root(tmp_path: object) -> None:
+    """ADR 0050 AC-9: with ``supervise --project-root R`` and a relative ``--db`` (no absolute path), the
+    supervisor composes each shard's ``<stem>_<shard>.db`` **under R** — not against the child CWD.
+
+    Anchoring happens in ``_supervise`` BEFORE ``supervise()`` discovers shards, so the db_base passed to
+    ``build_shard_specs`` is already absolute-under-R; the per-shard composition then keeps it there. We
+    patch ``supervise`` (as imported into ``_supervise``) to capture the resolved config + db_base, run
+    ``build_shard_specs`` on the captured base, and assert each shard DB lands under R.
+    """
+    from pathlib import Path
+
+    from messagefoundry import __main__ as cli
+
+    root = Path(str(tmp_path)) / "repo"
+    root.mkdir()
+    captured: dict[str, object] = {}
+
+    async def _fake_supervise(config: str, *, db_base: str, **_kw: object) -> int:
+        captured["config"] = config
+        captured["db_base"] = db_base
+        return 0
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr("messagefoundry.pipeline.supervisor.supervise", _fake_supervise)
+    try:
+        args = argparse.Namespace(
+            config="config",  # relative — must resolve under R
+            db="mefor.db",  # relative — must resolve under R
+            base_port=8765,
+            env="prod",
+            service_config=None,
+            project_root=str(root),
+        )
+        assert cli._supervise(args) == 0
+    finally:
+        monkey.undo()
+
+    # The discovery config + db base are anchored under R (so discover_shard_specs.load_config and the
+    # per-shard composition both resolve against R, from any CWD).
+    assert captured["config"] == str(root / "config")
+    assert captured["db_base"] == str(root / "mefor.db")
+    # And the per-shard <stem>_<shard>.db therefore composes under R.
+    specs = build_shard_specs(
+        ["a", "b"], config=str(captured["config"]), db_base=str(captured["db_base"]), base_port=8765
+    )
+    for spec in specs:
+        assert Path(spec.db_path).parent == root
+        assert Path(spec.db_path).name in {"mefor_a.db", "mefor_b.db"}
 
 
 # --- lifecycle (fake process) ------------------------------------------------

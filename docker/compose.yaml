@@ -7,6 +7,55 @@
 # docker/README.md before running in anger — especially the config-OWNERSHIP requirement and the
 # "secrets via env are visible in `docker inspect`" caveat.
 
+# Shared config for the `ha`-profile clustered-engine PAIR (engine-ha + engine-standby), top-level
+# extension keys (`x-*`) so the two stay byte-identical (ADR 0017). These are NOT services — Compose
+# ignores `x-` keys. They are merged into the two services below via the `<<:` merge key.
+x-ha-engine: &ha-engine
+  profiles: ["ha"]
+  image: messagefoundry:latest
+  depends_on:
+    postgres:
+      condition: service_healthy
+  command: ["serve", "--config", "/config", "--env", "prod"]
+  env_file:
+    - path: ./secrets.env
+      required: false
+  volumes:
+    - ./config:/config:ro
+    - ./tls:/etc/mefor/tls:ro
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  stop_grace_period: 40s    # > leader_lease_ttl (30s) so a drained leader releases its lease (ADR 0047)
+  restart: unless-stopped
+
+x-ha-engine-env: &ha-engine-env
+  MEFOR_API_HOST: "0.0.0.0"
+  MEFOR_API_PORT: "8443"
+  MEFOR_API_TLS_CERT_FILE: "/etc/mefor/tls/api.crt"
+  MEFOR_API_TLS_KEY_FILE: "/etc/mefor/tls/api.key"
+  MEFOR_INBOUND_BIND_HOST: "0.0.0.0"
+  MEFOR_AUTH_ENABLED: "true"
+  MEFOR_AUTH_REQUIRE_MFA: "true"
+  MEFOR_STORE_REQUIRE_ENCRYPTION: "true"
+  MEFOR_EGRESS_DENY_BY_DEFAULT: "true"
+  # HA: shared external Postgres + active-passive cluster (SQLite is REFUSED under [cluster]).
+  MEFOR_STORE_BACKEND: "postgres"
+  MEFOR_STORE_SERVER: "postgres"
+  MEFOR_STORE_PORT: "5432"
+  MEFOR_STORE_DATABASE: "messagefoundry"
+  MEFOR_STORE_USERNAME: "mefor"
+  MEFOR_STORE_POOL_SIZE: "5"          # >= 2 required under [cluster]; >= 3 recommended
+  MEFOR_CLUSTER_ENABLED: "true"
+  # DEV-ONLY: the local Postgres has no CA-trusted cert, so verification can't succeed here. This
+  # disables TLS verification across ALL transports — it is a CI/lab switch and must NEVER be set in
+  # a real deployment. Give a managed Postgres a CA-trusted cert and remove this line.
+  MEFOR_ALLOW_INSECURE_TLS: "1"
+
 services:
   engine:
     # Build locally:  docker build -f docker/Dockerfile -t messagefoundry:latest ..
@@ -46,8 +95,10 @@ services:
     ports:
       - "8443:8443"     # API + WSS (TLS)
       - "2575:2575"     # MLLP data plane (MLLP-over-TLS)
-      # Do NOT publish raw-TCP / X12 ports without TLS: those listeners have NO startup transport guard
-      # (MLLP and the DICOM C-STORE SCP are guarded — a non-loopback bind without tls=true is refused).
+      # Do NOT publish raw-TCP / X12 ports without TLS. Those listeners are PLAINTEXT-ONLY (no tls=
+      # option), but they ARE exposed-gated since PR #558: MLLP, the DICOM C-STORE SCP, HTTP, raw-TCP,
+      # and X12 all refuse a non-loopback bind without TLS at startup (check_mllp_/dimse_/http_/tcp_
+      # tls_exposure). For raw-TCP/X12 there is no TLS escape — bind loopback or front with a TLS proxy.
 
     volumes:
       # PHI store — a NAMED VOLUME (never the ephemeral layer) so at-least-once survives restarts. WAL
@@ -80,5 +131,71 @@ services:
     restart: unless-stopped
     # The image HEALTHCHECK already probes https://127.0.0.1:8443/health (-k) then http://...:8765/health.
 
+  # --- Multi-node-ready local HA backend (OPT-IN; profile "ha") ------------------------------------
+  # A local Postgres + a PAIR of clustered engines so you can exercise the ACTIVE-PASSIVE HA shape
+  # (docs/CLUSTERING.md, ADR 0047) on one host before deploying the k8s/ha-postgres.yaml manifest against a
+  # managed Postgres. It is gated behind the `ha` PROFILE, so the DEFAULT `docker compose up` is UNCHANGED
+  # (single-node SQLite engine, no Postgres, no cluster). Bring HA up with:  docker compose --profile ha up
+  #
+  # IMPORTANT — the failover demo is the PAIR `engine-ha` + `engine-standby`, NOT the default `engine`.
+  # The default `engine` service stays single-node SQLite (no cluster env) so `docker compose up` is
+  # unchanged; it is NOT part of the cluster and stopping it does nothing to leadership. The two `ha`-profile
+  # engines below BOTH join the shared Postgres cluster and share ONE leader lease — that is what makes
+  # "stop one, watch the other promote" actually true.
+  #
+  # This is a LOCAL DEV convenience, not a production DB: a single Postgres container is itself a SPOF
+  # (no DB-tier HA) and its TLS is not set up here — for real HA point [store] at a managed/replicated
+  # Postgres (RDS / Cloud SQL / Azure DB) with a CA-trusted cert, per docs/CLOUD-DEPLOYMENT.md.
+  postgres:
+    profiles: ["ha"]
+    image: postgres:16
+    environment:
+      POSTGRES_DB: messagefoundry
+      POSTGRES_USER: mefor
+      # DEV password — override via the env_file / your secret store for anything real.
+      POSTGRES_PASSWORD: "${MEFOR_STORE_PASSWORD:-mefor-dev-password}"
+    volumes:
+      - mefor-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mefor -d messagefoundry"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # TWO clustered engines that BOTH join the shared Postgres and share ONE leader lease — this is the real
+  # active-passive PAIR. The engine GRAPH SUPERVISOR runs the listeners/workers on whichever one currently
+  # holds the lease (the LEADER); the other is a WARM STANDBY that binds nothing. Stop the leader and the
+  # standby is promoted within ≈ one heartbeat and binds the listeners — genuine failover, because they
+  # share a store and a lease (the default `engine` service shares NEITHER, so it is not in this picture).
+  #
+  # NOTE on ports: a single host cannot publish 2575 twice, so only `engine-ha` publishes the MLLP port.
+  # When `engine-ha` is the leader, MLLP works through the published port; when it is the standby its
+  # listener is closed (connection refused on 2575) and the leader is `engine-standby`, reachable on the
+  # container network but not via the host-published port. That host-port asymmetry is a single-host
+  # docker limitation only — in k8s the L4 LB's primary-only health check moves the VIP to whichever pod is
+  # the leader (docs/CLOUD-DEPLOYMENT.md §3). For a clean local failover demo, hit `engine-ha` first, then
+  # `docker compose stop engine-ha` and watch `engine-standby` take the lease (GET /cluster/status role).
+  #
+  # Clustered engine #1 — publishes the MLLP host port; leader at start (first to claim the lease).
+  # (The shared *ha-engine / *ha-engine-env anchors are defined at the top of this file.)
+  engine-ha:
+    <<: *ha-engine
+    environment:
+      <<: *ha-engine-env
+    ports:
+      - "8444:8443"     # API on a distinct host port (the default `engine` already owns 8443)
+      - "2575:2575"     # MLLP — published only here; works while this node is the leader
+
+  # Clustered engine #2 — same image + config + cluster; the warm standby (or leader after a failover).
+  # Publishes only its API on a distinct host port; it does NOT publish 2575 (one host can't bind it twice).
+  engine-standby:
+    <<: *ha-engine
+    environment:
+      <<: *ha-engine-env
+    ports:
+      - "8445:8443"     # API only; MLLP is reachable on the container network, not a host port, here
+
 volumes:
   mefor-store:
+  mefor-pg:

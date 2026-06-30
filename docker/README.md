@@ -53,8 +53,16 @@ A **Docker-Desktop-on-Windows** bind mount surfaces as `0o777` and **will be ref
 
 - **Docker single host:** [`compose.yaml`](compose.yaml) — Topology A (in-process TLS). Copy
   `secrets.env.example` → `secrets.env`, drop a cert/key under `./tls`, point `./config` at your repo.
-- **Kubernetes:** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
-  — in-process TLS, a PVC for the store, secrets via `secretKeyRef`. Set `image:` to your config-baked image.
+- **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
+  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set `image:` to your config-baked image.
+- **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
+  Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
+  lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
+  (the Postgres-led cloud guide, MLLP L4-LB recipe, and edge-relay topology) and
+  [`docs/CLOUD-PHI-HIPAA.md`](../docs/CLOUD-PHI-HIPAA.md) (the cloud HIPAA posture) before deploying it.
+  For a local taste of the HA shape: `docker compose --profile ha up` (adds a Postgres + a PAIR of
+  clustered engines — `engine-ha` + `engine-standby` — that share one leader lease, so you can stop the
+  leader and watch the other promote; the default `docker compose up` stays single-node SQLite, unchanged).
 
 ## Exposure topologies (see the evaluation §1)
 
@@ -103,10 +111,13 @@ TLS (A) or a declared upstream terminator (B), or it **refuses to start** — by
 - **MLLP-over-TLS is effectively mandatory.** A non-loopback MLLP listener without `tls=True` is refused
   at wiring time. Set `tls=True` + cert/key on each `MLLP()`. The MLLP key must be **unencrypted** unless
   the connection sets **`tls_key_password`** (env-sourced — added with this work, parity with the API key).
-- **Do not publish raw-TCP / X12 ports without TLS.** Those two listeners have **no** startup transport
-  guard — a non-loopback bind would carry plaintext PHI with no startup error. Keep them loopback-bound or
-  front them with a TLS-terminating TCP proxy. (MLLP **and** the DICOM C-STORE SCP *are* guarded —
-  `check_mllp_tls_exposure` / `check_dimse_tls_exposure` refuse a non-loopback bind without `tls=True`.)
+- **Do not publish raw-TCP / X12 ports without TLS.** Those two listeners are **plaintext-only** (they
+  have no `tls=` option), but they **are** exposed-gated since PR #558: `check_tcp_tls_exposure` refuses a
+  non-loopback raw-TCP/X12 bind at startup — the same exposed-gate that already covers MLLP, the DICOM
+  C-STORE SCP, and HTTP (`check_mllp_tls_exposure` / `check_dimse_tls_exposure` / `check_http_tls_exposure`).
+  Because raw-TCP/X12 have no TLS to enable, the only way past the gate is a loopback bind, OS-level
+  firewall/segmentation, or `serve --allow-insecure-bind` (a loud dev-only escape) — keep them
+  loopback-bound or front them with a TLS-terminating TCP proxy.
 - **`require_mfa=true` for production + local accounts.** A production-PHI off-loopback bind with local
   accounts and `require_mfa=false` is **refused at startup** (AD-only shops delegate MFA). Set it true.
 - **Never bake `MEFOR_ALLOW_INSECURE_TLS`** — it disables outbound/peer TLS verification across **all**

@@ -18,9 +18,11 @@ from messagefoundry.config.models import (
     InternalErrorPolicy,
     OrderingMode,
     RetryPolicy,
+    StallThreshold,
 )
 from messagefoundry.config.active_environment import current_environment
 from messagefoundry.config.db_lookup import DbLookupError, db_lookup
+from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
 from messagefoundry.config.ingest_time import current_ingest_time
 from messagefoundry.config.reference import reference
 from messagefoundry.config.response import response_get
@@ -31,10 +33,13 @@ from messagefoundry.config.wiring import (
     DatabaseLookup,
     DatabasePoll,
     DatabaseRef,
+    Email,
+    FhirLookup,
     File,
     FileRef,
     Ftp,
     FHIR,
+    Http,
     DICOM,
     DICOMweb,
     Loopback,
@@ -42,6 +47,7 @@ from messagefoundry.config.wiring import (
     PassThrough,
     Reference,
     Rest,
+    SMTP,
     Sftp,
     Soap,
     Tcp,
@@ -59,9 +65,16 @@ from messagefoundry.config.wiring import (
 from messagefoundry.parsing.groups import SegmentGroup
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.parsing.split import split_by_obr
-from messagefoundry.timezone import convert_hl7_timestamp, to_zone
+from messagefoundry.timezone import (
+    age_from_dob,
+    convert_hl7_timestamp,
+    hl7_now,
+    length_of_stay,
+    parse_hl7_timestamp,
+    to_zone,
+)
 
-__version__ = "0.2.6"
+__version__ = "0.2.11"
 
 __all__ = [
     "Message",
@@ -75,11 +88,14 @@ __all__ = [
     "MLLP",
     "Tcp",
     "X12",
+    "Http",
     "File",
     "Timer",
     "Loopback",
     "PassThrough",
     "Rest",
+    "Email",
+    "SMTP",
     "FHIR",
     "DICOM",
     "DICOMweb",
@@ -98,6 +114,9 @@ __all__ = [
     "DatabaseRef",
     "db_lookup",
     "DbLookupError",
+    "FhirLookup",
+    "fhir_lookup",
+    "FhirLookupError",
     "current_ingest_time",
     "current_environment",
     "AckMode",
@@ -105,6 +124,7 @@ __all__ = [
     "OrderingMode",
     "InternalErrorPolicy",
     "BuildupThreshold",
+    "StallThreshold",
     "ContentType",
     "inbound",
     "outbound",
@@ -112,5 +132,9 @@ __all__ = [
     "handler",
     "convert_hl7_timestamp",
     "to_zone",
+    "parse_hl7_timestamp",
+    "hl7_now",
+    "age_from_dob",
+    "length_of_stay",
     "__version__",
 ]
