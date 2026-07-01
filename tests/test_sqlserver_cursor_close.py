@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 
 import pytest
 
+from messagefoundry.store.pool_metrics import AcquireWaitHistogram
 from messagefoundry.store.sqlserver import SqlServerStore
 
 
@@ -88,10 +89,13 @@ class _FakePool:
 
 
 def _make_store(conn: _FakeConn, events: list[str]) -> SqlServerStore:
-    # Bypass __init__ (no real connect): _acquire/_cursor/_execute only touch _pool and _settings.
+    # Bypass __init__ (no real connect). _acquire/_cursor/_execute touch _pool, _settings, and (B11)
+    # _acquire_wait — the pool-acquire-wait histogram _acquire records into; stub it so the timing
+    # instrumentation doesn't AttributeError on this driver-free path.
     store = SqlServerStore.__new__(SqlServerStore)
     store._pool = _FakePool(conn, events)  # type: ignore[assignment]
     store._settings = types.SimpleNamespace(command_timeout=0)  # type: ignore[assignment]
+    store._acquire_wait = AcquireWaitHistogram()
     return store
 
 

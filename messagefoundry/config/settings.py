@@ -97,6 +97,7 @@ _SECTIONS = (
     "diagnostics",
     "backup",
     "dr",
+    "pipeline",  # enables MEFOR_PIPELINE_* env overrides (e.g. MEFOR_PIPELINE_PER_LANE_WAKE, ADR 0061)
 )
 _ENV_PREFIX = "MEFOR_"
 _DEFAULT_FILE = "messagefoundry.toml"
@@ -192,13 +193,37 @@ class StoreSettings(_Section):
     # grouped — Hazard A / hash-chain). The window is bounded above by `command_timeout`-class latency,
     # but in practice a few ms is plenty. DEFAULT 0 = DISABLED → byte-identical to the inline-commit
     # path (no committer coroutine, each method commits as it always has). Off-by-default is mandatory:
-    # this is reliability-core code (ADR 0055). Ignored by the server-DB backends (they use native
-    # commit_delay + concurrent submission, a later increment).
+    # this is reliability-core code (ADR 0055). Ignored by the server-DB backends, which coalesce via
+    # their connection pool + concurrent submission instead. "Native commit_delay" is PostgreSQL-ONLY
+    # (a durability-neutral GUC, a planned gated/off-by-default increment); SQL Server has NO durability-
+    # neutral group-commit knob (its DELAYED_DURABILITY relaxes durability and is rejected for the PHI
+    # store), so its scale path is the concurrent pool + sharding (ADR 0037), not a native GUC.
     group_commit_window_ms: float = 0.0
     # Flush threshold for the group-commit committer: once this many members are enrolled in the open
     # batch, it commits immediately without waiting out the rest of `group_commit_window_ms` (bounds
     # batch size / latency under load). Ignored when group-commit is disabled (window == 0).
     group_commit_max_batch: int = 64
+    # Batch-claim on the INGRESS/ROUTED FIFO claim path (ADR 0058; all three backends). The router /
+    # transform workers normally claim ONE row per commit (claim_next_fifo, a standalone DB round-trip on
+    # the critical path). When this is > 1 they instead claim the CONTIGUOUS DUE head-prefix — up to this
+    # many of the lane's oldest due rows in ONE commit (claim_next_fifo_batch) — then process each in
+    # strict FIFO order with its own per-row off-loop route/transform + separate handoff, amortizing the
+    # standalone claim commit toward 1/N. The contiguous-due-prefix + block-on-locked-head rules keep
+    # strict per-lane FIFO (#285); a not-due/locked head still blocks the lane (empty batch == single-claim
+    # None). The OUTBOUND/delivery claim is NEVER batched (its skip-and-complete dedup must stay atomic).
+    # DEFAULT 1 = OFF → byte-identical to the single TOP(1)/LIMIT 1 claim (the batch method is never
+    # invoked). > 1 is opt-in throughput tuning (recommend 8-16; size against worst-case message size, not
+    # the average — N decrypted bodies are resident per lane between the one claim and the N handoffs).
+    fifo_claim_batch: int = Field(
+        default=1,
+        ge=1,
+        le=64,
+        description=(
+            "Max rows the INGRESS/ROUTED FIFO claim takes per commit (ADR 0058). 1 = OFF "
+            "(byte-identical to the single claim). > 1 claims the contiguous due head-prefix in one "
+            "commit (opt-in throughput tuning; outbound is never batched)."
+        ),
+    )
 
     # --- PHI-at-rest encryption (both backends; STORE-1 / WP-5) -------------
     # Base64 32-byte ACTIVE key; when set, PHI columns (raw bodies + summary/metadata + error/
@@ -569,6 +594,14 @@ class PipelineSettings(_Section):
     re-ingress)."""
 
     max_correlation_depth: int = Field(default=8, ge=1)
+
+    # Per-lane wake events (B12, ADR 0061). DEFAULT-OFF: when False the engine uses the historical
+    # engine-wide singleton wake events (byte-identical). When True, a committed message wakes ONLY its
+    # own (stage, lane) worker instead of every worker of that stage — killing the ~1,500-worker
+    # thundering-herd empty-claim storm at connection scale. Reliability-core + read ONCE at engine
+    # construction (a /config/reload does NOT toggle it — restart to change). Harness A/B via
+    # MEFOR_PIPELINE_PER_LANE_WAKE. The 0.25s poll_interval lost-wakeup backstop is unchanged in both arms.
+    per_lane_wake: bool = Field(default=False)
 
 
 class DiagnosticsSettings(_Section):

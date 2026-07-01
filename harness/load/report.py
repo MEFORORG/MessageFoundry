@@ -91,6 +91,9 @@ class PhaseReport:
 class EngineSummary:
     db_backend: str | None
     journal_mode: str | None
+    synchronous: (
+        str | None
+    )  # SQLite durability mode measured ("normal"/"full"); None on servers (B7)
     peak_backlog: int
     peak_queue_depth: int
     db_growth_bytes: int
@@ -144,6 +147,7 @@ class RunReport:
             "engine_side": {
                 "db_backend": self.engine.db_backend,
                 "journal_mode": self.engine.journal_mode,
+                "synchronous": self.engine.synchronous,
                 "peak_backlog": self.engine.peak_backlog,
                 "peak_queue_depth": self.engine.peak_queue_depth,
                 "db_growth_bytes": self.engine.db_growth_bytes,
@@ -233,7 +237,8 @@ class RunReport:
             f"engine: peak_backlog={e.peak_backlog} peak_queue_depth={e.peak_queue_depth} "
             f"dead={e.dead_letters} db_growth={e.db_growth_bytes}B "
             f"drain={'%.1fs' % e.drain_seconds if e.drain_seconds is not None else 'TIMEOUT'} "
-            f"journal={e.journal_mode} backend={e.db_backend or '?'}"
+            f"journal={e.journal_mode} synchronous={e.synchronous or 'n/a'} "
+            f"backend={e.db_backend or '?'}"
         )
         nl = self.no_loss
         lines.append(
@@ -488,7 +493,10 @@ def _engine_summary(
     growth = (final.db_size_bytes - base.db_size_bytes) if base and final else 0
     dead = (final.out_dead - base.out_dead) if base and final else 0
     journal = final.journal_mode if final else None
-    return EngineSummary(db_backend, journal, peak_backlog, peak_qd, growth, dead, drain_seconds)
+    synchronous = final.synchronous if final else None
+    return EngineSummary(
+        db_backend, journal, synchronous, peak_backlog, peak_qd, growth, dead, drain_seconds
+    )
 
 
 def _notes(counters: Counters, poller: EnginePoller) -> list[str]:

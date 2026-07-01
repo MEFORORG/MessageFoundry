@@ -49,6 +49,7 @@ from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.document_strip import StripResult, cutoff_for
+from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -331,8 +332,13 @@ class OutboxItem:
     stage: str
     handler_name: str | None = None
     # The row's enqueue time (epoch seconds) — the engine-assigned, re-run-stable timestamp a Handler
-    # reads via current_ingest_time() (ADR 0009 ingest-time provider). None when a backend doesn't
-    # surface it (the SQL Server backend is outbound-only and runs no transforms, so it never reads it).
+    # reads via current_ingest_time() (ADR 0009 ingest-time provider). Still a true wall-clock
+    # `time.time()` stamp, but as of ADR 0059 it is NO LONGER the per-lane FIFO ordering key (claims
+    # order by `seq`/rowid) and is no longer per-lane-clamped — purely an ingest-time + metrics field.
+    # None only when a backend's claim OUTPUT/RETURNING omits the column: the SQL Server single
+    # FIFO/ready claim does not project created_at, so its items carry None — NOT because SQL Server is
+    # outbound-only (it runs the full ingress -> routed -> outbound pipeline, store/sqlserver.py header).
+    # SQLite and Postgres surface it.
     created_at: float | None = None
 
     @classmethod
@@ -491,6 +497,12 @@ class DbStatus:
     messages: int
     events: int
     audit: int
+    # SQLite durability mode (PRAGMA synchronous): "normal" (the shipped default — crash-safe under
+    # WAL, no per-commit fsync) or "full" (every commit fsynced). A read-only observability surface
+    # (B7) so a status reader / load run records which durability mode it measured. None on the
+    # server backends, where it is not a SQLite-style knob (SQL Server recovery model / Postgres WAL
+    # durability is reported through journal_mode instead).
+    synchronous: str | None = None
 
 
 @dataclass(frozen=True)
@@ -795,12 +807,15 @@ CREATE TABLE IF NOT EXISTS queue (
 );
 -- Claim hot path (claim_ready), per stage:
 CREATE INDEX IF NOT EXISTS ix_queue_ready ON queue(stage, status, next_attempt_at);
--- Per-stage FIFO head-of-line: outbound lanes key on destination_name; ingress AND routed lanes on
--- channel_id (ix_queue_fifo_in serves both — `stage` is the leading column, so no separate routed
--- index is needed). (FIFO ORDER BY is created_at then the implicit rowid — rowid can't be indexed.)
-CREATE INDEX IF NOT EXISTS ix_queue_fifo_out ON queue(stage, destination_name, status, created_at);
-CREATE INDEX IF NOT EXISTS ix_queue_fifo_in  ON queue(stage, channel_id, status, created_at);
 CREATE INDEX IF NOT EXISTS ix_queue_message  ON queue(message_id);
+-- Per-stage FIFO head-of-line indexes (ix_queue_fifo_in_seq / ix_queue_fifo_out_seq) are created in
+-- _migrate, NOT here (ADR 0060): they were renamed from the old created_at-trailing ix_queue_fifo_in/
+-- out, so an upgraded DB's stale same-named index is DROPped and the seq-trailing one built there,
+-- keeping the DROP + CREATE together (executescript() implicit-COMMITs before running, so it is not a
+-- natural home for the paired swap). Mirrors ix_queue_body_ref. The swap is correctness-neutral +
+-- idempotent (see _migrate). Outbound lanes key on destination_name; ingress AND routed lanes on
+-- channel_id (the *_in_seq index serves both — `stage` leads). ORDER BY is `rowid` alone (seq-only, ADR
+-- 0059); rowid is the intrinsic physical order, so it is neither an indexed trailing column nor needs one.
 -- ix_queue_body_ref (store-once-deliver-many) is created in _migrate, AFTER body_ref is guaranteed
 -- present — on a Step-A `queue` table (no body_ref) a body_ref index here would reference a missing
 -- column (CREATE TABLE IF NOT EXISTS is a no-op on the pre-existing table). Mirrors handler_name.
@@ -1090,10 +1105,16 @@ class MessageStore:
         cipher: Cipher | None = None,
         group_commit_window_ms: float = 0.0,
         group_commit_max_batch: int = 64,
+        synchronous: str = "NORMAL",
     ) -> None:
         self._db = db
         self.path = str(path)
         self._cipher: Cipher = cipher or IdentityCipher()
+        # The configured PRAGMA synchronous mode, normalised to the lowercase settings vocabulary
+        # ("normal"/"full"). Read-only observability (B7): db_status() surfaces it so a status reader
+        # and a load run record which durability mode was measured. Not a behaviour knob — open()
+        # already applied it to the connection; this just remembers what was applied.
+        self.synchronous = synchronous.lower()
         # Serialise multi-statement transactions: aiosqlite serialises single
         # executes, but a txn spanning awaits could otherwise interleave.
         self._lock = asyncio.Lock()
@@ -1200,6 +1221,7 @@ class MessageStore:
             cipher=cipher,
             group_commit_window_ms=group_commit_window_ms,
             group_commit_max_batch=group_commit_max_batch,
+            synchronous=sync,
         )
         await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
         await store._backfill_audit_chain()  # chain any pre-existing (unhashed) audit rows
@@ -1730,6 +1752,28 @@ class MessageStore:
         # The body_ref deref index lives here (not _SCHEMA) so it is created only AFTER the column is
         # guaranteed present — on a Step-A queue it'd otherwise reference a not-yet-added column.
         await db.execute("CREATE INDEX IF NOT EXISTS ix_queue_body_ref ON queue(body_ref)")
+        # FIFO covering-index rename (ADR 0060). ADR 0059 re-keyed the per-lane FIFO indexes to trail in
+        # seq/rowid but KEPT the names ix_queue_fifo_in/out with CREATE IF NOT EXISTS — so an upgraded DB
+        # silently keeps its old created_at-trailing index and never adopts the seq-only claim's index.
+        # Drop the old-named indexes and build the seq-trailing ones under a NEW name (so name-existence is
+        # a correct discriminator). This is NOT a transactional swap on SQLite — Python's sqlite3 auto-
+        # commits DDL — but it does not need to be: the FIFO index is CORRECTNESS-NEUTRAL (the claim orders
+        # by rowid and names no index, ADR 0059), so a crash in the DROP→CREATE gap leaves a lane
+        # transiently unindexed (claims stay correct, just slower) and the next open's idempotent re-run
+        # (DROP IF EXISTS / CREATE IF NOT EXISTS) converges to the seq-trailing pair. This runs at open,
+        # before serving, so the transient gap is never observed by a live claim. DROP-old before
+        # CREATE-new so the on-disk FIFO index count never doubles; a fresh DB no-ops the drops and a
+        # re-opened migrated DB no-ops everything. (The server backends run the same swap inside a real
+        # schema transaction, so they additionally get atomicity — see ADR 0060 / sqlserver.py /
+        # postgres.py.)
+        await db.execute("DROP INDEX IF EXISTS ix_queue_fifo_in")
+        await db.execute("DROP INDEX IF EXISTS ix_queue_fifo_out")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_queue_fifo_in_seq ON queue(stage, channel_id, status)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_queue_fifo_out_seq ON queue(stage, destination_name, status)"
+        )
         # Step-up re-verification (ASVS 7.5.3) adds sessions.reauth_at. A pre-existing DB's rows get
         # NULL (treated as "never re-verified" — a sensitive op then requires /me/reauth).
         cur = await db.execute("PRAGMA table_info(sessions)")
@@ -1874,35 +1918,6 @@ class MessageStore:
                 raise
         return mid
 
-    async def _fifo_created_at(self, stage: str, lane_col: str, lane_val: str, now: float) -> float:
-        """The ``created_at`` to stamp on a new ``stage`` row so per-lane FIFO order (``ORDER BY
-        created_at, rowid`` in :meth:`claim_next_fifo`) survives a **backward wall-clock step**.
-
-        FIFO ordering assumes ``created_at`` (``time.time()``) is monotonically non-decreasing within a
-        lane; an NTP step-back / VM snapshot-revert could otherwise give a later-arriving row a smaller
-        ``created_at`` and let it sort ahead of an earlier one. Clamp the new row's ordering timestamp
-        up to the lane's current max so that can't happen (equal timestamps fall back to ``rowid`` =
-        insertion order). Only ``created_at`` is clamped — ``next_attempt_at``/``updated_at`` keep the
-        true ``now``. Logs once per actual clamp. ``lane_col`` is a code-controlled literal
-        (``channel_id`` for ingress/routed, ``destination_name`` for outbound), never user input."""
-        cur = await self._db.execute(
-            f"SELECT MAX(created_at) AS m FROM queue WHERE stage=? AND {lane_col}=?",
-            (stage, lane_val),
-        )
-        row = await cur.fetchone()
-        last = None if row is None else row["m"]
-        if last is not None and now < last:
-            log.warning(
-                "clock regression on the %s lane %r: created_at %.6f < lane max %.6f; clamping to "
-                "preserve FIFO order",
-                stage,
-                lane_val,
-                now,
-                last,
-            )
-            return float(last)
-        return now
-
     async def _insert_outbound_deliveries(
         self,
         mid: str,
@@ -2005,9 +2020,8 @@ class MessageStore:
         (byte-identical to the pre-feature path); a non-``None`` content-address hash references the single
         copy in ``shared_body`` and stores an empty inline ``payload`` (dereferenced at delivery). The
         caller (:meth:`_insert_outbound_deliveries`) reserves the shared_body row before passing a ref."""
-        created_at = await self._fifo_created_at(
-            Stage.OUTBOUND.value, "destination_name", dest_name, now
-        )
+        # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
+        created_at = now
         # When the body is shared, the inline payload is empty ('' — never ciphertext-of-empty, so it
         # reads back as a blank that the deref replaces). NOT NULL is satisfied by the '' sentinel.
         stored_payload = "" if body_ref is not None else self._cipher.encrypt(payload)
@@ -2040,7 +2054,8 @@ class MessageStore:
         (``payload``, encrypted) it re-parses; ``destination_name`` is NULL until transform produces
         outbound rows. The raw is consumed (the row is DELETEd) at :meth:`transform_handoff`, so it is
         never kept twice at rest beyond the brief route→transform window (mirrors the ingress row)."""
-        created_at = await self._fifo_created_at(Stage.ROUTED.value, "channel_id", channel_id, now)
+        # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
+        created_at = now
         await self._db.execute(
             "INSERT INTO queue"
             " (id, message_id, stage, channel_id, destination_name, handler_name, payload,"
@@ -2096,9 +2111,8 @@ class MessageStore:
                 error=None,
                 now=now,
             )
-            ingress_created_at = await self._fifo_created_at(
-                Stage.INGRESS.value, "channel_id", channel_id, now
-            )
+            # ingest-time (ADR 0009) + metrics only; FIFO orders by rowid (ADR 0059).
+            ingress_created_at = now
             await self._db.execute(
                 "INSERT INTO queue"
                 " (id, message_id, stage, channel_id, destination_name, payload,"
@@ -2221,9 +2235,9 @@ class MessageStore:
                 # DELETE matched nothing (zero net mutation), so under group-commit this member stays
                 # in the batch harmlessly; _AbortMember just short-circuits the rest of the body.
                 raise _AbortMember(False)
-            # Insert in handler-list order: routed rows share this handoff's created_at, so the
-            # transform worker's FIFO (created_at, rowid) falls back to rowid = insertion order,
-            # preserving the router's handler order to a shared outbound (see the worker docs).
+            # Insert in handler-list order: the transform worker's FIFO orders by rowid alone (seq-only,
+            # ADR 0059), so rowid = insertion order preserves the router's handler order to a shared
+            # outbound (see the worker docs).
             for handler_name, payload in handlers:
                 await self._insert_routed_row(message_id, channel_id, handler_name, payload, now)
             await self._db.execute(
@@ -2657,19 +2671,23 @@ class MessageStore:
         FIFO across all inbounds); ingress **and routed** lanes by ``channel_id`` (per-inbound FIFO —
         preserving arrival order into routing, and into transform) — those rows have a NULL
         ``destination_name``, so keying outbound's column there would match nothing and silently stall
-        the lane. Ordering is ``created_at, rowid`` — the ``rowid`` tiebreak preserves insertion order
-        among rows produced in the **same** transaction (e.g. one ``route_handoff``'s routed rows keep
-        their handler-list order). Ordering across separate enqueues to a lane assumes ``created_at`` is
-        monotonically non-decreasing within the lane; :meth:`_fifo_created_at` **clamps each new row's
-        ``created_at`` up to the lane's current max at insert**, so a backward wall-clock step (NTP
-        step-back, VM snapshot revert) can't make a later message sort ahead of an earlier one on this
-        backend. (The SQL Server backend applies the same clamp — ``store/sqlserver.py``'s own
-        ``_fifo_created_at`` at its insert sites; its ``claim_next_fifo`` also omits ``READPAST`` on the
-        FIFO head to preserve per-lane order, see #285.) If the head is
-        still backing off (``next_attempt_at`` in
-        the future) this returns ``None`` *without* skipping ahead — the head blocks the lane (head-of-
-        line) until it succeeds, dead-letters, or is purged. Contrast :meth:`claim_ready`, which skips a
-        backing-off row to drain others (unordered).
+        the lane. Ordering is ``rowid`` alone — seq-only per-lane FIFO (ADR 0059). ``rowid`` is the
+        SQLite ``seq``: the DB assigns it monotonically at INSERT and (without AUTOINCREMENT) allocates
+        ``rowid = max(live rowid) + 1``, so among a lane's live pending rows ``ORDER BY rowid`` is strict
+        insert-commit order — **with zero wall-clock dependence**, immune to NTP step-backs / VM
+        snapshot reverts that could reorder a ``created_at``-keyed claim. This is correct **only because
+        there is exactly ONE serial writer per (stage, lane-key)** (the listener for ingress, the
+        per-inbound router worker for routed, the per-inbound transform worker for outbound — fan-in on
+        ``destination_name`` is serialized a fortiori by the process-wide ``self._lock``), so rowid order
+        == receive order. If a future change adds a second writer to a lane, or switches a stage to
+        delete+reinsert on retry (re-minting rowid), this guarantee breaks — there is no longer a
+        ``created_at`` backstop. ``created_at`` remains a true ``time.time()`` ingest-time (ADR 0009) /
+        metrics column, no longer consulted for ordering (ADR 0059). (The SQL Server / Postgres backends
+        order by their ``seq`` IDENTITY/SERIAL equivalently; all three omit ``READPAST`` / SKIP-LOCKED of
+        the true head to preserve per-lane order, see #285.) If the head is still backing off
+        (``next_attempt_at`` in the future) this returns ``None`` *without* skipping ahead — the head
+        blocks the lane (head-of-line) until it succeeds, dead-letters, or is purged. Contrast
+        :meth:`claim_ready`, which skips a backing-off row to drain others (unordered).
         """
         now = time.time() if now is None else now
         # Lane column is a code-controlled literal (chosen by stage), never user input.
@@ -2681,7 +2699,7 @@ class MessageStore:
         async with self._lock:
             cur = await self._db.execute(
                 f"SELECT * FROM queue WHERE stage=? AND {lane_col}=? AND status=?"
-                " ORDER BY created_at, rowid LIMIT 1",
+                " ORDER BY rowid LIMIT 1",
                 (stage, name, OutboxStatus.PENDING.value),
             )
             row = await cur.fetchone()
@@ -2734,6 +2752,87 @@ class MessageStore:
                 claimed["id"], f"undecryptable payload: {exc}", _standalone=True
             )
             return None
+
+    async def claim_next_fifo_batch(
+        self,
+        name: str,
+        now: float | None = None,
+        *,
+        stage: str,
+        limit: int,
+    ) -> list[OutboxItem]:
+        """Claim the **contiguous DUE head-prefix** (up to ``limit`` rows) for one lane at ``stage`` in
+        ONE commit — the batched cousin of :meth:`claim_next_fifo` (ADR 0058), INGRESS/ROUTED only.
+
+        Under the existing process-wide ``self._lock`` (the ADR 0055 group-committer serializer): there
+        are no row locks because the single writer **is** the no-skip guarantee — no producer can hold a
+        row mid-claim, so there is no locked-head case to block on here (cf. the Postgres/SQL Server row
+        locks). SELECT the lane's oldest ``limit`` pending rows in ``rowid`` order (seq-only per-lane
+        FIFO, ADR 0059 — the single serial writer assigns ``rowid = max(live)+1`` in insert-commit
+        order, so rowid order == receive order with zero wall-clock dependence), then
+        truncate the prefix at the first **not-due** row (``next_attempt_at > now``) with a Python
+        ``break`` — never reaching past it (so a not-due head yields ``[]``, exactly as the single claim
+        returns ``None`` and blocks the lane). Bump ``attempts+1`` + flip to ``inflight`` on all claimed
+        rows in one ``UPDATE ... id IN (...)``, then **re-SELECT** them so each :class:`OutboxItem`
+        carries the POST-increment ``attempts`` the G6 ceiling reads (mirrors the single claim's re-read).
+
+        Decryption happens AFTER the commit, off the lock; an undecryptable row is dead-lettered
+        standalone and DROPPED from the returned list (a poison interior row never stalls the lane and
+        never reorders the surviving tail), mirroring :meth:`claim_ready`.
+        """
+        now = time.time() if now is None else now
+        # Lane column is a code-controlled literal (chosen by stage), never user input — same mapping as
+        # claim_next_fifo. ingress/routed/response key by channel_id; outbound by destination_name (the
+        # outbound lane is never batched, but keep the mapping total for protocol uniformity).
+        lane_col = (
+            "channel_id"
+            if stage in (Stage.INGRESS.value, Stage.ROUTED.value, Stage.RESPONSE.value)
+            else "destination_name"
+        )
+        async with self._lock:
+            cur = await self._db.execute(
+                f"SELECT * FROM queue WHERE stage=? AND {lane_col}=? AND status=?"
+                " ORDER BY rowid LIMIT ?",
+                (stage, name, OutboxStatus.PENDING.value, limit),
+            )
+            rows = await cur.fetchall()
+            due_ids: list[str] = []
+            for row in rows:
+                # Contiguous-due truncation: STOP at the first not-due head, never skip past it (strict
+                # per-lane FIFO — a not-due head blocks the lane exactly as the single claim's None does).
+                if row["next_attempt_at"] > now:
+                    break
+                due_ids.append(row["id"])
+            if not due_ids:
+                return []  # head not due / nothing pending — block the lane (== single-claim None)
+            placeholders = ",".join("?" * len(due_ids))
+            await self._db.execute(
+                f"UPDATE queue SET status=?, attempts=attempts+1, updated_at=?"
+                f" WHERE id IN ({placeholders})",
+                (OutboxStatus.INFLIGHT.value, now, *due_ids),
+            )
+            # RE-SELECT so OutboxItem.attempts is the POST-increment value (the G6 poison ceiling reads
+            # it); reusing the pre-UPDATE snapshot would shift the ceiling by one pass. Re-order by the
+            # lane total order so the returned list stays oldest-first (the worker never re-sorts).
+            cur = await self._db.execute(
+                f"SELECT * FROM queue WHERE id IN ({placeholders}) ORDER BY rowid",
+                due_ids,
+            )
+            claimed_rows = await cur.fetchall()
+            await self._db.commit()
+        # Decrypt per row OUTSIDE the lock; a single undecryptable payload (corrupt blob / rotated key)
+        # must not blow up the whole claim — dead-letter the bad row STANDALONE and deliver the rest
+        # (the surviving tail keeps its order — mirrors claim_ready / the single claim's H-1 handling).
+        items: list[OutboxItem] = []
+        for row in claimed_rows:
+            try:
+                items.append(await self._outbox_item_from_row(row))
+            except Exception as exc:
+                log.warning("dead-lettering undecryptable queue row %s: %s", row["id"], exc)
+                await self.dead_letter_now(
+                    row["id"], f"undecryptable payload: {exc}", _standalone=True
+                )
+        return items
 
     async def dead_letter_now(
         self,
@@ -2892,9 +2991,8 @@ class MessageStore:
                 # FIFO lane); message_id = the ORIGIN (so the finalizer holds it in flight until the
                 # reply is handed off). The re-ingress worker drains it via ingress_handoff.
                 artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
-                work_created = await self._fifo_created_at(
-                    Stage.RESPONSE.value, "channel_id", reingress_to, now
-                )
+                # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059)
+                work_created = now
                 await self._db.execute(
                     "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
                     " handler_name, payload, status, attempts, next_attempt_at, created_at,"
@@ -3016,9 +3114,8 @@ class MessageStore:
                 error=None,
                 now=now,
             )
-            ingress_created = await self._fifo_created_at(
-                Stage.INGRESS.value, "channel_id", pt_channel, now
-            )
+            # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059)
+            ingress_created = now
             await self._db.execute(
                 "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
                 " handler_name, payload, status, attempts, next_attempt_at, created_at,"
@@ -3060,9 +3157,8 @@ class MessageStore:
         (no real egress body); ``next_attempt_at`` is ``now`` (terminal, never due). A ``delivered``/
         ``dead`` event mirrors a normal outbound's so the hop is visible in the per-message timeline."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
-        created_at = await self._fifo_created_at(
-            Stage.OUTBOUND.value, "destination_name", pt_name, now
-        )
+        # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
+        created_at = now
         await self._db.execute(
             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
             " payload, status, attempts, next_attempt_at, created_at, updated_at)"
@@ -3246,9 +3342,8 @@ class MessageStore:
                     )
                     # 6. The ingress queue row — UNLESS peek_failed (an ERROR message owes no work).
                     if not peek_failed:
-                        ingress_created = await self._fifo_created_at(
-                            Stage.INGRESS.value, "channel_id", loopback_channel_id, now
-                        )
+                        # ingest-time (ADR 0009) + metrics only; FIFO orders by rowid (ADR 0059)
+                        ingress_created = now
                         await self._db.execute(
                             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
                             " handler_name, payload, status, attempts, next_attempt_at, created_at,"
@@ -3721,9 +3816,11 @@ class MessageStore:
             if channel_id is not None:
                 where.insert(0, "channel_id=?")
                 params.insert(0, channel_id)
+            # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match the
+            # claim's seq-only order (rowid = SQLite seq), NOT created_at (no longer the ordering key; ADR 0059).
             query = (
                 "SELECT id, message_id FROM queue"
-                f" WHERE {' AND '.join(where)} ORDER BY next_attempt_at, created_at"
+                f" WHERE {' AND '.join(where)} ORDER BY next_attempt_at, rowid"
             )
             if top_only:
                 query += " LIMIT 1"
@@ -4970,7 +5067,14 @@ class MessageStore:
                 messages=await self._count(db, "messages"),
                 events=await self._count(db, "message_events"),
                 audit=await self._count(db, "audit_log"),
+                synchronous=self.synchronous,
             )
+
+    def pool_status(self) -> PoolStatus | None:
+        """No connection pool on SQLite (a single writer + lockfree read connections, not a contended
+        pool), so the server-only pool-wait observability surface (B11) is ``None`` here — the wall it
+        measures does not exist on this backend."""
+        return None
 
     async def integrity_check(self) -> tuple[bool, str]:
         """Run ``PRAGMA quick_check`` (can be slow on a large DB — call on demand only). Runs on a

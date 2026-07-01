@@ -31,6 +31,7 @@ import time
 import urllib.parse
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -150,6 +151,42 @@ def _peek_for_loopback(
     return None, ic.content_type.value, None, False
 
 
+@dataclass
+class EmptyClaimCounters:
+    """Read-only, additive worker-loop counters for the connection-scale harness (B11).
+
+    A stage worker that claims its lane and finds it empty (``if not items:``) does a wasted DB
+    round-trip — an **empty claim**. There are two distinct sources, and the connection-scale wall
+    report must keep them SEPARATE (don't sum them into one number):
+
+    * ``idle_poll`` — the empty claim followed a ``poll_interval`` *timeout* in ``_wait_for_work`` (no
+      wake event arrived): the steady 0.25s idle re-SELECT every idle worker does. Scales with the
+      number of idle workers × 1/poll_interval.
+    * ``wake_fanout`` — the empty claim followed a *wake* (a producer ``event.set()``): the per-commit
+      **thundering-herd**. The per-stage wake events are engine-wide singletons, so one committed
+      message wakes ALL ~N workers of a stage and each re-SELECTs — but only one finds the new row, so
+      the other ~N-1 are woken-but-found-nothing. At a constant aggregate rate (the harness's
+      ``fixed_aggregate`` sweep) this is the wake-fanout cost, rising with N.
+
+    ``total`` (== idle_poll + wake_fanout) is surfaced as ``StatsResponse.empty_claims``; the split is
+    surfaced as ``empty_claims_idle_poll`` / ``empty_claims_wake_fanout`` so the report can plot the
+    herd slope distinctly from the idle-poll floor. All monotonic; default 0 (byte-identical when the
+    harness never reads them). Mutated only on the engine event loop (no lock needed)."""
+
+    total: int = 0
+    idle_poll: int = 0
+    wake_fanout: int = 0
+
+    def record_empty(self, *, woken: bool) -> None:
+        """Account one empty claim, classified by whether the worker was last *woken* (wake-fanout) or
+        timed out on the poll interval (idle-poll)."""
+        self.total += 1
+        if woken:
+            self.wake_fanout += 1
+        else:
+            self.idle_poll += 1
+
+
 class RegistryRunner:
     """Runs every inbound connection in a Registry + one delivery worker per outbound."""
 
@@ -160,6 +197,7 @@ class RegistryRunner:
         *,
         poll_interval: float = 0.25,
         claim_limit: int = 20,
+        fifo_claim_batch: int = 1,
         inbound_bind_host: str = "127.0.0.1",
         reserved_bindings: Sequence[tuple[str, str, int]] = (),
         allow_insecure_bind: bool = False,
@@ -180,6 +218,7 @@ class RegistryRunner:
         max_correlation_depth: int = 8,
         connection_events: bool = True,
         response_sent_default: bool = True,
+        per_lane_wake: bool = False,
     ) -> None:
         self.registry = registry
         self.store = store
@@ -197,6 +236,11 @@ class RegistryRunner:
         self._active_environment = active_environment
         self.poll_interval = poll_interval
         self.claim_limit = claim_limit
+        # ADR 0058 batch-claim: max rows the INGRESS/ROUTED FIFO claim takes per commit. 1 = OFF (the
+        # workers call the single claim_next_fifo, byte-identical). > 1 claims the contiguous due
+        # head-prefix in one commit (claim_next_fifo_batch) and processes each row in FIFO order. Clamp
+        # the floor to 1 so a stray 0/negative can never disable the claim. From [store].fifo_claim_batch.
+        self._fifo_batch = max(1, fifo_claim_batch)
         # Global outbound defaults (from [delivery]); a connection's own settings override them.
         # An outbound with none inherits these (per-connection override > global default > built-in).
         self._delivery_defaults = delivery_defaults or RetryPolicy()
@@ -301,6 +345,13 @@ class RegistryRunner:
         # built from registry.fhir_lookups at start/reload, None when the graph declares no FhirLookup.
         # When either executor is set, the transform runs off-loop with the matching runner(s) activated.
         self._fhir_lookup_executor: FhirLookupExecutor | None = None
+        # ADR 0057: per-inbound "inline Step-A fast-path eligible" flag, computed once at graph-build
+        # (start/reload, after the lookup executors are (re)built) and cached. True iff the inbound opts
+        # in (ic.inline) AND the graph declares no live lookup (db/fhir) AND ack_after resolves to
+        # ingest AND the inbound isn't a LOOPBACK. Per-message gates (single-handler, all-deliver) are
+        # re-checked at runtime in _router_worker; an ineligible/missing name reads False (the split
+        # path), so this is byte-identical when nobody opts in. Empty until start().
+        self._inline_ok: dict[str, bool] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop = asyncio.Event()
         # Per-stage wake events so a producer wakes only its own downstream consumer class. A single
@@ -314,6 +365,21 @@ class RegistryRunner:
         # is produced (a captured reply owes a re-ingress) — a sibling of _ingress_work/_routed_work.
         self._response_work = asyncio.Event()
         self._work = asyncio.Event()
+        # Per-lane wake events (B12, ADR 0061). DEFAULT-OFF: when False the four singleton events above
+        # are the wake mechanism (byte-identical to before B12); `_lane_events` stays EMPTY and is never
+        # consulted. When True, each (stage, lane) has its OWN Event so a committed message wakes only its
+        # own worker instead of every worker of that stage — killing the thundering-herd empty-claim storm
+        # at connection scale. Keyed by the STABLE lane-name string (INGRESS/ROUTED/RESPONSE by channel_id,
+        # OUTBOUND by destination_name) so a sticky set survives a worker spawn/respawn/reload. `_stop`
+        # stays a singleton (global shutdown, not per-lane). See _lane_event / _wake_lane / _wake_all.
+        self._per_lane_wake = per_lane_wake
+        self._lane_events: dict[Stage, dict[str, asyncio.Event]] = {s: {} for s in Stage}
+        self._singleton_for_stage: dict[Stage, asyncio.Event] = {
+            Stage.INGRESS: self._ingress_work,
+            Stage.ROUTED: self._routed_work,
+            Stage.RESPONSE: self._response_work,
+            Stage.OUTBOUND: self._work,
+        }
         # Connection-event log (Corepoint-style #46): on each listen source the runner injects a sink
         # that put_nowait's an event dict onto this bounded queue; a single drain task writes them to the
         # store OFF the accept/delivery hot path (pure observer — the listener never awaits a store
@@ -327,10 +393,21 @@ class RegistryRunner:
         self._conn_events_dropped = 0
         self._running = False
         self._reload_lock = asyncio.Lock()  # serialize concurrent reloads
+        # B11 read-only worker-loop instrumentation: empty-claim counts (router/transform/delivery),
+        # split into idle-poll re-SELECTs vs per-commit wake-fanout (the thundering herd). Surfaced via
+        # /stats; default 0, so byte-identical when the connection-scale harness never reads it.
+        self._empty_claims = EmptyClaimCounters()
 
     @property
     def running(self) -> bool:
         return self._running
+
+    @property
+    def empty_claims(self) -> EmptyClaimCounters:
+        """The B11 read-only empty-claim counters (idle-poll vs wake-fanout). The ``/stats`` route
+        reads these to surface the connection-scale wall signals; nothing in the engine mutates routing
+        from them."""
+        return self._empty_claims
 
     @property
     def coordinator(self) -> ClusterCoordinator:
@@ -338,12 +415,39 @@ class RegistryRunner:
         cheap, synchronous ``is_leader`` gate; this exposes the object."""
         return self._coordinator
 
+    def _lane_event(self, stage: Stage, key: str) -> asyncio.Event:
+        """Get-or-create the wake Event for one (stage, lane) — STRICT: create+store on a miss, else
+        return the SAME stored object. NEVER replace a live Event (a replace between a producer's set()
+        and the worker's first wait() would drop the sticky set → lost wakeup) and NEVER no-op on a miss
+        (a missing lane must be created so a wake to a not-yet-spawned worker's lane sticks). Called ONLY
+        when per_lane_wake is True — the OFF path never touches _lane_events. ADR 0061."""
+        return self._lane_events[stage].setdefault(key, asyncio.Event())
+
+    def _wake_lane(self, stage: Stage, key: str) -> None:
+        """Wake the worker for one (stage, lane). OFF → the whole-stage singleton (byte-identical to the
+        pre-B12 set()); ON → only this lane's Event. ADR 0061."""
+        if not self._per_lane_wake:
+            self._singleton_for_stage[stage].set()
+        else:
+            self._lane_event(stage, key).set()
+
+    def _wake_all(self, *stages: Stage) -> None:
+        """Wake EVERY worker of the given stages — for lane-agnostic producers (notify_work / reload /
+        teardown) that can't name a single lane. OFF → the stage singletons; ON → every registered lane
+        Event of those stages. MUST stay synchronous + await-free: it snapshots the Event list before
+        iterating so a concurrent reload/producer mutating _lane_events can't raise 'dict changed size
+        during iteration'. ADR 0061."""
+        if not self._per_lane_wake:
+            for stage in stages:
+                self._singleton_for_stage[stage].set()
+        else:
+            for stage in stages:
+                for ev in list(self._lane_events[stage].values()):
+                    ev.set()
+
     def notify_work(self) -> None:
         """Wake every stage worker now (e.g. after a replay re-queues rows at an unknown stage)."""
-        self._ingress_work.set()
-        self._routed_work.set()
-        self._response_work.set()
-        self._work.set()
+        self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
 
     def set_env_values(self, values: Mapping[str, Any]) -> None:
         """Replace the environment values used to resolve ``env()`` refs when (re)building connectors.
@@ -466,6 +570,29 @@ class RegistryRunner:
         if ic.spec.type not in (ConnectorType.MLLP, ConnectorType.TCP):
             return False
         return ic.capture_ack if ic.capture_ack is not None else self._response_sent_default
+
+    def _recompute_inline_ok(self) -> None:
+        """Recompute the per-inbound ADR 0057 inline-fast-path eligibility cache from the current graph
+        and the just-(re)built lookup executors. MUST be called after ``self._lookup_executor`` /
+        ``self._fhir_lookup_executor`` are set for the live graph (start + reload).
+
+        The graph-level gates (P-config opt-in, P-lookup no live lookups, P-ack ingest, not LOOPBACK):
+        per ADR 0057 §2 P-lookup is graph-level (lookup presence keys off ``registry.lookups`` /
+        ``fhir_lookups``, not per-handler), so a single declared lookup disables the inline path for the
+        WHOLE graph. The per-message gates (M-single / M-deliver) are re-checked at runtime. Anything
+        not eligible falls back to today's split path verbatim — byte-identical when nobody opts in.
+        """
+        no_lookups = self._lookup_executor is None and self._fhir_lookup_executor is None
+        inline_ok: dict[str, bool] = {}
+        for name, ic in self.registry.inbound.items():
+            resolved_ack_after = ic.ack_after or self._ack_after_default
+            inline_ok[name] = (
+                ic.inline
+                and no_lookups
+                and resolved_ack_after == AckAfter.INGEST
+                and ic.spec.type is not ConnectorType.LOOPBACK
+            )
+        self._inline_ok = inline_ok
 
     def _build_lookup_executor(self) -> DatabaseLookupExecutor | None:
         """Build the pooled live-lookup executor from the current graph's ``DatabaseLookup`` specs, or
@@ -884,6 +1011,9 @@ class RegistryRunner:
                 # failure here is graph-wide (not one connection), so let it hit the backstop below.
                 self._lookup_executor = self._build_lookup_executor()
                 self._fhir_lookup_executor = self._build_fhir_lookup_executor()
+                # ADR 0057: compute the inline-fast-path eligibility now that the lookup executors are
+                # known (P-lookup needs both to be None). Default-OFF unless an inbound opted in.
+                self._recompute_inline_ok()
                 for ic in self.registry.inbound.values():
                     # DR run-profile (#61, ADR 0048): a below-threshold inbound LISTENER is NOT bound
                     # (no source.start) — but its router + transform workers are still spawned below, so
@@ -960,10 +1090,9 @@ class RegistryRunner:
         _reload_lock) and idempotent — cleans up whatever is registered even if the runner never
         reached _running, so a half-started runner (review M-8) and a double stop() are both safe."""
         self._stop.set()
-        self._ingress_work.set()
-        self._routed_work.set()
-        self._response_work.set()
-        self._work.set()
+        # B12 (ADR 0061): break every waiting worker out of its wait so cancel()+gather lands promptly.
+        # OFF sets the four stage singletons (byte-identical); ON sets every registered lane Event.
+        self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
         for source in self._sources.values():
             await source.stop()
         inbound_tasks = (
@@ -1004,6 +1133,11 @@ class RegistryRunner:
         self._lane_healthy.clear()
         self._next_buildup_alert.clear()
         self._sources.clear()
+        # B12 (ADR 0061): drop the per-lane wake Events now that every worker is cancelled+gathered. Safe
+        # here (post-teardown) — NEVER clear/delete lane Events mid-run (a removed-but-draining worker and
+        # a re-added lane both reuse them by name via get-or-create). No-op when per_lane_wake is off.
+        for _lane_dict in self._lane_events.values():
+            _lane_dict.clear()
         self._running = False
 
     # --- outbound worker management ------------------------------------------
@@ -1049,7 +1183,20 @@ class RegistryRunner:
     def _ensure_inbound_workers(self, name: str) -> None:
         """Ensure the router + transform (+ for a loopback inbound, the response) workers for one inbound
         are running, spawning any that exited (a STOP-policy halt, a reload adding the inbound, or a
-        crash). Idempotent — the shared re-arm used by start(), start_inbound(), and reload()."""
+        crash). Idempotent — the shared re-arm used by start(), start_inbound(), and reload().
+
+        FIFO LOAD-BEARING ASSUMPTION (ADR 0059): there is exactly **ONE serial writer per (stage,
+        lane-key)**. This dict is keyed by inbound ``name`` and only ever holds one task per kind, so each
+        inbound has a single router worker (writing the ``routed`` lane, keyed by channel_id) and a single
+        transform worker (writing the ``outbound`` lanes, keyed by destination_name). The delivery worker
+        (one per outbound) is likewise singular. Seq-only per-lane FIFO (no created_at clamp backstop)
+        relies on this: a single serial writer assigns the DB seq (rowid/IDENTITY/SERIAL) in receive
+        order, so claim-by-seq == receive order. **Do NOT spawn a second concurrent writer into any lane**
+        (e.g. sharding a lane across two workers without partitioning the lane key) — it would let a
+        higher seq commit before a lower one and silently break per-lane FIFO. The outbound
+        ``destination_name`` fan-in is multi-writer across inbounds **by design**, but seq is still
+        DB-assigned in commit order there, so the first committer gets the lower seq (no honored
+        cross-inbound receive order to violate)."""
         kinds = ["router", "transform"]
         ic = self.registry.inbound.get(name)
         if ic is not None and ic.spec.type is ConnectorType.LOOPBACK:
@@ -1205,6 +1352,9 @@ class RegistryRunner:
                 # The FHIR-read executor holds no pools (a shared, stateless opener), so no aclose: just
                 # rebuild it from the new graph (None when the new graph declares no FhirLookup).
                 self._fhir_lookup_executor = self._build_fhir_lookup_executor()
+                # ADR 0057: re-evaluate inline eligibility against the swapped graph + rebuilt executors
+                # (a reload may add/remove a lookup, flip an inbound's inline=, or change ack_after).
+                self._recompute_inline_ok()
                 for ic in new_registry.inbound.values():
                     # DR run-profile (#61, ADR 0048): a reload re-evaluates the whole graph against the
                     # threshold (the profile is a per-run decision read at start/reload), so a
@@ -1216,8 +1366,11 @@ class RegistryRunner:
                     await self._start_inbound_unsafe(ic.name)
                 # 2b. Ensure the router + transform workers run for every inbound in the new graph.
                 # Workers read self.registry live, so a Router/Handler change applies to rows processed
-                # after the swap; a removed inbound keeps its workers so residual ingress/routed rows
-                # still drain.
+                # after the swap. A REMOVED inbound's router/transform/response workers EXIT on their
+                # first residual row (they see `ic is None`, revert the row retry-FOREVER, and return —
+                # :1994); the residual ingress/routed rows then SIT until a later reload RE-ADDS the
+                # inbound, which re-arms the worker here and its claim-first loop drains the backlog.
+                # (B12/ADR 0061: the lane's wake Event is kept across this remove→re-add, reused by name.)
                 for name in new_registry.inbound:
                     self._ensure_inbound_workers(name)
                 # 3. Reconcile outbound connectors/workers (intake already live).
@@ -1236,10 +1389,17 @@ class RegistryRunner:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
 
-            # Wake every stage (new connections / freshly enqueued rows may sit at any stage).
-            self._ingress_work.set()
-            self._routed_work.set()
-            self._work.set()
+            # Wake every stage (new connections / freshly enqueued rows may sit at any stage). B12 (ADR
+            # 0061): the OFF branch preserves the exact pre-B12 set (ingress+routed+outbound — note it has
+            # always OMITTED response) for byte-identity; the ON branch ALSO wakes RESPONSE lanes, fixing
+            # that asymmetry (a residual Stage.RESPONSE token on a reloaded loopback no longer waits out
+            # the poll). A missed wake here still self-heals on the poll backstop, so this is promptness.
+            _reload_stages = (
+                (Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
+                if self._per_lane_wake
+                else (Stage.INGRESS, Stage.ROUTED, Stage.OUTBOUND)
+            )
+            self._wake_all(*_reload_stages)
             log.info(
                 "wiring reloaded: %d inbound, %d outbound connection(s)",
                 len(new_registry.inbound),
@@ -1306,7 +1466,7 @@ class RegistryRunner:
                 source_type=src,
                 summary=None,
             )
-            self._ingress_work.set()
+            self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
             return mid
 
         encoding = ic.spec.settings.get("encoding", "utf-8")
@@ -1346,7 +1506,7 @@ class RegistryRunner:
                 source_type=src,
                 summary=None,
             )
-            self._ingress_work.set()
+            self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
             return mid
 
         # HL7-over-HTTP: parse (+ optional strict validate) before committing, recording ERROR on a
@@ -1379,7 +1539,7 @@ class RegistryRunner:
             source_type=src,
             summary=summarize(peek) or None,
         )
-        self._ingress_work.set()
+        self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
         return mid
 
     async def _handle_inbound(self, ic: InboundConnection, raw: bytes) -> str | None:
@@ -1419,7 +1579,7 @@ class RegistryRunner:
                 source_type=src,
                 summary=None,
             )
-            self._ingress_work.set()
+            self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
             return None
 
         # Decode with the connection's configured charset. A genuine decode failure means the bytes
@@ -1486,7 +1646,7 @@ class RegistryRunner:
                 source_type=src,
                 summary=None,
             )
-            self._ingress_work.set()
+            self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
             return None
 
         try:
@@ -1557,7 +1717,9 @@ class RegistryRunner:
             source_type=src,
             summary=summarize(peek) or None,
         )
-        self._ingress_work.set()  # wake the router worker to route the freshly-committed message
+        self._wake_lane(
+            Stage.INGRESS, ic.name
+        )  # B12: wake only this inbound's router lane (was the herd)
         ack = build_ack(peek, code="AA", ack_mode=ack_mode) if reply else None
         if ack is not None and self._capture_ack_enabled(ic):
             # The AA frame echoes MSH/MSA control fields; record_ack_sent stores its body only on an
@@ -1618,6 +1780,13 @@ class RegistryRunner:
     # --- delivery path -------------------------------------------------------
 
     async def _delivery_worker(self, name: str) -> None:
+        # B11: was the previous wait a wake (.set() — herd) or a poll-interval timeout (idle)? Seeds
+        # False so the first claim at startup classifies as idle-poll, not a spurious wake.
+        woken = False
+        # B12 (ADR 0061): wait on THIS outbound lane's Event when per-lane wake is on (get-or-create also
+        # registers the lane); else the shared singleton (byte-identical). Resolved once — the object is
+        # stable for the worker's life (never replaced), so a sticky set survives a respawn.
+        wait_ev = self._lane_event(Stage.OUTBOUND, name) if self._per_lane_wake else self._work
         while not self._stop.is_set():
             try:
                 # FIFO (default): claim only the due head — a backing-off head blocks the lane
@@ -1639,7 +1808,8 @@ class RegistryRunner:
                         limit=self.claim_limit, destination_name=name
                     )
                 if not items:
-                    await self._wait_for_work(self._work)
+                    self._empty_claims.record_empty(woken=woken)  # B11 wall #3
+                    woken = await self._wait_for_work(wait_ev)
                     continue
                 for item in items:
                     # Connector + retry re-resolved per item so a reload can swap an outbound's
@@ -1772,7 +1942,9 @@ class RegistryRunner:
                                 reingress_to=reingress_to,
                             )
                             if reingress_to is not None:
-                                self._response_work.set()  # wake the re-ingress worker for the new token
+                                # B12 (ADR 0061): CROSS-LANE — wake the loopback's RESPONSE lane
+                                # (reingress_to), NOT this delivery worker's own OUTBOUND lane.
+                                self._wake_lane(Stage.RESPONSE, reingress_to)
                         else:
                             await self.store.mark_done(item.id)
             except asyncio.CancelledError:
@@ -1800,91 +1972,204 @@ class RegistryRunner:
         worker's wait/backoff supervision.
         """
         last_buildup_check = 0.0
+        woken = False  # B11: previous wait was a wake (herd) vs poll-interval timeout (idle)?
+        # B12 (ADR 0061): wait on THIS inbound's INGRESS lane Event when per-lane wake is on; else the
+        # shared singleton (byte-identical). Resolved once — stable for the worker's life.
+        wait_ev = (
+            self._lane_event(Stage.INGRESS, name) if self._per_lane_wake else self._ingress_work
+        )
         while not self._stop.is_set():
             try:
-                # FIFO per inbound: claim only the due head (ingress rows never back off, so this is
+                # FIFO per inbound: claim the due head (ingress rows never back off, so this is
                 # effectively the oldest pending row for this inbound). Under active-passive HA the graph
-                # runs on the leader ONLY, so a single node drains this lane.
-                item = await self.store.claim_next_fifo(name, stage=Stage.INGRESS.value)
-                if item is None:
-                    await self._wait_for_work(self._ingress_work)
+                # runs on the leader ONLY, so a single node drains this lane. ADR 0058: when
+                # fifo_claim_batch == 1 (default) claim the single head (byte-identical); when > 1 claim
+                # the contiguous due head-prefix in one commit and process each row in FIFO order below.
+                if self._fifo_batch <= 1:
+                    one = await self.store.claim_next_fifo(name, stage=Stage.INGRESS.value)
+                    items = [one] if one is not None else []
+                else:
+                    items = await self.store.claim_next_fifo_batch(
+                        name, stage=Stage.INGRESS.value, limit=self._fifo_batch
+                    )
+                if not items:
+                    self._empty_claims.record_empty(woken=woken)  # B11 wall #3
+                    woken = await self._wait_for_work(wait_ev)
                     continue
-                ic = self.registry.inbound.get(name)
-                if ic is None:
-                    # The inbound was removed from the registry but residual ingress rows remain.
-                    # Revert this just-claimed row to pending and EXIT the worker — there is nothing to
-                    # route it with until a reload restores the inbound (which re-arms this worker and
-                    # drains the backlog). Reschedule with a retry-FOREVER policy (NOT the outbound
-                    # delivery defaults, whose finite max_attempts would dead-letter an ACKed-but-
-                    # never-attempted message purely for being removed) so the message is never dropped.
-                    await self.store.mark_failed(item.id, "inbound not in registry", RetryPolicy())
-                    return
-                try:
-                    # Publish the live graph's run-scoped views (code sets / reference snapshots /
-                    # active environment) so a call-time code_set(...)/reference(...)/current_environment()
-                    # inside the Router resolves (the loader only had them active during import). Views
-                    # are read from self.registry/self.store live, so a reload's swapped tables apply to
-                    # the next routed row; run_contexts restores cleanly after each run (no leak). The
-                    # set of providers is the run_context registry (router phase) — features add one
-                    # provider there, never edit this call site.
-                    with run_contexts(
-                        RunContext(
-                            code_sets=self.registry.code_sets,
-                            reference_view=self.store.reference_view(),
-                            active_environment=self._active_environment,
-                            ingest_time=item.created_at,
-                        ),
-                        phase="router",
-                    ):
-                        # Run the Router OFF the event loop (SEC-013, CWE-1322). A Router is arbitrary
-                        # synchronous Python whose CPU cost can scale with attacker-influenced content
-                        # (ReDoS over a field, O(n^2) build); running it inline would let one message
-                        # stall the single loop, freezing every listener, worker, and the API.
-                        # asyncio.to_thread copies THIS context (the run_contexts views) into the worker
-                        # thread, so a call-time code_set()/reference()/current_environment() still
-                        # resolves. db_lookup raises on a Router by design, so no lookup runner is needed.
-                        names = await asyncio.to_thread(route_only, self.registry, ic, item.payload)
-                except Exception as exc:
-                    # Router code error (incl. an unknown handler name). Post-ACK, so no NAK — the
-                    # global internal_error policy decides. Log the exception TYPE only; full detail
-                    # goes to the secured store's last_error, never the general log (PHI).
-                    if self._internal_error_default is InternalErrorPolicy.STOP:
-                        log.error(
-                            "router worker %r: router error on %s (%s); STOPPING ingest processing "
-                            "(operator must fix + reload to resume)",
+                for item in items:
+                    ic = self.registry.inbound.get(name)
+                    if ic is None:
+                        # The inbound was removed from the registry but residual ingress rows remain.
+                        # Revert this just-claimed row to pending and EXIT the worker — there is nothing to
+                        # route it with until a reload restores the inbound (which re-arms this worker and
+                        # drains the backlog). Reschedule with a retry-FOREVER policy (NOT the outbound
+                        # delivery defaults, whose finite max_attempts would dead-letter an ACKed-but-
+                        # never-attempted message purely for being removed) so the message is never
+                        # dropped. The unprocessed batch tail stays INFLIGHT and is recovered in order by
+                        # reset_stale_inflight on the next start/reload (ADR 0058 INV-3).
+                        await self.store.mark_failed(
+                            item.id, "inbound not in registry", RetryPolicy()
+                        )
+                        return
+                    inline = self._inline_ok.get(name, False)
+                    if inline:
+                        # ADR 0057 G6 — ingress-lane attempts ceiling. The fused inline path widens the
+                        # work under ONE re-runnable unit, so a deterministic process-crash (segfault/OOM,
+                        # no exception to catch) inside route_only/transform_one/handoff would re-pend +
+                        # re-run forever: C2 durably bumped attempts each pass, but no ingress/routed-lane
+                        # path enforces max_attempts today (mark_failed's ceiling is delivery-only). Close
+                        # that crash-loop here: a re-claimed item whose attempts have reached the finite
+                        # delivery cap is dead-lettered (matches mark_failed's `attempts >= max_attempts`
+                        # semantics, sqlserver.py mark_failed). max_attempts None = retry forever
+                        # (no ceiling), unchanged.
+                        max_attempts = self._delivery_defaults.max_attempts
+                        if max_attempts is not None and item.attempts >= max_attempts:
+                            log.warning(
+                                "router worker %r: inline item %s exhausted ingress attempts "
+                                "(%d >= %d); dead-lettering (poison-crash ceiling G6)",
+                                name,
+                                item.id,
+                                item.attempts,
+                                max_attempts,
+                            )
+                            await self.store.dead_letter_now(item.id, "ingress attempts exhausted")
+                            continue
+                    try:
+                        # Publish the live graph's run-scoped views (code sets / reference snapshots /
+                        # active environment) so a call-time code_set(...)/reference(...)/
+                        # current_environment() inside the Router resolves (the loader only had them
+                        # active during import). Views are read from self.registry/self.store live, so a
+                        # reload's swapped tables apply to the next routed row; run_contexts restores
+                        # cleanly after each run (no leak). The set of providers is the run_context
+                        # registry (router phase) — features add one provider there, never edit this call.
+                        with run_contexts(
+                            RunContext(
+                                code_sets=self.registry.code_sets,
+                                reference_view=self.store.reference_view(),
+                                active_environment=self._active_environment,
+                                ingest_time=item.created_at,
+                            ),
+                            phase="router",
+                        ):
+                            # Run the Router OFF the event loop (SEC-013, CWE-1322). A Router is arbitrary
+                            # synchronous Python whose CPU cost can scale with attacker-influenced content
+                            # (ReDoS over a field, O(n^2) build); running it inline would let one message
+                            # stall the single loop, freezing every listener, worker, and the API.
+                            # asyncio.to_thread copies THIS context (the run_contexts views) into the
+                            # worker thread, so a call-time code_set()/reference()/current_environment()
+                            # still resolves. db_lookup raises on a Router by design, so no lookup runner.
+                            names = await asyncio.to_thread(
+                                route_only, self.registry, ic, item.payload
+                            )
+                        # ADR 0057 inline Step-A fast-path (G1: this whole block is INSIDE the inner try,
+                        # so a raise from transform_one OR handoff routes to the internal_error policy
+                        # below — NOT the outer retry-forever except). Eligible iff the inbound opted in
+                        # AND the graph has no live lookup AND ack_after=ingest AND not LOOPBACK
+                        # (graph-level gates, cached in self._inline_ok) — plus the per-message gates here.
+                        if inline and len(names) == 1:
+                            # M-single held. Run the single handler's transform OFF the loop (G4: keep the
+                            # to_thread hop — SEC-013), mirroring _transform_worker. No lookup ExitStack:
+                            # self._inline_ok already guaranteed no live lookup runner (INV-7), so a
+                            # db_lookup()/fhir_lookup() inside the handler raises (fail-closed) — no hang.
+                            hname = names[0]
+                            content_type = ic.content_type.value
+                            with run_contexts(
+                                RunContext(
+                                    code_sets=self.registry.code_sets,
+                                    reference_view=self.store.reference_view(),
+                                    state_view=self.store.state_view(),
+                                    response_view=None,
+                                    active_environment=self._active_environment,
+                                    ingest_time=item.created_at,
+                                ),
+                                phase="transform",
+                            ):
+                                deliveries_preview, state_preview = await asyncio.to_thread(
+                                    transform_one,
+                                    self.registry,
+                                    hname,
+                                    item.payload,
+                                    content_type,
+                                )
+                            # Split deliveries / pass-through / state exactly as the transform worker does.
+                            deliveries = [
+                                (d.to, d.payload)
+                                for d in deliveries_preview
+                                if not d.is_passthrough
+                            ]
+                            pt_deliveries = [d for d in deliveries_preview if d.is_passthrough]
+                            state_ops = list(state_preview)
+                            # M-deliver gate: only the pure all-deliver case is fused. A zero-delivery
+                            # (filtering) handler, any state-op, or any pass-through Send FALLS BACK to the
+                            # split path — handoff lacks _maybe_finalize (G2: a zero-delivery fused message
+                            # would strand non-terminal) and the state-MERGE / PT-child machinery
+                            # transform_handoff carries. The split path finalizes those correctly (FILTERED
+                            # via transform_handoff's _maybe_finalize; state/PT via its dedicated handling).
+                            if deliveries and not state_ops and not pt_deliveries:
+                                # CF — the fused single commit: consume the ingress row, insert one
+                                # outbound row per delivery, set ROUTED. G5: no DB connection/txn is held
+                                # across the to_thread calls above — C2 committed + released before this
+                                # block, and handoff opens a fresh txn now. Idempotent against a crash
+                                # re-run (its DELETE-guard returns False as a no-op if the ingress row was
+                                # already consumed — INV-1, no duplicate outbound).
+                                await self.store.handoff(
+                                    ingress_id=item.id,
+                                    message_id=item.message_id,
+                                    channel_id=name,
+                                    deliveries=deliveries,
+                                    disposition=MessageStatus.ROUTED,
+                                )
+                                # B12 (ADR 0061): fan-out — wake EACH distinct destination's delivery
+                                # lane for the fused outbound rows (not one whole-stage set). OFF: each
+                                # call sets the shared singleton (idempotent), net-identical to today.
+                                for _dest in {d for d, _ in deliveries}:
+                                    self._wake_lane(Stage.OUTBOUND, _dest)
+                                continue  # fused — bypass the split route_handoff path entirely
+                            # else: ineligible per-message → fall through to the split path verbatim.
+                    except Exception as exc:
+                        # Router code error (incl. an unknown handler name) OR — on the inline fast-path —
+                        # a transform_one/handoff failure (G1). Post-ACK, so no NAK — the global
+                        # internal_error policy decides. Log the exception TYPE only; full detail goes to
+                        # the secured store's last_error, never the general log (PHI).
+                        if self._internal_error_default is InternalErrorPolicy.STOP:
+                            log.error(
+                                "router worker %r: router error on %s (%s); STOPPING ingest processing "
+                                "(operator must fix + reload to resume)",
+                                name,
+                                item.id,
+                                type(exc).__name__,
+                            )
+                            await self.store.mark_failed(
+                                item.id,
+                                f"router error (ingest stopped): {safe_exc(exc)}",
+                                self._delivery_defaults,
+                            )
+                            self._alert_sink.connection_stopped(
+                                name, detail=f"router {type(exc).__name__} on {item.id}"
+                            )
+                            return
+                        log.warning(
+                            "router worker %r: router error on %s (%s); dead-lettering",
                             name,
                             item.id,
                             type(exc).__name__,
                         )
-                        await self.store.mark_failed(
-                            item.id,
-                            f"router error (ingest stopped): {safe_exc(exc)}",
-                            self._delivery_defaults,
-                        )
-                        self._alert_sink.connection_stopped(
-                            name, detail=f"router {type(exc).__name__} on {item.id}"
-                        )
-                        return
-                    log.warning(
-                        "router worker %r: router error on %s (%s); dead-lettering",
-                        name,
-                        item.id,
-                        type(exc).__name__,
+                        await self.store.dead_letter_now(item.id, f"router error: {safe_exc(exc)}")
+                        continue
+                    disposition = MessageStatus.ROUTED if names else MessageStatus.UNROUTED
+                    await self.store.route_handoff(
+                        ingress_id=item.id,
+                        message_id=item.message_id,
+                        channel_id=name,
+                        handlers=[(h, item.payload) for h in names],
+                        disposition=disposition,
                     )
-                    await self.store.dead_letter_now(item.id, f"router error: {safe_exc(exc)}")
-                    continue
-                disposition = MessageStatus.ROUTED if names else MessageStatus.UNROUTED
-                await self.store.route_handoff(
-                    ingress_id=item.id,
-                    message_id=item.message_id,
-                    channel_id=name,
-                    handlers=[(h, item.payload) for h in names],
-                    disposition=disposition,
-                )
-                if names:
-                    self._routed_work.set()  # wake the transform worker for the new routed rows
-                # Off the hot path (rate-limited): alert if this inbound's ingress backlog is building
-                # (a slow/hung router). Uses the global buildup threshold (no per-inbound override yet).
+                    if names:
+                        # B12 (ADR 0061): the routed rows are on THIS inbound's ROUTED lane (`name`) —
+                        # wake only its transform worker.
+                        self._wake_lane(Stage.ROUTED, name)
+                # Off the hot path (rate-limited), ONCE PER BATCH (ADR 0058): alert if this inbound's
+                # ingress backlog is building (a slow/hung router). Uses the global buildup threshold.
                 now = time.time()
                 if now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL:
                     last_buildup_check = now
@@ -1910,11 +2195,18 @@ class RegistryRunner:
         Mirrors :meth:`_router_worker`'s claim / missing-inbound / backoff supervision. Re-ingress is an
         internal stage with no source of its own (``LoopbackSource`` is inert); under active-passive HA
         the whole graph (and thus this worker) runs on the leader ONLY, so a single node drains it."""
+        woken = False  # B11: previous wait was a wake (herd) vs poll-interval timeout (idle)?
+        # B12 (ADR 0061): wait on THIS loopback's RESPONSE lane Event when per-lane wake is on; else the
+        # shared singleton (byte-identical). Resolved once.
+        wait_ev = (
+            self._lane_event(Stage.RESPONSE, name) if self._per_lane_wake else self._response_work
+        )
         while not self._stop.is_set():
             try:
                 item = await self.store.claim_next_fifo(name, stage=Stage.RESPONSE.value)
                 if item is None:
-                    await self._wait_for_work(self._response_work)
+                    self._empty_claims.record_empty(woken=woken)  # B11 wall #3 (loopback lane)
+                    woken = await self._wait_for_work(wait_ev)
                     continue
                 ic = self.registry.inbound.get(name)
                 if ic is None:
@@ -1939,8 +2231,9 @@ class RegistryRunner:
                 )
                 if produced:
                     # Wake the loopback's router worker to route the freshly-ingressed answer (a no-op
-                    # wake for a depth-capped / peek-failed token that produced no ingress row).
-                    self._ingress_work.set()
+                    # wake for a depth-capped / peek-failed token that produced no ingress row). B12 (ADR
+                    # 0061): the re-ingress lands on THIS loopback's own INGRESS lane (`name`).
+                    self._wake_lane(Stage.INGRESS, name)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1966,154 +2259,190 @@ class RegistryRunner:
         recoverable via per-message replay once restored, matching the missing-outbound path.
         """
         last_buildup_check = 0.0
+        woken = False  # B11: previous wait was a wake (herd) vs poll-interval timeout (idle)?
+        # B12 (ADR 0061): wait on THIS inbound's ROUTED lane Event when per-lane wake is on; else the
+        # shared singleton (byte-identical). Resolved once.
+        wait_ev = self._lane_event(Stage.ROUTED, name) if self._per_lane_wake else self._routed_work
         while not self._stop.is_set():
             try:
                 # FIFO per inbound at the routed stage. Under active-passive HA the graph runs on the
-                # leader ONLY, so a single node drains this lane.
-                item = await self.store.claim_next_fifo(name, stage=Stage.ROUTED.value)
-                if item is None:
-                    await self._wait_for_work(self._routed_work)
-                    continue
-                ic = self.registry.inbound.get(name)
-                if ic is None:
-                    # Inbound removed; nothing to transform with until a reload restores it (which
-                    # re-arms this worker). Revert the row (retry-forever) and exit (mirrors the router
-                    # worker), so the ACKed-but-unprocessed message is never dropped.
-                    await self.store.mark_failed(item.id, "inbound not in registry", RetryPolicy())
-                    return
-                hname = item.handler_name
-                if hname is None or hname not in self.registry.handlers:
-                    # Handler gone (removed/renamed since routing). Can't transform this row; dead-letter
-                    # it (message ERROR, replayable once restored) — the per-row analogue of the startup
-                    # dead_letter_missing_handlers sweep. Dead-lettering (vs reverting) avoids a hot-loop
-                    # on a permanently-missing handler and gives the operator visibility.
-                    log.warning(
-                        "transform worker %r: handler %r for %s is missing; dead-lettering",
-                        name,
-                        hname,
-                        item.id,
+                # leader ONLY, so a single node drains this lane. ADR 0058: single head when
+                # fifo_claim_batch == 1 (default, byte-identical); else the contiguous due head-prefix in
+                # one commit, processed in FIFO order below.
+                if self._fifo_batch <= 1:
+                    one = await self.store.claim_next_fifo(name, stage=Stage.ROUTED.value)
+                    items = [one] if one is not None else []
+                else:
+                    items = await self.store.claim_next_fifo_batch(
+                        name, stage=Stage.ROUTED.value, limit=self._fifo_batch
                     )
-                    await self.store.dead_letter_now(
-                        item.id, f"handler {hname!r} removed from registry"
-                    )
+                if not items:
+                    self._empty_claims.record_empty(woken=woken)  # B11 wall #3
+                    woken = await self._wait_for_work(wait_ev)
                     continue
-                # ADR 0013 Increment 2: for a RE-INGRESSED message (only ever on a loopback inbound),
-                # feed the run-context `response` provider the ORIGIN request's captured replies so its
-                # Handler can read them via response_get(dest). A normal message → None (byte-identical,
-                # and the metadata read is skipped entirely for non-loopback inbounds).
-                response_view: dict[str, Any] | None = None
-                if ic.spec.type is ConnectorType.LOOPBACK:
-                    msg = await self.store.get_message(item.message_id)
-                    raw_meta = msg.get("metadata") if msg else None
-                    meta = json.loads(raw_meta) if raw_meta else {}
-                    corr = meta.get("correlation_id") if isinstance(meta, dict) else None
-                    if corr:
-                        # {destination_name: latest CapturedResponse}: correlate_response orders by
-                        # (dest, response_seq), so the last per destination wins (the authoritative
-                        # reply). Immutable committed rows → re-run-stable (ADR 0009).
-                        response_view = {
-                            c.destination_name: c for c in await self.store.correlate_response(corr)
-                        }
-                try:
-                    # Same as the router worker, plus the transform-only providers: publish the run-scoped
-                    # views so call-time code_set(...)/reference(...)/state_get(...)/current_environment()
-                    # inside the Handler resolve; restored cleanly after the run. The transform phase adds
-                    # the store's transform-state read-through cache view (ADR 0005) so state_get(...)
-                    # resolves against committed writes. Providers come from the run_context registry
-                    # (transform phase) — features add one provider, never edit this call site.
-                    with run_contexts(
-                        RunContext(
-                            code_sets=self.registry.code_sets,
-                            reference_view=self.store.reference_view(),
-                            state_view=self.store.state_view(),
-                            response_view=response_view,
-                            active_environment=self._active_environment,
-                            ingest_time=item.created_at,
-                        ),
-                        phase="transform",
-                    ):
-                        # Run the Handler's transform OFF the event loop UNCONDITIONALLY (SEC-013,
-                        # CWE-1322). A Handler is arbitrary synchronous Python whose CPU cost can scale
-                        # with attacker-influenced content (ReDoS, O(n^2) build, large fan-out); the old
-                        # no-lookup fast-path ran it inline on the single loop, so one pathological message
-                        # could stall every listener, worker, and the API. asyncio.to_thread copies THIS
-                        # context (the run_contexts views, plus the lookup runner(s) when activated) into
-                        # the worker thread, so code_set()/reference()/state_get()/current_environment() —
-                        # and db_lookup()/fhir_lookup() on the lookup path — resolve there while the loop
-                        # stays free.
-                        content_type = self.registry.inbound[name].content_type.value
-                        # Activate whichever live-lookup runner(s) the graph declares so a Handler call to
-                        # db_lookup()/fhir_lookup() resolves inside the worker thread, bridging back onto the
-                        # loop (run_coroutine_threadsafe). Both are the deliberate re-run-stability exception
-                        # (ADR 0009/0010/0043) and raise in dry-run (no runner published there). When neither
-                        # is declared the transform still hops off the loop (SEC-013) and both calls raise.
-                        with ExitStack() as lookup_stack:
-                            if self._lookup_executor is not None:
-                                lookup_stack.enter_context(db_lookup_activated(self._run_lookup))
-                            if self._fhir_lookup_executor is not None:
-                                lookup_stack.enter_context(
-                                    fhir_lookup_activated(self._run_fhir_lookup)
+                for item in items:
+                    ic = self.registry.inbound.get(name)
+                    if ic is None:
+                        # Inbound removed; nothing to transform with until a reload restores it (which
+                        # re-arms this worker). Revert the row (retry-forever) and exit (mirrors the
+                        # router worker), so the ACKed-but-unprocessed message is never dropped. The
+                        # unprocessed batch tail stays INFLIGHT and is recovered in order by
+                        # reset_stale_inflight on the next start/reload (ADR 0058 INV-3).
+                        await self.store.mark_failed(
+                            item.id, "inbound not in registry", RetryPolicy()
+                        )
+                        return
+                    hname = item.handler_name
+                    if hname is None or hname not in self.registry.handlers:
+                        # Handler gone (removed/renamed since routing). Can't transform this row;
+                        # dead-letter it (message ERROR, replayable once restored) — the per-row analogue
+                        # of the startup dead_letter_missing_handlers sweep. Dead-lettering (vs reverting)
+                        # avoids a hot-loop on a permanently-missing handler and gives operator visibility.
+                        log.warning(
+                            "transform worker %r: handler %r for %s is missing; dead-lettering",
+                            name,
+                            hname,
+                            item.id,
+                        )
+                        await self.store.dead_letter_now(
+                            item.id, f"handler {hname!r} removed from registry"
+                        )
+                        continue
+                    # ADR 0013 Increment 2: for a RE-INGRESSED message (only ever on a loopback inbound),
+                    # feed the run-context `response` provider the ORIGIN request's captured replies so its
+                    # Handler can read them via response_get(dest). A normal message → None (byte-identical,
+                    # and the metadata read is skipped entirely for non-loopback inbounds).
+                    response_view: dict[str, Any] | None = None
+                    if ic.spec.type is ConnectorType.LOOPBACK:
+                        msg = await self.store.get_message(item.message_id)
+                        raw_meta = msg.get("metadata") if msg else None
+                        meta = json.loads(raw_meta) if raw_meta else {}
+                        corr = meta.get("correlation_id") if isinstance(meta, dict) else None
+                        if corr:
+                            # {destination_name: latest CapturedResponse}: correlate_response orders by
+                            # (dest, response_seq), so the last per destination wins (the authoritative
+                            # reply). Immutable committed rows → re-run-stable (ADR 0009).
+                            response_view = {
+                                c.destination_name: c
+                                for c in await self.store.correlate_response(corr)
+                            }
+                    try:
+                        # Same as the router worker, plus the transform-only providers: publish the
+                        # run-scoped views so call-time code_set(...)/reference(...)/state_get(...)/
+                        # current_environment() inside the Handler resolve; restored cleanly after the run.
+                        # The transform phase adds the store's transform-state read-through cache view
+                        # (ADR 0005) so state_get(...) resolves against committed writes. Providers come
+                        # from the run_context registry (transform phase) — features add one provider,
+                        # never edit this call site.
+                        with run_contexts(
+                            RunContext(
+                                code_sets=self.registry.code_sets,
+                                reference_view=self.store.reference_view(),
+                                state_view=self.store.state_view(),
+                                response_view=response_view,
+                                active_environment=self._active_environment,
+                                ingest_time=item.created_at,
+                            ),
+                            phase="transform",
+                        ):
+                            # Run the Handler's transform OFF the event loop UNCONDITIONALLY (SEC-013,
+                            # CWE-1322). A Handler is arbitrary synchronous Python whose CPU cost can scale
+                            # with attacker-influenced content (ReDoS, O(n^2) build, large fan-out); the
+                            # old no-lookup fast-path ran it inline on the single loop, so one pathological
+                            # message could stall every listener, worker, and the API. asyncio.to_thread
+                            # copies THIS context (the run_contexts views, plus the lookup runner(s) when
+                            # activated) into the worker thread, so code_set()/reference()/state_get()/
+                            # current_environment() — and db_lookup()/fhir_lookup() on the lookup path —
+                            # resolve there while the loop stays free.
+                            content_type = self.registry.inbound[name].content_type.value
+                            # Activate whichever live-lookup runner(s) the graph declares so a Handler call
+                            # to db_lookup()/fhir_lookup() resolves inside the worker thread, bridging back
+                            # onto the loop (run_coroutine_threadsafe). Both are the deliberate
+                            # re-run-stability exception (ADR 0009/0010/0043) and raise in dry-run (no
+                            # runner published there). When neither is declared the transform still hops off
+                            # the loop (SEC-013) and both calls raise.
+                            with ExitStack() as lookup_stack:
+                                if self._lookup_executor is not None:
+                                    lookup_stack.enter_context(
+                                        db_lookup_activated(self._run_lookup)
+                                    )
+                                if self._fhir_lookup_executor is not None:
+                                    lookup_stack.enter_context(
+                                        fhir_lookup_activated(self._run_fhir_lookup)
+                                    )
+                                deliveries_preview, state_preview = await asyncio.to_thread(
+                                    transform_one,
+                                    self.registry,
+                                    hname,
+                                    item.payload,
+                                    content_type,
                                 )
-                            deliveries_preview, state_preview = await asyncio.to_thread(
-                                transform_one,
-                                self.registry,
-                                hname,
-                                item.payload,
-                                content_type,
+                    except Exception as exc:
+                        # Handler/transform code error (incl. an unknown outbound name). Post-ACK, so no
+                        # NAK — the global internal_error policy decides. Log the exception TYPE only (PHI).
+                        if self._internal_error_default is InternalErrorPolicy.STOP:
+                            log.error(
+                                "transform worker %r: handler error on %s (%s); STOPPING transform "
+                                "processing (operator must fix + reload to resume)",
+                                name,
+                                item.id,
+                                type(exc).__name__,
                             )
-                except Exception as exc:
-                    # Handler/transform code error (incl. an unknown outbound name). Post-ACK, so no
-                    # NAK — the global internal_error policy decides. Log the exception TYPE only (PHI).
-                    if self._internal_error_default is InternalErrorPolicy.STOP:
-                        log.error(
-                            "transform worker %r: handler error on %s (%s); STOPPING transform "
-                            "processing (operator must fix + reload to resume)",
+                            await self.store.mark_failed(
+                                item.id,
+                                f"handler error (transform stopped): {safe_exc(exc)}",
+                                self._delivery_defaults,
+                            )
+                            self._alert_sink.connection_stopped(
+                                name, detail=f"handler {type(exc).__name__} on {item.id}"
+                            )
+                            return
+                        log.warning(
+                            "transform worker %r: handler error on %s (%s); dead-lettering",
                             name,
                             item.id,
                             type(exc).__name__,
                         )
-                        await self.store.mark_failed(
-                            item.id,
-                            f"handler error (transform stopped): {safe_exc(exc)}",
-                            self._delivery_defaults,
-                        )
-                        self._alert_sink.connection_stopped(
-                            name, detail=f"handler {type(exc).__name__} on {item.id}"
-                        )
-                        return
-                    log.warning(
-                        "transform worker %r: handler error on %s (%s); dead-lettering",
-                        name,
-                        item.id,
-                        type(exc).__name__,
+                        await self.store.dead_letter_now(item.id, f"handler error: {safe_exc(exc)}")
+                        continue
+                    # Split outbound deliveries from pass-through (PT) Sends (ADR 0013, generalized): a PT
+                    # target re-ingresses the body through an internal inbound's own router (a fresh
+                    # INGRESS row on the PT channel), produced atomically in the SAME transform_handoff
+                    # transaction as the outbound rows + routed-row DELETE. transform_one already validated
+                    # each target and tagged PT ones (is_passthrough).
+                    deliveries = [
+                        (d.to, d.payload) for d in deliveries_preview if not d.is_passthrough
+                    ]
+                    pt_deliveries = [
+                        (d.to, d.payload) for d in deliveries_preview if d.is_passthrough
+                    ]
+                    state_ops = [(s.namespace, s.key, s.value) for s in state_preview]
+                    await self.store.transform_handoff(
+                        routed_id=item.id,
+                        message_id=item.message_id,
+                        channel_id=name,
+                        deliveries=deliveries,
+                        state_ops=state_ops,
+                        pt_deliveries=pt_deliveries,
+                        correlation_depth_cap=self._max_correlation_depth,
                     )
-                    await self.store.dead_letter_now(item.id, f"handler error: {safe_exc(exc)}")
-                    continue
-                # Split outbound deliveries from pass-through (PT) Sends (ADR 0013, generalized): a PT
-                # target re-ingresses the body through an internal inbound's own router (a fresh INGRESS
-                # row on the PT channel), produced atomically in the SAME transform_handoff transaction
-                # as the outbound rows + routed-row DELETE. transform_one already validated each target
-                # and tagged PT ones (is_passthrough).
-                deliveries = [(d.to, d.payload) for d in deliveries_preview if not d.is_passthrough]
-                pt_deliveries = [(d.to, d.payload) for d in deliveries_preview if d.is_passthrough]
-                state_ops = [(s.namespace, s.key, s.value) for s in state_preview]
-                await self.store.transform_handoff(
-                    routed_id=item.id,
-                    message_id=item.message_id,
-                    channel_id=name,
-                    deliveries=deliveries,
-                    state_ops=state_ops,
-                    pt_deliveries=pt_deliveries,
-                    correlation_depth_cap=self._max_correlation_depth,
-                )
-                if deliveries:
-                    self._work.set()  # wake the outbound delivery workers for the freshly-queued rows
-                if pt_deliveries:
-                    # A PT child INGRESS row was committed on the PT channel — wake the router workers so
-                    # the PT inbound's router re-routes it without waiting for the idle-poll interval.
-                    self._ingress_work.set()
-                # Off the hot path (rate-limited): alert if this inbound's routed (transform) backlog is
-                # building behind a slow/hung handler — reported separately from the ingress lane.
+                    if deliveries:
+                        # B12 (ADR 0061): fan-out — wake EACH distinct destination's delivery lane for
+                        # the queued outbound rows (not one whole-stage set). OFF: each call sets the
+                        # shared singleton (idempotent), net-identical to today.
+                        for _dest in {d for d, _ in deliveries}:
+                            self._wake_lane(Stage.OUTBOUND, _dest)
+                    if pt_deliveries:
+                        # A PT child INGRESS row was committed on EACH PT channel — wake those channels'
+                        # router workers so they re-route without waiting for the idle-poll. B12 (ADR 0061):
+                        # CROSS-LANE fan-out — wake each DISTINCT PT target's INGRESS lane (NOT this
+                        # transforming inbound's own lane). OFF: each call sets the shared ingress singleton
+                        # (idempotent), net-identical to the single pre-B12 set().
+                        for _pt_target in {d for d, _ in pt_deliveries}:
+                            self._wake_lane(Stage.INGRESS, _pt_target)
+                # Off the hot path (rate-limited), ONCE PER BATCH (ADR 0058): alert if this inbound's
+                # routed (transform) backlog is building behind a slow/hung handler — reported separately
+                # from the ingress lane.
                 now = time.time()
                 if now - last_buildup_check >= _BUILDUP_CHECK_INTERVAL:
                     last_buildup_check = now
@@ -2197,16 +2526,23 @@ class RegistryRunner:
         except Exception:
             log.exception("alert sink raised on message_stall for %r", name)
 
-    async def _wait_for_work(self, event: asyncio.Event) -> None:
+    async def _wait_for_work(self, event: asyncio.Event) -> bool:
         """Wait up to ``poll_interval`` for ``event`` (this worker class's wake event), then clear it.
         Per-class events mean a worker only clears its own signal, so one class can't swallow another's
-        wakeup; ``poll_interval`` still backstops any missed set()."""
+        wakeup; ``poll_interval`` still backstops any missed set().
+
+        Returns ``True`` if a wake event arrived (a producer ``.set()`` — the per-commit herd) and
+        ``False`` if it timed out on the poll interval (an idle re-poll). The worker uses this to
+        classify its NEXT empty claim as wake-fanout vs idle-poll (B11). Read-only: the return value is
+        observability-only and never changes the wait/clear behavior."""
+        woken = True
         try:
             await asyncio.wait_for(event.wait(), self.poll_interval)
         except asyncio.TimeoutError:
-            pass
+            woken = False
         finally:
             event.clear()
+        return woken
 
     async def _stop_or_sleep(self, delay: float) -> bool:
         """Sleep up to ``delay`` seconds; return True if a stop was requested meanwhile (so a

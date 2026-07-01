@@ -142,6 +142,7 @@ async def _db_info(settings: ServiceSettings) -> Any:
         messages=db.messages,
         events=db.events,
         audit=db.audit,
+        synchronous=db.synchronous,
     )
 
 

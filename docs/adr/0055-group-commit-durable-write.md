@@ -10,6 +10,14 @@
   · [0005](0005-transform-accessible-state.md) (the read-through state caches) · [0037](0037-multi-process-sharding-l3.md)
   (sharding — composes per shard) · [CLAUDE.md](../../CLAUDE.md) §2 (reliability + count-and-log invariants)
   · BACKLOG #64 · `docs/research/db-commit-wall-backend-survey.md` (gitignored)
+- **Correction (2026-06-30):** the `commit_delay`/`commit_siblings` "native group-commit" referenced
+  below is a **PostgreSQL-ONLY** GUC. **SQL Server has no durability-neutral group-commit knob** — its
+  only commit-coalescing control is `DELAYED_DURABILITY`, which *relaxes* durability (it could ACK a
+  crash-erasable message) and is therefore **rejected** for the PHI store. So the "server-DB native
+  group-commit" path here is Postgres-only; SQL Server's scale path is the concurrent pool + sharding
+  ([ADR 0037](0037-multi-process-sharding-l3.md)), not a native GUC. **As built (#660) the committer is
+  SQLite-only**; Postgres `commit_delay` adoption remains a future **gated, off-by-default** increment,
+  measurement-deferred until sharding supplies enough concurrent in-flight commits to coalesce.
 
 ---
 

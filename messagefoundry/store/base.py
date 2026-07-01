@@ -42,6 +42,7 @@ from messagefoundry.store.content_search import (
 from messagefoundry.store.crypto import CipherInfo, make_cipher
 from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.keyprovider import resolve_key_provider
+from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.store import (
     AlertInstance,
     CapturedResponse,
@@ -69,6 +70,7 @@ __all__ = [
     "DEFAULT_SCAN_LIMIT",
     "MAX_SCAN_LIMIT",
     "MessageSearchResult",
+    "PoolStatus",
     "QueueStore",
     "Row",
     "SearchSpec",
@@ -219,7 +221,14 @@ class QueueStore(StoreLifecycle, Protocol):
         ``disposition`` (``ROUTED``/``FILTERED``/``UNROUTED``). Idempotent against worker restart —
         returns ``False`` (a no-op) if the ingress row was already consumed by a prior run. The Step-A
         combined router+transform primitive; the split pipeline uses :meth:`route_handoff` +
-        :meth:`transform_handoff` instead."""
+        :meth:`transform_handoff` instead.
+
+        **LIVE for the ADR 0057 inline fast-path** (re-activated under ADR 0001 Step B for eligible
+        single-handler, all-deliver, no-lookup messages). Unlike :meth:`transform_handoff` it does NOT
+        run the finalizer, so it **must not be called with empty ``deliveries``** — a zero-delivery
+        message would set the disposition but produce no outbound row, leaving it non-terminal forever
+        (it would never reach ``FILTERED``). The caller (``_router_worker``) enforces this: a filtering
+        handler takes the split path instead (ADR 0057 guardrail G2)."""
         ...
 
     async def route_handoff(
@@ -336,12 +345,46 @@ class QueueStore(StoreLifecycle, Protocol):
     ) -> OutboxItem | None:
         """Claim the single oldest *due* pending row for one lane at ``stage`` (strict FIFO; the head
         blocks the lane while it backs off). The lane key is stage-aware: ``destination_name`` for
-        outbound, ``channel_id`` for ingress. ``None`` when nothing is pending or the head isn't due.
+        outbound, ``channel_id`` for ingress. Per-lane ordering is **seq-only** (ADR 0059): the row's
+        monotonic insert counter — SQLite ``rowid``, SQL Server ``BIGINT IDENTITY``, Postgres
+        ``BIGSERIAL`` — which the DB assigns in insert-commit order, so with one serial writer per lane it
+        IS receive order, with zero wall-clock dependence. ``created_at`` is an ingest-time (ADR 0009) /
+        metrics column, no longer an ordering key (and no longer per-lane-clamped). ``None`` when nothing
+        is pending or the head isn't due.
 
         On the Postgres backend (active-passive HA) the claim also reclaims this lane's stranded head —
         a crashed/fenced prior leader's expired-lease ``inflight`` row — in the same transaction before
         the head SELECT, so per-lane FIFO order survives failover. SQLite/SQL Server are single active
         node and have no such residue."""
+        ...
+
+    async def claim_next_fifo_batch(
+        self, name: str, now: float | None = None, *, stage: str, limit: int
+    ) -> list[OutboxItem]:
+        """Claim the **contiguous DUE head-prefix** (up to ``limit`` rows) for one lane at ``stage`` in
+        ONE commit — the batched cousin of :meth:`claim_next_fifo` (ADR 0058). It takes the ``limit``
+        oldest pending rows of the lane in ``seq`` (``rowid`` on SQLite) order — seq-only per-lane FIFO
+        (ADR 0059) — **stopping at the first
+        not-due (``next_attempt_at > now``) or producer-locked head** (never skipping past it),
+        bumping ``attempts+1`` on each claimed row and flipping them to ``inflight`` in the one claim
+        commit, then releasing all locks before returning the list.
+
+        Ordered oldest-first; the caller processes the list strictly in that order, one route/transform +
+        one separate-commit handoff per row (so a crash mid-batch re-pends only the still-inflight tail,
+        recovered in order by :meth:`reset_stale_inflight` — a pure re-run). An empty list is exactly
+        :meth:`claim_next_fifo` returning ``None`` (head not due / nothing pending → the lane blocks). A
+        not-due/locked head therefore **truncates the prefix**; it is never reached past (strict per-lane
+        FIFO, #285). **INGRESS/ROUTED lanes only** — the outbound/delivery claim is never batched (its
+        in-claim skip-and-complete dedup must stay atomic), so callers pass an ingress/routed ``stage``.
+
+        Per-backend: SQLite claims under its single-writer lock (no row locks; the lone writer is the
+        no-skip guarantee); Postgres uses an inner ``FOR UPDATE`` (no ``SKIP LOCKED`` — a locked head
+        blocks) over the lane's oldest pending rows, then an outer window that truncates at the first
+        not-due row, after the same-txn stranded-head reclaim; SQL Server uses ``TOP(@limit) WITH
+        (UPDLOCK, ROWLOCK)`` (no ``READPAST`` — a locked head blocks) with a contiguous-due-prefix
+        cutoff CTE (its ``LOCK_ESCALATION=DISABLE`` + ``ROWLOCK`` + bounded ``limit`` keep it to N row
+        locks, no escalation). Default OFF: ``[store].fifo_claim_batch == 1`` means the workers call the
+        single claim and this is never invoked."""
         ...
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
@@ -794,6 +837,17 @@ class QueueStore(StoreLifecycle, Protocol):
 
     # --- store health / metrics ----------------------------------------------
     async def db_status(self) -> DbStatus: ...
+
+    def pool_status(self) -> PoolStatus | None:
+        """A read-only snapshot of this backend's connection pool, or ``None`` on a backend with no
+        pool (SQLite). The **server-only** observability surface behind ``/status``'s additive ``pool``
+        field (B11): the PRIMARY ``acquire_wait`` percentiles (the connection-scale wall — they grow
+        monotonically with worker contention once the pool saturates) plus a secondary size/idle
+        occupancy boolean. Synchronous + cheap (it reads the live pool's size/idle accessors + a
+        snapshot of the in-process acquire-wait histogram — no DB round-trip), and additive: an older
+        client deserializes ``/status`` unchanged because the field defaults ``None``. Returns ``None``
+        on SQLite (no pool)."""
+        ...
 
     async def integrity_check(self) -> tuple[bool, str]: ...
 

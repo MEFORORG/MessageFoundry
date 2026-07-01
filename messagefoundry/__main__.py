@@ -1087,6 +1087,7 @@ def _serve(args: argparse.Namespace) -> int:
         ack_after_default=settings.inbound.ack_after,
         priority_default=settings.delivery.priority,
         max_correlation_depth=settings.pipeline.max_correlation_depth,
+        per_lane_wake=settings.pipeline.per_lane_wake,
         connection_events=settings.diagnostics.connection_events,
         response_sent_default=settings.diagnostics.response_sent,
         env_values_provider=env_values,

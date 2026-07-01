@@ -326,6 +326,22 @@ class StatsResponse(BaseModel):
     # whole-pipeline drain gauge, vs outbox_by_status which sees only the outbound stage. Defaults to 0
     # so a client reading an older engine (no field) degrades gracefully.
     in_pipeline: int = 0
+    # B11 connection-scale observability (read-only, additive): cumulative count of EMPTY claims — a
+    # stage worker (router/transform/delivery) that claimed its lane and found it empty (a wasted DB
+    # round-trip). Split into idle-poll re-SELECTs vs the per-commit wake-fanout (thundering herd); the
+    # connection-scale report plots the herd slope (empty_claims_wake_fanout) distinctly from the
+    # idle-poll floor. All default 0, so a client reading an older engine degrades gracefully and an
+    # engine the harness never measures is byte-identical.
+    empty_claims: int = 0
+    empty_claims_idle_poll: int = 0
+    empty_claims_wake_fanout: int = 0
+    # B11 wall #1 (executor saturation): the default ThreadPoolExecutor's submit-queue depth + in-flight
+    # ("busy") count — observable ONLY when the connection-scale harness installs its default-sized boot
+    # shim (loop.set_default_executor); ``None`` on a normal engine (no shim), so production /stats is
+    # byte-identical. The router/transform workers run route_only/transform_one via asyncio.to_thread on
+    # that shared pool, so queue_depth > 0 means the pool is saturated (the wall).
+    executor_queue_depth: int | None = None
+    executor_busy: int | None = None
 
 
 class Health(BaseModel):
@@ -353,6 +369,10 @@ class DbInfo(BaseModel):
     messages: int
     events: int
     audit: int
+    # SQLite durability mode (PRAGMA synchronous): "normal" (shipped default) or "full"; None on the
+    # server backends (a SQLite-only knob). Read-only observability (B7) so a status reader / load run
+    # records which durability mode it measured. Defaulted so older clients deserialize unchanged.
+    synchronous: str | None = None
 
 
 class LogInfo(BaseModel):
@@ -379,6 +399,34 @@ class UpdateInfo(BaseModel):
     update_available: bool
 
 
+class PoolWaitInfo(BaseModel):
+    """Connection-pool acquire-WAIT percentiles in milliseconds — the PRIMARY connection-scale
+    pool-wait signal (B11). The time a stage worker spends waiting for a pooled connection grows
+    monotonically with worker contention once the pool saturates (where size/idle occupancy can't tell
+    500 connections from 1500), so these percentiles are the load-bearing wall metric."""
+
+    count: int  # number of acquire() waits sampled since engine start
+    p50_ms: float
+    p95_ms: float
+    p99_ms: float
+    max_ms: float
+    mean_ms: float
+
+
+class PoolInfo(BaseModel):
+    """A **server-only** connection-pool snapshot (B11), surfaced as the additive ``pool`` field on
+    :class:`SystemStatus`. ``None`` on SQLite (no pool — it has a single writer + lockfree read
+    connections, not a contended pool), so an older client deserializes ``/status`` unchanged. Carries
+    the PRIMARY acquire-wait percentiles plus a secondary size/idle occupancy ("is it saturated":
+    ``idle == 0`` at the wall). Read-only observability — never affects routing or disposition."""
+
+    backend: str  # "postgres" | "sqlserver"
+    max_size: int  # the configured pool maximum
+    size: int  # connections currently open in the pool
+    idle: int  # currently-free connections (idle == 0 ⇒ saturated)
+    acquire_wait: PoolWaitInfo  # PRIMARY: acquire() wait-time percentiles
+
+
 class SystemStatus(BaseModel):
     engine: EngineInfo
     db: DbInfo
@@ -388,6 +436,10 @@ class SystemStatus(BaseModel):
     # No-network version-update signal (#30, ADR 0026). Additive + ``None`` when [update_check] is
     # disabled or the runner hasn't produced a result yet, so the existing payload is unchanged when off.
     update: UpdateInfo | None = None
+    # B11 connection-scale observability: a SERVER-ONLY connection-pool snapshot (acquire-wait
+    # percentiles + size/idle occupancy). Additive + ``None`` on SQLite (no pool) so the existing
+    # payload is unchanged on the default backend and an older client deserializes /status unchanged.
+    pool: PoolInfo | None = None
 
 
 class IntegrityResult(BaseModel):

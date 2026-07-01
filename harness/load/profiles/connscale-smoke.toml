@@ -1,0 +1,31 @@
+# Connection-scale CI smoke (B11) — small N (50 → 100) on SQLite, hermetic + fast (~15-25s). Proves
+# the harness SPINS N connections, NO-LOSS reconcile holds, and the FD + empty-claim counters move
+# MONOTONICALLY (the wall exists and scales). It does NOT regression-cover wall #1 (executor) or wall
+# #2 (pool): both are no-ops/under-threshold at small N on SQLite (the pool wall needs a server DB —
+# see the connscale-smoke-pg CI leg, which forces pool_size to 1-2). Stated honestly so the smoke is
+# not over-read. Synthetic + generic.
+
+[connscale]
+name = "connscale-smoke"
+description = "CI smoke: N=50/100 on SQLite — harness spins + no-loss + FD/empty-claim monotonicity"
+counts = [50, 100]
+sweep_mode = "both"
+aggregate_rate = 35.0
+per_conn_rate = 0.35
+hold_seconds = 3.0
+connect_batch = 25
+connect_batch_pause_s = 0.02
+poll_interval_s = 0.25
+drain_timeout_s = 30.0
+base_port = 2600
+transform = "cheap"
+reload_probe = true
+store_backend = "sqlite"
+corpus_count_per_trigger = 10
+
+[connscale.slo]
+zero_loss = true
+# Loose `>=` monotonicity smokes (CI runners are noisy — mf-ci-test-flakes): FD count + total
+# empty-claims/sec at N=100 must be >= N=50 within each sweep mode.
+fd_monotonic = true
+empty_claims_monotonic = true

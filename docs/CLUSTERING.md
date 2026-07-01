@@ -247,6 +247,13 @@ does not replicate the store itself.
 Like Rhapsody/Corepoint, clients reach "the engine" through a **floating VIP or load balancer**, not a
 fixed node — so a failover is transparent to senders (modulo a reconnect):
 
+> **Planned alternative — engine-managed VIP (Windows-only).** [ADR 0056](adr/0056-engine-managed-vip-failover.md)
+> proposes an **opt-in** mode where the **engine itself** owns the VIP (no external LB/VRRP/WSFC), moving it
+> in lockstep with the leadership lease. It is **Windows-only** and **not yet built**. Until it ships — and
+> on **Linux/containerized** deployments, which it does **not** cover — use the external floating VIP / LB
+> described here, which stays the **cross-platform** default and the recommended posture for the strictest
+> split-brain guarantee.
+
 - **MLLP / TCP inbound (per listener).** Use a VIP per inbound port whose health check is a **TCP
   connect to that port**. Because only the **primary** binds the port (the active-passive graph gating),
   the check passes only on the primary, so the VIP routes inbound traffic to it automatically; on

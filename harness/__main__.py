@@ -17,6 +17,12 @@
                                                 the harness OWNS the two engines, SIGKILLs the primary
                                                 mid-load, and exits 0 (recovery + no-loss + ordering met)
                                                 / 1 (an SLO violated) / 2 (setup) / 3 (interrupted).
+``python -m harness --connscale NAME``→ run the CONNECTION-SCALE measurement sweep (B11): spin up N
+                                                inbound MLLP connections (the profile's counts, e.g.
+                                                500/1000/1500) at a low per-connection rate against a real
+                                                engine the harness OWNS, and read the connection-scale
+                                                walls vs N. Exits 0 (no-loss + SLOs met) / 1 (an SLO
+                                                violated) / 2 (setup) / 3 (interrupted).
 
 The headless paths import no PySide6, so they run on a display-less runner; the GUI import is
 deferred into :func:`_launch_gui`.
@@ -57,6 +63,21 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=2600,
         help="failover: base inbound MLLP port (ADT hub; results/other = base+1/+2). Both nodes bind it",
+    )
+    parser.add_argument(
+        "--connscale",
+        help="run this connection-scale profile (B11; built-in name or path to a .toml) and exit",
+    )
+    parser.add_argument(
+        "--connscale-api-port",
+        type=int,
+        default=8800,
+        help="connscale: base engine API port (each sweep step's owned engine uses base + step)",
+    )
+    parser.add_argument(
+        "--list-connscale-profiles",
+        action="store_true",
+        help="list built-in connection-scale profiles",
     )
     parser.add_argument("--list-profiles", action="store_true", help="list built-in load profiles")
     parser.add_argument("--engine", default="http://127.0.0.1:8765", help="engine API base URL")
@@ -103,11 +124,18 @@ def main(argv: list[str] | None = None) -> int:
         return _list_scenarios()
     if args.list_profiles:
         return _list_profiles()
-    if sum(bool(x) for x in (args.load, args.scenario, args.failover)) > 1:
-        print("--load, --failover, and --scenario are mutually exclusive", file=sys.stderr)
+    if args.list_connscale_profiles:
+        return _list_connscale_profiles()
+    if sum(bool(x) for x in (args.load, args.scenario, args.failover, args.connscale)) > 1:
+        print(
+            "--load, --failover, --connscale, and --scenario are mutually exclusive",
+            file=sys.stderr,
+        )
         return 2
     if args.failover:
         return _run_failover(args)
+    if args.connscale:
+        return _run_connscale(args)
     if args.load:
         return _run_load(args)
     if args.scenario:
@@ -294,6 +322,52 @@ def _run_failover(args: argparse.Namespace) -> int:
         Path(args.report_json).write_text(
             json.dumps(report.to_json_dict(), indent=2), encoding="utf-8"
         )
+    return report.exit_code
+
+
+def _list_connscale_profiles() -> int:
+    from harness.load.connscale.profile import list_connscale_profiles
+
+    for name, description in list_connscale_profiles().items():
+        print(f"  {name:<20} {description}")
+    return 0
+
+
+def _run_connscale(args: argparse.Namespace) -> int:
+    import asyncio
+    from pathlib import Path
+
+    from harness.load.connscale.profile import ConnScaleProfileError, get_connscale_profile
+    from harness.load.connscale.runner import ConnScaleError, run_connscale
+
+    try:
+        profile = get_connscale_profile(args.connscale)
+    except ConnScaleProfileError as exc:
+        print(f"bad connscale profile: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        report = asyncio.run(
+            run_connscale(
+                profile,
+                engine_api_port_base=args.connscale_api_port,
+                sink_host="127.0.0.1",
+                sink_port=args.sink_port,
+                sink_ports=args.sink_ports,
+            )
+        )
+    except ConnScaleError as exc:
+        print(f"connscale setup failed: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render_console())
+    if args.report_json:
+        Path(args.report_json).write_text(report.to_json(), encoding="utf-8")
+    if args.report_csv:
+        Path(args.report_csv).write_text(report.to_csv(), encoding="utf-8")
     return report.exit_code
 
 

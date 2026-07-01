@@ -46,7 +46,9 @@ import logging
 import os
 import socket
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from time import perf_counter
 from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
@@ -64,6 +66,7 @@ from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import Row, warm_pool_connections, warm_pool_target
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.document_strip import StripResult, cutoff_for
+from messagefoundry.store.pool_metrics import AcquireWaitHistogram, PoolStatus
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -113,8 +116,9 @@ _FINALIZE_LOCK_PREFIX = "mefor_finalize:"
 # Schema (PostgreSQL). All DDL is `IF NOT EXISTS`, run once under the schema advisory lock so
 # concurrent opens don't race on CREATE. Epoch timestamps are DOUBLE PRECISION; ids TEXT (uuid4 hex);
 # bodies/PHI columns TEXT; booleans BOOLEAN; auto-ids BIGSERIAL. The `queue.seq` BIGSERIAL is the FIFO
-# tiebreak that replaces SQLite's implicit rowid (same-transaction inserts get increasing seq, so
-# handler-list order survives ORDER BY created_at, seq).
+# ordering key that replaces SQLite's implicit rowid — seq-only per-lane FIFO (ADR 0059): one serial
+# writer per lane gets monotonically increasing seq in insert-commit order, so handler-list order and
+# receive order both survive ORDER BY seq, with zero wall-clock dependence.
 _SCHEMA: list[str] = [
     """CREATE TABLE IF NOT EXISTS messages (
         id           TEXT PRIMARY KEY,
@@ -157,10 +161,12 @@ _SCHEMA: list[str] = [
     # by the guarded one-shot ADD COLUMN in _migrate_lease_columns (NOT a per-open ALTER, which would
     # take ACCESS EXCLUSIVE on `queue` every startup).
     "CREATE INDEX IF NOT EXISTS ix_queue_ready ON queue(stage, status, next_attempt_at)",
-    "CREATE INDEX IF NOT EXISTS ix_queue_fifo_out"
-    " ON queue(stage, destination_name, status, created_at, seq)",
-    "CREATE INDEX IF NOT EXISTS ix_queue_fifo_in"
-    " ON queue(stage, channel_id, status, created_at, seq)",
+    # Per-stage FIFO covering indexes (ix_queue_fifo_in_seq / ix_queue_fifo_out_seq, seq-trailing per
+    # ADR 0059) are built in _migrate_lease_columns, NOT here (ADR 0060): they were renamed from the old
+    # created_at-trailing ix_queue_fifo_in/out, so an upgraded DB's stale same-named index is DROPped and
+    # the seq-trailing one CREATEd there — both in this _ensure_schema txn (atomic) and each with
+    # asyncpg's client command_timeout exempted (timeout=inf), which a large first-upgrade rebuild needs
+    # and this generic _SCHEMA loop cannot give per-statement. Mirrors ix_queue_body_ref / ix_queue_lease.
     "CREATE INDEX IF NOT EXISTS ix_queue_message ON queue(message_id)",
     # ix_queue_body_ref is created in _migrate_lease_columns, AFTER body_ref is guaranteed present — on a
     # pre-existing queue without the column it'd reference a not-yet-added column (like ix_queue_lease).
@@ -474,6 +480,12 @@ class PostgresStore:
         self._settings = settings
         self._cipher: Cipher = cipher or IdentityCipher()
         self.path = f"{settings.server}/{settings.database}"  # descriptor for db_status
+        # B11 connection-scale observability: a perf_counter-measured histogram of how long each
+        # pooled-connection acquire() WAITS — the PRIMARY pool-wait wall signal (it grows monotonically
+        # with worker contention once the pool saturates, where occupancy can't). Read-only/additive,
+        # surfaced via pool_status() → the server-only /status `pool` field; default-empty (all zeros)
+        # when nothing has contended, so it is byte-identical-when-unused.
+        self._acquire_wait = AcquireWaitHistogram()
         # Track B Step 2: the identity stamped on a row's lease when THIS instance claims it (host:pid
         # + a short random suffix so two stores in one process still differ). reclaim_expired_leases /
         # recover_inflight_on_promotion use it to recover only OTHER (prior-leader) instances' rows and
@@ -549,8 +561,15 @@ class PostgresStore:
     async def _ensure_schema(self) -> None:
         """Create the schema once, serialized across concurrent opens by a schema advisory lock so
         two processes can't race the DDL (the lock auto-releases at txn end)."""
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
+                # B10/ADR 0060: disable any SERVER-side statement_timeout for this schema txn so a large
+                # first-upgrade FIFO index rebuild (in _migrate_lease_columns) isn't killed by a
+                # role/database-configured statement_timeout → txn abort → startup crash-loop. This covers
+                # only the server side; asyncpg ALSO imposes a client-side command_timeout, exempted
+                # per-statement with timeout=inf on the FIFO rebuild itself. SET LOCAL scopes to this txn
+                # and auto-reverts at commit.
+                await conn.execute("SET LOCAL statement_timeout = 0")
                 await self._advisory_lock(conn, _LOCK_CLASS_SCHEMA, _SCHEMA_LOCK)
                 for statement in _SCHEMA:
                     await conn.execute(statement)
@@ -589,6 +608,29 @@ class PostgresStore:
             "CREATE INDEX IF NOT EXISTS ix_queue_lease ON queue(lease_expires_at)"
             " WHERE status='inflight'"
         )
+        # FIFO covering-index rename (ADR 0060). ADR 0059 re-keyed the per-lane FIFO indexes to trail in
+        # `seq` but KEPT the names ix_queue_fifo_in/out with CREATE IF NOT EXISTS — so an upgraded DB
+        # silently keeps its old created_at-trailing index and never adopts the seq-only claim's index.
+        # DROP the old-named indexes and (re)build the seq-trailing ones under a NEW name so name-existence
+        # is a correct discriminator. Both run in THIS _ensure_schema txn under the schema advisory lock,
+        # so the swap is atomic (CREATE-new then DROP-old, one commit) and an upgraded DB adopts the
+        # seq-trailing index. Plain CREATE (SHARE lock; NOT CONCURRENTLY, forbidden in a txn) — acceptable
+        # at open, before serving. timeout=inf exempts each from asyncpg's client-side command_timeout
+        # (the pool default, 30s): a SET LOCAL statement_timeout=0 (in _ensure_schema) covers only the
+        # SERVER side, but asyncpg ALSO imposes a client cancel that a large first-upgrade rebuild would
+        # trip → txn abort → startup crash-loop. Idempotent (IF NOT EXISTS / IF EXISTS); correctness-
+        # neutral (the claim orders by seq and names no index, ADR 0059) — pure speed restoration.
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_queue_fifo_in_seq ON queue(stage, channel_id, status, seq)",
+            timeout=float("inf"),
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_queue_fifo_out_seq"
+            " ON queue(stage, destination_name, status, seq)",
+            timeout=float("inf"),
+        )
+        await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_in", timeout=float("inf"))
+        await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_out", timeout=float("inf"))
         # Step-up re-verification (ASVS 7.5.3) adds sessions.reauth_at; pre-existing rows get NULL.
         sessions_has_reauth = await conn.fetch(
             "SELECT 1 FROM information_schema.columns"
@@ -734,6 +776,35 @@ class PostgresStore:
             await self._advisory_lock(conn, _LOCK_CLASS_FINALIZE, f"{_FINALIZE_LOCK_PREFIX}{mid}")
 
     # --- pooled-statement helpers --------------------------------------------
+
+    @asynccontextmanager
+    async def _timed_acquire(self) -> AsyncIterator[Any]:
+        """Acquire a pooled connection, recording the **wait time** into the acquire-wait histogram
+        (B11 pool-wait wall). Byte-equivalent to ``self._pool.acquire()`` except for the perf_counter
+        pair around it — the connection yielded and the release on block-exit are unchanged. The
+        transactional claim/handoff paths use this so the connection-scale harness can read how long
+        the per-lane workers spend WAITING for a pooled connection as the pool saturates; the
+        low-frequency convenience reads (``_fetchall``/``_fetchone``/``_execute``) acquire+release
+        internally and are deliberately not timed, so a status poll never pollutes the worker curve."""
+        t0 = perf_counter()
+        pool_acquire = self._pool.acquire()
+        async with pool_acquire as conn:
+            self._acquire_wait.record((perf_counter() - t0) * 1000.0)
+            yield conn
+
+    def pool_status(self) -> PoolStatus | None:
+        """The asyncpg pool snapshot (B11): size/idle occupancy + the PRIMARY acquire-wait percentiles.
+
+        ``get_size()``/``get_idle_size()`` are the asyncpg ``Pool`` accessors (verified against the
+        pinned ``asyncpg==0.31.0``). Synchronous + cheap (cached counters + an in-process histogram
+        snapshot — no DB round-trip)."""
+        return PoolStatus(
+            backend="postgres",
+            max_size=self._pool.get_max_size(),
+            size=self._pool.get_size(),
+            idle=self._pool.get_idle_size(),
+            acquire_wait=self._acquire_wait.summary(),
+        )
 
     async def _fetchall(self, sql: str, *params: Any) -> list[Any]:
         return list(await self._pool.fetch(sql, *params))
@@ -881,7 +952,7 @@ class PostgresStore:
         """Fill ``row_hash`` for audit rows written before hash-chaining (idempotent; fills only
         NULLs, chained from the prior row). H-7: takes the audit-chain advisory lock first so a
         concurrent ``record_audit`` can't fork the chain while this backfills."""
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
                 rows = await conn.fetch(
@@ -927,7 +998,7 @@ class PostgresStore:
                 )
                 if not rows:
                     break
-                async with self._pool.acquire() as conn:
+                async with self._timed_acquire() as conn:
                     async with conn.transaction():
                         for r in rows:
                             await conn.execute(
@@ -979,7 +1050,7 @@ class PostgresStore:
             if not rows:
                 break
             where = " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(pk_cols))
-            async with self._pool.acquire() as conn:
+            async with self._timed_acquire() as conn:
                 async with conn.transaction():
                     for r in rows:
                         await conn.execute(
@@ -1019,7 +1090,7 @@ class PostgresStore:
                 # decrypt (via the keyring) → encrypt (active) up front so a CipherError (a prior key
                 # not supplied) propagates before any UPDATE — the batch is all-or-nothing.
                 updates = [(cipher.encrypt(cipher.decrypt(r["v"])), r["id"]) for r in rows]
-                async with self._pool.acquire() as conn:
+                async with self._timed_acquire() as conn:
                     async with conn.transaction():
                         for new_value, rid in updates:
                             await conn.execute(
@@ -1074,7 +1145,7 @@ class PostgresStore:
             updates = [
                 (cipher.encrypt(cipher.decrypt(r["v"])), [r[c] for c in pk_cols]) for r in rows
             ]
-            async with self._pool.acquire() as conn:
+            async with self._timed_acquire() as conn:
                 async with conn.transaction():
                     for new_value, pk_vals in updates:
                         await conn.execute(
@@ -1192,37 +1263,12 @@ class PostgresStore:
             self._enc(metadata),
         )
 
-    async def _fifo_created_at(
-        self, conn: Any, stage: str, lane_col: str, lane_val: str, now: float
-    ) -> float:
-        """The ``created_at`` to stamp on a new ``stage`` row so per-lane FIFO order (``ORDER BY
-        created_at, seq``) survives a backward wall-clock step — clamps up to the lane's current max
-        (mirrors MessageStore._fifo_created_at). ``lane_col`` is a code-controlled literal."""
-        row = await conn.fetchrow(
-            f"SELECT MAX(created_at) AS m FROM queue WHERE stage=$1 AND {lane_col}=$2",
-            stage,
-            lane_val,
-        )
-        last = None if row is None else row["m"]
-        if last is not None and now < last:
-            log.warning(
-                "clock regression on the %s lane %r: created_at %.6f < lane max %.6f; clamping to "
-                "preserve FIFO order",
-                stage,
-                lane_val,
-                now,
-                last,
-            )
-            return float(last)
-        return now
-
     async def _insert_outbound_row(
         self, conn: Any, mid: str, channel_id: str, dest_name: str, payload: str, now: float
     ) -> None:
         """Insert one ``stage='outbound'`` queue row (one message→destination delivery)."""
-        created_at = await self._fifo_created_at(
-            conn, Stage.OUTBOUND.value, "destination_name", dest_name, now
-        )
+        # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
+        created_at = now
         await conn.execute(
             "INSERT INTO queue"
             " (id, message_id, stage, channel_id, destination_name, payload,"
@@ -1244,9 +1290,8 @@ class PostgresStore:
         self, conn: Any, mid: str, channel_id: str, handler_name: str, payload: str, now: float
     ) -> None:
         """Insert one ``stage='routed'`` queue row (one handler assignment awaiting transform)."""
-        created_at = await self._fifo_created_at(
-            conn, Stage.ROUTED.value, "channel_id", channel_id, now
-        )
+        # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
+        created_at = now
         await conn.execute(
             "INSERT INTO queue"
             " (id, message_id, stage, channel_id, destination_name, handler_name, payload,"
@@ -1342,9 +1387,8 @@ class PostgresStore:
                 error=None,
                 now=now,
             )
-            ingress_created = await self._fifo_created_at(
-                conn, Stage.INGRESS.value, "channel_id", pt_channel, now
-            )
+            # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
+            ingress_created = now
             await conn.execute(
                 "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
                 " handler_name, payload, status, attempts, next_attempt_at, created_at,"
@@ -1389,9 +1433,8 @@ class PostgresStore:
         rows only), so it is inert; it exists solely so the finalizer counts the Send's outcome. The
         payload is the empty-body sentinel; ``next_attempt_at`` is ``now`` (terminal, never due)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
-        created_at = await self._fifo_created_at(
-            conn, Stage.OUTBOUND.value, "destination_name", pt_name, now
-        )
+        # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
+        created_at = now
         await conn.execute(
             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
             " payload, status, attempts, next_attempt_at, created_at, updated_at)"
@@ -1443,7 +1486,7 @@ class PostgresStore:
         now = time.time() if now is None else now
         mid = uuid4().hex
         status = MessageStatus.ROUTED.value if deliveries else MessageStatus.UNROUTED.value
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 await self._insert_message(
                     conn,
@@ -1486,7 +1529,7 @@ class PostgresStore:
         now = time.time() if now is None else now
         mid = uuid4().hex
         event = "error" if status is MessageStatus.ERROR else "filtered"
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 await self._insert_message(
                     conn,
@@ -1523,7 +1566,7 @@ class PostgresStore:
         this returns the message is durable and the inbound may be ACKed. Returns the message id."""
         now = time.time() if now is None else now
         mid = uuid4().hex
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 await self._insert_message(
                     conn,
@@ -1539,9 +1582,8 @@ class PostgresStore:
                     error=None,
                     now=now,
                 )
-                ingress_created_at = await self._fifo_created_at(
-                    conn, Stage.INGRESS.value, "channel_id", channel_id, now
-                )
+                # ingest-time (ADR 0009) + metrics only; FIFO orders by seq (BIGSERIAL) — ADR 0059.
+                ingress_created_at = now
                 await conn.execute(
                     "INSERT INTO queue"
                     " (id, message_id, stage, channel_id, destination_name, payload,"
@@ -1575,7 +1617,7 @@ class PostgresStore:
         post-router ``disposition``. Idempotent: ``False`` (no-op) if the ingress row was already
         consumed by a prior run."""
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 deleted = await conn.fetchval(
                     "DELETE FROM queue WHERE id=$1 AND stage=$2 AND status=$3 RETURNING id",
@@ -1623,7 +1665,7 @@ class PostgresStore:
         order), set the intermediate ``disposition`` (``ROUTED``/``UNROUTED``). Idempotent: ``False``
         if the ingress row was already consumed."""
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 deleted = await conn.fetchval(
                     "DELETE FROM queue WHERE id=$1 AND stage=$2 AND status=$3 RETURNING id",
@@ -1674,7 +1716,7 @@ class PostgresStore:
         empty. Mirrors :class:`MessageStore` (SQLite) exactly."""
         now = time.time() if now is None else now
         applied: list[tuple[tuple[str, str], Any]] = []
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 deleted = await conn.fetchval(
                     "DELETE FROM queue WHERE id=$1 AND stage=$2 AND status=$3 RETURNING id",
@@ -1780,7 +1822,7 @@ class PostgresStore:
         encrypted = [
             (name, version, k, self._cipher.encrypt(json.dumps(v))) for k, v in rows.items()
         ]
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM reference WHERE name=$1", name)
                 for n, ver, k, v in encrypted:
@@ -1875,9 +1917,16 @@ class PostgresStore:
     ) -> OutboxItem | None:
         """Claim the single oldest *due* pending row for one lane at ``stage`` (strict FIFO — the head
         blocks the lane while it backs off). Lane key is stage-aware (``destination_name`` outbound,
-        ``channel_id`` ingress/routed). Ordering is ``created_at, seq`` (seq = the BIGSERIAL tiebreak
-        that preserves same-txn insertion order). ``FOR UPDATE SKIP LOCKED`` on the head keeps
-        concurrent pollers non-blocking. ``None`` when nothing is pending or the head isn't due.
+        ``channel_id`` ingress/routed). Ordering is ``seq`` alone (seq-only per-lane FIFO, ADR 0059):
+        ``seq`` is a ``BIGSERIAL`` the DB assigns monotonically at INSERT, so among a lane's live pending
+        rows ``ORDER BY seq`` is strict insert-commit order — **with zero wall-clock dependence**, immune
+        to a skewed-standby clock across failover. This is correct **only because there is exactly ONE
+        serial writer per (stage, lane-key)** (the per-inbound listener/router/transform worker; the
+        destination_name fan-in is multi-writer but seq is still DB-assigned in commit order, so the
+        first committer gets the lower seq, and ``FOR UPDATE SKIP LOCKED`` never skips the true locked
+        head). With ``created_at`` no longer an ordering backstop, a future second-writer-per-lane or
+        delete+reinsert-on-retry (re-minting seq) would break FIFO. ``FOR UPDATE SKIP LOCKED`` on the
+        head keeps concurrent pollers non-blocking. ``None`` when nothing is pending or the head isn't due.
 
         FAILOVER FIFO SAFETY (active-passive HA): the claim runs in ONE transaction that FIRST reclaims
         this lane's stranded head — a crashed/fenced prior leader's claimed rows are still ``inflight``
@@ -1910,13 +1959,13 @@ class PostgresStore:
         head_sql = (
             "WITH head AS ("
             f" SELECT id, next_attempt_at FROM queue WHERE stage=$1 AND {lane_col}=$2 AND status=$3"
-            " ORDER BY created_at, seq LIMIT 1 FOR UPDATE SKIP LOCKED"
+            " ORDER BY seq LIMIT 1 FOR UPDATE SKIP LOCKED"
             ")"
             " UPDATE queue q SET status=$4, attempts=attempts+1, updated_at=$5,"
             " owner=$6, lease_expires_at=$7"
             f" FROM head WHERE q.id=head.id AND head.next_attempt_at<=$5{epoch_guard} RETURNING q.*"
         )
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 # FIRST recover this lane's stranded head: a crashed/fenced predecessor's claimed rows
                 # are still inflight under an expired ROW lease, and the PENDING-only head SELECT below
@@ -1981,6 +2030,116 @@ class PostgresStore:
                         row = None
         return await self._fifo_item_or_dead_letter(row)
 
+    async def claim_next_fifo_batch(
+        self,
+        name: str,
+        now: float | None = None,
+        *,
+        stage: str,
+        limit: int,
+    ) -> list[OutboxItem]:
+        """Claim the **contiguous DUE head-prefix** (up to ``limit`` rows) for one lane at ``stage`` in
+        ONE commit — the batched cousin of :meth:`claim_next_fifo` (ADR 0058), INGRESS/ROUTED only.
+
+        The same-txn per-lane **stranded-head reclaim** runs FIRST (identical to the single claim) so a
+        crashed/fenced predecessor's expired-lease inflight rows are re-pended before the window — the
+        recovered head is reconsidered as the (due) prefix head and blocks the lane, preserving per-lane
+        FIFO across failover.
+
+        Then the prefix claim. ``FOR UPDATE`` does NOT combine with window functions, and ``SKIP LOCKED``
+        at ``LIMIT N`` would skip a producer-locked interior head and pull a later row into the window (a
+        #285 reorder), so the lock and the prefix-cut are split into two levels:
+
+        * ``locked`` — an inner ``FOR UPDATE`` (NO ``SKIP LOCKED``) over the lane's ``LIMIT N`` oldest
+          pending rows in ``seq`` order (seq-only per-lane FIFO, ADR 0059). No window function here (FOR
+          UPDATE forbids it). A producer-locked interior head BLOCKS (matching the single claim's intent)
+          rather than being skipped — strict per-lane FIFO. The ``LIMIT N`` bounds the lock to at most N
+          rows (never the whole lane).
+        * ``boundary``/``head`` — a NON-locking outer window over ``locked`` that truncates at the first
+          not-due row (``rn < first-not-due rn``), the contiguous due prefix. A not-due head ⇒ empty
+          ``head`` ⇒ 0 rows updated ⇒ empty batch ⇒ the lane blocks (== the single claim's ``None``).
+
+        The UPDATE stamps ``owner``/``lease_expires_at`` on all claimed rows (failover-recovery parity)
+        and appends the H1 ``epoch_guard`` exactly as the single claim, and ``RETURNING q.*`` carries
+        ``created_at`` (Postgres surfaces it). Decode runs AFTER the claim txn: an undecryptable row is
+        dead-lettered (its own txn) and dropped, mirroring the single claim. The outbound/delivery lane is
+        never batched — callers pass an ingress/routed ``stage`` (ingress/routed rows have a NULL
+        ``destination_name`` and never reach the H2 skip-and-complete the single outbound claim runs)."""
+        now = time.time() if now is None else now
+        lease_until = now + self._settings.lease_ttl_seconds  # Track B Step 2: stamp the lease
+        lane_col = self._lane_col(stage)  # code-controlled literal
+        # Positional args, in order. $1..$7 are fixed; the batch LIMIT and the optional H1 fence follow.
+        claim_args: list[Any] = [
+            stage,  # $1
+            name,  # $2
+            OutboxStatus.PENDING.value,  # $3
+            OutboxStatus.INFLIGHT.value,  # $4
+            now,  # $5 (updated_at + the not-due cutoff)
+            self._owner,  # $6
+            lease_until,  # $7
+            limit,  # $8 (batch LIMIT)
+        ]
+        # H1 FENCING TOKEN — identical to the single claim: a fenced ex-leader's UPDATE matches 0 rows.
+        # When fenced, the lease key + held epoch are $9/$10 (after the fixed args + the LIMIT $8).
+        epoch_guard = ""
+        if self._leader_epoch is not None:
+            epoch_guard = (
+                " AND (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=$9) <= $10"
+            )
+            claim_args.extend([self._lease_key, self._leader_epoch])
+        # Two-level CTE: the inner FOR UPDATE locks the N oldest pending rows (no window, no SKIP LOCKED ->
+        # BLOCK on a producer-locked head, never skip — strict per-lane FIFO #285); the outer window
+        # truncates at the first not-due row (the contiguous due prefix). 2147483647 = a sentinel "no
+        # not-due row in the locked window" so an all-due window keeps the whole prefix. A not-due head ⇒
+        # empty `head` ⇒ 0 rows updated ⇒ empty batch ⇒ the lane blocks (== the single claim's None).
+        # ORDERING IS seq-ONLY (ADR 0059) and the THREE refs MUST stay in lockstep: the inner `locked`
+        # ORDER BY (picks WHICH N rows), the row_number() window (drives the not-due cutoff `rn`), AND the
+        # in-memory sort below. A partial edit type-checks but silently corrupts the contiguous-due cutoff.
+        prefix_sql = (
+            "WITH locked AS ("
+            " SELECT id, created_at, seq, next_attempt_at FROM queue"
+            f" WHERE stage=$1 AND {lane_col}=$2 AND status=$3"
+            " ORDER BY seq LIMIT $8 FOR UPDATE"
+            "), ordered AS ("
+            " SELECT id, next_attempt_at,"
+            " row_number() OVER (ORDER BY seq) AS rn FROM locked"
+            "), head AS ("
+            " SELECT id FROM ordered"
+            " WHERE rn < COALESCE((SELECT min(rn) FROM ordered WHERE next_attempt_at > $5), 2147483647)"
+            ")"
+            " UPDATE queue q SET status=$4, attempts=attempts+1, updated_at=$5,"
+            " owner=$6, lease_expires_at=$7"
+            f" FROM head WHERE q.id=head.id{epoch_guard} RETURNING q.*"
+        )
+        async with self._timed_acquire() as conn:
+            async with conn.transaction():
+                # FIRST recover this lane's stranded head (identical to the single claim) so the oldest
+                # recovered row is reconsidered as the (now-due) prefix head and blocks the lane.
+                await conn.execute(
+                    f"UPDATE queue SET status=$3, owner=NULL, lease_expires_at=NULL,"
+                    f" next_attempt_at=$4, updated_at=$4"
+                    f" WHERE stage=$1 AND {lane_col}=$2 AND status=$5"
+                    f" AND lease_expires_at IS NOT NULL AND lease_expires_at < $4",
+                    stage,
+                    name,
+                    OutboxStatus.PENDING.value,
+                    now,
+                    OutboxStatus.INFLIGHT.value,
+                )
+                rows = await conn.fetch(prefix_sql, *claim_args)
+        # Decode AFTER the claim txn. RETURNING does not guarantee order across the UPDATE, so sort by
+        # `seq` (seq-only per-lane FIFO, ADR 0059 — one serial writer per lane assigns BIGSERIAL seq in
+        # insert-commit order) to be certain the worker iterates oldest-first. This is the THIRD of the
+        # three lockstep ordering refs (see the prefix_sql comment). An undecryptable interior row is
+        # dead-lettered (its own txn) and dropped; the surviving tail keeps its order.
+        ordered = sorted(rows, key=lambda r: r["seq"])
+        items: list[OutboxItem] = []
+        for row in ordered:
+            item = await self._fifo_item_or_dead_letter(row)
+            if item is not None:
+                items.append(item)
+        return items
+
     async def _fifo_item_or_dead_letter(self, row: Any) -> OutboxItem | None:
         """Decode a claimed FIFO head into an :class:`OutboxItem`, or dead-letter an undecryptable head
         and return ``None`` so the lane advances on the next poll (mirrors SQLite). Runs AFTER the claim
@@ -2018,7 +2177,7 @@ class PostgresStore:
             error
         )  # PHI chokepoint (#120) — incl. the f"undecryptable payload: {exc}" callers
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
                 if row is None:
@@ -2039,7 +2198,7 @@ class PostgresStore:
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
                 if row is None:
@@ -2088,7 +2247,7 @@ class PostgresStore:
         finalizer (it scans ``queue`` only). When ``reingress_to`` is set (Increment 2) the same
         transaction also inserts the drainable ``Stage.RESPONSE`` work-row (identical to SQLite)."""
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
                 if row is None:
@@ -2124,9 +2283,8 @@ class PostgresStore:
                     # ADR 0013 Increment 2: drainable Stage.RESPONSE work-row in the SAME txn (orphan-free)
                     # — a token referencing the immutable artifact by its PK, on the loopback inbound's lane.
                     artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
-                    work_created = await self._fifo_created_at(
-                        conn, Stage.RESPONSE.value, "channel_id", reingress_to, now
-                    )
+                    # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
+                    work_created = now
                     await conn.execute(
                         "INSERT INTO queue"
                         " (id, message_id, stage, channel_id, destination_name, handler_name, payload,"
@@ -2182,7 +2340,7 @@ class PostgresStore:
 
         now = time.time() if now is None else now
         try:
-            async with self._pool.acquire() as conn:
+            async with self._timed_acquire() as conn:
                 async with conn.transaction():
                     wr = await conn.fetchrow(
                         "SELECT message_id, payload FROM queue WHERE id=$1 AND stage=$2 AND status=$3",
@@ -2289,9 +2447,8 @@ class PostgresStore:
                             now=now,
                         )
                         if not peek_failed:
-                            ingress_created = await self._fifo_created_at(
-                                conn, Stage.INGRESS.value, "channel_id", loopback_channel_id, now
-                            )
+                            # ingest-time (ADR 0009) + metrics only; FIFO orders by seq — ADR 0059.
+                            ingress_created = now
                             await conn.execute(
                                 "INSERT INTO queue (id, message_id, stage, channel_id,"
                                 " destination_name, handler_name, payload, status, attempts,"
@@ -2403,7 +2560,7 @@ class PostgresStore:
         dest = "\x1fack:" + inbound_name
         enc_body = self._enc(ack_body) if (ack_body and self._cipher.encrypts) else None
         enc_detail = self._enc(safe_text(detail)[:200]) if detail else None
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 seq = await conn.fetchval(
                     "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
@@ -2651,7 +2808,7 @@ class PostgresStore:
         """Reschedule with exponential backoff, or dead-letter if retries are exhausted."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
                 if row is None:
@@ -2782,7 +2939,7 @@ class PostgresStore:
         whose rows this could steal — the SAME interlock the shipping SQL Server on-promotion
         ``reset_stale_inflight`` relies on. Returns the number of queue rows re-pended."""
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 result = await conn.execute(
                     "UPDATE queue SET status=$1, owner=NULL, lease_expires_at=NULL,"
@@ -2801,7 +2958,7 @@ class PostgresStore:
         """Dead-letter every non-terminal **outbound** row whose ``destination_name`` left the
         registry. Scoped to ``stage='outbound'``. Returns the rows killed."""
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 rows = await conn.fetch(
                     "SELECT id, message_id, destination_name FROM queue"
@@ -2848,7 +3005,7 @@ class PostgresStore:
         """Dead-letter every non-terminal **routed** row whose ``handler_name`` left the registry
         (no transform worker can run it). Scoped to ``stage='routed'``. Returns the rows killed."""
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 rows = await conn.fetch(
                     "SELECT id, message_id, handler_name FROM queue"
@@ -2887,7 +3044,7 @@ class PostgresStore:
         any ``dead``/``pending`` row (never a ``done`` sibling — the M-2 hazard), else **re-send** the
         ``done`` rows. ``cancelled`` rows are never touched. Returns rows requeued."""
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 stuck_row = await conn.fetchrow(
                     "SELECT COUNT(*) AS n FROM queue WHERE message_id=$1 AND status = ANY($2::text[])",
@@ -2945,7 +3102,7 @@ class PostgresStore:
         ``pending`` with attempts reset, revert each affected message from ``error`` to ``routed``.
         Scoped to ``stage='outbound'`` to match the dead-letter view. Returns rows requeued."""
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 ids = await conn.fetch(
                     "SELECT DISTINCT message_id FROM queue WHERE stage=$1 AND status=$2"
@@ -2995,14 +3152,16 @@ class PostgresStore:
         ``channel_id=None`` cancels across all producers; ``top_only`` cancels just the head. Returns
         the number cancelled."""
         now = time.time() if now is None else now
+        # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match the
+        # claim's seq-only order, NOT created_at (no longer the ordering key; ADR 0059).
         query = (
             "SELECT id, message_id FROM queue"
             " WHERE destination_name=$1 AND status=$2 AND ($3::text IS NULL OR channel_id=$3)"
-            " ORDER BY next_attempt_at, created_at"
+            " ORDER BY next_attempt_at, seq"
         )
         if top_only:
             query += " LIMIT 1"
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 rows = await conn.fetch(
                     query, destination_name, OutboxStatus.PENDING.value, channel_id
@@ -3275,7 +3434,7 @@ class PostgresStore:
     ) -> None:
         """Append a ``viewed`` audit event (called whenever a message body / PHI is opened)."""
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 await self._event(conn, message_id, "viewed", None, actor or "", now)
 
@@ -3295,7 +3454,7 @@ class PostgresStore:
         :func:`~messagefoundry.store.audit_tee.emit_audit_tee` (sec-offbox-log) — the same redaction
         path the SQLite and SQL Server backends use."""
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
                 last = await conn.fetchrow(
@@ -3553,7 +3712,7 @@ class PostgresStore:
         + ``UPDATE`` run in one transaction, so concurrent verifications (even cross-node) can't
         double-spend a single-use recovery code (WP-14)."""
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     "SELECT totp_recovery_codes FROM users WHERE id=$1 FOR UPDATE", user_id
@@ -3577,7 +3736,7 @@ class PostgresStore:
         consumed (strictly greater than any prior step). A code replayed inside its ±1-step verify
         window resolves to a non-greater step and returns ``False`` — single-use per ASVS 6.5.1. The
         ``SELECT ... FOR UPDATE`` + ``UPDATE`` run in one transaction (no cross-node double-spend)."""
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     "SELECT last_totp_step FROM users WHERE id=$1 FOR UPDATE", user_id
@@ -3616,7 +3775,7 @@ class PostgresStore:
         )
 
     async def delete_user(self, user_id: str) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
                 await conn.execute("DELETE FROM sessions WHERE user_id=$1", user_id)
@@ -3680,7 +3839,7 @@ class PostgresStore:
     async def delete_custom_role(self, role_id: str) -> bool:
         """Delete a custom (``builtin=FALSE``) role and its user/AD-group assignments in one
         transaction (ADR 0045 D4); never touches a built-in row. Returns ``True`` if removed."""
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow("SELECT builtin FROM roles WHERE id=$1", role_id)
                 if row is None or bool(row["builtin"]):
@@ -3705,7 +3864,7 @@ class PostgresStore:
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
                 for role_id in role_ids:
@@ -3744,7 +3903,7 @@ class PostgresStore:
 
     async def set_ad_group_role_map(self, entries: Iterable[tuple[str, str]]) -> None:
         pairs = sorted({(g.strip().lower(), r) for g, r in entries if g.strip()})
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM ad_group_role_map")
                 for ad_group, role_id in pairs:
@@ -3773,7 +3932,7 @@ class PostgresStore:
         pairs = sorted(
             {(g.strip().lower(), c.strip()) for g, c in entries if g.strip() and c.strip()}
         )
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM ad_group_scope_map")
                 for ad_group, channel in pairs:
@@ -3929,7 +4088,7 @@ class PostgresStore:
             f" AND q.status = ANY(${inflight_ph}::text[]))"
         )
         lead = [*cutoff_params, inflight]
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 result = await conn.execute(
                     f"UPDATE messages SET raw='', summary=NULL, error=NULL"
@@ -3984,7 +4143,7 @@ class PostgresStore:
         if not finite:
             return StripResult()  # everything keep-forever ⇒ nothing to scan
         scan_cutoff = max(finite)
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             rows = await conn.fetch(
                 "SELECT m.id, m.channel_id, m.raw, m.received_at FROM messages m"
                 " WHERE m.raw <> '' AND m.documents_pruned IS NULL AND m.received_at < $1"
@@ -4065,7 +4224,7 @@ class PostgresStore:
         keys (the version-scan reload re-seeds the surviving rows, leaving the purged keys gone). Gated, so
         single-node writes no state_version rows and stays byte-identical."""
         now = time.time() if now is None else now
-        async with self._pool.acquire() as conn:
+        async with self._timed_acquire() as conn:
             async with conn.transaction():
                 rows = await conn.fetch(
                     "SELECT namespace, key FROM state WHERE set_at < $1", older_than
@@ -4128,6 +4287,7 @@ class PostgresStore:
             messages=await self._count("messages"),
             events=await self._count("message_events"),
             audit=await self._count("audit_log"),
+            synchronous=None,  # SQLite-only knob; Postgres WAL durability is not a per-store PRAGMA
         )
 
     async def integrity_check(self) -> tuple[bool, str]:

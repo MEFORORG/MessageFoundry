@@ -1615,6 +1615,11 @@ class InboundConnection:
     ack_after: AckAfter | None = None
     validation: Validation = field(default_factory=Validation)
     content_type: ContentType = ContentType.HL7V2  # payload format (ADR 0004); HL7V2 = the HL7 path
+    # ADR 0057: opt into the inline Step-A fast-path. For an ELIGIBLE message (no-lookup graph,
+    # single-handler, all-deliver) the router worker fuses route+transform+handoff into ONE committed
+    # transaction (7 -> 5 commits/msg). Default False = the split pipeline, byte-identical. Eligibility is
+    # re-checked per message at runtime (RegistryRunner); anything not eligible falls back to the split path.
+    inline: bool = False
     # Operability (Tier 4): free-form operator metadata (owner/runbook/env labels — surfaced by the
     # API, never used for routing); a per-connection inbound bind interface that overrides the service
     # [inbound].bind_host; and an inbound peer-IP allowlist (MLLP/TCP listen sources only). All
@@ -2030,6 +2035,7 @@ def build_inbound_connection(
     strict: bool = False,
     hl7_version: str | None = None,
     content_type: ContentType | str = ContentType.HL7V2,
+    inline: bool = False,
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
     source_ip_allowlist: list[str] | None = None,
@@ -2192,6 +2198,7 @@ def build_inbound_connection(
         ack_after=ack_after,
         validation=Validation(strict=strict, hl7_version=hl7_version),
         content_type=content_type,
+        inline=inline,
         metadata=metadata,
         bind_address=bind_address,
         source_ip_allowlist=allowlist,
@@ -2217,6 +2224,7 @@ def inbound(
     strict: bool = False,
     hl7_version: str | None = None,
     content_type: ContentType | str = ContentType.HL7V2,
+    inline: bool = False,
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
     source_ip_allowlist: list[str] | None = None,
@@ -2281,6 +2289,7 @@ def inbound(
             strict=strict,
             hl7_version=hl7_version,
             content_type=content_type,
+            inline=inline,
             metadata=metadata,
             bind_address=bind_address,
             source_ip_allowlist=source_ip_allowlist,

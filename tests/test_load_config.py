@@ -216,9 +216,13 @@ def test_guard_actually_scans_files() -> None:
 
 
 def test_all_shipped_profiles_parse() -> None:
-    # Every shipped profile must parse cleanly — guards against a typo'd/renamed key shipping a broken
-    # profile (the failure mode that left matrix row H1 pointing at a nonexistent "steady" profile).
-    profiles = sorted(PROFILES_DIR.glob("*.toml"))
+    # Every shipped LOAD profile must parse cleanly — guards against a typo'd/renamed key shipping a
+    # broken profile (the failure mode that left matrix row H1 pointing at a nonexistent "steady"
+    # profile). connscale*.toml are a DIFFERENT schema ([connscale], not [load]) consumed by the
+    # --connscale CLI (covered by test_connscale_profile.py), so they are excluded here.
+    profiles = [
+        p for p in sorted(PROFILES_DIR.glob("*.toml")) if not p.name.startswith("connscale")
+    ]
     assert len(profiles) >= 8, "expected the shipped profile set; did the directory move?"
     for path in profiles:
         try:

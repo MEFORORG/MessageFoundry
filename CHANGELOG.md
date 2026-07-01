@@ -6,6 +6,63 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.12] — 2026-07-01 — Early Access
+
+The **throughput & connection-scale wave.** The staged-queue per-message commit chain is shortened
+(opt-in inline fast-path + batch-claim, plus a result-preserving seq-only FIFO ordering that drops a
+per-handoff round-trip); a connection-scale measurement harness + read-only engine instrumentation lands;
+**per-lane wake events** (opt-in) eliminate the thundering-herd empty-claim storm that dominates at high
+connection counts; and ADR 0059's seq-only FIFO index re-key now reaches **upgraded** databases via a
+one-time on-open migration. All new *runtime* behavior is opt-in / off-by-default unless noted — the
+seq-only ordering (B3) and the index migration (B10) are result-preserving.
+
+### Added
+- **Inline Step-A fast-path** ([ADR 0057](docs/adr/0057-inline-step-a-fast-path.md)) — **opt-in per
+  inbound via `inline`**: for the pure all-deliver message (no filter/state/pass-through), fuse
+  route+transform+handoff into **one committed transaction**, cutting the per-message commit depth from 7
+  to 5 durable round-trips. Off by default → byte-identical to the split path; ineligible messages fall
+  back automatically.
+- **Batch-claim** (#671, [ADR 0058](docs/adr/0058-batch-claim-fifo-prefix.md)) — **opt-in via
+  `[store].fifo_claim_batch`** (>1): the INGRESS/ROUTED FIFO claim takes the contiguous due head-prefix in
+  one commit instead of one row per commit, processed in strict FIFO order. Default `1` = off
+  (byte-identical); preserves per-lane FIFO (#285) and at-least-once.
+- **Per-lane wake events** (#678, [ADR 0061](docs/adr/0061-per-lane-wake-events.md)) — **opt-in via
+  `[pipeline].per_lane_wake`**: a committed message wakes **only its own `(stage, lane)` worker** instead
+  of every worker of that stage, eliminating the thundering-herd empty-claim storm at high **connection**
+  counts (~1,500 inbounds). Default off + byte-identical; the FIFO claim and the lost-wakeup poll backstop
+  are unchanged (a missed wake self-heals). Env override `MEFOR_PIPELINE_PER_LANE_WAKE` for the harness A/B.
+- **Connection-scale measurement harness + read-only engine instrumentation** (#675) — a headless harness
+  that spins N inbound connections at a low per-connection rate and reads the connection-scale walls
+  (executor saturation, server-store pool wait, idle-poll storm, FD/socket count, config-reload + ACK
+  latency) vs connection count. The supporting engine instrumentation is **additive + read-only**, surfaced
+  via `/stats` + `/status`: empty-claim counters split into idle-poll vs per-commit wake-fanout, and (on a
+  server store) connection-pool acquire-wait percentiles + size/idle occupancy. Counters default to 0 /
+  `None` — byte-identical when unused.
+
+### Changed
+- **Seq-only per-lane FIFO ordering** (#673, [ADR 0059](docs/adr/0059-seq-only-fifo-ordering.md)) — the
+  per-lane FIFO claim now orders by the DB-assigned `seq` (rowid on SQLite) **alone** instead of
+  `(created_at, seq)`, and the per-insert `SELECT MAX(created_at)` clamp is removed from **every stage
+  handoff** (one fewer round-trip per produced row). **Result-preserving** (proven order-isomorphic to the
+  prior clamped ordering) and strictly more robust under clock skew / failover (`seq` has no wall-clock
+  dependence). `created_at` stays a real ingest-time/metrics timestamp — it is simply no longer an ordering
+  key. The FIFO covering indexes re-key to trail in `seq` (see the migration below).
+- **Rename-based FIFO covering-index migration** (#676, [ADR 0060](docs/adr/0060-rename-based-fifo-index-migration.md)) —
+  ADR 0059 re-keyed the per-lane FIFO indexes to trail in `seq` for the seq-only claim, but kept their names
+  under `IF NOT EXISTS` guards, so **only fresh databases** adopted the new index — an upgraded DB silently
+  kept its old `created_at`-trailing index and never got ADR 0059's throughput win. The seq-trailing indexes
+  are now named `ix_queue_fifo_in_seq` / `ix_queue_fifo_out_seq`, and a one-time, idempotent **on-open
+  migration drops the old-named index and builds the new one** on all three backends, so upgraded databases
+  adopt it. Correctness is unchanged (the claim orders by `seq`/`rowid` and names no index, so the migration
+  only restores speed). Operational notes: the first open after upgrade pays a **one-time index rebuild** on
+  the `queue` table (SQLite/Postgres blocking, SQL Server offline — bounded by live queue depth, at cold start
+  before serving); on a very large SQLite queue a *concurrent* second opener may hit a transient, non-corrupting
+  open failure during the rebuild; the shared-DB backends (SQL Server / Postgres) should upgrade **stop-the-world
+  / under a drain window** (a mixed-version fleet or a live rejoin can re-create or contend on the index); a
+  downgrade re-creates the old-named index (drop `ix_queue_fifo_in/out` manually if downgrading permanently).
+- **`/status` DB observability** — the SQLite journal mode and `synchronous` durability setting are now
+  surfaced in the DB status (`synchronous=NORMAL` remains the crash-safe-under-WAL default).
+
 ## [0.2.11] — 2026-06-29 — Early Access
 
 The **Plan-6 disaster-recovery + cloud/HA wave** — turnkey DR backup/restore-verify and a third-tier DR

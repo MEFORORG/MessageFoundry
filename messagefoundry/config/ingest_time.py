@@ -74,7 +74,14 @@ def current_ingest_time() -> float | None:
 
     ``None`` outside a run, or on the SQL Server backend (it runs no transforms). Re-run-stable — the
     same message re-derives the same value (it's the persisted enqueue time, not a live clock read), so
-    using it keeps a transform pure for at-least-once (unlike :func:`db_lookup`)."""
+    using it keeps a transform pure for at-least-once (unlike :func:`db_lookup`).
+
+    It is **persisted-once and immutable per message** (re-run-stable), but as of ADR 0059 it is **NOT
+    guaranteed non-decreasing across messages in a lane**: per-lane FIFO now orders by ``seq`` (the row's
+    insert counter), not ``created_at``, and the old per-lane ``created_at`` clamp was removed — so after
+    a backward wall-clock step (NTP step-back, VM snapshot revert) a later-arriving message in a lane can
+    carry a *smaller* ingest time than its predecessor. FIFO delivery order is unaffected (it follows
+    seq); only this timestamp's cross-message monotonicity is no longer promised."""
     return _active.get()
 
 

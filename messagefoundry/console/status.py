@@ -34,7 +34,16 @@ from messagefoundry.console._async import AsyncRunner
 from messagefoundry.console.client import ApiError, EngineClient
 
 _ENGINE_ROWS = ["Reachable", "Version", "Uptime", "PID", "Channels", "Queue"]
-_DB_ROWS = ["Path", "Size", "Free disk", "Journal mode", "Messages", "Events", "Audit entries"]
+_DB_ROWS = [
+    "Path",
+    "Size",
+    "Free disk",
+    "Journal mode",
+    "Synchronous",
+    "Messages",
+    "Events",
+    "Audit entries",
+]
 _NODE_COLS = ["Node", "Host", "PID", "Status", "Last seen", "Leader"]
 
 
@@ -224,6 +233,8 @@ class EngineStatusPage(QWidget):
         self._db["Size"].setText(_human_bytes(d.size_bytes))
         self._db["Free disk"].setText(_human_bytes(d.disk_free_bytes))
         self._db["Journal mode"].setText(d.journal_mode)
+        # SQLite durability mode (PRAGMA synchronous); "n/a" on the server backends where it is None.
+        self._db["Synchronous"].setText(d.synchronous or "n/a")
         self._db["Messages"].setText(str(d.messages))
         self._db["Events"].setText(str(d.events))
         self._db["Audit entries"].setText(str(d.audit))

@@ -1,0 +1,35 @@
+# Connection-scale measurement profile (B11) — the OPERATOR sweep: 500 / 1000 / 1500 inbound MLLP
+# connections at a low per-connection rate (~0.35 msg/s) against a real engine the harness owns. Run
+# on the on-prem NVMe box against a SERVER-DB store (the pool-wait wall is a no-op on SQLite). Both
+# sweep modes run by default. This is OPERATOR-ONLY (multi-minute, large port budget) — never CI.
+#
+#   MEFOR_STORE_BACKEND=postgres MEFOR_STORE_* ... \
+#     python -m harness --connscale connscale --report-json out/connscale.json
+#
+# All values synthetic + generic. See docs/LOAD-TESTING.md.
+
+[connscale]
+name = "connscale"
+description = "Connection-scale walls vs N (500/1000/1500), both sweep modes, server-DB store"
+counts = [500, 1000, 1500]
+# fixed_aggregate holds ~521 msg/s across N (matches the mf-pipeline-commit-bottleneck ceiling),
+# isolating the cost of idle connection count + the per-commit wake-fanout herd; fixed_per_conn holds
+# ~0.35 msg/s per connection so the aggregate rises with N (the combined load+scale wall).
+sweep_mode = "both"
+aggregate_rate = 521.0
+per_conn_rate = 0.35
+hold_seconds = 60.0
+connect_batch = 50
+connect_batch_pause_s = 0.05
+poll_interval_s = 1.0
+drain_timeout_s = 300.0
+base_port = 2600
+transform = "cheap"
+reload_probe = true
+store_backend = "postgres"
+corpus_count_per_trigger = 20
+
+[connscale.slo]
+# Correctness gate only: no message loss at any N, and the backlog drains. The wall metrics are
+# REPORTED as curves (not hard-gated) — their absolute values are host-variable by design.
+zero_loss = true

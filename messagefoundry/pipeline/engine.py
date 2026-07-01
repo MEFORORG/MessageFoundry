@@ -87,6 +87,7 @@ class Engine:
         *,
         poll_interval: float = 0.25,
         max_correlation_depth: int = 8,
+        per_lane_wake: bool = False,  # B12 (ADR 0061): per-lane wake events; default-OFF singleton wake
         connection_events: bool = True,
         response_sent_default: bool = True,
         config_dir: str | Path | None = None,
@@ -156,6 +157,7 @@ class Engine:
         self._poll_interval = poll_interval
         # [pipeline] re-ingress loop-prevention cap (ADR 0013 Increment 2); every runner inherits it.
         self._max_correlation_depth = max_correlation_depth
+        self._per_lane_wake = per_lane_wake  # B12 (ADR 0061)
         # [diagnostics] Corepoint-style event log (#46); every runner inherits these master switches.
         self._connection_events = connection_events
         self._response_sent_default = response_sent_default
@@ -192,6 +194,11 @@ class Engine:
         # prunes keep-N), so it is coordinator-gated like retention.
         self._backup_settings = backup_settings
         self._store_settings = store_settings
+        # ADR 0058 batch-claim on the INGRESS/ROUTED FIFO claim path. Threaded into every runner this
+        # engine builds. None store_settings (embedding/tests) → 1 (OFF, byte-identical single claim).
+        self._fifo_claim_batch = (
+            store_settings.fifo_claim_batch if store_settings is not None else 1
+        )
         self._engine_version = engine_version
         self._backup_runner: BackupRunner | None = None
         # [dr] third-tier DR standby coordinator (#61, ADR 0048). Built lazily on first access (it needs
@@ -292,6 +299,7 @@ class Engine:
         *,
         poll_interval: float = 0.25,
         max_correlation_depth: int = 8,
+        per_lane_wake: bool = False,  # B12 (ADR 0061): per-lane wake events; default-OFF singleton wake
         connection_events: bool = True,
         response_sent_default: bool = True,
         synchronous: str = "NORMAL",
@@ -330,6 +338,7 @@ class Engine:
             store,
             poll_interval=poll_interval,
             max_correlation_depth=max_correlation_depth,
+            per_lane_wake=per_lane_wake,
             connection_events=connection_events,
             response_sent_default=response_sent_default,
             config_dir=config_dir,
@@ -465,6 +474,7 @@ class Engine:
             registry,
             self.store,
             poll_interval=self._poll_interval,
+            fifo_claim_batch=self._fifo_claim_batch,
             inbound_bind_host=self._inbound_bind_host,
             reserved_bindings=self._reserved_bindings,
             allow_insecure_bind=self._allow_insecure_bind,
@@ -483,6 +493,7 @@ class Engine:
             active_environment=self._active_environment,
             coordinator=self._coordinator,
             max_correlation_depth=self._max_correlation_depth,
+            per_lane_wake=self._per_lane_wake,
             connection_events=self._connection_events,
             response_sent_default=self._response_sent_default,
         )
@@ -953,6 +964,7 @@ class Engine:
                 registry,
                 self.store,
                 poll_interval=self._poll_interval,
+                fifo_claim_batch=self._fifo_claim_batch,
                 inbound_bind_host=self._inbound_bind_host,
                 reserved_bindings=self._reserved_bindings,
                 delivery_defaults=self._delivery_defaults,

@@ -24,9 +24,42 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Iterable, Sequence, TypeVar
 
 from messagefoundry.console.client import ApiError, EngineClient
+
+_T = TypeVar("_T")
+
+
+def _first_not_none(values: Iterable[_T | None]) -> _T | None:
+    """The first non-``None`` value, or ``None`` if all are ``None`` (per-process gauges: the connscale
+    harness drives a single engine, so this is exactly that engine's reading)."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _pool_attr(status: Any, name: str) -> int | None:
+    """Read ``status.pool.<name>`` (the server-only pool field), or ``None`` on SQLite / an older
+    engine whose ``SystemStatus`` has no ``pool`` field."""
+    pool = getattr(status, "pool", None)
+    if pool is None:
+        return None
+    value = getattr(pool, name, None)
+    return int(value) if value is not None else None
+
+
+def _pool_wait_attr(status: Any, name: str) -> float | None:
+    """Read ``status.pool.acquire_wait.<name>`` (the PRIMARY pool-wait percentiles), or ``None``."""
+    pool = getattr(status, "pool", None)
+    if pool is None:
+        return None
+    wait = getattr(pool, "acquire_wait", None)
+    if wait is None:
+        return None
+    value = getattr(wait, name, None)
+    return float(value) if value is not None else None
 
 
 @dataclass(frozen=True)
@@ -49,7 +82,24 @@ class EngineSample:
     )
     db_size_bytes: int
     journal_mode: str
+    synchronous: (
+        str | None
+    )  # SQLite durability mode ("normal"/"full"); None on server backends (B7)
     uptime_s: float
+    # B11 connection-scale instrumentation (read-only, additive; default 0/None so an OLDER engine
+    # without these fields deserializes to zeros — the established back-compat pattern). Summed across
+    # shards where summable; pool gauges take the first server-store shard reporting one.
+    empty_claims: int = 0  # Σ cumulative empty claims (wall #3)
+    empty_claims_idle_poll: int = 0  # the idle-poll re-SELECT share
+    empty_claims_wake_fanout: int = 0  # the per-commit wake-fanout (thundering-herd) share
+    executor_queue_depth: int | None = None  # default-pool submit-queue depth (wall #1; shim-only)
+    executor_busy: int | None = None  # default-pool in-flight count (wall #1; shim-only)
+    pool_size: int | None = None  # server-store pool: connections open (wall #2; None on SQLite)
+    pool_idle: int | None = None  # server-store pool: connections free (idle==0 ⇒ saturated)
+    pool_wait_p50_ms: float | None = None  # PRIMARY wall #2: acquire-wait percentiles (ms)
+    pool_wait_p95_ms: float | None = None
+    pool_wait_p99_ms: float | None = None
+    pool_wait_max_ms: float | None = None
 
     @property
     def backlog(self) -> int:
@@ -72,6 +122,20 @@ class _ShardSample:
     db_size_bytes: int
     uptime_s: float
     journal_mode: str
+    synchronous: str | None
+    # B11 (read-only, additive): empty-claim counts (summable) + executor gauges + the server-store
+    # pool snapshot. All default 0/None so an older engine without these fields reads as zeros.
+    empty_claims: int = 0
+    empty_claims_idle_poll: int = 0
+    empty_claims_wake_fanout: int = 0
+    executor_queue_depth: int | None = None
+    executor_busy: int | None = None
+    pool_size: int | None = None
+    pool_idle: int | None = None
+    pool_wait_p50_ms: float | None = None
+    pool_wait_p95_ms: float | None = None
+    pool_wait_p99_ms: float | None = None
+    pool_wait_max_ms: float | None = None
 
 
 class EnginePoller:
@@ -195,8 +259,8 @@ class EnginePoller:
             if shard is None:
                 return None  # one shard unreachable → skip the aggregate (keep polling)
             shard_samples.append(shard)
-        # Journal mode is reported per shard; they share a backend in practice, so take the first
-        # (informational only — it doesn't feed the no-loss check).
+        # Journal mode + synchronous are reported per shard; they share a backend in practice, so take
+        # the first (informational only — neither feeds the no-loss check).
         return EngineSample(
             elapsed_s=time.perf_counter() - self._origin,
             pending=sum(s.pending for s in shard_samples),
@@ -210,7 +274,23 @@ class EnginePoller:
             in_pipeline=sum(s.in_pipeline for s in shard_samples),
             db_size_bytes=sum(s.db_size_bytes for s in shard_samples),
             journal_mode=shard_samples[0].journal_mode,
+            synchronous=shard_samples[0].synchronous,
             uptime_s=max(s.uptime_s for s in shard_samples),
+            # B11: empty-claim counts SUM across shards (each shard runs its own workers). Executor
+            # gauges + the pool snapshot are per-process; take the MAX queue depth/busy and the first
+            # shard reporting a pool (in practice the connscale harness runs a single engine, so this
+            # is exactly that one engine's reading).
+            empty_claims=sum(s.empty_claims for s in shard_samples),
+            empty_claims_idle_poll=sum(s.empty_claims_idle_poll for s in shard_samples),
+            empty_claims_wake_fanout=sum(s.empty_claims_wake_fanout for s in shard_samples),
+            executor_queue_depth=_first_not_none(s.executor_queue_depth for s in shard_samples),
+            executor_busy=_first_not_none(s.executor_busy for s in shard_samples),
+            pool_size=_first_not_none(s.pool_size for s in shard_samples),
+            pool_idle=_first_not_none(s.pool_idle for s in shard_samples),
+            pool_wait_p50_ms=_first_not_none(s.pool_wait_p50_ms for s in shard_samples),
+            pool_wait_p95_ms=_first_not_none(s.pool_wait_p95_ms for s in shard_samples),
+            pool_wait_p99_ms=_first_not_none(s.pool_wait_p99_ms for s in shard_samples),
+            pool_wait_max_ms=_first_not_none(s.pool_wait_max_ms for s in shard_samples),
         )
 
     @staticmethod
@@ -241,4 +321,20 @@ class EnginePoller:
             db_size_bytes=status.db.size_bytes,
             uptime_s=status.engine.uptime_seconds,
             journal_mode=status.db.journal_mode,
+            synchronous=status.db.synchronous,
+            # B11 read-only instrumentation. getattr-with-default so an OLDER engine (whose
+            # StatsResponse/SystemStatus lack these fields) reads as zeros/None — the established
+            # back-compat pattern (mirrors in_pipeline/synchronous). `pool` is the server-only field
+            # (None on SQLite); its acquire_wait sub-object carries the PRIMARY pool-wait percentiles.
+            empty_claims=getattr(stats, "empty_claims", 0) or 0,
+            empty_claims_idle_poll=getattr(stats, "empty_claims_idle_poll", 0) or 0,
+            empty_claims_wake_fanout=getattr(stats, "empty_claims_wake_fanout", 0) or 0,
+            executor_queue_depth=getattr(stats, "executor_queue_depth", None),
+            executor_busy=getattr(stats, "executor_busy", None),
+            pool_size=_pool_attr(status, "size"),
+            pool_idle=_pool_attr(status, "idle"),
+            pool_wait_p50_ms=_pool_wait_attr(status, "p50_ms"),
+            pool_wait_p95_ms=_pool_wait_attr(status, "p95_ms"),
+            pool_wait_p99_ms=_pool_wait_attr(status, "p99_ms"),
+            pool_wait_max_ms=_pool_wait_attr(status, "max_ms"),
         )

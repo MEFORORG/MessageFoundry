@@ -3,7 +3,7 @@
     Create an isolated git worktree (+ its own .venv) for a parallel MessageFoundry build session.
 
 .DESCRIPTION
-    Two parallel efforts (e.g. two Claude Code chats) can't safely build in the same working tree —
+    Two parallel efforts (e.g. two Claude Code chats) can't safely build in the same working tree --
     one's branch switch / edits clobber the other. This adds a git worktree as a SIBLING directory
     (<repo>-<Name>) on its own branch, then bootstraps that worktree's own Python virtualenv so its
     tests/tools run against its own checkout. The worktree shares the same .git/history/remote, so
@@ -45,9 +45,9 @@ $WorktreePath = Join-Path $Parent "$RepoName-$Name"
 if (Test-Path $WorktreePath) { throw "Worktree path already exists: $WorktreePath" }
 
 # Refresh remote-tracking refs FIRST so the base is current. The classic trap is branching a new
-# worktree off a LOCAL `main` that quietly lags `origin/main` — every parallel session then starts
+# worktree off a LOCAL `main` that quietly lags `origin/main` -- every parallel session then starts
 # from stale code. Defaulting -Base to `origin/main` (the freshly fetched remote tip) avoids it. A
-# fetch failure (offline) is a loud warning, not fatal — you can still branch off whatever you have.
+# fetch failure (offline) is a loud warning, not fatal -- you can still branch off whatever you have.
 Write-Host "Fetching origin so the base is current..."
 & git -C $RepoRoot fetch origin --quiet
 if ($LASTEXITCODE -ne 0) {
@@ -67,7 +67,7 @@ if ($branchExists) {
     if ($LASTEXITCODE -eq 0 -and $baseUpstream) {
         $behind = & git -C $RepoRoot rev-list --count "$Base..$baseUpstream" 2>$null
         if ($LASTEXITCODE -eq 0 -and $behind -and [int]$behind -gt 0) {
-            Write-Warning ("Base '$Base' is $behind commit(s) behind its upstream '$baseUpstream' — " +
+            Write-Warning ("Base '$Base' is $behind commit(s) behind its upstream '$baseUpstream' -- " +
                 "the new worktree will start from stale code. Update '$Base' first, or use " +
                 "-Base $baseUpstream (the default).")
         }

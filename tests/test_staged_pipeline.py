@@ -422,9 +422,10 @@ async def test_route_handoff_produces_routed_rows_and_completes_ingress(
 async def test_routed_fifo_preserves_multimessage_order(store: MessageStore) -> None:
     # The serial transform worker relies on a load-bearing invariant: two messages M1 then M2 on the
     # same inbound, each routed to [h1, h2], drain through the routed stage in strict arrival order —
-    # M1.h1, M1.h2, M2.h1, M2.h2. `created_at` advances per route_handoff (across messages) and `rowid`
-    # breaks the tie within a handoff (= handler-list insertion order). Explicit now= keeps it
-    # independent of wall-clock resolution.
+    # M1.h1, M1.h2, M2.h1, M2.h2. Seq-only FIFO (ADR 0059): `rowid` (the SQLite seq) is assigned in
+    # insert order across BOTH messages, and within a handoff in handler-list order, so claim-by-rowid
+    # is strict arrival order with zero wall-clock dependence (the explicit now= values are irrelevant
+    # to ordering now — they are only the ingest-time/metrics stamp).
     m1 = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
     i1 = await _claim_ingress(store, "IB")
     assert i1 is not None
@@ -457,34 +458,33 @@ async def test_routed_fifo_preserves_multimessage_order(store: MessageStore) -> 
     assert await _claim_routed(store, "IB") is None
 
 
-async def test_outbound_fifo_clamps_created_at_on_backward_clock(
-    store: MessageStore, caplog: pytest.LogCaptureFixture
-) -> None:
-    # A backward wall-clock step must not let a later delivery sort ahead of an earlier one:
-    # _fifo_created_at clamps the new row's created_at up to the lane's max, so FIFO claim order
-    # follows ARRIVAL order, not the regressed clock.
+async def test_outbound_fifo_holds_under_backward_clock(store: MessageStore) -> None:
+    # ANTI-REGRESSION (ADR 0059): seq-only per-lane FIFO must hold under a BACKWARD wall-clock step.
+    # Enqueue m1 @now=100 then m2 @now=50 — created_at goes BACKWARD while rowid/seq goes FORWARD. With
+    # the old `created_at, rowid` ordering m2 (created_at=50 < 100) would sort first and break FIFO; the
+    # clamp papered over that. Seq-only orders by rowid alone, so claim order is arrival order (m1 then
+    # m2) regardless of the clock. There is no longer a clamp WARNING and no created_at >= lane-max
+    # guarantee — only the ordering matters. This test FAILS if ordering ever reverts to a
+    # clock-sensitive basis.
     m1 = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB", "first")], now=100.0
     )
-    with caplog.at_level("WARNING"):
-        m2 = await store.enqueue_message(
-            channel_id="IB", raw=RAW, deliveries=[("OB", "second")], now=50.0
-        )  # clock stepped BACK
-    assert any("clock regression" in r.message for r in caplog.records)  # warned on the clamp
-    # The second delivery's ordering timestamp was clamped up to the lane max (>= 100), not left at 50.
-    assert (await store.outbox_for(m2))[0]["created_at"] >= 100.0
-    # FIFO still claims the earlier-arrived delivery first.
+    m2 = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB", "second")], now=50.0
+    )  # clock stepped BACK
+    assert {m1, m2}  # two distinct messages
+    # FIFO still claims the earlier-arrived (lower-seq) delivery first, despite its LARGER created_at.
     head1 = await store.claim_next_fifo("OB")
     assert head1 is not None and head1.payload == "first"
     await store.mark_done(head1.id)
     head2 = await store.claim_next_fifo("OB")
     assert head2 is not None and head2.payload == "second"
-    assert {m1, m2}  # two distinct messages
 
 
-async def test_ingress_fifo_clamps_created_at_on_backward_clock(store: MessageStore) -> None:
-    # Same protection on the per-inbound ingress lane (channel_id-keyed): a backward clock step on the
-    # second arrival must not let it be routed before the first.
+async def test_ingress_fifo_holds_under_backward_clock(store: MessageStore) -> None:
+    # ANTI-REGRESSION (ADR 0059) on the per-inbound ingress lane (channel_id-keyed): m1 @now=100 then m2
+    # @now=50 — a backward clock step must not let the later arrival be routed before the first. Seq-only
+    # FIFO orders by rowid (forward) not created_at (backward), so claim order is arrival order.
     m1 = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
     m2 = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=50.0)  # clock stepped back
     first = await _claim_ingress(store, "IB")

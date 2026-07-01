@@ -86,6 +86,8 @@ from messagefoundry.api.models import (
     OutboxInfo,
     PendingApprovalInfo,
     PendingApprovalResponse,
+    PoolInfo,
+    PoolWaitInfo,
     PurgeResult,
     ReloadRequest,
     ReloadResult,
@@ -149,6 +151,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.integrity import run_startup_attestation
 from messagefoundry.last_resort import install_loop_exception_handler
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
+from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.alert_sinks import notifier_from_settings
 from messagefoundry.pipeline.alerts import LoggingAlertSink
@@ -265,6 +268,16 @@ def _get_engine(request: Request) -> Engine:
     if engine is None:
         raise HTTPException(status_code=503, detail="engine not started")
     return engine
+
+
+def _executor_gauges(app: FastAPI) -> tuple[int | None, int | None]:
+    """The B11 default-executor submit-queue depth + busy count, or ``(None, None)`` when the
+    harness's instrumented boot-shim is not installed (production / every non-connscale run). Read-only
+    observability for ``/stats`` wall #1; never raises."""
+    executor = getattr(app.state, "connscale_executor", None)
+    if executor is None:
+        return None, None
+    return executor.queue_depth, executor.busy
 
 
 def _get_gate(request: Request) -> ApprovalGate | None:
@@ -1921,9 +1934,21 @@ def create_app(
         engine: Engine = Depends(_get_engine),
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> StatsResponse:
+        # B11 (read-only, additive): the runner's empty-claim counters (idle-poll vs wake-fanout herd)
+        # for the connection-scale harness. Default-zero when no runner is attached (graph-less engine).
+        rr = engine.registry_runner
+        ec = rr.empty_claims if rr is not None else None
+        # Executor saturation (B11 wall #1): only populated when the harness installs the default-sized
+        # boot-shim executor; None/absent otherwise, so production /stats is byte-identical.
+        exec_depth, exec_busy = _executor_gauges(app)
         return StatsResponse(
             outbox_by_status=await engine.store.stats(),
             in_pipeline=await engine.store.in_pipeline_depth(),
+            empty_claims=ec.total if ec is not None else 0,
+            empty_claims_idle_poll=ec.idle_poll if ec is not None else 0,
+            empty_claims_wake_fanout=ec.wake_fanout if ec is not None else 0,
+            executor_queue_depth=exec_depth,
+            executor_busy=exec_busy,
         )
 
     @app.get("/metrics")
@@ -1987,6 +2012,28 @@ def create_app(
             total = len(rr.registry.inbound)
             running = sum(1 for name in rr.registry.inbound if rr.inbound_running(name))
         db = await engine.store.db_status()
+        # B11 connection-scale observability: the server-only connection-pool snapshot (acquire-wait
+        # percentiles + size/idle occupancy). None on SQLite (no pool), so the payload is unchanged on
+        # the default backend. Synchronous + cheap (cached counters + a histogram snapshot, no DB I/O).
+        pool_status = engine.store.pool_status()
+        pool = (
+            PoolInfo(
+                backend=pool_status.backend,
+                max_size=pool_status.max_size,
+                size=pool_status.size,
+                idle=pool_status.idle,
+                acquire_wait=PoolWaitInfo(
+                    count=pool_status.acquire_wait.count,
+                    p50_ms=pool_status.acquire_wait.p50_ms,
+                    p95_ms=pool_status.acquire_wait.p95_ms,
+                    p99_ms=pool_status.acquire_wait.p99_ms,
+                    max_ms=pool_status.acquire_wait.max_ms,
+                    mean_ms=pool_status.acquire_wait.mean_ms,
+                ),
+            )
+            if pool_status is not None
+            else None
+        )
         # App-log disk metering (#50), alongside the DB metrics — only when a log dir is configured.
         # Run the blocking stat()s off the event loop (the DB metering is itself off-loop in the store);
         # None when stdout-only or the directory is unreadable, so /status never raises on it.
@@ -2024,9 +2071,11 @@ def create_app(
                 messages=db.messages,
                 events=db.events,
                 audit=db.audit,
+                synchronous=db.synchronous,
             ),
             logs=logs,
             update=update,
+            pool=pool,
         )
 
     # --- cluster observability (Track B Step 7) ------------------------------
@@ -2308,6 +2357,7 @@ def create_managed_app(
     stall_default: StallThreshold | None = None,
     ack_after_default: AckAfter | None = None,
     max_correlation_depth: int = 8,
+    per_lane_wake: bool = False,  # B12 (ADR 0061): per-lane wake events; default-OFF singleton wake
     connection_events: bool = True,
     response_sent_default: bool = True,
     env_values: Mapping[str, Any] | None = None,
@@ -2359,6 +2409,12 @@ def create_managed_app(
         # through safe_exc → the log, so it can't escape as a raw traceback (possible PHI) or die
         # silently (ASVS 16.5.4). Here because set_exception_handler needs the running loop.
         install_loop_exception_handler()
+        # B11 connection-scale measurement hook (harness-only, env-gated): when the harness sets the
+        # gate env var, install a DEFAULT-SIZED instrumented ThreadPoolExecutor as the loop's default
+        # executor so the route/transform to_thread pool's queue-depth/busy become observable on /stats
+        # WITHOUT changing capacity. A no-op returning None in production / every other test, so the
+        # engine is byte-identical when the gate is unset. Stashed for /stats + shut down in finally.
+        app.state.connscale_executor = maybe_install_executor_shim(asyncio.get_running_loop())
         store = await open_store(resolved)
         # Operational alert notifier (webhook/email). None when no transport is configured → the
         # engine falls back to the logging sink. Its background dispatch task is owned by this
@@ -2400,6 +2456,7 @@ def create_managed_app(
             store,
             poll_interval=poll_interval,
             max_correlation_depth=max_correlation_depth,
+            per_lane_wake=per_lane_wake,
             connection_events=connection_events,
             response_sent_default=response_sent_default,
             config_dir=config_dir,
@@ -2479,6 +2536,11 @@ def create_managed_app(
                 # (review M-33).
                 await asyncio.gather(reaper, return_exceptions=True)
             await engine.stop()
+            # B11: shut down the harness-only instrumented executor (None in production / other tests).
+            # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.
+            shim_executor = getattr(app.state, "connscale_executor", None)
+            if shim_executor is not None:
+                shim_executor.shutdown(wait=False)
             if security_notifier is not None:
                 await (
                     security_notifier.aclose()

@@ -70,6 +70,10 @@ TRANSCRIPTS.md
 # Still usable by name (they sit in PROFILES_DIR) and copy-on to the test box.
 /harness/load/profiles/hospital-baseline.toml
 /harness/load/profiles/soak-12h.toml
+# Deep-research survey of alternative OSS DB backends for the shared-DB commit-wall — local working
+# note, not a committed artifact (the conclusion is carried in the throughput ADRs / AI memory).
+/docs/research/db-commit-wall-backend-survey.md
+
 # --- MessageFoundry ---
 .mefor/
 *.db*

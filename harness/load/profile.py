@@ -234,9 +234,13 @@ def load_profile_text(text: str, *, where: str = "<text>") -> LoadProfile:
 
 
 def list_profiles() -> dict[str, str]:
-    """Built-in profile name → description, read from ``harness/load/profiles/*.toml``."""
+    """Built-in profile name → description, read from ``harness/load/profiles/*.toml``. ``connscale*``
+    profiles are a DIFFERENT schema ([connscale], not [load]) consumed by the ``--connscale`` CLI, so
+    they are skipped here rather than reported as invalid load profiles."""
     out: dict[str, str] = {}
     for path in sorted(PROFILES_DIR.glob("*.toml")):
+        if path.name.startswith("connscale"):
+            continue
         try:
             out[load_profile(path).name] = load_profile(path).description
         except LoadProfileError:

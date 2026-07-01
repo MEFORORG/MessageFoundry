@@ -134,7 +134,12 @@ expectation, not just a convention).
 Use a **single generic staged-queue table** with a `stage` discriminator, mirroring the proven outbox
 shape: `id, message_id, stage, payload, status, attempts, next_attempt_at, last_error, created_at,
 updated_at`, indexed `(stage, status, next_attempt_at)` for the claim and ordered `(created_at, rowid)`
-for FIFO. The current **outbox becomes "the outbound stage's rows"** of this model. The Phase-1 store
+for FIFO. **(Superseded by [ADR 0059](0059-seq-only-fifo-ordering.md): per-lane FIFO now orders by
+`seq` alone — SQLite `rowid`, SQL Server `BIGINT IDENTITY`, Postgres `BIGSERIAL` — dropping the
+`_fifo_created_at` write-time clamp. `created_at` stays a real ingest-time/metrics timestamp but is no
+longer the ordering key; one serial writer per lane makes seq order == receive order with zero
+wall-clock dependence. The reliability invariant and the #285 no-skip / head-of-line-blocking lock
+semantics below are unchanged.)** The current **outbox becomes "the outbound stage's rows"** of this model. The Phase-1 store
 methods generalize to take a `stage`: `claim_next_fifo` / `claim_ready`, `mark_done` / `mark_failed` /
 `dead_letter_now`, `reset_stale_inflight`, `pending_depth`. The Phase-1 worker (FIFO/unordered,
 retry-policy, internal-error policy, buildup alert) becomes a **per-stage worker** parameterized by

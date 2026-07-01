@@ -126,6 +126,12 @@ class EngineNode:
     def alive(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
 
+    @property
+    def pid(self) -> int | None:
+        """The engine subprocess PID, or ``None`` if not started / already reaped. Used by the
+        connection-scale harness's OS-side FD sampler (B11)."""
+        return self._proc.pid if self._proc is not None else None
+
     def kill(self) -> None:
         """SIGKILL — the faithful crash. No-op if already gone."""
         if self._proc is not None and self._proc.returncode is None:

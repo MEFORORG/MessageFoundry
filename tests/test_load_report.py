@@ -52,9 +52,22 @@ def _hist(value_ms: float, n: int) -> Histogram:
 
 def _poller(read: int, written: int, *, backlog: int = 0) -> EnginePoller:
     p = EnginePoller("http://x", None, origin=0.0)
-    base = EngineSample(0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, "wal", 1.0)
+    base = EngineSample(0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, "wal", "normal", 1.0)
     final = EngineSample(
-        10.0, backlog, 0, written, 0, read, written, 0, backlog, backlog, 5000, "wal", 11.0
+        10.0,
+        backlog,
+        0,
+        written,
+        0,
+        read,
+        written,
+        0,
+        backlog,
+        backlog,
+        5000,
+        "wal",
+        "normal",
+        11.0,
     )
     p._samples.extend([base, final])
     return p
@@ -229,7 +242,7 @@ def test_engine_poller_parses_sample_from_client() -> None:
                 SimpleNamespace(read=None, written=20, errored=0, queue_depth=0),  # outbound row
             ],
             status=lambda: SimpleNamespace(
-                db=SimpleNamespace(size_bytes=4096, journal_mode="wal"),
+                db=SimpleNamespace(size_bytes=4096, journal_mode="wal", synchronous="normal"),
                 engine=SimpleNamespace(uptime_seconds=12.0),
             ),
         )
@@ -242,3 +255,4 @@ def test_engine_poller_parses_sample_from_client() -> None:
     assert sample.backlog == 3 and sample.queue_depth == 3
     assert sample.in_pipeline == 4  # taken straight from /stats, not derived from outbox_by_status
     assert sample.db_size_bytes == 4096
+    assert sample.synchronous == "normal"  # B7: the durability mode rides through the sample

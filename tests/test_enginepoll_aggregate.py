@@ -38,6 +38,7 @@ def _shard(
     db_size_bytes: int = 0,
     uptime_s: float = 1.0,
     journal_mode: str = "wal",
+    synchronous: str | None = "normal",
 ) -> _ShardSample:
     return _ShardSample(
         pending=pending,
@@ -52,6 +53,7 @@ def _shard(
         db_size_bytes=db_size_bytes,
         uptime_s=uptime_s,
         journal_mode=journal_mode,
+        synchronous=synchronous,
     )
 
 

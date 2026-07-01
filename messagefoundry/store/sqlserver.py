@@ -24,6 +24,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from time import perf_counter
 from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
@@ -51,6 +52,7 @@ from messagefoundry.store.crypto import (
     cipher_info,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
+from messagefoundry.store.pool_metrics import AcquireWaitHistogram, PoolStatus
 from messagefoundry.store.store import (
     AlertInstance,
     ConnectionEvent,
@@ -131,10 +133,21 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_queue_ready ON queue(stage, status, next_attempt_at)""",
     """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_message','IndexID') IS NULL
         CREATE INDEX ix_queue_message ON queue(message_id)""",
-    """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_fifo_out','IndexID') IS NULL
-        CREATE INDEX ix_queue_fifo_out ON queue(stage, destination_name, status, created_at, seq)""",
-    """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_fifo_in','IndexID') IS NULL
-        CREATE INDEX ix_queue_fifo_in ON queue(stage, channel_id, status, created_at, seq)""",
+    # FIFO covering indexes trail in `seq` alone (seq-only per-lane FIFO, ADR 0059) so the claim's
+    # `... ORDER BY seq` is an index-ordered scan, NOT a sort. `created_at` was dropped from the key.
+    # ADR 0060: the seq-trailing index is named ix_queue_fifo_*_seq (distinct from the old created_at-
+    # trailing ix_queue_fifo_*), so an upgraded DB DROPs the stale old-named index and CREATEs the new
+    # one under a name that name-existence guards tell apart. DROP-old then CREATE-new, all inside this
+    # applock-serialized _SCHEMA batch → one atomic commit. (The batch's per-statement command timeout is
+    # exempted in _ensure_schema so a large first-upgrade rebuild can't be killed → crash-loop startup.)
+    """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_fifo_out','IndexID') IS NOT NULL
+        DROP INDEX ix_queue_fifo_out ON queue""",
+    """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_fifo_out_seq','IndexID') IS NULL
+        CREATE INDEX ix_queue_fifo_out_seq ON queue(stage, destination_name, status, seq)""",
+    """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_fifo_in','IndexID') IS NOT NULL
+        DROP INDEX ix_queue_fifo_in ON queue""",
+    """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_fifo_in_seq','IndexID') IS NULL
+        CREATE INDEX ix_queue_fifo_in_seq ON queue(stage, channel_id, status, seq)""",
     # LOCK_ESCALATION=DISABLE: `queue` is a hot multi-writer table; a depth-triggered escalation to a
     # TABLE X lock during a deep startup orphan sweep would block ALL claim/handoff workers. Degrade a
     # deep sweep to many row locks under RCSI instead. Idempotent (re-running re-sets the same option).
@@ -377,6 +390,12 @@ class SqlServerStore:
         self._settings = settings
         self._cipher: Cipher = cipher or IdentityCipher()
         self.path = f"{settings.server}/{settings.database}"  # descriptor for db_status
+        # B11 connection-scale observability: a perf_counter-measured histogram of how long each
+        # pooled-connection acquire() WAITS — the PRIMARY pool-wait wall signal (it grows monotonically
+        # with worker contention once the pool saturates, where occupancy can't). Recorded on the single
+        # _acquire() chokepoint below; read-only/additive, surfaced via pool_status() → the server-only
+        # /status `pool` field; default-empty (all zeros) when nothing has contended.
+        self._acquire_wait = AcquireWaitHistogram()
         # ADR 0005 transform-state read-through cache (parity with SQLite/PG): loaded at open, updated
         # post-commit by transform_handoff, surfaced via state_view() so a Handler's cross-message
         # state_get(...) resolves in-process.
@@ -641,6 +660,17 @@ class SqlServerStore:
     async def _ensure_schema(self) -> None:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # B10/ADR 0060: exempt the schema DDL from the per-statement command timeout. The first-
+                # upgrade FIFO index rebuild (DROP old + CREATE ix_queue_fifo_*_seq) over a large backlog
+                # can exceed command_timeout (30s default); being killed mid-CREATE would roll back this
+                # batch and re-fail on every restart — a startup crash-loop. raw.timeout=0 = no client
+                # statement timeout for this connection; _acquire re-applies command_timeout on the next
+                # borrow, so no restore is needed. (sp_getapplock below keeps its own server-side
+                # @LockTimeout from command_timeout, so a peer's in-progress migration still bounds the
+                # lock wait rather than hanging.)
+                raw = getattr(conn, "_conn", None)
+                if raw is not None:
+                    raw.timeout = 0
                 # Serialize schema-init across concurrent opens (e.g. a 2-node HA cold start against a
                 # virgin DB) — the T-SQL analog of the Postgres store's schema advisory lock. Without it
                 # the `IF OBJECT_ID(...) IS NULL CREATE` guards below are check-then-create: two nodes
@@ -688,12 +718,35 @@ class SqlServerStore:
         we set it on the underlying ``pyodbc.Connection`` (``_conn``); aioodbc 0.5.0 has no creation
         hook (``after_created``), so we apply it per-acquire (an idempotent int assignment). The prior
         ``conn.timeout = ...`` raised AttributeError and was silently swallowed, so no statement
-        timeout was ever applied — a hung statement then held its queue/messages row X-locks forever."""
+        timeout was ever applied — a hung statement then held its queue/messages row X-locks forever.
+
+        B11: the perf_counter pair records the acquire WAIT time (the PRIMARY pool-wait wall signal)
+        into the acquire-wait histogram. Every store DB call funnels through here (the single _acquire
+        chokepoint), so the connection-scale harness sees how long the per-lane workers wait for a
+        pooled connection as the pool saturates. Read-only/additive — the timing never changes the
+        acquired connection or its release."""
+        t0 = perf_counter()
         async with self._pool.acquire() as conn:
+            self._acquire_wait.record((perf_counter() - t0) * 1000.0)
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit
             yield conn
+
+    def pool_status(self) -> PoolStatus | None:
+        """The aioodbc pool snapshot (B11): size/idle occupancy + the PRIMARY acquire-wait percentiles.
+
+        ``size``/``freesize`` are the aioodbc ``Pool`` properties (verified against the pinned
+        ``aioodbc==0.5.0``): ``size`` is the connections currently open, ``freesize`` the currently-free
+        ones. Synchronous + cheap (cached counters + an in-process histogram snapshot — no DB
+        round-trip)."""
+        return PoolStatus(
+            backend="sqlserver",
+            max_size=self._pool.maxsize,
+            size=self._pool.size,
+            idle=self._pool.freesize,
+            acquire_wait=self._acquire_wait.summary(),
+        )
 
     @asynccontextmanager
     async def _cursor(self, conn: Any) -> AsyncIterator[Any]:
@@ -848,26 +901,6 @@ class SqlServerStore:
         for mid in sorted(set(message_ids)):
             await self._applock(cur, f"mefor:finalize:{mid}")
 
-    async def _fifo_created_at(
-        self, cur: Any, stage: str, lane_col: str, lane_val: str, now: float
-    ) -> float:
-        """The ``created_at`` to stamp on a new ``stage`` row so per-lane FIFO order stays monotonic
-        even if the wall clock regresses: ``max(now, the lane's current max created_at)``. ``lane_col``
-        is a code-controlled literal (allow-listed below — never user input). One grouped MAX per lane
-        bounds the lock-hold window under high fan-out; under RCSI it reads the committed snapshot
-        without blocking writers."""
-        if lane_col not in (
-            "channel_id",
-            "destination_name",
-        ):  # injection guard (survives python -O)
-            raise ValueError(f"invalid lane column: {lane_col!r}")
-        await cur.execute(
-            f"SELECT MAX(created_at) FROM queue WHERE stage=? AND {lane_col}=?", (stage, lane_val)
-        )
-        row = await cur.fetchone()
-        prior = row[0] if row and row[0] is not None else None
-        return max(now, prior) if prior is not None else now
-
     async def _maybe_finalize(self, cur: Any, message_id: str, now: float) -> None:
         """Recompute and persist a message's terminal disposition — the SOLE authority for it. Scans
         ALL stages of ``queue`` so a delivered handler can't finalize the message while a sibling
@@ -999,10 +1032,9 @@ class SqlServerStore:
     async def _insert_outbound(
         self, cur: Any, message_id: str, channel_id: str, dest_name: str, payload: str, now: float
     ) -> None:
-        """Insert one ``stage='outbound'`` queue row (lane = destination_name), FIFO-clamped."""
-        created_at = await self._fifo_created_at(
-            cur, Stage.OUTBOUND.value, "destination_name", dest_name, now
-        )
+        """Insert one ``stage='outbound'`` queue row (lane = destination_name)."""
+        # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (IDENTITY) — ADR 0059.
+        created_at = now
         await cur.execute(
             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
             " payload, status, attempts, next_attempt_at, owner, lease_expires_at, created_at,"
@@ -1030,10 +1062,9 @@ class SqlServerStore:
         payload: str,
         now: float,
     ) -> None:
-        """Insert one ``stage='routed'`` queue row (lane = channel_id), FIFO-clamped."""
-        created_at = await self._fifo_created_at(
-            cur, Stage.ROUTED.value, "channel_id", channel_id, now
-        )
+        """Insert one ``stage='routed'`` queue row (lane = channel_id)."""
+        # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (IDENTITY) — ADR 0059.
+        created_at = now
         await cur.execute(
             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
             " payload, status, attempts, next_attempt_at, owner, lease_expires_at, created_at,"
@@ -1116,9 +1147,8 @@ class SqlServerStore:
                     self._enc(child_meta),
                 ),
             )
-            ingress_created = await self._fifo_created_at(
-                cur, Stage.INGRESS.value, "channel_id", pt_channel, now
-            )
+            # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (IDENTITY) — ADR 0059.
+            ingress_created = now
             await cur.execute(
                 "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
                 " handler_name, payload, status, attempts, next_attempt_at, owner,"
@@ -1166,9 +1196,8 @@ class SqlServerStore:
         rows only), so it is inert; it exists solely so the finalizer counts the Send's outcome. The
         payload is the empty-body sentinel; ``next_attempt_at`` is ``now`` (terminal, never due)."""
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
-        created_at = await self._fifo_created_at(
-            cur, Stage.OUTBOUND.value, "destination_name", pt_name, now
-        )
+        # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (IDENTITY) — ADR 0059.
+        created_at = now
         await cur.execute(
             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
             " payload, status, attempts, next_attempt_at, owner, lease_expires_at, created_at,"
@@ -1229,9 +1258,8 @@ class SqlServerStore:
                         self._enc(metadata),
                     ),
                 )
-                created_at = await self._fifo_created_at(
-                    cur, Stage.INGRESS.value, "channel_id", channel_id, now
-                )
+                # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (IDENTITY) — ADR 0059.
+                created_at = now
                 await cur.execute(
                     "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
                     " handler_name, payload, status, attempts, next_attempt_at, owner,"
@@ -1510,9 +1538,8 @@ class SqlServerStore:
                     # ADR 0013 Increment 2: a drainable Stage.RESPONSE work-row in the SAME txn (orphan-
                     # free) — a token referencing the immutable artifact by PK, on the loopback lane.
                     artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
-                    work_created = await self._fifo_created_at(
-                        cur, Stage.RESPONSE.value, "channel_id", reingress_to, now
-                    )
+                    # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
+                    work_created = now
                     await cur.execute(
                         "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
                         " handler_name, payload, status, attempts, next_attempt_at, owner,"
@@ -1989,9 +2016,8 @@ class SqlServerStore:
                         ),
                     )
                     if not peek_failed:
-                        ingress_created = await self._fifo_created_at(
-                            cur, Stage.INGRESS.value, "channel_id", loopback_channel_id, now
-                        )
+                        # ingest-time (ADR 0009) + metrics only; FIFO orders by seq — ADR 0059.
+                        ingress_created = now
                         await cur.execute(
                             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
                             " handler_name, payload, status, attempts, next_attempt_at, owner,"
@@ -2639,8 +2665,16 @@ class SqlServerStore:
     ) -> OutboxItem | None:
         """Claim the single oldest *due* pending row for one lane at ``stage`` (strict FIFO — the head
         blocks the lane while it backs off, via the WHERE on the UPDATE). The lane key is stage-aware
-        (``destination_name`` outbound, ``channel_id`` ingress/routed); ordering is ``created_at, seq``
-        (the IDENTITY tiebreak preserving same-txn insertion order — NOT the random uuid ``id``). This
+        (``destination_name`` outbound, ``channel_id`` ingress/routed); ordering is ``seq`` alone
+        (seq-only per-lane FIFO, ADR 0059): ``seq`` is a ``BIGINT IDENTITY`` the DB assigns
+        monotonically at INSERT (never the random uuid ``id``), so among a lane's live pending rows
+        ``ORDER BY seq`` is strict insert-commit order — **with zero wall-clock dependence**, immune to a
+        skewed-standby clock across failover. This is correct **only because there is exactly ONE serial
+        writer per (stage, lane-key)** (the per-inbound listener/router/transform worker; the
+        destination_name fan-in is multi-writer but seq is still DB-assigned in commit order, so the
+        first committer gets the lower seq). With ``created_at`` no longer an ordering backstop (ADR
+        0059), a future second-writer-per-lane or delete+reinsert-on-retry (re-minting seq) would break
+        FIFO — pin that assumption if either is ever added. This
         backend runs active-passive HA with one active node (the leader), so owner/lease stay NULL on
         the FIFO claim and the runner never owns lanes.
 
@@ -2671,7 +2705,7 @@ class SqlServerStore:
             epoch_args = (self._lease_key, self._leader_epoch)
         sql = (
             "WITH head AS (SELECT TOP (1) * FROM queue WITH (UPDLOCK, ROWLOCK)"
-            f" WHERE stage=? AND {lane_col}=? AND status=? ORDER BY created_at, seq)"
+            f" WHERE stage=? AND {lane_col}=? AND status=? ORDER BY seq)"
             " UPDATE head SET status=?, attempts=attempts+1, updated_at=?,"
             " owner=NULL, lease_expires_at=NULL"
             " OUTPUT inserted.id, inserted.message_id, inserted.channel_id,"
@@ -2751,6 +2785,157 @@ class SqlServerStore:
             attempts=d["attempts"],
             stage=stage,
         )
+
+    async def claim_next_fifo_batch(
+        self,
+        name: str,
+        now: float | None = None,
+        *,
+        stage: str,
+        limit: int,
+    ) -> list[OutboxItem]:
+        """Claim the **contiguous DUE head-prefix** (up to ``limit`` rows) for one lane at ``stage`` in
+        ONE commit — the batched cousin of :meth:`claim_next_fifo` (ADR 0058). SQL Server runs the full
+        ingress -> routed -> outbound staged pipeline (module header; ``supports_ingest_stage = True``),
+        so it is a real ingress/routed scale-path store and gets a REAL batch claim, not a delegation.
+
+        **SELECT-then-UPDATE in ONE transaction** (the same shape the SQLite impl already uses), with the
+        single claim's ``UPDLOCK, ROWLOCK`` **no-READPAST** lock providing the head-of-line *blocking* that
+        SQLite gets from its global lock:
+
+        1. **Lock the prefix candidates** — a plain ``SELECT TOP (@limit) id, next_attempt_at, seq FROM
+           queue WITH (UPDLOCK, ROWLOCK) ... ORDER BY seq`` (seq-only per-lane FIFO, ADR 0059; **NO window
+           function, NO READPAST**). Because there is no window function and no re-join to ``queue``, this acquires the
+           U-locks *as it scans the rows in FIFO order* and **BLOCKS** on a producer-locked head exactly
+           like the single claim's ``head`` SELECT — it cannot read past a locked interior head to a later
+           seq (#285 preserved). The U-locks are held until this txn commits. ``LOCK_ESCALATION=DISABLE``
+           on ``queue`` + the ``ROWLOCK`` hint + the bounded ``@limit`` (<= 64) keep it to at most N row
+           locks, so no escalation to a TABLE lock.
+        2. **Contiguous-due cutoff in Python** — iterate the rows (sorted by ``seq`` defensively, though the
+           ``ORDER BY`` already returns them in lane order) and ``break`` at the first row whose
+           ``next_attempt_at > now``; collect the due-prefix ids. A not-due *head* yields an empty prefix
+           ⇒ ``[]`` ⇒ the lane blocks (== the single claim's ``None``); a not-due interior head truncates
+           the prefix there, never reaching past it.
+        3. **Claim the prefix** — ``UPDATE queue SET status=?, attempts=attempts+1, updated_at=? OUTPUT
+           inserted.* WHERE id IN (<qmarks>) AND status=?`` (the ``AND status=?`` PENDING is a
+           belt-and-suspenders guard; the held U-locks already prevent another claimer touching these rows).
+           The H1 ``epoch_guard`` is appended verbatim so a fenced ex-leader claims 0 rows. OUTPUT projects
+           the SAME fields as the single claim plus ``inserted.seq`` (the plaintext FIFO tiebreak, never
+           PHI) — ``created_at`` is omitted, so the worker's ingest-time is ``None`` here, consistent with
+           the single claim.
+
+        Why NOT the earlier single-statement window-CTE: ``WITH locked AS (SELECT TOP(N) ..., SUM(...) OVER
+        (...) FROM queue WITH(UPDLOCK,ROWLOCK)...), head AS (...) UPDATE q ... FROM queue q JOIN head``. The
+        **window function** plus the **re-join to ``queue q``** let the optimizer satisfy the read from a
+        version/index without holding the UPDLOCK *through the lock-wait* under the store's force-enabled
+        RCSI — so it did **not** block on a producer-locked head and could claim a later seq ahead of it (a
+        #285 violation caught by T6 on real SQL Server). The SELECT-then-UPDATE form operates the lock-wait
+        directly on the candidate rows, matching the single claim's blocking exactly.
+
+        Read with ``fetchall`` under the EF-6 ``_cursor`` close-before-release discipline (no-MARS), like
+        the single claim. An undecryptable row is dead-lettered and DROPPED (poison containment); the
+        surviving tail keeps its order. The outbound/delivery lane is never batched — callers pass an
+        ingress/routed ``stage`` (the H2 skip-and-complete that the single outbound claim runs in-txn is
+        deliberately absent here; ingress/routed rows have ``destination_name`` NULL and never hit it)."""
+        now = time.time() if now is None else now
+        lane_col = self._lane_col(stage)  # code-controlled literal
+        # H1 FENCING TOKEN — identical to the single claim: gate the UPDATE on the held leader epoch still
+        # being current so a paused/superseded ex-leader claims 0 rows. epoch=None disables the guard.
+        epoch_guard = ""
+        epoch_args: tuple[Any, ...] = ()
+        if self._leader_epoch is not None:
+            epoch_guard = (
+                " AND (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=?) <= ?"
+            )
+            epoch_args = (self._lease_key, self._leader_epoch)
+        # STEP 1 — lock the TOP(N) oldest PENDING rows in FIFO order. A plain SELECT (no window function,
+        # no re-join to `queue`) under WITH (UPDLOCK, ROWLOCK) takes its U-locks AS it scans the rows in
+        # `seq` order (seq-only per-lane FIFO, ADR 0059 — one serial writer per lane assigns IDENTITY seq
+        # in insert-commit order), so it BLOCKS on a producer-locked head — it cannot read past a locked
+        # interior head to a later seq (the #285 no-skip guarantee). NO READPAST: blocking, not skipping,
+        # is the correct FIFO semantic for a transiently producer-locked head (a long lock is bounded by
+        # command_timeout). Mirrors the single claim's `head` SELECT, generalized to TOP(N).
+        select_sql = (
+            "SELECT TOP (?) id, next_attempt_at, seq FROM queue WITH (UPDLOCK, ROWLOCK)"
+            f" WHERE stage=? AND {lane_col}=? AND status=? ORDER BY seq"
+        )
+        select_args = (limit, stage, name, OutboxStatus.PENDING.value)
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(select_sql, select_args)
+                lock_cols = [c[0] for c in cur.description] if cur.description else []
+                locked = [dict(zip(lock_cols, r)) for r in await cur.fetchall()]
+                # STEP 2 — contiguous-due truncation in Python. The SELECT already returns FIFO order; sort
+                # by `seq` defensively, then STOP at the first not-due row (never skip past it: a not-due
+                # head blocks the lane exactly as the single claim's None does — strict per-lane FIFO).
+                due_ids: list[str] = []
+                for d in sorted(locked, key=lambda d: d["seq"]):
+                    if d["next_attempt_at"] > now:
+                        break
+                    due_ids.append(d["id"])
+                if not due_ids:
+                    # Head not due / nothing pending — block the lane (== single-claim None). Commit to
+                    # release the U-locks held by the SELECT before the connection returns to the pool.
+                    await conn.commit()
+                    return []
+                # STEP 3 — claim exactly the due prefix. The U-locks from STEP 1 are still held (same txn),
+                # so no other claimer can race these rows; `AND status=?` (PENDING) is a belt-and-suspenders
+                # guard. OUTPUT projects the single claim's fields + `seq` (the plaintext FIFO tiebreak).
+                qmarks = ",".join("?" * len(due_ids))
+                update_sql = (
+                    "UPDATE queue SET status=?, attempts=attempts+1, updated_at=?"
+                    " OUTPUT inserted.id, inserted.message_id, inserted.channel_id,"
+                    " inserted.destination_name, inserted.handler_name, inserted.payload,"
+                    " inserted.attempts, inserted.seq"
+                    f" WHERE id IN ({qmarks}) AND status=?{epoch_guard}"
+                )
+                update_args = (
+                    OutboxStatus.INFLIGHT.value,
+                    now,  # updated_at
+                    *due_ids,
+                    OutboxStatus.PENDING.value,
+                    *epoch_args,
+                )
+                await cur.execute(update_sql, update_args)
+                columns = [c[0] for c in cur.description] if cur.description else []
+                # EF-6: drain the OUTPUT rows with fetchall; _cursor closes the statement handle before
+                # the connection returns to the pool (no-MARS).
+                rows = await cur.fetchall()
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        if not rows:
+            # The epoch_guard matched 0 rows (a fenced ex-leader) — nothing claimed.
+            return []
+        # The OUTPUT clause does NOT guarantee row order; re-establish the lane's FIFO order in memory by
+        # `seq` (seq-only per-lane FIFO, ADR 0059). A single serial writer per lane assigns the IDENTITY
+        # `seq` in insert-commit order, and failover preserves seq (recovery/replay never re-stamp it), so
+        # `ORDER BY seq` IS the lane's receive order with zero wall-clock dependence. `seq` is the only
+        # extra OUTPUT field over the single claim; it is the plaintext FIFO key, never PHI, and is not
+        # read as created_at. The worker then iterates strictly oldest-first (it never re-sorts).
+        decoded = sorted((dict(zip(columns, r)) for r in rows), key=lambda d: d["seq"])
+        items: list[OutboxItem] = []
+        for d in decoded:
+            try:
+                payload = self._cipher.decrypt(d["payload"])
+            except CipherError as exc:
+                log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], exc)
+                await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
+                continue
+            items.append(
+                OutboxItem(
+                    id=d["id"],
+                    message_id=d["message_id"],
+                    channel_id=d["channel_id"],
+                    destination_name=d["destination_name"],
+                    handler_name=d["handler_name"],
+                    payload=payload,
+                    attempts=d["attempts"],
+                    stage=stage,
+                )
+            )
+        return items
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -3074,9 +3259,11 @@ class SqlServerStore:
         top = "TOP (1) " if top_only else ""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # `top_only` cancels the true FIFO head, so the tiebreak after next_attempt_at must match
+                # the claim's seq-only order, NOT created_at (no longer the ordering key; ADR 0059).
                 await cur.execute(
                     f"SELECT {top}id, message_id FROM queue WHERE {' AND '.join(where)}"
-                    " ORDER BY next_attempt_at, created_at",
+                    " ORDER BY next_attempt_at, seq",
                     tuple(params),
                 )
                 rows = [(r[0], r[1]) for r in await cur.fetchall()]
@@ -3985,6 +4172,7 @@ class SqlServerStore:
             messages=await self._count("messages"),
             events=await self._count("message_events"),
             audit=await self._count("audit_log"),
+            synchronous=None,  # SQLite-only knob; SQL Server durability rides journal_mode (recovery model)
         )
 
     async def integrity_check(self) -> tuple[bool, str]:

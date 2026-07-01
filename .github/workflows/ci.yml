@@ -431,6 +431,33 @@ jobs:
           MEFOR_ALLOW_INSECURE_TLS: "1"
         run: pytest tests/test_load_failover_sqlserver.py -v
 
+      - name: Run the throughput-lever backend invariants on real SQL Server (B1 inline, B2 batch-claim, ...)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        # The staged-pipeline throughput levers (ADR 0057 inline fast-path, ADR 0058 batch-claim, ...) carry
+        # reliability-core invariant tests — crash-replay, poison-bound, and the per-lane-FIFO locked-head-
+        # BLOCKS (#285) gate — that are MEFOR_TEST_SQLSERVER-gated but live in their OWN files, so the named
+        # suites above never picked them up and they ran only on SQLite. Run them here against the real
+        # backend. APPEND each new lever's test file per docs/throughput-build-plan.md.
+        run: >-
+          pytest -v
+          tests/test_inline_fast_path.py
+          tests/test_batch_claim_fifo.py
+          tests/test_batch_claim_worker.py
+          tests/test_batch_claim_locking.py
+          tests/test_seq_only_fifo.py
+          tests/test_fifo_index_migration.py
+          tests/test_per_lane_wake.py
+
   # Postgres store backend (Track B): run the gated store suite against a real PostgreSQL service
   # container (Linux, so 1x minutes). Skipped on PRs like the other server-DB job to save spend; runs
   # on push to main and on-demand (workflow_dispatch — use `gh workflow run ci.yml --ref <branch>` to
@@ -503,6 +530,53 @@ jobs:
           MEFOR_STORE_ENCRYPT: "false"
           MEFOR_ALLOW_INSECURE_TLS: "1"
         run: pytest tests/test_load_failover_postgres.py -v
+
+      - name: Run the throughput-lever backend invariants on real Postgres (B1 inline, B2 batch-claim, ...)
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        # The throughput levers' MEFOR_TEST_POSTGRES-gated invariants (esp. the FOR-UPDATE no-SKIP-LOCKED
+        # locked-head-BLOCKS twin of #285, and the batch FIFO/crash tests) live in their own files. APPEND
+        # each new lever's test file per docs/throughput-build-plan.md.
+        run: >-
+          pytest -v
+          tests/test_inline_fast_path.py
+          tests/test_batch_claim_fifo.py
+          tests/test_batch_claim_worker.py
+          tests/test_batch_claim_locking.py
+          tests/test_seq_only_fifo.py
+          tests/test_fifo_index_migration.py
+          tests/test_per_lane_wake.py
+
+      - name: Run the connection-scale pool-wait smoke on real Postgres (B11 wall #2, tiny pool)
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+          # FORCE a below-default pool (4 connections) so the perf_counter-measured acquire-WAIT
+          # histogram (the PRIMARY pool-wait signal) is non-trivial even at small N: ~3N inbound workers
+          # contend for 4 connections, so acquires actually queue and the percentiles populate. The
+          # default pool (5+) would mask the wall. 4 (not 1-2) is deliberate: GET /status runs
+          # db_status()'s four sequential COUNT(*) queries on every poll, and an extremely tiny pool
+          # starves those acquires past the poller's HTTP timeout under the empty-claim herd on a slow
+          # runner — every poll then fails and the drain loops burn the test budget (the PR #675 hang).
+          # This still gives the B11 pool-wait instrumentation real regression coverage SQLite (no pool)
+          # cannot — the connscale harness OWNS the engine subprocess and inherits this env.
+          MEFOR_STORE_POOL_SIZE: "4"
+        run: pytest tests/test_connscale_postgres.py -v
 
   # Headless load test (Track B / throughput): serve the synthetic high-fan-out load config (auth
   # off, small fan-out) and drive the smoke profile through the real `python -m harness --load` CLI,

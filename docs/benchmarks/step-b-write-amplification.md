@@ -22,8 +22,9 @@ transaction (claim → produce-next-stage rows → complete/consume this stage):
 For the common **single-handler** message (H = 1, delivering to N destinations), Step B is **three
 transactions** (`enqueue_ingress` + `route_handoff` + `transform_handoff`):
 
-- **3 commits/message** — up from Step A's 2, and the pre-staging baseline of 1 (≈3× the inline model,
-  as ADR 0001 Q5 predicted).
+- **3 *producer-handoff* commits/message** — up from Step A's 2, and the pre-staging baseline of 1
+  (≈3× the inline model, as ADR 0001 Q5 predicted). This counts only the producer-side handoff
+  transactions in the table above — see the end-to-end note below for the throughput-relevant figure.
 - **+1 transient queue-row class** — the `routed` row, INSERTed at `route_handoff` and DELETEd at
   `transform_handoff` (on top of Step A's transient `ingress` row).
 - **+1 `transformed` event** per handler — the disposition is logged as it flows
@@ -31,6 +32,19 @@ transactions** (`enqueue_ingress` + `route_handoff` + `transform_handoff`):
 - **Persistent footprint is unchanged at N outbound rows.** Both the `ingress` and the `routed` rows
   are *consumed* (deleted) at their handoff, so the raw body is never kept twice at rest beyond the
   brief route→transform window — the same PHI-at-rest posture as Step A's ingress row (`docs/PHI.md`).
+
+> **End-to-end durable-commit count is ~7/message, not 3 — use ~7 for commit-tier throughput modeling.**
+> The "3 commits" above counts only the three *producer-stage handoff* transactions. Each stage
+> transition is actually **two** commits, not one: the consuming worker first commits a **standalone
+> `claim_next_fifo`** (the `attempts+1` poison-guard must be durable *before* the claimed work —
+> [ADR 0055](../adr/0055-group-commit-durable-write.md) AC-2; the claim **cannot fuse** with its handoff
+> because `route_only`/`transform_one` run off the event loop via `asyncio.to_thread` *between* them),
+> then commits the handoff. Plus the per-outbound **delivery worker** adds a `claim_next_fifo` +
+> `mark_done`. So the single-handler fan-out-1 path is `enqueue_ingress` + (claim ingress,
+> `route_handoff`) + (claim routed, `transform_handoff`) + (claim outbound, `mark_done`) = **~7 durable
+> commits/message** (e.g. 521 msg/s ⇒ ~3,647 commits/s). This matches
+> [ADR 0055](../adr/0055-group-commit-durable-write.md)'s "~7 transactions/msg"; the **3** figure is the
+> *producer-handoff* subset only.
 
 ### Multi-handler fan-out
 

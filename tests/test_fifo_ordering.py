@@ -47,7 +47,8 @@ async def test_fifo_dup_head_is_completed_and_advanced_no_reorder(store: Message
     assert h1 is not None and h1.payload == "p1"
     await store.mark_done(h1.id, now=200.0)
     # Simulate a post-commit re-claim: force p1 back to PENDING at the front of the lane (its FIFO
-    # created_at is the smallest, so it is the head again) WITHOUT clearing its ledger entry.
+    # rowid/seq is the smallest, so it is the head again — seq-only ordering, ADR 0059) WITHOUT
+    # clearing its ledger entry.
     await store._db.execute("UPDATE queue SET status=? WHERE id=?", ("pending", h1.id))
     await store._db.commit()
     # The claim consumes the dup head in place (returns None) — it must NOT re-offer p1, and it must
