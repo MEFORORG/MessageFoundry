@@ -23,6 +23,12 @@
                                                 engine the harness OWNS, and read the connection-scale
                                                 walls vs N. Exits 0 (no-loss + SLOs met) / 1 (an SLO
                                                 violated) / 2 (setup) / 3 (interrupted).
+``python -m harness multishard ...``  → run the multi-ENGINE store-contention sweep (WS-B): spin up N
+                                                concurrently-active `serve` engines against ONE shared
+                                                store (disjoint inbound/sink/API ports + disjoint
+                                                connection names), drive per-engine load, and read whether
+                                                one store is the aggregate ceiling. Exits 0 (zero-loss at
+                                                every N) / 1 (loss) / 2 (setup) / 3 (interrupted).
 
 The headless paths import no PySide6, so they run on a display-less runner; the GUI import is
 deferred into :func:`_launch_gui`.
@@ -44,6 +50,12 @@ def main(argv: list[str] | None = None) -> int:
             _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
         except (AttributeError, ValueError, OSError):
             pass
+
+    # `multishard` is a positional subcommand with its own option set (the flag-based `--connscale`/
+    # `--load` style doesn't fit an N-engine sweep), so route it before the shared flag parser.
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "multishard":
+        return _run_multishard(raw[1:])
 
     parser = argparse.ArgumentParser(prog="harness", description="MessageFoundry test harness")
     parser.add_argument(
@@ -368,6 +380,124 @@ def _run_connscale(args: argparse.Namespace) -> int:
         Path(args.report_json).write_text(report.to_json(), encoding="utf-8")
     if args.report_csv:
         Path(args.report_csv).write_text(report.to_csv(), encoding="utf-8")
+    return report.exit_code
+
+
+def _run_multishard(argv: list[str]) -> int:
+    import asyncio
+    import os
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(
+        prog="harness multishard",
+        description="Multi-ENGINE store-contention sweep (WS-B): N concurrently-active `serve` engines "
+        "against ONE shared store, disjoint lanes, measuring whether one store is the aggregate ceiling.",
+    )
+    parser.add_argument(
+        "--engines",
+        required=True,
+        help="engine count(s) to sweep — a single N or a comma-separated list (e.g. 2,4,8,16)",
+    )
+    parser.add_argument(
+        "--count", type=int, default=30, help="inbound MLLP connections PER engine (C)"
+    )
+    parser.add_argument(
+        "--per-conn-rate", type=float, default=13.0, help="target msg/s per connection (R)"
+    )
+    parser.add_argument(
+        "--hold-seconds", type=float, default=60.0, help="steady-state hold per N step"
+    )
+    parser.add_argument("--inbound-base", type=int, default=20000, help="base inbound MLLP port")
+    parser.add_argument("--sink-base", type=int, default=40000, help="base correlation-sink port")
+    parser.add_argument(
+        "--stride", type=int, default=200, help="per-engine port stride (must be >= --count)"
+    )
+    parser.add_argument("--api-base", type=int, default=9000, help="base engine API port")
+    parser.add_argument(
+        "--store",
+        default="sqlite",
+        choices=("sqlite", "sqlserver", "postgres"),
+        help="store backend LABEL for the report; the actual connection comes from MEFOR_STORE_*",
+    )
+    parser.add_argument(
+        "--db",
+        help="sqlite only: the SHARED .db file every engine's MEFOR_STORE_PATH points at (required so "
+        "the engines truly share one store; ignored for server backends)",
+    )
+    parser.add_argument(
+        "--cluster",
+        action="store_true",
+        help="the [cluster]-ON comparison arm (sets MEFOR_CLUSTER_ENABLED=true on every engine); the "
+        "PRIMARY sweep is cluster OFF (all N engines write simultaneously with disjoint rows)",
+    )
+    parser.add_argument("--report-json", help="write the JSON report to this path")
+    args = parser.parse_args(argv)
+
+    from harness.load.connscale.runner import ConnScaleError
+    from harness.load.multishard import run_multishard
+
+    try:
+        engine_counts = [int(x) for x in str(args.engines).split(",") if x.strip()]
+    except ValueError:
+        print(
+            f"--engines must be an int or comma-separated ints, got {args.engines!r}",
+            file=sys.stderr,
+        )
+        return 2
+    if not engine_counts or any(n < 1 for n in engine_counts):
+        print("--engines must list one or more positive integers", file=sys.stderr)
+        return 2
+
+    db_path: str | None = None
+    if args.store == "sqlite":
+        if not args.db:
+            print(
+                "sqlite: pass --db <shared.db> so every engine shares ONE store file (else each engine "
+                "gets its own default messagefoundry.db and there is no contention to measure)",
+                file=sys.stderr,
+            )
+            return 2
+        db_path = str(Path(args.db).resolve())
+    else:
+        backend = os.environ.get("MEFOR_STORE_BACKEND", "").strip().lower()
+        if backend != args.store:
+            print(
+                f"--store {args.store} needs MEFOR_STORE_BACKEND={args.store} (+ the MEFOR_STORE_* "
+                f"connection env); got {backend or '(unset)'!r}",
+                file=sys.stderr,
+            )
+            return 2
+
+    try:
+        report = asyncio.run(
+            run_multishard(
+                engine_counts=engine_counts,
+                count_per_engine=args.count,
+                per_conn_rate=args.per_conn_rate,
+                hold_seconds=args.hold_seconds,
+                inbound_base=args.inbound_base,
+                sink_base=args.sink_base,
+                stride=args.stride,
+                api_base=args.api_base,
+                store_backend=args.store,
+                cluster_enabled=args.cluster,
+                db_path=db_path,
+            )
+        )
+    except ConnScaleError as exc:
+        print(f"multishard setup failed: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render_console())
+    if args.report_json:
+        import json
+
+        Path(args.report_json).write_text(
+            json.dumps(report.to_json_dict(), indent=2), encoding="utf-8"
+        )
     return report.exit_code
 
 

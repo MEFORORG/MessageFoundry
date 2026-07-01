@@ -305,6 +305,7 @@ def _node_env(
     sink_ports: int,
     install_executor_shim: bool,
     db_path: str | None,
+    name_prefix: str = "",
 ) -> dict[str, str]:
     env = dict(base)
     env["MEFOR_AUTH_ENABLED"] = "false"  # the poller reads /stats etc. without a bearer token
@@ -314,6 +315,11 @@ def _node_env(
     env["MEFOR_CONNSCALE_SINK_HOST"] = sink_host
     env["MEFOR_CONNSCALE_SINK_PORT"] = str(sink_port)
     env["MEFOR_CONNSCALE_SINK_PORTS"] = str(sink_ports)
+    # Per-engine connection-name tag: empty (the single-engine connscale default) leaves the historical
+    # IB_CS_{i}.. names byte-identical; the multishard orchestrator sets a distinct value per engine so
+    # a shared store's FIFO lanes stay disjoint across engines.
+    if name_prefix:
+        env["MEFOR_CONNSCALE_NAME_PREFIX"] = name_prefix
     if db_path is not None:
         env["MEFOR_STORE_PATH"] = db_path  # SQLite: this step's own DB file
     if install_executor_shim:
@@ -597,15 +603,28 @@ def _evaluate_slos(profile: ConnScaleProfile, records: list[ConnScaleRecord]) ->
     return out
 
 
-def _monotonic_slo(name: str, records: list[ConnScaleRecord], key) -> SloCheck:  # type: ignore[no-untyped-def]
+#: Noise tolerance for the loose monotonicity smoke: a larger-N metric may dip up to this fraction below a
+#: smaller-N reading without failing. These are timing-derived counters (empty-claims/sec especially) and CI
+#: runners are noisy (mf-ci-test-flakes), so only a REAL regression (a drop past the band) should fail — a
+#: strict `>=` flaked on ~10% jitter (empty_claims 398.7 < 442.9 on windows-2022). 0.25 absorbs runner jitter
+#: while still catching a genuine collapse (a halving).
+_MONOTONIC_TOLERANCE = 0.25
+
+
+def _monotonic_slo(  # type: ignore[no-untyped-def]
+    name: str, records: list[ConnScaleRecord], key, *, tolerance: float = _MONOTONIC_TOLERANCE
+) -> SloCheck:
     """A LOOSE per-mode monotonicity smoke: within a sweep mode the metric at a larger N must be >= a
-    smaller N (the wall exists and scales). A `>=` check, not a tight threshold — CI runners are noisy
-    (mf-ci-test-flakes). Missing readings (None) are skipped, not failed."""
+    smaller N **minus a noise ``tolerance``** (default 25%) — the wall exists and scales, but these are
+    timing-derived counters on noisy CI runners (mf-ci-test-flakes), so a small dip is jitter, not a
+    regression. Fails only on a real drop (``v < prior * (1 - tolerance)``). Missing readings (None) are
+    skipped, not failed."""
     ok = True
     detail_parts: list[str] = []
     by_mode: dict[str, list[ConnScaleRecord]] = {}
     for r in records:
         by_mode.setdefault(r.sweep_mode, []).append(r)
+    floor = 1.0 - tolerance
     for mode, rs in by_mode.items():
         ordered = sorted(rs, key=lambda r: r.count)
         prev_val: float | None = None
@@ -614,9 +633,11 @@ def _monotonic_slo(name: str, records: list[ConnScaleRecord], key) -> SloCheck: 
             if val is None:
                 continue
             v = float(val)
-            if prev_val is not None and v < prev_val:
+            if prev_val is not None and v < prev_val * floor:
                 ok = False
-                detail_parts.append(f"{mode}@N={r.count}: {v:.1f} < prior {prev_val:.1f}")
+                detail_parts.append(
+                    f"{mode}@N={r.count}: {v:.1f} < prior {prev_val:.1f} * {floor:.2f}"
+                )
             prev_val = v
     observed = "monotonic" if ok else "; ".join(detail_parts)
-    return SloCheck(name, "non-decreasing vs N", observed, ok)
+    return SloCheck(name, f"non-decreasing vs N (±{int(tolerance * 100)}% jitter)", observed, ok)

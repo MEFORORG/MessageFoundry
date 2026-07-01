@@ -12,6 +12,7 @@ from harness.load.connscale.report import (
     NoLoss,
     SloCheck,
 )
+from harness.load.connscale.runner import _monotonic_slo
 
 
 def _record(
@@ -84,6 +85,36 @@ def test_herd_is_reported_separately_from_idle_poll() -> None:
     assert w3["wake_fanout_per_s"] == 6.0  # the per-commit thundering herd (read distinctly)
     # The total carries both, but the split is preserved (not collapsed).
     assert w3["idle_poll_per_s"] + w3["wake_fanout_per_s"] == w3["total_per_s"]
+
+
+def test_monotonic_slo_tolerates_jitter_but_catches_regression() -> None:
+    # mf-ci-test-flakes: a strict >= flaked on windows-2022 when empty_claims/sec dipped ~10%
+    # (398.7 < prior 442.9). The loose SLO now allows a noise band (default 25%): jitter passes, a real
+    # collapse still fails.
+    def _empty(rs: list[ConnScaleRecord]) -> bool:
+        return _monotonic_slo("empty_claims_monotonic", rs, lambda r: r.empty_claims_per_s).ok
+
+    # the observed ~10% dip is jitter -> ok
+    assert _empty(
+        [
+            _record(mode="fixed_aggregate", count=12, empty_per_s=442.9),
+            _record(mode="fixed_aggregate", count=24, empty_per_s=398.7),
+        ]
+    )
+    # a genuine collapse (halving, well past the band) -> fail
+    assert not _empty(
+        [
+            _record(mode="fixed_aggregate", count=12, empty_per_s=400.0),
+            _record(mode="fixed_aggregate", count=24, empty_per_s=150.0),
+        ]
+    )
+    # a clean increase -> ok
+    assert _empty(
+        [
+            _record(mode="fixed_per_conn", count=12, empty_per_s=100.0),
+            _record(mode="fixed_per_conn", count=24, empty_per_s=200.0),
+        ]
+    )
 
 
 def test_json_curve_schema_keyed_by_count() -> None:

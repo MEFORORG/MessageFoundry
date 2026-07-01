@@ -76,16 +76,19 @@ def _route_to(handler_name: str) -> RouterFn:
 
 # Wire N independent inbound→router→handler→outbound chains by name (a flat graph, no enclosing
 # "channel" element). Conn i: IB_CS_{i} on base_port+i → R_CS_{i} → H_CS_{i} → OB_CS_{i} → the sink.
+# Names run through ``ConnScaleShape.conn_name`` so a per-engine MEFOR_CONNSCALE_NAME_PREFIX gives each
+# engine DISTINCT names on a shared store (disjoint FIFO lanes); an empty prefix is byte-identical to
+# the historical IB_CS_{i}.. single-engine names.
 for _i in range(_SHAPE.count):
-    _dest = f"OB_CS_{_i:05d}"
+    _dest = _SHAPE.conn_name("OB", _i)
     _host, _port = _SHAPE.sink_endpoint(_i)
     outbound(
         _dest,
         MLLP(host=_host, port=_port, connect_timeout=2.0, timeout_seconds=5.0),
         retry=_RETRY,
     )
-    _hname = f"H_CS_{_i:05d}"
+    _hname = _SHAPE.conn_name("H", _i)
     handler(_hname)(_make_passthrough(_dest, _SHAPE, _i))
-    _rname = f"R_CS_{_i:05d}"
+    _rname = _SHAPE.conn_name("R", _i)
     router(_rname)(_route_to(_hname))
-    inbound(f"IB_CS_{_i:05d}", MLLP(port=_SHAPE.base_port + _i), router=_rname)
+    inbound(_SHAPE.conn_name("IB", _i), MLLP(port=_SHAPE.base_port + _i), router=_rname)

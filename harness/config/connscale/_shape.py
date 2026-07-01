@@ -21,6 +21,12 @@ Knobs (all optional, with safe CI-small defaults so ``serve`` works with none se
 * ``MEFOR_CONNSCALE_SINK_PORT``  — base sink port (default 2700).
 * ``MEFOR_CONNSCALE_SINK_PORTS`` — contiguous sink ports to round-robin across (default 1).
 * ``MEFOR_CONNSCALE_TRANSFORM``  — ``cheap`` | ``edit`` (default ``cheap`` — pass-through, cheapest graph).
+* ``MEFOR_CONNSCALE_NAME_PREFIX``— an OPTIONAL per-engine tag inserted into every connection name
+  (default empty = byte-identical to the single-engine graph). The multi-ENGINE store-contention
+  orchestrator (``harness multishard``) sets a distinct prefix per engine so that on ONE shared store
+  the same-index lanes across engines get DISTINCT connection identities — FIFO lanes are keyed by
+  connection name, so identical names would share rows (cross-engine claim/steal), confounding the
+  disjoint-lane isolation the gate needs. Restricted to ``[A-Za-z0-9_]`` (safe in a connection name).
 
 Everything is **synthetic and generic** — it models the *shape* of a high-connection-count estate
 (N inbound feeds each with one trivial route+handler), never a real site.
@@ -29,6 +35,7 @@ Everything is **synthetic and generic** — it models the *shape* of a high-conn
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 # Transform cost modes (a subset of the load graph's — connscale only needs cheapest + a representative
@@ -42,6 +49,10 @@ _TRANSFORMS = frozenset({CHEAP, EDIT})
 _MAX_PORT = 65535
 _MIN_COUNT = 1
 _MAX_COUNT = 5000  # generous headroom over the 1500 ceiling; a typo of 50000 fails loud
+
+# A per-engine name prefix must be safe inside a connection name (no HL7 separators / no whitespace /
+# nothing the loader or the registry would choke on). Empty is allowed (the single-engine default).
+_NAME_PREFIX_RE = re.compile(r"^[A-Za-z0-9_]*$")
 
 
 def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -69,11 +80,23 @@ class ConnScaleShape:
     sink_port: int
     sink_ports: int
     transform: str
+    name_prefix: str = (
+        ""  # per-engine tag inserted into every connection name (empty = single-engine)
+    )
 
     def sink_endpoint(self, index: int) -> tuple[str, int]:
         """Round-robin a destination index across the contiguous sink port range (mirrors the load
         graph's ``sink_endpoint``)."""
         return self.sink_host, self.sink_port + (index % self.sink_ports)
+
+    def conn_name(self, role: str, index: int) -> str:
+        """The registry name for connection ``index`` of ``role`` (``IB``/``OB``/``R``/``H``).
+
+        With an empty ``name_prefix`` this is byte-identical to the historical single-engine names
+        (e.g. ``IB_CS_00000``); with a prefix ``E0`` it becomes ``IB_E0_CS_00000`` — DISTINCT per
+        engine so the shared-store FIFO lanes stay disjoint (each engine claims only its own rows)."""
+        tag = f"{self.name_prefix}_" if self.name_prefix else ""
+        return f"{role}_{tag}CS_{index:05d}"
 
 
 def load_connscale_shape() -> ConnScaleShape:
@@ -86,6 +109,12 @@ def load_connscale_shape() -> ConnScaleShape:
     base_port = _env_int("MEFOR_CONNSCALE_BASE_PORT", 2600, minimum=1, maximum=_MAX_PORT)
     sink_port = _env_int("MEFOR_CONNSCALE_SINK_PORT", 2700, minimum=1, maximum=_MAX_PORT)
     sink_ports = _env_int("MEFOR_CONNSCALE_SINK_PORTS", 1, minimum=1, maximum=4096)
+    name_prefix = os.environ.get("MEFOR_CONNSCALE_NAME_PREFIX", "").strip()
+    if not _NAME_PREFIX_RE.match(name_prefix):
+        raise ValueError(
+            f"MEFOR_CONNSCALE_NAME_PREFIX must match [A-Za-z0-9_]* (safe in a connection name), "
+            f"got {name_prefix!r}"
+        )
     # The N inbound ports occupy [base_port, base_port + count). Validate the block stays inside the
     # port space and does NOT overlap the sink port range — a collision would have an inbound listener
     # and the correlation sink fight for the same port, surfacing as a bind error deep in startup.
@@ -108,4 +137,5 @@ def load_connscale_shape() -> ConnScaleShape:
         sink_port=sink_port,
         sink_ports=sink_ports,
         transform=transform,
+        name_prefix=name_prefix,
     )
