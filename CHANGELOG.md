@@ -6,6 +6,32 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **Default server-DB store connection pool size raised 5 → 40** ([`[store].pool_size`](docs/CONFIGURATION.md),
+  env `MEFOR_STORE_POOL_SIZE`; [ADR 0062](docs/adr/0062-default-store-pool-size.md)). A three-sweep
+  connection-scale study found the pool is an **inverted-U**: it helps up to ~40 per engine, and
+  **over-provisioning is catastrophic** — past ~40 the extra connections thrash one shared SQL instance
+  (WRITELOG serialization + per-message finalizer applocks), and ACK latency explodes 30–90×. 40 is the
+  measured optimum — **do not set it higher to chase connection count.** **Server-DB backends only** (Postgres
+  / SQL Server) — the default **single-node SQLite** backend is unaffected (fixed read pool + single writer;
+  never reads `pool_size`). **Existing explicit `[store].pool_size` / `MEFOR_STORE_POOL_SIZE` values are
+  unchanged** — only the unset default moves. Behavioral deltas on server-DB engines: ~**8×** the steady-state
+  DB sessions per engine, and the startup pool pre-warm rises from ~2 to **~20 connections per engine**
+  (bounded by `warm_pool_timeout`, off the intake path, self-releasing, never raises). **Connection-budget
+  caution:** `pool_size` is **per engine**, so on a shared server DB `engines × pool_size` all count against
+  one `max_connections` (Postgres default ~100 → ~2 engines at 40) — raise `max_connections`, front the DB
+  with a pooler (PgBouncer), or use SQL Server; or size `pool_size` down. **Never split the store** to fit the
+  budget ([ADR 0063](docs/adr/0063-no-split-store-unified-store-for-sharding.md)). See
+  [`docs/DEPLOY-SERVER-DB.md`](docs/DEPLOY-SERVER-DB.md) §3.
+- **No split data store: multi-shard engine sharding now requires a server DB** ([ADR 0063](docs/adr/0063-no-split-store-unified-store-for-sharding.md),
+  amends [ADR 0037](docs/adr/0037-multi-process-sharding-l3.md)). `messagefoundry supervise` with **more than
+  one shard** on a **SQLite** store is now **refused at startup** — the old SQLite-file-per-shard behavior
+  split the message store into one database per shard, fragmenting search/reporting/audit/replay. A sharded
+  deployment must share **one unified store**, so `>1` shard requires `[store].backend = 'postgres'` or
+  `'sqlserver'` (every shard connects to the same database). **A single un-sharded engine on SQLite is
+  unaffected** (byte-identical to `serve`). Migrating an existing SQLite-sharded deployment: drain each shard
+  store to empty, then re-point `supervise` at one server DB (not an offline store merge).
+
 ## [0.2.12] — 2026-07-01 — Early Access
 
 The **throughput & connection-scale wave.** The staged-queue per-message commit chain is shortened

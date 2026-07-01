@@ -77,7 +77,7 @@ is verified against [`config/settings.py`](../messagefoundry/config/settings.py)
 | `MEFOR_STORE_DATABASE` | `[store].database` | `messagefoundry` | the database name |
 | `MEFOR_STORE_USERNAME` | `[store].username` | `mefor` | the login |
 | `MEFOR_STORE_PASSWORD` | `[store].password` | *(secret)* | **env/secret only** — never the config file |
-| `MEFOR_STORE_POOL_SIZE` | `[store].pool_size` | `5` | `>= 2` **required** under `[cluster]`, `>= 3` recommended |
+| `MEFOR_STORE_POOL_SIZE` | `[store].pool_size` | `40` | default 40, the inverted-U optimum — don't set higher ([ADR 0062](adr/0062-default-store-pool-size.md)); `>= 2` under `[cluster]`. **Budget:** `engines × pool_size` hit one managed-PG `max_connections` (~2 engines at 40/100) — raise it, add a pooler, or size down; never split the store ([DEPLOY-SERVER-DB.md](DEPLOY-SERVER-DB.md) §3) |
 | `MEFOR_CLUSTER_ENABLED` | `[cluster].enabled` | `true` | turns on the leader lease + graph gating |
 | `MEFOR_STORE_REQUIRE_ENCRYPTION` | `[store].require_encryption` | `true` | fail-closed: refuse to start keyless (PHI at rest) |
 | `MEFOR_STORE_ENCRYPTION_KEY` | `[store].encryption_key` | *(secret)* | base64 32 bytes — `messagefoundry gen-key` |

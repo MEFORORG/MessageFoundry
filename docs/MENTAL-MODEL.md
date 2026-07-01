@@ -422,7 +422,7 @@ The built-in HA model is **active-passive failover** (the Corepoint/Rhapsody mod
 backend = "postgres"   # or "sqlserver"; SQLite cannot cluster
 server = "db.internal"
 database = "messagefoundry"
-pool_size = 5          # >= 2 (>= 3 preferred)
+pool_size = 40         # default (ADR 0062); >= 2 (>= 3 preferred)
 
 [cluster]
 enabled = true

@@ -5,6 +5,12 @@
   [`pipeline/supervisor.py`](../../messagefoundry/pipeline/supervisor.py), the `serve --shard` flag, the
   `supervise` CLI, and the `shard` tag on the inbound connection); the multi-shard console / IDE promote
   views landed alongside (PRs #582/#583).
+- **Amended by [ADR 0063](0063-no-split-store-unified-store-for-sharding.md) (2026-07-01):** the
+  **SQLite-file-per-shard store split** described below is **deprecated** — a split data store fragments
+  reporting/monitoring/audit/replay, a no-go. A `>1`-shard deployment now **requires a server-DB backend**
+  (one unified store; a `>1`-shard SQLite config is refused at startup by `require_unified_store`). The rest
+  of this ADR — per-connection engine sharding, the `shard` tag, `serve --shard`, per-shard API ports, the
+  fleet console — stands.
 - **Date:** 2026-06-27
 - **Related:** [docs/design/multiproc.md](../design/multiproc.md) (full design) · ADR 0001 (staged
   pipeline — each shard *is* the whole pipeline) · ADR 0039 (DB-tier sharding — L5, generalizes the

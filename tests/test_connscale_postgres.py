@@ -50,7 +50,7 @@ def _free_port() -> int:
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
 async def test_connscale_postgres_pool_wait_is_measured() -> None:
     # The CI step forces MEFOR_STORE_POOL_SIZE=4 in base_env; assert a below-default pool is actually
-    # in effect so the wall under test is non-trivial (the default pool of 5+ would mask the
+    # in effect so the wall under test is non-trivial (the default pool of 40 would mask the
     # acquire-wait curve). 4 is small enough that ~3N workers still queue on it, but not so small that
     # /status's db_status() COUNT queries starve past the poll timeout (the PR #675 hang — see module
     # docstring).

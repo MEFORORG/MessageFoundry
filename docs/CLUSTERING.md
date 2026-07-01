@@ -42,7 +42,7 @@ backend   = "postgres"   # or "sqlserver"
 server    = "db.internal"
 database  = "messagefoundry"
 username  = "mefor"
-pool_size = 5          # >= 2
+pool_size = 40         # default (ADR 0062); >= 2 under [cluster]
 
 [cluster]
 enabled = true

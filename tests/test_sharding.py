@@ -17,10 +17,12 @@ from messagefoundry.config.wiring import (
     build_inbound_connection,
     build_outbound_connection,
 )
+from messagefoundry.config.settings import StoreBackend
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline.sharding import (
     DEFAULT_SHARD,
     filter_registry_for_shard,
+    require_unified_store,
     shard_ids,
     shard_of,
 )
@@ -56,6 +58,43 @@ def _registry() -> Registry:
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: None)
     return reg
+
+
+# --- no-split-store guard (require_unified_store, ADR 0063) ------------------
+
+
+def test_require_unified_store_refuses_multi_shard_sqlite() -> None:
+    with pytest.raises(ValueError, match="server-DB"):
+        require_unified_store(StoreBackend.SQLITE, ["a", "b"])
+
+
+def test_require_unified_store_allows_single_or_no_shard_on_sqlite() -> None:
+    # One shard (or an untagged single-shard config) is one process, one store — allowed on SQLite.
+    require_unified_store(StoreBackend.SQLITE, [DEFAULT_SHARD])
+    require_unified_store(StoreBackend.SQLITE, ["a", "a"])  # dupes collapse to one distinct shard
+    require_unified_store(StoreBackend.SQLITE, [])
+
+
+def test_require_unified_store_allows_multi_shard_on_server_db() -> None:
+    # Server DBs unify the store (every shard connects to the same database) — sharding is allowed.
+    require_unified_store(StoreBackend.POSTGRES, ["a", "b"])
+    require_unified_store(StoreBackend.SQLSERVER, ["a", "b", "c"])
+
+
+def test_discover_shard_specs_runs_the_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    # discover_shard_specs must enforce the guard with the passed backend: a multi-shard SQLite config is
+    # refused before any subprocess spec is built; the same config on a server DB builds specs normally.
+    from messagefoundry.pipeline import supervisor
+
+    monkeypatch.setattr(supervisor, "load_config", lambda cfg: _registry())
+    with pytest.raises(ValueError, match="server-DB"):
+        supervisor.discover_shard_specs(
+            "cfg", store_backend=StoreBackend.SQLITE, db_base="m.db", base_port=8765
+        )
+    specs = supervisor.discover_shard_specs(
+        "cfg", store_backend=StoreBackend.POSTGRES, db_base="m.db", base_port=8765
+    )
+    assert {s.shard for s in specs} == {"a", "b", DEFAULT_SHARD}
 
 
 def test_shard_of_normalizes_none_to_default() -> None:

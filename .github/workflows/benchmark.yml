@@ -84,7 +84,7 @@ jobs:
       MEFOR_STORE_DATABASE: messagefoundry
       MEFOR_STORE_USERNAME: postgres
       MEFOR_STORE_PASSWORD: mefor
-      MEFOR_STORE_POOL_SIZE: "5"
+      MEFOR_STORE_POOL_SIZE: "40"  # track the shipped default (ADR 0062: 5 -> 40)
       MEFOR_STORE_ENCRYPT: "false"  # plaintext to the container; the TLS-hardening guard needs the escape
       MEFOR_ALLOW_INSECURE_TLS: "1"
     steps:
@@ -151,7 +151,7 @@ jobs:
       MEFOR_STORE_AUTH: sql
       MEFOR_STORE_USERNAME: sa
       MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
-      MEFOR_STORE_POOL_SIZE: "5"
+      MEFOR_STORE_POOL_SIZE: "40"  # track the shipped default (ADR 0062: 5 -> 40)
       MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
       MEFOR_ALLOW_INSECURE_TLS: "1"
     steps:

@@ -284,7 +284,7 @@ class StoreSettings(_Section):
     # so it is REJECTED for the sqlserver backend (install the CA into the Windows machine trust store
     # instead). A path, not a secret. Empty = use the system trust store (the secure default).
     ssl_root_cert: str | None = None
-    pool_size: int = 5
+    pool_size: int = 40
     connect_timeout: int = 15  # seconds
     command_timeout: int = 30  # seconds
     db_schema: str | None = (
@@ -318,7 +318,8 @@ class StoreSettings(_Section):
     # How many connections to pre-open. None (default) = a safe fraction of the pool
     # (min(pool_size-1, pool_size//2)) so the warm never pins more than half the pool while the concurrent
     # startup work (on-promotion recovery, the coordinator heartbeat, the first delivery workers) keeps
-    # slots; an explicit value is clamped to pool_size-1. A pool of 1 is never warmed.
+    # slots; an explicit value is clamped to pool_size-1. A pool of 1 is never warmed. At the default
+    # pool_size=40 this resolves to min(39, 20) = 20 pre-opened connections per server-DB engine at startup.
     warm_pool_target: int | None = None
 
     @field_validator("lease_ttl_seconds")

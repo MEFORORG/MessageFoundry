@@ -1169,9 +1169,26 @@ def _supervise(args: argparse.Namespace) -> int:
     db_base = anchor_under_root(args.db, root, cwd=cwd)
     assert db_base is not None  # supervise --db has a string default ("messagefoundry.db")
 
+    # Resolve the store backend up front so the no-split-store guard (ADR 0063) can refuse a >1-shard
+    # config on SQLite BEFORE any subprocess is spawned. --service-config is anchored the same way each
+    # child resolves it; --db only sets the SQLite path, never the backend.
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import load_settings
+
+    # anchor_under_root(None, ...) returns None (config/anchor.py), so this is safe when unset; each child
+    # re-anchors the raw --service-config to the same path under the forwarded --project-root.
+    service_config = anchor_under_root(args.service_config, root, cwd=cwd)
+    try:
+        settings = load_settings(config_path=service_config)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     return asyncio.run(
         supervise(
             config,
+            store_backend=settings.store.backend,
             db_base=db_base,
             base_port=args.base_port,
             env=args.env,

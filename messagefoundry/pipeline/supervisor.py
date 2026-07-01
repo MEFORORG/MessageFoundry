@@ -34,8 +34,9 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from messagefoundry.config.settings import StoreBackend
 from messagefoundry.config.wiring import load_config
-from messagefoundry.pipeline.sharding import shard_ids
+from messagefoundry.pipeline.sharding import require_unified_store, shard_ids
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,7 @@ def build_shard_specs(
 def discover_shard_specs(
     config: str,
     *,
+    store_backend: StoreBackend,
     db_base: str,
     base_port: int,
     env: str | None = None,
@@ -138,7 +140,8 @@ def discover_shard_specs(
     """Load the config, discover its shard ids, and build a :class:`ShardSpec` per shard.
 
     Raises ``WiringError``/``FileNotFoundError`` from :func:`load_config` if the config is invalid,
-    and ``ValueError`` if the graph declares no inbound connections (nothing to supervise).
+    and ``ValueError`` if the graph declares no inbound connections (nothing to supervise), or if a
+    ``>1``-shard config is on SQLite (the no-split-store guard — see :func:`require_unified_store`).
     """
     registry = load_config(config)
     ids = shard_ids(registry)
@@ -146,6 +149,9 @@ def discover_shard_specs(
         raise ValueError(
             f"config {config!r} declares no inbound connections — nothing to supervise"
         )
+    # No-split-store guard (ADR 0063): >1 shard on SQLite would fan the message store into one file per
+    # shard. Refuse it here — a sharded deployment must share ONE unified server-DB store.
+    require_unified_store(store_backend, ids)
     return build_shard_specs(
         ids,
         config=config,
@@ -274,6 +280,7 @@ class Supervisor:
 async def supervise(
     config: str,
     *,
+    store_backend: StoreBackend,
     db_base: str,
     base_port: int,
     env: str | None = None,
@@ -292,6 +299,7 @@ async def supervise(
     try:
         specs = discover_shard_specs(
             config,
+            store_backend=store_backend,
             db_base=db_base,
             base_port=base_port,
             env=env,

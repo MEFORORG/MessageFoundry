@@ -47,7 +47,7 @@ parallelism, method, coordination.
 | **B11** | connection-scale harness (500/1k/1.5k lanes) | ✅ **DONE** (#675) | — | `harness/load/connscale/` + additive engine instrumentation. Measures executor saturation, store-pool wait, idle-poll RT/s, FD/socket, reload + ACK latency vs connection count. |
 | **B8** | single-store commit ceiling (bench) | ✅ **DONE** 2026-06-30 | — | **≈23,600 commits/s** on local NVMe (AWS i4i) → **store is NOT the wall; 1 unified store DECIDED** (≈6.5× target, ≈83× SAN). SAN ~100/~284 were storage artifacts. **Still pending: the prod-faithful per-interface "04" run** (real engine over LAN) — gated on the **cut build (v0.2.12/.13)**; redeploy the ~15-min AWS rig. |
 | **B12** | per-lane wake events | ✅ **DONE** (ADR 0061) | B11 | **#1 connection-scale fix.** Wake events WERE engine-wide singletons → one message woke all ~1,500 router workers (thundering herd). Now a committed message wakes **only its own (stage, lane) worker** via a strict get-or-create per-lane Event registry. **DEFAULT-OFF** + byte-identical when off; the 0.25 s poll backstop + FIFO claim are untouched (a missed wake self-heals). Measurable via B11's `wake_fanout_per_s → ~0`. |
-| **B13** | server-DB `pool_size` right-sizing | ⬜ TODO | B11 | `pool_size=5` for the whole engine (settings.py) → catastrophic for ~3,000 workers. Raise to tens–low-hundreds, sized to connection count; startup validation. Near one-line, outsized impact. |
+| **B13** | server-DB `pool_size` right-sizing | ✅ **DONE** (ADR 0062) | B11 | Default `pool_size` raised **5 → 40** — the measured **inverted-U optimum** (helps to ~40; over-provisioning past it is CATASTROPHIC — shared-instance WRITELOG/applock contention, not CPU). NOT "bigger for 1500": that's a **sharding** problem (~47 engines × modest pool). Residual per-engine wall at ≥~48 interfaces is a separate lever (B2/UNORDERED). Server-DB only; tunable; explicit configs unchanged. |
 | **B5** | off-loop executor sizing + **split** | ⬜ TODO | B11/B8 | No `set_default_executor` today → route_only + transform_one share Python's default pool (~12–32 threads) engine-wide. Install explicit **split** pools (routing vs larger transform), sized to cores+connections; isolate the 30 s `db_lookup` thread-pin so it can't starve routing+transform. |
 | **B6** | shared **ingest sub-pool** / writer path | ⬜ TODO | B11/B13 | Give pre-ACK intake its own commit path so ACK-on-receipt latency doesn't queue behind the worker-claim + idle-poll storm. **Shared sub-pool carved from B13's pool — NOT per-listener** (1,500 dedicated conns is infeasible). |
 | **B14** | per-listener accept-cap default | ⬜ TODO | B11 | `DEFAULT_MAX_CONNECTIONS=256` × 1,500 listeners = 384k socket ceiling. Lower the default (most HL7 partners hold 1–4), keep the per-connection override. |
@@ -63,7 +63,7 @@ DONE:     B11 connection-scale harness (#675) + B10 index migration (ADR 0060, #
 GATE:     the "04" prod-faithful per-interface run -- real engine over LAN driving the 7-commit pipeline
           -- gated on the CUT BUILD (v0.2.12/.13). Redeploy the ~15-min AWS rig. This sizes B13/B12/B5/B6/
           B14 against the real engine (B8 already proved the store won't be the wall).
-THEN:     B13 pool right-size  ->  B12 per-lane wake events  ->  B5 executor split  ->  B6 ingest sub-pool
+THEN:     B13 pool right-size (DONE: default 5->40, ADR 0062)  ->  B5 executor split  ->  B6 ingest sub-pool
           ->  B14 accept-cap            (each sized by B11's curves; B12 is the structural one)
 LATER:    B9 (only if the 04 run shows durable-write-bound + concurrent in-flight txns) ; T8 backend-parametric
 RELIABILITY-AT-SCALE (fold into the above): failover cold-start stampede control (~3,000 workers re-armed
@@ -76,7 +76,7 @@ DOC:      reconcile SYSTEM-REQUIREMENTS.md (it wrongly says multi-process shardi
 **The store is no longer a gate** — B8 proved one store absorbs ~23,600 commits/s (~6.5× the 45M/day
 target), so the connection-scale levers (B13/B12/B5/B6/B14) are unblocked; size them against B11's curves
 + the **"04" engine-over-LAN run** (still needed before a near-1,500-connection deployment claim). The
-defaults (executor ~12–32, `pool_size=5`, 0.25 s poll) are still for *tens* of connections — that is the
+defaults (executor ~12–32, 0.25 s poll; `pool_size` raised to 40 by B13/ADR 0062) are still largely for *tens* of connections — that is the
 remaining engine-side work.
 
 ## Per-session method (the proven loop)

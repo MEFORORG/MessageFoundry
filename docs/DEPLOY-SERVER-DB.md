@@ -60,12 +60,34 @@ Configure `[store]` in the service settings (full reference: [`CONFIGURATION.md`
 
 ## 3. Pool sizing
 
+The default `[store].pool_size` is **40** (server-DB only; a no-op on the SQLite default, which uses a fixed
+read pool + single writer). Raised from 5 in [ADR 0062](adr/0062-default-store-pool-size.md): the
+connection-scale study found the pool is an **inverted-U** — it helps up to ~40 per engine, and
+**over-provisioning is catastrophic** (past ~40 the extra connections thrash one shared instance — WRITELOG +
+finalizer applocks — and ACK latency explodes 30–90×). 40 is the measured **optimum**, not a floor: **do not
+set it higher to chase connection count** (that path is refuted — scale is *sharding*, not a bigger pool).
+Tunable via `[store].pool_size` / `MEFOR_STORE_POOL_SIZE`; re-measure for a materially different deployment
+shape (transform cost, message size, disk, SQL-box sizing).
+
 - **Single node:** `[store].pool_size ≥ 3` recommended. Each stage handoff is a committed round-trip and
   the per-stage workers (router, transform, per-outbound delivery) run concurrently against the pool — a
   pool of 1 serializes them against intake.
 - **Clustered (active-passive):** `pool_size ≥ 2` is **required** (a cross-section validator refuses a
   smaller pool when `[cluster].enabled`), `≥ 3` recommended — a clustered node also drives the
   membership / lease-renewal maintenance loop against the pool.
+- **Connection-budget ceiling (important on a shared server DB):** `pool_size` is **per engine**. Every
+  Postgres/SQL Server engine that shares the store — multi-process shards (all connect to the *same*
+  database) and the active-passive standby's warm pool — counts against one server limit. So budget
+  **peak connections ≈ engines × `pool_size`** (+ the standby's `warm_pool_target`) and keep it well under
+  the DB server's `max_connections` (**Postgres default ~100**; SQL Server is bounded by sessions/memory).
+  At the default `pool_size = 40`, ~2 co-located engines already reach ~100 — **a config that connected at
+  5 can fail to connect at 40.** Co-locating several server-DB engines (a sharded fan-out)? **Raise
+  `max_connections`, front the DB with a connection pooler (PgBouncer), or use SQL Server** (more sessions);
+  or size `pool_size` **down**. **Do NOT give each shard its own database/server** — that is a split store,
+  which is disallowed ([ADR 0063](adr/0063-no-split-store-unified-store-for-sharding.md)); one unified store
+  scales *vertically* (faster box/disk) + *cheaper-per-message*, never by fragmenting. Also budget the startup
+  warm burst (~20 pre-opened/engine at the default; set `warm_pool_target` or `warm_pool = false` on a
+  connection-/license-constrained site).
 
 ---
 
@@ -173,7 +195,8 @@ update the pin in lockstep — pin the **CA**, not the leaf, to keep rotations m
 - [ ] `[store].encrypt = true` (and **not** `MEFOR_ALLOW_INSECURE_TLS`) for any PHI deployment.
 - [ ] DB CA trusted so `trust_server_certificate = false` validates — Postgres `ssl_root_cert` **or**
       machine-store import; SQL Server **machine store only** (§5). Never `TrustServerCertificate=true`.
-- [ ] `[store].pool_size ≥ 3` (≥ 2 hard-required in cluster mode).
+- [ ] `[store].pool_size` sized (default **40**, server-DB only; ≥ 2 hard-required in cluster mode) **and**
+      the connection budget checked: engines × `pool_size` (+ standby warm) well under the DB `max_connections` (§3).
 - [ ] Bootstrap login can create the schema on first open, **or** the schema is pre-created.
 - [ ] SQL Server: RCSI enabled (auto, or pre-enabled by a DBA).
 - [ ] Source store drained (`in_pipeline → 0`) before cutover — greenfield, no in-place migration.

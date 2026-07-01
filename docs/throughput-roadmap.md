@@ -76,7 +76,7 @@ customers reject the fragmented search/reporting/audit it causes. But the verdic
 unmeasured numbers** — the on-prem NVMe concurrent-commit ceiling (decides 1 vs 2–3 stores) and the
 1,500-connection resource footprint (**no harness exists**) — and **three defaults sized for tens of
 connections, not 1,500**: the off-loop executor (~12–32 threads; there is **no** `set_default_executor`
-in the codebase), `pool_size=5` for the whole engine, and the 0.25 s idle-poll backstop.
+in the codebase), `pool_size` (raised 5→40 by B13/ADR 0062), and the 0.25 s idle-poll backstop.
 
 **The #1 connection-scale problem (sized by the review):** the per-stage wake events are **engine-wide
 singletons** — one message `set()`s the routed-work event and wakes **all ~1,500** router workers
@@ -87,7 +87,7 @@ store-commit are one contention point at scale. This makes B12 a structural chan
 
 **Revised lever set** (full table + sequence: [`throughput-build-plan.md`](throughput-build-plan.md)):
 **DELETED** B4 (order-group sharding). **NEW** B11 connection-scale harness (the prerequisite — does not
-exist today), B12 per-lane idle-economy (per-lane wake events), B13 `pool_size` right-sizing, B14
+exist today), B12 per-lane idle-economy (per-lane wake events), B13 `pool_size` right-sizing (**DONE**, ADR 0062), B14
 accept-cap default. **REFRAMED** B5 (sized + **split** off-loop executor) + B6 (shared ingest sub-pool,
 not per-listener) toward 1,500 lanes; B8 = the gating NVMe-ceiling + connections-per-node curve. B10 =
 the B3 index migration so the cut lands on **upgraded** DBs. **B11 + B8 are hard prerequisites — nothing

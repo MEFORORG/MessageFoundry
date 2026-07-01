@@ -17,6 +17,7 @@ from messagefoundry.config.settings import (
     StoreBackend,
     load_settings,
 )
+from messagefoundry.store.base import warm_pool_target
 
 
 def _write(path: Path, body: str) -> Path:
@@ -400,6 +401,56 @@ def test_cluster_enabled_on_postgres_is_ok(tmp_path: Path) -> None:
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.cluster.enabled is True and s.store.backend is StoreBackend.POSTGRES
+
+
+# --- [store].pool_size default (B13 / ADR 0062) -----------------------------
+
+
+def test_default_pool_size_is_40(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # B13 / ADR 0062: the unset server-DB pool default is 40 (the higher-N inverted-U optimum; was 5).
+    # The single guard against an accidental revert of the default literal.
+    monkeypatch.chdir(tmp_path)  # no ./messagefoundry.toml here
+    assert load_settings(environ={}).store.pool_size == 40
+
+
+def test_explicit_pool_size_overrides_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # "Only the unset default moves" — an explicit file value wins, and an env value wins over the file,
+    # so no existing config's pool changes under the 5->40 default bump.
+    monkeypatch.chdir(tmp_path)
+    cfg = _write(tmp_path / "messagefoundry.toml", "[store]\npool_size = 7\n")
+    assert load_settings(config_path=cfg, environ={}).store.pool_size == 7  # file wins over default
+    # config_path=None picks up ./messagefoundry.toml (pool_size = 7); env must still override it.
+    assert load_settings(environ={"MEFOR_STORE_POOL_SIZE": "9"}).store.pool_size == 9
+
+
+def test_warm_target_at_new_default() -> None:
+    # ADR 0062 consequence: the implicit startup warm target scales with the default. At pool_size=40 the
+    # unset target is min(39, 20) = 20 (was min(4, 2) = 2 at the old default of 5); an explicit count is
+    # still clamped to maxsize-1.
+    assert warm_pool_target(40, None) == 20
+    assert warm_pool_target(5, None) == 2  # the OLD default's warm target, for contrast
+    assert warm_pool_target(40, 4) == 4  # explicit honored: min(4, 39)
+
+
+def test_cluster_floor_and_default_pool(tmp_path: Path) -> None:
+    # The [cluster] pool_size >= 2 floor is untouched by the bump: an explicit pool_size=1 still refuses,
+    # and the new default (40) trivially satisfies it.
+    bad = _write(
+        tmp_path / "bad.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\npool_size = 1\n'
+        "[cluster]\nenabled = true\n",
+    )
+    with pytest.raises(ValidationError):
+        load_settings(config_path=bad, environ={})
+    ok = _write(
+        tmp_path / "ok.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[cluster]\nenabled = true\n",
+    )
+    s = load_settings(config_path=ok, environ={})
+    assert s.store.pool_size == 40 and s.cluster.enabled is True
 
 
 def test_cluster_enabled_on_sqlserver_is_ok(tmp_path: Path) -> None:
