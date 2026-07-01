@@ -82,6 +82,9 @@ __all__ = [
     "sqlite_settings",
     "warm_pool_connections",
     "warm_pool_target",
+    "pool_over_provisioned_warning",
+    "POOL_SIZE_OPTIMUM",
+    "POOL_SIZE_CLIFF",
 ]
 
 
@@ -1206,6 +1209,44 @@ def warm_pool_target(maxsize: int, configured: int | None) -> int:
         return min(configured, maxsize - 1)
     # maxsize >= 2 here, so maxsize // 2 >= 1 — no lower clamp needed.
     return min(maxsize - 1, maxsize // 2)
+
+
+# ADR 0062 — the store connection-pool inverted-U. On a shared server DB, over-provisioning the pool past
+# the optimum thrashes it (WRITELOG serialization + per-message finalizer applocks) and COLLAPSES
+# throughput; the catastrophic cliff is ~2x the optimum. These bound the soft over-provisioning warning.
+POOL_SIZE_OPTIMUM = 40
+POOL_SIZE_CLIFF = 80
+_POOL_CONCURRENCY_PER_INBOUND = 2.5
+
+
+def pool_over_provisioned_warning(pool_max_size: int, n_inbound: int) -> str | None:
+    """A soft over-provisioning check for a **server-DB** connection pool (ADR 0062). Returns a warning
+    string when ``pool_max_size`` looks oversized, else ``None``. SQLite has no pool, so the caller only
+    invokes this when a pool exists (``Store.pool_status()`` is not ``None``). Two triggers:
+
+    (a) **Cliff** — ``pool_max_size >= POOL_SIZE_CLIFF`` (~80), regardless of interface count: past this the
+        extra connections thrash a shared instance and collapse throughput (the measured inverted-U).
+    (b) **Idle over-provision** — above the optimum AND well beyond this engine's expected concurrency
+        (~``2.5 x n_inbound``): the excess connections are dead-weight on a shared server DB.
+
+    Pure + side-effect-free (the caller logs the message); the constants are the ADR 0062 findings. The
+    default pool (``POOL_SIZE_OPTIMUM``) never warns — it is not > the optimum."""
+    if pool_max_size >= POOL_SIZE_CLIFF:
+        return (
+            f"[store].pool_size={pool_max_size} is at/beyond the measured connection-pool cliff "
+            f"(~{POOL_SIZE_CLIFF}): over-provisioning a shared server DB thrashes it (WRITELOG + finalizer "
+            f"applock contention) and collapses throughput. The optimum is ~{POOL_SIZE_OPTIMUM} per engine — "
+            f"scale by SHARDING (more engines), not a bigger pool. See ADR 0062."
+        )
+    demand = max(1, round(n_inbound * _POOL_CONCURRENCY_PER_INBOUND))
+    if pool_max_size > POOL_SIZE_OPTIMUM and pool_max_size > demand:
+        return (
+            f"[store].pool_size={pool_max_size} looks over-provisioned for {n_inbound} inbound "
+            f"interface(s) (~{demand} concurrent connections expected). Past ~{POOL_SIZE_OPTIMUM} the extra "
+            f"connections are idle/contention on a shared server DB — consider lowering [store].pool_size. "
+            f"See ADR 0062."
+        )
+    return None
 
 
 async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backend: str) -> int:

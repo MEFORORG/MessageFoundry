@@ -75,6 +75,7 @@ from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.pipeline.dryrun import route_only, transform_one
 from messagefoundry.store import MessageStatus, QueueStore, Stage
+from messagefoundry.store.base import pool_over_provisioned_warning
 from messagefoundry.transports import (
     DeliveryError,
     DestinationConnector,
@@ -1077,6 +1078,16 @@ class RegistryRunner:
                     len(self.registry.inbound),
                     len(self.registry.outbound),
                 )
+            # Soft over-provisioning check (ADR 0062): warn if this engine's SERVER-DB connection pool is
+            # sized past the inverted-U optimum. SQLite has no pool (pool_status() -> None) -> skipped, and
+            # the default pool never trips it (not > the optimum). Advisory only — never blocks startup.
+            _pool = self.store.pool_status()
+            if _pool is not None:
+                _pool_warn = pool_over_provisioned_warning(
+                    _pool.max_size, len(self.registry.inbound)
+                )
+                if _pool_warn is not None:
+                    log.warning(_pool_warn)
 
     async def stop(self) -> None:
         async with self._reload_lock:  # serialize against an in-flight reload (no torn-down state)

@@ -109,8 +109,10 @@ via the existing B11 `/status` pool surface (`pool_status()` → `PoolInfo`/`Poo
   (PgBouncer), or SQL Server (more sessions) — **not** a smaller default and **not** a split store. Documented
   in [DEPLOY-SERVER-DB.md](../DEPLOY-SERVER-DB.md) §3 + [CLOUD-DEPLOYMENT.md](../CLOUD-DEPLOYMENT.md).
 - **Over-provisioning is a footgun** — setting `pool_size` far above ~40 (or above ~interfaces × 2.5) degrades
-  a shared store. A soft startup warning is a recommended follow-up (not built here); the docs carry the
-  guidance meanwhile.
+  a shared store. **A soft startup warning is now built** (`pool_over_provisioned_warning`, logged once at
+  graph start; server-DB only — SQLite has no pool): it flags a pool at/beyond the ~80 cliff, or one oversized
+  for the engine's inbound-interface count. Advisory — never blocks startup.
+  → `tests/test_settings.py::test_pool_over_provisioned_warning`
 
 **Refuted / re-scoped by the higher-N sweep**
 - **"Raise the pool to reach ~1500 connections" is refuted.** One engine caps out well below it; 1500 is a
@@ -124,8 +126,7 @@ via the existing B11 `/status` pool surface (`pool_status()` → `PoolInfo`/`Poo
   each message **cheaper** on it (fewer commits/applocks) — never by fragmenting it. Validating the one store
   under real multi-shard load is the open pre-1500 risk (ADR 0063 §risks).
 
-**Out of scope** — the soft over-provisioning warning; B5/B6 (executor split / ingest sub-pool); the
-multi-shard runtime (ADR 0063).
+**Out of scope** — B5/B6 (executor split / ingest sub-pool); the multi-shard runtime (ADR 0063).
 
 ## To resolve on acceptance
 

@@ -88,6 +88,16 @@ shape (transform cost, message size, disk, SQL-box sizing).
   scales *vertically* (faster box/disk) + *cheaper-per-message*, never by fragmenting. Also budget the startup
   warm burst (~20 pre-opened/engine at the default; set `warm_pool_target` or `warm_pool = false` on a
   connection-/license-constrained site).
+- **Commit-depth at high interface counts (`fifo_claim_batch`):** the pool is not the only per-engine wall —
+  above ~48 inbound interfaces an engine becomes bound by *commits per message* on the shared store (WRITELOG
+  + the per-message finalizer applock), which a bigger pool **cannot** fix. For a **high-interface-count,
+  commit-bound** server-DB engine, set **`[store].fifo_claim_batch = 8`** (range 8–16, [ADR 0058](adr/0058-batch-claim-fifo-prefix.md)):
+  the INGRESS/ROUTED FIFO claim then takes the contiguous due head-prefix in one commit instead of one-per-row,
+  amortizing the claim commit toward `1/N` on backlogged lanes. It **preserves strict per-lane FIFO (#285) +
+  at-least-once**, is **byte-identical at `1` (the default)** and on caught-up (low-backlog) lanes, and never
+  batches the outbound/delivery claim. Size it against worst-case message size (N decrypted bodies are resident
+  per lane between the claim and its N handoffs). This — not the pool — is the *raise-interfaces-per-engine*
+  lever.
 
 ---
 

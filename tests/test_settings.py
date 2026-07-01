@@ -17,7 +17,7 @@ from messagefoundry.config.settings import (
     StoreBackend,
     load_settings,
 )
-from messagefoundry.store.base import warm_pool_target
+from messagefoundry.store.base import pool_over_provisioned_warning, warm_pool_target
 
 
 def _write(path: Path, body: str) -> Path:
@@ -451,6 +451,21 @@ def test_cluster_floor_and_default_pool(tmp_path: Path) -> None:
     )
     s = load_settings(config_path=ok, environ={})
     assert s.store.pool_size == 40 and s.cluster.enabled is True
+
+
+def test_pool_over_provisioned_warning() -> None:
+    # ADR 0062 soft guard (pure policy; the caller skips it on SQLite where there is no pool). The default
+    # (40) never warns, at any interface count.
+    assert pool_over_provisioned_warning(40, 2) is None
+    assert pool_over_provisioned_warning(40, 100) is None
+    assert pool_over_provisioned_warning(20, 1) is None  # below the optimum
+    # Cliff (>= 80): warns regardless of interface count.
+    assert "cliff" in (pool_over_provisioned_warning(80, 200) or "")
+    assert pool_over_provisioned_warning(150, 100) is not None
+    # Idle over-provision: above the optimum AND well beyond the ~2.5x interface demand.
+    assert "over-provisioned" in (pool_over_provisioned_warning(60, 2) or "")  # demand ~5
+    # Justified: above the optimum but within the interface demand -> no warning.
+    assert pool_over_provisioned_warning(60, 30) is None  # demand ~75 >= 60
 
 
 def test_cluster_enabled_on_sqlserver_is_ok(tmp_path: Path) -> None:

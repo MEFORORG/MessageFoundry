@@ -6,6 +6,14 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Soft store-pool over-provisioning warning** ([ADR 0062](docs/adr/0062-default-store-pool-size.md)) — a
+  server-DB engine now logs an advisory `WARNING` at graph start if `[store].pool_size` is sized past the
+  connection-pool inverted-U optimum: at/beyond the ~80 catastrophic cliff, or oversized for the engine's
+  inbound-interface count (`~2.5 ×` interfaces). Advisory only — it never blocks startup; SQLite has no pool
+  so it is skipped, and the default (40) never trips it. Guards the "set a huge pool for 1500 connections"
+  footgun (which is a *sharding* problem, not a pool one).
+
 ### Changed
 - **Default server-DB store connection pool size raised 5 → 40** ([`[store].pool_size`](docs/CONFIGURATION.md),
   env `MEFOR_STORE_POOL_SIZE`; [ADR 0062](docs/adr/0062-default-store-pool-size.md)). A three-sweep
