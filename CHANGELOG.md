@@ -6,6 +6,12 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.13] — 2026-07-01 — Early Access
+
+The **store connection-scale sizing** wave — right-size the server-DB connection pool to the measured
+inverted-U optimum, guard against over-provisioning, and guarantee the message store stays unified. All
+changes are **server-DB-only**; the single-node SQLite default is unaffected.
+
 ### Added
 - **Soft store-pool over-provisioning warning** ([ADR 0062](docs/adr/0062-default-store-pool-size.md)) — a
   server-DB engine now logs an advisory `WARNING` at graph start if `[store].pool_size` is sized past the
