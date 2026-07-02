@@ -28,6 +28,8 @@ from typing import Any, Iterable, Sequence, TypeVar
 
 from messagefoundry.console.client import ApiError, EngineClient
 
+from harness.load.metrics import Counters
+
 _T = TypeVar("_T")
 
 
@@ -136,6 +138,48 @@ class _ShardSample:
     pool_wait_p95_ms: float | None = None
     pool_wait_p99_ms: float | None = None
     pool_wait_max_ms: float | None = None
+
+
+async def sample_until_reconciled(
+    poller: EnginePoller, counters: Counters, *, timeout: float, interval: float
+) -> EngineSample | None:
+    """Re-sample the engine until the no-loss reconcile condition SETTLES — every CONFIRMED send has
+    been read (``read >= sent - timeouts``) and every delivery has reached the sink
+    (``sink_received >= written``) — or ``timeout`` elapses. The durable fix for the intake/delivery
+    count-lag a noisy runner shows even after a clean drain: assert the actual settled condition, not
+    a single fixed-instant sample (mf-ci-test-flakes). The baseline-relative deltas are used,
+    mirroring the reconcile. On timeout the last sample is returned and the no-loss check reports the
+    residual shortfall honestly (no masking).
+
+    ``sent - timeouts`` because a ``timeouts``-counted message (in-flight at a connection close with
+    no ACK seen — a mid-run reset or the stop-grace expiring) is UNCONFIRMED: ``sent`` was counted at
+    write-buffer time, so the frame may never have left the closed socket. Waiting for ``read`` to
+    reach the full ``sent`` would poll the entire timeout for a message that may never arrive; the
+    reconcile applies the same accounting, so the settled condition must match it. With
+    ``timeouts == 0`` (every healthy run) this is exactly ``read >= sent``. (This is only the
+    STOP-SAMPLING heuristic — the reconcile itself additionally caps how many unconfirmed sends are
+    excusable, so a timeout flood still fails the run regardless of when sampling stopped.)"""
+    loop = asyncio.get_running_loop()
+    base = poller.baseline
+    start = loop.time()
+    last = poller.final
+    while loop.time() - start < timeout:
+        sample = await poller.sample_once()
+        if sample is not None:
+            last = sample
+            if base is not None:
+                read = sample.read - base.read
+                written = sample.written - base.written
+                # Settled: every confirmed send fully read AND every counted delivery arrived at the
+                # sink AND the pipeline is empty (no in-flight rows that could still move the counts).
+                if (
+                    read >= counters.sent - counters.timeouts
+                    and counters.sink_received >= written
+                    and sample.in_pipeline == 0
+                ):
+                    return sample
+        await asyncio.sleep(interval)
+    return last
 
 
 class EnginePoller:

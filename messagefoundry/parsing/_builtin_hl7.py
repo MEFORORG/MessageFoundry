@@ -479,6 +479,15 @@ def separators(msg: ParsedMessage) -> tuple[str, str, str, str, str]:
 # Escape / unescape — byte-parity with hl7.util
 # ---------------------------------------------------------------------------
 
+# Upper bound on an HL7 rich-text repetition escape (e.g. ``\.in5\`` = indent 5). Real messages use
+# tiny counts; without a cap, a ~15-byte ``\.in2000000000\`` expands to gigabytes synchronously on the
+# event loop *before* the ACK — an unauthenticated memory-exhaustion DoS (DELTA-01). An over-limit or
+# non-numeric count is treated as an unmappable sequence and dropped, matching python-hl7's own
+# log-and-discard for sequences it cannot map. This is a deliberate divergence from python-hl7's
+# UNBOUNDED expansion: the built-in is the default hot-path backend (ADR 0054), so it must be the one
+# to bound the allocation (the upstream raw-size cap cannot — a tiny input expands past it).
+MAX_ESCAPE_REPEAT = 512
+
 
 def unescape(field: str, seps: tuple[str, str, str, str, str]) -> str:
     """Unescape an HL7 leaf value — byte-parity with ``hl7.util.unescape``.
@@ -525,7 +534,18 @@ def unescape(field: str, seps: tuple[str, str, str, str, str]) -> str:
                 if value in default_map:
                     out.append(default_map[value])
                 elif value.startswith(".") and value[:3] in default_map:
-                    out.append(default_map[value[:3]] * int(value[3:]))
+                    try:
+                        count = int(value[3:])
+                    except ValueError:
+                        # Non-numeric repeat count (e.g. ``\.inX\``): unmappable — drop it, matching
+                        # the hex branch below and python-hl7's log-and-discard. (DELTA-02: an
+                        # uncaught ValueError here previously escaped the pre-ACK summarize() and
+                        # dropped a parseable message with no disposition, breaking count-and-log.)
+                        continue
+                    if not 0 <= count <= MAX_ESCAPE_REPEAT:
+                        # Reject absurd/negative counts BEFORE the multiply (DELTA-01 DoS clamp).
+                        continue
+                    out.append(default_map[value[:3]] * count)
                 elif value[0] in ("C", "M"):
                     # Inline character-set switches: python-hl7 logs and emits nothing.
                     continue

@@ -188,7 +188,11 @@ class Peek:
         # invalid-depth index surfaces here as IndexError, mapped to None like the python-hl7 path.
         try:
             return _builtin_hl7.extract_field(msg, seg, fld, comp, sub)
-        except IndexError:
+        except (IndexError, ValueError):
+            # IndexError = invalid-depth over-index, mapped to None exactly like the python-hl7 path.
+            # ValueError is defense-in-depth for a malformed escape count surfacing from unescape
+            # (DELTA-02): a field read on the pre-ACK summarize() path must never crash the
+            # connection — an absent/unreadable value is None.
             return None
 
     @staticmethod

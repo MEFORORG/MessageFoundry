@@ -59,5 +59,8 @@ def test_schema_validates_through_hardened_parser() -> None:
 
 def test_verify_rejects_unsigned_document() -> None:
     # A plain document carries no XML-DSig signature → not a verifiable payload (a data error, raised).
+    # An anchor is supplied so this exercises the unsigned-document rejection rather than the no-anchor
+    # guard (DELTA-03): signxml locates the ds:Signature element before it touches the anchor, so an
+    # unsigned document still raises regardless of the anchor value.
     with pytest.raises(XmlError):
-        verify(b"<root>unsigned</root>")
+        verify(b"<root>unsigned</root>", x509_cert=b"unit-test-anchor-sentinel")

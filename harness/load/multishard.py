@@ -51,10 +51,9 @@ from harness.load.connscale.runner import (
     _build_corpus,
     _node_env,
     _reconcile,
-    _sample_until_reconciled,
 )
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EngineSample, EnginePoller
+from harness.load.enginepoll import EngineSample, EnginePoller, sample_until_reconciled
 from harness.load.failover import EngineNode, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
@@ -113,8 +112,10 @@ class MultiShardRecord:
     drain_complete_iso: str
 
     # --- aggregate throughput / no-loss ---
-    achieved_aggregate_rate: float  # summed engine read-delta / hold_seconds (messages/s in)
-    delivered_aggregate_rate: float  # summed engine written-delta / hold_seconds (deliveries/s)
+    achieved_aggregate_rate: float  # summed engine read-delta ACROSS THE HOLD ONLY (messages/s in)
+    delivered_aggregate_rate: (
+        float  # summed engine written-delta across the hold only (deliveries/s)
+    )
     sent: int
     acked: int
     nak: int
@@ -132,6 +133,11 @@ class MultiShardRecord:
     ack_p50_ms: float
     ack_p95_ms: float
     ack_p99_ms: float
+
+    # Unconfirmed sends (in-flight at a connection close with no ACK seen). The reconcile excuses
+    # these from the intake bound only up to ~one per connection (engines × count); surfaced here so
+    # the tolerance width is visible on a PASSING record too. Default 0 for older artifacts.
+    timeouts: int = 0
 
     # --- per-engine disjoint-lane attribution (the no-cross-engine-steal proof) ---
     per_engine: tuple[EngineAttribution, ...] = ()
@@ -164,6 +170,7 @@ class MultiShardRecord:
                 "acked": self.acked,
                 "nak": self.nak,
                 "deferred": self.deferred,
+                "timeouts": self.timeouts,
             },
             "no_loss": {
                 "ok": self.no_loss.ok,
@@ -401,17 +408,19 @@ async def _run_one_step(
     aggregate_rate = per_conn_rate * count_per_engine  # per-engine offered rate
     try:
         await sink.start()
-        # Start the FIRST engine and wait until it's healthy BEFORE the rest, so the schema-creating
-        # engine wins the store-init race. This matters for SQLite: `serve` runs `PRAGMA journal_mode=
-        # WAL` + the schema DDL at open, and a same-instant second opener can hit "database is locked"
-        # on the shared file before WAL exists. Once the first engine has created the schema + WAL, the
-        # peers open cleanly and coexist under WAL's busy-timeout. A server backend creates its schema
-        # once too, so the gate is harmless there — it just orders the first open ahead of the peers.
-        await nodes[0].start()
-        await _await_node_healthy(nodes[0], timeout=_HEALTH_TIMEOUT)
-        for node in nodes[1:]:
+        # Start the engines STRICTLY ONE AT A TIME — start engine k, wait until it is healthy, then
+        # start k+1. Two shared-store races force full serialization, not just an engine-0 gate:
+        # (1) SQLite: `serve` runs `PRAGMA journal_mode=WAL` + the schema DDL at open, and a
+        #     same-instant second opener can hit "database is locked" before WAL exists.
+        # (2) SQL Server (WS-B Finding 2, the co-start convoy): EVERY open re-runs the full multi-
+        #     round-trip schema DDL batch under the exclusive `mefor:schema_init` applock (no schema-
+        #     version fast-path) and then reset_stale_inflight's unindexed status scan — N peers
+        #     started simultaneously convoy on the applock + LCK_M_IX/X on the shared tables, and a
+        #     loser blows the 30s command timeout and fails startup (observed rc=2 at N>=4, N=16
+        #     never started). Serial start+gate removes the convoy for a few seconds per engine —
+        #     negligible for a measurement tool, and the steady-state measurement is unaffected.
+        for node in nodes:
             await node.start()
-        for node in nodes[1:]:
             await _await_node_healthy(node, timeout=_HEALTH_TIMEOUT)
         await poller.open()
         await poller.sample_once()  # aggregate baseline
@@ -436,6 +445,14 @@ async def _run_one_step(
         sample_task = asyncio.create_task(
             _sample_loop(poller, _POLL_INTERVAL_S, sampler_stop, samples)
         )
+        # Bracket the hold with explicit samples + a wall clock, so achieved/delivered are computed
+        # over EXACTLY the steady-state window. Dividing the baseline→post-drain read-delta by the
+        # nominal hold instead (the original metric) inflated the rate wherever intake spilled past
+        # the hold — the WS-B N=8 record printed 857/s for a ~230-240/s steady state because the
+        # numerator's window was 341s against a 60s divisor (WS_B_REPORT.md, REVISED 2026-07-02).
+        loop = asyncio.get_running_loop()
+        hold_begin = await poller.sample_once()
+        hold_started = loop.time()
         hold_start_iso = _now_iso()
         hold_tasks = [
             asyncio.create_task(
@@ -449,6 +466,8 @@ async def _run_one_step(
             for driver in drivers
         ]
         await asyncio.gather(*hold_tasks)
+        hold_end = await poller.sample_once()
+        hold_elapsed_s = loop.time() - hold_started
 
         # Stop offering everywhere; then drain the aggregate pipeline; final reconcile.
         sampler_stop.set()
@@ -460,9 +479,14 @@ async def _run_one_step(
         await asyncio.gather(*(driver.stop(_STOP_GRACE) for driver in drivers))
         drain_seconds = await poller.await_drain(timeout=drain_timeout_s, interval=_POLL_INTERVAL_S)
         await asyncio.sleep(_SETTLE)
-        final = await _sample_until_reconciled(
-            poller, metrics.counters, timeout=drain_timeout_s, interval=_POLL_INTERVAL_S
-        )
+        if drain_seconds is not None:
+            final = await sample_until_reconciled(
+                poller, metrics.counters, timeout=drain_timeout_s, interval=_POLL_INTERVAL_S
+            )
+        else:
+            # Drain timed out — the verdict is determined (backlog != 0 fails the reconcile); a
+            # second drain_timeout_s of settle-polling would only delay the honest failure.
+            final = await poller.sample_once()
         if final is not None:
             samples.append(final)
         drain_complete_iso = _now_iso()
@@ -484,6 +508,9 @@ async def _run_one_step(
             hold_start_iso=hold_start_iso,
             drain_complete_iso=drain_complete_iso,
             per_engine=per_engine,
+            hold_begin=hold_begin,
+            hold_end=hold_end,
+            hold_elapsed_s=hold_elapsed_s,
         )
     finally:
         for driver in drivers:
@@ -512,16 +539,33 @@ def _build_record(
     hold_start_iso: str,
     drain_complete_iso: str,
     per_engine: tuple[EngineAttribution, ...],
+    hold_begin: EngineSample | None = None,
+    hold_end: EngineSample | None = None,
+    hold_elapsed_s: float = 0.0,
 ) -> MultiShardRecord:
     c = metrics.counters.snapshot()
     base, final = poller.baseline, poller.final
-    no_loss = _reconcile(c, base, final)
+    # Budget = total connection count across every engine (at most ~one stranded in-flight per
+    # connection is a plausible teardown artifact; more is a systemic no-ACK fault).
+    no_loss = _reconcile(c, base, final, unconfirmed_budget=engines * count_per_engine)
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
-    # Aggregate achieved/delivered rate = summed engine read/written delta over the hold window.
-    read_delta = (final.read - base.read) if (base and final) else 0
-    written_delta = (final.written - base.written) if (base and final) else 0
-    achieved = read_delta / hold_seconds if hold_seconds > 0 else 0.0
-    delivered = written_delta / hold_seconds if hold_seconds > 0 else 0.0
+    # Aggregate achieved/delivered rate = the read/written delta across EXACTLY the hold window
+    # (bracket samples + measured wall time), so the number is a true steady-state rate. The
+    # baseline→final delta over the nominal hold (the fallback below, and the original metric) counts
+    # intake that spills into the post-hold flush + drain against a 60s divisor — under overload that
+    # inflated WS-B's N=8 "achieved" ~3.5x (857/s printed for a ~230-240/s steady state). The
+    # fallback only runs when a bracket sample failed (poller API error); its distortion is the known
+    # caveat, preferred over reporting 0 for a run that did move traffic.
+    if hold_begin is not None and hold_end is not None and hold_elapsed_s > 0:
+        read_delta = hold_end.read - hold_begin.read
+        written_delta = hold_end.written - hold_begin.written
+        achieved = read_delta / hold_elapsed_s
+        delivered = written_delta / hold_elapsed_s
+    else:
+        read_delta = (final.read - base.read) if (base and final) else 0
+        written_delta = (final.written - base.written) if (base and final) else 0
+        achieved = read_delta / hold_seconds if hold_seconds > 0 else 0.0
+        delivered = written_delta / hold_seconds if hold_seconds > 0 else 0.0
     pool_p95 = _peak_float([s.pool_wait_p95_ms for s in samples])
     ack = metrics.ack.summary()
     offered = engines * count_per_engine * per_conn_rate
@@ -539,6 +583,7 @@ def _build_record(
         acked=c.acked,
         nak=c.nak,
         deferred=c.deferred,
+        timeouts=c.timeouts,
         no_loss=no_loss,
         in_pipeline_peak=in_pipeline_peak,
         drain_seconds=drain_seconds,

@@ -376,6 +376,21 @@ def test_check_fhir_lookup_unrestricted_when_empty() -> None:
     check_fhir_lookup_allowed("epic", {"url": BASE}, EgressSettings())  # no raise
 
 
+def test_check_fhir_lookup_denies_unlisted_smart_token_url() -> None:  # DELTA-04
+    # FHIR base host is allowlisted, but the SMART token endpoint host is not. The signed
+    # client_assertion would be POSTed there, so it must be refused exactly like the outbound arm.
+    egress = EgressSettings(allowed_http=["fhir.example.org"])
+    settings = {"url": BASE, "smart_token_url": "https://evil.example/token"}
+    with pytest.raises(WiringError, match="SMART token endpoint"):
+        check_fhir_lookup_allowed("epic", settings, egress)
+
+
+def test_check_fhir_lookup_permits_allowlisted_smart_token_url() -> None:  # DELTA-04
+    egress = EgressSettings(allowed_http=["fhir.example.org", "auth.example.org"])
+    settings = {"url": BASE, "smart_token_url": "https://auth.example.org/token"}
+    check_fhir_lookup_allowed("epic", settings, egress)  # no raise
+
+
 # --- end-to-end: router + dry-run raise (fhir_lookup is the live exception) ---
 
 

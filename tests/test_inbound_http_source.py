@@ -416,6 +416,46 @@ async def test_read_request_rejects_chunked() -> None:
     assert exc.value.status == 400
 
 
+async def test_read_request_rejects_duplicate_content_length() -> None:  # DELTA-06
+    # Two Content-Length headers are an ambiguous-framing / request-smuggling signal (a dict would
+    # silently keep the last); reject rather than pick one.
+    raw = b"POST /x HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc"
+    with pytest.raises(HttpRequestError) as exc:
+        await _read_request(
+            await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
+        )
+    assert exc.value.status == 400 and exc.value.kind == "framing_error"
+
+
+async def test_read_request_rejects_content_length_with_transfer_encoding() -> None:  # DELTA-06
+    # Both Content-Length and Transfer-Encoding present: RFC 7230 §3.3.3 mandates rejection.
+    raw = b"POST /x HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\nabc"
+    with pytest.raises(HttpRequestError) as exc:
+        await _read_request(
+            await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
+        )
+    assert exc.value.status == 400 and exc.value.kind == "framing_error"
+
+
+async def test_read_request_rejects_duplicate_transfer_encoding() -> None:  # DELTA-06
+    # A duplicated Transfer-Encoding is how an obfuscated encoding is smuggled past the chunked check.
+    raw = b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n"
+    with pytest.raises(HttpRequestError) as exc:
+        await _read_request(
+            await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
+        )
+    assert exc.value.status == 400 and exc.value.kind == "framing_error"
+
+
+async def test_read_request_allows_single_content_length_get() -> None:
+    # Regression: a lone Content-Length (no duplicate, no Transfer-Encoding) is still accepted.
+    raw = b"GET /health HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n"
+    req = await _read_request(
+        await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
+    )
+    assert req.method == "GET" and req.body == b""
+
+
 def test_build_response_shape() -> None:
     out = build_response(202, '{"ok":1}')
     assert out.startswith(b"HTTP/1.1 202 Accepted\r\n")

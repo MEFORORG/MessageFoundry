@@ -101,6 +101,12 @@ class ConnScaleRecord:
     ack_p95_ms: float
     ack_p99_ms: float
 
+    # Unconfirmed sends (in-flight at a connection close with no ACK seen). The reconcile excuses
+    # these from the intake bound only up to ~one per connection; surfaced here so the tolerance
+    # width is visible on a PASSING record too, not just in a failing no_loss detail. Default 0 so
+    # older JSON artifacts deserialize unchanged.
+    timeouts: int = 0
+
     def to_json_dict(self) -> dict[str, object]:
         return {
             "sweep_mode": self.sweep_mode,
@@ -111,6 +117,7 @@ class ConnScaleRecord:
                 "acked": self.acked,
                 "nak": self.nak,
                 "deferred": self.deferred,
+                "timeouts": self.timeouts,
                 "in_pipeline_peak": self.in_pipeline_peak,
                 "drain_seconds": self.drain_seconds,
             },

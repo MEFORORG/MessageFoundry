@@ -6,6 +6,46 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.14] — 2026-07-01 — Early Access
+
+**Delta security-audit remediation.** A focused security audit of the surface added since the
+2026-06-10 full review (v0.2.0 → v0.2.13) surfaced seven verified findings; this release fixes all of
+them. No new critical, no SQL injection, no auth bypass, no RCE — the most serious was an
+unauthenticated memory-exhaustion DoS in the new default HL7 parser. Each fix ships with a regression
+test. See [`docs/reviews/DELTA-REVIEW-2026-07-01.md`](docs/reviews/DELTA-REVIEW-2026-07-01.md).
+
+### Security
+- **Bounded the built-in HL7 rich-text repetition escape** (DELTA-01/02;
+  [`_builtin_hl7.py`](messagefoundry/parsing/_builtin_hl7.py)). The tolerant built-in parser (now the
+  default hot-path backend, ADR 0054) expanded `\.inN\`-style repetition escapes with no cap, so a
+  ~15-byte inbound field (`\.in2000000000\`) allocated gigabytes synchronously on the event loop
+  **before the ACK** — an unauthenticated OOM/denial-of-service. The count is now clamped
+  (`MAX_ESCAPE_REPEAT = 512`), and a malformed count no longer raises out of a field read — that had
+  severed the connection and dropped a parseable message with **no disposition**, breaking the
+  count-and-log invariant.
+- **XML-DSig `verify()` now requires an explicit trust anchor** (DELTA-03;
+  [`parsing/xml/signature.py`](messagefoundry/parsing/xml/signature.py)). Called with neither `x509_cert`
+  nor `ca_pem_file`, it previously fell back to signxml's default of trusting **any** certificate that
+  chains to the host's system CA store (origin-blind verification); it now raises `ValueError`.
+  **Behavior change** for the opt-in `[xml]` codec — a caller must pin the expected signer or a partner
+  CA. No in-repo caller relied on the old default.
+- **FhirLookup SMART token endpoint is now egress-gated** (DELTA-04;
+  [`[egress].allowed_http`](docs/CONFIGURATION.md)). A `fhir_lookup` connection composed with
+  `with_smart_backend()` POSTs a signed `client_assertion` to its `smart_token_url`; that host was not
+  checked against the egress allowlist (only the FHIR base host was), so a crafted `smart_token_url`
+  could exfiltrate the assertion to an un-allowlisted host. The lookup and outbound arms now share one
+  gate ([ADR 0043](docs/adr/0043-fhir-read-lookup.md) §D3).
+- **Support bundle no longer discloses the store host/database; its log redaction was widened**
+  (DELTA-05/07; [`support/`](messagefoundry/support/)). The offline support bundle's `status.json`
+  carried the SQL Server `host/database` verbatim — it is now reduced to the backend kind (file basename
+  only for SQLite). The bundled-log redactor previously used a fixed HL7-segment allowlist with no
+  free-text name/DOB heuristics; it now delegates to the engine redactor
+  ([`messagefoundry.redaction`](messagefoundry/redaction.py)) for parity with stored-error redaction.
+- **Inbound HTTP listener rejects ambiguous framing** (DELTA-06;
+  [`transports/http_listener.py`](messagefoundry/transports/http_listener.py)). A duplicate
+  `Content-Length`, a duplicate `Transfer-Encoding`, or the two present together are now refused with
+  `400` per RFC 7230 §3.3.3 — closing an HTTP request-smuggling / desync surface behind a fronting proxy.
+
 ## [0.2.13] — 2026-07-01 — Early Access
 
 The **store connection-scale sizing** wave — right-size the server-DB connection pool to the measured

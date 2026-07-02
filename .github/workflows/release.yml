@@ -275,8 +275,9 @@ jobs:
     # "false" until WINDOWS_SIGN_CERT_BASE64 is provisioned -> the sign step skips, build stays green.
     env:
       SIGN_CONFIGURED: ${{ secrets.WINDOWS_SIGN_CERT_BASE64 != '' }}
-      # Pinned Inno Setup version (Chocolatey package `innosetup`). Bump deliberately; keep the installer
-      # reproducible alongside the wheel (ADR 0032 §(d) reproducibility hole).
+      # Fallback Inno Setup version (Chocolatey package `innosetup`) — used ONLY when the runner image
+      # ships no Inno Setup. When the image preinstalls one (currently 6.7.1), that build is used and this
+      # pin is not consulted (choco won't install an older version over a newer preinstalled one).
       INNO_SETUP_VERSION: "6.3.3"
     defaults:
       run:
@@ -354,12 +355,21 @@ jobs:
           pip install pytest pytest-timeout
           python -m pytest tests/test_frozen_launch_smoke.py -v -p no:cacheprovider
 
-      - name: Install Inno Setup (pinned)
+      - name: Install Inno Setup (prefer the runner's preinstalled build, else pin)
         run: |
-          choco install innosetup --version=$env:INNO_SETUP_VERSION --no-progress -y
-          # ISCC.exe is not on PATH after a choco install; resolve + export it for the next step.
+          # The GitHub Windows runner image may already ship a newer Inno Setup (currently 6.7.1),
+          # installed at the same "Inno Setup 6" path. A pinned `choco install <older>` then fails hard
+          # ("a newer version of InnoSetup is already installed. 0/1 packages"), breaking every release.
+          # Prefer an already-present ISCC.exe; only choco-install the pinned version when the box has
+          # none. ISCC compiles our .iss identically across 6.x, so using the preinstalled build is safe.
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc after choco install" }
+          if (Test-Path $iscc) {
+            Write-Host "Using preinstalled Inno Setup at $iscc"
+          } else {
+            choco install innosetup --version=$env:INNO_SETUP_VERSION --no-progress -y
+            if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc after choco install" }
+          }
+          # ISCC.exe is not on PATH; export the resolved path for the build step.
           "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build the installer (ISCC, AppVersion injected)

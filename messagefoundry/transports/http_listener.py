@@ -174,13 +174,28 @@ async def _read_request(
         raise HttpRequestError(400, "malformed request line", kind="framing_error")
 
     headers: dict[str, str] = {}
+    header_counts: dict[str, int] = {}
     for line in lines[1:]:
         if not line:
             continue
         name, sep, value = line.partition(":")
         if not sep:
             raise HttpRequestError(400, "malformed header line", kind="framing_error")
-        headers[name.strip().lower()] = value.strip()
+        key = name.strip().lower()
+        header_counts[key] = header_counts.get(key, 0) + 1
+        headers[key] = value.strip()
+
+    # Reject AMBIGUOUS framing before any Content-Length is trusted — the HTTP request-smuggling
+    # defense (RFC 7230 §3.3.3). A duplicate Content-Length / Transfer-Encoding, or the two present
+    # together, is exactly how a request is desynced past a fronting proxy (a dict collapses the
+    # duplicate silently, so it must be caught here). A conformant client sends neither. Checked for
+    # every method, before the GET/HEAD no-body short-circuit — smuggled framing on a GET still counts.
+    if header_counts.get("content-length", 0) > 1 or header_counts.get("transfer-encoding", 0) > 1:
+        raise HttpRequestError(400, "duplicate framing header", kind="framing_error")
+    if "content-length" in headers and "transfer-encoding" in headers:
+        raise HttpRequestError(
+            400, "ambiguous framing: Content-Length with Transfer-Encoding", kind="framing_error"
+        )
 
     method = method.upper()
     # 2. Body — only for methods that carry one. GET/HEAD are health probes (no body read, no ingress).

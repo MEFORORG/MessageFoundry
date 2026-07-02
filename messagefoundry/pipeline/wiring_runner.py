@@ -2814,6 +2814,28 @@ def check_lookup_allowed(name: str, settings: Mapping[str, Any], egress: EgressS
             )
 
 
+def _check_smart_token_url_egress(
+    label: str, settings: Mapping[str, Any], allowed_http: list[str]
+) -> None:
+    """Gate a SMART Backend Services token endpoint (ADR 0024): the connector POSTs the signed
+    ``client_assertion`` there, so a crafted ``smart_token_url`` pointing at an un-allowlisted host
+    would exfiltrate the assertion (a fail-open hole). Shared by the FHIR **outbound** and the
+    **FhirLookup** read arm so the two never drift out of lockstep — DELTA-04 was exactly that drift
+    (the read arm gated only ``url``). Only REST/FHIR/FhirLookup carry the key; an unset value is a
+    no-op. Call only when ``allowed_http`` is non-empty (matching the host gate's own guard)."""
+    token_url = str(settings.get("smart_token_url", ""))
+    if token_url and not _http_egress_allowed(token_url, allowed_http):
+        host = urllib.parse.urlsplit(token_url).hostname or ""
+        log.warning(
+            "egress denied: %s SMART token endpoint host %r not in [egress].allowed_http",
+            label,
+            host,
+        )
+        raise WiringError(
+            f"{label}: SMART token endpoint host {host!r} is not in the [egress].allowed_http allowlist"
+        )
+
+
 def check_fhir_lookup_allowed(
     name: str, settings: Mapping[str, Any], egress: EgressSettings
 ) -> None:
@@ -2840,6 +2862,10 @@ def check_fhir_lookup_allowed(
             raise WiringError(
                 f"FhirLookup {name!r}: host {host!r} is not in the [egress].allowed_http allowlist"
             )
+        # The SMART token endpoint (ADR 0024) is a SECOND egress host on this read arm — gate it with
+        # the same allowlist as the FHIR outbound, or a crafted smart_token_url (set via
+        # with_smart_backend()) exfiltrates the signed client_assertion to an unlisted host (DELTA-04).
+        _check_smart_token_url_egress(f"FhirLookup {name!r}", settings, egress.allowed_http)
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
@@ -3080,21 +3106,9 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
                 "[egress].allowed_http allowlist"
             )
         # ADR 0024: the SMART Backend Services token endpoint is a SECOND egress host — the connector
-        # POSTs the signed client_assertion there — so gate it too. Left ungated, a crafted
-        # smart_token_url would exfiltrate the assertion to an unlisted host (a fail-open hole). Only
-        # REST/FHIR carry it; an unset value is a no-op.
-        token_url = str(dest.settings.get("smart_token_url", ""))
-        if token_url and not _http_egress_allowed(token_url, egress.allowed_http):
-            host = urllib.parse.urlsplit(token_url).hostname or ""
-            log.warning(
-                "egress denied: outbound %r SMART token endpoint host %r not in [egress].allowed_http",
-                dest.name,
-                host,
-            )
-            raise WiringError(
-                f"outbound {dest.name!r}: SMART token endpoint host {host!r} is not in the "
-                "[egress].allowed_http allowlist"
-            )
+        # POSTs the signed client_assertion there — so gate it with the same allowlist. Shared helper,
+        # so the FhirLookup read arm in check_fhir_lookup_allowed stays in lockstep (DELTA-04).
+        _check_smart_token_url_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_http)
     elif dest.type is ConnectorType.DATABASE and egress.allowed_db:
         host = str(dest.settings.get("server", ""))
         port = dest.settings.get("port", 1433)

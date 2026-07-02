@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 from messagefoundry import __version__
 
 if TYPE_CHECKING:
-    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.settings import ServiceSettings, StoreBackend
 
 __all__ = ["BundleResult", "build_bundle", "config_summary", "status_snapshot"]
 
@@ -125,6 +125,21 @@ def status_snapshot(settings: ServiceSettings | None) -> dict[str, Any]:
     return status.model_dump()
 
 
+def _redact_store_path(path: str, backend: StoreBackend) -> str:
+    """A non-identifying store descriptor for the bundle. A server-DB ``path`` is ``"<server>/<database>"``
+    (``store/sqlserver.py``, ``store/postgres.py``), so carrying it verbatim leaks the DB **host and
+    database name** into the off-box bundle (DELTA-05) — a breach of the bundle's stated no-host/no-path
+    contract. Return only the backend kind for a server backend, and only the file **basename** for SQLite
+    (dropping any directory, which can carry a username or deployment path)."""
+    import os
+
+    from messagefoundry.config.settings import StoreBackend
+
+    if backend is StoreBackend.SQLITE:
+        return os.path.basename(path) or path
+    return f"<{backend.value}>"
+
+
 async def _db_info(settings: ServiceSettings) -> Any:
     from messagefoundry.api.models import DbInfo
     from messagefoundry.store.base import open_store
@@ -135,7 +150,7 @@ async def _db_info(settings: ServiceSettings) -> Any:
     finally:
         await store.close()
     return DbInfo(
-        path=db.path,
+        path=_redact_store_path(db.path, settings.store.backend),
         size_bytes=db.size_bytes,
         disk_free_bytes=db.disk_free_bytes,
         journal_mode=db.journal_mode,

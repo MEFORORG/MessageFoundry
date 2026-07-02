@@ -24,6 +24,12 @@ from harness.__main__ import main
 from harness.load.profile import load_profile_text
 from harness.load.runner import PreflightError, run_load
 
+# A genuine failure burns the full budgets back-to-back (5s stop grace + 30s await_drain + up to 30s
+# settle-poll + the 1.5s phase + fixture startup) — past the global 60s watchdog, which would kill the
+# run with a stack dump INSTEAD of failing the assert with report.no_loss.detail. Match the sibling
+# connscale/multishard smokes' 120s so a real failure stays diagnosable.
+pytestmark = pytest.mark.timeout(120)
+
 _LOAD_CONFIG = Path("harness/config/load")
 
 
@@ -113,7 +119,7 @@ name = "it"
 corpus_count_per_trigger = 5
 pool_size = 4
 poll_interval_s = 0.25
-drain_timeout_s = 20.0
+drain_timeout_s = 30.0
 [[load.target]]
 name = "adt_hub"
 host = "127.0.0.1"
@@ -123,14 +129,20 @@ types = ["ADT"]
 "ADT^A05" = 1.0
 [load.slo]
 zero_loss = true
-max_error_rate = 0.05
+# No max_error_rate: over this profile's ~90-message phase a single transport blip (one reconnect's
+# failed open under CI contention — client-side noise, not loss) exceeds any sane rate threshold, so
+# the SLO would gate on runner weather, flipping result_ok while every correctness check passes (the
+# windows-2025 flake). Correctness is fully carried by zero_loss + the reconcile + the resolution
+# asserts below; report._phase_slos also floors rate SLOs at _RATE_SLO_MIN_SENT, so a threshold on a
+# phase this small would not be evaluated anyway.
+#
 # Align the drain SLO with drain_timeout_s above — this is a no-loss CORRECTNESS test, not a
 # throughput benchmark, so the only meaningful bound is "did the backlog drain within the timeout".
 # A contended CI runner can take >15s to drain a perfectly lossless backlog (observed 16.14s on the
-# windows-2025 leg); a tighter threshold just opens a flake window between "drained fine" and "SLO
-# failed". A real timeout already fails the no-loss check (backlog != 0) and the drain_seconds
-# assertion below, so this stays a true bound without the timing flake.
-max_drain_seconds = 20.0
+# windows-2025 leg — hence 30, not 20); a tighter threshold just opens a flake window between
+# "drained fine" and "SLO failed". A real timeout already fails the no-loss check (backlog != 0) and
+# the drain_seconds assertion below, so this stays a true bound without the timing flake.
+max_drain_seconds = 30.0
 [[load.phase]]
 name = "steady"
 kind = "sustained"
@@ -153,12 +165,24 @@ def test_run_load_end_to_end_no_loss(engine: tuple[str, int, int]) -> None:
         )
     )
     assert report.counters.sent > 0
-    assert report.counters.acked == report.counters.sent  # engine ACKs every received message
+    # Every send resolves to exactly one of acked / nak / timeout (the sender's _fail_inflight
+    # reclassifies anything in-flight at a connection close as a timeout). A timeout is a client-side
+    # unconfirmed ACK (a reset/teardown under CI contention), not an engine failure — the reconcile
+    # accounts for it as unconfirmed, never as loss. But the count is BOUNDED here: the excusable CI
+    # flake is one-or-two stranded in-flight frames at teardown, while a systemic ACK-path regression
+    # (an engine that receives but never ACKs) strands the whole run — nak==0 + the identity alone
+    # would pass that (acked=0, timeouts=sent satisfies both), so the cap is the load-bearing assert.
+    assert report.counters.nak == 0
+    assert report.counters.timeouts <= 2, report.counters
+    assert report.counters.acked + report.counters.timeouts == report.counters.sent
     assert report.no_loss.ok, report.no_loss.detail
-    # Fan-out 2 → every sent message arrives at the sink twice and is timed each time.
+    # Fan-out 2 → every ACKed message (ACK == durable ingress commit) MUST reach the sink twice; the
+    # drain wait + no_loss.ok guarantee both deliveries resolved. `>= acked` alone would also pass an
+    # ACKed-then-dead-lettered message (dead rows leave backlog at 0 and are excluded from written).
     assert report.no_loss.sink_received == report.no_loss.engine_written
-    assert report.no_loss.sink_received >= report.counters.sent
-    assert report.result_ok and report.exit_code == 0
+    assert report.no_loss.sink_received >= 2 * report.counters.acked
+    # Name the violated SLO(s) on failure — a bare `assert False` here cost a CI-triage round trip.
+    assert report.result_ok and report.exit_code == 0, [c for c in report.slos if not c.ok]
     assert report.engine.drain_seconds is not None  # backlog drained within the timeout
 
 

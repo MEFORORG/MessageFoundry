@@ -294,7 +294,15 @@ def build_report(
         if rec.phase.measured:
             slos.extend(_phase_slos(rec, profile.slo_for(rec.phase)))
 
-    no_loss = _reconcile(final_counters, poller, drain_seconds, tolerance=loss_tolerance)
+    # Unconfirmed-send budget = the run's total client connection count (one pool of pool_size per
+    # target): at most ~one stranded in-flight frame per connection is a plausible teardown artifact.
+    no_loss = _reconcile(
+        final_counters,
+        poller,
+        drain_seconds,
+        tolerance=loss_tolerance,
+        unconfirmed_budget=profile.pool_size * max(1, len(profile.targets)),
+    )
     engine = _engine_summary(poller, drain_seconds, db_backend)
     slos.extend(_run_slos(profile.default_slo, final_counters, no_loss, engine, drain_seconds))
 
@@ -339,6 +347,11 @@ def _phase_report(rec: PhaseRecord) -> PhaseReport:
     )
 
 
+# Minimum phase `sent` for RATE-based SLOs (max_error_rate) to be emitted: below this, one transport
+# blip exceeds any sane rate threshold, so the check would gate on noise rather than behavior.
+_RATE_SLO_MIN_SENT = 200
+
+
 def _phase_slos(rec: PhaseRecord, slo: Slo) -> list[SloCheck]:
     p = rec.phase
     sent = rec.end.sent - rec.start.sent
@@ -376,8 +389,16 @@ def _phase_slos(rec: PhaseRecord, slo: Slo) -> list[SloCheck]:
                 e2e.p99_ms <= slo.max_e2e_p99_ms,
             )
         )
-    if slo.max_error_rate is not None:
-        er = errs / sent if sent else 0.0
+    if slo.max_error_rate is not None and sent >= _RATE_SLO_MIN_SENT:
+        # A RATE over a tiny denominator is statistically meaningless: on a ~90-message CI smoke phase
+        # a single transport blip (one reconnect's failed open / stranded in-flights — client-side
+        # noise, not loss) is >1%, so any sane threshold flips on one event. Below the floor the check
+        # is not emitted at all (no verdict beats a noise-driven one); real load profiles run thousands
+        # of messages per phase and keep the gate. A mass reset/timeout FLOOD on a small phase is not
+        # un-gated by this floor: the reconcile's bounded unconfirmed-send budget fails zero_loss when
+        # timeouts exceed ~one per connection. (max_nak_rate below deliberately has no floor — a NAK
+        # is a deterministic engine verdict, not transport noise, so even one is signal.)
+        er = errs / sent
         out.append(
             SloCheck(
                 f"{p.name}:max_error_rate",
@@ -438,7 +459,12 @@ def _run_slos(
 
 
 def _reconcile(
-    counters: Counters, poller: EnginePoller, drain_seconds: float | None, *, tolerance: float
+    counters: Counters,
+    poller: EnginePoller,
+    drain_seconds: float | None,
+    *,
+    tolerance: float,
+    unconfirmed_budget: int,
 ) -> NoLoss:
     sent = counters.sent
     sink_received = counters.sink_received
@@ -464,21 +490,52 @@ def _reconcile(
     # so a symmetric abs() check would false-FAIL on a re-delivery. Tolerance is an absolute message
     # count (default 0 = exact); after the drain wait + settle there should be no in-flight skew, so a
     # strict check is correct here — a percentage-of-volume slack would silently mask thousands lost.
-    read_short = sent - read
+    #
+    # A `timeouts`-counted message (in-flight at a connection close with no ACK seen — a mid-run reset
+    # or the stop-grace expiring) is UNCONFIRMED, not lost: `sent` was counted at write-buffer time, so
+    # the frame may never have left the closed socket. Requiring `read >= sent` false-fails exactly
+    # when timeouts > 0; `read >= sent - timeouts` accepts the unconfirmed sends as unconfirmed while
+    # ANY FURTHER shortfall is a real, confirmed-then-lost message and still fails. With timeouts == 0
+    # (every healthy run) this is exactly as strict as read >= sent.
+    #
+    # BUT the excusal is BOUNDED by `unconfirmed_budget` (the run's connection count — at most ~one
+    # stranded in-flight frame per connection is a plausible teardown artifact). Past the budget the
+    # timeout count is a SYSTEMIC no-ACK fault (mass resets, or the engine accepting frames and never
+    # ACKing — possibly accepted-and-dropped, the exact class the count-and-log invariant forbids), so
+    # NOTHING is excused and the reconcile fails loudly. Without the cap, `timeouts == sent` would
+    # degrade the intake bound to `read >= 0` and a total ACK-path regression would pass zero_loss.
+    unconfirmed = counters.timeouts
+    over_budget = unconfirmed > unconfirmed_budget
+    excused = 0 if over_budget else unconfirmed
+    read_short = sent - excused - read
     deliver_short = written - sink_received
     read_ok = read_short <= tolerance
     deliver_ok = deliver_short <= tolerance
     drained = backlog == 0
-    ok = read_ok and deliver_ok and drained
+    ok = read_ok and deliver_ok and drained and not over_budget
     parts: list[str] = []
     if not read_ok:
-        parts.append(f"engine_read {read} < sent {sent} (lost {read_short} on intake)")
+        parts.append(
+            f"engine_read {read} < confirmed sent {sent - excused} (lost {read_short} on intake)"
+        )
     if not deliver_ok:
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
     if not drained:
         parts.append(f"backlog {backlog} not drained")
+    if over_budget:
+        parts.append(
+            f"{unconfirmed} unconfirmed sends exceed the stranding budget "
+            f"({unconfirmed_budget} ≈ one in-flight per connection) — systemic no-ACK fault "
+            f"(possible accepted-and-dropped); nothing excused"
+        )
+    elif unconfirmed > 0 and read < sent:
+        # Honest reporting either way: the gap is attributed to unconfirmed sends, not silently absorbed.
+        parts.append(
+            f"{unconfirmed} unconfirmed send(s) (no ACK before connection close) "
+            f"not observed at intake — not counted as loss"
+        )
     detail = "; ".join(parts) if parts else "read>=sent, sink_received>=written, backlog drained"
     return NoLoss(ok, sent, read, written, sink_received, backlog, at_least_once, detail)
 

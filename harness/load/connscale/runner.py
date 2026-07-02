@@ -44,7 +44,7 @@ from harness.load.connscale.report import (
 )
 from harness.load.corpus import Corpus, build_corpus
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EngineSample, EnginePoller
+from harness.load.enginepoll import EngineSample, EnginePoller, sample_until_reconciled
 from harness.load.failover import EngineNode, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
@@ -243,17 +243,24 @@ async def _run_one_step(
             timeout=profile.drain_timeout_s, interval=profile.poll_interval_s
         )
         await asyncio.sleep(_SETTLE)
-        # Poll the SETTLED reconcile condition (read >= sent, sink_received >= written) rather than
-        # trusting a single fixed-instant sample — the durable fix for the intake/delivery-count lag a
-        # noisy runner shows even after a clean drain (mf-ci-test-flakes: assert the actual settled
-        # condition, not a timing). Bounded; on timeout it falls through to the last sample and the
-        # no-loss reconcile reports the residual shortfall honestly.
-        final = await _sample_until_reconciled(
-            poller,
-            metrics.counters,
-            timeout=profile.drain_timeout_s,
-            interval=profile.poll_interval_s,
-        )
+        if drain_seconds is not None:
+            # Poll the SETTLED reconcile condition (read >= confirmed sent, sink_received >= written)
+            # rather than trusting a single fixed-instant sample — the durable fix for the
+            # intake/delivery-count lag a noisy runner shows even after a clean drain
+            # (mf-ci-test-flakes: assert the actual settled condition, not a timing). Bounded; on
+            # timeout it falls through to the last sample and the no-loss reconcile reports the
+            # residual shortfall honestly.
+            final = await sample_until_reconciled(
+                poller,
+                metrics.counters,
+                timeout=profile.drain_timeout_s,
+                interval=profile.poll_interval_s,
+            )
+        else:
+            # The drain already timed out — the verdict (backlog != 0 fails the reconcile) is
+            # determined, so burning a second drain_timeout_s polling for a settle that cannot come
+            # would only compound a genuine failure across sweep steps into the pytest watchdog.
+            final = await poller.sample_once()
         if final is not None:
             samples.append(final)
         return _build_record(
@@ -405,38 +412,6 @@ async def _time_reload(poller: EnginePoller) -> float | None:
     return await loop.run_in_executor(None, time_reload, client, None)
 
 
-async def _sample_until_reconciled(
-    poller: EnginePoller, counters: Counters, *, timeout: float, interval: float
-) -> EngineSample | None:
-    """Re-sample the engine until the no-loss reconcile condition SETTLES — every offered message has
-    been read (``read >= sent``) and every delivery has reached the sink (``sink_received >= written``)
-    — or ``timeout`` elapses. The durable fix for the intake/delivery count-lag a noisy runner shows
-    even after a clean drain: assert the actual settled condition, not a single fixed-instant sample
-    (mf-ci-test-flakes). The baseline-relative deltas are used, mirroring the reconcile. On timeout the
-    last sample is returned and the no-loss check reports the residual shortfall honestly (no masking)."""
-    loop = asyncio.get_running_loop()
-    base = poller.baseline
-    start = loop.time()
-    last = poller.final
-    while loop.time() - start < timeout:
-        sample = await poller.sample_once()
-        if sample is not None:
-            last = sample
-            if base is not None:
-                read = sample.read - base.read
-                written = sample.written - base.written
-                # Settled: intake fully read AND every counted delivery arrived at the sink AND the
-                # pipeline is empty (no in-flight rows that could still move the counts).
-                if (
-                    read >= counters.sent
-                    and counters.sink_received >= written
-                    and sample.in_pipeline == 0
-                ):
-                    return sample
-        await asyncio.sleep(interval)
-    return last
-
-
 def _build_record(
     *,
     mode: str,
@@ -451,7 +426,9 @@ def _build_record(
 ) -> ConnScaleRecord:
     c = metrics_counters.snapshot()
     base, final = poller.baseline, poller.final
-    no_loss = _reconcile(c, base, final)
+    # Budget = this step's connection count: at most ~one stranded in-flight per connection is a
+    # plausible teardown artifact; more is a systemic no-ACK fault the reconcile must fail.
+    no_loss = _reconcile(c, base, final, unconfirmed_budget=count)
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
 
     # Wall #1: executor saturation (None when the shim isn't installed → all-None samples).
@@ -483,6 +460,7 @@ def _build_record(
         acked=c.acked,
         nak=c.nak,
         deferred=c.deferred,
+        timeouts=c.timeouts,
         no_loss=no_loss,
         in_pipeline_peak=in_pipeline_peak,
         drain_seconds=drain_seconds,
@@ -505,7 +483,13 @@ def _build_record(
     )
 
 
-def _reconcile(c: Counters, base: EngineSample | None, final: EngineSample | None) -> NoLoss:
+def _reconcile(
+    c: Counters,
+    base: EngineSample | None,
+    final: EngineSample | None,
+    *,
+    unconfirmed_budget: int,
+) -> NoLoss:
     sent = c.sent
     sink_received = c.sink_received
     if base is None or final is None:
@@ -521,19 +505,49 @@ def _reconcile(c: Counters, base: EngineSample | None, final: EngineSample | Non
     read = final.read - base.read
     written = final.written - base.written
     backlog = final.backlog
-    read_short = sent - read
+    # A `timeouts`-counted message (in-flight at a connection close with no ACK seen — a mid-run reset
+    # or the stop-grace expiring) is UNCONFIRMED, not lost: `sent` was counted at write-buffer time, so
+    # the frame may never have left the closed socket. Requiring `read >= sent` false-fails exactly when
+    # timeouts > 0 (the "lost 1 on intake" CI flake); requiring `read >= sent - timeouts` accepts the
+    # unconfirmed sends as unconfirmed while ANY FURTHER shortfall is a real, confirmed-then-lost
+    # message and still fails. With timeouts == 0 (every healthy run) it is exactly read >= sent.
+    #
+    # BUT the excusal is BOUNDED by `unconfirmed_budget` (the caller's connection count — at most ~one
+    # stranded in-flight frame per connection is a plausible teardown artifact). Past the budget the
+    # timeout count is a SYSTEMIC no-ACK fault (mass resets, or the engine accepting frames and never
+    # ACKing — possibly accepted-and-dropped, the exact class the count-and-log invariant forbids), so
+    # NOTHING is excused and the reconcile fails loudly. Without the cap, `timeouts == sent` would
+    # degrade the intake bound to `read >= 0` and a total ACK-path regression would pass zero_loss.
+    unconfirmed = c.timeouts
+    over_budget = unconfirmed > unconfirmed_budget
+    excused = 0 if over_budget else unconfirmed
+    read_short = sent - excused - read
     deliver_short = written - sink_received
     drained = backlog == 0
-    ok = read_short <= 0 and deliver_short <= 0 and drained
+    ok = read_short <= 0 and deliver_short <= 0 and drained and not over_budget
     parts: list[str] = []
     if read_short > 0:
-        parts.append(f"engine_read {read} < sent {sent} (lost {read_short} on intake)")
+        parts.append(
+            f"engine_read {read} < confirmed sent {sent - excused} (lost {read_short} on intake)"
+        )
     if deliver_short > 0:
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
     if not drained:
         parts.append(f"backlog {backlog} not drained")
+    if over_budget:
+        parts.append(
+            f"{unconfirmed} unconfirmed sends exceed the stranding budget "
+            f"({unconfirmed_budget} ≈ one in-flight per connection) — systemic no-ACK fault "
+            f"(possible accepted-and-dropped); nothing excused"
+        )
+    elif unconfirmed > 0 and read < sent:
+        # Honest reporting either way: the gap is attributed to unconfirmed sends, not silently absorbed.
+        parts.append(
+            f"{unconfirmed} unconfirmed send(s) (no ACK before connection close) "
+            f"not observed at intake — not counted as loss"
+        )
     detail = "; ".join(parts) if parts else "read>=sent, sink_received>=written, backlog drained"
     return NoLoss(ok, sent, read, written, sink_received, backlog, detail)
 

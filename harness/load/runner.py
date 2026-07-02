@@ -19,7 +19,7 @@ from messagefoundry.console.client import ApiError
 
 from harness.load.corpus import build_corpus
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EnginePoller
+from harness.load.enginepoll import EnginePoller, sample_until_reconciled
 from harness.load.governor import RateGovernor
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
@@ -101,13 +101,33 @@ async def run_load(
             with contextlib.suppress(asyncio.CancelledError):
                 await poll_task
             poll_task = None
+        # Stop the dispatcher FIRST (flush queued sends + grace in-flight ACKs) BEFORE draining, so
+        # every offered message has reached the engine's ingress stage before await_drain waits for
+        # empty. Draining first would let a message still in a pool's send queue arrive AFTER
+        # await_drain returned, so the final sample's `read` could trail `sent` on a slow runner — the
+        # "engine_read < sent" intake-gap flake (the same ordering fix the connscale step carries).
+        await dispatcher.stop(_STOP_GRACE)
         drain_seconds = await poller.await_drain(
             timeout=profile.drain_timeout_s, interval=profile.poll_interval_s
         )
-
-        await dispatcher.stop(_STOP_GRACE)
         await asyncio.sleep(_SETTLE)
-        await poller.sample_once()  # truly-final engine state for reconciliation
+        if drain_seconds is not None:
+            # Poll the SETTLED reconcile condition (read >= confirmed sent, sink_received >= written,
+            # pipeline empty) rather than trusting a single fixed-instant sample — the durable fix for
+            # the intake/delivery count-lag a noisy runner shows even after a clean drain
+            # (mf-ci-test-flakes). Bounded; on timeout the last sample stands and the reconcile
+            # reports the residual honestly.
+            await sample_until_reconciled(
+                poller,
+                metrics.counters,
+                timeout=profile.drain_timeout_s,
+                interval=profile.poll_interval_s,
+            )
+        else:
+            # The drain already timed out — the verdict (max_drain_seconds fails, backlog != 0) is
+            # determined, so burning a second drain_timeout_s polling for a settle that cannot come
+            # would only push a genuine failure into the pytest watchdog. One honest final sample.
+            await poller.sample_once()
         return build_report(
             profile,
             engine_url,

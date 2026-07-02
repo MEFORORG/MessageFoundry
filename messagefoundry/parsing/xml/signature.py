@@ -49,10 +49,22 @@ def verify(
 ) -> XmlSignatureResult:
     """Verify the enveloped XML-DSig signature on ``document``.
 
-    Pass ``x509_cert`` to pin the expected signer certificate, or ``ca_pem_file`` to trust a CA. Returns
-    an :class:`XmlSignatureResult` (a failed verification is **data**, not an exception, so a Handler
-    can route the message). Raises :class:`~messagefoundry.parsing.xml.errors.XmlError` if the input is
-    unparseable, and :class:`RuntimeError` if the ``[xml]`` extra is absent."""
+    A trust anchor is **required**: pass ``x509_cert`` to pin the expected signer certificate, **or**
+    ``ca_pem_file`` to trust a partner CA. Calling with neither is refused with :class:`ValueError` —
+    signxml's default would otherwise trust **any** signature whose embedded certificate chains to the
+    host's system CA store, so anyone with a public domain-validated certificate could forge a
+    signature this returns ``verified=True`` for (DELTA-03). Returns an :class:`XmlSignatureResult` (a
+    failed verification is **data**, not an exception, so a Handler can route the message). Raises
+    :class:`ValueError` if no anchor is supplied,
+    :class:`~messagefoundry.parsing.xml.errors.XmlError` if the input is unparseable, and
+    :class:`RuntimeError` if the ``[xml]`` extra is absent."""
+    if x509_cert is None and ca_pem_file is None:
+        # Refuse origin-blind verification. Require the caller to pin the expected signer or a partner
+        # CA rather than fall back to signxml's "trust anything the OS trusts" default (DELTA-03).
+        raise ValueError(
+            "verify() requires a trust anchor: pass x509_cert (the pinned signer certificate) or "
+            "ca_pem_file (a trusted CA). Refusing to trust any system-CA-trusted certificate."
+        )
     signxml = load_signxml()
     root = parse_bytes(document)
     verifier = signxml.XMLVerifier()
