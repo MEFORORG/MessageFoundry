@@ -585,8 +585,26 @@ async def test_dl_replay_per_destination_rejects_cross_site(engine: Engine) -> N
 
 def test_ws_stats_payload_is_enriched(tmp_path: Path) -> None:
     # Sync TestClient drives the lifespan (engine on its own loop), like tests/test_api.py's WS test.
-    # No auth → the native allow_no_auth path authorizes the socket; the enriched payload now carries
-    # the server-rendered connections fragment alongside the queue-by-status counts.
+    # No auth → the native allow_no_auth path authorizes the socket; with serve_ui on the web console
+    # installs the app.state.ui_connections_render hook, so the payload carries the server-rendered
+    # connections fragment alongside the queue-by-status counts (Option B Phase 0 seam 3).
+    from starlette.testclient import TestClient
+
+    from messagefoundry.api import create_managed_app
+
+    app = create_managed_app(db_path=tmp_path / "wsx.db", poll_interval=0.05, serve_ui=True)
+    with TestClient(app) as tc, tc.websocket_connect("/ws/stats") as ws:
+        data = ws.receive_json()
+        assert "outbox_by_status" in data and isinstance(data["outbox_by_status"], dict)
+        assert "connections_html" in data and isinstance(data["connections_html"], str)
+        assert 'id="conns"' in data["connections_html"]  # the server-rendered table fragment
+
+
+def test_ws_stats_payload_is_counts_only_without_serve_ui(tmp_path: Path) -> None:
+    # JSON-only fallback (Option B Phase 0 seam 3): with serve_ui off the ui_connections_render hook is
+    # unset, so /ws/stats pushes a COUNTS-ONLY frame (no server-rendered connections_html) over the
+    # native Authorization-header WS auth path. The counts key is always present; a native client that
+    # only reads outbox_by_status is unaffected.
     from starlette.testclient import TestClient
 
     from messagefoundry.api import create_managed_app
@@ -595,8 +613,7 @@ def test_ws_stats_payload_is_enriched(tmp_path: Path) -> None:
     with TestClient(app) as tc, tc.websocket_connect("/ws/stats") as ws:
         data = ws.receive_json()
         assert "outbox_by_status" in data and isinstance(data["outbox_by_status"], dict)
-        assert "connections_html" in data and isinstance(data["connections_html"], str)
-        assert 'id="conns"' in data["connections_html"]  # the server-rendered table fragment
+        assert "connections_html" not in data
 
 
 # --- PR C: off-loopback exposure — [api].public_origin same-origin checks ------

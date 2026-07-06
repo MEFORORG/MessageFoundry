@@ -1,0 +1,30 @@
+Thread-hop-fusion A/B (ADR 0071 B5) -- baseline fuse=off (B0) vs candidate fuse=on (B1)
+guards (ADR 0071 6.4b): lift >= 10% AND > 2sigma | in_pipeline flat-or-lower | delivered/offered >= 0.98 | zero-loss held  (SQL Server is the valid leg; SQLite is NOT a throughput proxy)
+overall: NO-GO  (GO=0, NO-GO=3, INCONCLUSIVE=0, missing=0, candidate_zero_loss_ok=True)
+
+[pooled/fixed_aggregate] N=256  =>  NO-GO
+  in_pipeline grew (B1 21503 > B0 19732) -- the higher intake rides a backlog, not a real ceiling lift
+  achieved_read/s (ceiling) B0=   114.77  B1=   122.18      +6.5%  2sigma=     1.72  significant: yes
+  in_pipeline_peak          B0=    19732  B1=    21503             flat-or-lower: NO
+  delivered/offered         B0=     1.00  B1=     1.00             keeping-up: yes
+  zero_loss                 B0=      yes  B1=      yes             candidate_lost: NO
+  trials                   B0=        3  B1=        3
+  achieved_written/s       B0=   114.90  B1=   122.27
+
+[pooled/fixed_aggregate] N=512  =>  NO-GO
+  lift +9.3% < 10% -- fusion banked no worthwhile margin (null/negative → ADR 0071 escalates to free-threading)
+  achieved_read/s (ceiling) B0=   110.41  B1=   120.64      +9.3%  2sigma=     3.26  significant: yes
+  in_pipeline_peak          B0=    20583  B1=    21552             flat-or-lower: yes
+  delivered/offered         B0=     1.00  B1=     1.00             keeping-up: yes
+  zero_loss                 B0=      yes  B1=      yes             candidate_lost: NO
+  trials                   B0=        3  B1=        3
+  achieved_written/s       B0=   110.49  B1=   120.71
+
+[pooled/fixed_aggregate] N=1024  =>  NO-GO
+  in_pipeline grew (B1 21969 > B0 9316) -- the higher intake rides a backlog, not a real ceiling lift
+  achieved_read/s (ceiling) B0=   106.83  B1=   117.52     +10.0%  2sigma=     1.48  significant: yes
+  in_pipeline_peak          B0=     9316  B1=    21969             flat-or-lower: NO
+  delivered/offered         B0=     1.00  B1=     1.00             keeping-up: yes
+  zero_loss                 B0=      yes  B1=      yes             candidate_lost: NO
+  trials                   B0=        3  B1=        3
+  achieved_written/s       B0=   106.87  B1=   117.57

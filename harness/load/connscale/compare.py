@@ -928,6 +928,12 @@ def _fuse_row(
     # "flat-or-lower": B1's in_pipeline peak must not exceed B0's beyond a small noise cushion (a
     # +1 absolute so a near-zero baseline isn't tripped by unit jitter). A grown in_pipeline means the
     # higher intake number is riding a backlog, not a real ceiling lift.
+    # TODO(ADR 0071 §10 item 8): in_pipeline_peak is the /stats-POLLER-sampled peak, which UNDER-samples
+    # under overload — the 2026-07-06 fuse_ab bench read a spuriously low B0 peak (1369/7801/9316 vs a
+    # steady B1 ~21k) and fired a FALSE "in_pipeline grew" NO-GO at N=1024 (B1 in fact drained faster;
+    # Little's law says the lower-intake arm should read equal-or-higher). Should compare the AUTHORITATIVE
+    # sink/drain signal (sink_received vs sent, backlog-at-drain) instead of the sampled gauge. Does not
+    # change that run's overall NO-GO (256/512 fail on the lift clause), but it produces misleading reasons.
     in_pipeline_ok = (
         cand.in_pipeline_peak <= base.in_pipeline_peak * (1.0 + in_pipeline_tolerance) + 1.0
     )

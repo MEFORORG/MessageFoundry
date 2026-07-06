@@ -1,0 +1,76 @@
+ADR 0071 B5 — thread-hop fusion A/B (fuse_ab): the throughput GO/NO-GO promote gate
+====================================================================================
+Run date:   2026-07-06 (UTC)   |  Result: NO-GO (see README / fuse_ab.txt)
+Purpose:    Decide ship-fusion-by-default (GO) vs bank-nothing + escalate to free-threading
+            (ADR 0053) (NO-GO/INCONCLUSIVE), per ADR 0071 §6.4(b).
+
+CODE UNDER TEST
+  Branch:       feat/adr0071-pr5-trials
+  Checkout HEAD: 8bab40e2cb20eebe626f8557434a28ea02874f51 (detached)
+  Commit:       "feat(harness): ADR 0071 B5 PR5 — connscale `trials` field so one fuse_ab run banks >=3 trials/arm"
+  Provenance note: PR4 (#777, the fuse_ab profile + fuse_modes axis) + PR5 (#780, the trials field) were
+                fetched as the `feat/adr0071-pr5-trials` branch tip from the source repo (git over the
+                RDP \\tsclient share depth-1). Whether PR4/PR5 are merged to `main` could NOT be confirmed
+                from the bench (git ls-remote/deep ops over \\tsclient hang); the PR5 branch tip is the
+                authoritative PR4+PR5 code either way. Fusion machinery PR1-3 is in this branch's history.
+  Branch identity: fuse machinery present (wiring_runner `_fusion_active`, route/transform_handoff_sync,
+                per-stage fusing executors); fuse_thread_hops settings field default OFF.
+
+RIG (AWS two-box bench, us-east-2)
+  Engine box:   m7i.2xlarge (instance-id + private IP redacted), Windows Server 2025,
+                Python 3.14.6, asyncio ProactorEventLoop. Engine spawned per sweep step by the connscale
+                harness (it OWNS the engine; one fresh engine per step, its own MLLP + API ports).
+  SQL box:      SQL Server 2022 (RTM 16.0.1000.6), database `mfbench`, SQL login, RCSI = ON (verified;
+                force-enabled at store open). Per handoff: i4i.2xlarge, store on local NVMe D:. It stayed
+                RUNNING across the engine-box stop (mfbench intact) — the §2 stop/start-wipes-D: hazard
+                was avoided.
+  INTER-BOX RTT (disclosed per handoff §8): TCP-connect RTT engine->store (SQL box):1433, n=12:
+                min 10.14 / median 11.38 / mean 12.68 / max 24.03 ms. This is HIGH for same-VPC EC2
+                (usually sub-ms) and, at ~4-5 store round-trips per message, is a real co-bottleneck on
+                the ABSOLUTE ceiling (~107 msg/s). It does NOT bias the A/B (both arms share the link, so
+                the fusion LIFT is clean), but it is a plausible reason the lift is a modest ~10% rather
+                than the projected large collapse — fusion cuts marshaling crossings, not network latency.
+                A same-AZ / sub-ms rig might show a different (larger or smaller) fusion delta.
+
+RUN PARAMETERS (harness/load/profiles/fuse_ab.toml)
+  claim_modes=["pooled"]  fuse_modes=[false(B0), true(B1)]  trials=3  counts=[256,512,1024]
+  sweep_mode=fixed_aggregate  aggregate_rate=400.0 msg/s offered  hold_seconds=60 (warm; warmup discarded)
+  drain_timeout_s=300  store_backend=sqlserver  transform=cheap  zero_loss=true
+  base_port=20000 (EDITED from committed 2600 — the 2600..3623 band at N=1024 straddles RDP 3389;
+                20000..21023 is clear and under the 22000 ephemeral floor. Bench-only; do NOT commit.)
+  18 steps total (2 fuse x 3 counts x 3 trials); wall time ~64 min (dominated by the ~140-160s at-ceiling
+                backlog drain per step: 400/s offered vs ~107-117/s achieved => ~24000 sent/step draining
+                at the ceiling).
+
+INVOCATION
+  python -m harness --connscale fuse_ab --report-json out/fuse_ab.json --report-compare out/fuse_ab.txt \
+    --connscale-api-port 8800 --sink-port 2700
+  (store connection + the 3 disclosed startup escapes set in the shell; connscale env-injects them + the
+   per-arm MEFOR_PIPELINE_FUSE_THREAD_HOPS into each spawned engine.)
+
+THREE DISCLOSED STARTUP ESCAPES (throughput-neutral; trusted-network synthetic bench only)
+  MEFOR_STORE_TRUST_SERVER_CERTIFICATE=true  — accept the SQL box's self-signed dev cert
+  MEFOR_ALLOW_INSECURE_TLS=1                  — permit the above cert override (fail-closed gate otherwise)
+  MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1        — the worktree config dir is writable by BUILTIN\Users
+
+FUSION ACTIVATION (pre-run smoke, direct `serve`, pooled + fuse on, this store)
+  Log confirmed: "ADR 0071 thread-hop fusion ACTIVE (SQL Server, pooled): 8 fusing worker(s)/stage +
+  matched synchronous handoff pools" — no "FALLING BACK", store connected (pre-warmed 20 pooled conns,
+  no SQL 18456/4060). Every B1 arm uses the identical env injection; the positive+significant B1 lift at
+  every count corroborates fusion engaged (a silent async fallback would show ~0 lift). NOTE: the connscale
+  runner auto-deletes each per-step engine log on teardown, so per-arm activation was not re-grepped.
+
+SECURITY POSTURE (honored)
+  Synthetic HL7 only, no PHI/customer data. MEFOR_STORE_PASSWORD env-only — never written to any file/report.
+  RCSI stayed ON. No DELAYED_DURABILITY / no durability relaxation. Nothing committed or pushed from the bench.
+  Artifacts screened for store IP / login / password / message bodies before handback (only a loopback
+  127.0.0.1 engine URL remains). SQLite/Postgres are NOT valid throughput proxies for this axis (fusion is a
+  provable no-op there) — SQL Server is the only valid leg.
+
+FILES
+  README.md              — bottom-line verdict -> table -> provenance (READ FIRST)
+  fuse_ab.json           — authoritative machine-readable report (records[] + comparison + GO/NO-GO)
+  fuse_ab.txt            — rendered A/B table + §6.4(b) verdict
+  fuse_ab_console.txt    — full connscale console report (per-arm rows + SLO + exit)
+  environment.txt        — this file
+  Intended repo home (dev team to commit): docs/benchmarks/results/2026-07-06-adr0071-b5-throughput/

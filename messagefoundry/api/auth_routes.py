@@ -19,8 +19,9 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import ValidationError
 
-from messagefoundry.api import webui
-
+# NOTE: messagefoundry.api.webui is deliberately NOT imported at module scope (ADR 0065 / Option B
+# Phase 0). It is a GUARDED, lazy import inside the serve_ui branch below, so this module imports and
+# the engine boots with the web console ABSENT. The serve_ui /ui admin pages require it.
 from messagefoundry.api.auth_models import (
     AdGroupMap,
     AdGroupMapEntry,
@@ -805,6 +806,18 @@ def add_auth_routes(app: FastAPI, *, serve_ui: bool = False) -> None:
     #    POSTs map their stale-step-up redirect to that form via reauth_next — so no body (and no
     #    password) ever crosses /ui/reauth.
     if serve_ui:
+        # GUARDED, lazy import (Option B Phase 0): the web console is an optional package required only
+        # when serve_ui is on. add_auth_routes runs UNCONDITIONALLY from create_app, so this module must
+        # import with the console absent; a missing install fails LOUD at startup here. (The absent path
+        # is exercised by tests/test_webconsole_absent.py, which shadows the import.)
+        try:
+            from messagefoundry.api import webui
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "serve_ui requires the web console (messagefoundry.api.webui / the "
+                "messagefoundry-webconsole package) which could not be imported"
+            ) from exc
+
         webui.register_ui_action(
             r"^/ui/users/new$", Permission.USERS_MANAGE, auto_retry=False, unlock=True
         )

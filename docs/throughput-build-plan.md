@@ -83,6 +83,17 @@ preserved in the operator-local WS_B_REPORT.md). The settled, five-way-confirmed
   any N-concurrently-active engines on one store:** ownership-scoped startup recovery (today's
   unconditional `reset_stale_inflight` would steal a live sibling's in-flight rows — design plan
   exists, build gated on the 1500-shape box count).
+  - **Scope correction (2026-07-06, from a code map): this is TWO entangled reliability-core builds, not a
+    one-file patch.** (A) Scoping the reset to a shard's owned inbound `channel_id`s cleanly recovers
+    ingress/routed/response/PT rows. But (B) **outbound rows are the gap** — they carry the *source*
+    inbound's `channel_id` while the delivery lane keys on `destination_name` and is **shared across
+    shards**, so a naive `channel_id` filter either **dups** a sibling's in-flight send or **strands** a row
+    INFLIGHT forever (SQL Server has no lease sweep). [ADR 0063](adr/0063-no-split-store-unified-store-for-sharding.md)
+    §45-50 names the missing piece — a **single-delivery-consumer-per-outbound-lane** ownership primitive
+    (or a shard-stable outbound `owner` stamp: SS writes `owner=NULL`; PG's `owner` is `pid+uuid`, *not*
+    restart-stable). MVP = **A + B**; estimate ~2–4 weeks + a **new overlapping-destination failover test**
+    (today's `harness/load/multishard.py` deliberately uses disjoint names, sidestepping the exact overlap).
+    Full build spec: the operator handoff `SHARDING-OWNERSHIP-SCOPED-RECOVERY-HANDOFF-2026-07-06.md`.
 
 **NEXT (priority order):** (a) the **1500-SHAPE test** — hundreds of connections @ ~0.35–1 msg/s,
 ~521 aggregate, B1/B2 ON (+B12 as the confirm-at-scale arm), a dedicated load-gen box, ≥5–6 sink
@@ -165,7 +176,9 @@ THEN:     engine per-message CPU decomposition -> pick the top lever (B5 executo
           free-threading / hot-path cuts)  ->  B5  ->  B6 ingest sub-pool  ->  B14 accept-cap
 LATER:    B9 (only if a de-confounded run shows durable-write-bound) ; T8 backend-parametric
 RELIABILITY-AT-SCALE (fold into the above): ownership-scoped reset_stale_inflight (PREREQUISITE for any
-          N-active engines on one store) · failover cold-start stampede control · finalizer contention
+          N-active engines on one store; = scoped-reset + the ADR 0063 single-consumer-per-outbound-lane
+          primitive — a reliability-core A+B build, NOT a one-file patch; see the "Scope correction" above)
+          · failover cold-start stampede control · finalizer contention
           sizing · O(connections) monitoring-cardinality caps · ~0.5-1.3 TB/day store growth ->
           per-connection retention + lean-write become MANDATORY.
 DOC:      SYSTEM-REQUIREMENTS.md multi-process-sharding wording reconciled 2026-07-02 (supervise is

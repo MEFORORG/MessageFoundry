@@ -119,7 +119,12 @@ from messagefoundry.api.security import (
     require_step_up,
     ws_token,
 )
-from messagefoundry.api import webui
+
+# NOTE: messagefoundry.api.webui is deliberately NOT imported at module scope (ADR 0065 / Option B
+# Phase 0). It is a GUARDED, lazy import inside create_app's / add_auth_routes' serve_ui branch, so
+# the engine imports + boots + serves the JSON API with the web console ABSENT. serve_ui-on behavior
+# is preserved via three seams: app.state.ui_csp, app.state.ui_ws_authorize,
+# app.state.ui_connections_render (set in the serve_ui path, read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.service import AuthService, BootstrapAdmin, MfaStatus
@@ -745,7 +750,13 @@ def create_app(
         # cache directive can't slip through. nosniff/frame-deny/HSTS above still apply.
         path = request.url.path
         if (path == "/ui" or path.startswith("/ui/")) and not path.startswith("/ui/static"):
-            response.headers["Content-Security-Policy"] = webui.UI_CSP
+            # The /ui CSP is co-versioned with the app.js/app.css it governs, so the web console owns
+            # it and installs it as an app.state hook in the serve_ui path (Option B Phase 0). Absent
+            # (JSON-only) → apply no /ui-specific CSP; the JSON API serves no HTML. Cache-Control
+            # no-store still applies to any /ui path so a browser/proxy never caches HTML.
+            ui_csp = getattr(request.app.state, "ui_csp", None)
+            if ui_csp is not None:
+                response.headers["Content-Security-Policy"] = ui_csp
             response.headers["Cache-Control"] = "no-store"
         elif path.startswith("/messages") or path.startswith("/dead-letters"):
             response.headers["Cache-Control"] = "no-store"
@@ -2437,10 +2448,16 @@ def create_app(
         token can't keep streaming forever, and concurrent sockets are capped (API-WS)."""
         # Browser (same-origin mf_session cookie) OR native (Authorization header) auth (ADR 0065). A
         # browser cannot set the WS Authorization header, so a same-origin browser handshake
-        # authenticates via the cookie (webui.authorize_ui_ws — CSWSH-guarded by a same-origin Origin
-        # check + SameSite=Strict). A native client sends no Origin, so it falls through to the header
+        # authenticates via the cookie (the web console's authorize_ui_ws — CSWSH-guarded by a same-
+        # origin Origin check + SameSite=Strict), installed as the app.state.ui_ws_authorize hook in
+        # the serve_ui path (Option B Phase 0). Absent (JSON-only) → only the native header path runs.
+        # A native client sends no Origin, so even with the hook present it falls through to the header
         # path (authorize_ws) unchanged. `token` (cookie or header) backs the periodic revalidation.
-        identity, token = await webui.authorize_ui_ws(websocket, Permission.MONITORING_READ)
+        identity: Identity | None = None
+        token: str | None = None
+        ui_ws_authorize = getattr(websocket.app.state, "ui_ws_authorize", None)
+        if ui_ws_authorize is not None:
+            identity, token = await ui_ws_authorize(websocket, Permission.MONITORING_READ)
         if identity is None:
             identity = await authorize_ws(websocket, Permission.MONITORING_READ)
             token = ws_token(websocket)
@@ -2457,6 +2474,9 @@ def create_app(
             await websocket.close(code=1013)  # try again later — too many live monitor sockets
             return
         auth: AuthService | None = getattr(state, "auth", None)
+        # Server-rendered connections fragment for the browser dashboard, installed by the web console
+        # in the serve_ui path. Absent → counts-only push (see the send loop below).
+        ui_connections_render = getattr(state, "ui_connections_render", None)
         await websocket.accept()
         state.ws_count = getattr(state, "ws_count", 0) + 1
 
@@ -2495,13 +2515,14 @@ def create_app(
                 # poll path — no client-side table building, no XSS. connections_html is scoped to the
                 # CURRENT (revalidated) identity's per-channel RBAC — a narrowed scope is reflected within
                 # one revalidation window; a native client that only reads outbox_by_status ignores it.
-                rows = await list_connections(engine=engine_obj, identity=current)
-                await websocket.send_json(
-                    {
-                        "outbox_by_status": await engine_obj.store.stats(),
-                        "connections_html": str(webui.pages.connections_fragment(rows)),
-                    }
-                )
+                # The counts frame is built unconditionally; connections_html is attached only when the
+                # web console's render hook (app.state.ui_connections_render) is installed (serve_ui on,
+                # Option B Phase 0). Absent (JSON-only) → a counts-only push, native clients unaffected.
+                frame: dict[str, Any] = {"outbox_by_status": await engine_obj.store.stats()}
+                if ui_connections_render is not None:
+                    rows = await list_connections(engine=engine_obj, identity=current)
+                    frame["connections_html"] = str(ui_connections_render(rows))
+                await websocket.send_json(frame)
                 await asyncio.sleep(1.0)
                 # Revalidate on an elapsed-time cadence (independent of the per-second send), so a
                 # revoked/downgraded token stops streaming (and a narrowed scope takes effect) within
@@ -2525,6 +2546,26 @@ def create_app(
     # so bearer_token() stays header-only and a JSON route with only the cookie still 401s. Rendering is
     # a stdlib autoescape-by-default builder (messagefoundry.api.webui) — zero new runtime dependency.
     if serve_ui:
+        # GUARDED, lazy import (Option B Phase 0): the web console is an optional package, so the engine
+        # imports + boots + serves the JSON API without it. It is required only when serve_ui is on, and
+        # a missing install fails LOUD at startup here — never a mid-request 500. (The absent path is
+        # exercised by tests/test_webconsole_absent.py, which shadows the import.)
+        try:
+            from messagefoundry.api import webui
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "serve_ui requires the web console (messagefoundry.api.webui / the "
+                "messagefoundry-webconsole package) which could not be imported"
+            ) from exc
+
+        # Install the always-on seams the JSON engine reads when serve_ui is on: the /ui CSP (co-
+        # versioned with app.js/app.css), the browser-cookie WS authorizer (CSWSH-guarded), and the
+        # server-rendered connections fragment pushed over /ws/stats. With serve_ui off these stay
+        # unset, so the security-headers middleware and /ws/stats take their JSON-only fallbacks.
+        app.state.ui_csp = webui.UI_CSP
+        app.state.ui_ws_authorize = webui.authorize_ui_ws
+        app.state.ui_connections_render = webui.pages.connections_fragment
+
         app.mount("/ui/static", StaticFiles(directory=str(webui.STATIC_DIR)), name="ui-static")
 
         def _register_core(app: FastAPI) -> None:

@@ -1,0 +1,59 @@
+Connection-scale report -- profile 'fuse_ab' against http://127.0.0.1:8800 (backend sqlserver)
+coverage: all walls measured.
+
+claim    mode                 N    rate  achv/s     sent inpipe  exqd  poolp99  idle  empty/s  wake/s  idle/s     fd   cpu_s  reload   ackp99
+---------------------------------------------------------------------------------------------------------------------------------------------
+pooled   fixed_aggregate    256     400     114    23999  15196    27  10000.0     1     17.4    12.8     4.6   1601    88.0     n/a  11105.7
+pooled   fixed_aggregate    256     400     115    23999  19732    28  10000.0     1     15.1    10.0     5.1   1603   119.1     n/a  12030.7
+pooled   fixed_aggregate    256     400     115    23998  13685    22  10000.0     1     19.0    13.2     5.8   1603    86.0     n/a  10885.7
+pooled   fixed_aggregate    512     400     110    24000  18444    27  10000.0     1     27.6    18.0     9.6   2369   113.8     n/a  13838.6
+pooled   fixed_aggregate    512     400     111    24000  20583    26  10000.0     1     29.9    18.3    11.5   2369   131.7     n/a  13032.7
+pooled   fixed_aggregate    512     400     110    23999   8419    27  10000.0     1     21.2    10.2    11.1   2373    58.8     n/a  14118.2
+pooled   fixed_aggregate   1024     400     106    24000   7801    28  10000.0     0     33.3    11.8    21.5   3928    58.5     n/a  14403.4
+pooled   fixed_aggregate   1024     400     107    23996   9316    29  10000.0     1     39.3    12.6    26.7   3907    61.0     n/a  14991.2
+pooled   fixed_aggregate   1024     400     107    24000   1369     1  10000.0     2     30.5    13.1    17.3   3905     7.8     n/a  15294.1
+pooled   fixed_aggregate    256     400     122    23997  20782    27   2500.0     1     89.4    79.4    10.0   1838   113.4     n/a   1502.9
+pooled   fixed_aggregate    256     400     123    23998  21469    31   2500.0     1    108.3    93.7    14.5   1846   122.0     n/a   1444.0
+pooled   fixed_aggregate    256     400     122    24000  21503    29   2500.0     1     98.4    92.4     6.0   1827   121.8     n/a   1564.2
+pooled   fixed_aggregate    512     400     121    23999  21320    28   2500.0     1    122.6    26.1    96.5   2606   120.2     n/a   1332.9
+pooled   fixed_aggregate    512     400     122    23998  21552    28   1000.0     1    115.5    13.8   101.8   2594   120.4     n/a   1113.4
+pooled   fixed_aggregate    512     400     119    24000  21251    29   2500.0     1    113.9    23.0    90.9   2606   117.2     n/a   1473.1
+pooled   fixed_aggregate   1024     400     117    24000  20920    28   2500.0     1    122.7     8.6   114.0   4132   120.0     n/a   1533.2
+pooled   fixed_aggregate   1024     400     118    24000  21969    31   2500.0     1    118.6     8.3   110.3   4131   122.5     n/a   1387.3
+pooled   fixed_aggregate   1024     400     118    24000  21889    28   2500.0     1    116.7     7.5   109.2   4141   121.0     n/a   1415.4
+
+SLOs:
+  [PASS] zero_loss: observed=True threshold=True
+
+Thread-hop-fusion A/B (ADR 0071 B5) -- baseline fuse=off (B0) vs candidate fuse=on (B1)
+guards (ADR 0071 6.4b): lift >= 10% AND > 2sigma | in_pipeline flat-or-lower | delivered/offered >= 0.98 | zero-loss held  (SQL Server is the valid leg; SQLite is NOT a throughput proxy)
+overall: NO-GO  (GO=0, NO-GO=3, INCONCLUSIVE=0, missing=0, candidate_zero_loss_ok=True)
+
+[pooled/fixed_aggregate] N=256  =>  NO-GO
+  in_pipeline grew (B1 21503 > B0 19732) -- the higher intake rides a backlog, not a real ceiling lift
+  achieved_read/s (ceiling) B0=   114.77  B1=   122.18      +6.5%  2sigma=     1.72  significant: yes
+  in_pipeline_peak          B0=    19732  B1=    21503             flat-or-lower: NO
+  delivered/offered         B0=     1.00  B1=     1.00             keeping-up: yes
+  zero_loss                 B0=      yes  B1=      yes             candidate_lost: NO
+  trials                   B0=        3  B1=        3
+  achieved_written/s       B0=   114.90  B1=   122.27
+
+[pooled/fixed_aggregate] N=512  =>  NO-GO
+  lift +9.3% < 10% -- fusion banked no worthwhile margin (null/negative → ADR 0071 escalates to free-threading)
+  achieved_read/s (ceiling) B0=   110.41  B1=   120.64      +9.3%  2sigma=     3.26  significant: yes
+  in_pipeline_peak          B0=    20583  B1=    21552             flat-or-lower: yes
+  delivered/offered         B0=     1.00  B1=     1.00             keeping-up: yes
+  zero_loss                 B0=      yes  B1=      yes             candidate_lost: NO
+  trials                   B0=        3  B1=        3
+  achieved_written/s       B0=   110.49  B1=   120.71
+
+[pooled/fixed_aggregate] N=1024  =>  NO-GO
+  in_pipeline grew (B1 21969 > B0 9316) -- the higher intake rides a backlog, not a real ceiling lift
+  achieved_read/s (ceiling) B0=   106.83  B1=   117.52     +10.0%  2sigma=     1.48  significant: yes
+  in_pipeline_peak          B0=     9316  B1=    21969             flat-or-lower: NO
+  delivered/offered         B0=     1.00  B1=     1.00             keeping-up: yes
+  zero_loss                 B0=      yes  B1=      yes             candidate_lost: NO
+  trials                   B0=        3  B1=        3
+  achieved_written/s       B0=   106.87  B1=   117.57
+
+RESULT: PASS -> exit 0

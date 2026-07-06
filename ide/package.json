@@ -132,6 +132,11 @@
       {
         "command": "messagefoundry.showAiPolicy",
         "title": "MessageFoundry: Show AI Policy"
+      },
+      {
+        "command": "messagefoundry.toggleLiveDebug",
+        "title": "MessageFoundry: Toggle Live Debug",
+        "icon": "$(pulse)"
       }
     ],
     "viewsContainers": {
@@ -405,6 +410,12 @@
           "default": 8000,
           "minimum": 0,
           "markdownDescription": "Maximum characters of the active editor's code attached to a `@messagefoundry` AI chat request. The assistant only ever sends code + your config graph's names — never message bodies/PHI — so this bounds how much of your *own* code leaves to your chosen model provider. Files larger than the limit are truncated on a line boundary with a visible marker; `0` sends only the graph names (no editor code)."
+        },
+        "messagefoundry.liveDebug.debounceMs": {
+          "type": "integer",
+          "default": 400,
+          "minimum": 0,
+          "markdownDescription": "Debounce (milliseconds) before Live Debug re-runs `dryrun` after a config file is saved. A save-storm coalesces to a single run of the newest content. Only used when Live Debug is toggled on."
         }
       }
     }

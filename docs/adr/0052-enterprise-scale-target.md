@@ -52,6 +52,14 @@ enterprise market is **in-scope and not demand-gated**.
 - The target must be reached **with the invariants intact** — per-channel FIFO, at-least-once delivery,
   count-and-log disposition, and **unified-store observability** (the fragmented-store caveat of sharding is
   the reason ADR 0053 is the *preferred* path, not sharding).
+  - *Update 2026-07-06:* [ADR 0063](0063-no-split-store-unified-store-for-sharding.md) (amends ADR 0037)
+    requires **one unified server store** for any multi-shard deployment, so sharding **no longer fragments
+    the store** — free-threading and unified-store sharding are **complementary**, not preferred-vs-fallback.
+    And per ADR 0053's WS4 + the 2026-07-06 [ADR 0071](0071-cut-executor-round-trips-b5.md) B5 NO-GO,
+    free-threading's prize is single-feed transform CPU only (a desk Amdahl bounds it to ~+6–7 % on a
+    bench-like feed) — so the committed 45M/day path is **unified-store engine sharding + ADR 0051
+    durable-write levers**, with free-threading an optional per-engine box-count reducer. See the ADR 0053
+    update note.
 
 ## Acceptance Criteria
 

@@ -13,6 +13,28 @@
   [CLAUDE.md](../../CLAUDE.md) §2 (reliability invariant — pure routers/transforms) ·
   [design/freethread.md](../design/freethread.md) (the 0040 assessment — still-valid input)
 
+> **Update — 2026-07-06 (post-B5 re-scope; read alongside the "fallback" framing above).** Two corrections
+> the Accepted decision predates:
+> 1. **[ADR 0063](0063-no-split-store-unified-store-for-sharding.md) retired the "sharding fragments the
+>    store" premise.** ADR 0063 (Accepted 2026-07-01) *amended ADR 0037*: a >1-shard deployment now
+>    **requires ONE unified server store** (the SQLite-per-shard split is declined) — reporting/audit/replay
+>    hit one store; only the API/console control plane is per-shard. So engine sharding is now a
+>    **unified-store** multicore path too. Free-threading and engine sharding are therefore **complementary**
+>    (FT = within-process single-feed transform CPU; sharding = across-process aggregate on one store), **not
+>    preferred-vs-fallback**. The "fragments the store" language in §Context below and in ADR 0052 §Decision
+>    reflects ADR 0037's original SQLite-per-shard MVP only.
+> 2. **The prize is narrower than the enterprise framing (see §WS4 below) — and B5 sharpened it.** WS4 already
+>    found free-threading buys **nothing** on store throughput (write is fsync-bound); its only win is
+>    parallelizing single-feed transform CPU. The [ADR 0071](0071-cut-executor-round-trips-b5.md) B5
+>    thread-hop-fusion lever then came back **NO-GO** (2026-07-06: +6.5/+9.3/+10.0 %, below the 10 % bar),
+>    showing the ~107 msg/s single-engine wall is single-loop-thread marshaling + ~11 ms RTT with CPU/store
+>    idle — **both FT-immune**. A **desk Amdahl** on the measured `--gil` decomposition (pure transform CPU
+>    ≈ 7 % of per-message cost) bounds FT's end-to-end ceiling to **~+6–7 % on a bench-like feed** — a paper
+>    NO-GO unless a real feed's transform CPU is far higher (>~23 % for +25 %, ~57 % for 2×). **Gate hard on
+>    the cheap measurement (BACKLOG #91) before the #90 reliability re-arch;** engine sharding + ADR 0051
+>    durable-write levers remain the committed 45M/day path, with FT an optional per-engine box-count reducer.
+>    Full re-scope: `OneDrive\Desktop\MEFOR\ADR0053-FREETHREADING-SCOPE-2026-07-06.md`.
+
 ---
 
 ## Context

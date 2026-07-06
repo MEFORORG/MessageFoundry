@@ -1,6 +1,6 @@
 # ADR 0071 — Cutting per-message executor round-trips: the async-marshaling feed wall (build-plan B5)
 
-**Status:** Proposed (2026-07-04)
+**Status:** Built + merged behind `[pipeline].fuse_thread_hops` (default **OFF**, SQL Server + `pooled` only; PR1–PR5, shipped v0.2.15). **Throughput promote gate: NO-GO** (2026-07-06 AWS SQL-Server bench, §8/§10 — measured +6.5/+9.3/+10.0 % lift, below the ≥10 % bar) → the default stays **OFF**; escalated to free-threading (ADR 0053). The flagged machinery is correct (zero-loss held; a provable no-op on Postgres/SQLite).
 **Deciders:** throughput working group
 **Related:** ADR 0069 (durable-write is not the wall — engine feed concurrency is; this ADR is the concrete B5 lever it defers to), ADR 0066 (pooled stage claimers — the first concurrency lever, `pooled` default since #744), ADR 0001 (staged-pipeline invariants), ADR 0055 (group-commit / durable-write), ADR 0057 (inline Step-A fast path), ADR 0053 / ADR 0040 (free-threading — the complementary track), ADR 0067 (persistent outbound MLLP).  Build-plan **B5**; [`docs/throughput-roadmap.md`](../throughput-roadmap.md), [`docs/throughput-build-plan.md`](../throughput-build-plan.md).
 **Evidence (in-repo):** the 2026-07-04 py-spy profile of a single pooled **SQL Server** engine at its ceiling + the 2026-07-04 **B5 micro-bench results** (SQLite/Proactor, mechanism-only) live under [`docs/benchmarks/results/2026-07-04-adr0071-b5-executor-marshaling/`](../benchmarks/results/2026-07-04-adr0071-b5-executor-marshaling/) (see §8; the harness itself lands with the B5 build PR).
@@ -133,6 +133,18 @@ Removes the GIL so the marshaling callbacks parallelize across the idle cores �
 
 *Limits (validator, honest):* the harness is self-contained (does not import `messagefoundry`; CPU analogs, not the literal `route_only`/`transform_one`), so it proves the **crossing arithmetic and the no-txn-fusion identity**, **not** the throughput lift and **not** the real-path invariants — those need the §6 gates on the flagged fused path + the SQL-Server aioodbc leg. The profile is in-repo; the mechanism-only harness is operator-local and lands (lint/type-clean) with the B5 build PR — the numbers above are reproduced 3× (synthetic HL7, no PHI).
 
+**Throughput promote-gate bench (`fuse_ab`, SQL Server, 2026-07-06) — NO-GO.** The §6.4(b) leg ran on a real
+AWS two-box SQL-Server rig (pooled, C ∈ {256, 512, 1024}, **3 trials/arm**, 400 msg/s offered, 60 s warm hold);
+artifacts under [`docs/benchmarks/results/2026-07-06-adr0071-b5-throughput/`](../benchmarks/results/2026-07-06-adr0071-b5-throughput/).
+Fusion engaged in every B1 arm (ACK p50 ~7–10× lower, pool-wait p95 ~5× lower; the B1/B0 `read/s` distributions
+**fully separated**) and produced a **real, statistically-significant, concurrency-growing lift — but only
++6.5 % (N=256) / +9.3 % (512) / +10.0 % (1024)**, below the ≥10 % promote bar (256 & 512 fail on the lift clause;
+N=1024's *stated* in_pipeline NO-GO is a `/stats`-poller under-sampling artifact — corrected, a marginal +10.007 %
+GO that a conjunctive all-cells gate does not rescue). Zero-loss + `delivered/offered = 1.00` held in all 18 trials
+(run PASS / exit 0). An ~11 ms inter-box store RTT (high for same-VPC EC2) is a plausible dilutant fusion can't
+address — it cuts marshaling crossings, not network hops — but it does **not** bias the A/B (shared link).
+**Verdict: bank nothing, keep the default OFF, escalate to free-threading (ADR 0053).**
+
 ## 9. Rejected alternatives
 
 | Alternative | Verdict | Why |
@@ -155,10 +167,10 @@ Removes the GIL so the marshaling callbacks parallelize across the idle cores �
 5. **Per-backend scope — RESOLVED (sharper than "measure per backend"): fusion is a blocking-driver lever.** ENABLE on SQL Server (profiled + enterprise store); KEEP the async path on **Postgres** (asyncpg loop-native, ~2 crossings) and **SQLite** (loop-affine lock + single-writer WAL) **by construction**. A PG "no fusion win" is the **expected control**, not a regression.
 6. **Selector-loop rejection — CONFIRMED SOUND** (512 `FD_SETSIZE` unchanged in 3.14 + O(n) `select()`).
 7. **Dedicated fusing executor — RESOLVED: mandatory** (fused DB-bound hops must not share the default `to_thread` executor with strict-validation/decrypt).
+8. **Throughput promote gate — RESOLVED 2026-07-06: NO-GO → escalate to ADR 0053.** The §6.4(b) SQL-Server `fuse_ab` bench (§8) measured a real, significant, concurrency-growing lift of only **+6.5 / +9.3 / +10.0 %** — below the ≥10 % bar (256 & 512 fail on lift; N=1024 is a marginal artifact-corrected GO a conjunctive gate can't rescue). Zero-loss held (run PASS). A sub-threshold SQL-Server result **banks nothing** (§6.4b): keep `fuse_thread_hops` **default-OFF**, escalate to free-threading (ADR 0053). Harness follow-up noted: the `in_pipeline` guard reads the `/stats`-poller peak (under-samples under overload → false NO-GO *reasons*); it should read the authoritative sink/drain signal.
 
 **Still open (measurement-gated, by design):**
-- **Promote-to-Accepted gate** — the paid **SQL-Server** at-scale re-bench (ceiling lifts by a worthwhile margin; zero-loss + crash-replay green on live SQL Server *and* Postgres). A measurement, not adjudicable on paper.
-- **Magnitude of the throughput win** — the aioodbc per-statement collapse could make it large, or the residual marshaling floor could dominate. Settled only by the §6.4(b) SQL-Server leg. *(Why confidence is medium.)*
+- *(The promote-to-Accepted gate + the win-magnitude question are now RESOLVED — item 8 above: NO-GO. A higher-concurrency (C > 1024) / lower-RTT same-AZ re-bench is a record-only follow-up — the lift grew monotonically and might clear 10 % where the marshaling wall dominates — **not** a reason to ship.)*
 - **Dedicated sync connection-source sub-design** — sizing / warm / exhaustion of the synchronous pyodbc pool (must track the fusing executor's max workers).
 - **Whether the starvation risk forces the dedicated executor in practice** — the design mandates it pre-emptively; the micro-bench's co-tenant validate-latency tripwire on the real path confirms sufficiency.
 - **Postgres residual-crossing lever (out of B5 scope, noted)** — PG's ~2 CPU-hop crossings, if they ever dominate, are a free-threading/parser problem (ADR 0053), not a fusion one.

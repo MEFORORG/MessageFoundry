@@ -14,6 +14,7 @@ import { registerChat } from "./chat";
 import { registerEditorToolbar } from "./editorToolbar";
 import { registerInsertElement } from "./insertElement";
 import { generateSamples } from "./generate";
+import { registerLiveDebug } from "./liveDebug";
 import { openCodeSetEditor } from "./codeSetEditor";
 import { CodeSetsProvider } from "./codesetsTree";
 import { openConnectionEditor } from "./connectionEditor";
@@ -70,6 +71,8 @@ export function activate(context: vscode.ExtensionContext): void {
   registerChat(context, graph);
   registerEditorToolbar(context);
   registerInsertElement(context);
+  // Live-debug v1 (#92): status-bar toggle + on-save dryrun → CodeLens summaries (off by default).
+  registerLiveDebug(context);
   const testBench = new TestBench(context);
 
   context.subscriptions.push(

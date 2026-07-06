@@ -77,6 +77,21 @@ def test_leak_token_table_matches_publish_guard() -> None:
     assert tee_leak._ALLOWED_IP.pattern == sf._ALLOWED_IP.pattern  # type: ignore[attr-defined]
 
 
+def test_leak_tables_load_empty_without_the_publish_guard(tmp_path: Path) -> None:
+    # On the OSS mirror scripts/publish/ is deny-listed, so the guard is ABSENT. The token tables must
+    # then load EMPTY (never a stale/fragmented copy), so no customer/vendor token ships in the tee.
+    # Exercise the loader against a tree that has no scripts/publish above it.
+    assert tee_leak._load_publish_guard(tmp_path / "no-guard-here" / "leak.py") is None  # type: ignore[attr-defined]
+
+
+def test_leak_tables_are_sourced_from_the_guard_when_present() -> None:
+    # In the private source tree the guard IS present -> the tables are populated *from it* (not hard-
+    # coded here). Skipped on the mirror, where the guard is absent and the tables are legitimately empty.
+    if tee_leak._load_publish_guard() is None:  # type: ignore[attr-defined]
+        pytest.skip("publish guard is private-only (absent on the OSS mirror)")
+    assert tee_leak.FORBIDDEN and tee_leak.ESTATE_TOKENS  # type: ignore[attr-defined]
+
+
 def test_adversarial_inputs_engine_output_equals_tee_output() -> None:
     for msg in _ADVERSARIAL:
         engine = engine_anonymize(msg, salt=_SALT)

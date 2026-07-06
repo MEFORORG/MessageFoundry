@@ -1,9 +1,11 @@
 // Test Bench: load a message set, dry-run it through the config (no sending), show a results table,
-// and an above/below Before/After (both always shown, changed lines highlighted) per message, plus
-// optional step-through under the Python debugger.
+// and a Before/After view per message (side-by-side or above/below) with an HL7 segment/field-aware
+// diff — inserted/deleted segments are aligned so they don't cascade false changes, and changed
+// fields are highlighted inline (see hl7diff.ts) — plus optional step-through under the debugger.
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, messageSetsDir, pythonPath, runJson, workspaceDir } from "./cli";
+import { diffMessages } from "./hl7diff";
 
 interface Delivery {
   to: string;
@@ -147,14 +149,15 @@ export class TestBench {
         delivery = row.deliveries[pick.i];
       }
       to = delivery.to;
-      after = delivery.payload.replace(/\r/g, "\n");
+      after = delivery.payload;
     }
+    // Compute the segment/field-aware diff here (pure, in the extension host) and post the aligned
+    // result; the webview only renders it. diffMessages tolerates \r / \n / \r\n itself.
     await this.panel.webview.postMessage({
       type: "detail",
       source: row.source,
       to,
-      before: row.raw.replace(/\r/g, "\n"),
-      after,
+      diff: diffMessages(row.raw, after),
     });
   }
 
@@ -242,7 +245,14 @@ export class TestBench {
     .pane pre { margin: 0; padding: 8px; background: var(--vscode-textCodeBlock-background, rgba(127,127,127,0.1));
                 border: 1px solid var(--vscode-panel-border); border-radius: 3px; overflow: auto;
                 font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; }
-    .pane pre div.chg { background: var(--vscode-diffEditor-insertedTextBackground, rgba(63,185,80,0.2)); }
+    /* HL7-aware diff: whole-line background for an inserted/deleted segment, inline field spans for a
+       changed field within an otherwise-matched segment (red on the before pane, green on the after). */
+    .pane pre div.ln { white-space: pre-wrap; word-break: break-word; }
+    .pane pre div.ln-ins { background: var(--vscode-diffEditor-insertedLineBackground, rgba(63,185,80,0.12)); }
+    .pane pre div.ln-del { background: var(--vscode-diffEditor-removedLineBackground, rgba(248,81,73,0.12)); }
+    .pane pre div.gap { opacity: 0.35; }
+    .pane pre span.ins { background: var(--vscode-diffEditor-insertedTextBackground, rgba(63,185,80,0.35)); border-radius: 2px; }
+    .pane pre span.del { background: var(--vscode-diffEditor-removedTextBackground, rgba(248,81,73,0.35)); border-radius: 2px; }
     .panes.sbs { display: flex; gap: 12px; align-items: flex-start; }
     .panes.sbs .pane { flex: 1 1 0; min-width: 0; margin-bottom: 0; }
   </style>
@@ -265,10 +275,21 @@ export class TestBench {
 
     function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-    function pane(label, lines, changed){
-      const html = lines.map((l, i) =>
-        '<div class="' + (changed[i] ? 'chg' : '') + '">' + (esc(l) || '&nbsp;') + '</div>'
-      ).join('');
+    // Render one side of the HL7-aware diff. The cells are aligned so before[i] lines up with
+    // after[i]: a gap cell (seg=false) holds the place opposite an inserted/deleted segment, and
+    // each segment's changed fields are highlighted inline (side picks red 'del' vs green 'ins').
+    function pane(label, cells, side){
+      const span = side === 'before' ? 'del' : 'ins';
+      const html = cells.map((cell) => {
+        if (!cell.seg) return '<div class="ln gap">&nbsp;</div>';
+        let cls = 'ln';
+        if (cell.status === 'added') cls += ' ln-ins';
+        else if (cell.status === 'removed') cls += ' ln-del';
+        const inner = cell.fields.map((f) =>
+          f.c ? '<span class="' + span + '">' + (esc(f.t) || '&nbsp;') + '</span>' : esc(f.t)
+        ).join(esc(cell.sep));
+        return '<div class="' + cls + '">' + (inner || '&nbsp;') + '</div>';
+      }).join('');
       return '<div class="pane"><div class="lbl">' + esc(label) + '</div><pre>' + html + '</pre></div>';
     }
 
@@ -287,15 +308,12 @@ export class TestBench {
     window.addEventListener('message', (ev) => {
       const m = ev.data;
       if (!m || m.type !== 'detail') return;
-      const a = m.before.split('\\n'), b = m.after.split('\\n');
-      const max = Math.max(a.length, b.length);
-      const chgA = [], chgB = [];
-      for (let i = 0; i < max; i++) { const d = (a[i] ?? '') !== (b[i] ?? ''); chgA[i] = d; chgB[i] = d; }
+      const diff = m.diff || { before: [], after: [] };
       detail.innerHTML =
         '<h3>' + esc(m.source) + ' &rarr; ' + esc(m.to) + '</h3>' +
         '<div class="panes' + (sbs ? ' sbs' : '') + '">' +
-          pane('Before (received)', a, chgA) +
-          pane('After (would send to ' + m.to + ')', b, chgB) +
+          pane('Before (received)', diff.before, 'before') +
+          pane('After (would send to ' + m.to + ')', diff.after, 'after') +
         '</div>';
       results.style.display = 'none';
       detail.style.display = 'block';
