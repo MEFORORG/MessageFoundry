@@ -1,0 +1,655 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+"""Response schemas for the localhost API.
+
+These are the wire contract the console (and any other client) sees — deliberately
+separate from the internal SQLite rows and channel-config models so storage/runtime
+changes don't leak into the API. Message *list* responses carry metadata only; the raw
+body (PHI) appears only in the single-message detail view, which is audited.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+from messagefoundry.config.ai_policy import AiDataScope, AiMode, DataClass
+
+
+class ChannelInfo(BaseModel):
+    id: str
+    name: str
+    enabled: bool
+    running: bool
+    source_type: str
+    destinations: list[str]
+
+
+class MessageSummary(BaseModel):
+    id: str
+    channel_id: str
+    received_at: float
+    source_type: str | None
+    control_id: str | None
+    message_type: str | None
+    status: str
+    error: str | None
+    event: str | None = None  # latest processing event (received/delivered/failed/dead/replayed)
+    summary: str | None = None  # ingest-derived: MRN/name (+ order/accession for ORM/ORU)
+    metadata: str | None = None  # code/operator-attached values (mechanism TBD)
+
+
+class MessageList(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    messages: list[MessageSummary]
+
+
+class MessageSearchResults(BaseModel):
+    """Result of a scan-and-decrypt content search (ADR 0046 #51). ``messages`` are the matched message
+    summaries (metadata only — same shape + PHI redaction as ``MessageList``, never a decrypted body).
+    ``scanned`` is how many candidate rows were decrypted; ``matched`` the number that matched (==
+    ``len(messages)`` before the result cap); ``truncated`` is True when the scan stopped at the
+    ``scan_limit`` ceiling before exhausting the candidate set — the "narrow your filters" signal."""
+
+    messages: list[MessageSummary]
+    scanned: int
+    matched: int
+    truncated: bool
+    limit: int
+    scan_limit: int
+
+
+class OutboxInfo(BaseModel):
+    id: str
+    destination_name: str
+    status: str
+    attempts: int
+    next_attempt_at: float
+    last_error: str | None
+
+
+class EventInfo(BaseModel):
+    ts: float
+    event: str
+    destination: str | None
+    detail: str | None
+
+
+class MessageDetail(MessageSummary):
+    """Full single-message view, including the raw body and delivery/audit trail."""
+
+    raw: str
+    outbox: list[OutboxInfo]
+    events: list[EventInfo]
+
+
+class CapturedResponseInfo(BaseModel):
+    """One captured request/response reply (ADR 0013). ``outcome``/``detail`` are visible with the
+    message-read permission; ``body`` is PHI and populated only when the caller also holds the raw-body
+    permission (``None`` otherwise, and ``None`` once retention has purged it)."""
+
+    destination_name: str
+    response_seq: int
+    outcome: str
+    detail: str | None
+    captured_at: float
+    body: str | None = None
+
+
+class MessageResponses(BaseModel):
+    """The captured-reply history for one message (ADR 0013), ordered by destination then seq."""
+
+    message_id: str
+    responses: list[CapturedResponseInfo]
+
+
+class OutboundPayloadInfo(BaseModel):
+    """One outbound delivery's **transformed payload** (#14 parity tool). ``payload`` is the PHI body
+    MEFOR routed/transformed for ``destination_name``; it is returned in full only to a caller holding
+    ``MESSAGES_VIEW_RAW``, and every access is audited. (Distinct from :class:`OutboxInfo`, which is
+    the body-free delivery *metadata* shown in the message-detail view.)"""
+
+    destination_name: str
+    status: str
+    payload: str
+
+
+class OutboundPayloads(BaseModel):
+    """The transformed outbound payloads for one message — one entry per destination (#14). Populated
+    on both simulate/shadow and live runs (the transformed payload is retained on the done outbound
+    row in either mode), enabling the ``tee compare`` parity check against Corepoint's output."""
+
+    message_id: str
+    payloads: list[OutboundPayloadInfo]
+
+
+class ReplayResult(BaseModel):
+    message_id: str
+    requeued: int
+
+
+class PurgeResult(BaseModel):
+    cancelled: int
+
+
+class DeadLetterRow(BaseModel):
+    """One dead-lettered delivery (a message→destination that exhausted its retries)."""
+
+    outbox_id: str
+    message_id: str
+    channel_id: str
+    destination_name: str
+    attempts: int
+    last_error: str | None
+    failed_at: float  # when the delivery was dead-lettered (outbox.updated_at)
+    control_id: str | None
+    message_type: str | None
+    received_at: float
+    summary: str | None = None  # PHI-bearing (MRN/name); display is audited
+
+
+class DeadLetterList(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    dead_letters: list[DeadLetterRow]
+
+
+class ConnectionEventInfo(BaseModel):
+    """One connection/transport event (Corepoint-style log, #46) — **metadata only, no PHI**: the
+    connection name, transport, direction, event kind, peer IP, and a scrubbed reason. Read via the
+    ``monitoring:read``-gated ``GET /events`` / ``GET /connections/{name}/events`` routes."""
+
+    id: int
+    ts: float
+    connection: str
+    transport: str
+    direction: str  # 'inbound' | 'outbound'
+    kind: str
+    peer_host: str | None = None
+    message_id: str | None = None
+    reason: str | None = None
+
+
+class AlertInstanceInfo(BaseModel):
+    """One resolvable operator-alert instance (ADR 0044, #56) — **metadata only, no PHI**: the alert
+    type, connection label, severity, lifecycle status (open/acknowledged/resolved), the
+    first/last-seen window + occurrence count, a scrubbed reason, and the ack/resolve audit fields.
+    Read via the ``monitoring:diagnose``-gated ``GET /alerts/active`` route."""
+
+    id: int
+    event_type: str
+    connection: str
+    severity: str
+    status: str  # 'open' | 'acknowledged' | 'resolved'
+    first_seen: float
+    last_seen: float
+    count: int
+    reason: str | None = None
+    acked_by: str | None = None
+    acked_at: float | None = None
+    resolved_at: float | None = None
+
+
+class AlertInstanceList(BaseModel):
+    """The active (open + acknowledged) operator-alert instances, newest ``last_seen`` first (ADR 0044)."""
+
+    alerts: list[AlertInstanceInfo]
+
+
+class DeadLetterReplayRequest(BaseModel):
+    # Connection names; bounded so an over-long value can't reach the store query (ASVS 1.3.3).
+    channel_id: str | None = Field(None, max_length=256)  # scope replay to one inbound (None = all)
+    destination_name: str | None = Field(None, max_length=256)  # scope to one outbound (None = all)
+
+
+class DeadLetterReplayResult(BaseModel):
+    requeued: int
+
+
+class PendingApprovalResponse(BaseModel):
+    """Returned (HTTP 202) when a high-value action is held for dual-control approval (ASVS 2.3.5)
+    instead of executing inline. A distinct second approver must release it via ``/approvals``."""
+
+    approval_id: str
+    operation: str
+    status: str = "pending_approval"
+    detail: str
+
+
+class PendingApprovalInfo(BaseModel):
+    """One open (still-pending, unexpired) approval request in the approver's queue."""
+
+    id: str
+    operation: str
+    label: str
+    requester: str
+    requested_at: float
+    expires_at: float | None = None
+
+
+class ApprovalList(BaseModel):
+    approvals: list[PendingApprovalInfo]
+
+
+class ApprovalDecisionResult(BaseModel):
+    """The outcome of approving or rejecting a pending request. On approval, ``result`` carries the
+    executed operation's summary (e.g. ``{"requeued": 3}``)."""
+
+    operation: str
+    requested_by: str
+    approved_by: str | None = None
+    rejected_by: str | None = None
+    result: dict[str, Any] | None = None
+
+
+class ReloadRequest(BaseModel):
+    # Directory of code-first config modules to load + apply. Optional: omitted/None reloads the
+    # server's startup --config dir. Any value must resolve within an allowed reload root (the
+    # startup dir or [api].config_reload_roots) — the loader executes Python from it. Length-bounded
+    # (ASVS 1.3.3); the allow-list confinement remains the real control.
+    config_dir: str | None = Field(None, max_length=4096)
+    # dry_run: validate the graph against THIS environment (loads + build-checks connectors, which
+    # resolves env() values for the target) and report the result WITHOUT swapping the live graph.
+    # The promote pre-flight: catch a missing env value / bad spec before it goes live.
+    dry_run: bool = False
+
+
+class ReloadResult(BaseModel):
+    """Summary of the graph that is now live after a reload — or, for a dry run, the graph that
+    *would* go live (``dry_run=True``; ``running`` then reflects the still-current graph)."""
+
+    inbound: int
+    outbound: int
+    routers: int
+    handlers: int
+    running: bool
+    dry_run: bool = False
+
+
+class ConfigProvenance(BaseModel):
+    """Provenance of the config graph the engine currently has loaded (ADR 0041 D1): the content
+    ``fingerprint`` and best-effort git ``git_head`` captured at load, plus whether the on-disk config
+    has since **drifted** from it. Read-only and non-secret — a one-way content hash and a commit sha,
+    never resolved ``env()`` / ``MEFOR_VALUE_*`` values. ``loaded`` is False before any graph is loaded
+    (or if the fingerprint could not be computed); ``drift`` is only meaningful when ``loaded`` is True."""
+
+    loaded: bool
+    fingerprint: str | None = None  # content hash of the loaded bundle (scheme mefor-cfg-fp:v1)
+    git_head: str | None = None  # commit sha at load, when the config dir is a git work tree
+    files: int | None = None  # number of files folded into the fingerprint
+    drift: bool = False  # the on-disk config now differs from what was loaded
+
+
+class ConnectionRow(BaseModel):
+    """One endpoint (a channel's source, or one of its destinations) for the connections
+    dashboard. Fields are role-dependent: source rows carry read/inbound-errored/idle and the
+    listen peer/port; destination rows carry queue/written/dead/backlog/delivered-age and the
+    remote peer/port. Unused fields are None so the UI can render blanks."""
+
+    role: str  # "source" | "destination"
+    channel_id: str
+    channel_name: str
+    destination: str | None  # destination name; None for the source row
+    name: str  # display name
+    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining"
+    direction: str  # "in" (source) | "out" (destination)
+    method: str  # connection method/protocol, e.g. MLLP / File / TCP / REST
+    peer: str | None  # MLLP host or file directory
+    port: int | None
+    queue_depth: int | None
+    idle_seconds: float | None
+    alerts_active: int  # count of OPEN alert instances for this connection (ADR 0044, #56)
+    errored: int | None  # source: inbound errors; destination: dead-lettered
+    read: int | None  # source only: inbound received
+    written: int | None  # destination only: delivered
+    backlog_seconds: float | None  # destination only; None = unknown/stalled
+    delivered_age_seconds: float | None  # destination only; age of oldest queued item
+    simulated: bool | None = None  # destination only; True = egress-suppressed shadow lane (#15)
+    # Destination-only operator-pause flag (connection controls). True = the outbound is operator-paused
+    # AND fully quiesced (delivery stopped, zero in-flight), so its queue may be purged. Deliberately
+    # INDEPENDENT of the collapsed display ``status`` above: a failed/filtered-but-paused outbound shows
+    # status "failed"/"filtered" yet stays purge-eligible (``paused`` True). ``False`` for source rows and
+    # for a running or still-"stopping" (not-yet-quiesced) outbound.
+    paused: bool = False
+    error: str | None = (
+        None  # set when status == "failed" (why it failed to start, ADR 0031) or "filtered" (why the DR run-profile parked it, #61 ADR 0048)
+    )
+
+
+class StatsResetTarget(BaseModel):
+    """One connections-dashboard endpoint to reset, matching a row's (role, channel_id, destination).
+    For ``source`` rows ``destination`` is ignored; for ``destination`` rows it is required."""
+
+    role: Literal["source", "destination"]
+    channel_id: str = Field(min_length=1, max_length=256)
+    destination: str | None = Field(default=None, max_length=256)
+
+
+class StatsResetRequest(BaseModel):
+    """Reset the dashboard's cumulative counters for ``targets``, or for every connection (``all``)."""
+
+    all: bool = False
+    targets: list[StatsResetTarget] = Field(default_factory=list)
+
+
+class StatsResetResult(BaseModel):
+    reset: int  # number of connection endpoints whose dashboard counters were reset
+
+
+class StatsResponse(BaseModel):
+    outbox_by_status: dict[str, int]
+    # NOT-DONE rows (pending|inflight) across every stage (ingress + routed + outbound) — a
+    # whole-pipeline drain gauge, vs outbox_by_status which sees only the outbound stage. Defaults to 0
+    # so a client reading an older engine (no field) degrades gracefully.
+    in_pipeline: int = 0
+    # B11 connection-scale observability (read-only, additive): cumulative count of EMPTY claims — a
+    # stage worker (router/transform/delivery) that claimed its lane and found it empty (a wasted DB
+    # round-trip). Split into idle-poll re-SELECTs vs the per-commit wake-fanout (thundering herd); the
+    # connection-scale report plots the herd slope (empty_claims_wake_fanout) distinctly from the
+    # idle-poll floor. All default 0, so a client reading an older engine degrades gracefully and an
+    # engine the harness never measures is byte-identical.
+    empty_claims: int = 0
+    empty_claims_idle_poll: int = 0
+    empty_claims_wake_fanout: int = 0
+    # B11 wall #1 (executor saturation): the default ThreadPoolExecutor's submit-queue depth + in-flight
+    # ("busy") count — observable ONLY when the connection-scale harness installs its default-sized boot
+    # shim (loop.set_default_executor); ``None`` on a normal engine (no shim), so production /stats is
+    # byte-identical. The router/transform workers run route_only/transform_one via asyncio.to_thread on
+    # that shared pool, so queue_depth > 0 means the pool is saturated (the wall).
+    executor_queue_depth: int | None = None
+    executor_busy: int | None = None
+
+
+class Health(BaseModel):
+    status: str = "ok"
+    # WP-L3-07 (ASVS 13.4.6): the build version is a fingerprinting detail, disclosed only to an
+    # authenticated caller. A tokenless liveness probe gets ``status`` with ``version`` omitted/None.
+    version: str | None = None
+
+
+class EngineInfo(BaseModel):
+    version: str
+    uptime_seconds: float
+    pid: int
+    channels_total: int
+    channels_running: int
+    channels_stopped: int
+    outbox_by_status: dict[str, int]
+
+
+class DbInfo(BaseModel):
+    path: str
+    size_bytes: int  # db file + -wal + -shm
+    disk_free_bytes: int
+    journal_mode: str
+    messages: int
+    events: int
+    audit: int
+    # SQLite durability mode (PRAGMA synchronous): "normal" (shipped default) or "full"; None on the
+    # server backends (a SQLite-only knob). Read-only observability (B7) so a status reader / load run
+    # records which durability mode it measured. Defaulted so older clients deserialize unchanged.
+    synchronous: str | None = None
+
+
+class LogInfo(BaseModel):
+    """App-log storage metering for the configured ``[logging].log_dir`` (#50), mirroring
+    :class:`DbInfo`'s DB-side ``size_bytes`` / ``disk_free_bytes``. **Metadata only — never any log
+    content** (no PHI). Present only when a log directory is configured; when the engine logs to stdout
+    (captured off-process by NSSM) the ``logs`` field on :class:`SystemStatus` is ``None``."""
+
+    path: str
+    size_bytes: int  # total bytes of regular files under the log directory (one level)
+    disk_free_bytes: int  # free space on the log directory's filesystem
+
+
+class UpdateInfo(BaseModel):
+    """No-network version-update result (#30, ADR 0026): the running version vs the installed/pinned
+    one + the derived ``update_available`` bool. Carries **only version strings** — no PHI, no
+    dependency list. Present on :class:`SystemStatus` only when ``[update_check]`` is enabled and the
+    runner has produced a result; ``None``/absent otherwise (so the payload is unchanged when off)."""
+
+    current_version: str
+    pinned_version: (
+        str | None
+    )  # None in a source/checkout run with no installed-distribution metadata
+    update_available: bool
+
+
+class PoolWaitInfo(BaseModel):
+    """Connection-pool acquire-WAIT percentiles in milliseconds — the PRIMARY connection-scale
+    pool-wait signal (B11). The time a stage worker spends waiting for a pooled connection grows
+    monotonically with worker contention once the pool saturates (where size/idle occupancy can't tell
+    500 connections from 1500), so these percentiles are the load-bearing wall metric."""
+
+    count: int  # number of acquire() waits sampled since engine start
+    p50_ms: float
+    p95_ms: float
+    p99_ms: float
+    max_ms: float
+    mean_ms: float
+
+
+class PoolInfo(BaseModel):
+    """A **server-only** connection-pool snapshot (B11), surfaced as the additive ``pool`` field on
+    :class:`SystemStatus`. ``None`` on SQLite (no pool — it has a single writer + lockfree read
+    connections, not a contended pool), so an older client deserializes ``/status`` unchanged. Carries
+    the PRIMARY acquire-wait percentiles plus a secondary size/idle occupancy ("is it saturated":
+    ``idle == 0`` at the wall). Read-only observability — never affects routing or disposition."""
+
+    backend: str  # "postgres" | "sqlserver"
+    max_size: int  # the configured pool maximum
+    size: int  # connections currently open in the pool
+    idle: int  # currently-free connections (idle == 0 ⇒ saturated)
+    acquire_wait: PoolWaitInfo  # PRIMARY: acquire() wait-time percentiles
+
+
+class SystemStatus(BaseModel):
+    engine: EngineInfo
+    db: DbInfo
+    # App-log disk metering (#50), alongside the DB metrics. ``None`` when no [logging].log_dir is
+    # configured (the engine logs to stdout under NSSM) or the directory is unreadable — never raises.
+    logs: LogInfo | None = None
+    # No-network version-update signal (#30, ADR 0026). Additive + ``None`` when [update_check] is
+    # disabled or the runner hasn't produced a result yet, so the existing payload is unchanged when off.
+    update: UpdateInfo | None = None
+    # B11 connection-scale observability: a SERVER-ONLY connection-pool snapshot (acquire-wait
+    # percentiles + size/idle occupancy). Additive + ``None`` on SQLite (no pool) so the existing
+    # payload is unchanged on the default backend and an older client deserializes /status unchanged.
+    pool: PoolInfo | None = None
+
+
+class IntegrityResult(BaseModel):
+    ok: bool
+    detail: str
+
+
+class ClusterStatus(BaseModel):
+    """This node's cluster posture (Track B Step 7), from the cheap in-memory coordinator gates — no DB
+    round-trip. ``clustered`` is False on a single node (NullCoordinator), where ``is_leader`` is always
+    True and ``config_version`` is 0. ``role`` (Workstream A5) is the operator-facing active-passive
+    role: ``"single-node"`` when not clustered, else ``"primary"`` when this node is the leader (it runs
+    the graph) or ``"standby"`` when it is a warm follower (no listeners bound, no workers running)."""
+
+    node_id: str
+    clustered: bool
+    is_leader: bool
+    role: str
+    config_version: int
+
+
+class ClusterNode(BaseModel):
+    """One node in the cluster (Track B Step 7). ``is_leader`` is the DERIVED live leader (the durable
+    ``nodes.is_leader`` heartbeat flag filtered for freshness, so a crashed ex-leader's stale flag is not
+    reported). ``started_at``/``last_seen`` are epoch seconds, ``None`` only for the single-node
+    synthetic self-entry."""
+
+    node_id: str
+    host: str | None
+    pid: int | None
+    status: str
+    started_at: float | None
+    last_seen: float | None
+    is_leader: bool
+
+
+class ClusterNodeList(BaseModel):
+    """Cluster membership (Track B Step 7). ``leader_node_id`` is the node_id of the single derived
+    leader (from the ``nodes.is_leader`` heartbeat flag), or ``None`` if no fresh node currently holds
+    it. ``lease_owner`` / ``lease_expires_at`` (Workstream A5) are the **authoritative** leadership-lease
+    state — who holds the self-fencing lease and the DB-clock epoch at which it expires (when a standby
+    could acquire if the leader stops renewing). ``lease_owner`` normally equals ``leader_node_id``; a
+    brief divergence during failover is expected (the lease is the source of truth). ``lease_expires_at``
+    is ``None`` single-node (no lease)."""
+
+    nodes: list[ClusterNode]
+    leader_node_id: str | None
+    lease_owner: str | None
+    lease_expires_at: float | None
+
+
+class DrStatus(BaseModel):
+    """Third-tier DR standby posture (#61, ADR 0048). ``enabled`` = this deployment is a DR box at all
+    (``[dr].enabled``); ``active`` = it is currently serving under the DR run-profile (the priority feeds
+    are bound, the rest report ``status:"filtered"``); ``threshold`` is ``[dr].priority_threshold``;
+    ``activation_mode`` is always ``"manual"`` in this slice (``auto`` is rejected at config load). A
+    non-DR deployment reports ``enabled=false`` / ``active=false``."""
+
+    enabled: bool
+    active: bool
+    threshold: str
+    activation_mode: str
+
+
+class ServiceStatusInfo(BaseModel):
+    """The engine's own hosting-service (NSSM) run state (L6a, ADR 0065). ``enabled`` reflects
+    ``[service].report_status``; when off, no query runs and ``state`` is ``"disabled"``. Otherwise
+    ``state`` is ``running`` / ``stopped`` / ``not_installed`` / ``unknown`` / ``unavailable`` (off
+    Windows or when ``sc`` can't run). Read-only, ``monitoring:read``; carries no PHI and no secret."""
+
+    enabled: bool
+    state: str
+    service_name: str
+
+
+class DrActionResult(BaseModel):
+    """The PHI-free outcome of a ``POST /dr/activate`` or ``/dr/release`` (#61, ADR 0048): the new
+    posture plus, for an activation, the verified cold-seed archive name + restore-verify status + the
+    new audit-chain segment marker hash. Paths/counts/one-way fingerprints only — never a body or key
+    bytes."""
+
+    action: str  # "activate" | "release"
+    active: bool
+    threshold: str
+    archive: str | None = None
+    verify_status: str | None = None
+    seed_segment: str | None = None
+    vip_hook_ran: bool = False
+
+
+class AiPolicy(BaseModel):
+    """The effective AI-assistance policy for the IDE gate. ``assist_permitted`` is the
+    identity-dependent bit: ``True``/``False`` when the caller's RBAC can be evaluated, ``None`` when
+    no/invalid token under enabled auth made it unknown (a tokenless read still gets mode/scope, so a
+    central ``off`` is honored)."""
+
+    mode: AiMode
+    data_scope: AiDataScope
+    environment: str | None  # the free-form active-environment NAME (ADR 0017)
+    data_class: DataClass | None = None  # PHI posture (synthetic|phi), if resolvable
+    production: bool | None = None  # production-tier posture, if resolvable
+    assist_permitted: bool | None
+    reason: str | None = None
+
+
+class SecurityPosture(BaseModel):
+    """The instance's **effective** PHI-at-rest security posture (M5), behind the authenticated,
+    permission-gated ``GET /security/posture`` route. Surfaces what protection is *actually* in effect
+    (vs. what an operator assumes) so an EF-3-class accidental-dangerous-deploy is visible.
+
+    **No secret material ever appears here** (SECRET-1): ``key_id`` is only the active key's one-way
+    **fingerprint** (the first 16 hex of SHA-256(key)), never key bytes, and ``key_source`` is the
+    provider *name*, not a credential. ``data_class``/``production`` are the resolved posture;
+    ``encryption_enabled`` is read from the *live* store cipher (not just config). ``plaintext_columns``
+    lists any PHI-bearing columns that stay UNENCRYPTED at rest on the active backend — ``[]`` on every
+    backend now (the SQL Server ``error``/``last_error``/``message_events.detail`` residual was retired
+    by H4; SQLite, Postgres, and SQL Server all have full at-rest coverage of the PHI-bearing columns).
+    """
+
+    data_class: DataClass | None = None  # resolved PHI posture (synthetic|phi), if resolvable
+    production: bool | None = None  # production-tier posture, if resolvable
+    environment: str | None = None  # the active-environment NAME (ADR 0017)
+    backend: str  # store backend: "sqlite" | "postgres" | "sqlserver"
+    encryption_enabled: bool  # whether the LIVE store cipher encrypts at rest
+    key_source: str  # [store].key_provider name (auto|env|dpapi|aws_kms|...); NOT key material
+    key_id: str | None = (
+        None  # active key FINGERPRINT only (first 16 hex of SHA-256(key)); never bytes
+    )
+    require_encryption: bool  # whether keyless start is refused regardless of data_class
+    allow_unencrypted_phi: bool  # whether the audited keyless-PHI override is set
+    # PHI-bearing columns NOT encrypted at rest on this backend; empty on every backend (the SQL Server
+    # error/last_error/detail residual was retired by H4) or when encryption is off, where it is N/A.
+    plaintext_columns: list[str] = Field(default_factory=list)
+
+
+class ConnectionMetadata(BaseModel):
+    """Static metadata for one connection (operability Tier 4). ``metadata`` is the operator's
+    free-form label table (owner / runbook / environment); ``settings`` is **secret-scrubbed**
+    (``env()`` refs shown as ``{"env": key}``, inline credentials redacted). No live probe — use
+    ``POST /connections/{name}/test`` for reachability."""
+
+    name: str
+    direction: str  # "in" (inbound) | "out" (outbound)
+    method: str  # connector type, e.g. "mllp" / "file" / "rest"
+    running: bool
+    router: str | None = None  # inbound only
+    metadata: dict[str, Any] | None = None  # operator labels
+    settings: dict[str, Any]  # secret-scrubbed view
+    simulated: bool | None = None  # outbound only; True = egress-suppressed shadow lane (#15)
+    error: str | None = None  # why this connection failed to start, if it did (ADR 0031)
+
+
+class AlertRuleInfo(BaseModel):
+    """One operator-authored alert rule (ADR 0014), read-only. Pure routing/threshold data — no secrets."""
+
+    event_type: str
+    connection: str
+    min_depth: int | None = None
+    min_oldest_seconds: float | None = None
+    severity: str
+    transports: list[str] | None = None
+    cooldown_seconds: float | None = None
+
+
+class AlertsConfig(BaseModel):
+    """Read-only view of the loaded [alerts] config (ADR 0014, BACKLOG #22b). Transports are reported
+    present-or-not; NO secrets (webhook URL, SMTP password/username) or recipient addresses are ever
+    included."""
+
+    webhook_configured: bool
+    webhook_timeout: float
+    webhook_allowed_hosts: list[str]
+    email_configured: bool
+    email_smtp_port: int
+    email_use_tls: bool
+    email_recipient_count: int
+    smtp_allowed_hosts: list[str]
+    realert_seconds: float
+    rules: list[AlertRuleInfo]
+
+
+class ConnectionTestResult(BaseModel):
+    """Result of ``POST /connections/{name}/test`` — a reachability probe that sends no real payload.
+    ``supported`` is False when the connector has nothing external to probe (a bound listen source, a
+    timer); ``success`` is the reachability outcome; ``detail`` carries the failure / not-supported
+    reason."""
+
+    name: str
+    direction: str  # "in" | "out"
+    supported: bool
+    success: bool
+    duration_ms: float
+    detail: str | None = None

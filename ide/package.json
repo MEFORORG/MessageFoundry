@@ -1,0 +1,437 @@
+{
+  "name": "messagefoundry",
+  "displayName": "MessageFoundry",
+  "description": "Author, test, and monitor MessageFoundry HL7 v2 interfaces in VS Code.",
+  "version": "0.0.1",
+  "publisher": "messagefoundry",
+  "icon": "media/icon.png",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MEFORORG/MessageFoundry"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Testing",
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:python",
+    "workspaceContains:**/*.py"
+  ],
+  "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In an untrusted workspace, MessageFoundry will not auto-run the workspace Python CLI (validate/graph/codeset/promote are disabled) until you trust the workspace."
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "messagefoundry.validate",
+        "title": "MessageFoundry: Validate Config",
+        "icon": "$(check)"
+      },
+      {
+        "command": "messagefoundry.openTestBench",
+        "title": "MessageFoundry: Open Test Bench",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "messagefoundry.refreshGraph",
+        "title": "MessageFoundry: Refresh Connections",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "messagefoundry.filterConnections",
+        "title": "MessageFoundry: Filter Connections",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "messagefoundry.groupConnections",
+        "title": "MessageFoundry: Group Connections",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "messagefoundry.openConnectionSettings",
+        "title": "MessageFoundry: Open Connection Settings",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "messagefoundry.newConnection",
+        "title": "MessageFoundry: Connection Wizard"
+      },
+      {
+        "command": "messagefoundry.editConnection",
+        "title": "MessageFoundry: Edit Connection"
+      },
+      {
+        "command": "messagefoundry.newCodeSet",
+        "title": "MessageFoundry: New Translation Table",
+        "icon": "$(add)"
+      },
+      {
+        "command": "messagefoundry.editCodeSet",
+        "title": "MessageFoundry: Edit Translation Table"
+      },
+      {
+        "command": "messagefoundry.renameCodeSet",
+        "title": "MessageFoundry: Rename Translation Table"
+      },
+      {
+        "command": "messagefoundry.deleteCodeSet",
+        "title": "MessageFoundry: Delete Translation Table"
+      },
+      {
+        "command": "messagefoundry.refreshCodeSets",
+        "title": "MessageFoundry: Refresh Translation Tables",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "messagefoundry.newRoute",
+        "title": "MessageFoundry: Route Wizard"
+      },
+      {
+        "command": "messagefoundry.newRouter",
+        "title": "MessageFoundry: Router Wizard"
+      },
+      {
+        "command": "messagefoundry.newHandler",
+        "title": "MessageFoundry: Handler Wizard"
+      },
+      {
+        "command": "messagefoundry.newAlert",
+        "title": "MessageFoundry: Alert Wizard"
+      },
+      {
+        "command": "messagefoundry.generateSamples",
+        "title": "MessageFoundry: Generate Samples"
+      },
+      {
+        "command": "messagefoundry.setupSourceControl",
+        "title": "MessageFoundry: Set Up Version Control & Checks"
+      },
+      {
+        "command": "messagefoundry.setRepoStorage",
+        "title": "MessageFoundry: Config Repo Storage Location"
+      },
+      {
+        "command": "messagefoundry.promote",
+        "title": "MessageFoundry: Stage → Promote",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "messagefoundry.insertElement",
+        "title": "MessageFoundry: Insert Element",
+        "icon": "$(symbol-snippet)"
+      },
+      {
+        "command": "messagefoundry.showAiPolicy",
+        "title": "MessageFoundry: Show AI Policy"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "messagefoundry",
+          "title": "MessageFoundry",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "messagefoundry": [
+        {
+          "id": "messagefoundry.home",
+          "name": "Home",
+          "type": "webview"
+        },
+        {
+          "id": "messagefoundry.graph",
+          "name": "Connections"
+        },
+        {
+          "id": "messagefoundry.codesets",
+          "name": "Translation Tables"
+        }
+      ]
+    },
+    "submenus": [
+      {
+        "id": "messagefoundry.editorMenu",
+        "label": "MessageFoundry",
+        "icon": "media/icon-amber.svg"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "submenu": "messagefoundry.editorMenu",
+          "when": "messagefoundry.isConfigFile",
+          "group": "navigation@1"
+        }
+      ],
+      "messagefoundry.editorMenu": [
+        {
+          "command": "messagefoundry.validate",
+          "group": "1_build@1"
+        },
+        {
+          "command": "messagefoundry.openTestBench",
+          "group": "1_build@2"
+        },
+        {
+          "command": "messagefoundry.promote",
+          "group": "1_build@3"
+        },
+        {
+          "command": "messagefoundry.newRouter",
+          "group": "2_scaffold@1"
+        },
+        {
+          "command": "messagefoundry.newHandler",
+          "group": "2_scaffold@2"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "messagefoundry.filterConnections",
+          "when": "view == messagefoundry.graph",
+          "group": "navigation@1"
+        },
+        {
+          "command": "messagefoundry.groupConnections",
+          "when": "view == messagefoundry.graph",
+          "group": "navigation@2"
+        },
+        {
+          "command": "messagefoundry.openTestBench",
+          "when": "view == messagefoundry.graph",
+          "group": "navigation@3"
+        },
+        {
+          "command": "messagefoundry.refreshGraph",
+          "when": "view == messagefoundry.graph",
+          "group": "navigation@4"
+        },
+        {
+          "command": "messagefoundry.newCodeSet",
+          "when": "view == messagefoundry.codesets",
+          "group": "navigation@1"
+        },
+        {
+          "command": "messagefoundry.refreshCodeSets",
+          "when": "view == messagefoundry.codesets",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "messagefoundry.openConnectionSettings",
+          "when": "view == messagefoundry.graph && viewItem == meforConnection",
+          "group": "inline"
+        },
+        {
+          "command": "messagefoundry.editConnection",
+          "when": "view == messagefoundry.graph && viewItem == meforConnection",
+          "group": "1_edit"
+        },
+        {
+          "command": "messagefoundry.editCodeSet",
+          "when": "view == messagefoundry.codesets && viewItem == meforCodeSetCsv",
+          "group": "1_edit"
+        },
+        {
+          "command": "messagefoundry.editCodeSet",
+          "when": "view == messagefoundry.codesets && viewItem == meforCodeSetToml",
+          "group": "1_edit"
+        },
+        {
+          "command": "messagefoundry.renameCodeSet",
+          "when": "view == messagefoundry.codesets && viewItem == meforCodeSetCsv",
+          "group": "1_edit"
+        },
+        {
+          "command": "messagefoundry.deleteCodeSet",
+          "when": "view == messagefoundry.codesets && (viewItem == meforCodeSetCsv || viewItem == meforCodeSetToml)",
+          "group": "9_danger"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "messagefoundry.editConnection",
+          "when": "false"
+        },
+        {
+          "command": "messagefoundry.editCodeSet",
+          "when": "false"
+        },
+        {
+          "command": "messagefoundry.renameCodeSet",
+          "when": "false"
+        },
+        {
+          "command": "messagefoundry.deleteCodeSet",
+          "when": "false"
+        }
+      ]
+    },
+    "snippets": [
+      {
+        "language": "python",
+        "path": "./snippets/messagefoundry.code-snippets"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "messagefoundry.chat",
+        "name": "messagefoundry",
+        "fullName": "MessageFoundry",
+        "description": "Ask about Connections, Routers, and Handlers (PHI-safe — code & schema only).",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "explain",
+            "description": "Explain the selected HL7 path, Router, or Handler"
+          },
+          {
+            "name": "transform",
+            "description": "Draft a Handler transform for what you describe"
+          },
+          {
+            "name": "router",
+            "description": "Draft a Router for the routing policy you describe"
+          },
+          {
+            "name": "review",
+            "description": "Review the active Router/Handler for PHI leaks and bugs"
+          },
+          {
+            "name": "migrate",
+            "description": "Convert pasted Mirth/Corepoint logic to a Router/Handler"
+          },
+          {
+            "name": "test",
+            "description": "Generate a synthetic HL7 sample for the active code"
+          }
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "MessageFoundry",
+      "properties": {
+        "messagefoundry.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "scope": "machine",
+          "description": "Python interpreter used to run the `messagefoundry` CLI. Machine-scoped: a checked-in workspace .vscode/settings.json cannot override it to a malicious interpreter that would run on the next CLI/debug launch."
+        },
+        "messagefoundry.configDir": {
+          "type": "string",
+          "default": "samples/config",
+          "description": "Config modules directory (relative to the workspace)."
+        },
+        "messagefoundry.serviceConfig": {
+          "type": "string",
+          "default": "messagefoundry.toml",
+          "description": "Service-settings TOML the engine loads (relative to the workspace). The Alert Wizard reads/writes its [[alerts.rules]] (ADR 0014); created on first add if absent."
+        },
+        "messagefoundry.engineUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8765",
+          "scope": "machine",
+          "description": "Engine API URL used by Stage → Promote when no named environments are configured (see messagefoundry.environments). Machine-scoped: a checked-in workspace .vscode/settings.json cannot retarget promote to an attacker host that would then receive your credentials and session token."
+        },
+        "messagefoundry.environments": {
+          "type": "array",
+          "default": [],
+          "scope": "machine",
+          "markdownDescription": "Named promote targets for Stage → Promote (e.g. DEV/PROD). When set, promote asks which to target; when empty, it uses `messagefoundry.engineUrl`. Each engine resolves its own environment values, so the same config promotes to each. Machine-scoped: a checked-in workspace .vscode/settings.json cannot retarget promote to an attacker host that would then receive your credentials and session token.",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "url"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Display name, e.g. DEV or PROD."
+              },
+              "url": {
+                "type": "string",
+                "description": "Engine API URL, e.g. https://prod-host:8765."
+              },
+              "shards": {
+                "type": "array",
+                "markdownDescription": "Optional engine instances (shards/replicas) within this environment. When 2 or more are listed, Stage → Promote asks WHICH instance to deploy to and uses that shard's `url`; with 0 or 1 it behaves exactly as a shard-less environment (no extra prompt). Additive — omit it to keep today's single-target behavior.",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "name",
+                    "url"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "description": "Display name for this engine instance, e.g. shard-1 or us-east."
+                    },
+                    "url": {
+                      "type": "string",
+                      "description": "This instance's Engine API URL, e.g. https://prod-shard-1:8765."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "messagefoundry.messageSetsDir": {
+          "type": "string",
+          "default": "samples/messages",
+          "description": "Default folder the Test Bench's 'Load Message Set' dialog opens to."
+        },
+        "messagefoundry.sourceControl.autoPrompt": {
+          "type": "boolean",
+          "default": true,
+          "description": "Offer to set up version control + commit-time checks when a config project has no git repo yet."
+        },
+        "messagefoundry.ai.contextCharLimit": {
+          "type": "integer",
+          "default": 8000,
+          "minimum": 0,
+          "markdownDescription": "Maximum characters of the active editor's code attached to a `@messagefoundry` AI chat request. The assistant only ever sends code + your config graph's names — never message bodies/PHI — so this bounds how much of your *own* code leaves to your chosen model provider. Files larger than the limit are truncated on a line boundary with a visible marker; `0` sends only the graph names (no editor code)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit",
+    "compile-tests": "tsc -p ./tsconfig.test.json",
+    "pretest": "npm run compile && npm run compile-tests",
+    "test": "node ./out/test/runTest.js",
+    "package": "vsce package",
+    "vscode:prepublish": "node -e \"require('fs').copyFileSync('../LICENSE','LICENSE')\" && npm run compile"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^3.0.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.28.1",
+    "glob": "^13.0.6",
+    "mocha": "^11.7.6",
+    "typescript": "^5.4.5"
+  },
+  "overrides": {
+    "serialize-javascript": ">=7.0.5",
+    "diff": ">=8.0.3"
+  }
+}

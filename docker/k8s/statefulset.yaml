@@ -1,0 +1,132 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+#
+# Minimal Kubernetes manifests for the headless engine — Topology A (in-process TLS), the self-contained
+# baseline. See docs/CONTAINER-EXPOSURE-EVALUATION.md §1 for Topology B (a same-pod TLS-terminating
+# sidecar with the engine bound to 127.0.0.1 + trusted_proxies=[127.0.0.1]), the "k8s-preferred" pattern
+# and the right home for mTLS + OCSP-must-staple revocation.
+#
+# CONFIG IS BAKED INTO THE IMAGE, not mounted: a ConfigMap/projected volume mounts root-owned, but the
+# engine (uid 10001) refuses a config dir owned by another uid (_assert_safe_config_source — it executes
+# the *.py as the service account). Build an adopter image:
+#     FROM messagefoundry:<version>
+#     COPY --chown=10001:10001 config /config
+# and set image: below to it. This also matches ADR 0017's immutable, byte-identical multi-instance model.
+#
+# Single replica: the default SQLite store is single-writer. For multi-node HA use the Postgres/SQL Server
+# store backend + the built leader election (docs/CLUSTERING.md) — out of scope for this baseline manifest.
+---
+# Headless governing Service for the StatefulSet (stable per-pod DNS: pod-0.mefor-engine.<ns>...).
+apiVersion: v1
+kind: Service
+metadata:
+  name: mefor-engine
+spec:
+  clusterIP: None
+  selector:
+    app: mefor-engine
+  ports:
+    - { name: api, port: 8443, targetPort: 8443 }
+    - { name: mllp, port: 2575, targetPort: 2575 }
+---
+# Client-facing Service. NOTE: MLLP is long-lived TCP — for off-cluster partners front it with an L4
+# load balancer (NLB), not an L7/HTTP ingress, with a TCP health check + generous idle/dereg timeouts.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mefor-engine-client
+spec:
+  selector:
+    app: mefor-engine
+  ports:
+    - { name: api, port: 8443, targetPort: 8443 }
+    - { name: mllp, port: 2575, targetPort: 2575 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mefor-engine
+spec:
+  serviceName: mefor-engine
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mefor-engine
+  template:
+    metadata:
+      labels:
+        app: mefor-engine
+    spec:
+      # Cover engine.stop()'s ordered teardown: ≈10s graph-quiesce + ~5s PER MLLP listener (drained
+      # serially) + store-close margin. Raise it for many-listener graphs; also ensure it exceeds the
+      # cluster leader-lease TTL so a drained leader releases the lease before SIGKILL.
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001                      # so the mounted TLS Secret files (mode 0440) are group-readable
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: engine
+          # REPLACE with your config-baked image (FROM messagefoundry:<version>; COPY --chown=10001:10001 config /config).
+          image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE
+          args: ["serve", "--config", "/config", "--env", "prod"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - { name: api, containerPort: 8443 }
+            - { name: mllp, containerPort: 2575 }
+            # Do NOT expose raw-TCP / X12 ports without TLS. Those listeners are PLAINTEXT-ONLY (no tls=
+            # option), but they ARE exposed-gated since PR #558: MLLP, the DICOM C-STORE SCP, HTTP, raw-TCP,
+            # and X12 all refuse a non-loopback bind without TLS at startup. For raw-TCP/X12 there is no TLS
+            # escape — keep them loopback-bound or front them with a TLS-terminating TCP proxy.
+          env:
+            - { name: MEFOR_API_HOST, value: "0.0.0.0" }
+            - { name: MEFOR_API_PORT, value: "8443" }
+            - { name: MEFOR_API_TLS_CERT_FILE, value: "/etc/mefor/tls/api.crt" }
+            - { name: MEFOR_API_TLS_KEY_FILE, value: "/etc/mefor/tls/api.key" }
+            - { name: MEFOR_INBOUND_BIND_HOST, value: "0.0.0.0" }   # MLLP() must set tls=True (exposure gate)
+            - { name: MEFOR_AUTH_ENABLED, value: "true" }
+            - { name: MEFOR_AUTH_REQUIRE_MFA, value: "true" }       # local-admin MFA on an exposed PHI bind
+            - { name: MEFOR_STORE_REQUIRE_ENCRYPTION, value: "true" }
+            - { name: MEFOR_EGRESS_DENY_BY_DEFAULT, value: "true" } # plus MEFOR_EGRESS_ALLOWED_* for your graph
+            # Secrets injected from the Secret as env (never plain manifest values):
+            - name: MEFOR_STORE_ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: mefor-secrets, key: store-encryption-key } }
+            - name: MEFOR_API_TLS_KEY_PASSWORD
+              # optional: the pod still starts if the API key is unencrypted and the Secret omits this key.
+              valueFrom: { secretKeyRef: { name: mefor-secrets, key: api-tls-key-password, optional: true } }
+          volumeMounts:
+            - { name: store, mountPath: /var/lib/mefor }   # PHI store (PVC); WAL writes -wal/-shm siblings here
+            - { name: tls, mountPath: /etc/mefor/tls, readOnly: true }
+            - { name: tmp, mountPath: /tmp }               # writable tmpfs for the read-only root fs
+          # Liveness only. /health is tokenless + always 200 and answers BEFORE the engine finishes
+          # starting — a pure liveness signal, not readiness. There is no unauthenticated readiness
+          # endpoint today, so no readinessProbe is wired (one would mark the pod Ready prematurely).
+          livenessProbe:
+            httpGet: { path: /health, port: 8443, scheme: HTTPS }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: tls
+          secret:
+            secretName: mefor-secrets
+            defaultMode: 0440           # group-readable (fsGroup 10001); keep the private key off 0644
+            items:
+              - { key: api.crt, path: api.crt }
+              - { key: api.key, path: api.key }
+        - name: tmp
+          emptyDir: { medium: Memory }
+  volumeClaimTemplates:
+    - metadata:
+        name: store
+      spec:
+        accessModes: ["ReadWriteOnce"]   # the PHI store MUST persist across restarts (at-least-once invariant)
+        resources:
+          requests:
+            storage: 5Gi

@@ -1,0 +1,53 @@
+================ PUSH N=1500 offered=80/s  2026-07-03T18:59:33.0725545+00:00 ================
+Connection-scale report -- profile 'pooled_push' against http://127.0.0.1:8800 (backend sqlserver)
+coverage: all walls measured.
+
+claim    mode                 N    rate  achv/s     sent inpipe  exqd  poolp99  idle  empty/s  wake/s  idle/s     fd   cpu_s  reload   ackp99
+---------------------------------------------------------------------------------------------------------------------------------------------
+pooled   fixed_aggregate   1500      80      78     9600     19     3     0.25     5     24.6    24.6     0.0   5287   226.8     n/a     81.0
+
+SLOs:
+  [PASS] zero_loss: observed=True threshold=True
+
+RESULT: PASS -> exit 0
+offered=80 exit=0
+================ PUSH N=1500 offered=100/s  2026-07-03T19:01:42.2948470+00:00 ================
+Connection-scale report -- profile 'pooled_push' against http://127.0.0.1:8800 (backend sqlserver)
+coverage: all walls measured.
+
+claim    mode                 N    rate  achv/s     sent inpipe  exqd  poolp99  idle  empty/s  wake/s  idle/s     fd   cpu_s  reload   ackp99
+---------------------------------------------------------------------------------------------------------------------------------------------
+pooled   fixed_aggregate   1500     100      97    12000    553    32   2500.0     1    102.5    91.4    11.1   5358   237.2     n/a    443.7
+
+SLOs:
+  [PASS] zero_loss: observed=True threshold=True
+
+RESULT: PASS -> exit 0
+offered=100 exit=0
+================ PUSH N=1500 offered=120/s  2026-07-03T19:03:52.8768143+00:00 ================
+Connection-scale report -- profile 'pooled_push' against http://127.0.0.1:8800 (backend sqlserver)
+coverage: all walls measured.
+
+claim    mode                 N    rate  achv/s     sent inpipe  exqd  poolp99  idle  empty/s  wake/s  idle/s     fd   cpu_s  reload   ackp99
+---------------------------------------------------------------------------------------------------------------------------------------------
+pooled   fixed_aggregate   1500     120     104    14399   4027    69   2500.0     1     64.7    55.6     9.1   5394   238.8     n/a   2579.0
+
+SLOs:
+  [PASS] zero_loss: observed=True threshold=True
+
+RESULT: PASS -> exit 0
+offered=120 exit=0
+================ PUSH N=1500 offered=160/s  2026-07-03T19:06:18.3744149+00:00 ================
+Connection-scale report -- profile 'pooled_push' against http://127.0.0.1:8800 (backend sqlserver)
+coverage: all walls measured.
+
+claim    mode                 N    rate  achv/s     sent inpipe  exqd  poolp99  idle  empty/s  wake/s  idle/s     fd   cpu_s  reload   ackp99
+---------------------------------------------------------------------------------------------------------------------------------------------
+pooled   fixed_aggregate   1500     160     107    19200   8782    28   5000.0     1     66.3    49.4    16.9   5442   243.3     n/a   4606.3
+
+SLOs:
+  [PASS] zero_loss: observed=True threshold=True
+
+RESULT: PASS -> exit 0
+offered=160 exit=0
+=== rate-walk done elapsed=592s ===

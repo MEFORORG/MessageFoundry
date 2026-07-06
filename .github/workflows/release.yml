@@ -1,0 +1,246 @@
+# Release — build, SBOM, Sigstore-sign, publish a GitHub release, and upload to PyPI when a `vX.Y.Z`
+# tag is pushed.
+#
+# Cut a release:  git tag v0.1.0 && git push origin v0.1.0   (on a commit that already passed CI on main).
+# Dry-run:        run this workflow manually (workflow_dispatch) — it builds + SBOMs + signs and uploads
+#                 the artifacts for inspection. It does NOT create a GitHub release and does NOT publish
+#                 to PyPI (both are gated on a tag push), so the dry-run validates build/SBOM/sign/upload
+#                 ONLY — the publish step never runs on a branch ref. The first live PyPI publish is the
+#                 first real tag; validate it with a `vX.Y.Z-rc1` pre-release tag (also matched below)
+#                 once Trusted Publishing is configured.
+#
+# PyPI publish uses Trusted Publishing (OIDC) — no API token. OWNER PREREQ (one-time, before the first
+# tag): claim the `messagefoundry` PyPI project + configure a Trusted Publisher (a PENDING publisher works
+# before the first upload) for repo MEFORORG/MessageFoundry + workflow `release.yml`. Note: pre-release
+# `-*` tags publish to PRODUCTION PyPI (a TestPyPI route would need its own Trusted Publisher). Cut the tag
+# only AFTER the py.typed marker (WS-3) is on main — the wheel smoke step enforces this on a tag.
+#
+# SECOND distribution — `messagefoundry-harness` (the synthetic test/load/failover harness,
+# packaging/messagefoundry-harness/) — is built + published in lockstep by the `release-harness` job
+# below (same version, same tag). Its PyPI publish is GATED on the `PUBLISH_HARNESS` repo variable so it
+# stays a no-op until the OWNER (one-time): (1) configures a `messagefoundry-harness` PyPI Trusted
+# Publisher — a PENDING publisher for repo MEFORORG/MessageFoundry + workflow `release.yml` (blank
+# environment, matching the engine) — then (2) sets repo variable PUBLISH_HARNESS=true. Until then the
+# job still BUILDS + version-checks the harness wheel each release and attaches it to the GitHub release.
+#
+# The version is single-sourced from messagefoundry/__init__.py (hatchling dynamic version), so the built
+# artifact's version must match the tag.
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"  # pre-releases: v0.1.0-rc1, …
+  workflow_dispatch:
+
+# Deny-all at the workflow level; each job below requests only the scopes it uses (least privilege).
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create the release + upload its assets
+      id-token: write       # Sigstore signing, PyPI Trusted Publishing, + provenance — all via the GitHub OIDC identity
+      attestations: write   # write the SLSA build-provenance attestation (actions/attest-build-provenance)
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false  # release uses GH_TOKEN env / OIDC, never the persisted git credential
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Rewrite README repo slug for the public PyPI long_description
+        run: |
+          # PyPI renders README.md (pyproject `readme = "README.md"`) as the project description and
+          # fetches it anonymously. The source README points at the PRIVATE source repo
+          # (MEFORORG/MessageFoundry) so the team's GitHub view shows the private repo's own CI
+          # badges — but anonymous fetches of a private repo's Actions badge SVG 404 (broken badge
+          # images), and every body link 404s on click. The public mirror (MEFORORG/MessageFoundry)
+          # runs the same workflows and is anonymously reachable, so rewrite the slug here (the same
+          # rewrite scripts/publish/publish.ps1 applies to the mirror) before `python -m build` embeds
+          # the README. Ephemeral runner edit only — never committed.
+          sed -i 's#MEFORORG/MessageFoundry#MEFORORG/MessageFoundry#g' README.md
+          if grep -q 'MEFORORG/MessageFoundry' README.md; then
+            echo '::error::README slug rewrite left private-repo links'; exit 1
+          fi
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+          ls -l dist/
+
+      - name: Smoke-check the built wheel (clean venv → import + version)
+        run: |
+          python -m venv /tmp/relsmoke
+          /tmp/relsmoke/bin/pip install --quiet dist/*.whl
+          built=$(/tmp/relsmoke/bin/python -c "import messagefoundry; print(messagefoundry.__version__)")
+          echo "built version: $built"
+          # On a tag push, the built version MUST equal the tag (single-source check).
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            want="${GITHUB_REF_NAME#v}"
+            [ "$built" = "$want" ] || { echo "::error::built version $built != tag $want"; exit 1; }
+            # A released wheel MUST ship the PEP 561 marker so an external consumer's mypy sees the
+            # typed surface. Enforced ONLY on a tag, so the workflow_dispatch dry-run is never blocked
+            # before py.typed (WS-3) merges. This is the CI enforcement of the cross-workstream rule
+            # "py.typed must merge before the v0.1.0 tag is cut" — a wheel is a zip, so grep its listing.
+            if ! unzip -l dist/*.whl | grep -q 'messagefoundry/py.typed'; then
+              echo "::error::messagefoundry/py.typed missing from the wheel — the py.typed marker (WS-3) must merge before tagging a release"; exit 1
+            fi
+          fi
+
+      - name: Stage a clean dist for PyPI (wheel + sdist only — no signature bundles)
+        run: |
+          # PyPI's uploader (twine) rejects non-distribution files, and the Sigstore step below signs
+          # in-place into dist/ (writing *.sigstore bundles there). Snapshot ONLY the wheel + sdist into
+          # a clean dir now — before signing — and publish FROM it as the last step, so the irreversible
+          # PyPI upload runs last and the uploader never sees the signature bundles.
+          mkdir -p dist-pub
+          cp dist/*.whl dist/*.tar.gz dist-pub/
+          ls -l dist-pub/
+
+      - name: Generate CycloneDX SBOM (from the hash-locked runtime deps)
+        run: |
+          python -m pip install cyclonedx-bom
+          python -m cyclonedx_py requirements requirements.lock --of JSON -o messagefoundry-sbom.cdx.json
+          python -c "import json; d=json.load(open('messagefoundry-sbom.cdx.json')); print('SBOM', d['bomFormat'], d['specVersion'], '-', len(d.get('components',[])), 'components')"
+
+      - name: Sign artifacts with Sigstore (keyless, GitHub OIDC)
+        run: |
+          python -m pip install sigstore
+          python -m sigstore sign dist/*.tar.gz dist/*.whl
+          ls -l dist/
+
+      # SLSA build provenance (Beyond-ASVS-L3 WP-BL3-01): a signed in-toto provenance attestation
+      # (predicateType slsaprovenance v1) binding each artifact's sha256 -> this source commit + the
+      # builder workflow identity, transparency-logged via the OIDC identity above. This is the
+      # GitHub-native artifact attestation for the GitHub release assets, COMPLEMENTING the PyPI-side
+      # PEP 740 attestations emitted by the publish step below (dist-pub/ is a byte-identical copy, so
+      # the digests match either source). Runs on a tag push AND the workflow_dispatch dry-run, so the
+      # attestation path is validated before the real tag. Verify a downloaded artifact with:
+      #   gh attestation verify dist/<artifact> --repo MEFORORG/MessageFoundry
+      # GATED to PUBLIC repos: the GitHub attestation API (actions/attest-build-provenance) is "not
+      # available for user-owned private repositories" and FAILS there, aborting the job BEFORE the PyPI
+      # publish below. While this repo is private the step is SKIPPED (skip != fail, so the release
+      # proceeds); provenance is still covered by the Sigstore bundle (above) and the PyPI-side PEP 740
+      # attestations (publish step below). Auto-resumes if a release ever runs from the public mirror.
+      # `github.event.repository.private` is populated on the tag-push event.
+      - name: Attest build provenance (SLSA) for sdist + wheel
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: "dist/*.tar.gz, dist/*.whl"
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          # Release notes = this version's CHANGELOG section (fall back to a one-liner).
+          awk -v v="$ver" 'BEGIN{f=0} /^## \[/{ if(f) exit; if(index($0,"["v"]")) f=1 } f{print}' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "MessageFoundry $tag" > notes.md
+          pre=""
+          case "$ver" in *-*) pre="--prerelease";; esac
+          gh release create "$tag" \
+            dist/*.tar.gz dist/*.whl dist/*.sigstore* messagefoundry-sbom.cdx.json \
+            --title "$tag" --notes-file notes.md $pre
+
+      - name: Upload artifacts (dry-run / always)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-artifacts
+          path: |
+            dist/
+            messagefoundry-sbom.cdx.json
+          if-no-files-found: ignore
+
+      # LAST step on purpose: PyPI is the one IRREVERSIBLE sink (uploads can't be replaced), so it runs
+      # after build/smoke/sign/release — the step's `if` has an implicit success(), so any earlier
+      # failure skips it and nothing can fail AFTER an upload. Tag-gated, so the workflow_dispatch
+      # dry-run skips it entirely (a branch ref isn't `refs/tags/...`). Reads dist-pub/ (clean wheel +
+      # sdist; dist/ now also holds the *.sigstore bundles, which twine would reject). Trusted Publishing
+      # (OIDC) — no token, uses the job's `id-token: write`. attestations: PEP 740 provenance ON PyPI,
+      # distinct from the Sigstore bundle attached to the GitHub release above. skip-existing: a re-run /
+      # same-version re-push is a no-op, NOT a failure (a version bump is required to republish; the
+      # version==tag smoke check already prevents a wrong-version upload).
+      - name: Publish to PyPI (Trusted Publishing / OIDC)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: dist-pub/
+          skip-existing: true
+          attestations: true
+
+  release-harness:
+    # Build + publish the SEPARATE `messagefoundry-harness` distribution (the synthetic test/load/failover
+    # harness, packaging/messagefoundry-harness/) in lockstep with the engine — same version, same tag.
+    # Isolated from the `release` job so a harness-side issue can never jeopardize the engine release;
+    # `needs: release` so the engine ships (and its GitHub release exists) first. Inherits the workflow's
+    # contents:write + id-token:write. The PyPI publish is GATED on the `PUBLISH_HARNESS` repo variable:
+    # until the owner sets up the harness Trusted Publisher AND PUBLISH_HARNESS=true (see the header note),
+    # this job still BUILDS + version-checks the wheel and attaches it to the GitHub release, but does not
+    # publish — so a missing harness PyPI project can never red a release.
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # gh release upload (attach the harness wheel)
+      id-token: write   # PyPI Trusted Publishing (OIDC) for the harness wheel
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false  # gh upload uses GH_TOKEN env / OIDC, never the persisted git credential
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Build the harness wheel (wheel-only — harness/ is force-included from the repo root)
+        run: |
+          python -m pip install --upgrade pip build
+          # Wheel-only on purpose: the harness source (harness/) lives OUTSIDE this project dir (it is
+          # force-included from ../../harness), so an sdist would not be self-contained. Pure-Python, so a
+          # wheel suffices. Version is read from messagefoundry/__init__.py (lockstep with the engine).
+          python -m build --wheel ./packaging/messagefoundry-harness --outdir harness-dist
+          ls -l harness-dist/
+
+      - name: Smoke-check the harness wheel (version == engine == tag)
+        run: |
+          built=$(python -c "import glob,re; print(re.search(r'messagefoundry_harness-([^-]+)-', glob.glob('harness-dist/*.whl')[0]).group(1))")
+          echo "harness wheel version: $built"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            want="${GITHUB_REF_NAME#v}"
+            [ "$built" = "$want" ] || { echo "::error::harness wheel version $built != tag $want"; exit 1; }
+          fi
+
+      - name: Attach the harness wheel to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" harness-dist/*.whl --clobber
+
+      - name: Upload harness artifact (dry-run / always)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: harness-artifacts
+          path: harness-dist/
+          if-no-files-found: ignore
+
+      # GATED: no-op until the owner configures the messagefoundry-harness PyPI Trusted Publisher AND sets
+      # repo variable PUBLISH_HARNESS=true. The build + version-check above still run every release.
+      - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
+        if: ${{ startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_HARNESS == 'true' }}
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: harness-dist/
+          skip-existing: true
+          attestations: true

@@ -1,0 +1,19 @@
+# Code owners for MessageFoundry.
+# Listed owners are auto-requested for review when matching paths change.
+# See GOVERNANCE.md and MAINTAINERS.md for the roles behind these assignments.
+
+# Default owner for everything in the repo.
+*                                         @wshallwshall
+
+# --- Sensitive subsystems: steward review required even after more maintainers join ---
+/messagefoundry/auth/                     @wshallwshall
+/messagefoundry/store/                    @wshallwshall
+/messagefoundry/transports/               @wshallwshall
+/messagefoundry/api/security.py           @wshallwshall
+
+# Security, licensing, and the public-mirror publish/scan tooling.
+/docs/SECURITY.md                         @wshallwshall
+/docs/Secure_Development_Standards.md     @wshallwshall
+/scripts/publish/                         @wshallwshall
+/CLA.md                                   @wshallwshall
+/LICENSE                                  @wshallwshall

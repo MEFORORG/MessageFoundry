@@ -1,0 +1,50 @@
+# Spike-burst stress profile (W2025 test plan S4.3). A single hard burst held ABOVE the host's
+# sustainable ceiling, followed by a measured recovery phase — the signal is that the backlog the
+# spike builds DRAINS to zero in the recovery phase with no loss. Set the spike rate above the
+# closed-loop ceiling you measured in S4.2 for this host. Serve harness/config/load, then:
+#   python -m harness --load spike-burst --engine URL --token T
+#
+# All values are generic and synthetic — no real partner, site code, host, IP, or volume appears here.
+
+[load]
+name = "spike-burst"
+description = "single hard burst above ceiling, then a measured recovery window"
+pool_size = 160
+corpus_count_per_trigger = 20
+drain_timeout_s = 600.0
+correlator_capacity = 2000000
+
+[[load.target]]
+name = "adt_hub"
+port = 2600
+types = ["ADT"]
+
+[load.mix]
+"ADT^A01" = 70.0
+"ADT^A08" = 30.0
+
+[load.slo]
+max_ack_p99_ms = 50.0
+zero_loss = true
+# no min_sustained_msg_s — recovery (drain), not a throughput floor, is the signal
+
+[[load.phase]]
+name = "warmup"
+kind = "warmup"
+loop = "open"
+rate_start = 100.0
+duration_s = 10.0
+
+[[load.phase]]
+name = "spike"            # transient, EXCLUDED from the verdict
+kind = "spike"
+loop = "open"
+rate_start = 3000.0      # set ABOVE the S4.2 ceiling for this host
+duration_s = 30.0
+
+[[load.phase]]
+name = "recovery"        # MEASURED: backlog must drain here
+kind = "sustained"
+loop = "open"
+rate_start = 300.0       # well under ceiling so backlog can drain
+duration_s = 60.0

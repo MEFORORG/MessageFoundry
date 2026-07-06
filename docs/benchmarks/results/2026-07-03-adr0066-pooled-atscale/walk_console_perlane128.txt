@@ -1,0 +1,27 @@
+======== per_lane pool=128 N=1500 offered=400/s  2026-07-03T19:11:09.8137897+00:00 ========
+Connection-scale report -- profile 'per_lane_pool128' against http://127.0.0.1:8800 (backend sqlserver)
+coverage: all walls measured.
+
+claim    mode                 N    rate  achv/s     sent inpipe  exqd  poolp99  idle  empty/s  wake/s  idle/s     fd   cpu_s  reload   ackp99
+---------------------------------------------------------------------------------------------------------------------------------------------
+per_lane fixed_aggregate   1500     400       0    36000    380   114  10000.0     1      0.0     0.0     0.0    n/a     n/a     n/a  56121.0
+
+SLOs:
+  [FAIL] zero_loss: observed=False threshold=True
+
+RESULT: FAIL (1 violated) -> exit 1
+offered=400 exit=1
+======== per_lane pool=128 N=1500 offered=800/s  2026-07-03T19:18:25.9855909+00:00 ========
+Connection-scale report -- profile 'per_lane_pool128' against http://127.0.0.1:8800 (backend sqlserver)
+coverage: all walls measured.
+
+claim    mode                 N    rate  achv/s     sent inpipe  exqd  poolp99  idle  empty/s  wake/s  idle/s     fd   cpu_s  reload   ackp99
+---------------------------------------------------------------------------------------------------------------------------------------------
+per_lane fixed_aggregate   1500     800       0    71999      0   n/a      n/a   n/a      0.0     0.0     0.0    n/a     n/a     n/a  75756.1
+
+SLOs:
+  [FAIL] zero_loss: observed=False threshold=True
+
+RESULT: FAIL (1 violated) -> exit 1
+offered=800 exit=1
+=== per_lane pool128 walk done elapsed=866s ===

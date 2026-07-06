@@ -1,0 +1,55 @@
+# Failover-under-load profile — the Gate #3 capstone (active-passive primary-kill).
+#
+# Synthetic and generic: no real partner, site, host, or volume. The `--failover` orchestrator runs TWO
+# `messagefoundry serve` nodes against ONE shared server DB (MEFOR_STORE_BACKEND=postgres|sqlserver),
+# drives this load at the leader, and SIGKILLs the current primary at `kill_at_fraction` into the
+# sustained phase — then measures recovery time, no-loss (acknowledged), bounded duplicates, and per-lane
+# FIFO ordering. See docs/LOAD-TESTING.md.
+#
+# ONE hub at pool_size = 1 is deliberate: a single serialized stream makes harness send order == engine
+# insertion order, so the per-sink-connection (= per-lane) first-arrival monotonicity check is SOUND
+# (no false inversions from sender-pool concurrency).
+[load]
+name = "failover"
+description = "Two-node active-passive primary-kill under load: recovery + no-loss + per-lane ordering"
+pool_size = 1                 # single serialized stream → sound per-lane ordering check
+corpus_count_per_trigger = 25
+poll_interval_s = 0.5
+drain_timeout_s = 90.0        # a server-DB round-trip per staged handoff → a generous post-load drain
+
+[[load.target]]
+name = "adt_hub"
+host = "127.0.0.1"
+port = 2600                   # overridden by the orchestrator to the reserved inbound port
+types = ["ADT"]
+
+[load.mix]
+"ADT^A01" = 1.0
+
+# Tuned-short lease timings (heartbeat < fence < ttl) so a CI crash-failover completes in seconds; the
+# recovery SLO is relative to the TTL, so it stays valid if these are retuned for a slower network.
+[load.failover]
+kill_at_fraction = 0.5
+heartbeat_seconds = 2.0
+leader_fence_timeout_seconds = 4.0
+leader_lease_ttl_seconds = 6.0
+recovery_ttl_multiple = 2.0   # functional recovery must be ≤ 12 s (2 × the 6 s TTL)
+max_dup_rate = 0.10           # at-least-once re-deliveries are expected across a crash — bounded, not zero
+
+[[load.phase]]
+name = "warmup"
+kind = "warmup"
+loop = "open"
+rate_start = 40.0
+duration_s = 6.0
+
+# The measured phase MUST be last; the primary is SIGKILLed at kill_at_fraction into it. The rate is kept
+# moderate (the failover scenario is about CORRECTNESS — recovery + no-loss + ordering — not max
+# throughput) so the pipeline stays drainable on modest infra (e.g. co-located CI DB containers); raise it
+# for a higher-in-flight-at-kill stress on capable infra.
+[[load.phase]]
+name = "sustained"
+kind = "sustained"
+loop = "open"
+rate_start = 40.0
+duration_s = 30.0

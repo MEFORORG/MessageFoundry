@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "kind": "connscale",
+  "profile": "pooled_push",
+  "engine_url": "http://127.0.0.1:8800",
+  "db_backend": "sqlserver",
+  "executor_shim_installed": true,
+  "result": "PASS",
+  "exit_code": 0,
+  "coverage": "coverage: all walls measured.",
+  "records": [
+    {
+      "claim_mode": "pooled",
+      "sweep_mode": "fixed_aggregate",
+      "count": 1500,
+      "offered_aggregate_rate": 80.0,
+      "achieved": {
+        "read_per_s": 77.73,
+        "written_per_s": 77.74
+      },
+      "cpu": {
+        "seconds_total": 226.766,
+        "util_cores_peak": 2.13,
+        "util_cores_mean": 1.888
+      },
+      "working_set": {
+        "peak_bytes": 253161472
+      },
+      "traffic": {
+        "sent": 9600,
+        "acked": 9600,
+        "nak": 0,
+        "deferred": 0,
+        "timeouts": 0,
+        "in_pipeline_peak": 19,
+        "drain_seconds": 2.358794400000079
+      },
+      "no_loss": {
+        "ok": true,
+        "sent": 9600,
+        "engine_read": 9600,
+        "engine_written": 9600,
+        "sink_received": 9600,
+        "backlog": 0,
+        "detail": "read>=sent, sink_received>=written, backlog drained"
+      },
+      "wall1_executor": {
+        "queue_depth_peak": 3,
+        "busy_peak": 15
+      },
+      "wall2_pool_wait": {
+        "p50_ms": 0.05,
+        "p95_ms": 0.05,
+        "p99_ms": 0.25,
+        "max_ms": 15.71940000030736,
+        "idle_min": 5,
+        "size_max": 35
+      },
+      "wall3_empty_claims": {
+        "total_per_s": 24.63,
+        "idle_poll_per_s": 0.0,
+        "wake_fanout_per_s": 24.63
+      },
+      "wall4_fd": {
+        "count_peak": 5287
+      },
+      "wall5_reload": {
+        "seconds": null
+      },
+      "wall6_ack_ms": {
+        "p50": 28.079,
+        "p95": 42.735,
+        "p99": 81.048
+      }
+    }
+  ],
+  "slo": [
+    {
+      "name": "zero_loss",
+      "threshold": true,
+      "observed": true,
+      "ok": true
+    }
+  ],
+  "notes": []
+}

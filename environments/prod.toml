@@ -1,0 +1,33 @@
+# PROD environment values — resolved by env("key") in the message graph (see docs/CONFIGURATION.md).
+# Same keys as dev.toml, different values: this is the ONLY thing that changes between environments;
+# the message graph (samples/config) is identical. Secrets come from MEFOR_VALUE_<KEY>, never here.
+#
+# Active environment is selected by [ai].environment / `serve --env prod`.
+
+# Downstream peer for OB_ACME_ADT: the real receiver in PROD (placeholder host — edit for a real
+# deployment). A referenced key missing here would make a promote to PROD fail loud, by design.
+acme_adt_host = "receiver-prod.example.org"
+acme_adt_port = 6661
+
+# Downstream payer for OB_PAYER_X12 (placeholder host — edit for a real deployment).
+payer_x12_host = "payer-prod.example.org"
+payer_x12_port = 6662
+
+# WS-* SOAP submit (samples/config/IB_IMMUNIZATION_VXU.py). Non-secret endpoint only; the client
+# cert/key/password + WS-Security credentials come from MEFOR_VALUE_REGISTRY_* env vars, never here.
+registry_url = "https://iis-prod.example.org:8443/iis/services/submit"
+
+# Real-time eligibility peers (samples/config/IB_RTE_ELIGIBILITY.py — placeholder hosts).
+payer_rte_host = "rte-prod.example.org"
+payer_rte_port = 6663
+rte_result_host = "rte-result-prod.example.org"
+rte_result_port = 6664
+
+# FHIR server BASE url for OB_FHIR_SERVER (samples/config/IB_FHIR_INTAKE.py — placeholder host). A
+# SMART/OAuth bearer token (if any) comes from MEFOR_VALUE_FHIR_BEARER_TOKEN, never this file.
+fhir_base_url = "https://fhir-prod.example.org/fhir"
+
+# Downstream dictation/reporting system (PowerScribe analog) for OB_POWERSCRIBE
+# (samples/config/IB_RADIOLOGY_SR.py — placeholder host; ADR 0025).
+powerscribe_host = "powerscribe-prod.example.org"
+powerscribe_port = 6665

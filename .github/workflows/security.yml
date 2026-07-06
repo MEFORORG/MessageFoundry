@@ -1,0 +1,280 @@
+name: Security
+
+# Security gate: Python SAST (bandit), Python dependency audit (pip-audit), npm dependency audit
+# (npm-audit, for the ide/ extension), secret scan (gitleaks), and project SAST rules (semgrep).
+#   All four are BLOCKING — their first CI run was clean (bandit: 0; gitleaks: 0; semgrep: 0 across
+#   5 rules; pip-audit: no known CVEs), so each now fails the build on a regression rather than
+#   merging unnoticed. To temporarily downgrade one, add `continue-on-error: true` back to its job.
+# CodeQL and native push-protection secret scanning need GitHub Advanced Security on this private
+# repo; gitleaks below is the no-GHAS secret scanner. See docs/SECURITY.md.
+#
+# NO push-to-main trigger (dropped for CI cost): every push to main is an auto-merged PR whose head
+# was JUST scanned by the pull_request run of this same workflow, so the post-merge re-scan re-ran
+# identical scanners on identical content minutes later (~376 runs/month at ~8 billed min each).
+# The drift a push run could in principle catch (a CVE disclosed between the PR scan and the merge)
+# is exactly what the daily cron below exists for — caught within ~24h, the same bound as a CVE
+# against an unchanged main. On-demand full scans: workflow_dispatch.
+on:
+  pull_request:
+  schedule:
+    # Daily, so a CVE freshly disclosed against an UNCHANGED pinned dep (no push/PR to trigger a scan)
+    # is caught within ~24h instead of up to 7 days — a weekly cadence can't meet a 72h-class remediation
+    # clock. pip-audit/npm-audit here are a second detector independent of GitHub's advisory-review lag.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  # Per-ref for PR events so a rapid re-push supersedes its own in-flight scan (ci.yml's pattern —
+  # auto-merge tolerates cancelled contexts on superseded SHAs; it gates on the latest head SHA).
+  # schedule/dispatch runs get a unique group (run_id): never superseded, never cancelled.
+  group: security-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    name: pip-audit (dependency vulnerabilities)
+    runs-on: ubuntu-latest
+    # BLOCKING: the lockfile audit is clean. A newly-disclosed CVE in a pinned dep will now turn CI
+    # red (the intended forcing function) — bump the lockfile, or `pip-audit --ignore-vuln <ID>` to
+    # accept a triaged advisory.
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+      - name: Check the lockfile is in sync with pyproject (DEP-1)
+        run: |
+          python -m pip install --upgrade pip uv
+          # Fails if pyproject changed without re-running `uv lock` (drift guard).
+          uv lock --check
+          # Re-export to the same path and fail if it differs from what's committed (keeps the
+          # hashed requirements.lock in sync with uv.lock; same -o name = deterministic header).
+          uv export --all-extras --no-emit-project --format requirements.txt -o requirements.lock
+          # The container image installs from SCOPED, per-profile locks (not the all-extras lock above,
+          # which drags PySide6/dev/etc. into a slim runtime image) — keep them in sync too. The -o paths
+          # match the header recorded in each committed file, so re-export is byte-identical when in sync.
+          uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
+          uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock
+      - name: Install from the hashed lockfile (DEP-1)
+        run: |
+          # --require-hashes enforces a hash for every requirement (the lockfile carries them): a
+          # reproducible, tamper-evident install. Exercises the lockfile as an actual install path
+          # instead of only auditing it, so a lockfile that doesn't resolve/install is caught (low-26).
+          python -m venv /tmp/lockcheck
+          /tmp/lockcheck/bin/pip install --upgrade pip
+          /tmp/lockcheck/bin/pip install --require-hashes -r requirements.lock
+      - name: Audit the locked dependencies (DEP-1)
+        run: |
+          pip install pip-audit
+          # Audit the committed, pinned set — reproducible (vs auditing a fresh latest-resolve).
+          pip-audit -r requirements.lock --desc
+
+  npm-audit:
+    name: npm-audit (ide dependency vulnerabilities)
+    runs-on: ubuntu-latest
+    # BLOCKING: the ide/ npm tree (the VS Code extension's build-time toolchain) audits clean today, so a
+    # newly-disclosed advisory in a pinned npm dep now turns CI red — the same forcing function as
+    # pip-audit, extended to the extension's supply chain (previously only pip + github-actions were
+    # watched). `overrides` in ide/package.json is where a triaged transitive advisory gets pinned out.
+    defaults:
+      run:
+        working-directory: ide
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "24"
+      - name: Audit the locked npm dependencies (install-free)
+        # --package-lock-only audits straight from the committed package-lock.json (no install needed) —
+        # fast and reproducible. Default level fails on ANY severity, matching pip-audit's strict posture.
+        run: npm audit --package-lock-only
+
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    # Advisory (non-blocking): generate a machine-readable CycloneDX SBOM from the committed, pinned
+    # lockfile and retain it as a build artifact, so "are we exposed to CVE-X?" is answerable from a
+    # recorded bill of materials rather than a fresh resolve (ASVS 15.1.2). The step still fails if
+    # the SBOM can't be produced, so a lockfile that won't render is caught.
+    continue-on-error: true
+    # Daily cron + on-demand only (CI cost): the SBOM derives from the COMMITTED lockfile, so a
+    # per-PR build adds no information over a daily one — the artifact answers "are we exposed to
+    # CVE-X?" from the recorded bill of materials, a freshness question, not a merge gate. Advisory
+    # (continue-on-error) and NOT a required check, so this gate can never wedge a PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+      - name: Generate a CycloneDX SBOM from the lockfile
+        run: |
+          # cyclonedx-bom~=7.3 (was ~=4.6): the 4.x line drags cyclonedx-python-lib 7.x → lxml<6, which
+          # has no cp314 wheel, so on the 3.14 runner pip source-builds lxml and fails. 7.3 → lxml 6.x
+          # (cp314 wheels). The 7.x `requirements` CLI renamed `--outfile` → `--output-file`.
+          python -m pip install --upgrade pip "cyclonedx-bom~=7.3"
+          cyclonedx-py requirements requirements.lock --output-format JSON --output-file sbom.cdx.json
+      - name: Upload the SBOM artifact
+        # SHA-pinned for supply-chain integrity, matching ci.yml's upload-artifact pin.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+
+  trivy:
+    name: trivy (container image vulnerabilities)
+    runs-on: ubuntu-latest
+    # ADVISORY for its first cycle (continue-on-error): scan the built engine image for OS-package and
+    # Python CVEs — the supply-chain layer pip-audit (lockfile only) and bandit/semgrep (source only)
+    # never see: the Debian base, system libs, and (on the -sqlserver variant) the msodbcsql18/unixODBC
+    # apt layer. Once a baseline run confirms it's clean, DELETE `continue-on-error` to make it BLOCKING
+    # like the other gates here. There's now a real docker/Dockerfile, so the image is a live surface.
+    continue-on-error: true
+    # Daily cron + on-demand only (CI cost): the scan INPUT (Dockerfile + base image + locks) changes
+    # rarely while trivy's vuln DB changes daily — the cron is the natural cadence, and ci.yml's
+    # docker-smoke still covers image buildability on merges. Advisory and NOT a required check, so
+    # this gate can never wedge a PR. If trivy is later promoted to BLOCKING (deleting
+    # continue-on-error per the note above), REMOVE this gate too so it runs pre-merge again.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Build the slim engine image
+        # The slim default the docker-smoke leg (ci.yml) and the Dockerfile's `docker build` docs produce.
+        run: docker build -f docker/Dockerfile -t messagefoundry:scan .
+      - name: Install Trivy (pinned)
+        run: |
+          # Pin the release; bump deliberately (same posture as the gitleaks job). Verify the tag exists
+          # at https://github.com/aquasecurity/trivy/releases if this step 404s.
+          VER=0.71.2
+          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${VER}/trivy_${VER}_Linux-64bit.tar.gz" \
+            | tar -xz -C /tmp trivy
+          sudo install -m 0755 /tmp/trivy /usr/local/bin/trivy
+          trivy --version
+      - name: Scan the image (fixable HIGH/CRITICAL fail the build)
+        # --ignore-unfixed keeps the gate ACTIONABLE: a Debian CVE with no upstream fix can't be
+        # remediated by us and shouldn't redden CI; only patchable HIGH/CRITICAL fail. --scanners vuln
+        # keeps this to CVEs (secrets stay gitleaks' job). Extend to `--target runtime-sqlserver` (more
+        # OS surface) once this is green. Trivy auto-pulls its vuln DB from ghcr.io on first run.
+        run: |
+          trivy image --no-progress --scanners vuln \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+            messagefoundry:scan
+      - name: Lint the Dockerfile for misconfig (informational)
+        # IaC checks (non-root USER, pinned base, secrets in layers). Informational only — never fails.
+        if: always()
+        run: trivy config --no-progress --severity HIGH,CRITICAL docker/Dockerfile || true
+
+  bandit:
+    name: bandit (Python SAST)
+    runs-on: ubuntu-latest
+    # BLOCKING: the baseline is clean, so any NEW insecure pattern (that isn't a reviewed per-line
+    # `# nosec`) fails the build instead of merging unnoticed.
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+      - name: Scan source for insecure patterns
+        run: |
+          # Pin bandit: an unpinned upgrade once silently changed `# nosec` parsing (1.9.x requires
+          # space-separated test IDs) and broke a green branch. Bump deliberately, not implicitly.
+          python -m pip install --upgrade pip "bandit==1.9.4"
+          # Skips are reviewed-safe project idioms. The subprocess sites (B603/B607) are annotated
+          # per-line with `# nosec` at the call instead of a wholesale skip, so a NEW unreviewed
+          # subprocess call is still flagged (review low-27):
+          #   B101 assert        — type-narrowing invariants, not security checks
+          #   B404 import subprocess — the calls themselves are per-line nosec'd (icacls/sc/ruff/mypy)
+          #   B311 random        — synthetic-data generators only; tokens use `secrets`
+          #   B110 try/except/pass — best-effort resource cleanup
+          #   B608 hardcoded SQL — f-strings interpolate only literal column names; values are bound
+          #                        params (verified — see security review STORE-4)
+          # `tee/` is in-tree vendored SOUP (a standalone relay) — scanned to the SAME bar as the
+          # engine. Its one urllib GET (tee/mefor_api.py) is per-line `# nosec B310`: the URL scheme is
+          # fixed by operator config (default localhost), never message-derived.
+          bandit -r messagefoundry tee --skip B101,B110,B311,B404,B608
+
+  gitleaks:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    # BLOCKING: full-history scan came back clean; a newly-introduced secret now fails the build.
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # full history so the scan also covers earlier commits, not just the tip
+      - name: Install gitleaks (pinned)
+        run: |
+          # Pin the release; bump deliberately. Verify the tag exists if this step 404s.
+          VER=8.18.4
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" \
+            | tar -xz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Scan repository for secrets
+        run: gitleaks detect --config .gitleaks.toml --redact --verbose --no-banner
+
+  semgrep:
+    name: semgrep (project SAST rules)
+    runs-on: ubuntu-latest
+    # BLOCKING: the first run was 0 findings; a new match for any rule now fails the build.
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+      - name: Run the MessageFoundry rules
+        run: |
+          python -m pip install --upgrade pip "semgrep~=1.90"
+          # --error: any finding fails the step — and the job, now that this gate is blocking.
+          # Includes `tee/` (in-tree vendored SOUP) so the standalone relay is held to the same
+          # dangerous-sink rules as the engine.
+          semgrep --config .semgrep --error --metrics off messagefoundry tee
+
+  # zizmor (GitHub Actions static analysis) moved to its own paths-filtered workflow
+  # (.github/workflows/zizmor.yml): it lints .github/** only, so running it on every PR was pure
+  # cost — it now runs when the workflow surface changes, plus the same daily cron + dispatch.
+
+  crypto-inventory:
+    name: crypto-inventory (ASVS 11.1.3 discovery gate)
+    runs-on: ubuntu-latest
+    # BLOCKING: enumerate every crypto call site (hashlib/secrets/hmac/ssl/argon2/cryptography) and diff
+    # against the maintained inventory in scripts/security/crypto_inventory_check.py (machine-readable
+    # companion to docs/security/ASVS-L2-PHASE0-CHANGES.md §4). A new/moved/undocumented crypto usage —
+    # or a stale inventory entry — fails the build, so the inventory can't silently drift (WP-L3-02).
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+      - name: Diff crypto call sites against the inventory
+        # Stdlib-only (no install). Exits non-zero — failing the build — on any drift.
+        run: python scripts/security/crypto_inventory_check.py
+
+  forbidden-content:
+    name: forbidden-content (customer/PHI leak guard)
+    runs-on: ubuntu-latest
+    # BLOCKING: scan the PUBLISHABLE subset — every tracked file MINUS scripts/publish/publish-denylist.txt
+    # (the same deny-list publish.ps1 removes) — for customer/PHI-adjacent strings: partner/site names, the
+    # real production estate, routable host IPs. These are not *secrets* (gitleaks won't flag them) but must
+    # never reach the open-source mirror. This is the same scanner publish.ps1 runs as its fail-closed gate,
+    # brought forward to PR/push-to-main time so a token can't ride a squash-merge onto main and sit there
+    # until the next publish catches it. See docs/security/PUBLISHING.md.
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+      - name: Scan the publishable subset for forbidden content
+        # Stdlib-only scanner (no install). Exits non-zero — failing the build — on any hit. The scanner
+        # lives under the deny-listed scripts/publish/, so it is ABSENT on the OSS mirror — there's
+        # nothing to gate there (everything is already the published subset); skip rather than error.
+        run: |
+          if [ -f scripts/publish/scan_forbidden.py ]; then
+            python scripts/publish/scan_forbidden.py --published
+          else
+            echo "scripts/publish/scan_forbidden.py absent (OSS mirror) — skipping the publish leak-gate."
+          fi

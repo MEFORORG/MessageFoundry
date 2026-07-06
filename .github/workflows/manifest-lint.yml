@@ -1,0 +1,114 @@
+# Kubernetes manifest schema + policy lint (ADR 0047 AC-4 / AC-5).
+#
+# Validates the docker/k8s/*.yaml manifests against the upstream Kubernetes JSON schemas (kubeconform)
+# and asserts a few ADR-0047 HA-policy invariants on the multi-replica reference manifest, so the
+# manifests cannot silently drift from the engine's validators / the documented HA shape.
+#
+# GATED SENSIBLY — additive, NOT a required check:
+#   * It runs ONLY when a manifest, this workflow, or the docker/ docs change (paths filter), so docs/code
+#     PRs that don't touch manifests skip it entirely.
+#   * It is a SEPARATE workflow, deliberately not part of ci.yml's required `ci-gate`. The required set
+#     stays: the `test` matrix + bandit + pip-audit + cla (see docs/.. main required-checks). Do NOT add
+#     "manifest lint" to branch-protection required checks unless the owner decides to promote it.
+#   * It is fast + dependency-light (a single static binary + grep assertions), so it is cheap to run.
+
+name: manifest lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker/k8s/**.yaml"
+      - "docker/README.md"
+      - ".github/workflows/manifest-lint.yml"
+  pull_request:
+    paths:
+      - "docker/k8s/**.yaml"
+      - "docker/README.md"
+      - ".github/workflows/manifest-lint.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: manifest-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  kubeconform:
+    name: kubeconform + HA policy lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false # read-only lint job; don't persist the token (zizmor: artipacked)
+
+      # kubeconform = a fast, offline-capable schema validator for Kubernetes manifests. Pin the release
+      # by VERSION, then verify the downloaded tarball against the checksum the release itself publishes
+      # (CHECKSUMS file) — reproducible + tamper-evident without hardcoding a hash that would silently
+      # break on a version bump. Bump KUBECONFORM_VERSION deliberately.
+      - name: Install kubeconform
+        env:
+          KUBECONFORM_VERSION: "0.6.7"
+        run: |
+          set -euo pipefail
+          base="https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}"
+          # Keep the tarball's canonical name so the CHECKSUMS line ("<sha256>  kubeconform-linux-amd64.tar.gz")
+          # refers to a file that actually exists in cwd — sha256sum -c verifies by the name in the line.
+          curl -fsSL "${base}/kubeconform-linux-amd64.tar.gz" -o kubeconform-linux-amd64.tar.gz
+          curl -fsSL "${base}/CHECKSUMS" -o CHECKSUMS
+          grep ' kubeconform-linux-amd64.tar.gz$' CHECKSUMS | sha256sum -c -
+          tar -xzf kubeconform-linux-amd64.tar.gz kubeconform
+          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
+          kubeconform -v
+
+      # Schema-validate every manifest. -strict rejects unknown fields (catches typos);
+      # -summary prints a per-file pass/fail roll-up. The Deployment/StatefulSet/Service/PDB kinds are all
+      # in the bundled upstream schemas, so no extra schema location is needed.
+      - name: Validate docker/k8s manifests (kubeconform -strict)
+        run: |
+          set -euo pipefail
+          kubeconform -strict -summary -verbose \
+            docker/k8s/statefulset.yaml \
+            docker/k8s/ha-postgres.yaml
+
+      # ADR-0047 HA-policy assertions on the multi-replica reference manifest. These are the artifact
+      # locks for AC-4 (PDB maxUnavailable:1 + grace > lease TTL) and AC-5 (no HPA, no L7 ingress for
+      # MLLP). Lightweight grep checks — they guard against the manifest drifting away from the decision.
+      - name: HA policy lint (ADR 0047 AC-4 / AC-5)
+        run: |
+          set -euo pipefail
+          M=docker/k8s/ha-postgres.yaml
+          fail=0
+          assert_present() {  # $1 = regex, $2 = message
+            if ! grep -Eq "$1" "$M"; then echo "FAIL: $2 (expected /$1/ in $M)"; fail=1; fi
+          }
+          assert_absent() {   # $1 = regex, $2 = message (ignores commented lines)
+            if grep -Ev '^\s*#' "$M" | grep -Eq "$1"; then echo "FAIL: $2 (unexpected /$1/ in $M)"; fail=1; fi
+          }
+
+          assert_present 'replicas:\s*3'                  "multi-replica HA must declare replicas: 3"
+          assert_present 'kind:\s*PodDisruptionBudget'    "must ship a PodDisruptionBudget"
+          assert_present 'maxUnavailable:\s*1'            "PDB must set maxUnavailable: 1 (AC-4)"
+          assert_present 'terminationGracePeriodSeconds:\s*[0-9]+' "must set terminationGracePeriodSeconds (> lease TTL, AC-4)"
+          assert_present 'MEFOR_CLUSTER_ENABLED'          "must enable [cluster] (HA leader election)"
+          assert_present 'MEFOR_STORE_BACKEND'            "must set a server-DB backend (SQLite is refused under [cluster])"
+
+          # AC-5 prohibitions: no HPA object, and no L7/HTTP Ingress for MLLP. An UNcommented occurrence fails.
+          assert_absent 'kind:\s*HorizontalPodAutoscaler' "no HPA for MLLP (active-passive; FIFO/single-writer) — AC-5"
+          assert_absent 'kind:\s*Ingress'                 "no L7/HTTP Ingress for the MLLP data plane — AC-5"
+
+          # terminationGracePeriodSeconds must exceed the default leader_lease_ttl (30s) — a numeric check.
+          grace=$(grep -Eo 'terminationGracePeriodSeconds:\s*[0-9]+' "$M" | grep -Eo '[0-9]+' | head -1)
+          if [ "${grace:-0}" -le 30 ]; then
+            echo "FAIL: terminationGracePeriodSeconds=$grace must be > leader_lease_ttl_seconds (30s default) — AC-4"
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::ADR-0047 HA policy lint failed — see FAIL lines above"
+            exit 1
+          fi
+          echo "ADR-0047 HA policy lint: OK"

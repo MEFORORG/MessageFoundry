@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Second distribution: the MessageFoundry TEST HARNESS, published alongside the engine in lockstep
+# (same version, same tag). The harness/ package lives at the REPO ROOT (so `python -m harness` and the
+# tests' `from harness...` imports keep working from a checkout); this build pulls it in via force-include
+# and reads the engine's __version__ so the two always ship matched. The ENGINE wheel does NOT contain
+# harness/ — that is the whole point of a separate distribution: a lean engine artifact for
+# servers/containers/adopters, with the test/load tooling as an opt-in install for test boxes.
+
+[tool.hatch.version]
+path = "../../messagefoundry/__init__.py"  # lockstep: single source of truth is the engine's __version__
+
+[project]
+name = "messagefoundry-harness"
+dynamic = ["version"]
+description = "Test harness for MessageFoundry — synthetic-only send/receive (MLLP), load, and failover tooling for the engine"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "MessageFoundry Organization and contributors" }]
+keywords = ["hl7", "healthcare", "integration", "load-testing", "failover", "mllp", "testing"]
+classifiers = [
+    "Development Status :: 4 - Beta",  # Early Access (lockstep with the engine)
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Benchmark",
+    "Topic :: Communications",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console",
+]
+dependencies = [
+    # The engine + its localhost API client (messagefoundry.console.client) + PySide6 (the harness GUI).
+    # Lockstep release: install messagefoundry-harness==X.Y.Z alongside messagefoundry==X.Y.Z.
+    "messagefoundry[console]",
+]
+
+[project.scripts]
+messagefoundry-harness = "harness.__main__:main"
+
+[project.urls]
+Homepage = "https://messagefoundry.org/"
+Source = "https://github.com/MEFORORG/MessageFoundry"
+Issues = "https://github.com/MEFORORG/MessageFoundry/issues"
+
+[tool.hatch.build.targets.wheel]
+# harness/ is two levels up (the repo root); pull the whole package tree into the wheel as `harness`.
+force-include = { "../../harness" = "harness" }

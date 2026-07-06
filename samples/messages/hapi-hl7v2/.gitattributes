@@ -1,0 +1,5 @@
+# HAPI HL7v2 fixtures are vendored byte-verbatim (see README "Provenance"); never
+# let EOL normalization touch them, or the stored bytes drift from upstream and the
+# MPL-2.0 "unmodified" basis no longer holds. -text = store/checkout exactly as-is.
+*.hl7 -text
+*.txt -text

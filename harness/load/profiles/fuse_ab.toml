@@ -1,0 +1,68 @@
+# Thread-hop-fusion A/B (ADR 0071 B5) — B0 (fusion OFF) vs B1 (fusion ON), swept at 256 / 512 / 1024
+# inbound MLLP connections against a real engine the harness OWNS per step. Fusion collapses each
+# pooled fused stage's off-loop CPU work + its SQL Server store handoff into ONE executor->loop
+# completion (the profiled per-completion async-marshaling wall, ADR 0071 §2), so the differentiator
+# is achieved intake throughput (the "ceiling"). The comparison report lays the two arms side by side
+# and emits the §6.4(b) GO / NO-GO / INCONCLUSIVE verdict per (claim_mode, count).
+#
+# TARGET RIG — the AWS SQL-Server bench box (per operator: the two-box engine + SQL Server 2022 rig),
+# NOT this or any local box, and NOT CI. Fusion only ACTIVATES on SQL Server + claim_mode=pooled +
+# the flag on; on Postgres (asyncpg loop-native) and SQLite (loop-affine handoff lock) it fails OPEN
+# to the async path by construction, so a fusion arm there is a provable no-op. Critically, **SQLite
+# is NOT a valid throughput proxy for this axis** — its write-lock regime is not the profiled
+# idle-store marshaling wall (the B5 micro-bench proved this: throughput sign flipped run-to-run while
+# the crossing arithmetic stayed byte-stable, ADR 0071 §8). Run it against SQL Server only:
+#
+#   MEFOR_STORE_BACKEND=sqlserver MEFOR_STORE_* ... \
+#     python -m harness --connscale fuse_ab \
+#       --report-json out/fuse_ab.json --report-compare out/fuse_ab.txt
+#
+# METHODOLOGY (ADR 0071 §6 harness requirements): a WARM hold (hold_seconds below, warmup discarded)
+# and >= 3 TRIALS per arm so the GO/NO-GO's "> 2sigma" spread guard has real trial-to-trial variance
+# to test against. ONE invocation now banks `trials` (= 3 below) trials PER ARM — the runner reruns
+# each (claim_mode, fuse, sweep_mode, count) cell `trials` times as distinct steps and the fusion
+# comparison aggregates the repeats by key — so a single
+#
+#   python -m harness --connscale fuse_ab --report-json out.json --report-compare out.txt
+#
+# yields the finished §6.4(b) GO / NO-GO / INCONCLUSIVE verdict directly (no concatenating the JSON
+# from multiple runs). C >= 256 per §6.4(b) (the marshaling wall is a concurrency phenomenon). All
+# values synthetic + generic. See docs/LOAD-TESTING.md.
+
+[connscale]
+name = "fuse_ab"
+description = "Fusion A/B (ADR 0071 B5): B0 vs B1 (pooled) at 256/512/1024 on SQL Server, fixed aggregate rate"
+# Fusion is pooled-only, so pin the single pooled claim mode and put the A/B on the fuse axis. The two
+# A/B axes are never both multi-arm in one profile (the comparison pairs one axis at a time).
+claim_modes = ["pooled"]
+# The A/B axis: run BOTH fusion arms (B0 off / B1 on) per (claim_mode, count) cell.
+fuse_modes = [false, true]
+# Bank >= 3 trials per arm in ONE invocation so the §6.4(b) ">2σ" spread guard is reachable directly
+# (each cell is rerun `trials` times as distinct steps; the fusion comparison aggregates them by key).
+trials = 3
+counts = [256, 512, 1024]
+# fixed_aggregate holds a constant aggregate across N (per-conn rate falls as N rises); a single sweep
+# mode keeps the A/B focused on the fusion contrast (not also the load+scale axis). Drive at/above the
+# B0 ceiling so the B1 arm's lifted ceiling is what the achieved-intake delta reads.
+sweep_mode = "fixed_aggregate"
+aggregate_rate = 400.0
+per_conn_rate = 0.35
+# A warm steady-state hold (discard warmup); long enough that the achieved-intake rate is stable.
+hold_seconds = 60.0
+connect_batch = 50
+connect_batch_pause_s = 0.05
+poll_interval_s = 1.0
+drain_timeout_s = 300.0
+base_port = 2600
+transform = "cheap"
+# The A/B is about steady-state fused-handoff throughput, not reload latency — leave wall #5 off.
+reload_probe = false
+store_backend = "sqlserver"
+corpus_count_per_trigger = 20
+
+[connscale.slo]
+# Correctness gate: no message loss at any N in either arm, and the backlog drains. The fusion GO/NO-GO
+# verdict (throughput lift >= 10% & > 2sigma, in_pipeline flat-or-lower, delivered/offered >= 0.98) is
+# computed by the comparison report on top of this. A NO-GO/INCONCLUSIVE throughput verdict is a valid
+# measurement (fusion banked nothing → ADR 0071 escalates to free-threading), NOT an SLO failure.
+zero_loss = true

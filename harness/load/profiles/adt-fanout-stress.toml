@@ -1,0 +1,116 @@
+# High-fan-out ADT stress — a PURE-ADT feed driven into the ADT hub at the worst-case fan-out the real
+# ADT hub produces (FANOUT ~= 20), so the matrix can measure the pure-ADT stress case in isolation
+# (not diluted by the results/orders mix the fanout-baseline / reference profiles carry). One inbound
+# ADT message fans out to ~20 outbound deliveries, so the engine's durable-write / delivery path sees
+# ~20x the per-message write amplification of a FANOUT=1 feed — this is the write-amplification ceiling
+# the ADT hub actually imposes. Serve harness/config/load with the high fan-out, then:
+#   MEFOR_LOAD_FANOUT=20 python -m harness --load adt-fanout-stress --engine URL --token T
+# (FANOUT is a SERVE-side graph knob — harness/config/load/_shape.py reads MEFOR_LOAD_FANOUT, default
+# 20 — not a profile field; this profile only shapes the OFFERED traffic. Keep the served FANOUT and
+# this profile paired so the run is the intended worst-case.)
+#
+# Like the reference profile this is an open-loop sustainable-RATE ladder: each step holds a fixed
+# offered rate so the report shows achieved vs offered + ACK/e2e latency at each rate; the ladder
+# climbs until a step shows achieved < offered (the knee), which at FANOUT=20 is reached at a far lower
+# INBOUND rate than the low-fan-out profiles (each inbound message is ~20 deliveries of work). A final
+# low cooldown drains the backlog so the zero_loss + drain conformance check stays honest.
+#
+# IMPORTANT: every number here is generic and synthetic — illustrative rate steps + a pure-ADT message
+# shape, loopback host, generic labels. No real partner, site code, IP, or volume appears in this
+# file. See docs/LOAD-TESTING.md.
+
+[load]
+name = "adt-fanout-stress"
+description = "Pure-ADT feed at worst-case fan-out (~20) — the ADT hub's write-amplification stress, drained"
+pool_size = 64
+corpus_count_per_trigger = 20
+poll_interval_s = 1.0
+drain_timeout_s = 180.0
+correlator_capacity = 4000000
+
+[[load.target]]
+name = "adt_hub"
+port = 2600
+types = ["ADT"]
+weight = 1.0
+
+# Pure ADT — this profile isolates the ADT hub's fan-out stress, so no results/orders types appear.
+[load.mix]
+ADT = 1.0
+
+# Conformance-tier invariants ONLY (hardware-independent). NO e2e/throughput floor here: the per-step
+# e2e is the SIGNAL used to read the knee (reported, not pass/failed), and throughput is measured "as
+# observed on this host", per the Q3 two-tier gate. zero_loss + drain still gate (the cooldown drains).
+[load.slo]
+max_error_rate = 0.001
+max_dead_letters = 0
+zero_loss = true
+
+[[load.phase]]
+name = "warmup"
+kind = "warmup"
+loop = "open"
+rate_start = 10.0
+duration_s = 15.0
+
+# Rate steps — each a MEASURED (sustained) phase, so the report shows achieved vs offered + ACK/e2e
+# latency at each offered INBOUND rate (every inbound message is ~20 outbound deliveries at FANOUT=20).
+# The sustainable ceiling is the highest step where achieved ≈ offered and e2e p99 stays bounded; the
+# ladder starts low and climbs well past it so the knee is actually located on enterprise hardware.
+[[load.phase]]
+name = "r10"
+kind = "sustained"
+loop = "open"
+rate_start = 10.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r25"
+kind = "sustained"
+loop = "open"
+rate_start = 25.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r50"
+kind = "sustained"
+loop = "open"
+rate_start = 50.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r80"
+kind = "sustained"
+loop = "open"
+rate_start = 80.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r120"
+kind = "sustained"
+loop = "open"
+rate_start = 120.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r175"
+kind = "sustained"
+loop = "open"
+rate_start = 175.0
+duration_s = 40.0
+
+[[load.phase]]
+name = "r250"
+kind = "sustained"
+loop = "open"
+rate_start = 250.0
+duration_s = 40.0
+
+# Cooldown well below the delivery ceiling, so whatever backlog the steps above built drains within the
+# run + the final drain — keeping the zero_loss + drain conformance check honest.
+[[load.phase]]
+name = "cooldown"
+kind = "sustained"
+loop = "open"
+rate_start = 8.0
+duration_s = 45.0

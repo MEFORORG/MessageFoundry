@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "kind": "multishard",
+  "store_backend": "sqlserver",
+  "cluster_enabled": false,
+  "result": "FAIL",
+  "exit_code": 1,
+  "records": [
+    {
+      "engines": 1,
+      "count_per_engine": 750,
+      "per_conn_rate": 0.17,
+      "offered_aggregate_rate": 127.5,
+      "cluster_enabled": false,
+      "window": {
+        "hold_start": "2026-07-04T02:01:52+00:00",
+        "drain_complete": "2026-07-04T02:09:54+00:00"
+      },
+      "throughput": {
+        "achieved_aggregate_rate": 127.48,
+        "delivered_aggregate_rate": 94.14,
+        "in_pipeline_peak": 2604,
+        "drain_seconds": null
+      },
+      "traffic": {
+        "sent": 40800,
+        "acked": 40777,
+        "nak": 0,
+        "deferred": 0,
+        "timeouts": 23
+      },
+      "no_loss": {
+        "ok": false,
+        "sent": 40800,
+        "engine_read": 40794,
+        "engine_written": 30125,
+        "sink_received": 38995,
+        "backlog": 4857,
+        "detail": "backlog 4857 not drained; 23 unconfirmed send(s) (no ACK before connection close) not observed at intake \u2014 not counted as loss"
+      },
+      "pool_wait": {
+        "p95_ms": 10000.0
+      },
+      "ack_ms": {
+        "p50": 5405.577,
+        "p95": 26775.426,
+        "p99": 44145.951
+      },
+      "per_engine": [
+        {
+          "node_id": "ms-e0",
+          "name_tag": "E0",
+          "inbound_rows": 0,
+          "foreign_rows": 0,
+          "reads": 0
+        }
+      ],
+      "cross_engine_steal": false
+    }
+  ],
+  "notes": []
+}

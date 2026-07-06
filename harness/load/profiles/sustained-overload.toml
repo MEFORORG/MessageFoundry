@@ -1,0 +1,51 @@
+# Sustained-overload / backpressure stress profile (W2025 test plan S4.7). Holds an offered rate well
+# ABOVE the delivery ceiling for minutes, then a long low-rate drain phase. Proves graceful backpressure:
+# backlog inflates under load but drains to zero after, with zero loss — and the report's
+# "harness-was-the-limit" flag must be FALSE (the deferred count proves the ENGINE, not the sender, set
+# the rate, so the S4.2 ceiling is real). Set the overload rate ~3-5x the S4.2 knee for this host.
+# Serve harness/config/load, then: python -m harness --load sustained-overload --engine URL --token T
+#
+# All values are generic and synthetic — no real partner, site code, host, IP, or volume appears here.
+
+[load]
+name = "sustained-overload"
+description = "hold offered rate above the delivery ceiling for minutes, then drain"
+pool_size = 160
+corpus_count_per_trigger = 20
+drain_timeout_s = 600.0
+correlator_capacity = 2000000
+
+[[load.target]]
+name = "adt_hub"
+port = 2600
+types = ["ADT"]
+
+[load.mix]
+"ADT^A01" = 70.0
+"ADT^A08" = 30.0
+
+[load.slo]
+zero_loss = true
+max_drain_seconds = 600.0
+
+[[load.phase]]
+name = "warmup"
+kind = "warmup"
+loop = "open"
+rate_start = 200.0
+duration_s = 15.0
+
+[[load.phase]]
+name = "overload"        # MEASURED overload: held above ceiling for 5 min
+kind = "sustained"
+loop = "open"
+rate_start = 4000.0      # >> the S4.2 closed-loop knee; backlog SHOULD grow
+duration_s = 300.0
+# no min_sustained_msg_s floor — backlog growth + ACK/E2E divergence is the signal
+
+[[load.phase]]
+name = "drain"           # long low-rate DRAIN phase
+kind = "sustained"
+loop = "open"
+rate_start = 50.0
+duration_s = 180.0

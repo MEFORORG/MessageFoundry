@@ -1,0 +1,95 @@
+name: Dependabot lock resync
+
+# Re-exports the hash-pinned lock files (requirements.lock + docker/locks/requirements-core.lock +
+# docker/locks/requirements-sqlserver.lock) on a Dependabot PR that touched uv.lock / pyproject.toml,
+# and commits them back to the PR branch so the DEP-1 drift gate (security.yml -> pip-audit job,
+# step "Check the lockfile is in sync with pyproject (DEP-1)") goes green WITHOUT a human re-export.
+#
+# WHY: the native "uv" Dependabot ecosystem regenerates uv.lock + pyproject.toml in its PR, but NOT
+# the exported requirements*.lock files (those are "uv export" artifacts). The DEP-1 gate re-runs
+# "uv lock --check" + the three "uv export"s and "git diff --exit-code"s the result, so a Dependabot
+# uv PR would otherwise leave the exports stale and red the gate. This workflow runs the IDENTICAL
+# commands and pushes the refreshed exports onto the Dependabot branch.
+#
+# SECURITY MODEL (read before editing):
+#  - Trigger is "pull_request" (NOT pull_request_target). A Dependabot-triggered "pull_request" run is
+#    sandboxed like a fork PR: GITHUB_TOKEN is READ-ONLY (the permissions block cannot elevate it) and
+#    ONLY Dependabot secrets are readable — never the full Actions secret store. The writable
+#    capability is a self-minted, narrowly-scoped (contents:write), ~1h GitHub App token.
+#  - Author gate is the IMMUTABLE github.event.pull_request.user.login == 'dependabot[bot]', not the
+#    spoofable github.actor — a third party injecting commits into a Dependabot PR cannot make it run.
+#  - NO project install/tests/build runs here, and "uv lock --check" (validate-only, never builds an
+#    sdist) + "uv export" (serializes the existing lock) execute NO package code — so no
+#    attacker-controlled build backend ever runs while the token is on the runner.
+
+on:
+  pull_request:
+    paths:
+      - "uv.lock"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependabot-lock-resync-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  resync:
+    name: Re-export lock files and push to the PR branch
+    runs-on: ubuntu-latest
+    if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
+    timeout-minutes: 10
+    steps:
+      - name: Mint a scoped GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.LOCK_RESYNC_APP_ID }}
+          private-key: ${{ secrets.LOCK_RESYNC_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Check out the PR head
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          # The App token is persisted as the git credential so the push below uses it WITHOUT the
+          # token ever appearing in a command line / process table. Safe because no untrusted package
+          # code runs in this job (uv lock --check + uv export only).
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Re-export the lock files (DEP-1 — byte-for-byte identical flags/paths)
+        run: |
+          set -euo pipefail
+          # Mirror the DEP-1 gate (security.yml, pip-audit job) EXACTLY. "--check" validates the
+          # Dependabot-produced uv.lock WITHOUT building any sdist (no arbitrary build-backend code);
+          # a genuinely-stale lock fails here loudly (the same red the gate would raise), rather than
+          # silently re-locking. "uv export" then serializes the validated lock (runs no package code).
+          uv lock --check
+          uv export --all-extras --no-emit-project --format requirements.txt -o requirements.lock
+          uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
+          uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
+
+      - name: Commit and push the resynced locks
+        env:
+          # Pass the PR head ref through the environment, NOT inline ${{ }} in the run block, so a branch
+          # name containing shell metacharacters can never be evaluated as code (template injection).
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          git config user.name 'dependabot[bot]'
+          git config user.email '49699333+dependabot[bot]@users.noreply.github.com'
+          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock; then
+            echo 'Exported lock files already in sync; nothing to push.'
+            exit 0
+          fi
+          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock
+          git commit -m 'chore(deps): resync exported lock files (DEP-1)'
+          # Push with the persisted App-token credential (NOT GITHUB_TOKEN). An App-token push emits a
+          # synchronize event so the required checks (DEP-1, ci.yml) re-run on the new commit; a
+          # GITHUB_TOKEN push would leave them pending and the PR unmergeable.
+          git push origin "HEAD:${HEAD_REF}"

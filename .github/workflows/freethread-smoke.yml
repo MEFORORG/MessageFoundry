@@ -1,0 +1,95 @@
+# Free-threaded (no-GIL / PEP 703, cp314t) engine canary — INFORMATIONAL, NEVER BLOCKING.
+#
+# This is an EXPLORATORY signal (see docs/design/freethread.md), not a supported config. The engine
+# ships on the GIL build; this leg only tells us, on a weekly schedule, whether the engine still
+# installs + imports + smoke-tests under the free-threaded 3.14t interpreter, so a regression in a
+# dependency's cp314t wheel surfaces early. It is an early-warning tripwire, not a per-PR gate —
+# hence weekly (+ manual dispatch), not on every push/PR.
+#
+# IT MUST NEVER BLOCK A MERGE:
+#   * It is a SEPARATE workflow, deliberately not part of ci.yml's `ci-gate` (the required "CI gate"
+#     context). It is not in any `needs:` list a PR waits on.
+#   * The job AND its fragile steps are `continue-on-error: true`, so a red canary is an informational
+#     red check, never a failed required one.
+#   * DO NOT add the "freethread smoke (3.14t)" context to branch-protection required checks. The
+#     required set is the `test` matrix + bandit + pip-audit + cla — keep it that way.
+#
+# If actions/setup-python ever cannot provision 3.14t on the runner, the continue-on-error job simply
+# goes red as information; nothing downstream is gated on it.
+
+name: freethread smoke
+
+on:
+  # Weekly early-warning tripwire (Mondays 06:00 UTC) + manual dispatch. NOT per-PR/per-push: this is
+  # an informational cp314t-readiness signal, not a gate, so it doesn't need to run on every change.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: freethread-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only: install deps + run a pure test subset. No gh writes, no secrets.
+permissions:
+  contents: read
+
+jobs:
+  freethread:
+    name: freethread smoke (3.14t)
+    # The whole job is non-blocking: a failure here is reported but never fails the workflow's
+    # required-context resolution, so it cannot block a PR even if it is ever (mis)added to protection.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false # read-only smoke job; don't persist the token (zizmor: artipacked)
+
+      # Provision the FREE-THREADED 3.14 interpreter (distinct cp314t ABI). `freethreaded: true` +
+      # the `t` suffix both select it; allow-prereleases covers the 3.14 line. This step is allowed to
+      # fail (continue-on-error) so a runner that cannot yet provide 3.14t never reds a blocking check.
+      - name: Set up free-threaded Python 3.14t
+        id: setup
+        continue-on-error: true
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14t"
+          freethreaded: true
+          allow-prereleases: true
+
+      # Install the CORE engine only (no Qt/SQL/DICOM/SFTP extras), so the smoke exercises the minimal
+      # free-threaded-relevant compiled surface: pydantic-core, cryptography, and the argon2-cffi + cffi
+      # chain. --prerelease handling: pip resolves the cp314t wheels; the cffi 2.0 chain may need a
+      # prerelease allowance depending on the index state at run time.
+      - name: Install the core engine (dev extra; no compiled-heavy extras)
+        if: steps.setup.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # Prove we are actually on the no-GIL interpreter — an incompatible C extension importing can make
+      # CPython silently RE-ENABLE the GIL, which would make a "green" canary meaningless. Fail (softly)
+      # if the GIL is back on.
+      - name: Assert the GIL is actually disabled
+        if: steps.setup.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import sys
+          gil_on = sys._is_gil_enabled()
+          print(f"sys._is_gil_enabled() = {gil_on}")
+          print(f"sys.version = {sys.version}")
+          if gil_on:
+              raise SystemExit("GIL is ENABLED on the 3.14t build — an extension likely forced it back on")
+          PY
+
+      # Run a PURE, fast subset under 3.14t: parsing (pure HL7 library) + config wiring. This is the
+      # cheap install-and-import + smoke signal, NOT the perf experiment (that lives in the load harness,
+      # run manually — see docs/LOAD-TESTING.md / docs/design/freethread.md §4).
+      - name: Smoke a pure test subset under 3.14t
+        if: steps.setup.outcome == 'success'
+        continue-on-error: true
+        run: pytest -q tests/test_parsing.py tests/test_wiring.py

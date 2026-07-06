@@ -1,0 +1,7 @@
+node_modules/
+dist/
+out/
+.vscode-test/
+*.vsix
+# generated from ../LICENSE by vscode:prepublish for VSIX bundling
+LICENSE

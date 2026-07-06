@@ -1,0 +1,133 @@
+// "Home" — a webview view at the top of the MessageFoundry sidebar: grouped action cards that run
+// extension commands. Every action is live; the `soon` flag renders a "soon" badge for any action
+// still queued in the backlog. Monitoring + engine run/stop deliberately live in the Console, not here.
+import * as vscode from "vscode";
+
+interface Action {
+  id: string; // command id
+  label: string;
+  soon?: boolean;
+}
+
+const GROUPS: { title: string; actions: Action[] }[] = [
+  {
+    title: "Wizards",
+    actions: [
+      { id: "messagefoundry.newRoute", label: "Route Wizard" },
+      { id: "messagefoundry.newConnection", label: "Connection Wizard" },
+      { id: "messagefoundry.newRouter", label: "Router Wizard" },
+      { id: "messagefoundry.newHandler", label: "Handler Wizard" },
+      { id: "messagefoundry.newAlert", label: "Alert Wizard" },
+    ],
+  },
+  {
+    title: "Test & data",
+    actions: [
+      { id: "messagefoundry.openTestBench", label: "Open Test Bench" },
+      { id: "messagefoundry.validate", label: "Validate Config" },
+      { id: "messagefoundry.generateSamples", label: "Generate Samples" },
+    ],
+  },
+  {
+    title: "Operate",
+    actions: [
+      { id: "messagefoundry.setupSourceControl", label: "Set Up Version Control & Checks" },
+      { id: "messagefoundry.setRepoStorage", label: "Config Repo Storage Location" },
+      { id: "messagefoundry.promote", label: "Stage → Promote" },
+    ],
+  },
+];
+
+function nonce(): string {
+  let s = "";
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  for (let i = 0; i < 24; i++) {
+    s += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return s;
+}
+
+function esc(s: string): string {
+  // Escape quotes too, not just &<>: these values land inside double-quoted HTML attributes
+  // (e.g. data-cmd="${esc(...)}"), so an unescaped " would break out of the attribute.
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+export class HomeView implements vscode.WebviewViewProvider {
+  resolveWebviewView(view: vscode.WebviewView): void {
+    view.webview.options = { enableScripts: true };
+    view.webview.onDidReceiveMessage((m: { command?: string; id?: string }) => {
+      if (m?.command === "run" && typeof m.id === "string") {
+        void vscode.commands.executeCommand(m.id);
+      }
+    });
+    view.webview.html = this.html(view.webview);
+  }
+
+  private html(webview: vscode.Webview): string {
+    const n = nonce();
+    const groups = GROUPS.map(
+      (g) =>
+        `<details class="group" data-key="${esc(g.title)}" open><summary class="title">${esc(
+          g.title,
+        )}</summary><div class="body">${g.actions
+          .map(
+            (a) =>
+              `<button class="action" data-cmd="${esc(a.id)}">${esc(a.label)}${
+                a.soon ? '<span class="soon">soon</span>' : ""
+              }</button>`,
+          )
+          .join("")}</div></details>`,
+    ).join("");
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${n}';" />
+  <style>
+    body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 6px 8px; }
+    .group { margin-bottom: 12px; }
+    summary.title { display: flex; align-items: center; gap: 4px; font-size: 11px; text-transform: uppercase;
+      letter-spacing: .04em; color: var(--vscode-descriptionForeground); margin: 6px 2px; cursor: pointer;
+      user-select: none; list-style: none; }
+    summary.title::-webkit-details-marker { display: none; }
+    summary.title::before { content: "▸"; font-size: 14px; transition: transform .12s ease; }
+    details[open] > summary.title::before { transform: rotate(90deg); }
+    details:not([open]) > .body { display: none; }
+    button.action { display: flex; align-items: center; justify-content: space-between; width: 100%;
+      text-align: left; font-family: inherit; font-size: 13px; margin: 3px 0; padding: 6px 10px; cursor: pointer;
+      color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground);
+      border: none; border-radius: 3px; }
+    button.action:hover { background: var(--vscode-button-hoverBackground); }
+    .soon { font-size: 10px; text-transform: uppercase; opacity: .7;
+      border: 1px solid currentColor; border-radius: 8px; padding: 0 6px; margin-left: 8px; }
+  </style>
+</head>
+<body>
+  ${groups}
+  <script nonce="${n}">
+    const vscode = acquireVsCodeApi();
+    const state = vscode.getState() || { collapsed: {} };
+    for (const d of document.querySelectorAll('details.group')) {
+      const key = d.dataset.key;
+      if (state.collapsed[key]) { d.open = false; }
+      d.addEventListener('toggle', () => {
+        state.collapsed[key] = !d.open;
+        vscode.setState(state);
+      });
+    }
+    for (const b of document.querySelectorAll('button.action')) {
+      b.addEventListener('click', () => vscode.postMessage({ command: 'run', id: b.dataset.cmd }));
+    }
+  </script>
+</body>
+</html>`;
+  }
+}

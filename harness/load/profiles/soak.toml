@@ -1,0 +1,45 @@
+# Soak profile — a long steady-state run that watches DB/WAL growth and dead-letter accumulation
+# over time. On-demand / nightly only (not a PR gate). Serve harness/config/load, then:
+#   python -m harness --load soak --engine URL --token T
+#
+# All values are generic and synthetic; this profile names no real partner, site, host, or volume.
+
+[load]
+name = "soak"
+description = "long steady-state run to watch DB growth and dead-letter accumulation (on-demand)"
+pool_size = 32
+corpus_count_per_trigger = 20
+poll_interval_s = 5.0
+drain_timeout_s = 300.0
+correlator_capacity = 2000000
+
+[[load.target]]
+name = "adt_hub"
+port = 2600
+types = ["ADT"]
+weight = 3.0
+
+[[load.target]]
+name = "results_hub"
+port = 2601
+types = ["ORU", "ORM"]
+weight = 1.0
+
+[load.mix]
+ADT = 70.0
+ORU = 20.0
+ORM = 10.0
+
+[load.slo]
+min_sustained_msg_s = 100.0
+max_e2e_p99_ms = 10000.0
+max_error_rate = 0.001
+max_drain_seconds = 120.0
+zero_loss = true
+
+[[load.phase]]
+name = "soak"
+kind = "soak"
+loop = "open"
+rate_start = 300.0
+duration_s = 3600.0

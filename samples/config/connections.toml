@@ -1,0 +1,28 @@
+# Connections authored as DATA (ADR 0007) — an alternative to declaring inbound()/outbound() in a
+# .py module. The loader merges these into the SAME registry as the code-first connections, so they
+# coexist freely. Routing/transform LOGIC stays code-first: this inbound binds the `acme_adt_router`
+# declared in IB_ACME_ADT.py and reuses its `acme_adt_handler` → `OB_ACME_ADT` chain.
+#
+# Edit this file by hand OR from the VS Code connection editor — both write the same TOML.
+# Secrets/peers are never inline: use { env = "key" }, resolved from environments/<env>.toml or
+# MEFOR_VALUE_<KEY> at connector-build time.
+
+[[inbound]]
+name      = "IB_ACME_ADT_TCP"          # a second ACME intake, authored as data
+transport = "mllp"
+router    = "acme_adt_router"          # picked from the routers registered in the .py modules
+  [inbound.settings]
+  port = 2700                          # inbound MLLP takes only a port (bind host is a service setting)
+
+# Example of a data-authored OUTBOUND with an env() reference (commented — OB_ACME_ADT already exists
+# in IB_ACME_ADT.py, and a name declared in both surfaces is a hard duplicate error):
+#
+# [[outbound]]
+# name      = "OB_ACME_ADT_BACKUP"
+# transport = "mllp"
+# ordering  = "fifo"
+#   [outbound.settings]
+#   host = { env = "acme_adt_host" }
+#   port = { env = "acme_adt_port", cast = "int" }
+#   [outbound.retry]
+#   max_attempts = 5

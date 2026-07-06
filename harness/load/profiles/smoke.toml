@@ -1,0 +1,36 @@
+# Smoke load profile — the CI gate. Tiny, fast, deterministic: proves the whole pipeline wires up
+# and loses no messages, NOT a performance measurement. Serve harness/config/load (FANOUT small) on
+# SQLite, then: python -m harness --load smoke --engine URL --token T
+#
+# All values are generic and synthetic. This profile names no real partner, site, host, or volume.
+
+[load]
+name = "smoke"
+description = "tiny zero-loss wiring check for CI (not a perf measurement)"
+pool_size = 4
+corpus_count_per_trigger = 5
+poll_interval_s = 0.5
+drain_timeout_s = 30.0
+correlator_capacity = 50000
+
+[[load.target]]
+name = "adt_hub"
+host = "127.0.0.1"
+port = 2600
+types = ["ADT"]
+
+# A single clean trigger keeps corpus generation (hl7apy-validated) fast for CI.
+[load.mix]
+"ADT^A05" = 1.0
+
+[load.slo]
+zero_loss = true
+max_error_rate = 0.01
+max_drain_seconds = 20.0
+
+[[load.phase]]
+name = "steady"
+kind = "sustained"
+loop = "open"
+rate_start = 20.0
+duration_s = 5.0

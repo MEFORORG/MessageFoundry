@@ -1,0 +1,85 @@
+# Real-hardware CI leg (BACKLOG #40, PLAN-6 lane L3): the SQL Server store / coordinator / failover /
+# DATABASE-connector suites against a REAL local SQL Server 2025 on REAL Windows Server 2025, via a
+# self-hosted runner. This is the one production-shaped combination GitHub's hosted runners cannot reach
+# (they exercise SQL Server only on a Linux service container). It is the companion to ci.yml's
+# `sql server (store + connector)` legs — the SAME suites, run on the real OS + driver stack.
+#
+# SECURITY (a self-hosted runner executes repository code):
+#   * Gated to `workflow_dispatch` ONLY — never `pull_request`, never a fork, no schedule. The repo is
+#     private, so untrusted fork code never reaches this runner. Run it ON DEMAND when the VM is up.
+#   * NOT a required check, and there is NO scheduled trigger — so the VM never has to be on. Nothing
+#     queues or fails while it is off; a manual run just waits for the runner (and expires after ~24h if
+#     the VM never comes up). It never blocks a PR or a merge.
+#   * The runner (label `mefor-win2025-sql`) lives in a dedicated, isolated Windows Server 2025 VM.
+#
+# CREDENTIALS: the SQL connection comes from the RUNNER's machine environment (set on the box, never in
+# this repo). This workflow sets only the NON-SECRET posture + the agreed instance values; the password
+# (`MEFOR_STORE_PASSWORD`) is inherited from the runner's machine env and never appears here.
+
+name: self-hosted win2025 + sql server 2025
+
+on:
+  workflow_dispatch: # on-demand only — run it when the VM runner is up; no schedule, so the VM is never required to be on
+
+concurrency:
+  # ONE shared local DB on the runner — never run two of these at once. Queue, don't cancel.
+  group: selfhosted-win2025-sql
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sqlserver-real:
+    name: SQL Server 2025 suites (real hardware)
+    runs-on: [self-hosted, windows, mefor-win2025-sql]
+    timeout-minutes: 30
+    env:
+      # The exact contract the suites read (load_settings(environ=os.environ).store). Non-secret values +
+      # the agreed instance; MEFOR_STORE_PASSWORD is inherited from the runner's machine env.
+      MEFOR_TEST_SQLSERVER: "1"
+      MEFOR_STORE_BACKEND: sqlserver
+      MEFOR_STORE_SERVER: localhost
+      MEFOR_STORE_PORT: "1433"
+      MEFOR_STORE_DATABASE: mefor_ci
+      MEFOR_STORE_USERNAME: mefor_ci
+      MEFOR_STORE_AUTH: sql
+      MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true" # local SQL self-signed cert
+      MEFOR_ALLOW_INSECURE_TLS: "1" # trusted-network test box only (mirrors the hosted sqlserver leg)
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false # read-only test job; don't persist the token
+
+      - name: Toolchain (runner-provided Python 3.14 + ODBC Driver 18)
+        shell: powershell
+        run: |
+          python --version
+          python -m pip --version
+          $drv = Get-OdbcDriver -Name "ODBC Driver 18 for SQL Server" -ErrorAction SilentlyContinue
+          if (-not $drv) { throw "ODBC Driver 18 for SQL Server is not installed on the runner" }
+          if (-not $env:MEFOR_STORE_PASSWORD) { throw "MEFOR_STORE_PASSWORD must be set in the runner's machine environment (it is never committed)" }
+
+      - name: Install the project (dev + sqlserver extras)
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,sqlserver]"
+
+      - name: SQL Server store / coordinator / connector suites (against the real DB)
+        shell: powershell
+        run: |
+          # `python -m pytest`, not bare `pytest` — the console-script isn't reliably on PATH in the
+          # runner's PowerShell, but the module always is via the same Python we installed into.
+          #
+          # tests/test_cluster_failover_sqlserver.py is intentionally NOT run on this self-hosted leg.
+          # Its 2-coordinator lease/takeover *lifecycle* is timing-sensitive and hangs on this VM (slower
+          # I/O than the hosted Linux SQL service leg, where it already runs and passes). The goal of this
+          # leg is real-Windows-hardware coverage of the store, the coordinator lease primitives, and the
+          # production DB connector; whole-lifecycle failover stays covered by the hosted
+          # `sql server (store + connector)` leg. Follow-up: give that suite a longer timeout / diagnose
+          # the VM hang, then add it back here.
+          python -m pytest -v `
+            tests/test_sqlserver_store.py `
+            tests/test_sqlserver_coordinator.py `
+            tests/test_database_connector_integration.py

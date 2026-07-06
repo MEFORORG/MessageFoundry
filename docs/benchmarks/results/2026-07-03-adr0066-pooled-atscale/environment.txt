@@ -1,0 +1,42 @@
+ADR 0066 pooled-claimer at-scale campaign — run environment & provenance
+========================================================================
+Date:     2026-07-03
+Issue:    #744 (default claim_mode flip)  ·  ADR 0066 (pooled per-stage claimers)
+Code:     branch feat/adr0066-pr5-bench @ 85c7415 (bundles the PR4 pooled wiring + the PR5 harness)
+Harness:  python -m harness --connscale <profile> --report-json <f> [--report-compare <f>]
+Payload:  synthetic HL7 v2 (harness-generated). No PHI. Numbers/metadata only.
+
+Topology — two boxes in one AWS VPC/subnet; the engine->DB path is on the local network
+(production-representative; no load was generated over the internet). The harness spawns the
+MessageFoundry engine subprocess(es) on the engine box and points them at the store box.
+  engine box:  Windows, Python 3.14.6, ODBC Driver 18 (EC2 instance type not separately recorded).
+  store box:   AWS i4i.2xlarge; SQL Server 2022, single unified store, RCSI ON (verified; no ALTER
+               needed). Data + log BOTH on D: = ephemeral local instance-store Nitro NVMe (sub-ms
+               log writes; no EBS in the data path); OS on a default gp3 volume.
+
+  *** CORRECTION (post-commit-storm): the ~97-107 msg/s ceiling is NOT the store's durable-write
+  capacity. A driver-free commit-storm on this store box (commit_storm.txt) measured its raw ceiling
+  at ~27,000 commits/s with sub-ms log and ~19:1 group-commit -- ~36x headroom over the pipeline's
+  ~750 commits/s. The bound is the engine-side claim-path FEED, not the store (see ADR 0069). The
+  storage is the fastest tier (local Nitro NVMe) but EPHEMERAL, so the number is also best-case and
+  not production-durable. ***
+
+Run matrix (all single-engine unless noted):
+  Run 1  pooled_ab         per_lane + pooled  N=500/1000/1500  offered 400/s fixed      pool=40   -- the #744 A/B decision
+  Run 2  pooled_push       pooled             N=1500           offered 80/100/120/160   pool=40   -- pooled ceiling @ default pool
+  Run 3  pooled_pool128    pooled             N=1500           offered 150/250/350/500  pool=128  -- does a bigger pool lift the ceiling?
+  Run 4  per_lane_pool128  per_lane           N=1500           offered 400/800          pool=128  -- does a bigger pool rescue per_lane?
+
+Artifacts in this directory:
+  pooled_ab_atscale.json / .txt              Run 1 (A/B + comparison object)
+  push_r{80,100,120,160}.json                Run 2 (pool=40 ceiling walk)
+  pooled_pool128_r{150,250,350,500}.json     Run 3 (pool=128 ceiling walk)
+  perlane_pool128_r{400,800}.json            Run 4 (per_lane rescue attempt)
+  walk_console_{pool40,pool128,perlane128}.txt   console tables for the rate-walks
+  commit_storm.txt                           driver-free store commit ceiling (~27k commits/s) -- the decisive measurement
+
+READING CAVEAT (important): at/near overload the engine /stats poller zeros the achieved-rate
+aggregate. For a FAILING arm, trust the independent sink counter + the no_loss/traffic blocks in
+the JSON, NOT achieved.read_per_s (which reads 0.0 there). The comparison object's automated
+"throughput_non_regression" can therefore read a vacuous PASS against a zeroed baseline — the
+per-arm no_loss table is the authority. (Harness follow-up: make compare.py loss-aware.)

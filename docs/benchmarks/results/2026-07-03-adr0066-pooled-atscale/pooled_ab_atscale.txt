@@ -1,0 +1,36 @@
+Claim-mode A/B (ADR 0066) -- baseline 'per_lane' vs candidate 'pooled'
+guards: throughput non-regression (pooled >= per_lane * 0.90) | idle-poll collapse (pooled <= per_lane * 0.50 where per_lane > 5.0/s)
+overall: PASS  (throughput_non_regression=True, worst_collapse=INCONCLUSIVE, missing_arms=0)
+
+[fixed_aggregate] N=500
+  achieved_read/s        per_lane=    72.66  pooled=   111.76     +53.8%  throughput: OK
+  idle_poll/s            per_lane=   269.58  pooled=     2.63     -99.0%  collapse: PASS
+  wake_fanout/s          per_lane=   155.24  pooled=    37.33
+  ack_p99_ms             per_lane= 22364.58  pooled= 10670.19
+  pool_wait_p99_ms       per_lane= 10000.00  pooled= 10000.00
+  cpu_seconds_total      per_lane=      n/a  pooled=    75.55
+  cpu_util_cores_mean    per_lane=      n/a  pooled=     2.00
+  fd_count_peak          per_lane=     2333  pooled=     2339
+  working_set_bytes      per_lane=166850560  pooled=166752256
+
+[fixed_aggregate] N=1000
+  achieved_read/s        per_lane=     0.00  pooled=   109.31        n/a  throughput: OK
+  idle_poll/s            per_lane=     0.00  pooled=    10.79        n/a  collapse: INCONCLUSIVE
+  wake_fanout/s          per_lane=     0.00  pooled=    46.72
+  ack_p99_ms             per_lane= 25216.10  pooled= 12273.70
+  pool_wait_p99_ms       per_lane= 10000.00  pooled= 10000.00
+  cpu_seconds_total      per_lane=      n/a  pooled=    71.59
+  cpu_util_cores_mean    per_lane=      n/a  pooled=     2.00
+  fd_count_peak          per_lane=      n/a  pooled=     3835
+  working_set_bytes      per_lane=      n/a  pooled=221483008
+
+[fixed_aggregate] N=1500
+  achieved_read/s        per_lane=     0.00  pooled=   106.49        n/a  throughput: OK
+  idle_poll/s            per_lane=     0.00  pooled=    13.22        n/a  collapse: INCONCLUSIVE
+  wake_fanout/s          per_lane=     0.00  pooled=    61.26
+  ack_p99_ms             per_lane= 25725.51  pooled= 13032.69
+  pool_wait_p99_ms       per_lane= 10000.00  pooled= 10000.00
+  cpu_seconds_total      per_lane=      n/a  pooled=    14.25
+  cpu_util_cores_mean    per_lane=      n/a  pooled=     2.04
+  fd_count_peak          per_lane=      n/a  pooled=     5335
+  working_set_bytes      per_lane=      n/a  pooled=261820416

@@ -1,0 +1,242 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+#
+# Multi-replica ACTIVE-PASSIVE HA reference (ADR 0047) — Postgres-backed, replicas: 3.
+# A COPYABLE example of the shipped, code-complete active-passive HA (docs/CLUSTERING.md) packaged for
+# Kubernetes. It is a SIBLING of the single-node k8s/statefulset.yaml (which stays the SQLite, replicas:1
+# baseline) — use THIS one only for multi-node HA against a managed/external Postgres. Read
+# docs/CLOUD-DEPLOYMENT.md (the Postgres-led cloud guide) and docs/CLOUD-PHI-HIPAA.md before running it.
+#
+# Why this is a Deployment, not a StatefulSet, and why there is NO PVC here:
+#   The engine's durability lives in the EXTERNAL Postgres store (the staged queue + leader lease are in
+#   the shared DB), so the pods are STATELESS — no per-pod PVC, no stable per-pod identity needed. A
+#   ReadWriteOnce SQLite PVC would PHYSICALLY pin the workload to one writer (one node can mount RWO), so
+#   it is the wrong shape for >1 replica. The [cluster] validator (config/settings.py) ENFORCES this: it
+#   refuses to start unless [store].backend ∈ {postgres, sqlserver} and [store].pool_size >= 2 — a SQLite
+#   HA manifest cannot silently degrade to a single writer (ADR 0047 AC-2).
+#
+# Active-PASSIVE, never active-active: all 3 replicas run the SAME config dir (ADR 0017 byte-identical),
+# but the engine GRAPH SUPERVISOR (pipeline/engine.py _start_graph / _reconcile_graph /
+# _graph_supervisor_loop) starts the RegistryRunner — listeners AND workers — ONLY on the replica that
+# holds the leader lease. The other two are WARM STANDBYS that bind NOTHING (a LISTEN source ignores the
+# per-source leader_gate, but the supervisor never starts its runner on a standby — pipeline/cluster.py:
+# "only the leader binds them"). Exactly one writer at a time; no second concurrent writer (#396).
+#
+# CONFIG IS BAKED INTO THE IMAGE (same rule as statefulset.yaml): the engine (uid 10001) refuses a config
+# dir owned by another uid, so a ConfigMap/projected mount (root-owned) is rejected. Build an adopter
+# image and set image: below to it:
+#     FROM messagefoundry:<version>
+#     COPY --chown=10001:10001 config /config
+# The same baked image deploys to all 3 replicas (ADR 0017 same-commit-everywhere).
+---
+# Headless governing Service — stable in-cluster DNS for the API control/read plane (up on EVERY node).
+apiVersion: v1
+kind: Service
+metadata:
+  name: mefor-engine-ha
+spec:
+  clusterIP: None
+  selector:
+    app: mefor-engine-ha
+  ports:
+    - { name: api, port: 8443, targetPort: 8443 }
+---
+# Client-facing MLLP data-plane Service.
+#
+# IMPORTANT — as shipped (type: ClusterIP) this in-cluster Service is NON-FUNCTIONAL for MLLP and must NOT
+# be wired to a client expecting it to follow the leader. A plain ClusterIP Service load-balances across ALL
+# Ready endpoints (all 3 pods — standbys are intentionally Ready, with no readinessProbe), but only the
+# LEADER actually has the MLLP port OPEN; the 2 standbys' listener is unbound, so ~2/3 of connections hit a
+# CLOSED port (connection refused) and there is nothing here that steers traffic to the leader. There is no
+# way to make a bare ClusterIP follow failover.
+#
+# The ONLY working path is to front this with an operator-built L4 load balancer (NLB) whose health check
+# passes ONLY on the primary — one NLB listener per MLLP port, TCP-connect health check to that port (the
+# standby's port is CLOSED, so the check fails there and the VIP lands on the primary automatically — zero
+# engine VIP code). This Service object is kept as the NLB's backing endpoint/selector (and so the example
+# applies on any cluster); switch `type` to LoadBalancer with the annotations below for a real deployment.
+# See docs/CLOUD-DEPLOYMENT.md "MLLP load balancing". Do NOT put MLLP behind an L7/HTTP ingress, and do NOT
+# use an HPA (below).
+apiVersion: v1
+kind: Service
+metadata:
+  name: mefor-engine-ha-mllp
+  annotations:
+    # AWS example — an L4 Network Load Balancer (NOT an ALB/L7). Uncomment + adapt for your cloud.
+    # service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    # service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+    # service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"          # never internet-facing for MLLP
+    # # Health check = TCP-connect to the MLLP port; PASSES ONLY ON THE PRIMARY (standby port is closed).
+    # service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: "TCP"
+    # service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "2575"
+    # # Interval MUST exceed the engine graph-reconcile interval (~1s) so the VIP does not flap during a
+    # # leadership transition's brief start/stop window. 10s is comfortably above it.
+    # service.beta.kubernetes.io/aws-load-balancer-healthcheck-interval: "10"
+    # # Drain in-flight MLLP frames before deregistering a failing-over target.
+    # service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: "deregistration_delay.timeout_seconds=60"
+  labels:
+    app: mefor-engine-ha
+spec:
+  # type: LoadBalancer  # with the L4/NLB annotations above; ClusterIP shown so the example applies anywhere
+  type: ClusterIP
+  selector:
+    app: mefor-engine-ha
+  ports:
+    - { name: mllp, port: 2575, targetPort: 2575 }
+---
+# PodDisruptionBudget — a VOLUNTARY disruption (node drain, rollout) may take AT MOST ONE replica down at
+# a time, so the cluster never drops below 2 live nodes (one leader + one warm standby able to take over).
+# This is ADR 0047 AC-4: a drain evicts one pod, it releases its leader lease within the grace period
+# (below), a standby is promoted, THEN the next pod may go — failover stays continuous.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mefor-engine-ha
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: mefor-engine-ha
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mefor-engine-ha
+spec:
+  replicas: 3                       # active-passive: 1 leader + 2 warm standbys (NEVER scale via an HPA — see below)
+  selector:
+    matchLabels:
+      app: mefor-engine-ha
+  strategy:
+    # Rolling restarts replace pods one at a time; combined with the PDB above, never below 2 live nodes.
+    # SAFE ONLY for changes that do NOT alter the baked config/graph (e.g. a base-image security bump that
+    # keeps /config byte-identical). It is safe against split-brain regardless — the single-leader lease +
+    # fence token prevent a second concurrent writer — but a rolling replace runs a MIXED-version window
+    # (old leader + new standbys, or vice-versa) which is exactly the DIVERGENT-GRAPH window CLUSTERING.md
+    # §"Operational assumptions" item 3 says to avoid. For a CONFIG/GRAPH change (a new config-baked image),
+    # do a COORDINATED restart instead — e.g. scale the Deployment to 0 then back to 3, or otherwise avoid a
+    # mixed-version leader window — so no two nodes run divergent graphs. `kubectl rollout restart` is ALSO
+    # rolling and is NOT a substitute. See docs/CLOUD-DEPLOYMENT.md §4 and docs/CLUSTERING.md.
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: mefor-engine-ha
+    spec:
+      # terminationGracePeriodSeconds — MUST exceed the time for a drained LEADER to (1) lose/expire its
+      # leader lease so a standby can take over, AND (2) finish engine.stop()'s ordered teardown, before
+      # SIGKILL. The formula the value below carries:
+      #
+      #   grace >= leader_lease_ttl_seconds          (default 30s; a clean stop EXPIRES the lease at once,
+      #                                                but budget the TTL so even a non-clean stop releases)
+      #          + ~10s graph-quiesce
+      #          + ~5s  PER MLLP listener (drained SERIALLY — additive, not bounded)
+      #          + store-close/flush margin
+      #
+      # The single-node statefulset.yaml ships 40 (covering the 30s lease TTL + a light graph). This HA
+      # manifest carries 40 forward as the reconciled default for a SMALL graph (lease 30 + ~10 quiesce =
+      # 40, ~0 extra listeners). RAISE IT for many-MLLP-listener graphs: 40 + 5*(listeners-1). If you LOWER
+      # leader_lease_ttl_seconds in [cluster] for faster failover, you may lower this in lockstep — but it
+      # must always stay > leader_lease_ttl_seconds, or a drained leader is SIGKILLed still holding its lease.
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001                      # mounted TLS Secret files (mode 0440) become group-readable
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread the 3 replicas across nodes/zones so a single node/zone loss can't take the whole cluster.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: mefor-engine-ha
+      containers:
+        - name: engine
+          # REPLACE with your config-baked image (FROM messagefoundry:<version>; COPY --chown=10001:10001 config /config).
+          # Use the messagefoundry:sqlserver base ONLY if you switch [store].backend to sqlserver or use
+          # the DATABASE / db_lookup connectors; the Postgres store needs only the slim default.
+          image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE
+          args: ["serve", "--config", "/config", "--env", "prod"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - { name: api, containerPort: 8443 }
+            - { name: mllp, containerPort: 2575 }
+            # Do NOT expose raw-TCP / X12 ports without TLS. Those listeners are PLAINTEXT-ONLY (no tls=
+            # option), but they ARE exposed-gated since PR #558: check_tcp_tls_exposure refuses a
+            # non-loopback raw-TCP/X12 bind at startup (parity with the MLLP/DICOM/HTTP guards). Keep them
+            # loopback-bound, or front them with a TLS-terminating TCP proxy.
+          env:
+            # --- exposure (Topology A — in-process TLS) ---
+            - { name: MEFOR_API_HOST, value: "0.0.0.0" }
+            - { name: MEFOR_API_PORT, value: "8443" }
+            - { name: MEFOR_API_TLS_CERT_FILE, value: "/etc/mefor/tls/api.crt" }
+            - { name: MEFOR_API_TLS_KEY_FILE, value: "/etc/mefor/tls/api.key" }
+            - { name: MEFOR_INBOUND_BIND_HOST, value: "0.0.0.0" }   # each MLLP() must set tls=True (exposure gate)
+            # --- production guardrails (refuses to start off-loopback without these) ---
+            - { name: MEFOR_AUTH_ENABLED, value: "true" }
+            - { name: MEFOR_AUTH_REQUIRE_MFA, value: "true" }       # local-admin MFA on an exposed PHI bind
+            - { name: MEFOR_STORE_REQUIRE_ENCRYPTION, value: "true" }
+            - { name: MEFOR_EGRESS_DENY_BY_DEFAULT, value: "true" } # plus MEFOR_EGRESS_ALLOWED_* for your graph
+            # --- HA: external Postgres store + active-passive cluster ---
+            - { name: MEFOR_STORE_BACKEND, value: "postgres" }      # SQLite is REFUSED under [cluster] (validator)
+            - { name: MEFOR_STORE_SERVER, value: "REPLACE.rds.amazonaws.com" }  # managed Postgres endpoint (RDS / Cloud SQL / Azure DB)
+            - { name: MEFOR_STORE_PORT, value: "5432" }
+            - { name: MEFOR_STORE_DATABASE, value: "messagefoundry" }
+            - { name: MEFOR_STORE_USERNAME, value: "mefor" }
+            - { name: MEFOR_STORE_POOL_SIZE, value: "5" }           # >= 2 required under [cluster]; >= 3 recommended
+            # [store].encrypt defaults true + trust_server_certificate defaults false — the DB connection is
+            # TLS-verified. Give the managed DB a CA-trusted cert; do NOT set MEFOR_ALLOW_INSECURE_TLS.
+            - { name: MEFOR_CLUSTER_ENABLED, value: "true" }        # the leader lease + graph gating come on here
+            # Secrets injected from the Secret as env (never plain manifest values):
+            - name: MEFOR_STORE_PASSWORD
+              valueFrom: { secretKeyRef: { name: mefor-secrets, key: store-password } }
+            - name: MEFOR_STORE_ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: mefor-secrets, key: store-encryption-key } }
+            - name: MEFOR_API_TLS_KEY_PASSWORD
+              valueFrom: { secretKeyRef: { name: mefor-secrets, key: api-tls-key-password, optional: true } }
+          volumeMounts:
+            - { name: tls, mountPath: /etc/mefor/tls, readOnly: true }
+            - { name: tmp, mountPath: /tmp }               # writable tmpfs for the read-only root fs
+            # NOTE: NO store PVC here — durability is in the external Postgres, the pods are stateless.
+          # Liveness only. /health is tokenless + always 200 and answers BEFORE the engine finishes
+          # starting — a pure liveness signal, not readiness. It is up on EVERY node (leader + standbys),
+          # so it does NOT distinguish primary from standby — that is the LB health check's job (TCP-connect
+          # to the MLLP port, which is open only on the primary), NOT this probe's. There is no
+          # unauthenticated readiness endpoint, so no readinessProbe is wired (one would mark a pod Ready
+          # prematurely); a standby is intentionally "Ready" — it must be a warm failover target.
+          livenessProbe:
+            httpGet: { path: /health, port: 8443, scheme: HTTPS }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "512Mi" }
+      volumes:
+        - name: tls
+          secret:
+            secretName: mefor-secrets
+            defaultMode: 0440           # group-readable (fsGroup 10001); keep the private key off 0644
+            items:
+              - { key: api.crt, path: api.crt }
+              - { key: api.key, path: api.key }
+        - name: tmp
+          emptyDir: { medium: Memory }
+#
+# DO NOT add a HorizontalPodAutoscaler to this Deployment. HA replicas are for FAILOVER, not for spreading
+# one partner's inbound load: only the leader processes (active-passive), sticky long-lived MLLP senders
+# do not rebalance, and autoscaling conflicts with per-channel FIFO / single-writer-per-lane. Scale INTAKE
+# via L3 parallel-lane / order-group sharding (ADR 0037), never by replicating a partner's listener.
+#
+# DB-tier HA (a Postgres replica / failover) is DELEGATED TO THE DATABASE (managed-service Multi-AZ, or
+# self-run streaming replication) — MessageFoundry does not replicate the store. See docs/CLUSTERING.md.

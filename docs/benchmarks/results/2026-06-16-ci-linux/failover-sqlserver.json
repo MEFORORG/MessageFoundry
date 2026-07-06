@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "kind": "failover",
+  "profile": "failover",
+  "db_backend": "sqlserver",
+  "result": "PASS",
+  "exit_code": 0,
+  "failover": {
+    "killed_node": "fo-b",
+    "promoted_node": "fo-a",
+    "promotion_seconds": 6.519691397,
+    "recovery_seconds": 6.998472737,
+    "lease_ttl_seconds": 6.0,
+    "max_concurrent_leaders": 1
+  },
+  "totals": {
+    "sent": 1440,
+    "acked": 1248,
+    "nak": 0,
+    "timeouts": 192,
+    "deferred": 0,
+    "sink_received": 2505,
+    "engine_delivered": 2504
+  },
+  "no_loss": {
+    "acked_not_delivered": 0,
+    "intake_gap": 192,
+    "in_pipeline_final": 0,
+    "dead_final": 0
+  },
+  "duplicates": {
+    "count": 1,
+    "rate": 0.0004
+  },
+  "ordering": {
+    "lane_inversions": 0,
+    "lanes_observed": 2
+  },
+  "slo": [
+    {
+      "name": "promotion_observed",
+      "threshold": true,
+      "observed": true,
+      "ok": true
+    },
+    {
+      "name": "functional_recovery_seconds",
+      "threshold": 12.0,
+      "observed": 7.0,
+      "ok": true
+    },
+    {
+      "name": "single_leader",
+      "threshold": 1,
+      "observed": 1,
+      "ok": true
+    },
+    {
+      "name": "no_acknowledged_loss",
+      "threshold": 0,
+      "observed": 0,
+      "ok": true
+    },
+    {
+      "name": "per_lane_ordering",
+      "threshold": 0,
+      "observed": 0,
+      "ok": true
+    },
+    {
+      "name": "max_dup_rate",
+      "threshold": 0.1,
+      "observed": 0.0004,
+      "ok": true
+    }
+  ],
+  "notes": [
+    "elected fo-b as the initial primary",
+    "SIGKILLed primary fo-b at kill time",
+    "fo-a promoted to primary",
+    "forward progress resumed (engine delivered new rows post-promotion)"
+  ]
+}

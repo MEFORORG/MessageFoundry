@@ -1,0 +1,52 @@
+# MessageFoundry SAST rules — high-signal patterns for a PHI-handling HL7 engine. These complement
+# bandit; each targets a sink that untrusted HL7/config data must never reach unguarded. All rules
+# have ZERO matches in the current tree (verified at authoring), so the gate starts clean; the
+# security.yml job runs them advisory for one cycle, then flips to blocking (CI-1).
+rules:
+  - id: mf-no-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >
+      subprocess invoked with shell=True. Build an argv list and call without a shell so an
+      HL7- or config-derived value can never be interpreted as a command (command injection).
+    pattern: subprocess.$F(..., shell=True, ...)
+
+  - id: mf-no-os-system
+    languages: [python]
+    severity: ERROR
+    message: >
+      os.system runs a string through the shell. Use subprocess.run([...]) with an argv list.
+    pattern: os.system(...)
+
+  - id: mf-no-eval-exec
+    languages: [python]
+    severity: ERROR
+    message: >
+      Dynamic eval/exec is forbidden — never evaluate message- or config-derived data as code.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: mf-no-insecure-deserialization
+    languages: [python]
+    severity: ERROR
+    message: >
+      Unsafe deserialization. pickle/marshal execute arbitrary code; yaml.load without SafeLoader is
+      unsafe. Use json, or yaml.safe_load, on any external / message / config-derived data.
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+      - pattern: marshal.load(...)
+      - pattern: marshal.loads(...)
+      - pattern: yaml.load(...)
+
+  - id: mf-no-tls-verify-disabled
+    languages: [python]
+    severity: ERROR
+    message: >
+      TLS verification disabled on an outbound client. Never ship verify=False; keep certificate
+      validation on for any downstream connection that carries or triggers PHI movement.
+    pattern-either:
+      - pattern: requests.$M(..., verify=False, ...)
+      - pattern: httpx.$M(..., verify=False, ...)
+      - pattern: httpx.Client(..., verify=False, ...)

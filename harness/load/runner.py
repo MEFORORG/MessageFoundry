@@ -1,0 +1,199 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+"""The load runner — wires the sink, sender pool, governor, and engine poller into one run.
+
+Orchestration: start the correlation sink → preflight the engine (reachable + target inbounds exist)
+→ run each phase through the rate governor (per-phase latency histograms, counter snapshots at the
+boundaries) → stop offering and measure engine-side drain → reconcile and build the report. Cleanup
+(sink/pool/poller) runs in a ``finally`` so an error or interrupt still tears down cleanly.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import time
+from typing import Sequence
+
+from messagefoundry.console.client import ApiError
+
+from harness.load.corpus import build_corpus
+from harness.load.correlator import Correlator
+from harness.load.enginepoll import EnginePoller, sample_until_reconciled
+from harness.load.governor import RateGovernor
+from harness.load.ids import ControlIds
+from harness.load.metrics import Counters, Histogram, LiveMetrics
+from harness.load.profile import LoadProfile
+from harness.load.report import PhaseRecord, RunReport, build_report
+from harness.load.sender import ConnectionPool, Dispatcher
+from harness.load.sink import CorrelationSink
+
+_STOP_GRACE = 5.0
+_SETTLE = 0.25  # let final ACKs/arrivals settle before the final engine sample
+
+
+class PreflightError(RuntimeError):
+    """The engine isn't reachable, or it isn't serving the profile's target inbound ports."""
+
+
+async def run_load(
+    profile: LoadProfile,
+    *,
+    engine_url: str,
+    id_prefix: str,
+    token: str | None = None,
+    sink_host: str = "127.0.0.1",
+    sink_port: int = 2700,
+    sink_ports: int = 1,
+    db_backend: str | None = None,
+    skip_preflight: bool = False,
+    shard_engines: Sequence[str] = (),
+) -> RunReport:
+    ids = ControlIds(prefix=id_prefix)
+    # Generate + parse the corpus off the event loop (hl7apy validation is slow) before anything runs.
+    corpus = await asyncio.to_thread(build_corpus, profile, ids)
+
+    metrics = LiveMetrics(Counters(), Histogram(), Histogram())
+    correlator = Correlator(profile.correlator_capacity, metrics)
+
+    sink = CorrelationSink(
+        ids,
+        correlator,
+        metrics,
+        host=sink_host,
+        ports=tuple(sink_port + i for i in range(sink_ports)),
+    )
+    # Poll the primary --engine plus every --shard-engine and AGGREGATE (sum) their /stats, so the
+    # no-loss reconcile and drain see CLUSTER totals — not just the one shard the --engine names. With
+    # no shard_engines this is exactly [engine_url] = byte-identical to the single-shard behavior.
+    poller = EnginePoller([engine_url, *shard_engines], token, origin=time.perf_counter())
+    pools = [
+        (t, ConnectionPool(t, profile.pool_size, correlator, metrics)) for t in profile.targets
+    ]
+    dispatcher = Dispatcher(pools, seed=profile.seed)
+
+    poll_stop = asyncio.Event()
+    poll_task: asyncio.Task[None] | None = None
+    try:
+        await sink.start()
+        await poller.open()
+        if not skip_preflight:
+            await _preflight(
+                poller, profile
+            )  # raises PreflightError if unreachable / ports missing
+        # When skipped (multi-shard driving): one harness drives MLLP ports spread across several
+        # `supervise` shard engines, so no single --engine serves them all. The served-ports check is
+        # bypassed; the correlation sink still measures aggregate E2E + no-loss across every shard
+        # delivering to this run's --sink-port (set each shard's MEFOR_LOAD_SINK_PORT to match).
+
+        dispatcher.start()
+        poll_task = asyncio.create_task(poller.run(profile.poll_interval_s, poll_stop))
+
+        governor = RateGovernor(corpus, dispatcher, metrics.counters)
+        records = await _run_phases(profile, metrics, governor)
+
+        # Stop offering; let the engine drain its backlog. Swap in a throwaway histogram first so the
+        # drain tail (high-latency backlog deliveries) doesn't pollute the last measured phase.
+        metrics.ack = Histogram()
+        metrics.e2e = Histogram()
+        poll_stop.set()
+        if poll_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await poll_task
+            poll_task = None
+        # Stop the dispatcher FIRST (flush queued sends + grace in-flight ACKs) BEFORE draining, so
+        # every offered message has reached the engine's ingress stage before await_drain waits for
+        # empty. Draining first would let a message still in a pool's send queue arrive AFTER
+        # await_drain returned, so the final sample's `read` could trail `sent` on a slow runner — the
+        # "engine_read < sent" intake-gap flake (the same ordering fix the connscale step carries).
+        await dispatcher.stop(_STOP_GRACE)
+        drain_seconds = await poller.await_drain(
+            timeout=profile.drain_timeout_s, interval=profile.poll_interval_s
+        )
+        await asyncio.sleep(_SETTLE)
+        if drain_seconds is not None:
+            # Poll the SETTLED reconcile condition (read >= confirmed sent, sink_received >= written,
+            # pipeline empty) rather than trusting a single fixed-instant sample — the durable fix for
+            # the intake/delivery count-lag a noisy runner shows even after a clean drain
+            # (mf-ci-test-flakes). Bounded; on timeout the last sample stands and the reconcile
+            # reports the residual honestly.
+            await sample_until_reconciled(
+                poller,
+                metrics.counters,
+                timeout=profile.drain_timeout_s,
+                interval=profile.poll_interval_s,
+            )
+        else:
+            # The drain already timed out — the verdict (max_drain_seconds fails, backlog != 0) is
+            # determined, so burning a second drain_timeout_s polling for a settle that cannot come
+            # would only push a genuine failure into the pytest watchdog. One honest final sample.
+            await poller.sample_once()
+        return build_report(
+            profile,
+            engine_url,
+            records,
+            metrics.counters,
+            poller,
+            drain_seconds,
+            db_backend=db_backend,
+        )
+    finally:
+        poll_stop.set()
+        if poll_task is not None:
+            poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await poll_task
+        with contextlib.suppress(Exception):
+            await dispatcher.stop(_STOP_GRACE)
+        with contextlib.suppress(Exception):
+            await sink.stop()
+        with contextlib.suppress(Exception):
+            await poller.close()
+
+
+async def _run_phases(
+    profile: LoadProfile, metrics: LiveMetrics, governor: RateGovernor
+) -> list[PhaseRecord]:
+    records: list[PhaseRecord] = []
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for phase in profile.phases:
+        start_counters = metrics.counters.snapshot()
+        # Fresh per-phase histograms so warmup/ramp/spike don't pollute the steady-state SLO check.
+        metrics.ack = Histogram()
+        metrics.e2e = Histogram()
+        ack_hist, e2e_hist = metrics.ack, metrics.e2e
+        t0 = loop.time()
+        await governor.run_phase(phase, profile.mix_for(phase), stop)
+        wall = loop.time() - t0
+        records.append(
+            PhaseRecord(
+                phase, start_counters, metrics.counters.snapshot(), ack_hist, e2e_hist, wall
+            )
+        )
+    return records
+
+
+async def _preflight(poller: EnginePoller, profile: LoadProfile) -> None:
+    sample = await poller.sample_once()  # establishes the baseline + proves reachability
+    if sample is None:
+        raise PreflightError(
+            "engine is not reachable for metrics — check --engine and that the engine is running"
+        )
+    ports = await asyncio.to_thread(_engine_ports, poller)
+    missing = sorted({t.port for t in profile.targets} - ports)
+    if missing:
+        raise PreflightError(
+            f"engine is not serving inbound port(s) {missing} — did you serve harness/config/load "
+            f"(with matching MEFOR_LOAD_*_PORT)? engine ports seen: {sorted(ports)}"
+        )
+
+
+def _engine_ports(poller: EnginePoller) -> set[int]:
+    client = poller.client
+    if client is None:
+        return set()
+    try:
+        return {r.port for r in client.connections() if r.port}
+    except ApiError:
+        return set()

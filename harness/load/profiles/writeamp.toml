@@ -1,0 +1,41 @@
+# Fan-out write-amplification stress profile (W2025 test plan S4.5). A single thin open lane at a low
+# offered rate — the stress is the SERVE-SIDE fan-out (MEFOR_LOAD_FANOUT), so each inbound message
+# amplifies into N outbound rows + N deliveries + N store writes. Sweep MEFOR_LOAD_FANOUT (1, 10, 50,
+# 100) on the serve side, restarting serve each time, and watch DB/WAL growth + drain per backend.
+# Serve harness/config/load, then: python -m harness --load writeamp --engine URL --token T
+#
+# All values are generic and synthetic — no real partner, site code, host, IP, or volume appears here.
+
+[load]
+name = "writeamp"
+description = "single thin open lane; the FAN-OUT (serve-side) is the write-volume stress"
+pool_size = 64
+corpus_count_per_trigger = 20
+drain_timeout_s = 600.0    # raise as MEFOR_LOAD_FANOUT climbs (100x => lots to drain)
+correlator_capacity = 2000000
+
+[[load.target]]
+name = "adt_hub"
+port = 2600
+types = ["ADT"]
+
+[load.mix]
+"ADT^A01" = 100.0
+
+[load.slo]
+zero_loss = true
+max_drain_seconds = 600.0
+
+[[load.phase]]
+name = "warmup"
+kind = "warmup"
+loop = "open"
+rate_start = 20.0
+duration_s = 10.0
+
+[[load.phase]]
+name = "sustained"
+kind = "sustained"
+loop = "open"
+rate_start = 60.0          # low offered rate; fan-out is the write stress
+duration_s = 120.0

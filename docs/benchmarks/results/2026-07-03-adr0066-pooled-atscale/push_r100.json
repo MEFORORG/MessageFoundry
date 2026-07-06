@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "kind": "connscale",
+  "profile": "pooled_push",
+  "engine_url": "http://127.0.0.1:8800",
+  "db_backend": "sqlserver",
+  "executor_shim_installed": true,
+  "result": "PASS",
+  "exit_code": 0,
+  "coverage": "coverage: all walls measured.",
+  "records": [
+    {
+      "claim_mode": "pooled",
+      "sweep_mode": "fixed_aggregate",
+      "count": 1500,
+      "offered_aggregate_rate": 100.0,
+      "achieved": {
+        "read_per_s": 97.12,
+        "written_per_s": 97.14
+      },
+      "cpu": {
+        "seconds_total": 237.25,
+        "util_cores_peak": 2.255,
+        "util_cores_mean": 1.975
+      },
+      "working_set": {
+        "peak_bytes": 255131648
+      },
+      "traffic": {
+        "sent": 12000,
+        "acked": 12000,
+        "nak": 0,
+        "deferred": 0,
+        "timeouts": 0,
+        "in_pipeline_peak": 553,
+        "drain_seconds": 2.4051336000002266
+      },
+      "no_loss": {
+        "ok": true,
+        "sent": 12000,
+        "engine_read": 12000,
+        "engine_written": 12000,
+        "sink_received": 12000,
+        "backlog": 0,
+        "detail": "read>=sent, sink_received>=written, backlog drained"
+      },
+      "wall1_executor": {
+        "queue_depth_peak": 32,
+        "busy_peak": 43
+      },
+      "wall2_pool_wait": {
+        "p50_ms": 0.05,
+        "p95_ms": 1000.0,
+        "p99_ms": 2500.0,
+        "max_ms": 2351.695700000164,
+        "idle_min": 1,
+        "size_max": 40
+      },
+      "wall3_empty_claims": {
+        "total_per_s": 102.55,
+        "idle_poll_per_s": 11.1,
+        "wake_fanout_per_s": 91.45
+      },
+      "wall4_fd": {
+        "count_peak": 5358
+      },
+      "wall5_reload": {
+        "seconds": null
+      },
+      "wall6_ack_ms": {
+        "p50": 47.23,
+        "p95": 215.957,
+        "p99": 443.68
+      }
+    }
+  ],
+  "slo": [
+    {
+      "name": "zero_loss",
+      "threshold": true,
+      "observed": true,
+      "ok": true
+    }
+  ],
+  "notes": []
+}

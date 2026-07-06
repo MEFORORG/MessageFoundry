@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Engine runtime data (PHI may live here — never commit)
+*.db
+*.db-wal
+*.db-shm
+*.pid
+out/
+harness_io/
+*.log
+
+# One-time bootstrap admin credential written next to the store (consumed + deleted by the operator) — never commit
+bootstrap-admin.txt
+
+# Secrets / credentials — never commit (no such files exist today; these are foot-gun guards)
+.env
+.env.*
+*.key
+*.pem
+*.pfx
+secrets/
+
+# Container deployment secrets + TLS material — never commit (the *.example templates ARE tracked)
+/docker/secrets.env
+/docker/tls/
+
+# Generated, regenerable test corpus (build with: python -m messagefoundry.generators.adt)
+/samples/messages/adt/
+
+# Workflow agent self-verification temp dirs (an isolated copy of a ported migration module + codesets
+/_verify_*/
+# construction; this is the local-only working area.
+/migration-local/
+
+# Tooling
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.vscode/
+.idea/
+
+# Claude Code: settings.json is shared/tracked; settings.local.json is machine-local (never commit)
+.claude/settings.local.json
+
+# Local reference notes pointing at machine-specific Claude Code transcript paths — never commit
+TRANSCRIPTS.md
+
+# Local planning/marketing/security working docs — keep out of the repo
+# (docs/DUAL_LICENSING_PLAN.md is now a committed artifact — see ADR 0017 / #13 licensing)
+/docs/marketing/
+/docs/security/CISO-REVIEW.md
+/docs/security/DEPENDENCY-POSTURE-REVIEW.md
+/docs/security/DEPENDENCY-RESPONSE-PLAN.md
+/docs/security/DEPENDENCY-CUSTOMER-OFFERINGS.md
+/docs/security/DEPENDENCY-RESPONSE-HANDOFF.md
+/docs/security/DEPENDENCY-RESPONSE-A3-HANDOFF.md
+/docs/security/DEPENDENCY-RESPONSE-A4-HANDOFF.md
+# vuln_metrics.py local CSV output (the CI run uploads it as an artifact; not committed)
+/docs/security/metrics/
+
+# Operator-local load/throughput profiles — tuned to a specific deployment's volume; kept OUT of the
+# OSS repo + public mirror (the plan itself lives on the operator share, WIN2025-LOAD-THROUGHPUT-MATRIX.md).
+# Still usable by name (they sit in PROFILES_DIR) and copy-on to the test box.
+/harness/load/profiles/hospital-baseline.toml
+/harness/load/profiles/soak-12h.toml
+# Deep-research survey of alternative OSS DB backends for the shared-DB commit-wall — local working
+# note, not a committed artifact (the conclusion is carried in the throughput ADRs / AI memory).
+/docs/research/db-commit-wall-backend-survey.md
+
+# --- MessageFoundry ---
+.mefor/
+*.db*
+.DS_Store
+Thumbs.db

@@ -1,0 +1,113 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* First-party styles for the /ui ops dashboard (ADR 0065). Same-origin; CSP style-src 'self'. */
+
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --ink: #e6e9ef;
+  --muted: #9aa4b2;
+  --line: #262b34;
+  --accent: #5b9dff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --bad: #f85149;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 14px/1.5 -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 1rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+nav .brand { font-weight: 700; margin-right: 1rem; }
+nav .navlinks a { color: var(--muted); text-decoration: none; margin-right: 1rem; }
+nav .navlinks a.active, nav .navlinks a:hover { color: var(--accent); }
+nav .logout button, .filters button, .login button {
+  background: var(--accent); color: #04122b; border: 0; border-radius: 6px;
+  padding: 0.35rem 0.8rem; cursor: pointer; font-weight: 600;
+}
+nav .logout button { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+button[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+main { padding: 1rem; }
+h1 { font-size: 1.25rem; }
+h2 { font-size: 1rem; color: var(--muted); margin-top: 1.5rem; }
+
+table.grid { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+table.grid th, table.grid td {
+  text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line);
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+table.grid th { color: var(--muted); font-weight: 600; }
+table.grid a { color: var(--accent); text-decoration: none; }
+
+.status { padding: 0.05rem 0.45rem; border-radius: 999px; font-size: 0.8rem; }
+.status-running { color: var(--ok); }
+.status-stopped, .status-draining { color: var(--muted); }
+.status-failed, .status-error { color: var(--bad); }
+.status-filtered, .status-stopping { color: var(--warn); }
+
+pre.raw {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 0.8rem; overflow: auto; max-height: 60vh; white-space: pre-wrap; word-break: break-word;
+}
+
+.filters { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.5rem 0; }
+.filters input { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: 0.3rem 0.5rem; }
+.pager { color: var(--muted); }
+
+.card { max-width: 360px; margin: 4rem auto; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 10px; padding: 1.5rem; }
+.card .login { display: flex; flex-direction: column; gap: 0.75rem; }
+.card label { display: flex; flex-direction: column; gap: 0.25rem; color: var(--muted); }
+.card input { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: 0.4rem 0.5rem; }
+.banner { color: var(--warn); }
+
+.ctls { display: flex; gap: 0.3rem; }
+.ctl { display: inline; margin: 0; }
+.ctl button {
+  background: transparent; color: var(--muted); border: 1px solid var(--line);
+  border-radius: 5px; padding: 0.15rem 0.5rem; font-size: 0.8rem; cursor: pointer;
+}
+.ctl button:hover { color: var(--accent); border-color: var(--accent); }
+
+/* Connection-controls bulk-action toolbar (un-polled dashboard shell, ADR 0065 connection controls). */
+.ctlbar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; margin: 0.25rem 0 0.5rem; }
+.ctlbar select {
+  background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: 0.3rem 0.5rem;
+}
+.ctlbar button {
+  background: var(--accent); color: #04122b; border: 0; border-radius: 6px;
+  padding: 0.35rem 0.8rem; cursor: pointer; font-weight: 600;
+}
+.ctlbar span { color: var(--muted); }
+
+/* Selection checkbox column — keep it tight (one checkbox per cell). */
+table.grid th:has(> [data-mf-conns-all]), table.grid td:has(> .rowcb) {
+  width: 1%; text-align: center;
+}
+.rowcb { margin: 0; cursor: pointer; }
+
+.muted { color: var(--muted); }
+.detail-head { display: flex; align-items: center; gap: 1rem; }
+.livestats { color: var(--muted); font-variant-numeric: tabular-nums; min-height: 1.2rem;
+  margin: 0.25rem 0 0.5rem; }
+
+ul.tree { list-style: none; margin: 0; padding-left: 1rem; border-left: 1px solid var(--line); }
+ul.tree .tlabel { color: var(--muted); }
+ul.tree .tval { color: var(--ink); white-space: pre-wrap; word-break: break-word; }

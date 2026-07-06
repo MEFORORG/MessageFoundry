@@ -1,0 +1,47 @@
+name: zizmor
+
+# GitHub Actions static analysis (Trail of Bits), split out of security.yml so it runs only when the
+# surface it lints actually changes: zizmor reads .github/** (workflows + its config), so a Python /
+# docs / test PR cannot change its result and running it there was pure cost (~1 billed min on every
+# one of ~900 monthly PR/push scans). The daily cron re-runs it against the UNCHANGED tree so a
+# newly-added zizmor rule or newly-flagged action ref still surfaces within ~24h, and
+# workflow_dispatch covers on-demand runs. NOT a branch-protection required check (verified against
+# the live protection rules), so a paths-filtered skip can never wedge a PR or auto-merge.
+on:
+  pull_request:
+    paths:
+      - ".github/**"
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    name: zizmor (GitHub Actions static analysis)
+    runs-on: ubuntu-latest
+    # BLOCKING: static analysis of the workflow files THEMSELVES — template injection, over-broad
+    # GITHUB_TOKEN permissions, dangerous triggers, artifact-credential persistence. The baseline is
+    # clean — high-confidence findings are fixed in-tree (least-privilege per-job permissions,
+    # env-passed refs, persist-credentials: false) and the few safe-by-design ones are recorded with
+    # a justification in .github/zizmor.yml — so a NEW workflow-security regression fails the build.
+    # Tune suppressions in .github/zizmor.yml (with a reason), not by relaxing this gate.
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Lint-only job: no pushes, no uploaded artifacts — don't persist the token (artipacked).
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+      - name: Install zizmor (pinned)
+        run: |
+          # Pin deliberately; verify the tag at https://github.com/zizmorcore/zizmor/releases if it 404s.
+          python -m pip install --upgrade pip "zizmor==1.5.2"
+      - name: Analyze the workflows
+        env:
+          # Lets zizmor run its online audits (e.g. unpinned / known-problematic action refs).
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor .github/workflows

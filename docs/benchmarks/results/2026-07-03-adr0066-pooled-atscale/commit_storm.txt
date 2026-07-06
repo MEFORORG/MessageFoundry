@@ -1,0 +1,14 @@
+threads  commits/s   log_flushes/s  avg_log_write_ms  dominant_wait
+      1       1671           1672             0.102  WRITELOG
+      2       2706           1945             0.120  WRITELOG
+      4       5802           4734             0.129  WRITELOG
+      8      10201           7523             0.137  WRITELOG
+     16      17187          11228             0.151  WRITELOG
+     32      23577          10069             0.172  WRITELOG
+     64      25443           7622             0.200  WRITELOG
+     96      27013           2576             0.233  WRITELOG
+    128      27178           1431             0.253  WRITELOG
+
+COMMIT CEILING: 27178 commits/s at 128 threads (log write latency 0.253 ms there)
+  -> 1630688 commits/min   97.84 M commits/hour
+scratch tables dropped

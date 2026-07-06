@@ -1,0 +1,14 @@
+# gitleaks configuration — the default ruleset plus a tiny allowlist for known, non-sensitive
+# values that would otherwise trip the generic-password rule. NEVER allowlist a real secret: real
+# secrets must not exist in the repo at all (that is what this scanner is here to enforce).
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known non-sensitive values that trip the generic-password/api-key rule — NOT real secrets."
+regexes = [
+  # Ephemeral CI-only credential (SQL Server test container in .github/workflows/ci.yml).
+  '''Str0ng_P@ssw0rd!''',
+  # Fake test-fixture passphrase (admin-reset rotation test, tests/test_api_auth.py, WP-L3-12).
+  '''rotated-strong-passphrase-7''',
+]

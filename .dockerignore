@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+#
+# Keep the engine image build context small and free of anything sensitive. docker/Dockerfile COPYs
+# only: pyproject.toml, README.md, LICENSE, NOTICE, messagefoundry/, and docker/locks/. Everything
+# else is excluded so it can never end up in an image layer (PHI, secrets, the console, dev tooling).
+
+# VCS / editor / caches
+**/.git
+**/.gitignore
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.DS_Store
+
+# Local stores / logs / secrets — never in an image
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.env
+.env
+**/*.pem
+**/*.key
+
+# Not needed in the engine image (console is host-side; tests/docs/samples/harness are not shipped)
+.claude/
+.github/
+docs/
+tests/
+harness/
+samples/
+scripts/
+environments/
+ide/
+node_modules/
+migration-local/
+out/
+
+# The console package is GUI-only and must not be baked into the headless engine image. (The wheel
+# build needs the rest of messagefoundry/, so only the console subpackage is excluded.)
+messagefoundry/console/

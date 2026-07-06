@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "kind": "connscale",
+  "profile": "pooled_pool128",
+  "engine_url": "http://127.0.0.1:8800",
+  "db_backend": "sqlserver",
+  "executor_shim_installed": true,
+  "result": "FAIL",
+  "exit_code": 1,
+  "coverage": "coverage: all walls measured.",
+  "records": [
+    {
+      "claim_mode": "pooled",
+      "sweep_mode": "fixed_aggregate",
+      "count": 1500,
+      "offered_aggregate_rate": 500.0,
+      "achieved": {
+        "read_per_s": 107.55,
+        "written_per_s": 107.6
+      },
+      "cpu": {
+        "seconds_total": null,
+        "util_cores_peak": null,
+        "util_cores_mean": null
+      },
+      "working_set": {
+        "peak_bytes": 253796352
+      },
+      "traffic": {
+        "sent": 60000,
+        "acked": 55754,
+        "nak": 0,
+        "deferred": 0,
+        "timeouts": 4246,
+        "in_pipeline_peak": 3,
+        "drain_seconds": 408.1004431000001
+      },
+      "no_loss": {
+        "ok": false,
+        "sent": 60000,
+        "engine_read": 57326,
+        "engine_written": 57326,
+        "sink_received": 57326,
+        "backlog": 0,
+        "detail": "engine_read 57326 < confirmed sent 60000 (lost 2674 on intake); 4246 unconfirmed sends exceed the stranding budget (1500 \u2248 one in-flight per connection) \u2014 systemic no-ACK fault (possible accepted-and-dropped); nothing excused"
+      },
+      "wall1_executor": {
+        "queue_depth_peak": 0,
+        "busy_peak": 4
+      },
+      "wall2_pool_wait": {
+        "p50_ms": 25.0,
+        "p95_ms": 2500.0,
+        "p99_ms": 10000.0,
+        "max_ms": 92962.2116999999,
+        "idle_min": 45,
+        "size_max": 128
+      },
+      "wall3_empty_claims": {
+        "total_per_s": 27.11,
+        "idle_poll_per_s": 6.85,
+        "wake_fanout_per_s": 20.26
+      },
+      "wall4_fd": {
+        "count_peak": 6129
+      },
+      "wall5_reload": {
+        "seconds": null
+      },
+      "wall6_ack_ms": {
+        "p50": 5090.771,
+        "p95": 25216.097,
+        "p99": 39944.775
+      }
+    }
+  ],
+  "slo": [
+    {
+      "name": "zero_loss",
+      "threshold": true,
+      "observed": false,
+      "ok": false
+    }
+  ],
+  "notes": []
+}

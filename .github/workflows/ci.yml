@@ -1,0 +1,1144 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Nightly (03:17 UTC — off the top-of-hour rush) run of the HEAVY POST-MERGE legs: the load
+    # smokes (load-test, load-test-sqlserver x2 majors), the server-DB suites (sqlserver-store x2
+    # majors, postgres-store), windows-service-smoke (x2 SKUs, 2x-billed) and docker-smoke. These
+    # all used to run on EVERY push to main (~16 auto-merges/day re-validating content whose PR run
+    # had just passed); the nightly cadence + the PR path-gates (`changes`) keep the same coverage
+    # at a fraction of the runs. `gh workflow run ci.yml --ref main` (workflow_dispatch) still runs
+    # EVERYTHING on demand — use it to re-validate a specific merge immediately.
+    #   IMPORTANT: the cron must still NOT drag the FUNCTIONAL matrix along. `test` and `ide` gate
+    #   their full-coverage arm as `push || workflow_dispatch` — deliberately EXCLUDING `schedule` —
+    #   so the nightly never re-executes them (they already ran on the merge itself; the original
+    #   `!= 'pull_request'` form would have swept them into the cron). The nightly legs' `if:` is
+    #   `schedule || workflow_dispatch` (+ a PR path-gate arm where `changes` provides one).
+    - cron: "17 3 * * *"
+
+concurrency:
+  # Per-ref group so a new push/PR-update supersedes its own in-flight run. The nightly `schedule` run
+  # gets a SEPARATE group (…-nightly): without this it would share `ci-refs/heads/main` with push-to-main
+  # and a routine daytime push would cancel-in-progress the in-flight nightly LOAD run — silently killing
+  # the very long-running coverage the cron exists to provide. Scheduled and push runs no longer collide.
+  group: ci-${{ github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  cancel-in-progress: true
+
+# Least privilege: every job here only reads the repo and runs tests/builds (no gh writes, no git push,
+# no secrets), so a read-only default token is sufficient. A job needing more declares its own block.
+permissions:
+  contents: read
+
+jobs:
+  # Lint + type-check + unit tests. The project supports a single Python — 3.14 — so every leg runs it.
+  # Linux carries the cheap breadth (1x minutes); Windows Server 2022 + 2025 is the primary deployment
+  # target, so 3.14 is also exercised on both Server SKUs even though Windows bills at 2x — testing the
+  # version we ship on the OS we ship it on is worth the minutes.
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    # `needs: changes` for the docs-only short-circuit ONLY — this REQUIRED job still RUNS on every PR
+    # and ALWAYS reports its context. On a docs-only PR `changes.outputs.code == 'false'` and the
+    # expensive steps (install/lint/type/test) are skipped, so the leg goes green in seconds; the
+    # required `test (…, py3.14)` context stays present + green. (changes never fails, so this needs
+    # edge can't wedge the required context.)
+    needs: changes
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    # Wall-clock backstop: bound each leg so a hung test fails in minutes, not the 6h default. Three
+    # nested watchdogs catch a hang at increasing scope (#55): the pytest-timeout per-test cap (60s,
+    # pyproject addopts) + the faulthandler belt fire FIRST and name the stuck frame; the pytest STEP
+    # has its own `timeout-minutes: 13` so a process-level deadlock below pytest fails the step fast;
+    # this job cap is the outermost belt if even that is somehow out-raced.
+    timeout-minutes: ${{ matrix.job_timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `runner` is a JSON string consumed by fromJSON (runs-on above) so a Windows leg can target a
+          # self-hosted label WITHOUT changing the context NAME (which comes from `os`). Both Server SKUs
+          # now run on self-hosted NucBox runners ($0 minutes); they keep the tuned-for-hosted ubuntu leg
+          # on GitHub. The self-hosted (slower) boxes get a longer job cap / per-test timeout so a
+          # thermal-throttled run isn't a false timeout; the hosted ubuntu leg keeps 15/13/60/90.
+          #   NB windows-2022 targets its OWN label `mefor-ci-win2022` (a real Server-2022 box — a Hyper-V
+          #   guest on a NucBox; it CANNOT share the Server-2025 runners, the OS SKU is what's under test).
+          - { os: ubuntu-latest, python-version: "3.14", runner: '["ubuntu-latest"]', job_timeout: 15, step_timeout: 13, pytest_timeout: 60, fault_timeout: 90 }
+          - { os: windows-2022, python-version: "3.14", runner: '["self-hosted", "windows", "mefor-ci-win2022"]', job_timeout: 30, step_timeout: 26, pytest_timeout: 120, fault_timeout: 150 }
+          - { os: windows-2025, python-version: "3.14", runner: '["self-hosted", "windows", "mefor-ci-win2025"]', job_timeout: 30, step_timeout: 26, pytest_timeout: 120, fault_timeout: 150 }
+    defaults:
+      run:
+        shell: bash  # available on all runners (Git Bash on Windows) -> one set of commands
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          # No `cache: pip`: installs now go through uv (the "Set up uv" step below), which keeps its
+          # OWN wheel/download cache — a pip cache here would be a second, redundant cache competing
+          # for the repo's 10 GB cache budget. uv's cache is keyed on pyproject.toml + requirements.lock.
+
+      # Everything below is gated on `code` (docs-only short-circuit) OR a push-to-main / on-demand run
+      # (full coverage). On a docs-only PR these steps no-op and the REQUIRED leg reports green in seconds.
+      # The job itself (and the Python/cache setup above) still runs, so the required context is always
+      # present. NB: the gate is duplicated per-step (a job-level `if` would SKIP the whole job and remove
+      # the required context) — keep the condition identical on each. The push/dispatch arm is written
+      # `push || workflow_dispatch` (NOT `!= 'pull_request'`) so the nightly `schedule` event does NOT
+      # re-run this full functional matrix — the cron is reserved for the long load legs only.
+
+      # PySide6's offscreen platform plugin needs a few system libraries even
+      # headless. Linux-only; Windows runners need no equivalent.
+      - name: Install Qt offscreen system libraries
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+
+      # uv is the installer for every leg (was pip): it resolves + installs the pyproject extras far
+      # faster than pip, into the same setup-python interpreter via `uv pip install --system`. Pinned
+      # by the same SHA dependabot-lock-resync.yml already uses. Gated identically to the install
+      # below (docs-only PRs skip both). enable-cache defaults to 'auto' — a GitHub-hosted cache on
+      # hosted runners, the persistent on-disk uv cache on a self-hosted runner — keyed on the glob.
+      - name: Set up uv
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      - name: Install project (dev + console + fhir + dicom + x12 + xml extras)
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          # [fhir] so the FHIR typed-tier tests (incl. the PHI-no-leak invariant, ADR 0022) actually
+          # run their assertions in CI rather than importorskip-skipping (extra-less local runs skip).
+          # [dicom] (pydicom + pynetdicom; ADR 0025) does the same for the DICOM codec + C-STORE SCP
+          # tests, and lets mypy type-check transports/dicom.py + parsing/dicom/ against the real
+          # (py.typed) libraries rather than treating them as Any.
+          # [x12] (pyx12) + [xml] (lxml/xmlschema/signxml) likewise so the strict X12 validation (#32)
+          # and the hardened XML/SOAP codec (#31) tests run their assertions instead of importorskip-skipping.
+          # [webauthn] (ADR 0068) so the passkey ceremony tests run real verify_* assertions instead of
+          # importorskip-skipping, and mypy sees the py.typed library rather than Any.
+          uv pip install --system -e ".[dev,console,fhir,dicom,x12,xml,webauthn]"
+
+      # ruff (lint + format) and mypy are PLATFORM-INDEPENDENT results — a ruff/format outcome is
+      # identical on every OS, and mypy's platform-specific branches are covered by running it for
+      # BOTH platforms on the cheap Linux leg (below). Running them on the 2x-billed Windows legs was
+      # duplicate cost, so gate them to Linux. The Windows legs keep pytest — the one check whose
+      # result genuinely differs by OS (real sockets, ProactorEventLoop, Windows service paths).
+      - name: Lint (ruff)
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        run: ruff check messagefoundry tests
+
+      - name: Format check (ruff)
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        run: ruff format --check .
+
+      # Two mypy passes on Linux so BOTH platforms' typed branches are checked without paying for a
+      # Windows mypy: the default linux-platform run, plus an explicit --platform win32 run that types
+      # the sys.platform=='win32' branches (ctypes.windll / DPAPI / service_control) the linux run
+      # skips. Previously those were typed only by the mypy on the Windows legs. (All win32 code uses
+      # stdlib ctypes — typeshed's win32-conditional stubs cover it; there are no win32-only deps — so
+      # this resolves on a Linux runner. Verified: both passes clean on 204 files.)
+      - name: Type-check (mypy, strict — linux platform)
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        run: mypy messagefoundry
+
+      - name: Type-check (mypy, strict — win32 platform)
+        if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
+        run: mypy --platform win32 messagefoundry
+
+      # Step-level watchdog UNDER the 15-min job cap (#55): the windows-2022 leg intermittently
+      # wedges ~25% in (a Windows ProactorEventLoop listener-teardown / socket wait that the shared
+      # session event loop can't get past), emits no output for ~12 min, then the JOB cap CANCELS it
+      # — a red ✗ with no stack and no named test. Two belts make that fail FAST and NAMED instead:
+      #   * `--timeout-method=thread` (the ONLY method on Windows — SIGALRM is POSIX-only) dumps ALL
+      #     thread stacks at the per-test cap (60s, set in pyproject addopts), naming the stuck frame.
+      #   * PYTHONFAULTHANDLER=1 + `-o faulthandler_timeout=90` is the belt that fires even when the
+      #     thread-timer CANNOT interrupt a main-thread C-level wait (a Proactor overlapped op /
+      #     blocking accept / subprocess.wait): pytest's faulthandler plugin arms a separate watchdog
+      #     thread that dumps the NATIVE stack of every thread at 90s (> the 60s pytest-timeout, so the
+      #     per-test dump is attributed first; this is the last-resort stack when the thread method is
+      #     itself out-raced). NB the plugin exposes this as the `faulthandler_timeout` ini key, not a
+      #     `--faulthandler-*` CLI flag, so it is passed with `-o`; it only DUMPS (never kills), safe.
+      # The step `timeout-minutes: 13` is the outer backstop, well under the job's 15-min cap, so a
+      # hang both watchdogs somehow miss still fails the STEP (not the whole job at the silent cap).
+      - name: Tests (pytest)
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        timeout-minutes: ${{ matrix.step_timeout }}
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONFAULTHANDLER: "1"
+        run: pytest -q -o faulthandler_timeout=${{ matrix.fault_timeout }} --timeout=${{ matrix.pytest_timeout }}
+
+  # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
+  # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise
+  # pass CI unbuilt (this job exists because an esbuild bump merged "green" without anything having
+  # compiled it). The build runs on both OSes; the @vscode/test-electron suite (which downloads and
+  # launches a real headless VS Code to assert the extension activates and its commands register/run)
+  # runs on the Windows leg — Electron launches headless there with no xvfb, and Windows is a
+  # deployment target.
+  ide:
+    name: ide build (${{ matrix.os }})
+    # `ide` is NOT a required check and ci-gate does NOT `needs: ide`, so a skip here can't wedge any
+    # required context. It runs ONLY when it can be affected: a PR that touches ide/** or this workflow
+    # (the `changes.ide` path-gate) + on-demand dispatch. Dropped from push-to-main — the merge just
+    # re-validated what the ide PR already built, and the ide is an isolated npm project, so a non-ide
+    # push cannot break it (changes.ide already covers ide/** AND ci.yml). This removes both the Linux
+    # and the 2x-billed Windows ide legs from ~every push to main. Not on the nightly cron either: the
+    # engine heavy legs need that safety net, an isolated npm build gated on its own paths does not.
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.ide == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: ide
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ide/package-lock.json
+
+      - name: Install (clean, from lockfile)
+        run: npm ci
+
+      - name: Type-check (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Bundle (esbuild)
+        run: npm run compile
+
+      - name: Integration tests (headless VS Code)
+        if: runner.os == 'Windows'
+        run: npm test
+
+  # Path filter for the container-pulling server-DB leg(s). A docs/unrelated PR shouldn't pull the SQL
+  # Server image (mcr.microsoft.com anonymous pulls are rate-limited — repeated PRs flake on
+  # "toomanyrequests"). This job decides whether the SQL Server leg needs to run: ALWAYS true on
+  # workflow_dispatch (full coverage); FALSE on push-to-main (the container legs run nightly +
+  # PR-path-gated, not per merge); on a PR, true only when store / cluster / server-DB tests /
+  # this workflow changed. (NB: if `sqlserver-store` is later made a *required* check in branch
+  # protection, a path-skipped run reports "skipped" — use a ruleset that treats skips as success, or
+  # switch to an always-run job whose heavy steps are step-gated, since the service container starts
+  # before steps.)
+  changes:
+    name: detect server-DB + docker changes
+    runs-on: ubuntu-latest
+    outputs:
+      serverdb: ${{ steps.f.outputs.serverdb }}
+      docker: ${{ steps.f.outputs.docker }}
+      # `code` is the docs-only short-circuit signal: TRUE unless this PR touches ONLY non-code paths
+      # (Markdown / docs / licence / editorconfig / git metadata). It gates the EXPENSIVE STEPS of the
+      # required `test` legs (and the whole `ide` job) — the jobs still run + report their (required)
+      # context, but on a docs-only PR they skip install+lint+type+test and go green in seconds. TRUE on
+      # push-to-main / workflow_dispatch (full coverage); FALSE on the nightly `schedule` (load-legs-only
+      # cron — the functional matrix must not re-run nightly).
+      code: ${{ steps.f.outputs.code }}
+      # `ide`: run the ide build job only when a PR touches ide/** or this workflow (true on
+      # push/dispatch for full coverage; false on the nightly cron). Not a required check.
+      ide: ${{ steps.f.outputs.ide }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - id: f
+        # Hoist the two workflow expressions into env (zizmor: no `${{ }}` interpolated into the run body
+        # — a branch name / base sha is attacker-influenceable on a fork PR, so it must arrive as data).
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Manual dispatch = full coverage: force every gate true so the whole workflow runs.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "serverdb=true" >> "$GITHUB_OUTPUT"
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "ide=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Push-to-main: the FUNCTIONAL gate (code) stays true — the required test legs re-run on
+          # the merge commit — but serverdb/docker are FALSE: the container legs (sqlserver-store,
+          # postgres-store, docker-smoke) run nightly + on dispatch + via the PR path-gates, so a
+          # push must no longer fire them. BOTH halves of that guard matter: their `if:` has no push
+          # arm AND these outputs are false on push — restoring EITHER half re-adds the per-merge
+          # cost. A merge touching those surfaces was already path-gated on its own PR minutes ago.
+          if [ "$EVENT_NAME" = "push" ]; then
+            echo "serverdb=false" >> "$GITHUB_OUTPUT"
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "ide=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            # Nightly run: the heavy legs fire via their own `schedule` if-arm; these outputs stay
+            # false so the functional matrix and the PR path-gate arms don't ALSO fire.
+            echo "serverdb=false" >> "$GITHUB_OUTPUT"
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "ide=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Remaining case: pull_request. Compute the path-based filters from the PR diff.
+          changed=$(git diff --name-only "$BASE_SHA...HEAD")
+          # NB: the tests/test_(...) alternation MUST list every file in the sqlserver-store /
+          # postgres-store throughput-lever pytest step below (the ADR 0057/0058/0060/0066 levers);
+          # those suites are MEFOR_TEST_SQLSERVER-gated and run ONLY on the server-DB legs, so a file
+          # not matched here edits with NO real SS/PG coverage (it merely skips the gated leg). Keep
+          # this in sync with that step (docs/throughput-build-plan.md).
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/(cluster|wiring_runner|stage_dispatcher)|messagefoundry/config/settings|messagefoundry/transports/database|tests/test_(sqlserver|postgres|cluster|database_connector|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake)|\.github/workflows/ci\.yml)'; then
+            echo "serverdb=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "serverdb=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The container image smoke runs on PRs that touch the image, the per-profile locks, packaging,
+          # or this workflow (engine-wide regressions are already covered by the `test` job + push-to-main).
+          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|pyproject\.toml|requirements\.lock|\.github/workflows/ci\.yml)'; then
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The ide job (VS Code extension build+test) only depends on ide/** (its own npm project)
+          # and this workflow; a pure-Python PR can't change its result, so don't run it there.
+          if echo "$changed" | grep -qE '^(ide/|\.github/workflows/ci\.yml)'; then
+            echo "ide=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ide=false" >> "$GITHUB_OUTPUT"
+          fi
+          # `code`: CONSERVATIVE docs-only detector. Default to running everything (code=true), and only
+          # short-circuit when EVERY changed path matches the docs/non-code allowlist below. We compute it
+          # by inverting: list the files that are NOT docs-only; if that list is empty (and the diff is
+          # non-empty), it's a docs-only PR. Anything outside the allowlist — any *.py, ide/**, config,
+          # lockfiles, OTHER workflows, scripts, samples, harness — counts as CODE and runs the full suite.
+          # A path appears in `changed` even if only deleted/renamed, so a pure doc rename still short-
+          # circuits, and a code deletion still runs.
+          #   Allowlisted (docs-only) paths: any *.md anywhere, docs/**, top-level LICENSE/NOTICE/AUTHORS,
+          #   .editorconfig, .gitignore/.gitattributes, .github/{ISSUE_TEMPLATE,PULL_REQUEST_TEMPLATE,...}.md.
+          # Be conservative: when in doubt a path is CODE. Empty diff (shouldn't happen on a PR) => code=true.
+          noncode='(\.md$|^docs/|^LICENSE$|^NOTICE$|^AUTHORS$|^\.editorconfig$|^\.gitignore$|^\.gitattributes$|^\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE))'
+          if [ -z "$changed" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          elif echo "$changed" | grep -qvE "$noncode"; then
+            # At least one changed path is NOT docs-only -> run the full suite.
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            # Every changed path is docs-only -> short-circuit the expensive steps.
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # SQL Server service-container leg: runs the gated suites that need a real SQL Server (Linux, so 1x
+  # minutes) — the PRODUCTION store backend suite AND the PRODUCTION DATABASE connector round-trip
+  # (ADR 0003/0010/0013). Runs NIGHTLY + on-demand + on PRs that touch the server-DB surface (gated
+  # by `changes` above, so docs/unrelated PRs don't pull the rate-limited mcr image). It no longer
+  # runs per push-to-main: a merge touching this surface was path-gated on its own PR minutes
+  # earlier, so the per-merge re-run re-validated unchanged content (~16x/day); a regression that
+  # somehow slips past a green PR (e.g. a semantic conflict between two concurrently-green PRs) is
+  # caught by the nightly, fix-forward. Exercises the T-SQL + the live aioodbc round-trip the
+  # SQLite / faked-driver tests can't. NOT a required check — ci-gate rolls it up (skip = pass).
+  sqlserver-store:
+    name: sql server (store + connector) ${{ matrix.label }}
+    needs: changes
+    # Nightly / on-demand, or a PR that touches the server-DB surface. `changes` sets serverdb=false
+    # on push (both halves of the no-per-merge-run guard live there — see its comment) and on
+    # schedule, where the first arm below already covers the run.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true'
+    runs-on: ubuntu-latest
+    # Matrix the gated suite across every supported SQL Server major (2022 = 16.x, 2025 = 17.x) so a
+    # version-specific T-SQL / engine regression can't merge. fail-fast: false keeps a 2025-only hiccup
+    # from cancelling the 2022 leg (and vice-versa). The `changes` path-filter still gates this on PRs, so
+    # matrixing only doubles the (rate-limited) mcr pulls on server-DB PRs + the nightly run.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "mcr.microsoft.com/mssql/server:2022-latest", label: "2022" }
+          - { image: "mcr.microsoft.com/mssql/server:2025-latest", label: "2025" }
+    services:
+      mssql:
+        image: ${{ matrix.image }}
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "Str0ng_P@ssw0rd!"
+        ports:
+          - 1433:1433
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Install Microsoft ODBC Driver 18 + sqlcmd
+        run: |
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
+          curl -fsSL "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release; echo "$VERSION_ID")/prod.list" \
+            | sudo tee /etc/apt/sources.list.d/mssql-release.list > /dev/null
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev
+
+      - name: Wait for SQL Server and create the database
+        run: |
+          sqlcmd=/opt/mssql-tools18/bin/sqlcmd
+          for i in $(seq 1 60); do  # ~120s cap: 2025's first boot can run slower than 2022's
+            if "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1; then
+              echo "SQL Server is up"; break
+            fi
+            echo "waiting for SQL Server ($i)"; sleep 2
+          done
+          "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C \
+            -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      - name: Install project (dev + sqlserver extras)
+        run: uv pip install --system -e ".[dev,sqlserver]"
+
+      - name: Run the SQL Server store suite (against the real DB)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          # The service container uses a self-signed cert, so trust_server_certificate=true is
+          # required to connect. The store's TLS-hardening guard refuses that MITM-able combination
+          # unless this escape is set — exactly the trusted-network dev/test case it exists for.
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        run: pytest tests/test_sqlserver_store.py -v
+
+      - name: Run the SQL Server coordinator suite (active-passive HA leader election)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          # Same trusted-network TLS escape as the store suite (self-signed container cert): ODBC Driver
+          # 18 defaults to Encrypt=yes + verify, so trust_server_certificate=true is required to connect,
+          # and the store's TLS-hardening guard needs MEFOR_ALLOW_INSECURE_TLS to permit it. Exercises the
+          # SqlServerCoordinator leader-lease (MERGE WITH(HOLDLOCK) acquire/renew/take-over, self-fence,
+          # membership) against the real T-SQL the faked-driver tests can't.
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        run: pytest tests/test_sqlserver_coordinator.py -v
+
+      - name: Run the SQL Server failover suite (real TTL takeover + 2-node lifecycle)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          # Same trusted-network TLS escape (self-signed container cert). Drives two coordinators sharing
+          # the store through real DB-clock lease expiry + the full start()/stop() election + failover.
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        run: pytest tests/test_cluster_failover_sqlserver.py -v
+
+      - name: Run the DATABASE connector round-trip (against the real DB)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          # The connector suite reuses the same MEFOR_STORE_* connection env + the trusted-network TLS
+          # escape (self-signed container cert), exactly like the store suite above. This is the live
+          # aioodbc/ODBC round-trip backing the connector's "production" status (PR D).
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        run: pytest tests/test_database_connector_integration.py -v
+
+      - name: Run the failover-LOAD test (two nodes, SIGKILL the primary mid-load, against the real DB)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          # Gate #3 capstone + the FIRST LIVE PROOF of the SQL Server on-promotion recovery under a real
+          # crash: two `serve` nodes share this container, the harness SIGKILLs the primary mid-load and
+          # hard-asserts the host-independent CONFORMANCE invariants (zero acknowledged loss, per-lane FIFO,
+          # no split-brain, bounded duplicates, a recovered + drained pipeline). Recovery *time* is reported,
+          # not hard-gated (host-variable — see docs/LOAD-TESTING.md). This run guards the #285 claim-FIFO
+          # fix. The orchestrator spawns the nodes with auth off + the cluster env; they inherit MEFOR_STORE_*.
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        run: pytest tests/test_load_failover_sqlserver.py -v
+
+      - name: Run the throughput-lever backend invariants on real SQL Server (B1 inline, B2 batch-claim, ...)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        # The staged-pipeline throughput levers (ADR 0057 inline fast-path, ADR 0058 batch-claim, ...) carry
+        # reliability-core invariant tests — crash-replay, poison-bound, and the per-lane-FIFO locked-head-
+        # BLOCKS (#285) gate — that are MEFOR_TEST_SQLSERVER-gated but live in their OWN files, so the named
+        # suites above never picked them up and they ran only on SQLite. Run them here against the real
+        # backend. APPEND each new lever's test file per docs/throughput-build-plan.md.
+        run: >-
+          pytest -v
+          tests/test_inline_fast_path.py
+          tests/test_batch_claim_fifo.py
+          tests/test_batch_claim_worker.py
+          tests/test_batch_claim_locking.py
+          tests/test_claim_fifo_heads.py
+          tests/test_seq_only_fifo.py
+          tests/test_fifo_index_migration.py
+          tests/test_per_lane_wake.py
+          tests/test_stage_dispatcher.py
+          tests/test_pooled_rider.py
+
+  # Postgres store backend (Track B): run the gated store suite against a real PostgreSQL service
+  # container (Linux, so 1x minutes). Runs NIGHTLY + on-demand (workflow_dispatch — use
+  # `gh workflow run ci.yml --ref <branch>` to exercise it on a feature branch) + on PRs that touch
+  # the server-DB surface (NEW: the same `changes` path-gate as sqlserver-store — a store/cluster PR
+  # now gets real-Postgres coverage PRE-merge, which it never had). No longer per push-to-main; same
+  # rationale as sqlserver-store above. This is what actually drives the SELECT ... FOR UPDATE SKIP
+  # LOCKED + advisory-lock concurrency the SQLite tests can't reach.
+  postgres-store:
+    name: postgres store
+    needs: changes
+    # Nightly / on-demand / server-DB PRs (serverdb=false on push and schedule — see `changes`).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.serverdb == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: mefor
+          POSTGRES_DB: messagefoundry
+        ports:
+          - 5432:5432
+        # Gate steps on readiness so the suite never races the container's first-boot init.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      - name: Install project (dev + postgres extras)
+        run: uv pip install --system -e ".[dev,postgres]"
+
+      - name: Run the Postgres store suite (against the real DB)
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          # The service container speaks plaintext (no TLS), so encrypt=false; the store's
+          # TLS-hardening guard refuses that MITM-able combination unless this trusted-network
+          # dev/test escape is set.
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        run: pytest tests/test_postgres_store.py -v
+
+      - name: Run the failover-LOAD test (two nodes, SIGKILL the primary mid-load, against the real DB)
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          # Gate #3 capstone: two `serve` nodes share this container; the harness SIGKILLs the primary
+          # mid-load and hard-asserts the host-independent CONFORMANCE invariants (zero acknowledged loss,
+          # per-lane FIFO, no split-brain, bounded duplicates, a recovered + drained pipeline). Recovery
+          # time is reported, not hard-gated. The orchestrator spawns the nodes with auth off + the cluster
+          # env itself; they inherit MEFOR_STORE_* (incl. the plaintext-TLS escape) from here.
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        run: pytest tests/test_load_failover_postgres.py -v
+
+      - name: Run the throughput-lever backend invariants on real Postgres (B1 inline, B2 batch-claim, ...)
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        # The throughput levers' MEFOR_TEST_POSTGRES-gated invariants (esp. the FOR-UPDATE no-SKIP-LOCKED
+        # locked-head-BLOCKS twin of #285, and the batch FIFO/crash tests) live in their own files. APPEND
+        # each new lever's test file per docs/throughput-build-plan.md.
+        run: >-
+          pytest -v
+          tests/test_inline_fast_path.py
+          tests/test_batch_claim_fifo.py
+          tests/test_batch_claim_worker.py
+          tests/test_batch_claim_locking.py
+          tests/test_claim_fifo_heads.py
+          tests/test_seq_only_fifo.py
+          tests/test_fifo_index_migration.py
+          tests/test_per_lane_wake.py
+          tests/test_stage_dispatcher.py
+          tests/test_pooled_rider.py
+
+      - name: Run the connection-scale pool-wait smoke on real Postgres (B11 wall #2, tiny pool)
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+          # FORCE a below-default pool (4 connections) so the perf_counter-measured acquire-WAIT
+          # histogram (the PRIMARY pool-wait signal) is non-trivial even at small N: ~3N inbound workers
+          # contend for 4 connections, so acquires actually queue and the percentiles populate. The
+          # default pool (40) would mask the wall. 4 (not 1-2) is deliberate: GET /status runs
+          # db_status()'s four sequential COUNT(*) queries on every poll, and an extremely tiny pool
+          # starves those acquires past the poller's HTTP timeout under the empty-claim herd on a slow
+          # runner — every poll then fails and the drain loops burn the test budget (the PR #675 hang).
+          # This still gives the B11 pool-wait instrumentation real regression coverage SQLite (no pool)
+          # cannot — the connscale harness OWNS the engine subprocess and inherits this env.
+          MEFOR_STORE_POOL_SIZE: "4"
+        run: pytest tests/test_connscale_postgres.py -v
+
+  # Headless load test (Track B / throughput): serve the synthetic high-fan-out load config (auth
+  # off, small fan-out) and drive the smoke profile through the real `python -m harness --load` CLI,
+  # asserting zero message loss + all SLOs (exit 0) and uploading the JSON/CSV report. Skipped on PRs
+  # to save spend — the in-process load integration test (tests/test_load_runner.py, in the `test`
+  # job) is the PR gate. Runs on push to main + on-demand (workflow_dispatch). Heavier profiles
+  # (fanout-baseline / soak) and the SQLite-vs-Postgres comparison are run manually — see
+  # docs/LOAD-TESTING.md.
+  load-test:
+    name: load test (smoke, sqlite)
+    # Nightly schedule + on-demand only (was: every push to main). The PR gate is the in-process
+    # tests/test_load_runner.py in the `test` job; push-to-main keeps the full functional matrix
+    # (the server-DB suites are nightly + PR-path-gated too, as of the same cost pass). This
+    # multi-minute serve+load run no longer fires once per commit. NOT a required check,
+    # so dropping it from push is safe; ci-gate `needs` it but counts a `skipped` leg as a pass.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      - name: Install project (dev — engine + httpx client; no Qt needed for the headless load path)
+        run: uv pip install --system -e ".[dev]"
+
+      - name: Serve the load config (auth off) and run the smoke profile
+        env:
+          MEFOR_AUTH_ENABLED: "false"  # the load CLI polls /stats etc. without a bearer token
+          MEFOR_LOAD_FANOUT: "8"
+          MEFOR_LOAD_RESULTS_FANOUT: "2"
+          MEFOR_LOAD_TRANSFORM: edit
+          MEFOR_LOAD_SINK_PORT: "2700"  # matches --sink-port below
+        run: |
+          set -o pipefail
+          mkdir -p out/load
+          python -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
+            --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
+          engine_pid=$!
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8765/health > /dev/null && break || sleep 0.5
+          done
+          set +e
+          python -m harness --load smoke --engine http://127.0.0.1:8765 --sink-port 2700 \
+            --report-json out/load/smoke-ci.json --report-csv out/load/smoke-ci.csv
+          rc=$?
+          set -e
+          kill "$engine_pid" 2>/dev/null || true
+          echo "===== engine log (tail) ====="; tail -50 engine.log || true
+          exit $rc
+
+      - name: Upload load report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: load-report
+          path: out/load/
+          if-no-files-found: ignore
+
+  # SQL Server throughput smoke: the same zero-loss fan-out wiring check as `load test (smoke, sqlite)`,
+  # but driven through the **SQL Server store** end-to-end (ingress→routed→outbound→delivered, each a
+  # committed server-DB round-trip) on a real mssql service container. This is the load path that caught
+  # the routed-stage `handler_name`-drop regression the in-process tests missed. Uses the `smoke-sqlserver`
+  # profile (correctness SLOs strict; drain bound sized for a server DB). Skipped on PRs to save spend —
+  # runs on push to main + on-demand (workflow_dispatch). Heavier SQL Server profiles run manually.
+  load-test-sqlserver:
+    name: load test (smoke, sqlserver) ${{ matrix.label }}
+    # Nightly schedule + on-demand only (was: every push to main); same rationale as `load-test`. The
+    # end-to-end SQL Server store path is still smoked nightly (x2 majors) + on demand, and the SQL
+    # Server functional coverage stays in `sqlserver-store` (nightly + server-DB-PR path-gate). NOT
+    # required; ci-gate treats skip as pass.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Smoke the end-to-end SQL Server store path on every supported major (2022/2025). Push/dispatch-only,
+    # so no PR cost; fail-fast: false keeps the two legs independent.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "mcr.microsoft.com/mssql/server:2022-latest", label: "2022" }
+          - { image: "mcr.microsoft.com/mssql/server:2025-latest", label: "2025" }
+    services:
+      mssql:
+        image: ${{ matrix.image }}
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "Str0ng_P@ssw0rd!"
+        ports:
+          - 1433:1433
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Install Microsoft ODBC Driver 18 + sqlcmd
+        run: |
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc > /dev/null
+          curl -fsSL "https://packages.microsoft.com/config/ubuntu/$(. /etc/os-release; echo "$VERSION_ID")/prod.list" \
+            | sudo tee /etc/apt/sources.list.d/mssql-release.list > /dev/null
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 unixodbc-dev
+
+      - name: Wait for SQL Server and create the database (RCSI on, like the store suite)
+        run: |
+          sqlcmd=/opt/mssql-tools18/bin/sqlcmd
+          for i in $(seq 1 60); do  # ~120s cap: 2025's first boot can run slower than 2022's
+            if "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C -Q "SELECT 1" > /dev/null 2>&1; then
+              echo "SQL Server is up"; break
+            fi
+            echo "waiting for SQL Server ($i)"; sleep 2
+          done
+          "$sqlcmd" -S localhost -U sa -P 'Str0ng_P@ssw0rd!' -C \
+            -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry; ALTER DATABASE MessageFoundry SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      - name: Install project (dev + sqlserver extras)
+        run: uv pip install --system -e ".[dev,sqlserver]"
+
+      - name: Serve on the SQL Server store and run the smoke-sqlserver profile
+        env:
+          MEFOR_AUTH_ENABLED: "false"  # the load CLI polls /stats etc. without a bearer token
+          MEFOR_LOAD_FANOUT: "8"
+          MEFOR_LOAD_RESULTS_FANOUT: "2"
+          MEFOR_LOAD_TRANSFORM: edit
+          MEFOR_LOAD_SINK_PORT: "2700"  # matches --sink-port below
+          MEFOR_STORE_BACKEND: sqlserver  # no --db: the backend + connection come from MEFOR_STORE_*
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          MEFOR_ALLOW_INSECURE_TLS: "1"  # trusted-network escape for the container's self-signed cert
+        run: |
+          set -o pipefail
+          mkdir -p out/load
+          python -m messagefoundry serve --config harness/config/load --env dev \
+            --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
+          engine_pid=$!
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8765/health > /dev/null && break || sleep 0.5
+          done
+          set +e
+          python -m harness --load smoke-sqlserver --engine http://127.0.0.1:8765 --sink-port 2700 \
+            --report-json out/load/smoke-sqlserver-ci.json --report-csv out/load/smoke-sqlserver-ci.csv
+          rc=$?
+          set -e
+          kill "$engine_pid" 2>/dev/null || true
+          echo "===== engine log (tail) ====="; tail -50 engine.log || true
+          exit $rc
+
+      - name: Upload load report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: load-report-sqlserver
+          path: out/load/
+          if-no-files-found: ignore
+
+  # End-to-end check of the real Windows service path on both target Server
+  # versions: install via NSSM -> start -> /health -> send an MLLP message ->
+  # confirm it was recorded -> stop -> uninstall. Nightly + on-demand only
+  # (2x-billed Windows legs): this validates the NSSM/service PLUMBING, which
+  # changes when scripts/service/ or the serve path changes — not per merge —
+  # and it was never a pre-merge gate (it already ran post-merge). Per-push it
+  # was the single biggest push-run line item (~3.6 Windows min x ~16 merges/
+  # day); the nightly keeps both Server SKUs covered daily and workflow_dispatch
+  # re-validates a specific merge on demand.
+  windows-service-smoke:
+    name: windows service smoke (${{ matrix.os }}, py${{ matrix.python-version }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows Server 2022 + 2025 on the supported deploy Python (3.14), so the real NSSM
+        # install->serve->MLLP path is validated on the version we ship, on each Server SKU. This job
+        # is push/dispatch-only, so the Windows minutes cost no PR time.
+        include:
+          - { os: windows-2022, python-version: "3.14" }
+          - { os: windows-2025, python-version: "3.14" }
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      - name: Install the engine (fhir + dicom extras)
+        run: |
+          # The samples/config graph this smoke serves uses the FHIR and DICOM connectors, and the
+          # DICOM inbound binds a DIMSE C-STORE SCP at startup (transports/dicom.py imports pynetdicom
+          # eagerly on start) — so a bare `uv pip install --system -e .` makes the engine fail-close at
+          # wiring with ModuleNotFoundError and /health never comes up. Install the connector extras the
+          # graph needs (the "real Windows service path" a user running this graph would install). Keep
+          # in sync with the connectors used in samples/config.
+          uv pip install --system -e ".[fhir,dicom]"
+
+      # Run the install/uninstall scripts under Windows PowerShell 5.1 (shell: powershell) to
+      # match what the console launches on an end-user machine — catches 5.1-only behaviour
+      # (e.g. native-command stderr aborting under ErrorActionPreference=Stop). NSSM happens to
+      # be on the runner PATH, so the auto-download path is validated locally / on the user's box.
+      - name: Install the service
+        shell: powershell
+        run: |
+          $exe = (Get-Command messagefoundry).Source
+          # Run as the 'prod' environment (ADR 0017: `serve` requires an explicit active environment;
+          # install-service.ps1 -Environment threads it into the service command + resolves
+          # environments/prod.toml). INFO not DEBUG: `serve` refuses DEBUG in prod (Gate #1 — DEBUG can
+          # surface PHI); INFO is enough to smoke service start + MLLP.
+          # -LockConfigDir: the runner checks out samples/config with the default ACL, which grants
+          # BUILTIN\Users (S-1-5-32-545) write. The in-process config-source trust guard (SEC-003,
+          # wiring._assert_safe_config_source_windows) then REFUSES to load it ("writable-by-others
+          # path") and `serve` crash-loops to SERVICE_PAUSED, so /health never comes up. Locking the
+          # config dir (strip inheritance -> SYSTEM/Administrators only; the LocalSystem service still
+          # reads it) is the production-correct posture docs/SERVICE.md prescribes, and exercises the
+          # real -LockConfigDir install path rather than the MEFOR_ALLOW_INSECURE_CONFIG_SOURCE dev escape.
+          .\scripts\service\install-service.ps1 -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir
+          # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
+          # connector LOADS its client cert at wiring time, so the engine refuses to start the graph
+          # without a readable cert+key. Mint a throwaway pair for the smoke — the smoke sends only an
+          # MLLP ADT, never a VXU, so the cert is loaded but never used in a handshake. Run openssl via
+          # `cmd /c "... 2>nul"`: it streams RSA key-gen progress to stderr, and a bare `2>$null` did NOT
+          # suppress it on the runner's openssl build — PowerShell 5.1 wrapped that stderr as a
+          # NativeCommandError and aborted the step. Redirecting at the cmd level keeps PowerShell out of
+          # openssl's stderr path entirely, so no NativeCommandError regardless of the openssl build.
+          $certDir = Join-Path $env:RUNNER_TEMP "registry-cert"
+          New-Item -ItemType Directory -Force -Path $certDir | Out-Null
+          $cert = Join-Path $certDir "client.pem"
+          $key  = Join-Path $certDir "client.key"
+          cmd /c "openssl req -x509 -newkey rsa:2048 -keyout ""$key"" -out ""$cert"" -days 1 -subj /CN=mefor-smoke -passout pass:smoke-key-pass 2>nul"
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $cert)) { throw "openssl failed to mint the smoke client cert" }
+          # `prod` is a PHI environment, so the engine FAIL-CLOSES at startup unless a store encryption
+          # key is set (PHI-at-rest must never be plaintext). Without one, `serve` refuses to start, NSSM
+          # throttles the crash-loop to SERVICE_PAUSED, and /health never comes up. Mint a throwaway AES
+          # key for the smoke — `gen-key` prints only the key (stdout, pipeable; no stderr to trip PS 5.1).
+          $storeKey = (& $exe gen-key).Trim()
+          if (-not $storeKey) { throw "messagefoundry gen-key produced no store encryption key" }
+          # This smoke validates the Windows service + MLLP plumbing, not authentication (auth is
+          # covered by the pytest suite: test_api_auth / test_console_auth). Run with auth disabled so
+          # the /messages call below needs no bearer token, and supply the registry endpoint's secrets
+          # (cert/key/password + WS-Security creds) so the SOAP feed wires — placeholders, never used
+          # since no VXU is sent; the non-secret endpoints live in environments/prod.toml (selected by
+          # the -Environment prod passed to install-service.ps1 above).
+          # `prod` also FAIL-CLOSES on unrestricted egress (a transform could send PHI anywhere): lock it
+          # down (deny_by_default) AND allowlist the samples/config graph's 8 outbound destinations, or the
+          # engine refuses to start at wiring. [egress] is SERVICE settings (MEFOR_EGRESS_*), NOT an
+          # environments/<env>.toml value; lists are comma-separated host:port matching the resolved
+          # prod.toml endpoints (MLLP->allowed_mllp; X12->allowed_tcp; SOAP+FHIR->allowed_http; File->allowed_file_dirs).
+          # NOTE keep this list in sync with samples/config when an outbound is added (e.g. OB_FHIR_SERVER) —
+          # the egress check fails fast on the FIRST denied dest, so a missing entry wedges service start.
+          # fhir-prod.example.org is allowlisted HOST-ONLY: its prod URL (https://fhir-prod.example.org/fhir)
+          # has no explicit port, so urlsplit().port is None and a ":443" suffix would NOT match (see
+          # _http_egress_allowed). A bare host matches any port, which is what we want for a default-port URL.
+          nssm set MessageFoundry AppEnvironmentExtra `
+            "MEFOR_AUTH_ENABLED=false" `
+            "MEFOR_STORE_ENCRYPTION_KEY=$storeKey" `
+            "MEFOR_EGRESS_DENY_BY_DEFAULT=true" `
+            "MEFOR_EGRESS_ALLOWED_MLLP=receiver-prod.example.org:6661,powerscribe-prod.example.org:6665" `
+            "MEFOR_EGRESS_ALLOWED_TCP=payer-prod.example.org:6662,rte-prod.example.org:6663,rte-result-prod.example.org:6664" `
+            "MEFOR_EGRESS_ALLOWED_HTTP=iis-prod.example.org:8443,fhir-prod.example.org" `
+            "MEFOR_EGRESS_ALLOWED_FILE_DIRS=out" `
+            "MEFOR_VALUE_REGISTRY_CLIENT_CERT=$cert" `
+            "MEFOR_VALUE_REGISTRY_CLIENT_KEY=$key" `
+            "MEFOR_VALUE_REGISTRY_KEY_PASSWORD=smoke-key-pass" `
+            "MEFOR_VALUE_REGISTRY_USER=smoke-user" `
+            "MEFOR_VALUE_REGISTRY_PASSWORD=smoke-pass"
+
+      - name: Start and verify /health
+        run: |
+          nssm start MessageFoundry
+          $ok = $null
+          foreach ($i in 1..30) {
+            try { $ok = Invoke-RestMethod http://127.0.0.1:8765/health -TimeoutSec 2; break }
+            catch { Start-Sleep -Milliseconds 500 }
+          }
+          if (-not $ok) { throw "engine /health never came up" }
+          "health: $($ok | ConvertTo-Json -Compress)"
+
+      - name: Send an MLLP message and confirm it was recorded
+        run: |
+          python samples\send_mllp.py samples\messages\adt_a01.hl7
+          $msgs = $null
+          foreach ($i in 1..20) {
+            $msgs = Invoke-RestMethod http://127.0.0.1:8765/messages
+            if ($msgs.total -ge 1) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          if ($msgs.total -lt 1) { throw "message was not recorded by the engine" }
+          "messages.total = $($msgs.total)"
+
+      - name: Stop the service (graceful)
+        if: always()
+        run: nssm stop MessageFoundry
+
+      - name: Show service logs
+        if: always()
+        run: |
+          $dir = "C:\ProgramData\MessageFoundry\logs"
+          foreach ($f in "service.out.log", "service.err.log") {
+            $p = Join-Path $dir $f
+            "===== $f ====="
+            if (Test-Path $p) { Get-Content $p } else { "(none)" }
+          }
+
+      - name: Uninstall the service
+        if: always()
+        shell: powershell
+        run: .\scripts\service\uninstall-service.ps1
+
+      - name: Upload service logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: service-logs-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: C:\ProgramData\MessageFoundry\logs\
+          if-no-files-found: ignore
+
+  # Container image smoke (the engine's FIRST non-Windows runtime target — it is Windows-service/NSSM
+  # first today). Builds the slim engine image, builds a test-only image that bakes a minimal ADT->file
+  # config + a self-contained MLLP sender (config baked, not mounted, so it is owned by the engine's UID
+  # and not group/world-writable — _assert_safe_config_source refuses otherwise), serves it loopback +
+  # auth-off, sends one synthetic ADT^A01 over the in-container MLLP listener, and asserts it FINALIZES
+  # to PROCESSED (not merely RECEIVED — that distinguishes ACK-on-receipt from final disposition). Then
+  # it verifies a graceful `docker stop`: tini forwards SIGTERM -> uvicorn lifespan -> engine.stop().
+  # Runs NIGHTLY + on dispatch; on PRs only when the image/locks/packaging/this workflow change
+  # (gated by `changes`), so docs/unrelated PRs don't pay the build. No longer per push-to-main —
+  # an image-touching merge was path-gated on its own PR minutes earlier (same rationale as the
+  # server-DB legs; `changes` sets docker=false on push, the other half of this guard).
+  docker-smoke:
+    name: docker image smoke (slim, linux)
+    needs: changes
+    # Nightly / on-demand, or a PR that touches the image/locks/packaging.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build the slim engine image
+        run: docker build -f docker/Dockerfile -t messagefoundry:ci .
+
+      - name: Build the -sqlserver variant (ODBC apt layer + sqlserver lock must resolve)
+        # Build-only: it pulls the Microsoft ODBC repo + installs from requirements-sqlserver.lock, so a
+        # broken hashed dep or the Debian/MS-key issue the Dockerfile warns about turns the job red here.
+        run: docker build -f docker/Dockerfile --target runtime-sqlserver -t messagefoundry:sqlserver-ci .
+
+      - name: Build the test smoke image (baked minimal config + MLLP sender)
+        run: docker build -f docker/smoke/Dockerfile --build-arg BASE=messagefoundry:ci -t messagefoundry:smoke .
+
+      - name: Serve (loopback, auth off) and assert an MLLP message reaches PROCESSED
+        run: |
+          set -euo pipefail
+          # Bind the API + MLLP to loopback INSIDE the container and drive the test from inside it
+          # (docker exec). A non-loopback bind without TLS would be refused by the startup bind guard
+          # (and auth-off is refused off-loopback regardless of --allow-insecure-bind), so loopback +
+          # in-container traffic is the correct posture for an auth-disabled smoke — no insecure override.
+          docker run -d --name mefor -e MEFOR_AUTH_ENABLED=false messagefoundry:smoke \
+            serve --config /config --env dev --host 127.0.0.1 --port 8765
+          # Readiness: /health is tokenless and always 200 once the listener is up.
+          for _ in $(seq 1 60); do
+            docker exec mefor curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && break || sleep 0.5
+          done
+          docker exec mefor curl -fsS http://127.0.0.1:8765/health
+          # Send one synthetic ADT^A01 over the in-container MLLP listener (loopback:2575); fails on a non-AA ACK.
+          docker exec mefor python /smoke/send_adt.py 127.0.0.1 2575
+          # Poll the disposition via the container's own python (stdlib urllib — no host python/jq needed).
+          total() { docker exec mefor python -c "import urllib.request,json;print(json.load(urllib.request.urlopen('http://127.0.0.1:8765/messages?status=$1'))['total'])"; }
+          processed=0
+          for _ in $(seq 1 60); do
+            # `|| processed=0`: a transient non-zero before the row finalizes must NOT abort the loop under set -e.
+            processed=$(total processed) || processed=0
+            [ "$processed" -ge 1 ] && break || sleep 0.5
+          done
+          received=$(total received) || received=0
+          echo "processed=$processed received=$received"
+          # The whole point of the assert: confirm it FINALIZED, not just that it was acknowledged-on-receipt.
+          if [ "$processed" -lt 1 ]; then
+            echo "FAIL: message did not finalize to PROCESSED (received=$received) — stuck at ACK-on-receipt"
+            exit 1
+          fi
+
+      - name: Verify graceful shutdown (tini -> SIGTERM -> engine.stop drains)
+        run: |
+          set -euo pipefail
+          docker stop --time 30 mefor
+          code=$(docker inspect -f '{{.State.ExitCode}}' mefor)
+          echo "container exit code: $code"
+          # A fully graceful shutdown exits 0 (uvicorn handles SIGTERM, runs the lifespan, returns); 143
+          # (128+SIGTERM) is acceptable too. 137 = SIGKILL after the grace expired = ungraceful.
+          if [ "$code" = "137" ]; then echo "FAIL: ungraceful shutdown (SIGKILL after grace)"; exit 1; fi
+          # Poll for the marker: `docker stop` returns the instant the container exits, but the final
+          # buffered log line ("Application shutdown complete") can land in `docker logs` a beat later, so
+          # grepping once immediately is racy (a clean 143 shutdown then read as a missing marker). Retry
+          # for ~10s so a slow log flush is not misread as an incomplete lifespan shutdown.
+          for _ in $(seq 1 20); do
+            if docker logs mefor 2>&1 | grep -q "Application shutdown complete"; then
+              echo "graceful shutdown verified"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "FAIL: no clean-shutdown marker (lifespan shutdown did not complete)"
+          docker logs mefor 2>&1 | tail -20
+          exit 1
+
+      - name: Engine log (always)
+        if: always()
+        run: docker logs mefor 2>&1 | tail -60 || true
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f mefor || true
+
+  # Single STABLE required status check standing in for the conditional / matrix heavy legs (SQL
+  # Server, Postgres, load, Windows-service smoke). Those legs CANNOT be required directly:
+  #   * the nightly/path-gated legs (`postgres-store`, `load-test`, `load-test-sqlserver`,
+  #     `windows-service-smoke`) report `skipped` on most or all PRs — never a stable required
+  #     context a PR can wait on — so requiring them either no-ops or wedges; and
+  #   * the matrix legs report an UNEXPANDED name when skipped (`... ${{ matrix.label }}`) but
+  #     EXPANDED names when they run (`... 2022`/`2025`, `(windows-2022, py3.14)`), so no single
+  #     context string matches both the skipped and the run state.
+  # This gate ALWAYS runs (if: always()), so it reports ONE fixed context ("CI gate") regardless of
+  # which legs ran, and fails iff a gated leg actually FAILED or was cancelled — a `skipped` leg
+  # counts as a pass. Require "CI gate" in branch protection INSTEAD of the individual legs; a leg
+  # that does run on a PR (e.g. `sqlserver-store` on a server-DB PR) thus still blocks the merge.
+  # NB: `docker-smoke` is intentionally NOT gated here (out of the named set) — add it to `needs`
+  # below to make a container-smoke failure block merge too.
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs:
+      - changes
+      - sqlserver-store
+      - postgres-store
+      - load-test
+      - load-test-sqlserver
+      - windows-service-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any gated leg failed or was cancelled
+        if: >-
+          contains(needs.*.result, 'failure') ||
+          contains(needs.*.result, 'cancelled')
+        env:
+          # Pass the needs context via env, not inline ${{ }} in the run block (defense-in-depth against
+          # template injection — a job output could in theory carry a quote that breaks out of echo).
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          echo "::error::A gated CI leg failed or was cancelled."
+          echo "$NEEDS_JSON"
+          exit 1
+
+      - name: Gated legs OK
+        run: echo "All gated CI legs succeeded or were skipped."

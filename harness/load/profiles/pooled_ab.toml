@@ -1,0 +1,51 @@
+# Pipeline claim-mode A/B (ADR 0066) — per_lane (today's default) vs pooled StageDispatchers, swept
+# at 500 / 1000 / 1500 inbound MLLP connections against a real engine the harness OWNS per step. The
+# claim-storm collapse is ENGINE-SIDE, so the differentiator counters (achieved throughput, the
+# SEPARATED empty-claim idle-poll/wake-fanout rates, ACK percentiles, pool-wait, CPU/FD/RSS footprint)
+# are captured per ARM and laid side by side, with a throughput non-regression guard + an idle-poll
+# collapse verdict.
+#
+# This is an OPERATOR sweep (multi-minute, large port budget, SERVER-DB store) — never CI. Run it
+# against a server DB, tagging the arms per count:
+#
+#   MEFOR_STORE_BACKEND=sqlserver MEFOR_STORE_* ... \
+#     python -m harness --connscale pooled_ab \
+#       --report-json out/pooled_ab.json --report-compare out/pooled_ab.txt
+#
+# claim_mode=pooled fails CLOSED at engine startup if READ_COMMITTED_SNAPSHOT is OFF on the target DB
+# (require_rcsi_for_pooled=true, the default). So a pooled arm on an RCSI-off DB is REPORTED MISSING
+# (the harness never silently compares per_lane against nothing) — set RCSI ON on the target DB, or
+# MEFOR_PIPELINE_REQUIRE_RCSI_FOR_POOLED=false for a smoke (production wants RCSI ON). SQLite/Postgres
+# have no RCSI gate.
+#
+# All values synthetic + generic. See docs/LOAD-TESTING.md.
+
+[connscale]
+name = "pooled_ab"
+description = "Claim-mode A/B (ADR 0066): per_lane vs pooled at 500/1000/1500, fixed aggregate rate"
+# The A/B axis: run BOTH claim modes as the OUTER loop (each mode gets a full counts sweep).
+claim_modes = ["per_lane", "pooled"]
+counts = [500, 1000, 1500]
+# fixed_aggregate holds a MODEST constant aggregate across N (per-conn rate falls as N rises), so the
+# only thing rising with N is idle-connection machinery — exactly where per_lane's ~3N-worker claim
+# storm diverges from pooled's K-claimer-per-stage floor. A single sweep mode keeps the A/B focused on
+# the claim-mode contrast (not also the load+scale axis).
+sweep_mode = "fixed_aggregate"
+aggregate_rate = 400.0
+per_conn_rate = 0.35
+hold_seconds = 30.0
+connect_batch = 50
+connect_batch_pause_s = 0.05
+poll_interval_s = 1.0
+drain_timeout_s = 300.0
+base_port = 2600
+transform = "cheap"
+# The A/B is about steady-state claim machinery, not reload latency — leave wall #5 off.
+reload_probe = false
+store_backend = "sqlserver"
+corpus_count_per_trigger = 20
+
+[connscale.slo]
+# Correctness gate: no message loss at any N in either arm, and the backlog drains. The A/B verdict
+# (throughput non-regression + idle-poll collapse) is computed by the comparison report on top of this.
+zero_loss = true

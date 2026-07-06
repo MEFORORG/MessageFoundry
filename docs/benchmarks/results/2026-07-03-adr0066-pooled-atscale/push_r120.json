@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "kind": "connscale",
+  "profile": "pooled_push",
+  "engine_url": "http://127.0.0.1:8800",
+  "db_backend": "sqlserver",
+  "executor_shim_installed": true,
+  "result": "PASS",
+  "exit_code": 0,
+  "coverage": "coverage: all walls measured.",
+  "records": [
+    {
+      "claim_mode": "pooled",
+      "sweep_mode": "fixed_aggregate",
+      "count": 1500,
+      "offered_aggregate_rate": 120.0,
+      "achieved": {
+        "read_per_s": 104.42,
+        "written_per_s": 104.44
+      },
+      "cpu": {
+        "seconds_total": 238.781,
+        "util_cores_peak": 2.185,
+        "util_cores_mean": 2.007
+      },
+      "working_set": {
+        "peak_bytes": 260046848
+      },
+      "traffic": {
+        "sent": 14399,
+        "acked": 14399,
+        "nak": 0,
+        "deferred": 0,
+        "timeouts": 0,
+        "in_pipeline_peak": 4027,
+        "drain_seconds": 15.877404099999694
+      },
+      "no_loss": {
+        "ok": true,
+        "sent": 14399,
+        "engine_read": 14399,
+        "engine_written": 14399,
+        "sink_received": 14399,
+        "backlog": 0,
+        "detail": "read>=sent, sink_received>=written, backlog drained"
+      },
+      "wall1_executor": {
+        "queue_depth_peak": 69,
+        "busy_peak": 80
+      },
+      "wall2_pool_wait": {
+        "p50_ms": 0.05,
+        "p95_ms": 2500.0,
+        "p99_ms": 2500.0,
+        "max_ms": 6381.333499999528,
+        "idle_min": 1,
+        "size_max": 40
+      },
+      "wall3_empty_claims": {
+        "total_per_s": 64.7,
+        "idle_poll_per_s": 9.1,
+        "wake_fanout_per_s": 55.6
+      },
+      "wall4_fd": {
+        "count_peak": 5394
+      },
+      "wall5_reload": {
+        "seconds": null
+      },
+      "wall6_ack_ms": {
+        "p50": 490.344,
+        "p95": 1628.063,
+        "p99": 2579.012
+      }
+    }
+  ],
+  "slo": [
+    {
+      "name": "zero_loss",
+      "threshold": true,
+      "observed": true,
+      "ok": true
+    }
+  ],
+  "notes": []
+}
