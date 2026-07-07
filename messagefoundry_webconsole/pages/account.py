@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 
 from messagefoundry.api.auth_models import CurrentUser, MfaStatusResponse
 
-from .._html import Markup, el, page, register_nav
+from .._html import Markup, el, page, register_nav, wordmark
 
 __all__ = [
     "account_page",
@@ -93,7 +93,7 @@ def login(
         if sso_enabled
         else Markup("")
     )
-    body = el("div", el("h1", "MessageFoundry"), banner, form, sso, class_="card")
+    body = el("div", el("h1", wordmark(tm=True)), banner, form, sso, class_="card")
     # A bare page (no nav) for the unauthenticated login screen.
     return page("Sign in", body, nav=Markup(""))
 

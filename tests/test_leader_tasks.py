@@ -150,8 +150,14 @@ class _RecordingStore:
         self.state_convergence_enabled = False
 
     async def reset_stale_inflight(
-        self, now: float | None = None, *, stage: str | None = None
+        self,
+        now: float | None = None,
+        *,
+        stage: str | None = None,
+        owned: object | None = None,
     ) -> int:
+        # `owned` mirrors the ADR 0073 protocol kwarg — the no-registry engine passes owned=None
+        # (global reset), so the spy only needs to accept it, not model the scoping.
         self.reset_calls += 1
         return 0
 

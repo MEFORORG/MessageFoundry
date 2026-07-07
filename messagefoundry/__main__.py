@@ -1209,6 +1209,22 @@ def _serve(args: argparse.Namespace) -> int:
         from messagefoundry.config.wiring import Registry
         from messagefoundry.pipeline.sharding import filter_registry_for_shard
 
+        # ADR 0073: engine sharding and [cluster] active-passive are mutually exclusive, fail-closed.
+        # The cluster leadership lease is store-wide, so leadership would transfer ACROSS shard ids —
+        # and a promoted shard's ownership-scoped recovery would then skip (permanently strand) the
+        # dead prior leader shard's in-flight lanes. HA for a sharded fleet is the supervisor's
+        # restart-on-exit per shard, not [cluster].
+        if settings.cluster is not None and settings.cluster.enabled:
+            print(
+                "error: --shard cannot be combined with [cluster].enabled — engine sharding (ADR "
+                "0037/0073) and active-passive clustering use incompatible recovery models (the "
+                "store-wide leadership lease would transfer across shard ids). Disable [cluster] "
+                "for a sharded fleet (the supervisor restarts crashed shards), or run clustered "
+                "without --shard.",
+                file=sys.stderr,
+            )
+            return 2
+
         shard_id: str = args.shard
 
         def registry_filter(reg: Registry) -> Registry:  # noqa: F811 (local shard-bound closure)
@@ -1241,6 +1257,7 @@ def _serve(args: argparse.Namespace) -> int:
         infra_fault_backoff_cap=settings.pipeline.infra_fault_backoff_cap,
         fuse_thread_hops=settings.pipeline.fuse_thread_hops,
         pooled_fusing_workers=settings.pipeline.pooled_fusing_workers,
+        batch_handoff_statements=settings.pipeline.batch_handoff_statements,
         connection_events=settings.diagnostics.connection_events,
         response_sent_default=settings.diagnostics.response_sent,
         env_values_provider=env_values,

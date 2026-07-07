@@ -18,12 +18,16 @@ Design rationale (captured here for a future ADR; see also ``docs/design/multipr
   fan a single source across shards and break per-channel FIFO. Per-connection keeps it
   invisible-simple: tag a connection, done.
 
-* **Intake is partitioned; outbound + logic are shared.** A shard's registry contains ONLY its
-  inbound connections, but the SAME outbound connections, routers, handlers, references and lookups
-  as every other shard. Routers/handlers are pure functions (no per-process state), and an outbound
-  connection is independently re-bindable per process, so sharing the definitions is sound: each
-  shard process builds its own delivery worker(s) for the outbounds its handlers actually send to.
-  Only the listening/intake side is split across processes.
+* **Intake is partitioned; outbound + logic are shared — but delivery is single-consumer.** A
+  shard's registry contains ONLY its inbound connections, but the SAME outbound connections,
+  routers, handlers, references and lookups as every other shard. Routers/handlers are pure
+  functions (no per-process state), so sharing the definitions is sound. **Amended by ADR 0073:**
+  each outbound *lane* is CLAIMED by exactly ONE shard — the deterministic rendezvous owner
+  (:func:`owner_shard_of_destination`) — because on a unified store N concurrent head-claimers on
+  one FIFO lane can invert per-lane delivery order, and crash recovery needs an unambiguous owner
+  per lane. Every shard still *builds* every outbound connector (status/reload/dead-letter sweeps
+  key off the full map); only claiming/delivering is gated to the owner. A shard's handlers may
+  Send to any outbound — a non-owned lane's rows are drained by the owning shard.
 
 * **One SQLite db file + one API port per shard.** Each subprocess owns an independent WAL store
   (``<stem>_<shard>.db``) so there is no cross-process write contention on the message store, and an
@@ -47,6 +51,7 @@ event loop and no process state, so they are safe to call from the loader, the e
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 
 from messagefoundry.config.settings import StoreBackend
@@ -103,6 +108,42 @@ def require_unified_store(store_backend: StoreBackend, ids: Sequence[str]) -> No
         )
 
 
+def owner_shard_of_destination(dest: str, ids: Sequence[str]) -> str:
+    """The single shard that owns CLAIMING/DELIVERY for outbound lane ``dest`` (ADR 0073).
+
+    Rendezvous (highest-random-weight) hashing over the pinned shard universe ``ids``: every process
+    that knows the same universe derives the same owner with **no runtime coordination**. Three
+    properties the recovery design leans on:
+
+    * **Restart-stable** — ``hashlib.sha256`` (never the salted builtin ``hash``), so the owner of a
+      lane is identical across processes, restarts and machines.
+    * **Total over any lane name** — a destination dropped from config but still draining its queued
+      rows keeps exactly one owner (the universe, not the destination set, decides).
+    * **Minimal disruption** — adding/removing a destination never moves another lane; adding or
+      removing a shard id moves only ~1/N of lanes (why the universe must change only under a
+      coordinated fleet restart — see the reload refusal in ``Engine.reload``).
+
+    Ties are broken deterministically (candidates iterate sorted). Raises :class:`ValueError` on an
+    empty universe — callers gate on a sharded registry, which always pins a non-empty one.
+    """
+    universe = sorted(set(ids))
+    if not universe:
+        raise ValueError("owner_shard_of_destination: empty shard universe")
+    return max(universe, key=lambda s: hashlib.sha256(f"{dest}\x00{s}".encode()).digest())
+
+
+def owned_destination_set(registry: Registry, shard: str, ids: Sequence[str]) -> frozenset[str]:
+    """Every ``registry`` outbound lane owned by ``shard`` under the pinned universe ``ids``.
+
+    The set form of :func:`owner_shard_of_destination` for callers that need concrete names — the
+    ownership-scoped startup recovery (``OwnedLanes.destinations``) and the non-owned-lane watchdog.
+    Claim-path gates should prefer the predicate: it stays total over names a reload has already
+    dropped from ``registry.outbound``."""
+    return frozenset(
+        dest for dest in registry.outbound if owner_shard_of_destination(dest, ids) == shard
+    )
+
+
 def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
     """A :class:`Registry` exposing ONLY ``shard``'s inbound connections, sharing everything else.
 
@@ -112,12 +153,20 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
     Pure and non-mutating: the source registry is untouched and the shared sub-maps are reused by
     reference (they are read-only at run time), so this is cheap to call on every reload.
 
+    When the (unfiltered) config names **more than one** shard, the result also carries the shard
+    identity (``shard_id`` + the pinned ``all_shard_ids`` universe) that arms the ADR 0073
+    sharded-mode behaviors: ownership-scoped startup recovery, the single-delivery-consumer-per-
+    outbound-lane gates, and the shard-set reload refusal. A single-shard config attaches neither —
+    it stays byte-identical to plain ``serve`` everywhere.
+
     Raising is intentionally avoided for an empty result — a shard id that matches no inbound yields
     an empty-intake registry; the caller (``serve --shard``) decides whether that is an error.
     """
     selected = {
         name: conn for name, conn in registry.inbound.items() if shard_of(conn.shard) == shard
     }
+    ids = shard_ids(registry)
+    sharded = len(ids) > 1
     return Registry(
         inbound=selected,
         outbound=registry.outbound,
@@ -126,4 +175,7 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
         code_sets=registry.code_sets,
         references=registry.references,
         lookups=registry.lookups,
+        fhir_lookups=registry.fhir_lookups,
+        shard_id=shard if sharded else None,
+        all_shard_ids=tuple(ids) if sharded else None,
     )

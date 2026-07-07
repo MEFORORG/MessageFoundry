@@ -57,6 +57,7 @@ from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import VerifyResult, run_restore_verify
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import Store
+from messagefoundry.store.store import OwnedLanes
 
 __all__ = ["DrCoordinator", "DrActivationError", "DrResult"]
 
@@ -114,6 +115,7 @@ class DrCoordinator:
         config_fingerprint: str | None = None,
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
+        owned_lanes: Callable[[], OwnedLanes | None] | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -125,6 +127,12 @@ class DrCoordinator:
         self._config_fingerprint = config_fingerprint
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._clock = clock
+        # ADR 0073: the engine's ownership scope for the activation recovery reset. On a SHARDED DR
+        # fleet the shards activate one by one against the SAME restored store, so a global reset on
+        # the second activation would re-pend rows the first is already mid-processing — the exact
+        # cross-shard clobber the scoped startup reset removes. None/None-returning = global (the
+        # unsharded DR box, where "no live siblings" genuinely holds).
+        self._owned_lanes = owned_lanes
         # Whether the DR run-profile is currently on (mirrors the engine's _dr_active; the engine seeds
         # it from [dr].activate at construction and this coordinator flips it on activate/release).
         self._active = bool(settings.enabled and settings.activate)
@@ -184,8 +192,11 @@ class DrCoordinator:
 
             # (2) Recover the cold-restored store (every stage, AC-15) + open a NEW audit-chain segment
             # (the seed-marker genesis; do NOT blindly extend the restored chain — ADR 0049/0041).
+            # Ownership-scoped when sharded (ADR 0073) — see _owned_lanes in __init__.
             try:
-                await self._store.reset_stale_inflight()
+                await self._store.reset_stale_inflight(
+                    owned=self._owned_lanes() if self._owned_lanes is not None else None
+                )
             except (
                 Exception
             ) as exc:  # a store that can't recover its own residue can't safely serve

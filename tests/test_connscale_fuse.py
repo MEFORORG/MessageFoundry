@@ -167,6 +167,8 @@ def _rec(
     no_loss_ok: bool = True,
     offered: float = 400.0,
     written: float | None = None,
+    drain_seconds: float | None = 1.0,
+    backlog: int = 0,
 ) -> ConnScaleRecord:
     written = read if written is None else written
     detail = "ok" if no_loss_ok else f"lost {sent - sink_received}"
@@ -178,9 +180,9 @@ def _rec(
         acked=sent,
         nak=0,
         deferred=0,
-        no_loss=NoLoss(no_loss_ok, sent, sent, sink_received, sink_received, 0, detail),
+        no_loss=NoLoss(no_loss_ok, sent, sent, sink_received, sink_received, backlog, detail),
         in_pipeline_peak=in_pipeline,
-        drain_seconds=1.0,
+        drain_seconds=drain_seconds,
         executor_queue_depth_peak=None,
         executor_busy_peak=None,
         pool_wait_p50_ms=None,
@@ -273,16 +275,94 @@ def test_no_go_when_b1_breaches_zero_loss() -> None:
     assert not cmp.ok  # a zero-loss breach fails the run's correctness fold
 
 
-def test_no_go_when_in_pipeline_grows() -> None:
-    # B1's intake is higher but its in_pipeline peak grew far past B0's ⇒ backlog mirage ⇒ NO-GO.
-    recs = _trials(False, [100.0, 101.0, 99.0], in_pipeline=100) + _trials(
-        True, [130.0, 131.0, 129.0], in_pipeline=500
+def test_no_go_when_drain_time_grows() -> None:
+    # B1's intake is higher but its post-load DRAIN TIME grew far past B0's ⇒ the higher intake rode a
+    # larger backlog ⇒ NO-GO. Read from the AUTHORITATIVE drain signal, NOT the /stats-poller
+    # in_pipeline peak (ADR 0071 §10 item 8): the poller both arms drain to the same peak here, so the
+    # old peak clause could not see this — the drain time can. Both arms fully drained (finite drain
+    # time), so this is not a zero-loss breach, just a slower flush behind the inflated intake.
+    recs = _trials(False, [100.0, 101.0, 99.0], drain_seconds=1.0) + _trials(
+        True, [130.0, 131.0, 129.0], drain_seconds=10.0
     )
     cmp = build_fuse_comparison(recs, (False, True))
     assert cmp is not None
     row = cmp.rows[0]
     assert row.verdict == FUSE_NO_GO
     assert not row.in_pipeline_ok
+    assert "drain time grew" in row.reason
+
+
+def test_in_pipeline_ok_ignores_poller_peak_spike() -> None:
+    # The exact defect (ADR 0071 §10 item 8): B1's /stats-poller in_pipeline peak reads far HIGHER than
+    # B0's (poller under-sampling), yet B1 fully drained and drained FASTER. The OLD peak clause would
+    # have mis-fired NO-GO; the authoritative drain guard passes it.
+    recs = _trials(False, [100.0, 101.0, 99.0], in_pipeline=1369, drain_seconds=158.0) + _trials(
+        True, [130.0, 131.0, 129.0], in_pipeline=21969, drain_seconds=143.0
+    )
+    cmp = build_fuse_comparison(recs, (False, True))
+    assert cmp is not None
+    row = cmp.rows[0]
+    # OLD clause (poller peak) would be False here; NEW (drain) is True.
+    old_clause = row.candidate is not None and row.candidate.in_pipeline_peak <= (
+        row.baseline.in_pipeline_peak * 1.05 + 1.0
+    )
+    assert not old_clause
+    assert row.in_pipeline_ok
+
+
+def test_no_go_when_candidate_drain_times_out_despite_empty_outbound() -> None:
+    # The MEDIUM the drain guard MUST catch (adversarial re-review): a candidate that STRANDS rows in
+    # ingress/routed drains its OUTBOUND queue (backlog 0) and passes the outbound-only zero-loss
+    # reconcile, but await_drain TIMED OUT (drain_seconds=None → the whole-pipeline in_pipeline gauge
+    # never reached 0). That is the overload backlog mirage: it must be NO-GO, never a FALSE GO.
+    # delivered/offered alone can't catch a sub-2% strand, so this is the only backstop.
+    recs = _trials(False, [100.0, 101.0, 99.0], drain_seconds=1.0) + _trials(
+        True, [130.0, 131.0, 129.0], drain_seconds=None, backlog=0
+    )
+    cmp = build_fuse_comparison(recs, (False, True))
+    assert cmp is not None
+    row = cmp.rows[0]
+    assert row.candidate is not None
+    assert row.candidate.drain_seconds_worst is None  # timed-out drain poisons the worst case
+    assert not row.candidate.drain_completed
+    assert (
+        row.delivered_offered_ok
+    )  # delivered/offered == 1.0 — it would NOT have caught the strand
+    assert not row.in_pipeline_ok
+    assert row.verdict == FUSE_NO_GO
+    assert "did not fully drain" in row.reason and "await_drain timed out" in row.reason
+
+
+def test_single_timed_out_trial_poisons_candidate_drain_worst() -> None:
+    # Aggregation: ONE timed-out trial among otherwise-clean ones must poison the arm's worst-case drain
+    # (a partial strand is still a strand) — drain_seconds_worst → None → in_pipeline_ok False. The old
+    # `max(finite drains)` silently DROPPED the None trial and could false-pass.
+    recs = _trials(False, [100.0, 101.0, 99.0], drain_seconds=1.0) + [
+        _rec(fuse=True, read=130.0, drain_seconds=2.0),
+        _rec(fuse=True, read=131.0, drain_seconds=None),  # this trial's drain timed out
+        _rec(fuse=True, read=129.0, drain_seconds=2.0),
+    ]
+    cmp = build_fuse_comparison(recs, (False, True))
+    assert cmp is not None
+    row = cmp.rows[0]
+    assert row.candidate is not None and row.candidate.drain_seconds_worst is None
+    assert not row.in_pipeline_ok
+    assert row.verdict == FUSE_NO_GO
+
+
+def test_baseline_drain_timeout_does_not_fail_a_fully_draining_candidate() -> None:
+    # Asymmetric None handling: if the B0 BASELINE drowned (drain timed out) but B1 fully drained, B1 is
+    # unambiguously flat-or-lower — in_pipeline_ok True (the drowning is B0's problem; B1 held). Guards
+    # the None-condition ordering: a candidate FAIL is checked first, a baseline None auto-passes.
+    recs = _trials(False, [40.0, 41.0, 39.0], drain_seconds=None) + _trials(
+        True, [130.0, 131.0, 129.0], drain_seconds=2.0
+    )
+    cmp = build_fuse_comparison(recs, (False, True))
+    assert cmp is not None
+    row = cmp.rows[0]
+    assert row.candidate is not None and row.candidate.drain_seconds_worst == 2.0
+    assert row.baseline.drain_seconds_worst is None and not row.baseline.drain_completed
+    assert row.in_pipeline_ok
 
 
 def test_no_go_when_delivered_offered_below_floor() -> None:

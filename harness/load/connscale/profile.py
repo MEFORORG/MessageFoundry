@@ -48,6 +48,16 @@ CLAIM_MODES = frozenset({PER_LANE, POOLED})
 FUSE_OFF = False
 FUSE_ON = True
 
+#: Statement-batching on/off A/B axis (ADR 0075 Bench B). ``False`` is B0 (batching OFF, today's
+#: default); ``True`` is B1 (batching ON — the engine reads it per-process from
+#: MEFOR_PIPELINE_BATCH_HANDOFF_STATEMENTS, which the runner injects per arm). Batching only activates
+#: on **SQL Server** (it is a provable no-op on Postgres / SQLite, ADR 0075). Default ``(False,)`` so
+#: every pre-existing profile keeps its single-arm sweep byte-identical. This lever does NOT compose
+#: with fusion (ADR 0075), so a multi-arm ``batch_modes`` pins ``fuse_modes = [false]`` (validated
+#: below), and the two boolean axes are never both multi-arm in one profile.
+BATCH_OFF = False
+BATCH_ON = True
+
 _CONNSCALE_KEYS = frozenset(
     {
         "name",
@@ -55,6 +65,7 @@ _CONNSCALE_KEYS = frozenset(
         "counts",
         "claim_modes",
         "fuse_modes",
+        "batch_modes",
         "trials",
         "per_conn_rate",
         "aggregate_rate",
@@ -133,6 +144,13 @@ class ConnScaleProfile:
     # multi-arm ``fuse_modes`` pairs with ``claim_modes = ["pooled"]`` (the two A/B axes are not both
     # multi-arm in one profile — validated below).
     fuse_modes: tuple[bool, ...] = (FUSE_OFF,)
+    # The statement-batching A/B axis (ADR 0075 Bench B). Default single-arm ``(False,)`` so every
+    # pre-existing profile sweeps byte-identically (batching off is the engine default); ``[false,
+    # true]`` runs both B0 (batching off) and B1 (batching on) arms per (claim_mode, fuse, count) cell.
+    # Batching is SQL-Server-scoped and does NOT compose with fusion (ADR 0075), so a multi-arm
+    # ``batch_modes`` pins ``claim_modes = ["pooled"]`` + ``fuse_modes = [false]`` — at most ONE of the
+    # three A/B axes may be multi-arm in a single profile (validated below).
+    batch_modes: tuple[bool, ...] = (BATCH_OFF,)
     # How many TRIALS to bank per arm in ONE invocation (ADR 0071 §6.4b, B5 PR5). Default ``1`` = the
     # pre-PR5 single-trial-per-cell behavior, so every pre-existing profile sweeps byte-identically. Set
     # ``>= 2`` (fuse_ab ships 3) so the fusion GO/NO-GO's ">2σ" spread guard has real trial-to-trial
@@ -191,13 +209,17 @@ def load_connscale_profile_text(text: str, *, where: str = "<text>") -> ConnScal
 
 def list_connscale_profiles() -> dict[str, str]:
     """Built-in profile name → description, read from the connection-scale profile TOMLs
-    (``connscale*.toml`` plus the ``pooled*`` claim-mode A/B and ``fuse*`` fusion A/B profiles)."""
+    (``connscale*.toml`` plus the ``pooled*`` claim-mode A/B, ``fuse*`` fusion A/B, and ``batch*``
+    statement-batching A/B profiles). Keep the glob set in step with
+    ``tests/test_load_config.py::test_all_shipped_profiles_parse`` (which EXCLUDES the same set — a
+    connscale-schema profile is not a [load] profile)."""
     out: dict[str, str] = {}
     paths = sorted(
         {
             *PROFILES_DIR.glob("connscale*.toml"),
             *PROFILES_DIR.glob("pooled*.toml"),
             *PROFILES_DIR.glob("fuse*.toml"),
+            *PROFILES_DIR.glob("batch*.toml"),
         }
     )
     for path in paths:
@@ -234,6 +256,7 @@ def _profile_from_data(data: dict[str, Any], *, where: str) -> ConnScaleProfile:
     counts = _counts_from(cs.get("counts"), f"{where} [connscale]")
     claim_modes = _claim_modes_from(cs.get("claim_modes"), f"{where} [connscale]")
     fuse_modes = _fuse_modes_from(cs.get("fuse_modes"), f"{where} [connscale]")
+    batch_modes = _batch_modes_from(cs.get("batch_modes"), f"{where} [connscale]")
     sweep_mode = (_opt_str(cs, "sweep_mode", f"{where} [connscale]") or "both").strip().lower()
     if sweep_mode not in SWEEP_MODES:
         raise ConnScaleProfileError(
@@ -296,6 +319,7 @@ def _profile_from_data(data: dict[str, Any], *, where: str) -> ConnScaleProfile:
         slo=_slo_from(cs.get("slo"), f"{where} [connscale.slo]"),
         claim_modes=claim_modes,
         fuse_modes=fuse_modes,
+        batch_modes=batch_modes,
         # >= 1 trials per arm (ADR 0071 B5 PR5); default 1 = the pre-PR5 single-trial sweep. Non-int or
         # < 1 fails loud via _opt_int (mirroring the other scalars).
         trials=_opt_int(cs, "trials", f"{where} [connscale]", default=1, minimum=1),
@@ -316,16 +340,28 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
             f"{where}: base_port {profile.base_port} + max count {max(profile.counts)} runs past "
             f"port 65535 (highest inbound port would be {top})"
         )
-    # The two A/B axes (claim_modes, fuse_modes) each pair records ONE axis at a time; a profile that
-    # made BOTH multi-arm would produce 4 arms per (sweep_mode, count) cell and each comparison's
-    # single-axis keying would silently collapse them. Fusion is pooled-only anyway, so the supported
-    # shape is a multi-arm fuse_modes with claim_modes = ["pooled"] (or vice-versa). Fail loud.
-    if len(profile.claim_modes) > 1 and len(profile.fuse_modes) > 1:
+    # The three A/B axes (claim_modes, fuse_modes, batch_modes) each pair records ONE axis at a time; a
+    # profile that made two multi-arm would produce >2 arms per (sweep_mode, count) cell and each
+    # comparison's single-axis keying would silently collapse them. Fusion + statement-batching are
+    # pooled/SQL-Server-only and don't compose (ADR 0075), so the supported shape is EXACTLY ONE multi-
+    # arm boolean axis paired with claim_modes = ["pooled"] (or a multi-arm claim_modes A/B alone). Fail
+    # loud if more than one axis is multi-arm.
+    multi_arm = [
+        name
+        for name, axis in (
+            ("claim_modes", profile.claim_modes),
+            ("fuse_modes", profile.fuse_modes),
+            ("batch_modes", profile.batch_modes),
+        )
+        if len(axis) > 1
+    ]
+    if len(multi_arm) > 1:
         raise ConnScaleProfileError(
-            f"{where}: claim_modes and fuse_modes cannot BOTH be multi-arm in one profile — each A/B "
-            f"comparison pairs one axis at a time (fusion is pooled-only: use claim_modes = ['pooled'] "
-            f"with fuse_modes = [false, true]); got claim_modes={list(profile.claim_modes)}, "
-            f"fuse_modes={list(profile.fuse_modes)}"
+            f"{where}: {' and '.join(multi_arm)} cannot BOTH be multi-arm in one profile — each A/B "
+            f"comparison pairs one axis at a time (fusion + statement-batching are pooled/SQL-Server-"
+            f"only and don't compose, ADR 0075: use claim_modes = ['pooled'] with exactly ONE of "
+            f"fuse_modes / batch_modes = [false, true]); got claim_modes={list(profile.claim_modes)}, "
+            f"fuse_modes={list(profile.fuse_modes)}, batch_modes={list(profile.batch_modes)}"
         )
 
 
@@ -371,6 +407,29 @@ def _fuse_modes_from(raw: Any, where: str) -> tuple[bool, ...]:
         if not isinstance(item, bool):
             raise ConnScaleProfileError(
                 f"{where}: every 'fuse_modes' entry must be a boolean true/false, got {item!r}"
+            )
+        if item not in out:
+            out.append(item)
+    return tuple(out)
+
+
+def _batch_modes_from(raw: Any, where: str) -> tuple[bool, ...]:
+    """Parse the ``batch_modes`` statement-batching A/B axis (ADR 0075 Bench B). Absent → ``(False,)``
+    (single-arm, byte-identical to a pre-existing profile: batching OFF is the engine default). Present
+    → a non-empty list of TOML booleans (``false`` = B0 batching off, ``true`` = B1 batching on),
+    de-duplicated with first-seen order preserved (so the report's baseline B0 arm is stable). Mirrors
+    :func:`_fuse_modes_from` — an int like ``1``/``0`` is rejected, not silently read as on/off."""
+    if raw is None:
+        return (BATCH_OFF,)
+    if not isinstance(raw, list) or not raw:
+        raise ConnScaleProfileError(
+            f"{where}: 'batch_modes' must be a non-empty list of booleans (e.g. [false, true])"
+        )
+    out: list[bool] = []
+    for item in raw:
+        if not isinstance(item, bool):
+            raise ConnScaleProfileError(
+                f"{where}: every 'batch_modes' entry must be a boolean true/false, got {item!r}"
             )
         if item not in out:
             out.append(item)

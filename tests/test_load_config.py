@@ -218,10 +218,11 @@ def test_guard_actually_scans_files() -> None:
 def test_all_shipped_profiles_parse() -> None:
     # Every shipped LOAD profile must parse cleanly — guards against a typo'd/renamed key shipping a
     # broken profile (the failure mode that left matrix row H1 pointing at a nonexistent "steady"
-    # profile). connscale*/pooled*/fuse*.toml are a DIFFERENT schema ([connscale], not [load]) consumed
-    # by the --connscale CLI (covered by test_connscale_profile.py / test_connscale_fuse.py) — exactly
-    # the set that list_connscale_profiles() globs (connscale*, pooled*, fuse*) — so they are excluded
-    # here. Keep this in step with harness.load.connscale.profile.list_connscale_profiles().
+    # profile). connscale*/pooled*/fuse*/batch*.toml are a DIFFERENT schema ([connscale], not [load])
+    # consumed by the --connscale CLI (covered by test_connscale_profile.py / test_connscale_fuse.py /
+    # test_connscale_batch.py) — exactly the set that list_connscale_profiles() globs (connscale*,
+    # pooled*, fuse*, batch*) — so they are excluded here. Keep this in step with
+    # harness.load.connscale.profile.list_connscale_profiles().
     profiles = [
         p
         for p in sorted(PROFILES_DIR.glob("*.toml"))
@@ -229,6 +230,7 @@ def test_all_shipped_profiles_parse() -> None:
             p.name.startswith("connscale")
             or p.name.startswith("pooled")
             or p.name.startswith("fuse")
+            or p.name.startswith("batch")
         )
     ]
     assert len(profiles) >= 8, "expected the shipped profile set; did the directory move?"

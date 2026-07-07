@@ -332,7 +332,7 @@ Keep the message store on a fast *local* disk, not a network share — the stage
 
 - **Store.** SQLite (WAL) is the bundled, zero-setup default for single-node; **PostgreSQL 13+** or **SQL Server 2022/2025** for production (run the server DB on its own host; SQL Server also needs the OS-level ODBC Driver 18, RCSI recommended). MySQL/Oracle aren’t supported.
 
-- **Clients.** The PySide6 desktop console and the VS Code extension, plus an **opt-in read-only browser ops dashboard** served under `/ui` (`[api].serve_ui`, off by default — [ADR 0065](adr/0065-web-ops-dashboard.md)). No web browser is needed to operate the engine; one is needed only to use the `/ui` dashboard.
+- **Clients.** The PySide6 desktop console and the VS Code extension, plus an **opt-in browser ops dashboard** served under `/ui` (`[api].serve_ui`, off by default — [ADR 0065](adr/0065-web-ops-dashboard.md)). The `/ui` dashboard is **not** in the engine wheel: it ships as a separately-versioned second distribution (`messagefoundry-webconsole`) that the engine **mounts same-origin, in-process** — install it alongside the engine to use `serve_ui` ([WEBCONSOLE-PACKAGE.md](WEBCONSOLE-PACKAGE.md)). No web browser is needed to operate the engine; one is needed only to use the `/ui` dashboard.
 
 - **Network.** The engine API binds 127.0.0.1:8765 by default (auth-required; in-process TLS for off-loopback exposure); inbound MLLP/TCP listeners use operator-defined ports on a trusted segment; outbound reachability (and, for a server DB, the DB host) as configured.
 

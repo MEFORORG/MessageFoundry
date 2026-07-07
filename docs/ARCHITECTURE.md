@@ -298,7 +298,7 @@ for transport, and **retention/purge** enforcement.
 | `messagefoundry.transports` | Inbound & outbound connections (MLLP, file, X12 raw-TCP, DICOM C-STORE SCP inbound over pynetdicom — ADR 0025, …), resolved through a registry (`base.py`) — never special-cased in `pipeline/` |
 | `messagefoundry.anon` | Deterministic, secret-per-dataset pseudonymization / de-identification (fail-closed; ADR 0030) — exposed to the tee (`anonymize-captures`) and the test harness |
 | `messagefoundry.pipeline` | Per-message routing/handling (`RegistryRunner` in `wiring_runner.py`) + per-inbound-connection supervision (`engine.py`); offline `dryrun.py` |
-| `messagefoundry.api` | Localhost FastAPI surface for the console (`app.py` + response `models.py`) — the engine's only external interface |
+| `messagefoundry.api` | Localhost FastAPI surface for the console (`app.py` + response `models.py`) — the engine's only external interface. The optional `/ui` browser ops console is no longer in-tree: it mounts onto this app from a separate wheel (see below) via `mount_ui`, pinned against the `api/_ui_seam.py` contract ([WEBCONSOLE-PACKAGE.md](WEBCONSOLE-PACKAGE.md)) |
 | `messagefoundry.auth` | Authn + RBAC core (no FastAPI): permissions/roles, `Identity`, password hashing, opaque session tokens, LDAP/Kerberos (`service.py`) — enforced by `api` |
 | `messagefoundry.generators` | Conformant synthetic HL7 generators (ADT, ORM, ORU, …) behind `messagefoundry generate` |
 | `messagefoundry.console` | PySide6 admin app — a separate process, HTTP client to the API only |
@@ -309,6 +309,9 @@ never import `api` or `console`. The API depends on the engine; the console depe
 
 **Beyond the engine packages** (separate components, not `messagefoundry.*`): the **code-first config**
 an operator authors (their `--config` modules + [`environments/`](../environments/) value overrides),
+the **web ops console** ([`messagefoundry_webconsole/`](../messagefoundry_webconsole/), a
+separately-versioned second wheel `messagefoundry-webconsole` mounted same-origin under `/ui` — ADR
+0065, [WEBCONSOLE-PACKAGE.md](WEBCONSOLE-PACKAGE.md)),
 the **IDE extension** ([`ide/`](../ide/)), the **test harness** ([`harness/`](../harness/)), the
 sample config + message corpus ([`samples/`](../samples/)), the **Windows service** scripts
 ([`scripts/service/`](../scripts/service/)),

@@ -168,7 +168,7 @@ from messagefoundry.pipeline.alert_sinks import notifier_from_settings
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
 from messagefoundry.pipeline.cluster import build_coordinator
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, ShardLaneOwnershipError
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
@@ -327,8 +327,14 @@ def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> Approva
         # it would mis-fire; skip fail-closed and record cancelled=0/skipped in the approval audit. The
         # operator re-Stops (lets it quiesce) and re-requests.
         rr = engine.registry_runner
-        if rr is not None and not rr.outbound_quiesced(str(p["name"])):
-            return {"cancelled": 0, "skipped": "outbound running"}
+        if rr is not None:
+            # ADR 0073: a non-owning shard's quiesced signal is vacuous (it never runs the lane), so
+            # an ownership miss must skip fail-closed here exactly like the non-quiesced case.
+            owner = rr.destination_owner(str(p["name"]))
+            if owner is not None and owner != rr.registry.shard_id:
+                return {"cancelled": 0, "skipped": f"outbound owned by shard {owner}"}
+            if not rr.outbound_quiesced(str(p["name"])):
+                return {"cancelled": 0, "skipped": "outbound running"}
         cancelled = await engine.store.cancel_queued(
             None, str(p["name"]), top_only=(p.get("scope") == "top")
         )
@@ -1039,6 +1045,7 @@ def create_app(
                         # paused outbound stays purgeable even though it shows "failed"/"filtered").
                         paused=rr.outbound_quiesced(dname),
                         error=(dfail or dfiltered) if oc is not None else None,
+                        owner_shard=rr.destination_owner(dname),  # ADR 0073; None unsharded
                     )
                 )
             # ADR 0031 / #61 ADR 0048: an outbound that FAILED to build (0031) or was DR-PARKED below the
@@ -1092,6 +1099,7 @@ def create_app(
                         simulated=rr.outbound_simulated(dname),
                         paused=rr.outbound_quiesced(dname),
                         error=dreason,
+                        owner_shard=rr.destination_owner(dname),  # ADR 0073; None unsharded
                     )
                 )
         return rows
@@ -1137,12 +1145,17 @@ def create_app(
                 raise HTTPException(
                     403, "channel-scoped users cannot control a shared outbound connection"
                 )
-            if action == "start":
-                await rr.start_outbound(name)
-            elif action == "stop":
-                await rr.stop_outbound(name)
-            else:
-                await rr.restart_outbound(name)
+            try:
+                if action == "start":
+                    await rr.start_outbound(name)
+                elif action == "stop":
+                    await rr.stop_outbound(name)
+                else:
+                    await rr.restart_outbound(name)
+            except ShardLaneOwnershipError as exc:
+                # ADR 0073: this shard never runs the lane, so acting here would only produce a
+                # vacuous 'stopped' (and unlock purge) while the owner keeps delivering.
+                raise HTTPException(409, str(exc)) from None
             return {"name": name, "running": rr.outbound_running(name)}
         # Neither an inbound nor an outbound (or no runner). Run the per-channel guard first so a scoped
         # user is 403'd for a name outside their scope (don't disclose existence), then 404.
@@ -1281,6 +1294,15 @@ def create_app(
         rr = engine.registry_runner
         if rr is None or name not in rr.registry.outbound:
             raise HTTPException(404, f"no such outbound connection: {name}")
+        # ADR 0073: purge is owner-only on a sharded engine — a non-owning shard's quiesced signal is
+        # vacuous (it never runs the lane), so it would green-light a purge racing the owner's claims.
+        owner = rr.destination_owner(name)
+        if owner is not None and owner != rr.registry.shard_id:
+            raise HTTPException(
+                409,
+                f"outbound {name!r} is owned by engine shard {owner!r} — stop and purge it on that "
+                "shard's API",
+            )
         # require-stopped-before-purge (after the 404, before any approval is held for a doomed purge):
         # a running/still-"stopping" outbound may have a claimed INFLIGHT row cancel_queued cannot cancel,
         # so purge must wait until the lane is paused AND fully quiesced. The load-bearing dual-control
@@ -1779,6 +1801,8 @@ def create_app(
         status: str | None = Query(None, max_length=64),
         message_type: str | None = Query(None, max_length=64),
         control_id: str | None = Query(None, max_length=256),
+        received_from: float | None = Query(None, ge=0),
+        received_to: float | None = Query(None, ge=0),
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> MessageList:
@@ -1790,9 +1814,19 @@ def create_app(
         )
         allowed = _scope(identity)  # per-channel RBAC: only the caller's channels (None = all)
         rows = await engine.store.list_messages(
-            limit=limit, offset=offset, allowed_channels=allowed, **filters
+            limit=limit,
+            offset=offset,
+            allowed_channels=allowed,
+            received_from=received_from,
+            received_to=received_to,
+            **filters,
         )
-        total = await engine.store.count_messages(allowed_channels=allowed, **filters)
+        total = await engine.store.count_messages(
+            allowed_channels=allowed,
+            received_from=received_from,
+            received_to=received_to,
+            **filters,
+        )
         messages = [_summary(r) for r in rows]
         # Per-property PHI gate, centralized in api/field_authz (WP-9, ASVS 8.2.3): a caller without
         # messages:view_summary gets `summary` AND `error` (handler exception text can quote field
@@ -2684,6 +2718,7 @@ def create_managed_app(
     infra_fault_backoff_cap: float = 60.0,
     fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
     pooled_fusing_workers: int = 8,
+    batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
     connection_events: bool = True,
     response_sent_default: bool = True,
     env_values: Mapping[str, Any] | None = None,
@@ -2800,6 +2835,7 @@ def create_managed_app(
             infra_fault_backoff_cap=infra_fault_backoff_cap,
             fuse_thread_hops=fuse_thread_hops,
             pooled_fusing_workers=pooled_fusing_workers,
+            batch_handoff_statements=batch_handoff_statements,
             connection_events=connection_events,
             response_sent_default=response_sent_default,
             config_dir=config_dir,

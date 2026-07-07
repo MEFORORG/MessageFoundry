@@ -68,6 +68,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # manifest + the dr_backup audit row as a PHI-free integrity fingerprint) and re-derives the key_id
     # fingerprint via the backup codec; the AEAD itself lives in store/backup_codec.py.
     "messagefoundry/pipeline/dr_backup.py": frozenset({"hashlib"}),
+    # ADR 0073: rendezvous (HRW) outbound-lane ownership for engine shards — sha256 as a STABLE,
+    # process-independent hash (the salted builtin hash() differs per process, which would let two
+    # shards disagree on a lane's owner). Deterministic placement, not a security control, no secret
+    # material involved.
+    "messagefoundry/pipeline/sharding.py": frozenset({"hashlib"}),
     # ADR 0049 (#60): the .mfbak DR-backup archive codec — a chunked AES-256-GCM streaming framing
     # (cryptography AESGCM) keyed by the existing store DEK, with a SHA-256 (hashlib) header digest bound
     # as per-frame AAD + the one-way key_id fingerprint. Net-new crypto surface; the store DEK key source

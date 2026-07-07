@@ -110,3 +110,11 @@ choose the shard assignment.
 aggregation; graceful in-flight drain on restart; a shared single-db multi-shard mode (the MVP is one
 SQLite file per shard); **DB-tier** sharding onto multiple clusters (that is L5 / ADR 0039, which
 generalizes the per-shard store).
+
+> **Update — 2026-07-06.** The shared single-db multi-shard mode is now the ONLY multi-shard mode
+> ([ADR 0063](0063-no-split-store-unified-store-for-sharding.md) deprecated the SQLite-file-per-shard
+> split), and its reliability runtime is built by
+> [ADR 0073](0073-ownership-scoped-recovery-single-consumer-lanes.md): ownership-scoped crash recovery
+> + a single delivery consumer per outbound lane (so "outbound + logic are shared" now means shared
+> *definitions*, not shared *consumers*). Restart backoff / crash-loop breaker and per-shard log
+> aggregation remain deferred.

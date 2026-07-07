@@ -8,6 +8,7 @@
   --muted: #9aa4b2;
   --line: #262b34;
   --accent: #5b9dff;
+  --foundry: #f59e0b;   /* molten amber — the "Foundry" wordmark accent (brand guidelines) */
   --ok: #3fb950;
   --warn: #d29922;
   --bad: #f85149;
@@ -31,7 +32,16 @@ nav {
   border-bottom: 1px solid var(--line);
 }
 
-nav .brand { font-weight: 700; margin-right: 1rem; }
+nav .brand { margin-right: 1rem; text-decoration: none; color: inherit; }
+
+/* MessageFoundry wordmark (brand guidelines, June 2026): one camelCase word — "Message" in the base
+   ink, "Foundry" in molten amber — set in extra-bold system sans with tightened tracking. The amber
+   is confined to the wordmark and headings here, never body text. */
+.wordmark { font-weight: 800; letter-spacing: -0.02em; white-space: nowrap; }
+.wordmark .wm-foundry { color: var(--foundry); }
+.wordmark .wm-tm {
+  font-size: 0.65em; font-weight: 500; color: var(--muted); margin-left: 0.06em;
+}
 nav .navlinks a { color: var(--muted); text-decoration: none; margin-right: 1rem; }
 nav .navlinks a.active, nav .navlinks a:hover { color: var(--accent); }
 nav .logout button, .filters button, .login button {
@@ -52,6 +62,43 @@ table.grid th, table.grid td {
 }
 table.grid th { color: var(--muted); font-weight: 600; }
 table.grid a { color: var(--accent); text-decoration: none; }
+
+/* Adjustable grid tables (app.js, data-mf-table): keyboard-operable click-to-sort + drag-to-resize
+   columns, remembered per table. Best-practice layout (TanStack / AG Grid / W3C-APG): widths live on
+   injected <col> elements and the table gets an explicit px width = their SUM inside an overflow-x:auto
+   wrapper (NOT width:100%, which redistributes leftover space and snaps a resized column back wider than
+   set); sort is a native <button> cycling asc/desc/none with aria-sort on exactly one header. */
+.mf-table-scroll { overflow-x: auto; }
+table.grid.mf-adjustable { table-layout: fixed; width: auto; } /* app.js sets the explicit px width */
+table.grid.mf-adjustable th { position: relative; }
+table.grid.mf-adjustable td { overflow: hidden; text-overflow: ellipsis; }
+button.mf-sort {
+  display: block; width: 100%; margin: 0; padding: 0; cursor: pointer;
+  background: none; border: 0; color: inherit; font: inherit; text-align: left;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+button.mf-sort:hover { color: var(--ink); }
+button.mf-sort:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.mf-sort-arrow { color: var(--accent); font-size: 0.8em; }
+th .mf-resize {
+  position: absolute; top: 0; right: 0; width: 9px; height: 100%; cursor: col-resize; z-index: 1;
+}
+th .mf-resize:hover { box-shadow: inset -2px 0 0 var(--accent); }
+/* Drag-to-reorder: drop-target indicator (a left edge marking where the dragged column will land). */
+table.grid.mf-adjustable th.mf-drop { box-shadow: inset 3px 0 0 var(--accent); }
+body.mf-col-resizing, body.mf-col-resizing * { cursor: col-resize !important; user-select: none !important; }
+
+/* Connections filter-as-you-type box (app.js, data-mf-conns-filter). */
+.filterbox {
+  margin: 0; padding: 0.4rem 0.6rem; width: 18rem; max-width: 100%; box-sizing: border-box;
+  background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 6px;
+}
+.filterbox::placeholder { color: var(--muted); }
+.filterbox:focus { outline: none; border-color: var(--accent); }
+/* Connection detail link (right of the name) + the message-log From/To date fields. */
+.detail-link { font-size: 0.8em; color: var(--muted); margin-left: 0.5rem; text-decoration: none; }
+.detail-link:hover { color: var(--accent); }
+.filters .dtfield { display: inline-flex; gap: 0.25rem; align-items: center; color: var(--muted); }
 
 .status { padding: 0.05rem 0.45rem; border-radius: 999px; font-size: 0.8rem; }
 .status-running { color: var(--ok); }
@@ -86,6 +133,9 @@ pre.raw {
 .ctl button:hover { color: var(--accent); border-color: var(--accent); }
 
 /* Connection-controls bulk-action toolbar (un-polled dashboard shell, ADR 0065 connection controls). */
+/* Toolbar + filter box on one horizontal row. */
+.ctlrow { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin: 0.5rem 0; }
+.ctlrow .ctlbar, .ctlrow .filterbox { margin: 0; }
 .ctlbar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; margin: 0.25rem 0 0.5rem; }
 .ctlbar select {
   background: var(--bg); color: var(--ink); border: 1px solid var(--line);

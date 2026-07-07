@@ -53,6 +53,7 @@ from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.retention import RetentionRunner
+from messagefoundry.pipeline.sharding import owned_destination_set
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckRunner
 from messagefoundry.pipeline.wiring_runner import (
@@ -60,7 +61,12 @@ from messagefoundry.pipeline.wiring_runner import (
     check_pt_backend_supported,
 )
 from messagefoundry.store import MessageStore, Store
-from messagefoundry.store.store import ConnectionMetrics, DestinationMetrics, InboundMetrics
+from messagefoundry.store.store import (
+    ConnectionMetrics,
+    DestinationMetrics,
+    InboundMetrics,
+    OwnedLanes,
+)
 
 __all__ = ["Engine", "ConfigReloadDenied"]
 
@@ -99,6 +105,7 @@ class Engine:
         infra_fault_backoff_cap: float = 60.0,
         fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
         pooled_fusing_workers: int = 8,
+        batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
         connection_events: bool = True,
         response_sent_default: bool = True,
         config_dir: str | Path | None = None,
@@ -188,6 +195,9 @@ class Engine:
         # ONCE here — a /config/reload never re-reads it (restart to change, exactly like claim_mode).
         self._fuse_thread_hops = fuse_thread_hops
         self._fusing_workers = pooled_fusing_workers
+        # ADR 0075 per-hop SQL statement batching (SQL-Server-only, default-OFF); every runner inherits
+        # it. Read ONCE here — a /config/reload never re-reads it (restart to change, like fuse_thread_hops).
+        self._batch_handoff_statements = batch_handoff_statements
         # [diagnostics] Corepoint-style event log (#46); every runner inherits these master switches.
         self._connection_events = connection_events
         self._response_sent_default = response_sent_default
@@ -346,6 +356,7 @@ class Engine:
         infra_fault_backoff_cap: float = 60.0,
         fuse_thread_hops: bool = False,  # ADR 0071 B5
         pooled_fusing_workers: int = 8,
+        batch_handoff_statements: bool = False,  # ADR 0075
         connection_events: bool = True,
         response_sent_default: bool = True,
         synchronous: str = "NORMAL",
@@ -396,6 +407,7 @@ class Engine:
             infra_fault_backoff_cap=infra_fault_backoff_cap,
             fuse_thread_hops=fuse_thread_hops,
             pooled_fusing_workers=pooled_fusing_workers,
+            batch_handoff_statements=batch_handoff_statements,
             connection_events=connection_events,
             response_sent_default=response_sent_default,
             config_dir=config_dir,
@@ -469,6 +481,7 @@ class Engine:
                 deactivate_profile=self._dr_release_drain,
                 config_fingerprint=cfg_fp,
                 alert_sink=self._alert_sink,
+                owned_lanes=self._owned_lanes,  # ADR 0073: scoped activation recovery when sharded
             )
         return self._dr_coordinator
 
@@ -562,6 +575,7 @@ class Engine:
             infra_fault_backoff_cap=self._infra_fault_backoff_cap,
             fuse_thread_hops=self._fuse_thread_hops,
             pooled_fusing_workers=self._fusing_workers,
+            batch_handoff_statements=self._batch_handoff_statements,
             connection_events=self._connection_events,
             response_sent_default=self._response_sent_default,
         )
@@ -634,6 +648,24 @@ class Engine:
 
     # --- lifecycle -----------------------------------------------------------
 
+    def _owned_lanes(self) -> OwnedLanes | None:
+        """The ADR 0073 ownership scope for crash recovery — ``None`` (recover globally) unless this
+        process runs a SHARDED registry (a >1-shard config filtered by ``--shard``). Channel-keyed
+        lanes (ingress/routed/response) are the filtered inbound map; outbound lanes are the
+        rendezvous-owned subset of the registry's destinations. Residue in lanes outside this scope
+        belongs to a live sibling shard (recovered on ITS restart) or to a removed lane (the
+        dead-letter sweeps in ``_start_graph`` handle those)."""
+        runner = self._registry_runner
+        if runner is None:
+            return None
+        registry = runner.registry
+        if registry.shard_id is None or registry.all_shard_ids is None:
+            return None
+        return OwnedLanes(
+            channels=frozenset(registry.inbound),
+            destinations=owned_destination_set(registry, registry.shard_id, registry.all_shard_ids),
+        )
+
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed
         outbounds, then start the wired graph."""
@@ -643,8 +675,20 @@ class Engine:
         # (staged pipeline, ADR 0001). The handoff/delivery transactions make the re-run idempotent.
         if not self._coordinator.reclaims_inflight():
             # Single-node (SQLite / single-node Postgres): the unconditional reset is immediate self-
-            # recovery of this node's own crash residue — today's behavior, byte-identical.
-            await self.store.reset_stale_inflight()
+            # recovery of this node's own crash residue — today's behavior, byte-identical. Sharded
+            # (ADR 0073): scope recovery to THIS shard's lanes so a restarting shard never re-pends a
+            # live sibling shard's in-flight rows on the shared unified store.
+            owned = self._owned_lanes()
+            recovered = await self.store.reset_stale_inflight(owned=owned)
+            if owned is not None:
+                log.info(
+                    "sharded startup recovery: %d in-flight row(s) re-pended across %d owned "
+                    "channel lane(s) + %d owned destination lane(s); rows outside this shard's "
+                    "lanes were deliberately left for their owning shard",
+                    recovered,
+                    len(owned.channels),
+                    len(owned.destinations),
+                )
         # else clustered (Track B Step 4): the leader's periodic reclaim_expired_leases sweep (started
         # below) recovers expired-lease rows; the unconditional reset ignores leases and would steal a
         # live sibling's in-flight rows, so it must NOT run here.
@@ -1026,6 +1070,21 @@ class Engine:
             # Re-apply this process's shard filter so a reload keeps owning only its shard's inbounds
             # (outbound/routers/handlers stay shared). Pure + cheap (sharding.filter_registry_for_shard).
             registry = self._registry_filter(registry)
+            running = self._registry_runner.registry if self._registry_runner is not None else None
+            if running is not None and registry.all_shard_ids != running.all_shard_ids:
+                # ADR 0073: outbound-lane ownership is a pure function of the shard universe, and a
+                # reload is a PER-PROCESS operation with no fleet coordination — accepting a changed
+                # universe here would leave this shard claiming by a NEW map while siblings claim by
+                # the OLD one: some lanes get two concurrent consumers (per-lane FIFO inversion),
+                # others get none (ACKed messages stall with no alert). Fail closed instead.
+                old_ids = ",".join(running.all_shard_ids) if running.all_shard_ids else "<single>"
+                new_ids = ",".join(registry.all_shard_ids) if registry.all_shard_ids else "<single>"
+                raise WiringError(
+                    f"reload changes the engine-shard set ({old_ids} -> {new_ids}) — outbound-lane "
+                    "ownership (ADR 0073) is pinned to the shard universe, so a shard-set change "
+                    "requires a coordinated full-fleet restart (stop supervise, apply the config, "
+                    "start), not a per-shard reload"
+                )
         if not registry.inbound and not registry.outbound:
             raise WiringError(
                 f"config directory {config_dir!r} declares no connections — "

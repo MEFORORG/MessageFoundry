@@ -32,18 +32,16 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline import Engine
 
-SAMPLES_CONFIG = Path(__file__).resolve().parent.parent / "samples" / "config"
+# The repo root is three levels up from this file (packaging/messagefoundry-webconsole/tests/) — the
+# suite moved out of the engine's tests/ into the package's own suite (Option B Phase 2, ADR 0065).
+SAMPLES_CONFIG = Path(__file__).resolve().parents[3] / "samples" / "config"
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 # An HL7 field carrying HTML metacharacters — the XSS payload the browser must never execute.
 XSS_RAW = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|X1|P|2.5.1\rPID|1||1||<script>alert(1)</script>\r"
 
-
-@pytest.fixture
-async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(tmp_path / "webui.db", poll_interval=0.02)
-    yield eng
-    await eng.stop()
+# The shared ``engine`` fixture lives in the package ``conftest.py`` (so the golden-surface tests can
+# build an app too); everything below is /ui-suite-local.
 
 
 async def _service(engine: Engine) -> AuthService:
@@ -509,6 +507,112 @@ async def test_ws_cookie_auth_requires_cookie_and_origin(engine: Engine) -> None
     # A bad/expired cookie value → rejected.
     bad = _FakeWS(origin="http://t", host="t", cookie="not-a-real-token", app=app)
     assert (await authorize_ui_ws(bad, Permission.MONITORING_READ))[0] is None  # type: ignore[arg-type]
+
+
+def test_rows_table_marks_adjustable() -> None:
+    """Every grid table is marked ``data-mf-table`` so ``app.js`` enhances it with click-to-sort +
+    drag-to-resize columns. Losing the marker silently disables the enhancement (no error, just an
+    inert table), so lock the seam here. The enhancement is presentation-only — cells, header labels,
+    and escaping are unchanged."""
+    from messagefoundry_webconsole._html import rows_table
+
+    html = str(rows_table(["Name", "Count"], [["a", "2"]]))
+    assert 'class="grid" data-mf-table' in html
+    assert "<thead>" in html and "<th>Name</th>" in html and "<td>a</td>" in html
+
+
+def test_dashboard_has_connections_filter_box() -> None:
+    """The connections dashboard renders a client-side filter-as-you-type box (app.js hides rows that
+    don't match). It's an <input type=search> outside the polled table so its value survives the swap."""
+    from messagefoundry_webconsole.pages.connections import dashboard
+
+    html = str(dashboard([]))
+    assert "data-mf-conns-filter" in html and 'type="search"' in html
+
+
+def _ux_conn_row(name: str = "IB_ADT", channel_id: str = "c1"):
+    from messagefoundry.api.models import ConnectionRow
+
+    return ConnectionRow(
+        role="source",
+        channel_id=channel_id,
+        channel_name="IB",
+        destination=None,
+        name=name,
+        status="running",
+        direction="in",
+        method="MLLP",
+        peer="h",
+        port=1,
+        queue_depth=None,
+        idle_seconds=None,
+        alerts_active=0,
+        errored=0,
+        read=5,
+        written=None,
+        backlog_seconds=None,
+        delivered_age_seconds=None,
+    )
+
+
+def test_connection_name_cell_links() -> None:
+    """The connections table name cell (#4a/#4b): the name links to that connection's pre-filled message
+    search, and a 'details' link points at its detail page."""
+    from messagefoundry_webconsole.pages.connections import connections_fragment
+
+    html = str(connections_fragment([_ux_conn_row()]))
+    assert "/ui/messages?channel_id=c1&amp;defer=1" in html  # name → pre-filled search (# escaped)
+    assert "/ui/connection/IB_ADT" in html  # details link
+
+
+def test_connection_details_page_renders() -> None:
+    """The connection details page (#4a) composes info + stats + a recent-events table + a link to the
+    connection's pre-filled message search."""
+    from messagefoundry.api.models import ConnectionEventInfo
+    from messagefoundry_webconsole.pages.connections import connection_details
+
+    ev = ConnectionEventInfo(
+        id=1,
+        ts=1783431967.0,
+        connection="IB_ADT",
+        transport="MLLP",
+        direction="inbound",
+        kind="listen_start",
+        peer_host="h",
+        reason=None,
+    )
+    html = str(connection_details(_ux_conn_row(), [ev]))
+    assert "<h1>IB_ADT</h1>" in html and "listen_start" in html
+    assert "channel_id=c1&amp;defer=1" in html  # View messages → pre-filled search
+
+
+def test_messages_deferred_renders_form_only() -> None:
+    """The message log in deferred mode (#4b) renders the pre-filled form + a Search prompt, no results —
+    "open a connection's messages, adjust, then Search"."""
+    from messagefoundry_webconsole.pages.messages import messages
+
+    html = str(messages(None, deferred=True, channel_id="c1", received_from="2026-07-06T00:00"))
+    assert "Adjust the filters and click Search" in html
+    assert 'name="received_from"' in html and 'type="datetime-local"' in html
+    assert "<tbody>" not in html  # no results table when deferred
+
+
+def test_connection_name_strips_direction_suffix() -> None:
+    """#1: the connection display name drops the redundant ' ▸ in'/' ▸ out' suffix (the Dir column shows
+    direction), but the details link keeps the FULL composite name as the row identity; a destination's
+    'chan ▸ dest' name has no such suffix and is kept."""
+    from messagefoundry_webconsole.pages.connections import _display_name, connections_fragment
+
+    assert _display_name("IB_ADT_FEED ▸ in") == "IB_ADT_FEED"
+    assert _display_name("D ▸ out") == "D"
+    assert _display_name("chan ▸ dest") == "chan ▸ dest"  # destination composite kept
+    html = str(
+        connections_fragment([_ux_conn_row(name="IB_ADT_FEED ▸ in", channel_id="IB_ADT_FEED")])
+    )
+    assert ">IB_ADT_FEED</a>" in html  # stripped display
+    assert (
+        "/ui/connection/IB_ADT_FEED%20%E2%96%B8%20in" in html
+    )  # full name kept as the detail identity
 
 
 # --- PR A: parse-tree endpoint + per-destination dead-letter replay ----------
@@ -2701,7 +2805,7 @@ async def _browser_enroll(c: httpx.AsyncClient, *, label: str) -> object:
     """Run the full browser registration ceremony; returns the enrolled soft authenticator."""
     from webauthn.helpers import base64url_to_bytes
 
-    from tests._soft_webauthn import SoftAuthenticator
+    from _soft_webauthn import SoftAuthenticator
 
     r = await c.post("/ui/account/webauthn/enroll", headers=_SFS)
     assert r.status_code == 200, r.text

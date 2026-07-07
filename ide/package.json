@@ -137,6 +137,11 @@
         "command": "messagefoundry.toggleLiveDebug",
         "title": "MessageFoundry: Toggle Live Debug",
         "icon": "$(pulse)"
+      },
+      {
+        "command": "messagefoundry.toggleRevealValues",
+        "title": "MessageFoundry: Reveal Values (Live Debug)",
+        "icon": "$(eye)"
       }
     ],
     "viewsContainers": {

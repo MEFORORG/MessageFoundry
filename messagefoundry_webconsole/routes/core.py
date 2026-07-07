@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qsl
 
@@ -115,6 +116,33 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         rows = await core.list_connections(engine=engine, identity=identity)
         return HTMLResponse(pages.connections_fragment(rows))
 
+    @app.get("/ui/connection/{name}", response_class=HTMLResponse)
+    async def ui_connection_details(
+        name: str,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
+    ) -> HTMLResponse:
+        # Compose the detail view from existing monitoring handlers (no new PHI surface): find the row in
+        # the (already channel-scoped) connection list, then its recent events. A singular /ui/connection/
+        # path avoids colliding with the /ui/connections/{purge-confirm,...} action routes.
+        rows = await core.list_connections(engine=engine, identity=identity)
+        row = next((r for r in rows if r.name == name), None)
+        if row is None:
+            raise HTTPException(404, "connection not found")
+        # Events are recorded + RBAC-scoped by the RAW connection name (channel_id for a source,
+        # destination for an outbound), NOT the composite display name — pass the raw name so the events
+        # actually match and a channel-scoped operator isn't spuriously denied (+ audited) on their own.
+        events_key = (
+            row.destination if (row.role == "destination" and row.destination) else row.channel_id
+        )
+        try:
+            events = await core.list_connection_events(
+                engine=engine, identity=identity, connection=events_key, limit=50
+            )
+        except HTTPException:
+            events = []  # still show the connection's info + stats if events are RBAC-scoped out
+        return HTMLResponse(pages.connection_details(row, events))
+
     @app.get("/ui/messages", response_class=HTMLResponse)
     async def ui_messages(
         request: Request,
@@ -124,9 +152,42 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         status_filter: str | None = Query(None, alias="status", max_length=64),
         message_type: str | None = Query(None, max_length=64),
         control_id: str | None = Query(None, max_length=256),
+        received_from: str | None = Query(None, max_length=32),  # datetime-local (UTC)
+        received_to: str | None = Query(None, max_length=32),
+        defer: bool = Query(False),
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> HTMLResponse:
+        # Arriving pre-filled from a connection name (defer=1) with no explicit dates → default a 1-day
+        # window (UTC). The operator adjusts and clicks Search (a plain submit, no defer) to run it.
+        if defer and not received_from and not received_to:
+            now = datetime.now(UTC)
+            received_from = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M")
+            received_to = now.strftime("%Y-%m-%dT%H:%M")
+
+        def _epoch(value: str | None) -> float | None:
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(value).replace(tzinfo=UTC).timestamp()
+            except ValueError:
+                return None  # a malformed datetime-local simply drops that bound
+
+        if defer:
+            # Form-only landing: pre-filled, NOT run until the operator submits (#4b).
+            return HTMLResponse(
+                pages.messages(
+                    None,
+                    deferred=True,
+                    channel_id=channel_id or "",
+                    status=status_filter or "",
+                    message_type=message_type or "",
+                    control_id=control_id or "",
+                    received_from=received_from or "",
+                    received_to=received_to or "",
+                )
+            )
+
         data = await core.list_messages(
             request,
             engine=engine,
@@ -135,6 +196,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             status=status_filter,
             message_type=message_type,
             control_id=control_id,
+            received_from=_epoch(received_from),
+            received_to=_epoch(received_to),
             limit=limit,
             offset=offset,
         )
@@ -145,6 +208,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 status=status_filter or "",
                 message_type=message_type or "",
                 control_id=control_id or "",
+                received_from=received_from or "",
+                received_to=received_to or "",
             )
         )
 

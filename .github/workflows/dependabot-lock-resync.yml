@@ -60,7 +60,7 @@ jobs:
           # code runs in this job (uv lock --check + uv export only).
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
 
       - name: Re-export the lock files (DEP-1 — byte-for-byte identical flags/paths)
         run: |

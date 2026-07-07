@@ -568,6 +568,20 @@ async def test_list_messages_last_event_reflects_latest(store: MessageStore) -> 
     assert mid
 
 
+async def test_list_messages_received_at_range(store: MessageStore) -> None:
+    """The message-log date filter (#4b): received_from/received_to bound received_at to [from, to)."""
+    for ts in (1000.0, 2000.0, 3000.0):
+        await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=ts)
+    got = sorted(
+        r["received_at"] for r in await store.list_messages(received_from=1500, received_to=2500)
+    )
+    assert got == [2000.0]  # lower inclusive, upper exclusive
+    assert await store.count_messages(received_from=1500, received_to=2500) == 1
+    open_ended = sorted(r["received_at"] for r in await store.list_messages(received_from=2000.0))
+    assert open_ended == [2000.0, 3000.0]  # open upper bound
+    assert await store.count_messages() == 3  # no filter = all (regression guard)
+
+
 async def test_db_status_reports_counts_journal_size(store: MessageStore) -> None:
     await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=100.0)
     st = await store.db_status()

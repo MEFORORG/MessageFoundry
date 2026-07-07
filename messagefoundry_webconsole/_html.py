@@ -135,8 +135,23 @@ def register_nav(key: str, href: str, label: str) -> None:
         _NAV_ITEMS.append((key, href, label))
 
 
+def wordmark(*, tm: bool = False) -> Markup:
+    """The **MessageFoundry** wordmark, per the brand wordmark guidelines (June 2026): the single
+    camelCase word with ``Message`` in the base text color and ``Foundry`` in molten amber
+    (``#f59e0b``, the ``--foundry`` token). ``tm=True`` appends the superscript ™ — set it on the
+    primary lockup (the masthead) and the most-prominent appearance (the sign-in heading), and omit
+    it on repeated or running-text mentions. The amber stays confined to this mark and headings —
+    never body copy. ``Message`` and ``Foundry`` are adjacent with no separating space so the mark
+    renders as one word.
+    """
+    parts: list[object] = ["Message", el("span", "Foundry", class_="wm-foundry")]
+    if tm:
+        parts.append(el("sup", "™", class_="wm-tm"))
+    return el("span", *parts, class_="wordmark")
+
+
 def _default_nav(active: str) -> Markup:
-    links: list[object] = [el("span", "MessageFoundry", class_="brand")]
+    links: list[object] = [el("a", wordmark(tm=True), href="/ui", class_="brand")]
     for key, href, label in _NAV_ITEMS:
         links.append(el("a", label, href=href, class_="active" if key == active else None))
     # Logout is a POST (state-changing) rendered as a tiny same-origin form (form-action 'self').
@@ -151,7 +166,12 @@ def _default_nav(active: str) -> Markup:
 
 
 def rows_table(headers: Iterable[str], rows: Iterable[Iterable[object]]) -> Markup:
-    """A table whose header cells and every body cell are escaped (cells accept ``Markup`` for links)."""
+    """A table whose header cells and every body cell are escaped (cells accept ``Markup`` for links).
+
+    Marked ``data-mf-table`` so ``app.js`` enhances it in the browser with click-to-sort and
+    drag-to-resize columns, remembered per table (localStorage). Purely presentational: the server
+    output — cells, escaping, ordering — is unchanged, and with JS off it renders as a plain table.
+    """
     head = el("tr", *[el("th", h) for h in headers])
     body = [el("tr", *[el("td", c) for c in row]) for row in rows]
-    return el("table", el("thead", head), el("tbody", *body), class_="grid")
+    return el("table", el("thead", head), el("tbody", *body), class_="grid", data_mf_table=True)

@@ -135,6 +135,39 @@ def test_gate_byte_identical_unrouted_and_filtered() -> None:
     assert filtered["handlers"] == ["h"] and filtered["sends"] == []
 
 
+# --- Passive per-line timing (#84 profiling) — must stay byte-identical -------------------------
+
+
+def test_timing_is_passive_and_byte_identical() -> None:
+    # Adding per-line `t` timing must NOT change disposition / routed-to / would-send outbounds.
+    reg = _registry(route_to_h, {"h": handle_transform})
+    plain = dry_run(reg, ADT_A01)
+    traced = trace_dry_run(reg, ADT_A01)
+
+    assert traced["disposition"] == plain.disposition.value == MessageStatus.RECEIVED.value
+    assert [s["outbound"] for s in traced["sends"]] == [d.to for d in plain.deliveries] == ["out"]
+    assert traced["handlers"] == plain.handlers == ["h"]
+
+    # every line event carries a non-negative float `t` (wall time attributed to that line)
+    inv = _handler_invocation(traced)
+    assert inv["events"], "expected line events"
+    for ev in inv["events"]:
+        assert "t" in ev, "each line event must carry a passive `t` timing"
+        assert isinstance(ev["t"], float)
+        assert ev["t"] >= 0.0
+
+
+def test_timing_emitted_regardless_of_show_phi() -> None:
+    # Timings are not PHI, so they are emitted with OR without --show-phi (values stay REDACTED).
+    reg = _registry(route_to_h, {"h": handle_transform})
+    redacted = _handler_invocation(trace_dry_run(reg, ADT_A01, show_phi=False))
+    assert all(isinstance(ev.get("t"), float) for ev in redacted["events"])
+    assert _all_assigned(redacted).get("mrn") == "REDACTED"  # value still gated
+
+    shown = _handler_invocation(trace_dry_run(reg, ADT_A01, show_phi=True))
+    assert all(isinstance(ev.get("t"), float) for ev in shown["events"])
+
+
 # --- Gate 2: live-lookup identical + annotation -----------------------------------------------
 
 

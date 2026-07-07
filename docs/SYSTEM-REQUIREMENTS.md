@@ -104,14 +104,19 @@ workers draining **one shared server database** (PostgreSQL or SQL Server) concu
 commit capacity** is the wall. (SQLite is single-writer and does **not** scale this way — it is the
 single-process / single-node store.) Engine HA is **single-leader active-passive** — the graph runs on
 the leader only. A **multi-process, sharded-by-inbound** scale-out (multiple engines, each owning a
-disjoint set of inbounds) **is built as a mechanism** — `messagefoundry supervise`
+disjoint set of inbounds) **is built** — `messagefoundry supervise`
 ([ADR 0037](adr/0037-multi-process-sharding-l3.md)); with more than one shard it **requires a server
-DB** so all shards share **one unified store** ([ADR 0063](adr/0063-no-split-store-unified-store-for-sharding.md))
-— but running **N concurrently-active engines against one store is not yet a supported production
-topology**: the unconditional startup crash-recovery (`reset_stale_inflight`) is not
-ownership-scoped, so a restarting engine would re-pend rows a live sibling is actively processing.
-Ownership-scoped recovery is the named prerequisite (throughput build plan, 2026-07-02); until it
-lands, multi-engine deployments are **active-passive** (one active writer per store).
+DB** so all shards share **one unified store** ([ADR 0063](adr/0063-no-split-store-unified-store-for-sharding.md)),
+and the N-concurrently-active reliability runtime is built by
+[ADR 0073](adr/0073-ownership-scoped-recovery-single-consumer-lanes.md): startup/DR crash recovery is
+**ownership-scoped** (a restarting shard re-pends only its own lanes' in-flight rows, never a live
+sibling's) and each outbound lane has a **single delivery consumer** (deterministic rendezvous
+ownership, so per-lane FIFO holds across shards). Sharding and `[cluster]` active-passive are
+mutually exclusive (refused at startup); a shard-set change requires a coordinated fleet restart
+(reload refuses it). **Certification status:** the mechanism is built and invariant-tested, but
+N-active on one store is not yet certified as a supported production topology — that flips only after
+the clean 4-engine no-loss bench (sustained, zero loss, per-lane FIFO). Until then, treat
+multi-engine deployments as **active-passive** (one active writer per store) for production sizing.
 
 > **Connection-count guidance.** On a server-DB store, the pre-ADR-0066 `per_lane` topology ran a
 > claim loop per connection per stage against the shared queue; at very high connection counts the

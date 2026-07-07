@@ -1,0 +1,78 @@
+# Statement-batching A/B (ADR 0075 Bench B) — B0 (batching OFF) vs B1 (batching ON), swept at 256 /
+# 512 / 1024 inbound MLLP connections against a real engine the harness OWNS per step. Statement
+# batching folds each per-hop staged handoff's (route_handoff / transform_handoff) non-result-returning
+# DML into the fewest pyodbc.execute() T-SQL batches — same ordered (sql, params) sequence, one round-
+# trip per batch, still committing exactly ONCE per hop (commits/msg stays 2.000). It cuts network
+# round-trips, NOT transactions, so the differentiator is achieved intake throughput (the "ceiling").
+# The comparison report lays the two arms side by side and emits the §6.4(b)-style GO / NO-GO /
+# INCONCLUSIVE verdict per (claim_mode, count), reusing the fusion comparator's verdict path.
+#
+# TARGET RIG — the AWS SQL-Server bench box (the two-box engine + SQL Server 2022 rig), NOT this or any
+# local box, and NOT CI. Batching only ACTIVATES on SQL Server; on Postgres (asyncpg loop-native,
+# pipelines internally) and SQLite (loop-affine single writer) it is a provable no-op — a non-SS store
+# ignores the flag and runs byte-identically, so a batching arm there is meaningless. Critically,
+# **SQLite is NOT a valid throughput proxy for this axis** (its write-lock regime is not the profiled
+# per-hop round-trip cost). Run it against SQL Server only:
+#
+#   MEFOR_STORE_BACKEND=sqlserver MEFOR_STORE_* ... \
+#     python -m harness --connscale batch_ab \
+#       --report-json out/batch_ab.json --report-compare out/batch_ab.txt
+#
+# DOES NOT COMPOSE WITH FUSION (ADR 0075): this A/B keeps thread-hop fusion OFF in BOTH arms
+# (fuse_modes = [false]) so the measured delta is the batching lever ALONE. The profile's one-multi-arm-
+# axis rule (only batch_modes is multi-arm here) enforces that the two levers are never both toggled in
+# one sweep.
+#
+# METHODOLOGY (mirrors the fuse_ab bench): a WARM hold (hold_seconds below, warmup discarded) and >= 3
+# TRIALS per arm so the GO/NO-GO's "> 2sigma" spread guard has real trial-to-trial variance to test
+# against. ONE invocation banks `trials` (= 3 below) trials PER ARM — the runner reruns each
+# (claim_mode, batch, sweep_mode, count) cell `trials` times as distinct steps and the batch comparison
+# aggregates the repeats by key — so a single
+#
+#   python -m harness --connscale batch_ab --report-json out.json --report-compare out.txt
+#
+# yields the finished GO / NO-GO / INCONCLUSIVE verdict directly (no concatenating JSON from multiple
+# runs). C >= 256 (the round-trip wall is a concurrency phenomenon). All values synthetic + generic. See
+# docs/LOAD-TESTING.md.
+
+[connscale]
+name = "batch_ab"
+description = "Statement-batching A/B (ADR 0075 Bench B): B0 vs B1 (pooled) at 256/512/1024 on SQL Server, fixed aggregate rate"
+# Batching rides the pooled per-hop staged handoff, so pin the single pooled claim mode and put the A/B
+# on the batch axis. The A/B axes are never both multi-arm in one profile (the comparison pairs one axis
+# at a time — validated in profile.py).
+claim_modes = ["pooled"]
+# Fusion stays OFF in BOTH arms — the two levers don't compose (ADR 0075). A single-arm fuse axis, so
+# only batch_modes is multi-arm and the "at most one multi-arm axis" rule holds.
+fuse_modes = [false]
+# The A/B axis: run BOTH batching arms (B0 off / B1 on) per (claim_mode, count) cell.
+batch_modes = [false, true]
+# Bank >= 3 trials per arm in ONE invocation so the ">2σ" spread guard is reachable directly (each cell
+# is rerun `trials` times as distinct steps; the batch comparison aggregates them by key).
+trials = 3
+counts = [256, 512, 1024]
+# fixed_aggregate holds a constant aggregate across N (per-conn rate falls as N rises); a single sweep
+# mode keeps the A/B focused on the batching contrast (not also the load+scale axis). Drive at/above the
+# B0 ceiling so the B1 arm's lifted ceiling is what the achieved-intake delta reads.
+sweep_mode = "fixed_aggregate"
+aggregate_rate = 400.0
+per_conn_rate = 0.35
+# A warm steady-state hold (discard warmup); long enough that the achieved-intake rate is stable.
+hold_seconds = 60.0
+connect_batch = 50
+connect_batch_pause_s = 0.05
+poll_interval_s = 1.0
+drain_timeout_s = 300.0
+base_port = 2600
+transform = "cheap"
+# The A/B is about steady-state batched-handoff throughput, not reload latency — leave wall #5 off.
+reload_probe = false
+store_backend = "sqlserver"
+corpus_count_per_trigger = 20
+
+[connscale.slo]
+# Correctness gate: no message loss at any N in either arm, and the backlog drains. The batching GO/NO-GO
+# verdict (throughput lift >= 10% & > 2sigma, in_pipeline flat-or-lower, delivered/offered >= 0.98) is
+# computed by the comparison report on top of this. A NO-GO/INCONCLUSIVE throughput verdict is a valid
+# measurement (batching banked nothing), NOT an SLO failure.
+zero_loss = true

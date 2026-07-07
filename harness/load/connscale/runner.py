@@ -37,6 +37,7 @@ from typing import Any
 from harness.load.connscale.compare import (
     ClaimModeComparison,
     FuseModeComparison,
+    build_batch_comparison,
     build_comparison,
     build_fuse_comparison,
 )
@@ -124,6 +125,10 @@ async def run_connscale(
     # (claim_mode, sweep_mode, count) whose arm failed to start → the loud reason for the fusion A/B
     # (keyed with claim_mode since the fusion comparison pairs within a claim mode).
     fuse_missing_detail: dict[tuple[str, str, int], str] = {}
+    # ... and the same for the statement-batching A/B (ADR 0075 Bench B): a pooled-arm miss is recorded
+    # for the batch comparison too, so a swallowed B0/B1 batching arm is never silently compared against
+    # nothing.
+    batch_missing_detail: dict[tuple[str, str, int], str] = {}
     # claim_mode is the OUTER axis (ADR 0066 A/B): each mode gets a full (sweep_mode × counts) sweep,
     # so a single-arm profile (the default ("per_lane",)) is byte-identical to the pre-A/B behavior.
     # fuse_mode (ADR 0071 B5) nests just inside claim_mode: each (claim_mode, count) cell runs each
@@ -132,62 +137,73 @@ async def run_connscale(
     # trial (ADR 0071 B5 PR5) is the INNERMOST axis: each cell runs profile.trials times as distinct
     # steps so ONE invocation banks >= 3 trials/arm for the §6.4b ">2σ" spread guard. The default
     # trials=1 iterates once ⇒ the whole sweep (steps, ports, records) is byte-identical to pre-PR5.
+    # batch_mode (ADR 0075 Bench B) nests alongside fuse_mode: each (claim_mode, fuse, count) cell runs
+    # each batching arm (B0 off / B1 on) as a distinct step, tagged on the record so the batch A/B can
+    # pair them. The default single-arm (False,) iterates once ⇒ byte-identical to pre-ADR-0075. At most
+    # ONE of {claim_modes, fuse_modes, batch_modes} is multi-arm per profile (validated in profile.py),
+    # so fusion stays OFF in both batching arms (the two levers don't compose, ADR 0075).
     for claim_mode in profile.claim_modes:
         for fuse_mode in profile.fuse_modes:
-            for mode in profile.modes():
-                for count in profile.counts:
-                    rate = profile.aggregate_rate_for(mode, count)
-                    for trial in range(profile.trials):
-                        try:
-                            record = await _run_one_step(
-                                profile,
-                                claim_mode=claim_mode,
-                                fuse_mode=fuse_mode,
-                                mode=mode,
-                                count=count,
-                                trial=trial,
-                                aggregate_rate=rate,
-                                api_port=api_port + step,
-                                sink_host=sink_host,
-                                sink_port=sink_port,
-                                sink_ports=sink_ports,
-                                base_env=base_env,
-                                cwd=cwd,
-                                install_executor_shim=install_executor_shim,
-                                notes=notes,
-                            )
-                        except (ConnScaleError, FailoverError) as exc:
-                            # The per_lane BASELINE must start — a failure there is a real setup fault,
-                            # so it propagates (exit 2). A POOLED arm can legitimately refuse to start
-                            # (the SQL Server RCSI fail-closed gate); record the miss LOUDLY and keep the
-                            # sweep going so the A/B never silently compares per_lane against nothing.
-                            # FailoverError is caught too: the port preflight (`_await_port`) raises it,
-                            # and it must NOT escape to crash the whole sweep with no report
-                            # (_run_one_step normally re-wraps startup faults as ConnScaleError carrying
-                            # the engine log tail — defense in depth). Fusion never causes a miss (it
-                            # fails OPEN to the async path), so the miss gate stays keyed on claim_mode.
-                            if claim_mode != "pooled":
-                                raise
-                            # Only attribute the miss to the RCSI fail-closed gate when the engine log
-                            # actually shows it; otherwise surface the REAL failure (OOM at 1500 conns, a
-                            # DB-connect fault, a config error, a port-bind clash) so an operator doesn't
-                            # flip a DB setting and burn another multi-minute (or per-box-dollar) run
-                            # chasing a phantom RCSI problem.
-                            reason = _pooled_miss_reason(str(exc))
-                            fuse_tag = "B1" if fuse_mode else "B0"
-                            notes.append(
-                                f"POOLED ARM MISSING [{mode}] N={count} fuse={fuse_tag}: {reason}"
-                            )
-                            missing_detail[(mode, count)] = reason
-                            fuse_missing_detail[(claim_mode, mode, count)] = reason
+            for batch_mode in profile.batch_modes:
+                for mode in profile.modes():
+                    for count in profile.counts:
+                        rate = profile.aggregate_rate_for(mode, count)
+                        for trial in range(profile.trials):
+                            try:
+                                record = await _run_one_step(
+                                    profile,
+                                    claim_mode=claim_mode,
+                                    fuse_mode=fuse_mode,
+                                    batch_mode=batch_mode,
+                                    mode=mode,
+                                    count=count,
+                                    trial=trial,
+                                    aggregate_rate=rate,
+                                    api_port=api_port + step,
+                                    sink_host=sink_host,
+                                    sink_port=sink_port,
+                                    sink_ports=sink_ports,
+                                    base_env=base_env,
+                                    cwd=cwd,
+                                    install_executor_shim=install_executor_shim,
+                                    notes=notes,
+                                )
+                            except (ConnScaleError, FailoverError) as exc:
+                                # The per_lane BASELINE must start — a failure there is a real setup
+                                # fault, so it propagates (exit 2). A POOLED arm can legitimately refuse
+                                # to start (the SQL Server RCSI fail-closed gate); record the miss LOUDLY
+                                # and keep the sweep going so the A/B never silently compares per_lane
+                                # against nothing. FailoverError is caught too: the port preflight
+                                # (`_await_port`) raises it, and it must NOT escape to crash the whole
+                                # sweep with no report (_run_one_step normally re-wraps startup faults as
+                                # ConnScaleError carrying the engine log tail — defense in depth). Fusion
+                                # and statement-batching never cause a miss (each fails OPEN / no-ops to
+                                # the async path), so the miss gate stays keyed on claim_mode.
+                                if claim_mode != "pooled":
+                                    raise
+                                # Only attribute the miss to the RCSI fail-closed gate when the engine
+                                # log actually shows it; otherwise surface the REAL failure (OOM at 1500
+                                # conns, a DB-connect fault, a config error, a port-bind clash) so an
+                                # operator doesn't flip a DB setting and burn another multi-minute (or
+                                # per-box-dollar) run chasing a phantom RCSI problem.
+                                reason = _pooled_miss_reason(str(exc))
+                                fuse_tag = "B1" if fuse_mode else "B0"
+                                batch_tag = "B1" if batch_mode else "B0"
+                                notes.append(
+                                    f"POOLED ARM MISSING [{mode}] N={count} fuse={fuse_tag} "
+                                    f"batch={batch_tag}: {reason}"
+                                )
+                                missing_detail[(mode, count)] = reason
+                                fuse_missing_detail[(claim_mode, mode, count)] = reason
+                                batch_missing_detail[(claim_mode, mode, count)] = reason
+                                step += 1
+                                # A pooled-arm miss is a DETERMINISTIC RCSI/startup refusal, identical
+                                # for every trial of this cell — record it ONCE and stop retrying (don't
+                                # log it or burn a multi-minute spawn trials times). The remaining trials
+                                # of this cell are skipped; the outer sweep continues.
+                                break
+                            records.append(record)
                             step += 1
-                            # A pooled-arm miss is a DETERMINISTIC RCSI/startup refusal, identical for
-                            # every trial of this cell — record it ONCE and stop retrying (don't log it
-                            # or burn a multi-minute spawn trials times). The remaining trials of this
-                            # cell are skipped; the outer sweep continues.
-                            break
-                        records.append(record)
-                        step += 1
     slos = _evaluate_slos(profile, records)
     comparison: ClaimModeComparison | None = build_comparison(
         records, profile.claim_modes, missing_detail=missing_detail
@@ -195,14 +211,22 @@ async def run_connscale(
     fuse_comparison: FuseModeComparison | None = build_fuse_comparison(
         records, profile.fuse_modes, missing_detail=fuse_missing_detail
     )
+    # The statement-batching A/B (ADR 0075 Bench B) reuses the SAME comparator via build_batch_comparison
+    # (keyed on batch_handoff_statements). It is None for a single-arm batch_modes (the pre-ADR-0075
+    # shape), and at most one of {claim, fuse, batch} is multi-arm per profile, so at most one of the
+    # three comparisons is non-None for a given run.
+    batch_comparison: FuseModeComparison | None = build_batch_comparison(
+        records, profile.batch_modes, missing_detail=batch_missing_detail
+    )
     # A multi-arm run additionally fails on a throughput regression, a NO-collapse, or a missing pooled
     # arm (comparison.ok folds those in). A single-arm run has no comparison ⇒ unchanged verdict. The
-    # fusion A/B folds ONLY its correctness gate (fuse_comparison.ok = every B1 arm held zero-loss +
+    # fusion/batching A/Bs fold ONLY their correctness gate (.ok = every B1 arm held zero-loss +
     # present) — a NO-GO/INCONCLUSIVE throughput verdict is a legitimate measurement, not a red build.
     result_ok = (
         all(c.ok for c in slos)
         and (comparison is None or comparison.ok)
         and (fuse_comparison is None or fuse_comparison.ok)
+        and (batch_comparison is None or batch_comparison.ok)
     )
     return ConnScaleReport(
         profile=profile.name,
@@ -216,6 +240,7 @@ async def run_connscale(
         notes=notes,
         comparison=comparison,
         fuse_comparison=fuse_comparison,
+        batch_comparison=batch_comparison,
     )
 
 
@@ -224,6 +249,7 @@ async def _run_one_step(
     *,
     claim_mode: str,
     fuse_mode: bool,
+    batch_mode: bool,
     mode: str,
     count: int,
     trial: int,
@@ -254,12 +280,14 @@ async def _run_one_step(
     # On SQLite (no server backend) give each step its OWN DB file so a prior N's residue can't bleed
     # into this step's counters. On a server backend the connection comes from MEFOR_STORE_* in base_env.
     db_path: str | None = None
-    # A per-arm + per-trial tag: the fusion arm (b0/b1) and the trial index (t{trial}) so the two fusion
-    # arms — and the ``profile.trials`` repeats of one (claim_mode, mode, count) cell — never collide on
-    # the SQLite DB filename or the engine-node name (which prefixes the node's log file). trials=1 (the
-    # default) always emits -t0, the only string delta vs pre-PR5; the measurements are unchanged.
+    # A per-arm + per-trial tag: the fusion arm (b0/b1), the batching arm (bt0/bt1), and the trial index
+    # (t{trial}) so the two fusion arms, the two batching arms, and the ``profile.trials`` repeats of one
+    # (claim_mode, mode, count) cell never collide on the SQLite DB filename or the engine-node name
+    # (which prefixes the node's log file). A single-arm axis always emits its b0/bt0 segment, so the
+    # only string delta vs pre-ADR-0075 is the constant -bt0 insert; the measurements are unchanged.
     fuse_tag = "b1" if fuse_mode else "b0"
-    tag = f"cs-{claim_mode}-{fuse_tag}-{mode}-{count}-t{trial}"
+    batch_tag = "bt1" if batch_mode else "bt0"
+    tag = f"cs-{claim_mode}-{fuse_tag}-{batch_tag}-{mode}-{count}-t{trial}"
     if profile.store_backend is None:
         db_dir = tempfile.mkdtemp(prefix="mefor-connscale-")
         db_path = str(Path(db_dir) / f"{tag}.db")
@@ -270,6 +298,7 @@ async def _run_one_step(
             base_env,
             claim_mode=claim_mode,
             fuse_mode=fuse_mode,
+            batch_mode=batch_mode,
             count=count,
             base_port=profile.base_port,
             transform=profile.transform,
@@ -394,6 +423,7 @@ async def _run_one_step(
         return _build_record(
             claim_mode=claim_mode,
             fuse_mode=fuse_mode,
+            batch_mode=batch_mode,
             mode=mode,
             count=count,
             aggregate_rate=aggregate_rate,
@@ -436,6 +466,7 @@ def _node_env(
     *,
     claim_mode: str = "per_lane",
     fuse_mode: bool = False,
+    batch_mode: bool = False,
     count: int,
     base_port: int,
     transform: str,
@@ -457,6 +488,13 @@ def _node_env(
     # flag on (it fails OPEN to the async path elsewhere), so injecting "false" (the engine default) on
     # the B0 arm — and on every pre-B5 single-arm sweep — is behaviorally unchanged.
     env["MEFOR_PIPELINE_FUSE_THREAD_HOPS"] = "true" if fuse_mode else "false"
+    # ADR 0075 Bench B A/B seam: settings.py parses MEFOR_PIPELINE_BATCH_HANDOFF_STATEMENTS into
+    # PipelineSettings.batch_handoff_statements. Statement-batching only activates on SQL Server (a
+    # provable no-op on Postgres/SQLite), so injecting "false" (the engine default) on the B0 arm — and
+    # on every pre-ADR-0075 single-arm sweep — is behaviorally unchanged. Batching does NOT compose with
+    # fusion (ADR 0075), so the batch A/B keeps fuse OFF in both arms (the profile's one-multi-arm-axis
+    # rule enforces it); this seam sets the two flags independently.
+    env["MEFOR_PIPELINE_BATCH_HANDOFF_STATEMENTS"] = "true" if batch_mode else "false"
     env["MEFOR_CONNSCALE_COUNT"] = str(count)
     env["MEFOR_CONNSCALE_BASE_PORT"] = str(base_port)
     env["MEFOR_CONNSCALE_TRANSFORM"] = transform
@@ -658,6 +696,7 @@ def _build_record(
     *,
     claim_mode: str,
     fuse_mode: bool,
+    batch_mode: bool,
     mode: str,
     count: int,
     aggregate_rate: float,
@@ -737,6 +776,7 @@ def _build_record(
         cpu_util_cores_mean=proc.cpu_util_cores_mean,
         working_set_peak_bytes=proc.working_set_peak_bytes,
         fuse_thread_hops=fuse_mode,
+        batch_handoff_statements=batch_mode,
     )
 
 

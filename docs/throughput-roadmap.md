@@ -13,6 +13,35 @@ is NOT the wall; see the B8 result below.**
 
 ---
 
+## 2026-07-07 — status: sharding LANDED, cut-the-chain quantified + ratified (TIER 1 and TIER 2 reconciled)
+
+Two levers on this roadmap moved, and they are **complementary, not competing** — cut-the-chain raises the
+*per-engine and single-interface* ceiling (and lowers the shard count a given load needs); sharding is the
+*aggregate* 45M/day multiplier. The "cut the chain first, then multiply lanes" sequencing below stands.
+
+- **Multiply lanes (TIER 2) — sharding is BUILT.**
+  [ADR 0073](adr/0073-ownership-scoped-recovery-single-consumer-lanes.md) (ownership-scoped recovery + one
+  delivery consumer per outbound lane) **merged (#803)**, so N `serve --shard` engines on ONE unified store
+  is now a built runtime — gated only on the clean **4-engine no-loss bench** before SYSTEM-REQUIREMENTS
+  calls it a supported topology.
+- **Cut the chain (TIER 1) — statement batching quantified + ratified.**
+  [ADR 0075](adr/0075-per-hop-sql-statement-batching.md) (`batch_handoff_statements`, default-OFF, SS-only)
+  is Accepted. A microbench off the real handoffs (adversarially re-reviewed, counts verified honest)
+  measured a per-hop **round-trip drop of 27–50%** — but the **≥40% figure is conditional on the
+  applock-rc fold** (strict interpretation 27–33%, clears nothing), so it *justifies* a live-rig e2e A/B and
+  does not substitute for it. The prototype build **and** promote both remain **gated on that rig A/B**
+  (standard conjunctive ≥10% / >2σ / zero-loss bar). The one unconditional result: per-hop batching is
+  **not** invariant-blocked (commits/msg stays 2.000; only *cross-lane* batching hits the ADR 0069 fence).
+- **Settled dead-ends (do not re-rank as live levers):** B5 thread-hop fusion **NO-GO** 2026-07-06 (below
+  the ≥10% bar; [ADR 0071](adr/0071-cut-executor-round-trips-b5.md), stays default-OFF); free-threading
+  **~+6–7% paper NO-GO** ([ADR 0053](adr/0053-free-threaded-multicore-engine.md) re-scope, #789) — revives
+  only if a *real* feed measures transform-CPU share >~23%.
+
+*(Reconciliation note from the throughput-planning session. The older `origin/throughput-docs` @ 3843abe
+consolidation is superseded by this main version; see project memory `mf-throughput-plan-2026-07`.)*
+
+---
+
 ## 2026-07-02 — WS-B RESOLVED (multi-engine store gate): store EXONERATED; the wall is engine-box per-message CPU
 
 The multi-engine question ("does ONE store hold when N engine processes commit concurrently?") is

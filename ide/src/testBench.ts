@@ -1,11 +1,15 @@
 // Test Bench: load a message set, dry-run it through the config (no sending), show a results table,
 // and a Before/After view per message (side-by-side or above/below) with an HL7 segment/field-aware
 // diff — inserted/deleted segments are aligned so they don't cascade false changes, and changed
-// fields are highlighted inline (see hl7diff.ts) — plus optional step-through under the debugger.
+// fields are highlighted inline (see hl7diff.ts) — plus a Coverage/Profiling view per message (which
+// Router/Handler lines ran + per-line time, from `dryrun --trace json`, see traceView.ts) and optional
+// step-through under the debugger.
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, messageSetsDir, pythonPath, runJson, workspaceDir } from "./cli";
 import { diffMessages } from "./hl7diff";
+import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView";
 
 interface Delivery {
   to: string;
@@ -29,6 +33,7 @@ interface DryRunRow {
 type Incoming =
   | { command: "load" }
   | { command: "diff"; index: number }
+  | { command: "trace"; index: number }
   | { command: "debug"; index: number };
 
 function nonce(): string {
@@ -64,6 +69,8 @@ function defaultMessagesUri(): vscode.Uri | undefined {
 export class TestBench {
   private panel: vscode.WebviewPanel | undefined;
   private rows: DryRunRow[] = [];
+  private pickPaths: string[] = []; // the files last loaded — re-run under --trace on demand
+  private traces: TraceEntry[] | null = null; // lazily fetched, aligned 1:1 with `rows` by index
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -88,6 +95,8 @@ export class TestBench {
       await this.loadSet();
     } else if (m.command === "diff") {
       await this.showDiff(m.index);
+    } else if (m.command === "trace") {
+      await this.showTrace(m.index);
     } else if (m.command === "debug") {
       await this.debugRow(m.index);
     }
@@ -110,20 +119,80 @@ export class TestBench {
     if (!picks || picks.length === 0) {
       return;
     }
+    const pickPaths = picks.map((p) => p.fsPath);
     try {
       // One CLI call for all picks (the CLI batches files/folders, splits multi-message files, and
       // returns a `path` per row).
       this.rows = await runJson<DryRunRow[]>(
         // --show-phi: the Test Bench renders the developer's own test messages, so it needs the
         // full bodies the CLI redacts by default.
-        ["dryrun", "--config", configDir(), "--show-phi", "--messages", ...picks.map((p) => p.fsPath)],
+        ["dryrun", "--config", configDir(), "--show-phi", "--messages", ...pickPaths],
         cwd,
       );
     } catch (e) {
       void vscode.window.showErrorMessage(`MessageFoundry: dry-run failed — ${String(e)}`);
       return;
     }
+    // Remember the picks so Coverage/Profiling can re-run the SAME set under --trace (aligned by
+    // index); drop any stale trace cache from a previous load.
+    this.pickPaths = pickPaths;
+    this.traces = null;
     this.render();
+  }
+
+  /**
+   * Fetch (once, then cache) the traced dry-run of the loaded set. `dryrun --trace json` iterates the
+   * SAME expanded message list as the plain dry-run, in the same order, so `traces[i]` lines up with
+   * `rows[i]`. No `--show-phi`: Coverage/Profiling need only line numbers + timings, never PHI values.
+   */
+  private async ensureTraces(): Promise<TraceEntry[] | null> {
+    if (this.traces) {
+      return this.traces;
+    }
+    const cwd = workspaceDir();
+    if (!cwd || this.pickPaths.length === 0) {
+      return null;
+    }
+    try {
+      this.traces = await runJson<TraceEntry[]>(
+        ["dryrun", "--config", configDir(), "--messages", ...this.pickPaths, "--trace", "json"],
+        cwd,
+      );
+    } catch (e) {
+      void vscode.window.showErrorMessage(`MessageFoundry: trace failed — ${String(e)}`);
+      return null;
+    }
+    return this.traces;
+  }
+
+  private async showTrace(index: number): Promise<void> {
+    if (!this.panel) {
+      return;
+    }
+    const traces = await this.ensureTraces();
+    const entry = traces?.[index];
+    if (!entry) {
+      void vscode.window.showInformationMessage("MessageFoundry: no trace available for this message.");
+      return;
+    }
+    // fs-backed, per-detail cached source reader (the config .py is code, not PHI). Injected into the
+    // pure builder so traceView.ts stays testable without a filesystem.
+    const srcCache = new Map<string, string | null>();
+    const readSource = (file: string | null): string | null => {
+      if (!file) {
+        return null;
+      }
+      if (!srcCache.has(file)) {
+        try {
+          srcCache.set(file, fs.readFileSync(file, "utf8"));
+        } catch {
+          srcCache.set(file, null);
+        }
+      }
+      return srcCache.get(file) ?? null;
+    };
+    const detail: TraceDetail = buildTraceDetail(entry, readSource);
+    await this.panel.webview.postMessage({ type: "trace", detail });
   }
 
   private async showDiff(index: number): Promise<void> {
@@ -198,6 +267,7 @@ export class TestBench {
           <td>${outs}</td>
           <td class="actions">
             <button data-act="diff" data-i="${i}">Before/After</button>
+            <button data-act="trace" data-i="${i}">Coverage / Profile</button>
             <button data-act="debug" data-i="${i}">Debug</button>
           </td>
         </tr>`;
@@ -255,6 +325,33 @@ export class TestBench {
     .pane pre span.del { background: var(--vscode-diffEditor-removedTextBackground, rgba(248,81,73,0.35)); border-radius: 2px; }
     .panes.sbs { display: flex; gap: 12px; align-items: flex-start; }
     .panes.sbs .pane { flex: 1 1 0; min-width: 0; margin-bottom: 0; }
+    /* Coverage / Profiling (traceView.ts). */
+    .inv { margin-bottom: 18px; }
+    .inv h4 { margin: 6px 0; font-size: 13px; font-weight: 600; display: flex; align-items: baseline; gap: 8px; }
+    .inv h4 .kind { color: var(--vscode-descriptionForeground); font-weight: 600; text-transform: uppercase; font-size: 11px; }
+    .inv .meta { color: var(--vscode-descriptionForeground); font-size: 12px; font-weight: normal; }
+    .note { color: var(--vscode-descriptionForeground); font-size: 12px; margin: 4px 0; }
+    /* Executed-line coverage: exact green for lines that ran, red for executable lines that didn't,
+       dim for non-executable (def/decorator/comment/blank) context. */
+    pre.cov { margin: 0; padding: 6px 0; background: var(--vscode-textCodeBlock-background, rgba(127,127,127,0.1));
+              border: 1px solid var(--vscode-panel-border); border-radius: 3px; overflow: auto;
+              font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; }
+    pre.cov .row { display: flex; white-space: pre; }
+    pre.cov .g { flex: 0 0 auto; width: 4.5em; text-align: right; padding-right: 8px; color: var(--vscode-descriptionForeground);
+                 user-select: none; opacity: 0.8; border-right: 2px solid transparent; }
+    pre.cov .src { flex: 1 1 auto; padding-left: 8px; white-space: pre-wrap; word-break: break-word; }
+    pre.cov .hit .g { border-right-color: var(--vscode-testing-iconPassed, #3fb950); }
+    pre.cov .hit { background: var(--vscode-diffEditor-insertedLineBackground, rgba(63,185,80,0.12)); }
+    pre.cov .miss .g { border-right-color: var(--vscode-testing-iconFailed, #f85149); }
+    pre.cov .miss { background: var(--vscode-diffEditor-removedLineBackground, rgba(248,81,73,0.12)); }
+    pre.cov .non { opacity: 0.55; }
+    pre.cov .hits { color: var(--vscode-testing-iconPassed, #3fb950); }
+    /* Profiling table. */
+    table.prof { border-collapse: collapse; width: 100%; margin: 4px 0 2px; }
+    table.prof th, table.prof td { text-align: right; padding: 2px 8px; border-bottom: 1px solid var(--vscode-panel-border); font-size: 12px; }
+    table.prof th:last-child, table.prof td:last-child { text-align: left; width: 40%; }
+    .pbar { display: inline-block; height: 9px; border-radius: 2px; background: var(--vscode-progressBar-background, #3794ff); vertical-align: middle; }
+    .pbartrack { display: inline-block; width: 100%; background: rgba(127,127,127,0.15); border-radius: 2px; }
   </style>
 </head>
 <body>
@@ -262,6 +359,7 @@ export class TestBench {
     <button id="load">Load Message Set</button>
     <button id="back" hidden>← Back to results</button>
     <button id="layout" hidden>Side by side</button>
+    <button id="tracetoggle" hidden>Show Profiling</button>
   </div>
   <div id="results">${body}</div>
   <div id="detail"></div>
@@ -271,7 +369,10 @@ export class TestBench {
     const detail = document.getElementById('detail');
     const back = document.getElementById('back');
     const layout = document.getElementById('layout');
+    const tracetoggle = document.getElementById('tracetoggle');
     let sbs = (vscode.getState() || {}).sbs || false; // remembered layout choice
+    let traceMode = (vscode.getState() || {}).traceMode || 'coverage'; // 'coverage' | 'profile'
+    let lastTrace = null; // the most recent trace detail, so the toggle can re-render it
 
     function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
@@ -294,12 +395,89 @@ export class TestBench {
     }
 
     function layoutLabel(){ layout.textContent = sbs ? 'Top / bottom' : 'Side by side'; }
+    function traceToggleLabel(){ tracetoggle.textContent = traceMode === 'coverage' ? 'Show Profiling' : 'Show Coverage'; }
+
+    // Human-readable time from seconds (traced wall time; includes tracer overhead, so comparative).
+    function fmtTime(s){
+      if (!(s > 0)) return '0';
+      if (s < 1e-6) return (s * 1e9).toFixed(0) + ' ns';
+      if (s < 1e-3) return (s * 1e6).toFixed(1) + ' µs';
+      if (s < 1) return (s * 1e3).toFixed(2) + ' ms';
+      return s.toFixed(3) + ' s';
+    }
+    function pct(p){ return (p || 0).toFixed(p >= 10 ? 0 : 1) + '%'; }
+
+    // COVERAGE: source lines of one @router/@handler, executed (green) vs not (red) vs context (dim).
+    function coverageInv(cov){
+      const head = '<h4><span class="kind">' + esc(cov.kind) + '</span> ' + esc(cov.name) +
+        ' <span class="meta">' + cov.executed + '/' + cov.executable + ' lines' +
+        (cov.executable ? ' &middot; ' + pct(cov.pct) : '') + '</span></h4>';
+      const notes =
+        (cov.truncated ? '<div class="note">Trace hit its event cap — coverage may under-report.</div>' : '') +
+        (cov.sourceAvailable ? '' : '<div class="note">Source file unavailable — showing executed lines only.</div>');
+      const rows = cov.lines.map((l) => {
+        let cls = 'row non';
+        if (l.executable) cls = l.executed ? 'row hit' : 'row miss';
+        const hits = l.hits > 1 ? ' <span class="hits">&times;' + l.hits + '</span>' : '';
+        const src = cov.sourceAvailable ? (esc(l.text) || '&nbsp;') : ('line ' + l.line + ' executed');
+        return '<div class="' + cls + '"><span class="g">' + l.line + hits + '</span><span class="src">' + src + '</span></div>';
+      }).join('');
+      return '<div class="inv">' + head + notes + '<pre class="cov">' + rows + '</pre></div>';
+    }
+
+    // PROFILING: per-invocation total + a per-line time/%/bar table (hottest first).
+    function profileInv(prof){
+      const head = '<h4><span class="kind">' + esc(prof.kind) + '</span> ' + esc(prof.name) +
+        ' <span class="meta">' + fmtTime(prof.totalSeconds) + ' total</span></h4>';
+      if (!prof.hasTiming) {
+        return '<div class="inv">' + head + '<div class="note">This trace carried no timing.</div></div>';
+      }
+      if (!prof.lines.length) {
+        return '<div class="inv">' + head + '<div class="note">No lines executed.</div></div>';
+      }
+      const body = prof.lines.map((l) => {
+        const bar = '<span class="pbartrack"><span class="pbar" style="width:' + Math.max(0, Math.min(100, l.pct)).toFixed(1) + '%"></span></span>';
+        return '<tr><td>' + l.line + '</td><td>' + l.hits + '</td><td>' + fmtTime(l.seconds) +
+          '</td><td>' + pct(l.pct) + '</td><td>' + bar + '</td></tr>';
+      }).join('');
+      return '<div class="inv">' + head +
+        '<table class="prof"><thead><tr><th>Line</th><th>Hits</th><th>Time</th><th>%</th><th>Share</th></tr></thead>' +
+        '<tbody>' + body + '</tbody></table></div>';
+    }
+
+    function renderTrace(){
+      if (!lastTrace) return;
+      const t = lastTrace;
+      let inner;
+      if (traceMode === 'profile') {
+        const summary = t.hasTiming
+          ? '<div class="note">Total traced time ' + fmtTime(t.totalSeconds) + ' &middot; timings include tracer overhead (comparative, not a benchmark).</div>'
+          : '<div class="note">This trace carried no per-line timing.</div>';
+        inner = summary + t.invocations.map((v) => profileInv(v.profile)).join('');
+      } else {
+        inner = '<div class="note">Green = executed &middot; red = not executed &middot; dim = non-executable (def / comment / blank).</div>' +
+          t.invocations.map((v) => coverageInv(v.coverage)).join('');
+      }
+      const label = traceMode === 'profile' ? 'Profiling' : 'Coverage';
+      detail.innerHTML = '<h3>' + label + ' — ' + esc(t.source) +
+        ' <span class="meta">(' + esc(t.disposition) + ')</span></h3>' +
+        (t.invocations.length ? inner : '<div class="note">No Router/Handler ran for this message.</div>');
+    }
+
+    function saveState(){ vscode.setState({ sbs, traceMode }); }
 
     document.getElementById('load').addEventListener('click', () => vscode.postMessage({ command: 'load' }));
-    back.addEventListener('click', () => { detail.style.display='none'; results.style.display=''; back.hidden=true; layout.hidden=true; });
+    back.addEventListener('click', () => {
+      detail.style.display='none'; results.style.display=''; lastTrace=null;
+      back.hidden=true; layout.hidden=true; tracetoggle.hidden=true;
+    });
     layout.addEventListener('click', () => {
-      sbs = !sbs; vscode.setState({ sbs }); layoutLabel();
+      sbs = !sbs; saveState(); layoutLabel();
       const p = document.querySelector('.panes'); if (p) p.classList.toggle('sbs', sbs);
+    });
+    tracetoggle.addEventListener('click', () => {
+      traceMode = traceMode === 'coverage' ? 'profile' : 'coverage'; saveState();
+      traceToggleLabel(); renderTrace();
     });
     for (const b of document.querySelectorAll('button[data-act]')) {
       b.addEventListener('click', () => vscode.postMessage({ command: b.dataset.act, index: Number(b.dataset.i) }));
@@ -307,19 +485,32 @@ export class TestBench {
 
     window.addEventListener('message', (ev) => {
       const m = ev.data;
-      if (!m || m.type !== 'detail') return;
-      const diff = m.diff || { before: [], after: [] };
-      detail.innerHTML =
-        '<h3>' + esc(m.source) + ' &rarr; ' + esc(m.to) + '</h3>' +
-        '<div class="panes' + (sbs ? ' sbs' : '') + '">' +
-          pane('Before (received)', diff.before, 'before') +
-          pane('After (would send to ' + m.to + ')', diff.after, 'after') +
-        '</div>';
-      results.style.display = 'none';
-      detail.style.display = 'block';
-      back.hidden = false;
-      layout.hidden = false;
-      layoutLabel();
+      if (!m) return;
+      if (m.type === 'detail') {
+        const diff = m.diff || { before: [], after: [] };
+        detail.innerHTML =
+          '<h3>' + esc(m.source) + ' &rarr; ' + esc(m.to) + '</h3>' +
+          '<div class="panes' + (sbs ? ' sbs' : '') + '">' +
+            pane('Before (received)', diff.before, 'before') +
+            pane('After (would send to ' + m.to + ')', diff.after, 'after') +
+          '</div>';
+        lastTrace = null;
+        results.style.display = 'none';
+        detail.style.display = 'block';
+        back.hidden = false;
+        layout.hidden = false;
+        tracetoggle.hidden = true;
+        layoutLabel();
+      } else if (m.type === 'trace') {
+        lastTrace = m.detail;
+        renderTrace();
+        results.style.display = 'none';
+        detail.style.display = 'block';
+        back.hidden = false;
+        layout.hidden = true;
+        tracetoggle.hidden = false;
+        traceToggleLabel();
+      }
     });
   </script>
 </body>

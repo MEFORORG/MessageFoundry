@@ -1911,6 +1911,14 @@ class Registry:
     # (the SQL kind): the RegistryRunner builds one read executor from these; fhir_lookup(name, query)
     # reads it at handler run time. Carried with the graph so a reload re-arms the executor atomically.
     fhir_lookups: dict[str, FhirLookupSpec] = field(default_factory=dict)
+    # Engine-shard identity (ADR 0073), attached by pipeline.sharding.filter_registry_for_shard and
+    # None on an unfiltered graph OR a single-shard config (which stays byte-identical to plain
+    # `serve`). shard_id names THIS process's shard; all_shard_ids pins the full shard universe of
+    # the config the filter ran against (sorted). Sharded-mode behaviors — the ownership-scoped
+    # startup recovery, the single-delivery-consumer-per-outbound-lane gates, and the shard-set
+    # reload refusal — all key off these.
+    shard_id: str | None = None
+    all_shard_ids: tuple[str, ...] | None = None
 
     def add_inbound(self, conn: InboundConnection) -> None:
         self._add(self.inbound, conn.name, conn, "inbound connection")

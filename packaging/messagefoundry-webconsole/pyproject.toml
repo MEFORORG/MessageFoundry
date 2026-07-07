@@ -20,6 +20,7 @@ description = "Web ops console for MessageFoundry — the same-origin browser da
 readme = "README.md"
 requires-python = ">=3.14"
 license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "NOTICE"]  # ship the license + copyright/attribution NOTICE in the wheel (PEP 639), mirroring the engine
 authors = [{ name = "MessageFoundry Organization and contributors" }]
 keywords = ["hl7", "healthcare", "integration", "web-console", "dashboard", "fastapi"]
 classifiers = [

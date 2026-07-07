@@ -318,6 +318,11 @@ class ConnectionRow(BaseModel):
     error: str | None = (
         None  # set when status == "failed" (why it failed to start, ADR 0031) or "filtered" (why the DR run-profile parked it, #61 ADR 0048)
     )
+    # Destination-only, sharded deployments only (ADR 0073): the engine shard that owns claiming/
+    # delivery for this outbound lane. None when unsharded (every lane is local) or for source rows.
+    # Lets an operator watching a backlog on one shard's view see WHICH shard is responsible for
+    # draining it (controls/purge for a non-owned lane 409 with the same owner).
+    owner_shard: str | None = None
 
 
 class StatsResetTarget(BaseModel):

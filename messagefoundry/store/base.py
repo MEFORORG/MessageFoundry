@@ -55,6 +55,7 @@ from messagefoundry.store.store import (
     MessageStatus,
     MessageStore,
     OutboxItem,
+    OwnedLanes,
     SessionRecord,
     Stage,
     UserRecord,
@@ -72,6 +73,7 @@ __all__ = [
     "DEFAULT_SCAN_LIMIT",
     "MAX_SCAN_LIMIT",
     "MessageSearchResult",
+    "OwnedLanes",
     "PoolStatus",
     "QueueStore",
     "Row",
@@ -662,10 +664,21 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     async def reset_stale_inflight(
-        self, now: float | None = None, *, stage: str | None = None
+        self,
+        now: float | None = None,
+        *,
+        stage: str | None = None,
+        owned: OwnedLanes | None = None,
     ) -> int:
         """Return ``inflight`` rows (claimed before a crash) to ``pending``. ``stage=None`` (default)
-        recovers every stage in one pass — the right startup behavior; pass a stage to scope it."""
+        recovers every stage in one pass — the right startup behavior; pass a stage to scope it.
+
+        ``owned=None`` (default) is the unconditional single-node recovery. Pass :class:`OwnedLanes`
+        to scope recovery to the caller's config-graph lanes (ADR 0073): each stage is filtered by
+        its lane key (``channel_id`` for ingress/routed/response, ``destination_name`` for
+        outbound), so an engine shard restarting against a shared unified store recovers exactly its
+        own crash residue and never re-pends a live sibling shard's in-flight rows. An empty owned
+        set matches nothing for the stages it scopes."""
         ...
 
     async def dead_letter_missing_destinations(
@@ -714,6 +727,8 @@ class QueueStore(StoreLifecycle, Protocol):
         limit: int = 50,
         offset: int = 0,
         allowed_channels: Sequence[str] | None = None,
+        received_from: float | None = None,
+        received_to: float | None = None,
     ) -> Sequence[Row]: ...
 
     async def count_messages(
@@ -724,6 +739,8 @@ class QueueStore(StoreLifecycle, Protocol):
         message_type: str | None = None,
         control_id: str | None = None,
         allowed_channels: Sequence[str] | None = None,
+        received_from: float | None = None,
+        received_to: float | None = None,
     ) -> int: ...
 
     async def search_messages(

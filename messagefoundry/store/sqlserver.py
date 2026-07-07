@@ -70,6 +70,7 @@ from messagefoundry.store.store import (
     MessageStore,
     OutboxItem,
     OutboxStatus,
+    OwnedLanes,
     SessionRecord,
     Stage,
     UserRecord,
@@ -78,6 +79,7 @@ from messagefoundry.store.store import (
     _qmark_cutoff_case,
     audit_row_hash,
     delivery_key,
+    owned_lane_scope,
 )
 
 log = logging.getLogger(__name__)
@@ -88,6 +90,10 @@ log = logging.getLogger(__name__)
 _FIFO_HEADS_LANE_CHUNK = 500
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
+# ADR 0073: ownership-scoped reset lane-chunk bound (lane names per UPDATE's IN list) — well under
+# pyodbc's ~2,100-parameter bound with the fixed parameters; chunks run inside the reset's single
+# transaction, so the all-or-nothing recovery pass is unchanged.
+_RESET_LANE_CHUNK = 500
 
 # SQL Server native error 1222 = "Lock request time out period exceeded" — raised by SET LOCK_TIMEOUT 0
 # in the pooled claim (ADR 0066 §9) when a probe cannot IMMEDIATELY acquire a contended head lock. It is
@@ -368,6 +374,116 @@ def _close_sync_cursor(cur: Any) -> None:
         cur.close()
     except Exception:  # noqa: BLE001 - a close failure must not mask the in-flight error
         log.debug("sync handoff cursor close on release failed", exc_info=True)
+
+
+# --- ADR 0075: per-hop SQL statement batching (fold non-result DML into fewer round-trips) ---------
+#
+# A "batch group" is a list of the SAME logical (sql, params) statements the unbatched handoff issues,
+# grouped so consecutive non-result-returning DML folds into ONE pyodbc round-trip. A result-consuming
+# (read) statement — whose value the client must read before building/deciding the next statement — is
+# the LAST statement of its group and is read right after that group's single execute(). The single
+# per-hop COMMIT is untouched (commits/msg stays 2.000). This is the _SQL_APPLOCK technique (a 4-
+# statement T-SQL batch sent as one round-trip) generalized to the rest of the body; the batched form is
+# a THIRD emission of the identical logical sequence (async + sync twin + batched), assembled from the
+# SAME shared constants + param-builders so it can never drift.
+
+
+def _render_batch(group: Sequence[tuple[str, tuple[Any, ...]]]) -> tuple[str, tuple[Any, ...]]:
+    """Fold a >=2 statement group into ONE ``pyodbc.execute()`` payload: ``SET NOCOUNT ON`` prepended,
+    each logical statement ``;``-terminated and concatenated in order, params concatenated in the same
+    order (pyodbc binds ``?`` positionally across the whole batch).
+
+    ``SET NOCOUNT ON`` is load-bearing, not cosmetic: it suppresses the rows-affected result a preceding
+    INSERT/UPDATE/MERGE would otherwise stream, so a trailing read statement's result set (e.g. the
+    finalize ``SELECT @rc``) is the FIRST — and only — rowset the client reads with ``fetchone`` /
+    ``fetchall``. This is exactly why the shipped ``_SQL_APPLOCK`` opens with ``SET NOCOUNT ON``; batching
+    extends the same guarantee to a group that has DML *before* its trailing read. Its failure mode is
+    FAIL-CLOSED: if a positioning surprise made the read return no row, the applock rc reads ``None`` ->
+    ``-999`` -> raise -> rollback -> re-pend (never a silent unserialized proceed).
+
+    Two deliberate non-issues: (1) when the group's trailing read is the applock, the rendered batch
+    carries TWO ``SET NOCOUNT ON`` (one prepended here, one inside ``_SQL_APPLOCK``) — idempotent and
+    harmless, left as-is rather than string-surgery on a reliability-core constant. (2) ``SET NOCOUNT
+    ON`` is a session setting that persists on the pooled connection, but it does NOT corrupt the store's
+    ``cursor.rowcount``-dependent ops (mark_failed / purge / reset_stale_inflight): NOCOUNT suppresses the
+    informational "rows affected" *token*, while ``SQLRowCount`` for a directly-executed DML statement is
+    still populated — and the unbatched path already runs this same ``SET NOCOUNT ON`` (via the finalize
+    applock) on every handoff, so batching adds no new exposure. The SS-gated NOCOUNT-parity test guards
+    this."""
+    parts = ["SET NOCOUNT ON;"]
+    params: list[Any] = []
+    for sql, p in group:
+        stripped = sql.rstrip()
+        parts.append(stripped if stripped.endswith(";") else stripped + ";")
+        params.extend(p)
+    return (" ".join(parts), tuple(params))
+
+
+class _BatchAccumulator:
+    """Groups a handoff body's (sql, params) into the fewest round-trips (ADR 0075). Consecutive
+    non-result DML accumulates in ``_pending``; a result-consuming statement is appended as the group's
+    LAST statement, the group is flushed as ONE ``execute()``, and its result is read right after.
+    ``round_trips`` counts the ``execute()`` calls (ex-commit) so a gate can lock the reduction.
+
+    The accumulator NEVER reorders or drops a statement: it appends in call order and every pending
+    statement is flushed exactly once (at the next read boundary or the trailing :meth:`flush`), so the
+    logical (sql, params) sequence it issues is identical to the unbatched body — only the round-trip
+    grouping differs."""
+
+    def __init__(self, store: SqlServerStore, cur: Any) -> None:
+        self._store = store
+        self._cur = cur
+        self._pending: list[tuple[str, tuple[Any, ...]]] = []
+        self.round_trips = 0
+
+    def add(self, sql: str, params: tuple[Any, ...]) -> None:
+        """Queue one NON-RESULT-RETURNING DML statement into the current group (no round-trip yet).
+
+        The whole positioning-safety proof rests on this invariant: nothing folded via ``add`` may stream
+        a rowset that could shadow a trailing read statement's result. So a leading SELECT, any DML with
+        an ``OUTPUT`` clause, or the applock rc ``SELECT`` MUST go through :meth:`read_one` /
+        :meth:`read_all` (which end the group and read the result) — never ``add``. Enforced here rather
+        than trusted by convention."""
+        upper = sql.lstrip().upper()
+        assert not upper.startswith("SELECT"), (
+            f"_BatchAccumulator.add is for non-result DML only; a leading SELECT must use "
+            f"read_one/read_all: {sql[:80]!r}"
+        )
+        assert "OUTPUT" not in upper, (
+            f"_BatchAccumulator.add statement carries an OUTPUT clause (streams rows); use "
+            f"read_one/read_all so its result is read: {sql[:80]!r}"
+        )
+        assert "SP_GETAPPLOCK" not in upper, (
+            f"_BatchAccumulator.add must not fold the applock rc (it must be read + validated); use "
+            f"read_one: {sql[:80]!r}"
+        )
+        self._pending.append((sql, tuple(params)))
+
+    async def read_one(self, sql: str, params: tuple[Any, ...]) -> Any:
+        """Close the current group with a result-consuming statement, flush it as one round-trip, and
+        return ``fetchone()`` of its result (the read statement is the group's LAST, so under the
+        ``SET NOCOUNT ON`` framing its result set is the one the client reads)."""
+        self._pending.append((sql, tuple(params)))
+        await self._flush()
+        return await self._cur.fetchone()
+
+    async def read_all(self, sql: str, params: tuple[Any, ...]) -> Any:
+        """As :meth:`read_one` but returns ``fetchall()`` (used for the finalize GROUP BY + status read,
+        which also drains the SELECT so a same-cursor UPDATE afterwards is clean)."""
+        self._pending.append((sql, tuple(params)))
+        await self._flush()
+        return await self._cur.fetchall()
+
+    async def flush(self) -> None:
+        """Flush any trailing non-result DML (e.g. the finalize UPDATE + event) as one round-trip."""
+        if self._pending:
+            await self._flush()
+
+    async def _flush(self) -> None:
+        group = self._pending
+        self._pending = []
+        self.round_trips += 1
+        await self._store._execute_group(self._cur, group)
 
 
 class SyncHandoffUnavailable(RuntimeError):
@@ -835,6 +951,29 @@ class SqlServerStore:
         # ("routed"/"outbound"). Empty until open_sync_handoff_pool() is called (no pipeline code opens
         # one in PR1); closed by close_sync_handoff_pool() at store teardown.
         self._sync_pools: dict[str, _SyncHandoffPool] = {}
+        # ADR 0075 per-hop SQL statement batching. FROZEN intent, set ONCE by the runner at start via
+        # set_batch_handoff_statements() when [pipeline].batch_handoff_statements is on (a /config/reload
+        # never re-reads it). When True, route_handoff / transform_handoff dispatch to their batched forms
+        # (fewer pyodbc round-trips, IDENTICAL logical (sql, params) sequence, one commit/hop). Default
+        # False → the async path is byte-identical. SQL-Server-only is intrinsic: only this store class
+        # ships the batched forms + this attribute (MessageStore/PostgresStore have neither), so the flag
+        # is a provable no-op on the other backends.
+        self._batch_handoff_statements = False
+
+    def set_batch_handoff_statements(self, enabled: bool) -> bool:
+        """Enable/disable ADR 0075 per-hop statement batching on this SQL Server store (called ONCE by
+        the runner at start). Returns the EFFECTIVE decision. Fail-closed + SQL-Server-only by
+        construction: this method exists only on :class:`SqlServerStore`, so a non-SS store can never be
+        switched on; here it simply records the frozen intent. Batching never moves a commit boundary and
+        emits the identical logical (sql, params) sequence — see :meth:`_route_handoff_batched`."""
+        self._batch_handoff_statements = bool(enabled)
+        return self._batch_handoff_statements
+
+    @property
+    def batch_handoff_statements(self) -> bool:
+        """Whether ADR 0075 per-hop statement batching is EFFECTIVELY active this run (the /stats seam a
+        batched-vs-unbatched A/B reads). False on every other backend and when the flag is off."""
+        return self._batch_handoff_statements
 
     # --- PHI-at-rest cipher seam for nullable text columns (mirrors MessageStore._enc/_dec) -----
     # Used for summary/metadata (EF-3) and error/last_error/event.detail (H4). null/empty-safe: a NULL
@@ -1346,6 +1485,27 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
 
+    def _event_stmt(
+        self,
+        message_id: str,
+        event: str,
+        destination: str | None,
+        detail: str | None,
+        now: float,
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Build the ``(sql, params)`` for one message-event insert — the SINGLE source of the event
+        statement shared by the async :meth:`_event`, the sync twin :meth:`_event_sync`, and the batched
+        handoff (ADR 0075). PHI chokepoint (#120): scrub HL7-shaped content out of the detail, THEN
+        encrypt it at rest via the store cipher (null/blank-safe) — SQL Server at-rest parity with
+        SQLite/Postgres (H4). The scrub is defense-in-depth kept *around* the cipher, exactly as SQLite
+        does. Centralizing it here means the three emissions can never drift in the scrub/encrypt of the
+        detail."""
+        detail = safe_text(detail) if detail else detail
+        return (
+            _SQL_INSERT_EVENT,
+            _event_params(message_id, now, event, destination, self._enc(detail)),
+        )
+
     async def _event(
         self,
         cur: Any,
@@ -1355,14 +1515,8 @@ class SqlServerStore:
         detail: str | None,
         now: float,
     ) -> None:
-        # PHI chokepoint (#120): scrub HL7-shaped content out of the detail, THEN encrypt it at rest via
-        # the store cipher (null/blank-safe) — SQL Server at-rest parity with SQLite/Postgres (H4). The
-        # scrub is defense-in-depth kept *around* the cipher, exactly as SQLite does.
-        detail = safe_text(detail) if detail else detail
-        await cur.execute(
-            _SQL_INSERT_EVENT,
-            _event_params(message_id, now, event, destination, self._enc(detail)),
-        )
+        sql, params = self._event_stmt(message_id, event, destination, detail, now)
+        await cur.execute(sql, params)
 
     def _event_sync(
         self,
@@ -1374,12 +1528,31 @@ class SqlServerStore:
         now: float,
     ) -> None:
         """Synchronous twin of :meth:`_event` (ADR 0071 B5). Same scrub-then-encrypt chokepoint, same
-        constant + param-builder, over a synchronous pyodbc cursor."""
-        detail = safe_text(detail) if detail else detail
-        cur.execute(
-            _SQL_INSERT_EVENT,
-            _event_params(message_id, now, event, destination, self._enc(detail)),
-        )
+        constant + param-builder (via :meth:`_event_stmt`), over a synchronous pyodbc cursor."""
+        sql, params = self._event_stmt(message_id, event, destination, detail, now)
+        cur.execute(sql, params)
+
+    async def _execute_group(self, cur: Any, group: Sequence[tuple[str, tuple[Any, ...]]]) -> None:
+        """Execute one ADR 0075 batch group as a SINGLE round-trip. A 1-statement group runs the raw
+        statement (byte-identical to the unbatched execute); a >=2 statement group is rendered by
+        :func:`_render_batch` (``SET NOCOUNT ON`` + ``;``-joined) and folds into one ``execute()``. A
+        result-consuming group is arranged so its read statement is LAST, so the caller reads it right
+        after with ``fetchone`` / ``fetchall`` exactly as on the unbatched path.
+
+        The ``record_logical`` hook is a TEST-ONLY seam: a recording cursor may capture the pre-render
+        logical statements so the golden-SQL test can compare the batched logical sequence against the
+        unbatched one byte-for-byte (the rendered batch string cannot be safely re-split — statements
+        such as ``_SQL_APPLOCK`` / ``_SQL_STATE_MERGE`` contain intra-statement ``;``). A real pyodbc
+        cursor has no such attribute, so the branch is skipped in production."""
+        rec = getattr(cur, "record_logical", None)
+        if rec is not None:
+            rec(list(group))
+        if len(group) == 1:
+            sql, params = group[0]
+            await cur.execute(sql, params)
+        else:
+            sql, params = _render_batch(group)
+            await cur.execute(sql, params)
 
     async def _record_delivered_key(
         self,
@@ -1502,6 +1675,33 @@ class SqlServerStore:
                 _SQL_UPDATE_MESSAGE_STATUS, _update_message_status_params(status, message_id)
             )
 
+    async def _maybe_finalize_batched(
+        self, acc: _BatchAccumulator, message_id: str, now: float
+    ) -> None:
+        """Batched form of :meth:`_maybe_finalize` (ADR 0075). Emits the IDENTICAL applock -> GROUP BY
+        -> [status] -> UPDATE sequence through the accumulator, sharing the SAME constants + precedence
+        helpers so the disposition logic can never drift.
+
+        Round-trip structure (STRICT / applock_hard fold): the finalize ``sp_getapplock`` is kept a
+        result-consuming GATE — it CLOSES the group that carries the preceding body DML (the ``transformed``
+        event, etc.), and its rc is read + validated BEFORE any later statement is issued. So the finalize
+        UPDATE is only ever SENT after the client has confirmed the lock is held (rc>=0) — identical
+        ordering to today's unbatched finalize, with no unserialized write on the wire. The GROUP BY (and
+        the no-rows status read) each stay their own read boundary because their result chooses the UPDATE
+        target."""
+        resource = f"mefor:finalize:{message_id}"
+        timeout_ms = _applock_timeout_ms(self._settings.command_timeout)
+        # applock ends the pending body group (read + validate rc; raise on rc<0 -> whole-txn rollback).
+        arow = await acc.read_one(_SQL_APPLOCK, _applock_params(resource, timeout_ms))
+        _applock_result(arow, resource)
+        rows = await acc.read_all(_SQL_FINALIZE_COUNT, (message_id,))
+        action, status = _finalize_from_queue_rows(rows)
+        if action == "check_message":
+            mrows = await acc.read_all(_SQL_SELECT_MESSAGE_STATUS, (message_id,))
+            action, status = _finalize_from_message_status(mrows)
+        if action == "update" and status is not None:
+            acc.add(_SQL_UPDATE_MESSAGE_STATUS, _update_message_status_params(status, message_id))
+
     @staticmethod
     def _message_filter(
         channel_id: str | None,
@@ -1509,6 +1709,8 @@ class SqlServerStore:
         message_type: str | None,
         control_id: str | None,
         allowed_channels: Sequence[str] | None = None,
+        received_from: float | None = None,
+        received_to: float | None = None,
     ) -> tuple[str, tuple[Any, ...]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -1521,6 +1723,13 @@ class SqlServerStore:
             if value is not None:
                 clauses.append(f"{column}=?")
                 params.append(value)
+        # received_at epoch range: [received_from, received_to) — the message-log date filter (#4b).
+        if received_from is not None:
+            clauses.append("received_at >= ?")
+            params.append(received_from)
+        if received_to is not None:
+            clauses.append("received_at < ?")
+            params.append(received_to)
         _append_channel_scope(clauses, params, "channel_id", allowed_channels)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         return where, tuple(params)
@@ -1958,7 +2167,25 @@ class SqlServerStore:
         half of the split pipeline): consume the in-flight ingress row, insert one ``stage='routed'``
         row per selected handler (handler-list order; ``seq`` preserves it), set the intermediate
         disposition (ROUTED with handlers, UNROUTED with none) under the finalize applock. Idempotent:
-        False if the ingress row was already consumed."""
+        False if the ingress row was already consumed.
+
+        ADR 0075: when ``batch_handoff_statements`` is active, dispatches to :meth:`_route_handoff_batched`
+        (fewer round-trips, IDENTICAL logical (sql, params) sequence, one commit). Default-OFF path below
+        is byte-identical to before ADR 0075. Note: only this ASYNC path batches — the ADR 0071 fused
+        sync twins (:meth:`route_handoff_sync` / :meth:`transform_handoff_sync`) run UNBATCHED, so with
+        ``fuse_thread_hops`` also on the fused hops issue serial round-trips (correct, non-additive; the
+        runner logs a note when both flags are active)."""
+        # getattr default keeps a bare store (object.__new__, the offline-test idiom) on the safe
+        # unbatched path; a normally-constructed store always has the attribute set in __init__.
+        if getattr(self, "_batch_handoff_statements", False):
+            return await self._route_handoff_batched(
+                ingress_id=ingress_id,
+                message_id=message_id,
+                channel_id=channel_id,
+                handlers=handlers,
+                disposition=disposition,
+                now=now,
+            )
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -1982,6 +2209,71 @@ class SqlServerStore:
                 )
                 event = "routed" if disposition is MessageStatus.ROUTED else "unrouted"
                 await self._event(cur, message_id, event, None, f"{len(handlers)} handler(s)", now)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return True
+
+    async def _route_handoff_batched(
+        self,
+        *,
+        ingress_id: str,
+        message_id: str,
+        channel_id: str,
+        handlers: Sequence[tuple[str, str]],
+        disposition: MessageStatus,
+        now: float | None = None,
+    ) -> bool:
+        """ADR 0075 batched form of :meth:`route_handoff`. Emits the IDENTICAL ordered (sql, params)
+        sequence as the unbatched path (same constants + param-builders, same order) — it only groups the
+        statements into fewer ``execute()`` round-trips, still committing exactly ONCE.
+
+        Round-trips (STRICT / applock_hard, N=1 handler): [DELETE_GUARD] · [INSERT_ROUTED..., APPLOCK] ·
+        [UPDATE_STATUS, INSERT_EVENT] · COMMIT = 4 (vs 6 unbatched, 33.3%). The guard DELETE opens the
+        txn and is read to decide the idempotent no-op; the finalize applock CLOSES the inserts' group and
+        its rc is validated (raise on rc<0 -> rollback) BEFORE the UPDATE+event group is issued — so the
+        disposition UPDATE is only ever sent with the lock confirmed held (identical ordering to the
+        unbatched path)."""
+        now = time.time() if now is None else now
+        resource = f"mefor:finalize:{message_id}"
+        timeout_ms = _applock_timeout_ms(self._settings.command_timeout)
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                acc = _BatchAccumulator(self, cur)
+                row = await acc.read_one(
+                    _SQL_DELETE_GUARD,
+                    _delete_guard_params(
+                        ingress_id, Stage.INGRESS.value, OutboxStatus.INFLIGHT.value
+                    ),
+                )
+                if row is None:
+                    await conn.rollback()
+                    return False  # already handed off (crash-restart) — idempotent no-op
+                for handler_name, payload in handlers:
+                    acc.add(
+                        _SQL_INSERT_QUEUE_ROUTED,
+                        _insert_routed_params(
+                            uuid4().hex,
+                            message_id,
+                            channel_id,
+                            handler_name,
+                            self._cipher.encrypt(payload),
+                            now,
+                        ),
+                    )
+                # applock is a result-consuming GATE: it closes the inserts' group; rc<0 raises -> rollback.
+                arow = await acc.read_one(_SQL_APPLOCK, _applock_params(resource, timeout_ms))
+                _applock_result(arow, resource)
+                acc.add(
+                    _SQL_UPDATE_MESSAGE_STATUS,
+                    _update_message_status_params(disposition.value, message_id),
+                )
+                event = "routed" if disposition is MessageStatus.ROUTED else "unrouted"
+                acc.add(
+                    *self._event_stmt(message_id, event, None, f"{len(handlers)} handler(s)", now)
+                )
+                await acc.flush()  # [UPDATE_STATUS, INSERT_EVENT] as one round-trip
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -2061,7 +2353,23 @@ class SqlServerStore:
         parent finalizes ``PROCESSED`` (delivered into the PT) rather than collapsing to ``FILTERED``. A
         ``correlation_depth`` breach drops the child and dead-letters the parent's marker (``ERROR``).
         Byte-identical to the pre-feature path when ``pt_deliveries`` is empty. Mirrors
-        :class:`MessageStore` (SQLite) exactly."""
+        :class:`MessageStore` (SQLite) exactly.
+
+        ADR 0075: when ``batch_handoff_statements`` is active AND there are no ``pt_deliveries``,
+        dispatches to :meth:`_transform_handoff_batched` (fewer round-trips, IDENTICAL logical sequence,
+        one commit). The rare PT re-ingress branch (extra interleaved reads via the passthrough helpers)
+        stays on the proven unbatched path below — a bounded, deliberate scope for the prototype. Default-
+        OFF path below is byte-identical to before ADR 0075."""
+        # getattr default keeps a bare store (the offline-test idiom) on the safe unbatched path.
+        if getattr(self, "_batch_handoff_statements", False) and not pt_deliveries:
+            return await self._transform_handoff_batched(
+                routed_id=routed_id,
+                message_id=message_id,
+                channel_id=channel_id,
+                deliveries=deliveries,
+                state_ops=state_ops,
+                now=now,
+            )
         now = time.time() if now is None else now
         applied: list[tuple[tuple[str, str], Any]] = []
         async with self._acquire() as conn, self._cursor(conn) as cur:
@@ -2113,6 +2421,75 @@ class SqlServerStore:
                 )
                 # Finalizer is the sole disposition authority here (no direct messages.status write).
                 await self._maybe_finalize(cur, message_id, now)
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        # Commit succeeded → publish the committed state writes to the read-through cache.
+        self.publish_state_cache(applied)
+        return True
+
+    async def _transform_handoff_batched(
+        self,
+        *,
+        routed_id: str,
+        message_id: str,
+        channel_id: str,
+        deliveries: Sequence[tuple[str, str]],
+        state_ops: Sequence[tuple[str, str, Any]] = (),
+        now: float | None = None,
+    ) -> bool:
+        """ADR 0075 batched form of :meth:`transform_handoff` for the non-PT hot path. Emits the IDENTICAL
+        ordered (sql, params) sequence as the unbatched path (same constants + param-builders, same sorted
+        state order, same delivery order) — only the round-trip grouping differs, and it commits once.
+
+        Round-trips (STRICT / applock_hard, 1 delivery / 0 state): [DELETE_GUARD] · [INSERT_OUTBOUND,
+        INSERT_EVENT, APPLOCK] · [FINALIZE_COUNT] · [UPDATE_STATUS] · COMMIT = 5 (vs 7 unbatched, 28.6%).
+        The finalizer stays the sole disposition authority (:meth:`_maybe_finalize_batched`); its applock
+        rc is validated before the finalize UPDATE is issued (strict gate). Callers with ``pt_deliveries``
+        never reach here — :meth:`transform_handoff` keeps that branch on the unbatched path."""
+        now = time.time() if now is None else now
+        applied: list[tuple[tuple[str, str], Any]] = []
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                acc = _BatchAccumulator(self, cur)
+                row = await acc.read_one(
+                    _SQL_DELETE_GUARD,
+                    _delete_guard_params(
+                        routed_id, Stage.ROUTED.value, OutboxStatus.INFLIGHT.value
+                    ),
+                )
+                if row is None:
+                    await conn.rollback()
+                    return False  # already handed off (crash-restart) — idempotent no-op
+                for namespace, key, value in sorted(state_ops, key=lambda op: (op[0], op[1])):
+                    enc = self._cipher.encrypt(json.dumps(value))
+                    acc.add(
+                        _SQL_STATE_MERGE, _state_merge_params(namespace, key, enc, now, message_id)
+                    )
+                    applied.append(((namespace, key), value))
+                for dest_name, payload in deliveries:
+                    acc.add(
+                        _SQL_INSERT_QUEUE_OUTBOUND,
+                        _insert_outbound_params(
+                            uuid4().hex,
+                            message_id,
+                            channel_id,
+                            dest_name,
+                            self._cipher.encrypt(payload),
+                            now,
+                        ),
+                    )
+                # No pt_deliveries on this path, so total_targets == len(deliveries) — byte-identical
+                # event detail to the unbatched path (which adds len(pt_deliveries)==0).
+                acc.add(
+                    *self._event_stmt(
+                        message_id, "transformed", None, f"{len(deliveries)} destination(s)", now
+                    )
+                )
+                # Finalizer is the sole disposition authority here (no direct messages.status write).
+                await self._maybe_finalize_batched(acc, message_id, now)
+                await acc.flush()  # flush the finalize UPDATE (+ any trailing DML)
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -4190,18 +4567,32 @@ class SqlServerStore:
     # --- recovery / replay ---------------------------------------------------
 
     async def reset_stale_inflight(
-        self, now: float | None = None, *, stage: str | None = None
+        self,
+        now: float | None = None,
+        *,
+        stage: str | None = None,
+        owned: OwnedLanes | None = None,
     ) -> int:
         """Return in-flight rows to ``pending`` (startup crash recovery) across ALL stages by default —
         an ingress/routed row left inflight by a crash MUST be re-pended or the message hangs forever
         (count-and-log invariant). ``stage`` optionally narrows it; owner/lease are cleared (single-node
         parity).
 
+        ``owned=None`` (default) keeps the unconditional single-node recovery. Passing
+        :class:`OwnedLanes` scopes recovery to the caller's config-graph lanes (ADR 0073) — each
+        stage filtered by its lane key (``channel_id`` for ingress/routed/response,
+        ``destination_name`` for outbound) — so a restarting engine shard on a shared store recovers
+        exactly its own crash residue and never re-pends (or owner/lease-strips) a live sibling
+        shard's rows. This matters doubly here: SQL Server has NO lease sweep, so the scoped reset
+        is the ONLY recovery path for a sharded fleet. An empty owned set for a stage emits no
+        statement (never ``IN ()``).
+
         The all-stages case runs one UPDATE per :class:`Stage` in a single transaction: the
         ``(stage, status)`` pair seeks ``ix_queue_ready``, where the bare ``status=?`` predicate
         matches no index and full-scanned the queue on every open — with N engines opening against
         one shared (ghost-bloated) store, a measured contributor to the WS-B co-start lock convoy
-        (LCK_M_IX/X storms). Iterating the enum keeps a future stage automatically covered."""
+        (LCK_M_IX/X storms). The ownership filter rides that same seek as a residual chunked ``IN``
+        predicate (no index hints). Iterating the enum keeps a future stage automatically covered."""
         now = time.time() if now is None else now
         stages = [stage] if stage is not None else [s.value for s in Stage]
         sql = (
@@ -4212,11 +4603,30 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 for st in stages:
-                    await cur.execute(
-                        sql,
-                        (OutboxStatus.PENDING.value, now, now, OutboxStatus.INFLIGHT.value, st),
-                    )
-                    recovered += cur.rowcount
+                    if owned is None:
+                        await cur.execute(
+                            sql,
+                            (OutboxStatus.PENDING.value, now, now, OutboxStatus.INFLIGHT.value, st),
+                        )
+                        recovered += cur.rowcount
+                        continue
+                    lane_col, names = owned_lane_scope(st, owned)
+                    ordered = sorted(names)
+                    for i in range(0, len(ordered), _RESET_LANE_CHUNK):
+                        chunk = ordered[i : i + _RESET_LANE_CHUNK]
+                        marks = ",".join("?" * len(chunk))
+                        await cur.execute(
+                            f"{sql} AND {lane_col} IN ({marks})",
+                            (
+                                OutboxStatus.PENDING.value,
+                                now,
+                                now,
+                                OutboxStatus.INFLIGHT.value,
+                                st,
+                                *chunk,
+                            ),
+                        )
+                        recovered += cur.rowcount
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -4488,9 +4898,17 @@ class SqlServerStore:
         limit: int = 50,
         offset: int = 0,
         allowed_channels: Sequence[str] | None = None,
+        received_from: float | None = None,
+        received_to: float | None = None,
     ) -> list[dict[str, Any]]:
         where, params = self._message_filter(
-            channel_id, status, message_type, control_id, allowed_channels
+            channel_id,
+            status,
+            message_type,
+            control_id,
+            allowed_channels,
+            received_from,
+            received_to,
         )
         rows = await self._fetchall(
             "SELECT id, channel_id, received_at, source_type, control_id, message_type,"
@@ -4515,9 +4933,17 @@ class SqlServerStore:
         message_type: str | None = None,
         control_id: str | None = None,
         allowed_channels: Sequence[str] | None = None,
+        received_from: float | None = None,
+        received_to: float | None = None,
     ) -> int:
         where, params = self._message_filter(
-            channel_id, status, message_type, control_id, allowed_channels
+            channel_id,
+            status,
+            message_type,
+            control_id,
+            allowed_channels,
+            received_from,
+            received_to,
         )
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM messages{where}", params)
         return int(row["n"]) if row else 0

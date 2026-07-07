@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import math
 import statistics
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from harness.load.connscale.profile import FUSE_OFF, FUSE_ON
@@ -536,6 +537,13 @@ def _round_or_none(value: float | None, digits: int) -> float | None:
     return None if value is None else round(value, digits)
 
 
+def _drain_fmt(drain_seconds_worst: float | None) -> str:
+    """Render a worst-case drain time, distinguishing a TIMED-OUT drain (``None`` = await_drain never
+    saw the whole-pipeline reach 0, i.e. stranded) from a finite completed drain — so the table reader
+    isn't left reading a timeout as merely 'unmeasured'."""
+    return "TIMED-OUT" if drain_seconds_worst is None else f"{drain_seconds_worst:.2f}"
+
+
 # =============================================================================
 # Thread-hop-fusion A/B (ADR 0071 B5) — B0 (fusion off) vs B1 (fusion on).
 # =============================================================================
@@ -548,8 +556,11 @@ def _round_or_none(value: float | None, digits: int) -> float | None:
 #
 #   * throughput lift    -- B1 achieved intake msg/s (the "ceiling") must rise >= 10% AND by > 2σ of
 #                           the combined trial spread (a margin outside trial noise, not a lucky run);
-#   * in_pipeline        -- flat-or-lower on B1 (a higher intake number bought by a growing backlog is
-#                           a mirage, not a real ceiling lift);
+#   * in_pipeline        -- B1 must drain like B0 (its whole-pipeline drain COMPLETES + a flat-or-lower
+#                           post-load drain time): a higher intake bought by a growing backlog is a
+#                           mirage, not a real ceiling lift. Read from the AUTHORITATIVE await_drain
+#                           completion signal (whole-pipeline in_pipeline==0), NOT the /stats-poller
+#                           in_pipeline peak (which under-samples under overload, §10 item 8);
 #   * delivered/offered  -- B1 must deliver >= 0.98 of what was offered (it is keeping up end-to-end);
 #   * zero-loss held     -- B1 must NOT breach the at-least-once reconcile at any count (hard guard).
 #
@@ -564,8 +575,9 @@ DEFAULT_FUSE_MIN_LIFT_PCT = 10.0
 DEFAULT_FUSE_SIGMA_MULTIPLE = 2.0
 #: B1 must deliver at least this fraction of offered (sink_received / sent) — not a backlog mirage.
 DEFAULT_FUSE_MIN_DELIVERED_OFFERED = 0.98
-#: B1's in_pipeline peak may exceed B0's by at most this fraction (+1 absolute) and still count as
-#: "flat-or-lower" — a small noise cushion so runner jitter doesn't flip a real lift to NO-GO.
+#: B1's worst post-load DRAIN TIME may exceed B0's by at most this fraction (+1 s absolute) and still
+#: count as "flat-or-lower" — a small noise cushion so runner jitter doesn't flip a real lift to NO-GO.
+#: (Was the /stats-poller in_pipeline peak; now the authoritative drain signal — ADR 0071 §10 item 8.)
 DEFAULT_FUSE_IN_PIPELINE_TOLERANCE = 0.05
 
 # Fusion GO/NO-GO verdict labels.
@@ -585,28 +597,77 @@ FUSE_MISSING = (
 FUSE_B0_LABEL = "fuse=off (B0)"
 FUSE_B1_LABEL = "fuse=on (B1)"
 
+# The SAME §6.4(b) verdict machinery drives the ADR 0075 statement-batching A/B (Bench B): its axis
+# discriminator is the record's ``batch_handoff_statements`` tag rather than ``fuse_thread_hops``, and
+# it is relabelled for that axis. build_batch_comparison() below is a thin wrapper over
+# build_fuse_comparison() — ONE verdict path, no fork, no reintroduced poller-peak.
+FUSE_AXIS_KIND = "fuse_mode_ab"
+FUSE_TITLE = "Thread-hop-fusion A/B (ADR 0071 B5)"
+FUSE_GUARDS_REF = "ADR 0071 6.4b"
+BATCH_AXIS_KIND = "batch_mode_ab"
+BATCH_TITLE = "Statement-batching A/B (ADR 0075 Bench B)"
+BATCH_GUARDS_REF = "ADR 0075 Bench B"
+BATCH_B0_LABEL = "batch=off (B0)"
+BATCH_B1_LABEL = "batch=on (B1)"
+
+
+def _fuse_thread_hops(r: ConnScaleRecord) -> bool:
+    """Default arm discriminator for the fusion A/B: pair B0 vs B1 by the ``fuse_thread_hops`` tag."""
+    return r.fuse_thread_hops
+
+
+def _batch_handoff_statements(r: ConnScaleRecord) -> bool:
+    """Arm discriminator for the statement-batching A/B: pair B0 vs B1 by the
+    ``batch_handoff_statements`` tag (fusion stays OFF in both arms — the two levers don't compose,
+    ADR 0075)."""
+    return r.batch_handoff_statements
+
 
 @dataclass(frozen=True)
 class _FuseArm:
     """One fusion arm's read-off for a ``(claim_mode, sweep_mode, count)`` cell, aggregated over its
-    trials (mean + sample spread of the achieved intake rate; worst-case in_pipeline; all-trials
-    zero-loss)."""
+    trials (mean + sample spread of the achieved intake rate; worst-case drain; all-trials zero-loss)."""
 
     fuse: bool
     trials: int
     mean_read_per_s: float
     sd_read_per_s: float  # sample stddev of the intake rate across trials (0.0 for < 2 trials)
     mean_written_per_s: float
-    in_pipeline_peak: int  # the worst (max) in_pipeline peak across trials
+    in_pipeline_peak: (
+        int  # worst (max) /stats-poller in_pipeline peak — CONTEXT ONLY, no longer gated
+    )
+    # --- the AUTHORITATIVE WHOLE-PIPELINE drain signal (the same ``await_drain`` the runner already
+    # trusts; the /stats poller peak under-samples under overload — ADR 0071 §10 item 8).
+    # ``drain_seconds_worst`` = the worst (longest) post-load drain time across trials, and is **``None``
+    # when ANY trial's drain TIMED OUT** — ``await_drain`` returns a finite time only once the
+    # whole-pipeline ``in_pipeline`` gauge (NOT-DONE rows across ingress+routed+outbound) reaches 0, so a
+    # timeout means rows stranded in SOME stage. A ``None`` here is the WORST case ("never drained"), NOT
+    # "unmeasured": a timed-out trial poisons the worst-case so a partial strand can't be dropped. (The
+    # outbound-only ``no_loss.backlog`` can read 0 while ingress/routed still hold rows, so it is NOT a
+    # whole-pipeline gauge — drain completion is.) ---
+    drain_seconds_worst: float | None
     delivered_offered: float | None  # mean sink_received/sent across trials (None if no sent)
     zero_loss_ok: bool  # every trial held the at-least-once reconcile
     offered_rate: float
+
+    @property
+    def drain_completed(self) -> bool:
+        """Every trial's post-load drain COMPLETED — ``await_drain`` saw the whole-pipeline
+        ``in_pipeline`` gauge reach 0 (no rows stranded in ANY stage). Exactly
+        ``drain_seconds_worst is not None`` by construction: a timed-out trial poisons the worst case."""
+        return self.drain_seconds_worst is not None
 
     @classmethod
     def from_records(cls, fuse: bool, recs: list[ConnScaleRecord]) -> _FuseArm:
         reads = [r.achieved_read_per_s for r in recs]
         writtens = [r.achieved_written_per_s for r in recs]
         ratios = [r.no_loss.sink_received / r.no_loss.sent for r in recs if r.no_loss.sent > 0]
+        drains = [r.drain_seconds for r in recs]
+        completed = [d for d in drains if d is not None]
+        # A timed-out drain (None) POISONS the worst case: ``await_drain`` never saw ``in_pipeline``
+        # reach 0, so there is no finite whole-pipeline drain time to trust — the arm did NOT fully
+        # drain. Only when EVERY trial completed is the worst-case the max of the finite drain times.
+        drain_seconds_worst = max(completed) if recs and len(completed) == len(drains) else None
         return cls(
             fuse=fuse,
             trials=len(recs),
@@ -614,6 +675,7 @@ class _FuseArm:
             sd_read_per_s=statistics.stdev(reads) if len(reads) >= 2 else 0.0,
             mean_written_per_s=statistics.fmean(writtens) if writtens else 0.0,
             in_pipeline_peak=max((r.in_pipeline_peak for r in recs), default=0),
+            drain_seconds_worst=drain_seconds_worst,
             delivered_offered=statistics.fmean(ratios) if ratios else None,
             zero_loss_ok=all(r.no_loss.ok for r in recs) and bool(recs),
             offered_rate=recs[0].offered_aggregate_rate if recs else 0.0,
@@ -633,7 +695,9 @@ class FuseComparisonRow:
     lift_pct: float | None  # (B1 - B0) / B0 * 100 of the achieved intake rate
     sigma: float | None  # 2σ reference: combined per-arm trial spread of the intake rate
     significant: bool  # the lift exceeds sigma_multiple × sigma (outside trial noise)
-    in_pipeline_ok: bool  # B1 in_pipeline peak flat-or-lower vs B0
+    in_pipeline_ok: (
+        bool  # B1 whole-pipeline drain COMPLETED AND drain time flat-or-lower vs B0 (authoritative)
+    )
     delivered_offered_ok: bool  # B1 delivered/offered >= the floor
     candidate_lost: bool  # B1 breached zero-loss (hard fail)
     reason: str  # a human one-liner explaining the verdict
@@ -659,6 +723,14 @@ class FuseModeComparison:
     in_pipeline_tolerance: float
     rows: list[FuseComparisonRow] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Axis labelling (defaulted to the fusion axis so a pre-existing fuse run's JSON/table is byte-
+    # identical). The statement-batching A/B (ADR 0075) reuses this SAME class + verdict path via
+    # build_batch_comparison(), only overriding these labels — there is no second comparator.
+    axis_kind: str = FUSE_AXIS_KIND
+    title: str = FUSE_TITLE
+    guards_ref: str = FUSE_GUARDS_REF
+    baseline_label: str = FUSE_B0_LABEL
+    candidate_label: str = FUSE_B1_LABEL
     # (claim_mode, sweep_mode, count) cells with a B1 (fusion-on) record but NO B0 baseline record —
     # the fusion-off baseline (itself a pooled arm) failed or was omitted there, so the lift is
     # uncomputable. Folded into overall_verdict/ok so a swallowed baseline can never let a GO on the
@@ -709,9 +781,9 @@ class FuseModeComparison:
 
     def to_json_dict(self) -> dict[str, object]:
         return {
-            "kind": "fuse_mode_ab",
-            "baseline": FUSE_B0_LABEL,
-            "candidate": FUSE_B1_LABEL,
+            "kind": self.axis_kind,
+            "baseline": self.baseline_label,
+            "candidate": self.candidate_label,
             "guards": {
                 "min_lift_pct": self.min_lift_pct,
                 "sigma_multiple": self.sigma_multiple,
@@ -736,10 +808,10 @@ class FuseModeComparison:
     def render_table(self) -> str:
         lines: list[str] = []
         lines.append(
-            f"Thread-hop-fusion A/B (ADR 0071 B5) -- baseline {FUSE_B0_LABEL} vs candidate {FUSE_B1_LABEL}"
+            f"{self.title} -- baseline {self.baseline_label} vs candidate {self.candidate_label}"
         )
         lines.append(
-            f"guards (ADR 0071 6.4b): lift >= {self.min_lift_pct:.0f}% AND > {self.sigma_multiple:.0f}"
+            f"guards ({self.guards_ref}): lift >= {self.min_lift_pct:.0f}% AND > {self.sigma_multiple:.0f}"
             f"sigma | in_pipeline flat-or-lower | delivered/offered >= {self.min_delivered_offered:.2f}"
             f" | zero-loss held  (SQL Server is the valid leg; SQLite is NOT a throughput proxy)"
         )
@@ -771,8 +843,13 @@ class FuseModeComparison:
                 f"significant: {_yn(row.significant)}"
             )
             lines.append(
-                f"  in_pipeline_peak          B0={b.in_pipeline_peak:>9}  "
-                f"B1={cand.in_pipeline_peak:>9}  {'':>9}  flat-or-lower: {_yn(row.in_pipeline_ok)}"
+                f"  drain_seconds (worst)     B0={_drain_fmt(b.drain_seconds_worst):>9}  "
+                f"B1={_drain_fmt(cand.drain_seconds_worst):>9}  {'':>9}  drained+flat-or-lower: "
+                f"{_yn(row.in_pipeline_ok)}"
+            )
+            lines.append(
+                f"  in_pipeline_peak (poller) B0={b.in_pipeline_peak:>9}  "
+                f"B1={cand.in_pipeline_peak:>9}  {'':>9}  context only (under-samples; not gated)"
             )
             lines.append(
                 f"  delivered/offered         B0={_fmt(b.delivered_offered):>9}  "
@@ -800,13 +877,24 @@ def build_fuse_comparison(
     sigma_multiple: float = DEFAULT_FUSE_SIGMA_MULTIPLE,
     min_delivered_offered: float = DEFAULT_FUSE_MIN_DELIVERED_OFFERED,
     in_pipeline_tolerance: float = DEFAULT_FUSE_IN_PIPELINE_TOLERANCE,
+    arm_of: Callable[[ConnScaleRecord], bool] = _fuse_thread_hops,
+    axis_kind: str = FUSE_AXIS_KIND,
+    title: str = FUSE_TITLE,
+    guards_ref: str = FUSE_GUARDS_REF,
+    baseline_label: str = FUSE_B0_LABEL,
+    candidate_label: str = FUSE_B1_LABEL,
 ) -> FuseModeComparison | None:
     """Build the B0-vs-B1 fusion A/B from a run's records. Returns ``None`` for a single-arm
     ``fuse_modes`` (nothing to compare — the pre-existing single-arm shape). Groups records by
-    ``(claim_mode, sweep_mode, count, fuse)`` so >= 2 trials per arm feed the mean + spread, then pairs
+    ``(claim_mode, sweep_mode, count, arm)`` so >= 2 trials per arm feed the mean + spread, then pairs
     each B0 cell against its B1 arm and applies the ADR 0071 §6.4(b) guards. ``missing_detail`` maps a
     ``(claim_mode, sweep_mode, count)`` whose B1 arm never ran to a loud reason (surfaced on the missing
-    row)."""
+    row).
+
+    ``arm_of`` selects the boolean A/B discriminator (default the ``fuse_thread_hops`` tag); the
+    statement-batching A/B (ADR 0075) passes ``batch_handoff_statements`` + the batch labels through
+    :func:`build_batch_comparison` to reuse this EXACT verdict path (``_FuseArm`` / ``_in_pipeline_ok``
+    / ``_fuse_verdict``) — one comparator, only the discriminator + labels differ."""
     modes = list(fuse_modes)
     if len(modes) < 2 or FUSE_OFF not in modes or FUSE_ON not in modes:
         return None
@@ -814,14 +902,14 @@ def build_fuse_comparison(
 
     groups: dict[tuple[str, str, int, bool], list[ConnScaleRecord]] = {}
     for r in records:
-        groups.setdefault((r.claim_mode, r.sweep_mode, r.count, r.fuse_thread_hops), []).append(r)
+        groups.setdefault((r.claim_mode, r.sweep_mode, r.count, arm_of(r)), []).append(r)
 
     # Iterate the (claim_mode, sweep_mode, count) cells the B0 baseline produced, first-seen order, so
     # the report is stable and a missing B1 arm is detected against the baseline that always runs.
     baseline_cells: list[tuple[str, str, int]] = []
     seen: set[tuple[str, str, int]] = set()
     for r in records:
-        if r.fuse_thread_hops is FUSE_OFF:
+        if arm_of(r) is FUSE_OFF:
             key = (r.claim_mode, r.sweep_mode, r.count)
             if key not in seen:
                 seen.add(key)
@@ -888,7 +976,7 @@ def build_fuse_comparison(
     baseline_missing: list[tuple[str, str, int]] = []
     seen_b1: set[tuple[str, str, int]] = set()
     for r in records:
-        if r.fuse_thread_hops is FUSE_ON:
+        if arm_of(r) is FUSE_ON:
             key = (r.claim_mode, r.sweep_mode, r.count)
             if key not in seen and key not in seen_b1:
                 seen_b1.add(key)
@@ -909,7 +997,78 @@ def build_fuse_comparison(
         rows=rows,
         notes=notes,
         baseline_missing=baseline_missing,
+        axis_kind=axis_kind,
+        title=title,
+        guards_ref=guards_ref,
+        baseline_label=baseline_label,
+        candidate_label=candidate_label,
     )
+
+
+def build_batch_comparison(
+    records: list[ConnScaleRecord],
+    batch_modes: tuple[bool, ...],
+    *,
+    missing_detail: dict[tuple[str, str, int], str] | None = None,
+    min_lift_pct: float = DEFAULT_FUSE_MIN_LIFT_PCT,
+    sigma_multiple: float = DEFAULT_FUSE_SIGMA_MULTIPLE,
+    min_delivered_offered: float = DEFAULT_FUSE_MIN_DELIVERED_OFFERED,
+    in_pipeline_tolerance: float = DEFAULT_FUSE_IN_PIPELINE_TOLERANCE,
+) -> FuseModeComparison | None:
+    """Build the B0-vs-B1 statement-batching A/B (ADR 0075 Bench B) from a run's records.
+
+    A thin wrapper over :func:`build_fuse_comparison` — the SAME §6.4(b) verdict path (conjunctive
+    >= 10% & > 2σ lift, the authoritative whole-pipeline drain signal via ``_in_pipeline_ok`` from
+    #812, delivered/offered floor, hard zero-loss gate) — only the arm discriminator
+    (``batch_handoff_statements`` instead of ``fuse_thread_hops``) and the axis labels differ. Returns
+    ``None`` for a single-arm ``batch_modes`` (nothing to compare). ``missing_detail`` maps a
+    ``(claim_mode, sweep_mode, count)`` whose B1 (batching-on) arm never ran to a loud reason."""
+    return build_fuse_comparison(
+        records,
+        batch_modes,
+        missing_detail=missing_detail,
+        min_lift_pct=min_lift_pct,
+        sigma_multiple=sigma_multiple,
+        min_delivered_offered=min_delivered_offered,
+        in_pipeline_tolerance=in_pipeline_tolerance,
+        arm_of=_batch_handoff_statements,
+        axis_kind=BATCH_AXIS_KIND,
+        title=BATCH_TITLE,
+        guards_ref=BATCH_GUARDS_REF,
+        baseline_label=BATCH_B0_LABEL,
+        candidate_label=BATCH_B1_LABEL,
+    )
+
+
+def _in_pipeline_ok(base: _FuseArm, cand: _FuseArm, tolerance: float) -> bool:
+    """Did B1's higher intake ride a growing backlog (a mirage), or drain like B0 (a real lift)?
+
+    Read from the AUTHORITATIVE WHOLE-PIPELINE drain signal the harness already computes, NOT the
+    /stats-poller ``in_pipeline`` peak, which under-samples under overload and produced false NO-GO
+    *reasons* (ADR 0071 §10 item 8). The signal is drain COMPLETION: ``await_drain`` returns a finite
+    ``drain_seconds`` only once the whole-pipeline ``in_pipeline`` gauge (NOT-DONE rows across
+    ingress+routed+outbound) reaches 0 and the counters settle; on timeout it returns ``None``. So
+    ``drain_seconds_worst is None`` means at least one trial's drain never completed — rows stranded in
+    SOME stage. (The outbound-only ``no_loss.backlog`` can read 0 while ingress/routed still hold rows,
+    so it is NOT usable here — a fully-offered arm that strands upstream would false-pass; the whole-
+    pipeline drain gauge is the only reliable one.)
+
+    1. **Candidate fully drained.** If B1's worst drain did NOT complete (``drain_seconds_worst is
+       None``) the whole pipeline never emptied — the backlog mirage — so FAIL, never auto-pass. This is
+       the exact overload regime the guard targets: a timed-out drain is the strongest strand signal.
+    2. **Drain time flat-or-lower.** Otherwise (B1 fully drained) B1's worst (longest) completed drain
+       must not exceed B0's beyond a small cushion (× (1 + tolerance) + 1 s). A longer drain means a
+       larger backlog accumulated behind the higher intake. If B0 itself never drained
+       (``drain_seconds_worst is None``) B0 is the drowning arm and a fully-draining B1 is unambiguously
+       flat-or-lower ⇒ pass.
+    """
+    # Order matters: the candidate-timeout FAIL is checked FIRST, so a B1 that never drained can never be
+    # rescued by a B0 that also never drained.
+    if cand.drain_seconds_worst is None:
+        return False
+    if base.drain_seconds_worst is None:
+        return True
+    return cand.drain_seconds_worst <= base.drain_seconds_worst * (1.0 + tolerance) + 1.0
 
 
 def _fuse_row(
@@ -925,18 +1084,13 @@ def _fuse_row(
     in_pipeline_tolerance: float,
 ) -> FuseComparisonRow:
     candidate_lost = not cand.zero_loss_ok
-    # "flat-or-lower": B1's in_pipeline peak must not exceed B0's beyond a small noise cushion (a
-    # +1 absolute so a near-zero baseline isn't tripped by unit jitter). A grown in_pipeline means the
-    # higher intake number is riding a backlog, not a real ceiling lift.
-    # TODO(ADR 0071 §10 item 8): in_pipeline_peak is the /stats-POLLER-sampled peak, which UNDER-samples
-    # under overload — the 2026-07-06 fuse_ab bench read a spuriously low B0 peak (1369/7801/9316 vs a
-    # steady B1 ~21k) and fired a FALSE "in_pipeline grew" NO-GO at N=1024 (B1 in fact drained faster;
-    # Little's law says the lower-intake arm should read equal-or-higher). Should compare the AUTHORITATIVE
-    # sink/drain signal (sink_received vs sent, backlog-at-drain) instead of the sampled gauge. Does not
-    # change that run's overall NO-GO (256/512 fail on the lift clause), but it produces misleading reasons.
-    in_pipeline_ok = (
-        cand.in_pipeline_peak <= base.in_pipeline_peak * (1.0 + in_pipeline_tolerance) + 1.0
-    )
+    # "flat-or-lower" (ADR 0071 §10 item 8): does B1's higher intake ride a growing backlog (a mirage),
+    # or drain like B0 (a real ceiling lift)? Judged from the AUTHORITATIVE whole-pipeline drain signal
+    # (await_drain COMPLETION + post-load drain time), NOT the /stats-poller in_pipeline peak — that
+    # gauge UNDER-samples under overload (the 2026-07-06 fuse_ab bench read a spuriously low B0 peak of
+    # 1369/7801/9316 vs a steady B1 ~21k and fired a FALSE "in_pipeline grew" NO-GO at N=1024, though B1
+    # in fact drained FASTER: ~143 s vs ~158 s). See :func:`_in_pipeline_ok`.
+    in_pipeline_ok = _in_pipeline_ok(base, cand, in_pipeline_tolerance)
     delivered_offered_ok = (
         cand.delivered_offered is not None and cand.delivered_offered >= min_delivered_offered
     )
@@ -1005,9 +1159,16 @@ def _fuse_verdict(
     if candidate_lost:
         return FUSE_NO_GO, "B1 breached zero-loss -- fusion must never drop a message (hard guard)"
     if not in_pipeline_ok:
+        if not cand.drain_completed:
+            return FUSE_NO_GO, (
+                "B1 pipeline did not fully drain (await_drain timed out -- the whole-pipeline in_pipeline "
+                "gauge never reached 0, rows stranded in ingress/routed/outbound) -- the higher intake "
+                "rides a backlog, not a real ceiling lift"
+            )
         return FUSE_NO_GO, (
-            f"in_pipeline grew (B1 {cand.in_pipeline_peak} > B0 {base.in_pipeline_peak}) -- the higher "
-            "intake rides a backlog, not a real ceiling lift"
+            f"B1 drain time grew (B1 {_fmt(cand.drain_seconds_worst)}s > B0 "
+            f"{_fmt(base.drain_seconds_worst)}s) -- the higher intake rode a larger backlog, not a real "
+            "ceiling lift"
         )
     if not delivered_offered_ok:
         shown = "n/a" if cand.delivered_offered is None else f"{cand.delivered_offered:.3f}"
@@ -1061,6 +1222,22 @@ def _fuse_row_json(row: FuseComparisonRow) -> dict[str, object]:
         },
         "guards": {
             "in_pipeline_ok": row.in_pipeline_ok,
+            # The AUTHORITATIVE whole-pipeline drain signal the guard now reads (ADR 0071 §10 item 8): B1's
+            # await_drain COMPLETED (in_pipeline reached 0 — no rows stranded in ANY stage) and its
+            # post-load drain time is flat-or-lower vs B0. A null drain_seconds_worst = the drain TIMED
+            # OUT (rows stranded), i.e. drain_completed=false.
+            "b0_drain_completed": row.baseline.drain_completed,
+            "b1_drain_completed": (
+                None if row.candidate is None else row.candidate.drain_completed
+            ),
+            "b0_drain_seconds_worst": _round_or_none(row.baseline.drain_seconds_worst, 3),
+            "b1_drain_seconds_worst": (
+                None
+                if row.candidate is None
+                else _round_or_none(row.candidate.drain_seconds_worst, 3)
+            ),
+            # The /stats-poller in_pipeline peak — CONTEXT ONLY (under-samples under overload); the
+            # guard NO LONGER reads it, but it is retained for the run's diagnostic trail.
             "b0_in_pipeline_peak": row.baseline.in_pipeline_peak,
             "b1_in_pipeline_peak": (
                 None if row.candidate is None else row.candidate.in_pipeline_peak

@@ -31,15 +31,36 @@ __all__ = [
 ]
 
 
-def _msg_filters(channel_id: str, status: str, message_type: str, control_id: str) -> Markup:
-    """A GET filter form for the message log (reuses the /messages query params)."""
+def _msg_filters(
+    channel_id: str,
+    status: str,
+    message_type: str,
+    control_id: str,
+    received_from: str,
+    received_to: str,
+) -> Markup:
+    """A GET filter form for the message log (reuses the /messages query params). ``received_from``/
+    ``received_to`` are ``datetime-local`` values (UTC); submitting runs the search (no ``defer``)."""
     return el(
         "form",
         el("input", name="channel_id", value=channel_id or None, placeholder="channel"),
         el("input", name="status", value=status or None, placeholder="status"),
         el("input", name="message_type", value=message_type or None, placeholder="type"),
         el("input", name="control_id", value=control_id or None, placeholder="control id"),
-        el("button", "Filter", type="submit"),
+        el(
+            "label",
+            "From",
+            el("input", name="received_from", type="datetime-local", value=received_from or None),
+            class_="dtfield",
+        ),
+        el(
+            "label",
+            "To",
+            el("input", name="received_to", type="datetime-local", value=received_to or None),
+            class_="dtfield",
+        ),
+        el("button", "Search", type="submit"),
+        el("span", "(times UTC)", class_="muted"),
         # Content search (/ui/messages/search) is step-up-gated (bulk PHI decrypt) — a separate page.
         el("a", "Content search →", href="/ui/messages/search", class_="muted"),
         method="get",
@@ -49,14 +70,30 @@ def _msg_filters(channel_id: str, status: str, message_type: str, control_id: st
 
 
 def messages(
-    data: MessageList,
+    data: MessageList | None,
     *,
+    deferred: bool = False,
     channel_id: str = "",
     status: str = "",
     message_type: str = "",
     control_id: str = "",
+    received_from: str = "",
+    received_to: str = "",
 ) -> Markup:
-    """The message log (list of summaries; each summary is view_summary-redacted server-side)."""
+    """The message log (list of summaries; each summary is view_summary-redacted server-side).
+
+    ``deferred`` (or ``data is None``) renders the pre-filled filter form WITHOUT running a query — the
+    "open a connection's messages, adjust, then Search" landing (#4b). Otherwise the results table + pager
+    render as usual."""
+    filters = _msg_filters(channel_id, status, message_type, control_id, received_from, received_to)
+    if deferred or data is None:
+        return page(
+            "Messages",
+            el("h1", "Messages"),
+            filters,
+            el("p", "Adjust the filters and click Search to run.", class_="muted"),
+            active="messages",
+        )
     headers = ["Received", "Channel", "Type", "Status", "Control ID", "Summary"]
     body = [
         [
@@ -78,7 +115,7 @@ def messages(
     return page(
         "Messages",
         el("h1", "Messages"),
-        _msg_filters(channel_id, status, message_type, control_id),
+        filters,
         rows_table(headers, body),
         pager,
         active="messages",

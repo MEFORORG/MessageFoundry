@@ -125,10 +125,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--report-compare",
         help="connscale: write the A/B comparison table(s) to this path -- the claim-mode A/B "
-        "(per_lane vs pooled, ADR 0066) and/or the thread-hop-fusion A/B (B0 vs B1 with the GO/NO-GO "
-        "verdict, ADR 0071 B5). Each is produced when its axis has >1 arm (e.g. pooled_ab / fuse_ab); "
-        "the same tables also print via the console report and embed under 'comparison' / "
-        "'fuse_comparison' in --report-json.",
+        "(per_lane vs pooled, ADR 0066), the thread-hop-fusion A/B (B0 vs B1 with the GO/NO-GO verdict, "
+        "ADR 0071 B5), and/or the statement-batching A/B (B0 vs B1, ADR 0075 Bench B). Each is produced "
+        "when its axis has >1 arm (e.g. pooled_ab / fuse_ab / batch_ab); the same tables also print via "
+        "the console report and embed under 'comparison' / 'fuse_comparison' / 'batch_comparison' in "
+        "--report-json.",
     )
     parser.add_argument("--baseline", help="load: compare against this saved JSON report")
     parser.add_argument(
@@ -394,13 +395,16 @@ def _run_connscale(args: argparse.Namespace) -> int:
             tables.append(report.comparison.render_table())
         if report.fuse_comparison is not None:
             tables.append(report.fuse_comparison.render_table())
+        if report.batch_comparison is not None:
+            tables.append(report.batch_comparison.render_table())
         if tables:
             Path(args.report_compare).write_text("\n\n".join(tables) + "\n", encoding="utf-8")
         else:
             print(
-                "--report-compare: this profile has a single claim mode AND a single fuse mode (no "
-                'A/B to write); use claim_modes = ["per_lane", "pooled"] (e.g. pooled_ab) or '
-                "fuse_modes = [false, true] (e.g. fuse_ab)",
+                "--report-compare: this profile has a single claim mode, a single fuse mode, AND a "
+                'single batch mode (no A/B to write); use claim_modes = ["per_lane", "pooled"] (e.g. '
+                "pooled_ab), fuse_modes = [false, true] (e.g. fuse_ab), or batch_modes = [false, true] "
+                "(e.g. batch_ab)",
                 file=sys.stderr,
             )
     return report.exit_code

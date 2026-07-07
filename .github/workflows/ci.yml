@@ -46,13 +46,13 @@ jobs:
     # required `test (…, py3.14)` context stays present + green. (changes never fails, so this needs
     # edge can't wedge the required context.)
     needs: changes
-    # On the PUBLIC mirror (MEFORORG) the self-hosted NucBox runners don't exist — and must NEVER be
-    # exposed to a public repo (a fork PR on a self-hosted runner is RCE on the owner's LAN) — so the
-    # Windows legs run on FREE GitHub-hosted runners there (hosted Actions minutes are free on public,
-    # no 2x Windows billing). The private repo keeps its $0 self-hosted boxes. `matrix.hosted` is the
-    # hosted equivalent (ubuntu is hosted on both). This is the same repo-slug gate codeql.yml/
-    # scorecard.yml already use to run natively on the mirror.
-    runs-on: ${{ (github.repository == 'MEFORORG/MessageFoundry' && fromJSON(matrix.hosted)) || fromJSON(matrix.runner) }}
+    # Every leg runs on GitHub-HOSTED runners now — the self-hosted NucBox Windows runners are RETIRED.
+    # The PRIVATE repo (wshallwshall) runs the UBUNTU leg only (its remaining Actions cost); the mirror
+    # (MEFORORG) runs the full ubuntu + windows-2022 + windows-2025 matrix, all FREE (hosted minutes are
+    # free on the public mirror). Hosted-everywhere is also safer: a self-hosted runner must never be
+    # reachable by a public repo (fork PR = RCE on the owner's LAN). `matrix.hosted` is the runner label
+    # set; the per-repo matrix (which drops the Windows legs on the private repo) is built in `changes`.
+    runs-on: ${{ matrix.hosted }}
     # Wall-clock backstop: bound each leg so a hung test fails in minutes, not the 6h default. Three
     # nested watchdogs catch a hang at increasing scope (#55): the pytest-timeout per-test cap (60s,
     # pyproject addopts) + the faulthandler belt fire FIRST and name the stuck frame; the pytest STEP
@@ -61,20 +61,12 @@ jobs:
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # `runner` is a JSON string consumed by fromJSON (runs-on above) so a Windows leg can target a
-          # self-hosted label WITHOUT changing the context NAME (which comes from `os`). Both Server SKUs
-          # run on self-hosted NucBox runners ($0 minutes) ON THE PRIVATE REPO; `hosted` is the GitHub-
-          # hosted equivalent used ON THE MIRROR (runs-on picks it via the repo-slug gate above). They
-          # keep the tuned-for-hosted ubuntu leg on GitHub; the self-hosted (slower) boxes get a longer
-          # job cap / per-test timeout so a thermal-throttled run isn't a false timeout (harmless-but-
-          # generous on the mirror's faster hosted Windows). The hosted ubuntu leg keeps 15/13/60/90.
-          #   NB windows-2022 targets its OWN label `mefor-ci-win2022` (a real Server-2022 box — a Hyper-V
-          #   guest on a NucBox; it CANNOT share the Server-2025 runners, the OS SKU is what's under test).
-          - { os: ubuntu-latest, python-version: "3.14", runner: '["ubuntu-latest"]', hosted: '["ubuntu-latest"]', job_timeout: 15, step_timeout: 13, pytest_timeout: 60, fault_timeout: 90 }
-          - { os: windows-2022, python-version: "3.14", runner: '["self-hosted", "windows", "mefor-ci-win2022"]', hosted: '["windows-2022"]', job_timeout: 30, step_timeout: 26, pytest_timeout: 120, fault_timeout: 150 }
-          - { os: windows-2025, python-version: "3.14", runner: '["self-hosted", "windows", "mefor-ci-win2025"]', hosted: '["windows-2025"]', job_timeout: 30, step_timeout: 26, pytest_timeout: 120, fault_timeout: 150 }
+      # Per-repo matrix from the `changes` job: ubuntu-only on the private repo (Windows runners retired),
+      # full ubuntu+windows matrix on the mirror. Each leg carries os / python-version / hosted (the
+      # runner labels, an array) + the timeout knobs. NB: the Windows legs no longer EXIST on the private
+      # repo, so drop `test (windows-2022/2025, py3.14)` from wshallwshall's REQUIRED checks — a
+      # required-but-absent context blocks the PR forever.
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
     defaults:
       run:
         shell: bash  # available on all runners (Git Bash on Windows) -> one set of commands
@@ -83,7 +75,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
           # No `cache: pip`: installs now go through uv (the "Set up uv" step below), which keeps its
@@ -113,7 +105,7 @@ jobs:
       # hosted runners, the persistent on-disk uv cache on a self-hosted runner — keyed on the glob.
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -143,7 +135,7 @@ jobs:
       # result genuinely differs by OS (real sockets, ProactorEventLoop, Windows service paths).
       - name: Lint (ruff)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
-        run: ruff check messagefoundry messagefoundry_webconsole tests
+        run: ruff check messagefoundry messagefoundry_webconsole tests packaging/messagefoundry-webconsole scripts/webconsole_seam_snapshot.py
 
       - name: Format check (ruff)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
@@ -184,7 +176,34 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
           PYTHONFAULTHANDLER: "1"
-        run: pytest -q -o faulthandler_timeout=${{ matrix.fault_timeout }} --timeout=${{ matrix.pytest_timeout }}
+          # Pass the matrix-derived timeout knobs through env instead of expanding ${{ }} straight into
+          # the run: shell. The per-repo matrix is now built at runtime in `changes` (fromJSON), so zizmor
+          # can no longer statically prove these are literal ints and flags the in-run expansion as
+          # template-injection; env-passing removes the script sink. `defaults.run.shell: bash` applies on
+          # every OS, so $VAR resolves the same on the Windows legs (Git Bash).
+          FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
+          PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
+        run: pytest -q -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
+
+      # The web console's OWN suite (Option B, ADR 0065): the moved /ui tests live in the package's
+      # tests/ (the engine `pytest` above no longer collects them — engine testpaths = ["tests"]), so
+      # run them as a SECOND step on the SAME leg. The package was installed editable in the install
+      # step above (`-e packaging/messagefoundry-webconsole`), so both suites exercise the same
+      # engine build. Its pyproject sets asyncio_mode="auto" + session loop scopes; the timeout flags
+      # mirror the engine step (a hung ASGI test fails fast + named, not at the silent job cap).
+      # SEAM MATRIX: only ENGINE_UI_SEAM==1 exists today, so this runs the package against the single
+      # installed engine (seam 1). When a seam 2 lands, expand this into a matrix that also installs
+      # the MIN/MAX SUPPORTED_ENGINE_SEAMS engine builds and runs the package suite against each.
+      - name: Web console tests (pytest)
+        if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        timeout-minutes: ${{ matrix.step_timeout }}
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONFAULTHANDLER: "1"
+          # env-passed (not a ${{ }} expansion into run:) — see the Tests step above for why.
+          FAULT_TIMEOUT: ${{ matrix.fault_timeout }}
+          PYTEST_TIMEOUT: ${{ matrix.pytest_timeout }}
+        run: pytest packaging/messagefoundry-webconsole/tests -q -o faulthandler_timeout="$FAULT_TIMEOUT" --timeout="$PYTEST_TIMEOUT"
 
   # Build + type-check the VS Code extension, and run its integration tests. The Python jobs never
   # touch ide/, so a dep bump or IDE code change that breaks the bundle or the types would otherwise
@@ -260,6 +279,10 @@ jobs:
       # `ide`: run the ide build job only when a PR touches ide/** or this workflow (true on
       # push/dispatch for full coverage; false on the nightly cron). Not a required check.
       ide: ${{ steps.f.outputs.ide }}
+      # `matrix`: the `test` job's include list, per-repo — ubuntu-only on the private repo (the
+      # self-hosted Windows runners are retired), full ubuntu+windows matrix on the mirror (free
+      # hosted). Consumed as `matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}` in `test`.
+      matrix: ${{ steps.f.outputs.matrix }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -271,6 +294,21 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
+          # test matrix, per-repo — computed FIRST (independent of the event, before any early exit).
+          # Mirror (MEFORORG): full ubuntu + windows-2022 + windows-2025 on FREE hosted runners.
+          # Private repo (wshallwshall): the UBUNTU leg ONLY — the self-hosted Windows NucBox runners
+          # are retired. `hosted` = the runner labels (an array; see the `test` job's runs-on).
+          # $GITHUB_REPOSITORY is a built-in runner env var, read here as plain shell (NOT a workflow-
+          # expression interpolation into the run body), so it is zizmor-safe and cannot be misparsed as
+          # an Actions expression the way a literal double-brace token in a run: block would be.
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":15,"step_timeout":13,"pytest_timeout":60,"fault_timeout":90}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":30,"step_timeout":26,"pytest_timeout":120,"fault_timeout":150}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":30,"step_timeout":26,"pytest_timeout":120,"fault_timeout":150}'
+          if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
+            echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix={\"include\":[$U]}" >> "$GITHUB_OUTPUT"
+          fi
           # Manual dispatch = full coverage: force every gate true so the whole workflow runs.
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
@@ -388,7 +426,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.14"
 
@@ -414,7 +452,7 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -571,12 +609,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -689,12 +727,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -770,7 +808,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.14"
 
@@ -796,7 +834,7 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry; ALTER DATABASE MessageFoundry SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -877,12 +915,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
           cache-dependency-glob: |
             pyproject.toml

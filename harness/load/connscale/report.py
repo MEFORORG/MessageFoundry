@@ -22,7 +22,10 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from harness.load.connscale.compare import ClaimModeComparison, FuseModeComparison
+    from harness.load.connscale.compare import (
+        ClaimModeComparison,
+        FuseModeComparison,
+    )
 
 # Exit codes (shared with the load CLI).
 EXIT_OK = 0
@@ -129,11 +132,17 @@ class ConnScaleRecord:
     # (fusion off, the engine default), True = B1 (fusion on). Defaulted so an older artifact / a
     # non-fusion record deserializes unchanged. The fuse comparison pairs B0 vs B1 by this tag.
     fuse_thread_hops: bool = False
+    # The statement-batching A/B axis (ADR 0075 Bench B). Tags which batching arm this step ran: False =
+    # B0 (batching off, the engine default), True = B1 (batching on). Defaulted so an older artifact / a
+    # non-batching record deserializes unchanged. The batch comparison pairs B0 vs B1 by this tag (it
+    # reuses the fusion comparator's verdict path keyed on this field instead of ``fuse_thread_hops``).
+    batch_handoff_statements: bool = False
 
     def to_json_dict(self) -> dict[str, object]:
         return {
             "claim_mode": self.claim_mode,
             "fuse_thread_hops": self.fuse_thread_hops,
+            "batch_handoff_statements": self.batch_handoff_statements,
             "sweep_mode": self.sweep_mode,
             "count": self.count,
             "offered_aggregate_rate": round(self.offered_aggregate_rate, 2),
@@ -212,6 +221,12 @@ class ConnScaleReport:
     # ``fuse_modes`` profile (e.g. fuse_ab). ``None`` for a single fusion arm so a pre-existing report
     # is byte-identical.
     fuse_comparison: FuseModeComparison | None = None
+    # The per-cell B0-vs-B1 statement-batching A/B (ADR 0075 Bench B), present only for a multi-arm
+    # ``batch_modes`` profile (e.g. batch_ab). It is a :class:`FuseModeComparison` produced by the SAME
+    # comparator (``build_batch_comparison`` reuses ``build_fuse_comparison``'s verdict path, keyed on
+    # ``batch_handoff_statements`` and relabelled for the batching axis). ``None`` for a single batching
+    # arm so a pre-existing report is byte-identical.
+    batch_comparison: FuseModeComparison | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         out: dict[str, object] = {
@@ -237,6 +252,8 @@ class ConnScaleReport:
             out["comparison"] = self.comparison.to_json_dict()
         if self.fuse_comparison is not None:
             out["fuse_comparison"] = self.fuse_comparison.to_json_dict()
+        if self.batch_comparison is not None:
+            out["batch_comparison"] = self.batch_comparison.to_json_dict()
         return out
 
     def to_json(self) -> str:
@@ -251,6 +268,7 @@ class ConnScaleReport:
                 "profile",
                 "claim_mode",
                 "fuse_thread_hops",
+                "batch_handoff_statements",
                 "sweep_mode",
                 "count",
                 "offered_rate",
@@ -281,6 +299,7 @@ class ConnScaleReport:
                     _spreadsheet_safe(self.profile),
                     _spreadsheet_safe(r.claim_mode),
                     r.fuse_thread_hops,
+                    r.batch_handoff_statements,
                     _spreadsheet_safe(r.sweep_mode),
                     r.count,
                     round(r.offered_aggregate_rate, 2),
@@ -347,6 +366,9 @@ class ConnScaleReport:
         if self.fuse_comparison is not None:
             lines.append("")
             lines.append(self.fuse_comparison.render_table())
+        if self.batch_comparison is not None:
+            lines.append("")
+            lines.append(self.batch_comparison.render_table())
         violated = sum(1 for c in self.slos if not c.ok)
         lines.append("")
         lines.append(

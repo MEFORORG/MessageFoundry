@@ -75,6 +75,10 @@ _READ_POOL_SIZE = 4
 _FIFO_HEADS_LANE_CHUNK = 200
 # ADR 0066 §3.1: release_claimed id-chunk bound (ids per UPDATE statement).
 _RELEASE_CHUNK = 500
+# ADR 0073: ownership-scoped reset lane-chunk bound (lane names per UPDATE's IN list). Keeps every
+# statement under the legacy SQLite 999-variable floor (and SQL Server's 2100) with room for the
+# fixed parameters; the chunks run inside the reset's single transaction, so atomicity is unchanged.
+_RESET_LANE_CHUNK = 500
 
 
 class _AbortMember(Exception):  # noqa: N818 — control-flow signal, not an error condition
@@ -321,6 +325,31 @@ class Stage(str, Enum):
     ROUTED = "routed"
     OUTBOUND = "outbound"
     RESPONSE = "response"  # ADR 0013 Increment 2: a "this reply owes a re-ingress" work-row token
+
+
+@dataclass(frozen=True)
+class OwnedLanes:
+    """Config-graph lane ownership for an ownership-scoped recovery pass (ADR 0073).
+
+    Names the queue lanes ONE engine shard is responsible for recovering: ``channels`` scopes the
+    ``channel_id``-keyed stages (ingress/routed/response), ``destinations`` the
+    ``destination_name``-keyed outbound stage. Distinct from the row-claim ``owner`` column (a
+    per-store-instance identity, stamped on Postgres only, NOT stable across a restart): these sets
+    derive from the config graph, so they survive a crash/restart of the same shard — which is
+    exactly what startup recovery needs. An EMPTY set deliberately matches nothing (the stages it
+    scopes are skipped): recovering "no lanes" must never widen into recovering "all lanes"."""
+
+    channels: frozenset[str]
+    destinations: frozenset[str]
+
+
+def owned_lane_scope(stage: str, owned: OwnedLanes) -> tuple[str, frozenset[str]]:
+    """The ``(lane column, owned names)`` pair scoping ``stage`` in an ownership-scoped reset —
+    the same stage-aware lane keying every claim path uses (outbound lanes key on
+    ``destination_name``; ingress, routed, and response lanes on ``channel_id``)."""
+    if stage == Stage.OUTBOUND.value:
+        return "destination_name", owned.destinations
+    return "channel_id", owned.channels
 
 
 @dataclass(frozen=True)
@@ -736,6 +765,22 @@ def _current_user() -> str | None:
         return None
 
 
+# Backlog #106: a keep-forever retention cutoff is carried as ``float('-inf')`` (``received_at < -inf``
+# is always false), but ``-inf`` is NOT bindable as a SQL ``FLOAT`` on SQL Server (pyodbc/TDS rejects
+# a non-finite float) or Postgres. Clamp it to a finite floor far below any epoch ``received_at``, so
+# ``received_at < floor`` stays always-false (keep forever) while binding cleanly on every backend.
+# No legitimate cutoff (``now - days``, a positive epoch) is anywhere near this, so finite cutoffs pass
+# through unchanged.
+_KEEP_FOREVER_FLOOR = -1e30
+
+
+def _finite_cutoff(cutoff: float) -> float:
+    """Clamp a retention cutoff to a finite value bindable as a SQL ``FLOAT`` on all backends (#106).
+
+    ``float('-inf')`` (keep forever) → :data:`_KEEP_FOREVER_FLOOR`; any real cutoff is returned as-is."""
+    return cutoff if cutoff > _KEEP_FOREVER_FLOOR else _KEEP_FOREVER_FLOOR
+
+
 def _qmark_cutoff_case(
     column: str,
     global_cutoff: float,
@@ -748,18 +793,21 @@ def _qmark_cutoff_case(
     ``("?", [global_cutoff])`` — **byte-identical** to the single global cutoff today. With overrides it
     returns a ``CASE <column> WHEN ? THEN ? ... ELSE ? END`` whose per-connection ``THEN`` cutoffs come
     from the map and whose ``ELSE`` is the global cutoff (a connection absent from the map inherits the
-    global window). A keep-forever override is carried as ``float('-inf')`` so ``received_at < -inf`` is
-    always false → that connection is never purged. The returned fragment is meant to sit on the RIGHT of
+    global window). A keep-forever override is carried as ``float('-inf')`` (``received_at < -inf`` always
+    false → never purged) and clamped to :data:`_KEEP_FOREVER_FLOOR` via :func:`_finite_cutoff` so it
+    binds as a SQL ``FLOAT`` on SQL Server (#106). The returned fragment is meant to sit on the RIGHT of
     a ``received_at <`` / ``updated_at <`` comparison; the bind list is in placeholder order."""
     if not connection_cutoffs:
-        return "?", [global_cutoff]
+        return "?", [_finite_cutoff(global_cutoff)]
     whens: list[str] = []
     params: list[Any] = []
     for name, cutoff in connection_cutoffs.items():
         whens.append("WHEN ? THEN ?")
         params.append(name)
-        params.append(cutoff)
-    params.append(global_cutoff)  # ELSE — connections with no override use the global window
+        params.append(_finite_cutoff(cutoff))
+    params.append(
+        _finite_cutoff(global_cutoff)
+    )  # ELSE — connections with no override use the global window
     return f"(CASE {column} {' '.join(whens)} ELSE ? END)", params
 
 
@@ -3919,7 +3967,11 @@ class MessageStore:
     # --- recovery / replay ---------------------------------------------------
 
     async def reset_stale_inflight(
-        self, now: float | None = None, *, stage: str | None = None
+        self,
+        now: float | None = None,
+        *,
+        stage: str | None = None,
+        owned: OwnedLanes | None = None,
     ) -> int:
         """Return ``inflight`` rows (claimed before a crash) to ``pending``. Call once on startup.
 
@@ -3927,23 +3979,54 @@ class MessageStore:
         since ingress, routed, and outbound inflight rows all need recovering. Pass a ``stage`` to
         scope recovery to one. Returns the number of rows recovered.
 
+        ``owned=None`` (the default) keeps the **unconditional** single-node recovery: every inflight
+        row at startup is this node's own crash residue. Passing :class:`OwnedLanes` scopes recovery
+        to the caller's config-graph lanes (ADR 0073): each stage's rows are filtered by that stage's
+        lane key (``channel_id`` for ingress/routed/response, ``destination_name`` for outbound), so
+        an engine shard restarting against a shared store recovers exactly its own crash residue and
+        never re-pends a live sibling shard's in-flight rows. An empty owned set for a stage emits
+        no statement at all (never ``IN ()``): the residue belongs to someone else by definition.
+
         The all-stages case runs one UPDATE per :class:`Stage` (one transaction): the ``(stage,
         status)`` pair seeks ``ix_queue_ready``, where the bare ``status=?`` predicate matches no
         index and full-scans the queue on every startup — a measured contributor to the shared-store
-        co-start convoy (WS-B Finding 2). Iterating the enum keeps a future stage automatically
-        covered (count-and-log: an inflight row left behind hangs its message forever)."""
+        co-start convoy (WS-B Finding 2). The ownership filter rides that same seek as a residual
+        ``IN`` predicate (chunked, ``_RESET_LANE_CHUNK`` names per statement) — deliberately NOT an
+        index-hinted seek of the FIFO lane indexes. Iterating the enum keeps a future stage
+        automatically covered (count-and-log: an inflight row left behind hangs its message
+        forever)."""
         now = time.time() if now is None else now
         stages = [stage] if stage is not None else [s.value for s in Stage]
         recovered = 0
         async with self._lock:
             try:
                 for st in stages:
-                    cur = await self._db.execute(
-                        "UPDATE queue SET status=?, next_attempt_at=?, updated_at=?"
-                        " WHERE status=? AND stage=?",
-                        (OutboxStatus.PENDING.value, now, now, OutboxStatus.INFLIGHT.value, st),
-                    )
-                    recovered += cur.rowcount
+                    if owned is None:
+                        cur = await self._db.execute(
+                            "UPDATE queue SET status=?, next_attempt_at=?, updated_at=?"
+                            " WHERE status=? AND stage=?",
+                            (OutboxStatus.PENDING.value, now, now, OutboxStatus.INFLIGHT.value, st),
+                        )
+                        recovered += cur.rowcount
+                        continue
+                    lane_col, names = owned_lane_scope(st, owned)
+                    ordered = sorted(names)
+                    for i in range(0, len(ordered), _RESET_LANE_CHUNK):
+                        chunk = ordered[i : i + _RESET_LANE_CHUNK]
+                        marks = ",".join("?" * len(chunk))
+                        cur = await self._db.execute(
+                            f"UPDATE queue SET status=?, next_attempt_at=?, updated_at=?"
+                            f" WHERE status=? AND stage=? AND {lane_col} IN ({marks})",
+                            (
+                                OutboxStatus.PENDING.value,
+                                now,
+                                now,
+                                OutboxStatus.INFLIGHT.value,
+                                st,
+                                *chunk,
+                            ),
+                        )
+                        recovered += cur.rowcount
                 await self._db.commit()
             except Exception:
                 # A mid-loop failure must not leave the implicit txn open (the earlier stages'
@@ -4231,14 +4314,23 @@ class MessageStore:
         limit: int = 50,
         offset: int = 0,
         allowed_channels: Sequence[str] | None = None,
+        received_from: float | None = None,
+        received_to: float | None = None,
     ) -> list[dict[str, Any]]:
         """Most-recent-first message listing for the tracking view, with optional filters.
 
         Bodies (``raw``) are intentionally omitted here — the list view is metadata only,
         so PHI isn't fetched until a specific message is opened (and audited). ``allowed_channels``
-        restricts the result to a caller's per-channel RBAC scope (None = all)."""
+        restricts the result to a caller's per-channel RBAC scope (None = all). ``received_from``/
+        ``received_to`` bound ``received_at`` to an epoch range (#4b message-log date filter)."""
         where, params = self._message_filter(
-            channel_id, status, message_type, control_id, allowed_channels
+            channel_id,
+            status,
+            message_type,
+            control_id,
+            allowed_channels,
+            received_from,
+            received_to,
         )
         async with self._read() as db:
             cur = await db.execute(
@@ -4262,10 +4354,18 @@ class MessageStore:
         message_type: str | None = None,
         control_id: str | None = None,
         allowed_channels: Sequence[str] | None = None,
+        received_from: float | None = None,
+        received_to: float | None = None,
     ) -> int:
         """Total matching the same filters as :meth:`list_messages` (for pagination)."""
         where, params = self._message_filter(
-            channel_id, status, message_type, control_id, allowed_channels
+            channel_id,
+            status,
+            message_type,
+            control_id,
+            allowed_channels,
+            received_from,
+            received_to,
         )
         async with self._read() as db:
             cur = await db.execute(f"SELECT COUNT(*) AS n FROM messages{where}", params)
@@ -4403,6 +4503,8 @@ class MessageStore:
         message_type: str | None,
         control_id: str | None,
         allowed_channels: Sequence[str] | None = None,
+        received_from: float | None = None,
+        received_to: float | None = None,
     ) -> tuple[str, tuple[object, ...]]:
         clauses: list[str] = []
         params: list[object] = []
@@ -4415,6 +4517,13 @@ class MessageStore:
             if value is not None:
                 clauses.append(f"{column}=?")
                 params.append(value)
+        # received_at epoch range: [received_from, received_to) — the message-log date filter (#4b).
+        if received_from is not None:
+            clauses.append("received_at >= ?")
+            params.append(received_from)
+        if received_to is not None:
+            clauses.append("received_at < ?")
+            params.append(received_to)
         _append_channel_scope(clauses, params, "channel_id", allowed_channels)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         return where, tuple(params)

@@ -239,6 +239,15 @@ exactly as with TOTP (directory-delegated MFA).
 
 ### Off-loopback browser console (L5b, ADR 0068 §8)
 
+> The `/ui` browser console is now served by the separately-versioned **`messagefoundry-webconsole`**
+> package (Option B, [ADR 0065](adr/0065-web-ops-dashboard.md)), which the engine **mounts same-origin,
+> in-process** — it was previously the in-engine `messagefoundry/api/webui/` tree. The **same-origin
+> security model is unchanged by that move**: the whole security core (the `/ui`-confined
+> `SameSite=Strict` session cookie, the `Origin`/`Sec-Fetch-Site` CSRF check on every `/ui` POST, the
+> step-up + `reauth_next` unlock flow, the CSWSH `Origin == Host` WebSocket check, and the WebAuthn
+> ceremonies below) moved **verbatim** and reads `request(.websocket).app.state`, registering onto the
+> same app object. See [WEBCONSOLE-PACKAGE.md](WEBCONSOLE-PACKAGE.md).
+
 Exposing `/ui` off-box is a supported, **gated** posture. Beyond the existing TLS-or-refuse exposure
 gate (refused even under `--allow-insecure-bind`), `serve` now runs the **L5b exposure ladder**:
 with a **declared reverse proxy** (`tls_terminated_upstream`), `serve_ui` **refuses to start without

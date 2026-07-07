@@ -28,11 +28,25 @@ is additive / opt-in.
   crossing-count micro-bench + a Windows CI mechanism gate, and a connscale B0/B1 fusion A/B harness axis
   (`fuse_ab` profile, `trials`-banked); the throughput GO/NO-GO (ship-by-default vs escalate to
   free-threading, ADR 0053) is a separate SQL-Server bench, not a merge gate.
+  - **Promote-gate resolved 2026-07-06 — NO-GO** ([ADR 0071](docs/adr/0071-cut-executor-round-trips-b5.md)
+    §8/§10, #787): the SQL-Server `fuse_ab` bench measured a real but sub-threshold **+6.5 / +9.3 / +10.0 %**
+    lift (below the ≥10% bar; zero-loss held), so `fuse_thread_hops` **stays default-OFF** and the lever
+    escalates to free-threading (ADR 0053). Bench-SHA provenance: the run was at commit `8bab40e2`, which is
+    **not** an ancestor of `main` (PR5 was squash-merged as `90f80a3`, #780) — but `git diff 8bab40e2 90f80a3`
+    is **empty**, so the NO-GO bench ran a code tree byte-identical to merged PR5.
 - **store: pooled-claimer primitives** `claim_fifo_heads` / `list_fifo_lanes` / `release_claimed` on all
-  three backends ([ADR 0066](docs/adr/0066-pooled-stage-claimers.md) PR 2; **unwired — no engine caller
-  yet**): a FIFO-safe multi-lane head-claim (probe-then-claim, EMPTY-on-locked-head — never a #285 skip
+  three backends ([ADR 0066](docs/adr/0066-pooled-stage-claimers.md) PR 2 — **now wired by the
+  `StageDispatcher` and the default claim path since #755/#744, see _Changed_ below**): a FIFO-safe
+  multi-lane head-claim (probe-then-claim, EMPTY-on-locked-head — never a #285 skip
   to seq N+1), a read-only head-due-aware lane discovery for the pooled sweep, and an attempts-neutral
   claim release. `claim_next_fifo` / `claim_next_fifo_batch` / `claim_ready` are untouched.
+- **pipeline: bounded pooled-mode infra-fault handling (T17)** (ADR 0070; #766) — in `pooled` mode a lane
+  whose head keeps failing on an infrastructure fault now **re-pends its head at an exponential-capped
+  backoff** (cap `[pipeline].infra_fault_backoff_cap`, default **60 s**) instead of spinning the ~4×/s
+  discovery sweep, and after `[pipeline].infra_fault_stop_after` (default **10**) consecutive zero-progress
+  faults (~4 min of wall clock) applies `[pipeline].infra_fault_policy` (default **`stop`**): STOP-the-lane
+  with a throttled `lane_stuck` alert — **never** auto-dead-letter. `retry_forever` instead keeps re-pending
+  at the cap and alerts once the horizon is crossed. `per_lane` mode is unaffected.
 - **Browser ops dashboard (read-only, M1)** (#75, [ADR 0065](docs/adr/0065-web-ops-dashboard.md)) — an
   **opt-in** (`[api].serve_ui`, default **off**), same-origin, zero-install browser ops view served under
   `/ui` by the engine's FastAPI app. Read-only: a live-polling connections dashboard (In/Out/Queued/
@@ -130,6 +144,17 @@ is additive / opt-in.
   `ix_queue_ready(stage, status, …)` index instead of one unindexed status-only full scan of the
   queue (Postgres additionally drops an unsargable `OR $n IS NULL` form). Same rows recovered, same
   single transaction — all three backends.
+- **Default staged-pipeline claim path flipped to pooled per-stage claimers**
+  ([ADR 0066](docs/adr/0066-pooled-stage-claimers.md); `[pipeline].claim_mode` default `per_lane` →
+  **`pooled`** — issue #744, shipped via PR #765). The `StageDispatcher` was first wired in behind
+  `[pipeline].claim_mode` **default-OFF** (#755, ADR 0066 PR4) and is now the **default** claim topology:
+  one dispatcher per stage running a handful of pooled claimer tasks over the `claim_fifo_heads` /
+  `list_fifo_lanes` / `release_claimed` primitives (batch-claiming head-prefixes across lanes), collapsing
+  the ~4,500 per-(lane×stage) claim loops that saturated a shared server DB at high fan-out and holding
+  zero-loss where `per_lane` dropped messages. **`per_lane` stays fully selectable as the byte-identical
+  opt-out** (`[pipeline].claim_mode = "per_lane"`), enforced by the zero-pooled-construction test sentinel.
+  Reliability-core — read once at engine start (a `/config/reload` does not toggle it; restart to change).
+  Single-node scope; the at-least-once / per-lane-FIFO / poison-guard invariants are unchanged in both modes.
 
 ## [0.2.14] — 2026-07-01 — Early Access
 

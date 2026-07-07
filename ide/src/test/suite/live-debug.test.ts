@@ -5,10 +5,16 @@ import * as path from "path";
 import {
   LiveDebugController,
   buildLiveLenses,
+  buildTraceArgs,
+  inlineValuesFor,
+  invocationsForFile,
   namedElements,
+  rowsFromTrace,
   summarize,
-  type DryRunner,
   type LiveDryRunRow,
+  type LiveTraceEntry,
+  type TraceInvocation,
+  type TraceRunner,
 } from "../../liveDebug";
 
 // A config module shaped exactly like samples/config/IB_ACME_ADT.py: one inbound, one @router, one
@@ -35,6 +41,37 @@ function row(over: Partial<LiveDryRunRow>): LiveDryRunRow {
     handlers: ["acme_adt_handler"],
     deliveries: [{ to: "OB_ACME_ADT" }],
     error: null,
+    ...over,
+  };
+}
+
+// A canned traced-dryrun entry (one message). `invocations` default empty — the v1 CodeLens summary
+// reads only the top-level fields, so most summary tests leave them out.
+function traceEntry(over: Partial<LiveTraceEntry>): LiveTraceEntry {
+  return {
+    inbound: "IB_ACME_ADT",
+    disposition: "RECEIVED",
+    handlers: ["acme_adt_handler"],
+    sends: [{ outbound: "OB_ACME_ADT" }],
+    error: null,
+    trace_ok: true,
+    invocations: [],
+    ...over,
+  };
+}
+
+function inv(over: Partial<TraceInvocation>): TraceInvocation {
+  return {
+    kind: "handler",
+    name: "acme_adt_handler",
+    module: "IB_ACME_ADT",
+    file: "/cfg/IB_ACME_ADT.py",
+    def_line: 10,
+    events: [],
+    disposition: "RECEIVED",
+    sends: [{ outbound: "OB_ACME_ADT" }],
+    routed_to: [],
+    annotations: [],
     ...over,
   };
 }
@@ -91,6 +128,23 @@ suite("liveDebug summarize", () => {
   });
 });
 
+suite("liveDebug rowsFromTrace", () => {
+  test("projects the v1 CodeLens fields (sends → deliveries) off a trace entry", () => {
+    const rows = rowsFromTrace([
+      traceEntry({ handlers: ["h1"], sends: [{ outbound: "OB_A" }, { outbound: "OB_B" }] }),
+    ]);
+    assert.deepStrictEqual(rows, [
+      {
+        inbound: "IB_ACME_ADT",
+        disposition: "RECEIVED",
+        handlers: ["h1"],
+        deliveries: [{ to: "OB_A" }, { to: "OB_B" }],
+        error: null,
+      },
+    ]);
+  });
+});
+
 suite("liveDebug namedElements", () => {
   test("locates inbound/router/handler with their argument names", () => {
     const els = namedElements(CONFIG_TEXT);
@@ -134,25 +188,132 @@ suite("liveDebug buildLiveLenses", () => {
   });
 });
 
-suite("LiveDebugController with a mocked dryrun spawn", () => {
-  // The spawn seam is injected: a canned runner stands in for `messagefoundry dryrun --json`, so the
-  // whole pipeline (run → store rows → CodeLens summaries) runs with NO Python engine and no network.
-  test("canned dryrun JSON flows through to CodeLens summaries", async () => {
-    const canned: LiveDryRunRow[] = [row({})];
-    let calledWith: { sample: string; cwd: string } | undefined;
-    const runner: DryRunner = async (sample, cwd) => {
-      calledWith = { sample, cwd };
-      return canned;
+// ---- v2: inline decorations + PHI gating --------------------------------------------------------
+
+suite("liveDebug buildTraceArgs (--show-phi gating)", () => {
+  test("omits --show-phi by default (reveal off)", () => {
+    const args = buildTraceArgs("samples/config", "/synthetic/adt.hl7", false);
+    assert.deepStrictEqual(args, [
+      "dryrun",
+      "--config",
+      "samples/config",
+      "--messages",
+      "/synthetic/adt.hl7",
+      "--trace",
+      "json",
+    ]);
+    assert.ok(!args.includes("--show-phi"), "reveal-off argv must NOT contain --show-phi");
+  });
+
+  test("appends --show-phi only when showPhi is set (reveal on)", () => {
+    const args = buildTraceArgs("samples/config", "/synthetic/adt.hl7", true);
+    assert.ok(args.includes("--show-phi"), "reveal-on argv must request real values");
+    assert.ok(args.includes("--trace") && args[args.indexOf("--trace") + 1] === "json");
+  });
+});
+
+suite("liveDebug inlineValuesFor (PHI-safe inline values)", () => {
+  const producing = inv({
+    events: [
+      { line: 11, event: "line", assigned: { mrn: "12345" } }, // 1-based → 0-based 10
+      { line: 12, event: "line", writes: [{ path: "PID-5.1", value: "SMITH" }] }, // → 0-based 11
+    ],
+  });
+
+  test("values are REDACTED by default (reveal off) — no real value in after-text or hover", () => {
+    const off = inlineValuesFor([producing], false);
+    assert.strictEqual(off.length, 2);
+    for (const iv of off) {
+      assert.strictEqual(iv.kind, "value");
+      assert.ok(iv.after.includes("⋯"), `expected placeholder, got: ${iv.after}`);
+      assert.ok(!iv.after.includes("12345") && !iv.after.includes("SMITH"), iv.after);
+      assert.ok(!iv.hover.includes("12345") && !iv.hover.includes("SMITH"), iv.hover);
+    }
+  });
+
+  test("real values appear ONLY when reveal is set, mapped to their producing line", () => {
+    const on = inlineValuesFor([producing], true);
+    const byLine = new Map(on.map((iv) => [iv.line, iv]));
+    // event.line 11 → 0-based 10 shows the local; event.line 12 → 0-based 11 shows the write.
+    assert.strictEqual(byLine.get(10)?.line, 10);
+    assert.ok(byLine.get(10)?.after.includes('"12345"'), byLine.get(10)?.after);
+    assert.ok(byLine.get(11)?.after.includes('"SMITH"'), byLine.get(11)?.after);
+    assert.ok(byLine.get(11)?.hover.includes("SMITH"), byLine.get(11)?.hover);
+  });
+
+  test("a value the CLI still redacted stays a placeholder even under reveal", () => {
+    const gated = inlineValuesFor(
+      [inv({ events: [{ line: 11, event: "line", assigned: { x: "REDACTED" } }] })],
+      true,
+    );
+    assert.ok(gated[0].after.includes("⋯"), gated[0].after);
+    assert.ok(!gated[0].after.includes("REDACTED"), gated[0].after);
+  });
+
+  test("live_lookup_skipped renders a warning on its line (independent of reveal)", () => {
+    const warnInv = inv({
+      events: [{ line: 11, event: "line", assigned: { x: "REDACTED" } }],
+      annotations: [{ line: 13, kind: "live_lookup_skipped", call: "db_lookup" }],
+    });
+    const res = inlineValuesFor([warnInv], false);
+    const warn = res.find((iv) => iv.kind === "warning");
+    assert.ok(warn, "expected a warning decoration");
+    assert.strictEqual(warn?.line, 12, "annotation line 13 (1-based) → 12 (0-based)");
+    assert.ok(warn?.after.includes("live lookup"), warn?.after);
+    assert.ok(warn?.hover.includes("db_lookup"), warn?.hover);
+  });
+
+  test("a warning suppresses a value decoration on the same line", () => {
+    const both = inv({
+      events: [{ line: 12, event: "line", assigned: { y: "1" } }],
+      annotations: [{ line: 12, kind: "live_lookup_skipped", call: "fhir_lookup" }],
+    });
+    const r = inlineValuesFor([both], true);
+    assert.strictEqual(r.filter((iv) => iv.kind === "value" && iv.line === 11).length, 0);
+    assert.strictEqual(r.filter((iv) => iv.kind === "warning" && iv.line === 11).length, 1);
+  });
+
+  test("across messages, the newest invocation's value wins for a shared line", () => {
+    const first = inv({ events: [{ line: 11, event: "line", assigned: { x: "AAA" } }] });
+    const second = inv({ events: [{ line: 11, event: "line", assigned: { x: "BBB" } }] });
+    const merged = inlineValuesFor([first, second], true);
+    assert.strictEqual(merged.length, 1);
+    assert.ok(merged[0].after.includes('"BBB"'), merged[0].after);
+    assert.ok(!merged[0].after.includes('"AAA"'), merged[0].after);
+  });
+});
+
+suite("liveDebug invocationsForFile", () => {
+  test("filters to the active module by resolved path", () => {
+    const entries = [
+      traceEntry({ invocations: [inv({ file: "/cfg/A.py" }), inv({ file: "/cfg/B.py" })] }),
+    ];
+    const only = invocationsForFile(entries, "/cfg/A.py");
+    assert.strictEqual(only.length, 1);
+    assert.strictEqual(only[0].file, "/cfg/A.py");
+  });
+});
+
+suite("LiveDebugController with a mocked traced-dryrun spawn", () => {
+  // The spawn seam is injected: a canned runner stands in for `messagefoundry dryrun --trace json`, so
+  // the whole pipeline (run → store rows/trace → CodeLens summaries) runs with NO Python engine.
+  test("canned trace JSON flows through to CodeLens summaries (no --show-phi by default)", async () => {
+    let calledWith: { sample: string; cwd: string; showPhi: boolean } | undefined;
+    const runner: TraceRunner = async (sample, cwd, showPhi) => {
+      calledWith = { sample, cwd, showPhi };
+      return [traceEntry({})];
     };
     const controller = new LiveDebugController(runner);
     try {
       await controller.runWith("/synthetic/adt_a01.hl7", "/workspace");
-      assert.deepStrictEqual(calledWith, { sample: "/synthetic/adt_a01.hl7", cwd: "/workspace" });
+      assert.deepStrictEqual(calledWith, {
+        sample: "/synthetic/adt_a01.hl7",
+        cwd: "/workspace",
+        showPhi: false, // MEFOR Live alone NEVER requests PHI
+      });
 
       const lenses = controller.lensesForText(CONFIG_TEXT);
       const byLine = new Map(lenses.map((l) => [l.line, l.title]));
-      // The label is derived from the sample basename, and the routing/disposition/send lenses reflect
-      // the canned row — proving the mocked spawn's JSON reached the rendered lenses.
       assert.ok(byLine.get(2)?.includes("adt_a01.hl7: RECEIVED"), `inbound: ${byLine.get(2)}`);
       assert.ok(byLine.get(5)?.includes("routed → [acme_adt_handler]"), `router: ${byLine.get(5)}`);
       assert.ok(byLine.get(9)?.includes("1 Send"), `handler: ${byLine.get(9)}`);
@@ -162,7 +323,8 @@ suite("LiveDebugController with a mocked dryrun spawn", () => {
   });
 
   test("a runner rejection surfaces as an error lens (no live engine, no crash)", async () => {
-    const runner: DryRunner = () => Promise.reject(new Error("config has multiple inbound connections"));
+    const runner: TraceRunner = () =>
+      Promise.reject(new Error("config has multiple inbound connections"));
     const controller = new LiveDebugController(runner);
     try {
       await controller.runWith("/synthetic/x.hl7", "/workspace");
@@ -177,11 +339,10 @@ suite("LiveDebugController with a mocked dryrun spawn", () => {
   test("a superseded run's late result is discarded (newest run wins)", async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
-    // First run blocks on the gate; second run resolves immediately with different rows.
-    const slow: LiveDryRunRow[] = [row({ handlers: ["stale_handler"] })];
-    const fresh: LiveDryRunRow[] = [row({ handlers: ["fresh_handler"] })];
+    const slow = [traceEntry({ handlers: ["stale_handler"] })];
+    const fresh = [traceEntry({ handlers: ["fresh_handler"] })];
     let call = 0;
-    const runner: DryRunner = async () => {
+    const runner: TraceRunner = async () => {
       call += 1;
       if (call === 1) {
         await gate;
@@ -206,6 +367,37 @@ suite("LiveDebugController with a mocked dryrun spawn", () => {
   });
 });
 
+suite("LiveDebugController reveal-values gate (SEPARATE from MEFOR Live)", () => {
+  test("--show-phi is requested ONLY when reveal is on; Live never sets it, reveal toggles alone", async () => {
+    let lastShowPhi: boolean | undefined;
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      lastShowPhi = showPhi;
+      return [traceEntry({})];
+    };
+    const controller = new LiveDebugController(runner);
+    try {
+      // Default: reveal off → no --show-phi.
+      await controller.runWith("/synthetic/adt.hl7", "/ws");
+      assert.strictEqual(lastShowPhi, false, "default run must NOT pass --show-phi");
+      assert.strictEqual(controller.isRevealingValues(), false);
+
+      // Reveal ON via its OWN toggle. Live is off, so this does not auto-run — proving independence.
+      await controller.toggleReveal();
+      assert.strictEqual(controller.isRevealingValues(), true);
+      await controller.runWith("/synthetic/adt.hl7", "/ws");
+      assert.strictEqual(lastShowPhi, true, "reveal-on run passes --show-phi");
+
+      // Reveal back OFF → subsequent runs stop requesting PHI again.
+      await controller.toggleReveal();
+      assert.strictEqual(controller.isRevealingValues(), false);
+      await controller.runWith("/synthetic/adt.hl7", "/ws");
+      assert.strictEqual(lastShowPhi, false, "reveal-off run must not pass --show-phi");
+    } finally {
+      controller.dispose();
+    }
+  });
+});
+
 interface Pkg {
   contributes: {
     commands: Array<{ command: string }>;
@@ -220,9 +412,17 @@ function pkg(): Pkg {
 }
 
 suite("liveDebug contributions", () => {
-  test("package.json contributes the toggle command", () => {
+  test("package.json contributes the Live toggle command", () => {
     const cmds = pkg().contributes.commands.map((c) => c.command);
     assert.ok(cmds.includes("messagefoundry.toggleLiveDebug"), "toggleLiveDebug command missing");
+  });
+
+  test("package.json contributes the SEPARATE reveal-values command", () => {
+    const cmds = pkg().contributes.commands.map((c) => c.command);
+    assert.ok(
+      cmds.includes("messagefoundry.toggleRevealValues"),
+      "toggleRevealValues command missing",
+    );
   });
 
   test("package.json contributes the debounce config prop", () => {

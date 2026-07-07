@@ -92,13 +92,16 @@ from messagefoundry.store.store import (
     MessageStore,
     OutboxItem,
     OutboxStatus,
+    OwnedLanes,
     SessionRecord,
     Stage,
     UserRecord,
     WebAuthnCredential,
     audit_row_hash,
     delivery_key,
+    owned_lane_scope,
 )
+from messagefoundry.store.store import _finite_cutoff  # backlog #106: keep-forever cutoff clamp
 
 log = logging.getLogger(__name__)
 
@@ -3222,7 +3225,11 @@ class PostgresStore:
     # --- recovery / replay ---------------------------------------------------
 
     async def reset_stale_inflight(
-        self, now: float | None = None, *, stage: str | None = None
+        self,
+        now: float | None = None,
+        *,
+        stage: str | None = None,
+        owned: OwnedLanes | None = None,
     ) -> int:
         """Return ``inflight`` rows (claimed before a crash) to ``pending``. ``stage=None`` recovers
         every stage in one pass (the right startup behavior).
@@ -3237,10 +3244,20 @@ class PostgresStore:
         promotion. Expiry-gating this unconditional reset would strand a just-crashed single node's
         in-flight rows until their leases expire, so single-node keeps the unconditional path.
 
+        ``owned=None`` (default) keeps that unconditional single-node path. Passing
+        :class:`OwnedLanes` scopes recovery to the caller's config-graph lanes (ADR 0073) — each
+        stage filtered by its lane key (``channel_id`` for ingress/routed/response,
+        ``destination_name`` for outbound) — so a restarting engine shard on a shared store recovers
+        exactly its own crash residue and never re-pends (or owner/lease-strips) a live sibling
+        shard's rows. This is a THIRD recovery axis beside the cluster lease machinery: lane
+        ownership derives from the config graph and survives a restart, where ``self._owner`` (a
+        per-store-instance identity) does not. An empty owned set for a stage emits no statement.
+
         The all-stages case runs one UPDATE per :class:`Stage` in a single transaction: the plain
         ``(stage, status)`` equality pair seeks ``ix_queue_ready``, where the previous
         ``($4 IS NULL OR stage=$4)`` predicate was unsargable under a generic plan and full-scanned
-        the queue on every open — a measured contributor to the WS-B co-start lock convoy.
+        the queue on every open — a measured contributor to the WS-B co-start lock convoy. The
+        ownership filter rides that same seek as a residual ``= ANY($5::text[])`` predicate.
         Iterating the enum keeps a future stage automatically covered."""
         now = time.time() if now is None else now
         stages = [stage] if stage is not None else [s.value for s in Stage]
@@ -3253,8 +3270,22 @@ class PostgresStore:
         async with self._timed_acquire() as conn:
             async with conn.transaction():
                 for st in stages:
+                    if owned is None:
+                        result = await conn.execute(
+                            sql, OutboxStatus.PENDING.value, now, OutboxStatus.INFLIGHT.value, st
+                        )
+                        recovered += _rowcount(result)
+                        continue
+                    lane_col, names = owned_lane_scope(st, owned)
+                    if not names:
+                        continue
                     result = await conn.execute(
-                        sql, OutboxStatus.PENDING.value, now, OutboxStatus.INFLIGHT.value, st
+                        f"{sql} AND {lane_col} = ANY($5::text[])",
+                        OutboxStatus.PENDING.value,
+                        now,
+                        OutboxStatus.INFLIGHT.value,
+                        st,
+                        sorted(names),
                     )
                     recovered += _rowcount(result)
         return recovered
@@ -3586,11 +3617,20 @@ class PostgresStore:
         limit: int = 50,
         offset: int = 0,
         allowed_channels: Sequence[str] | None = None,
+        received_from: float | None = None,
+        received_to: float | None = None,
     ) -> list[dict[str, Any]]:
         """Most-recent-first message listing (metadata only — bodies omitted until a message is
-        opened + audited). ``allowed_channels`` restricts to a per-channel RBAC scope."""
+        opened + audited). ``allowed_channels`` restricts to a per-channel RBAC scope; ``received_from``/
+        ``received_to`` bound ``received_at`` to an epoch range (#4b message-log date filter)."""
         where, params = self._message_filter(
-            channel_id, status, message_type, control_id, allowed_channels
+            channel_id,
+            status,
+            message_type,
+            control_id,
+            allowed_channels,
+            received_from,
+            received_to,
         )
         n = len(params)
         rows = await self._fetchall(
@@ -3614,9 +3654,17 @@ class PostgresStore:
         message_type: str | None = None,
         control_id: str | None = None,
         allowed_channels: Sequence[str] | None = None,
+        received_from: float | None = None,
+        received_to: float | None = None,
     ) -> int:
         where, params = self._message_filter(
-            channel_id, status, message_type, control_id, allowed_channels
+            channel_id,
+            status,
+            message_type,
+            control_id,
+            allowed_channels,
+            received_from,
+            received_to,
         )
         row = await self._fetchone(f"SELECT COUNT(*) AS n FROM messages{where}", *params)
         return int(row["n"]) if row else 0
@@ -3716,6 +3764,8 @@ class PostgresStore:
         message_type: str | None,
         control_id: str | None,
         allowed_channels: Sequence[str] | None = None,
+        received_from: float | None = None,
+        received_to: float | None = None,
     ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -3728,6 +3778,13 @@ class PostgresStore:
             if value is not None:
                 params.append(value)
                 clauses.append(f"{column}=${len(params)}")
+        # received_at epoch range: [received_from, received_to) — the message-log date filter (#4b).
+        if received_from is not None:
+            params.append(received_from)
+            clauses.append(f"received_at >= ${len(params)}")
+        if received_to is not None:
+            params.append(received_to)
+            clauses.append(f"received_at < ${len(params)}")
         _append_channel_scope_pg(clauses, params, "channel_id", allowed_channels)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         return where, params
@@ -4936,23 +4993,29 @@ def _pg_cutoff_case(
 
     With no override (``connection_cutoffs`` empty/None) this returns ``("$start", [global_cutoff],
     start + 1)`` — **byte-identical** to the single global ``$1`` cutoff today. With overrides it returns
-    a ``CASE <column> WHEN $a THEN $b ... ELSE $z END`` whose per-connection ``THEN`` cutoffs come from
-    the map and whose ``ELSE`` is the global cutoff (a connection absent from the map inherits the global
-    window); a keep-forever override is carried as ``float('-inf')`` (``received_at < -inf`` always
-    false). Returns ``(sql, params, next_index)`` where ``next_index`` is the first free placeholder so
-    the caller can continue numbering its own binds after it."""
+    a ``CASE <column> WHEN $a THEN $b::double precision ... ELSE $z::double precision END`` whose
+    per-connection ``THEN`` cutoffs come from the map and whose ``ELSE`` is the global cutoff (a
+    connection absent from the map inherits the global window). Two backlog-#106 fixes: (1) the
+    ``THEN``/``ELSE`` casts — a bare ``$N`` inside a ``CASE`` result branch has no type context, so
+    Postgres infers it as ``text`` and ``received_at < (CASE … text …)`` fails with
+    ``operator does not exist: double precision < text``; the explicit ``::double precision`` cast fixes
+    the inference. (2) a keep-forever override (``float('-inf')``) is clamped to a finite floor via
+    :func:`~messagefoundry.store.store._finite_cutoff` (bindable everywhere). Returns
+    ``(sql, params, next_index)`` where ``next_index`` is the first free placeholder."""
     if not connection_cutoffs:
-        return f"${start}", [global_cutoff], start + 1
+        return f"${start}", [_finite_cutoff(global_cutoff)], start + 1
     whens: list[str] = []
     params: list[Any] = []
     idx = start
     for name, cutoff in connection_cutoffs.items():
-        whens.append(f"WHEN ${idx} THEN ${idx + 1}")
+        whens.append(f"WHEN ${idx} THEN ${idx + 1}::double precision")
         params.append(name)
-        params.append(cutoff)
+        params.append(_finite_cutoff(cutoff))
         idx += 2
-    params.append(global_cutoff)  # ELSE — connections with no override use the global window
-    sql = f"(CASE {column} {' '.join(whens)} ELSE ${idx} END)"
+    params.append(
+        _finite_cutoff(global_cutoff)
+    )  # ELSE — connections with no override use the global window
+    sql = f"(CASE {column} {' '.join(whens)} ELSE ${idx}::double precision END)"
     return sql, params, idx + 1
 
 

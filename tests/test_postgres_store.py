@@ -1212,6 +1212,71 @@ async def test_reset_stale_inflight_still_unconditional(store) -> None:
     assert row["owner"] is None and row["lease_expires_at"] is None
 
 
+async def test_reset_stale_inflight_owned_scopes_lanes_and_preserves_sibling_lease(store) -> None:
+    """ADR 0073 ownership-scoped recovery: ``owned=OwnedLanes(...)`` re-pends ONLY the caller
+    shard's lanes — its channels (ingress/routed/response lanes) + its rendezvous-owned outbound
+    destinations — clearing owner/lease on exactly the rows it re-pends. A live sibling shard's
+    inflight rows are untouched: still INFLIGHT **with their claim-stamped owner + lease intact**
+    (Postgres stamps owner on claim; a sibling's scoped restart must never owner/lease-strip them
+    the way the unconditional reset above deliberately does)."""
+    from messagefoundry.store.store import OwnedLanes
+
+    # Shard A's crash residue: an inflight ingress row on its channel IB_A + an inflight outbound
+    # row on its owned lane OB_A.
+    await store.enqueue_ingress(channel_id="IB_A", raw=RAW, now=100.0)
+    ing_a = await store.claim_next_fifo("IB_A", now=110.0, stage=Stage.INGRESS.value)
+    await store.enqueue_message(channel_id="IB_A", raw=RAW, deliveries=[("OB_A", "p")], now=100.0)
+    out_a = await store.claim_next_fifo("OB_A", now=110.0)
+    # Live sibling shard B, mid-flight on ITS lanes (same store handle → same owner id; the scoped
+    # reset must discriminate by LANE, not by the claim-owner column).
+    await store.enqueue_ingress(channel_id="IB_B", raw=RAW, now=100.0)
+    ing_b = await store.claim_next_fifo("IB_B", now=115.0, stage=Stage.INGRESS.value)
+    await store.enqueue_message(channel_id="IB_B", raw=RAW, deliveries=[("OB_B", "p")], now=100.0)
+    out_b = await store.claim_next_fifo("OB_B", now=115.0)
+    assert None not in (ing_a, out_a, ing_b, out_b)
+
+    # Reset + re-claim run INSIDE the sibling's lease window (claimed at 115, ttl 60 → expires
+    # 175): past it, the FIFO claim's own expired-lease stranded-head reclaim would legitimately
+    # take B's head and muddy the "sibling untouched" assertion.
+    owned_a = OwnedLanes(channels=frozenset({"IB_A"}), destinations=frozenset({"OB_A"}))
+    recovered = await store.reset_stale_inflight(now=120.0, owned=owned_a)
+    assert recovered == 2  # exactly shard A's ingress + outbound rows, despite 4 inflight total
+    for row_id in (ing_a.id, out_a.id):
+        row = await _queue_row(store, row_id)
+        assert row["status"] == OutboxStatus.PENDING.value
+        assert row["owner"] is None and row["lease_expires_at"] is None  # cleared on re-pend
+    for row_id in (ing_b.id, out_b.id):
+        row = await _queue_row(store, row_id)
+        assert row["status"] == OutboxStatus.INFLIGHT.value  # sibling untouched...
+        assert row["owner"] == store._owner  # ...owner survives the sibling's scoped reset
+        assert row["lease_expires_at"] == pytest.approx(115.0 + _ttl(store))  # lease intact
+    # The recovered lanes are claimable again at once; the sibling's heads are still held.
+    again = await store.claim_next_fifo("IB_A", now=130.0, stage=Stage.INGRESS.value)
+    assert again is not None and again.id == ing_a.id
+    assert await store.claim_next_fifo("IB_B", now=130.0, stage=Stage.INGRESS.value) is None
+
+
+async def test_reset_stale_inflight_owned_empty_sets_match_nothing(store) -> None:
+    """An EMPTY owned set matches NOTHING for the stages it scopes (no statement, never ``IN ()``):
+    recovering 'no lanes' must never widen into recovering 'all lanes'. Both inflight rows keep
+    status AND owner/lease."""
+    from messagefoundry.store.store import OwnedLanes
+
+    await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    ing = await store.claim_next_fifo("IB", now=110.0, stage=Stage.INGRESS.value)
+    await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0)
+    out = await store.claim_next_fifo("OB1", now=110.0)
+    assert ing is not None and out is not None
+
+    empty = OwnedLanes(channels=frozenset(), destinations=frozenset())
+    assert await store.reset_stale_inflight(now=200.0, owned=empty) == 0
+    for row_id in (ing.id, out.id):
+        row = await _queue_row(store, row_id)
+        assert row["status"] == OutboxStatus.INFLIGHT.value
+        assert row["owner"] == store._owner
+        assert row["lease_expires_at"] == pytest.approx(110.0 + _ttl(store))
+
+
 async def test_reclaim_expired_leases_no_expired_returns_zero(store) -> None:
     """The zero-row command-tag path: a sweep before any lease has expired reclaims nothing."""
     # Nothing inflight at all.

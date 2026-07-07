@@ -1,0 +1,163 @@
+# messagefoundry-webconsole ENGINE SEAM CONTRACT SNAPSHOT
+#
+# Deterministic serialization of the engine-side contract the web console depends on (ADR 0065).
+# Regenerate with: python scripts/webconsole_seam_snapshot.py
+# This is a GOLDEN gate: any diff means the seam contract changed - see the test's failure hint.
+
+## ENGINE_UI_SEAM
+1
+
+## dataclass messagefoundry.api._ui_seam.UiDeps
+engine_seam
+get_engine
+get_gate
+cookie_secure
+default_scan_limit
+core
+admin
+
+## dataclass messagefoundry.api._ui_seam.CoreHandlers
+list_connections
+list_messages
+get_message
+list_dead_letters
+start_connection
+stop_connection
+restart_connection
+replay_message
+replay_dead_letters
+list_active_alerts
+alerts_rules
+list_connection_events
+system_status
+security_posture
+cluster_status
+cluster_nodes
+dr_status
+service_status
+ack_alert
+resolve_alert
+reset_statistics
+integrity_check
+dr_activate
+dr_release
+dual_role_control
+purge_connection
+config_provenance
+reload_config
+search_messages
+audit_channel_denied
+
+## dataclass messagefoundry.api._ui_seam.AdminHandlers
+list_roles
+list_users
+list_custom_roles
+create_user
+update_user
+set_user_roles
+set_channel_scope
+reset_user_password
+reset_user_mfa
+admin_revoke_user_sessions
+delete_user
+create_custom_role
+update_custom_role
+delete_custom_role
+get_ad_group_map
+get_ad_group_scope_map
+set_ad_group_map
+set_ad_group_scope_map
+my_mfa
+change_password
+enroll_mfa
+disable_my_mfa
+list_audit
+my_security_events
+user_summary
+current_user
+
+## api.security surface (imported directly by the console, outside UiDeps)
+authorize_ws: (websocket: 'WebSocket', *permissions: 'Permission') -> 'Identity | None'
+get_auth: (request: 'Request') -> 'AuthService | None'
+require: (*permissions: 'Permission') -> 'Callable[[Request], Awaitable[Identity]]'
+require_reauth_only: (*permissions: 'Permission') -> 'Callable[[Request], Awaitable[Identity]]'
+require_step_up: (*permissions: 'Permission') -> 'Callable[[Request], Awaitable[Identity]]'
+ws_token: (websocket: 'WebSocket') -> 'str | None'
+
+## AuthService methods called by the console
+allow_login_attempt: (self, client: 'str | None') -> 'bool'
+allow_phi_read: (self, actor: 'str') -> 'bool'
+audit_kerberos_reject: (self, reason: 'str') -> 'None'
+audit_permission_denied: (self, identity: 'Identity', permission: 'Permission', path: 'str') -> 'None'
+authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, seed_reauth: 'bool' = True) -> 'LoginOutcome'
+begin_webauthn_assertion: (self, token: 'str | None', *, rp_id: 'str') -> 'str | None'
+begin_webauthn_registration: (self, identity: 'Identity', *, token: 'str', rp_id: 'str', rp_name: 'str') -> 'str'
+confirm_mfa_enrollment: (self, identity: 'Identity', code: 'str', *, token: 'str', client: 'str | None' = None) -> 'list[str] | None'
+delete_webauthn_credential: (self, identity: 'Identity', credential_id_hash: 'str', *, client: 'str | None' = None) -> 'bool'
+finish_webauthn_assertion: (self, token: 'str | None', response_json: 'str', *, client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'bool'
+finish_webauthn_registration: (self, identity: 'Identity', response_json: 'str', *, label: 'str', token: 'str', client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'bool'
+flag_new_client_ip: (self, token: 'str | None', client_ip: 'str | None', *, path: 'str') -> 'bool'
+has_recent_step_up: (self, token: 'str | None') -> 'bool'
+identity_for_token: (self, token: 'str | None', *, activity: 'bool' = True) -> 'Identity | None'
+list_sessions: (self, user_id: 'str') -> 'list[SessionRecord]'
+login: (self, username: 'str', password: 'str', *, provider: 'AuthProvider' = <AuthProvider.LOCAL: 'local'>, client: 'str | None' = None) -> 'LoginOutcome'
+logout: (self, token: 'str | None', *, actor: 'str | None' = None) -> 'None'
+mfa_satisfied: (self, token: 'str | None') -> 'bool'
+mfa_status: (self, identity: 'Identity') -> 'MfaStatus'
+reauth: (self, identity: 'Identity', password: 'str', *, token: 'str', client: 'str | None' = None) -> 'bool'
+revoke_other_sessions: (self, identity: 'Identity', current_token_hash: 'str', *, actor: 'str') -> 'int'
+revoke_own_session: (self, identity: 'Identity', session_id: 'str', *, actor: 'str') -> 'bool'
+verify_mfa: (self, token: 'str | None', code: 'str', *, client: 'str | None' = None) -> 'bool'
+webauthn_available: (self) -> 'bool'
+
+## app.state attributes the console sets/reads
+auth
+public_origin
+ui_connections_render
+ui_csp
+ui_ws_authorize
+webauthn_rp_from_request
+
+## api.models DTO fields rendered by the console
+AlertInstanceInfo: acked_at, acked_by, connection, count, event_type, first_seen, id, last_seen, reason, resolved_at, severity, status
+AlertInstanceList: alerts
+AlertsConfig: email_configured, email_recipient_count, email_smtp_port, email_use_tls, realert_seconds, rules, smtp_allowed_hosts, webhook_allowed_hosts, webhook_configured, webhook_timeout
+ClusterNodeList: leader_node_id, lease_expires_at, lease_owner, nodes
+ClusterStatus: clustered, config_version, is_leader, node_id, role
+ConfigProvenance: drift, files, fingerprint, git_head, loaded
+ConnectionEventInfo: connection, direction, id, kind, message_id, peer_host, reason, transport, ts
+ConnectionRow: alerts_active, backlog_seconds, channel_id, channel_name, delivered_age_seconds, destination, direction, error, errored, idle_seconds, method, name, owner_shard, paused, peer, port, queue_depth, read, role, simulated, status, written
+DeadLetterList: dead_letters, limit, offset, total
+DeadLetterReplayRequest: channel_id, destination_name
+DrStatus: activation_mode, active, enabled, threshold
+IntegrityResult: detail, ok
+MessageDetail: channel_id, control_id, error, event, events, id, message_type, metadata, outbox, raw, received_at, source_type, status, summary
+MessageList: limit, messages, offset, total
+MessageSearchResults: limit, matched, messages, scan_limit, scanned, truncated
+PendingApprovalResponse: approval_id, detail, operation, status
+ReloadRequest: config_dir, dry_run
+ReloadResult: dry_run, handlers, inbound, outbound, routers, running
+SecurityPosture: allow_unencrypted_phi, backend, data_class, encryption_enabled, environment, key_id, key_source, plaintext_columns, production, require_encryption
+ServiceStatusInfo: enabled, service_name, state
+StatsResetRequest: all, targets
+StatsResetTarget: channel_id, destination, role
+SystemStatus: db, engine, logs, pool, update
+
+## api.auth_models DTO fields rendered by the console
+AdGroupMap: entries
+AdGroupMapEntry: ad_group, role
+AdGroupScopeEntry: ad_group, channel
+AdGroupScopeMap: entries
+AuditList: entries
+ChannelScope: channels
+CurrentUser: auth_provider, permissions, roles, user_id, username
+CustomRoleInfo: description, display_name, id, permissions
+CustomRoleRequest: description, display_name, permissions
+MfaStatusResponse: enabled, enrolled_at, recovery_codes_remaining, required, webauthn_enrolled
+PasswordChangeRequest: current_password, new_password
+RoleInfo: builtin, description, display_name, id, permissions
+RolesUpdateRequest: roles
+SecurityEventsList: events
+UserCreateRequest: display_name, email, password, roles, username
+UserSummary: auth_provider, channel_scope, disabled, display_name, email, id, roles, username
+UserUpdateRequest: disabled, display_name, email

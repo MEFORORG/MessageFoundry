@@ -707,6 +707,23 @@ class PipelineSettings(_Section):
     # reserve 256 slots for a handful of workers, inflating in_pipeline + the crash-replay recovery set).
     pooled_fusing_workers: int = Field(default=8, ge=1)
 
+    # ADR 0075 per-hop SQL statement batching. DEFAULT-OFF and SQL-Server-scoped: when True AND the store
+    # backend is SQL Server, each per-hop staged handoff (route_handoff / transform_handoff) folds the
+    # non-result-returning DML of its body into the fewest ``pyodbc.execute()`` T-SQL batches — same
+    # ordered (sql, params) sequence, one round-trip per batch (the _SQL_APPLOCK precedent), still
+    # committing exactly ONCE per hop (commits/msg stays 2.000). It cuts network round-trips, NOT
+    # transactions: no commit boundary moves, the claim stays its own poison-guard txn, the ACK-on-receipt
+    # fence is untouched. Each result-consuming statement whose value gates later control flow (the guard
+    # DELETE, the finalize GROUP BY, and the finalize sp_getapplock rc-check) stays its own execute — the
+    # rc-check is kept a client-side gate (the "strict" / applock_hard fold: the finalize UPDATE is only
+    # SENT after the rc is validated >=0), so an ungranted lock never lets an unserialized write reach the
+    # wire. Fail-closed + provably no-op on the other backends: Postgres (asyncpg loop-native, pipelines
+    # internally) and SQLite (loop-affine single writer) have no batched path and run byte-identically; a
+    # non-SS store ignores the flag (logged). Reliability-core + read ONCE at engine construction (a
+    # /config/reload does NOT re-read it — restart to change, exactly like claim_mode / fuse_thread_hops).
+    # Harness A/B via MEFOR_PIPELINE_BATCH_HANDOFF_STATEMENTS.
+    batch_handoff_statements: bool = Field(default=False)
+
 
 class DiagnosticsSettings(_Section):
     """``[diagnostics]`` — the Corepoint-style event log (#46). Both switches are **on by default** and

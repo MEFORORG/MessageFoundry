@@ -50,6 +50,15 @@ outbound ownership is a separate reliability-core build, **gated** behind a meas
 free-threading-first (ADR 0053). This ADR only forbids the *split*; it does not certify multi-shard on a
 server DB as production-ready.
 
+> **Update — 2026-07-06 ([ADR 0073](0073-ownership-scoped-recovery-single-consumer-lanes.md)).** Both halves
+> of the deferred runtime are now **BUILT**: the single-delivery-consumer-per-outbound-lane primitive
+> (deterministic rendezvous ownership over the pinned shard universe, gated at the wake/claim boundary) and
+> the ownership-scoped startup/DR crash recovery (`reset_stale_inflight(owned=...)`). The gating language
+> above is stale in one respect: the ADR 0053 post-B5 re-scope (2026-07-06) inverted "free-threading-first" —
+> engine sharding on one unified store is the committed 45M/day path and FT is an optional box-count reducer.
+> N-active remains gated on the clean 4-engine no-loss bench before SYSTEM-REQUIREMENTS calls it a supported
+> production topology (ADR 0073 §Consequences).
+
 ## Acceptance Criteria
 
 - **AC-1** — IF a config declares `>1` distinct shard AND `[store].backend` is SQLite, THEN THE SYSTEM SHALL

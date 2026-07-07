@@ -74,6 +74,7 @@ from messagefoundry.parsing import HL7PeekError, Peek, RawMessage, normalize, su
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
+from messagefoundry.pipeline.sharding import owner_shard_of_destination
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.pipeline.dryrun import route_only, transform_one
 from messagefoundry.pipeline.stage_dispatcher import (
@@ -96,9 +97,27 @@ from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
 
-__all__ = ["RegistryRunner"]
+__all__ = ["RegistryRunner", "ShardLaneOwnershipError"]
 
 log = logging.getLogger(__name__)
+
+
+class ShardLaneOwnershipError(RuntimeError):
+    """An outbound CONTROL (pause/resume/restart — and, at the API layer, purge) targeted a lane
+    another engine shard owns (ADR 0073). Raised instead of acting: a non-owning shard has no
+    delivery worker/dispatcher lane, so its pause would report quiesced INSTANTLY and unlock the
+    require-stopped purge while the owning shard keeps claiming and delivering. The API maps this to
+    409, naming the owner so the operator can retarget that shard's API/console tab."""
+
+    def __init__(self, name: str, *, owner: str | None, shard: str | None) -> None:
+        super().__init__(
+            f"outbound {name!r} is owned by engine shard {owner!r} (this is shard {shard!r}) — "
+            "issue the control against the owning shard's API"
+        )
+        self.name = name
+        self.owner = owner
+        self.shard = shard
+
 
 # A delivery worker backs off this long after an *unexpected* error (e.g. the store being briefly
 # unavailable) before retrying, so a transient failure logs once and recovers instead of hot-looping.
@@ -118,6 +137,12 @@ _CONN_EVENT_FLUSH_GRACE = 2.0
 # router just falls behind), so it polls the lane depth at most this often — bounding the extra
 # COUNT+MIN query rate on the ingress hot path regardless of throughput.
 _BUILDUP_CHECK_INTERVAL = 1.0
+
+# ADR 0073: how often a SHARDED engine's read-only watchdog re-checks the buildup/stall thresholds
+# of the outbound lanes it does NOT own. With one delivery consumer per lane, a hung (not crashed)
+# owner would otherwise stall its lanes with zero paging anywhere — the supervisor's liveness test
+# is process-exit only, and the buildup/stall alerts fire only in the owner's delivery path.
+_SHARD_WATCHDOG_INTERVAL_SECONDS = 30.0
 
 # WS-C empty-claim storm (2026-07-02 bench finding; amends ADR 0061). With per-lane wake ON, a
 # committed row wakes ITS lane's worker directly, so the poll backstop is no longer the normal-case
@@ -380,6 +405,7 @@ class RegistryRunner:
         infra_fault_backoff_cap: float = 60.0,
         fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
         pooled_fusing_workers: int = 8,
+        batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
     ) -> None:
         self.registry = registry
         self.store = store
@@ -588,6 +614,12 @@ class RegistryRunner:
         self._fuse_thread_hops = fuse_thread_hops
         self._fusing_workers = pooled_fusing_workers
         self._fusion_active = False
+        # ADR 0075 per-hop SQL statement batching. FROZEN intent read ONCE here; a /config/reload never
+        # re-reads it (restart to change, exactly like fuse_thread_hops). Resolved to the store in start()
+        # via _activate_statement_batching(): True only when the flag is set AND the store is SQL Server
+        # (the only backend that ships the batched handoff forms) — else the async path (fail-closed,
+        # byte-identical). Independent of claim_mode: batching works on the plain async handoff too.
+        self._batch_handoff_statements = batch_handoff_statements
         # /stats-style gauge: True when the flag was set on a fusion-capable engine but the sync
         # handoff pool could not be opened at start (command_timeout==0 / session-cap / connect fault),
         # so fusion fell back to the async path. Distinct from "ignored on a non-SS backend".
@@ -618,6 +650,8 @@ class RegistryRunner:
         self._conn_event_q: asyncio.Queue[dict[str, Any]] | None = None
         self._conn_event_drainer: asyncio.Task[None] | None = None
         self._conn_events_dropped = 0
+        # ADR 0073: sharded-only read-only watchdog over NON-owned outbound lanes (hung-owner paging).
+        self._shard_watchdog: asyncio.Task[None] | None = None
         self._running = False
         self._reload_lock = asyncio.Lock()  # serialize concurrent reloads
         # B11 read-only worker-loop instrumentation: empty-claim counts (router/transform/delivery),
@@ -657,13 +691,50 @@ class RegistryRunner:
         when per_lane_wake is True — the OFF path never touches _lane_events. ADR 0061."""
         return self._lane_events[stage].setdefault(key, asyncio.Event())
 
+    # --- engine-shard lane ownership (ADR 0073) --------------------------------
+
+    def _destination_owner(self, name: str) -> str | None:
+        """The shard that owns claiming/delivery for outbound lane ``name`` — ``None`` when this
+        process is not sharded (single-shard/unsharded: every lane is locally owned). Reads the live
+        registry, so a reload's swapped graph is reflected immediately."""
+        reg = self.registry
+        if reg.shard_id is None or reg.all_shard_ids is None:
+            return None
+        return owner_shard_of_destination(name, reg.all_shard_ids)
+
+    def _owns_destination(self, name: str) -> bool:
+        """ADR 0073 single-delivery-consumer gate: True unless a sharded registry assigns outbound
+        lane ``name`` to a DIFFERENT shard. Deliberately a *predicate* (rendezvous over the pinned
+        shard universe, total over any string) rather than membership in a registry-derived set: a
+        destination a reload dropped from ``registry.outbound`` keeps exactly one owner, so its
+        still-queued rows keep draining on that shard instead of stranding everywhere."""
+        owner = self._destination_owner(name)
+        return owner is None or owner == self.registry.shard_id
+
+    def destination_owner(self, name: str) -> str | None:
+        """Public read of :meth:`_destination_owner` for the API surfaces (``/connections`` rows,
+        the purge handler's ownership 409) — ``None`` when unsharded."""
+        return self._destination_owner(name)
+
     def _wake_lane(self, stage: Stage, key: str) -> None:
         """Wake the worker for one (stage, lane). ADR 0066 pooled: route to the stage's dispatcher
         (``mark_ready`` — sync, await-free, ``Event.set()``-shaped, create-or-stick on an unknown lane)
         and NEVER touch the per_lane singletons/lane-events; a wake before the dispatcher exists is a
         no-op (the dispatcher's start-time seed-all-READY + immediate sweep covers it). per_lane OFF →
         the whole-stage singleton (byte-identical to the pre-B12 set()); ON → only this lane's Event
-        (ADR 0061)."""
+        (ADR 0061).
+
+        Sharded (ADR 0073): a wake for a lane ANOTHER shard owns is dropped here — the single choke
+        point for every producer wake (transform handoffs, retry re-wakes, response captures).
+        ``mark_ready`` is create-or-stick, so an ungated cross-shard wake would register the lane on
+        THIS shard's dispatcher and make it a second concurrent claimer — the exact per-lane FIFO
+        hazard the single-consumer invariant closes. The owning shard discovers cross-shard produce
+        via its sweep/idle poll instead (the documented wake gap)."""
+        if self.registry.shard_id is not None:
+            if stage is Stage.OUTBOUND and not self._owns_destination(key):
+                return
+            if stage is Stage.RESPONSE and key not in self.registry.inbound:
+                return  # the reingress_to loopback lives on (and is drained by) another shard
         if self._claim_mode == "pooled":
             d = self._dispatchers.get(stage)
             if d is not None:
@@ -1078,11 +1149,23 @@ class RegistryRunner:
             await self._stop_inbound_unsafe(name)
             await self._start_inbound_unsafe(name)
 
+    def _require_owned_destination(self, name: str) -> None:
+        """Refuse an outbound CONTROL for a lane another shard owns (ADR 0073). Without this, a
+        non-owning shard's pause reports quiesced instantly (it has no worker/dispatcher lane) and
+        unlocks the require-stopped purge while the owning shard keeps claiming and delivering — the
+        operator is told 'stopped' about a lane that is very much running. The 409 the API maps this
+        to names the owning shard so the operator can retarget."""
+        if not self._owns_destination(name):
+            raise ShardLaneOwnershipError(
+                name, owner=self._destination_owner(name), shard=self.registry.shard_id
+            )
+
     async def start_outbound(self, name: str) -> None:
         """RESUME delivery on one outbound connection (no-op if not paused). The OPPOSITE primitive to
         the inbound stop/start: it un-pauses DELIVERY, keeping the connector WARM. Takes the reload lock
-        so it can't race a concurrent reload/stop (review M-10)."""
+        so it can't race a concurrent reload/stop (review M-10). Sharded: owner-only (ADR 0073)."""
         async with self._reload_lock:
+            self._require_owned_destination(name)
             self._start_outbound_unsafe(name)
 
     async def stop_outbound(self, name: str) -> None:
@@ -1091,15 +1174,18 @@ class RegistryRunner:
         draining; this halts delivery but keeps the queue). Requests a COOPERATIVE pause and RETURNS
         FAST — it does NOT await the in-flight head to drain, so a hung/slow destination can never hang
         the caller (the HTTP request). The lane only *counts as* 'stopped' once its quiescence Event
-        fires (:meth:`outbound_quiesced`); until then it is 'stopping'."""
+        fires (:meth:`outbound_quiesced`); until then it is 'stopping'. Sharded: owner-only (ADR 0073)."""
         async with self._reload_lock:
+            self._require_owned_destination(name)
             self._stop_outbound_unsafe(name)
 
     async def restart_outbound(self, name: str) -> None:
         """Stop + start delivery for one outbound in a single lock span (atomic w.r.t. a concurrent
         reload). The connector is kept WARM throughout (``_destinations[name]`` is never torn down) — a
-        restart deliberately keeps MLLP sockets / DB pools / SMART tokens warm, exactly like a reload."""
+        restart deliberately keeps MLLP sockets / DB pools / SMART tokens warm, exactly like a reload.
+        Sharded: owner-only (ADR 0073)."""
         async with self._reload_lock:
+            self._require_owned_destination(name)
             self._stop_outbound_unsafe(name)
             self._start_outbound_unsafe(name)
 
@@ -1373,6 +1459,19 @@ class RegistryRunner:
             if self._connection_events:
                 self._conn_event_q = asyncio.Queue(maxsize=_CONN_EVENT_QUEUE_MAX)
                 self._conn_event_drainer = asyncio.create_task(self._connection_event_drainer())
+            if self.registry.shard_id is not None:
+                # ADR 0073 sharded-mode extras: page on a non-owned lane backing up (a hung owner is
+                # invisible to the supervisor and never pages itself), and warn on the per_lane_wake
+                # combination (cross-shard produce has no wake — only the 30s idle backstop).
+                self._shard_watchdog = asyncio.create_task(self._non_owned_lane_watchdog())
+                if self._claim_mode != "pooled" and self._per_lane_wake:
+                    log.warning(
+                        "sharded engine with per_lane_wake=True: a cross-shard send into an idle "
+                        "owned lane is discovered only by the %.0fs idle backstop (no cross-process "
+                        "wake) — prefer claim_mode='pooled' (<=%.2fs sweep) for sharded fleets",
+                        _PER_LANE_IDLE_BACKSTOP_SECONDS,
+                        self._pooled_sweep_interval,
+                    )
             try:
                 # Per-connection fault isolation (ADR 0031): a single outbound build / inbound bind
                 # failure no longer aborts startup — it is recorded + alerted and the rest of the graph
@@ -1423,6 +1522,9 @@ class RegistryRunner:
                 # seed-all-READY + immediate sweep re-claims any recovered rows with no wake.
                 if self._claim_mode == "pooled":
                     await self._start_pooled_dispatchers()
+                # ADR 0075: resolve per-hop statement batching on the store (SQL-Server-only, fail-closed).
+                # Independent of claim_mode, so it runs for both pooled and per_lane.
+                self._activate_statement_batching()
             except Exception:
                 # A truly fatal startup error (store / lookup executor — NOT a single connection, which
                 # is isolated above) must not leave half the graph wired with _running still False:
@@ -1524,6 +1626,10 @@ class RegistryRunner:
             await asyncio.gather(self._conn_event_drainer, return_exceptions=True)
             self._conn_event_drainer = None
             self._conn_event_q = None
+        if self._shard_watchdog is not None:
+            self._shard_watchdog.cancel()
+            await asyncio.gather(self._shard_watchdog, return_exceptions=True)
+            self._shard_watchdog = None
         for connector in self._destinations.values():
             await connector.aclose()
         # ADR 0071 B5: tear down the per-stage fusing executors + drop the dedicated synchronous handoff
@@ -1587,8 +1693,21 @@ class RegistryRunner:
         in pooled mode the per-outbound delivery worker is replaced by the OUTBOUND StageDispatcher, so
         this is a no-op — the mode gate lives HERE (not at each call site) so ``_start_outbound`` /
         ``_reconcile_outbounds`` still build the connector into ``self._destinations`` (the pooled
-        delivery body re-resolves from it) without leaking a per_lane worker."""
+        delivery body re-resolves from it) without leaking a per_lane worker.
+
+        Sharded (ADR 0073): a lane another shard owns gets NO local worker — same choke-point
+        placement, so start/reconcile/respawn all inherit the gate while the connector stays built
+        (status, DR parking and the dead-letter sweeps keep keying off the full outbound map)."""
         if self._claim_mode == "pooled":
+            return
+        if not self._owns_destination(name):
+            log.info(
+                "outbound %r: delivery lane owned by shard %r (this is shard %r) — no local "
+                "delivery worker (ADR 0073 single consumer per lane)",
+                name,
+                self._destination_owner(name),
+                self.registry.shard_id,
+            )
             return
         task = asyncio.create_task(self._delivery_worker(name))
         task.add_done_callback(functools.partial(self._on_worker_done, name))
@@ -1693,10 +1812,16 @@ class RegistryRunner:
     def _pooled_lane_provider(self, stage: Stage) -> Callable[[], set[str]]:
         """The live-registry lane set for one stage's dispatcher (ADR 0066 §4). INGRESS/ROUTED = this
         engine's inbound lanes; RESPONSE = the loopback inbound lanes; OUTBOUND = the outbound lanes
-        (registry ∪ any built connector still draining after a reload dropped it). Read live so a reload's
-        swapped graph is reflected without rebuilding the dispatcher."""
+        (registry ∪ any built connector still draining after a reload dropped it), each filtered to
+        the lanes THIS shard owns (ADR 0073 — a no-op unsharded; the predicate form keeps a
+        reload-dropped lane draining on exactly its owner). Read live so a reload's swapped graph is
+        reflected without rebuilding the dispatcher."""
         if stage is Stage.OUTBOUND:
-            return lambda: set(self.registry.outbound) | set(self._destinations)
+            return lambda: {
+                dest
+                for dest in set(self.registry.outbound) | set(self._destinations)
+                if self._owns_destination(dest)
+            }
         if stage is Stage.RESPONSE:
             return lambda: {
                 n
@@ -1802,6 +1927,39 @@ class RegistryRunner:
             len(self._dispatchers),
             ", ".join(s.value for s in self._dispatchers),
         )
+
+    def _activate_statement_batching(self) -> bool:
+        """Resolve EFFECTIVE ADR 0075 per-hop statement batching (called once from :meth:`start`). It
+        needs the flag AND a SQL Server store that ships the batched handoff forms (exposed via
+        ``set_batch_handoff_statements``); every other backend logs "ignored" and keeps the async path
+        (fail-closed, byte-identical). Returns the effective decision.
+
+        Unlike fusion this opens no pools/executors — it only flips a store-side dispatch flag — so it
+        cannot fail-closed to a lane outage; it either batches or runs the unchanged async handoff."""
+        if not self._batch_handoff_statements:
+            return False
+        setter = getattr(self.store, "set_batch_handoff_statements", None)
+        if setter is None:
+            log.info(
+                "batch_handoff_statements ignored on %s (SQL-Server-only); running the async handoff path",
+                self.store.backend.value,
+            )
+            return False
+        active = bool(setter(True))
+        log.info(
+            "ADR 0075 per-hop statement batching ACTIVE (SQL Server): route/transform handoffs fold "
+            "non-result DML into fewer round-trips (same logical sequence, one commit/hop)"
+        )
+        # Bench confounder note (not a fault): batching only reshapes the ASYNC handoff path. When ADR
+        # 0071 fusion is ALSO active, fused hops run the UNBATCHED sync twins, so the two levers are not
+        # additive on the fused stages — an A/B that leaves both on cannot attribute a delta cleanly.
+        if self._fusion_active:
+            log.warning(
+                "ADR 0075 batching AND ADR 0071 fusion are both active: fused stages run the UNBATCHED "
+                "sync handoff twins (only the async path batches). The levers are NOT additive — do not "
+                "run a batching A/B with fusion on."
+            )
+        return active
 
     async def _activate_fusion(self) -> bool:
         """Resolve EFFECTIVE ADR 0071 B5 thread-hop fusion (called once from :meth:`_start_pooled_
@@ -3534,6 +3692,35 @@ class RegistryRunner:
             self._alert_sink.queue_buildup(name, depth=depth, oldest_age_seconds=oldest_age or 0.0)
         except Exception:
             log.exception("alert sink raised on queue_buildup for %r", name)
+
+    async def _non_owned_lane_watchdog(self) -> None:
+        """Sharded-only (ADR 0073): periodically run the buildup/stall checks over the outbound
+        lanes THIS shard does not own. With a single delivery consumer per lane, a hung (not
+        crashed) owner stalls its lanes with zero paging anywhere — the supervisor's liveness test
+        is process-exit only, and the buildup/stall alerts otherwise fire only inside the owner's
+        delivery path. Every shard produces into shared lanes, so every shard watches the ones it
+        cannot drain: a pure ``pending_depth`` read per lane per tick, throttled by the alert
+        machinery's own re-alert window. Known limitation (documented in the ADR): an operator
+        pause on the OWNER is per-process state and invisible here, so a deliberately-paused lane
+        can page from a sibling — the owner's ``/connections`` row (``paused``/``owner_shard``)
+        disambiguates."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=_SHARD_WATCHDOG_INTERVAL_SECONDS)
+                return  # stop signalled — exit quietly
+            except TimeoutError:
+                pass  # tick: run the checks below
+            for name in list(self.registry.outbound):
+                if self._stop.is_set():
+                    return
+                if self._owns_destination(name):
+                    continue  # the local delivery path already checks lanes this shard drains
+                try:
+                    await self._maybe_alert_buildup(name)
+                    await self._maybe_alert_stall(name)
+                except Exception:
+                    # A watchdog read failure is a diagnostic, never fatal — next tick retries.
+                    log.exception("non-owned-lane watchdog check failed for %r", name)
 
     async def _maybe_alert_stall(self, name: str) -> None:
         """Raise a ``message_stall`` alert if an outbound lane's **oldest undelivered message** has aged

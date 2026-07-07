@@ -11,6 +11,7 @@ import pytest
 
 from messagefoundry.config.wiring import (
     MLLP,
+    FhirLookupSpec,
     File,
     Registry,
     WiringError,
@@ -22,6 +23,8 @@ from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline.sharding import (
     DEFAULT_SHARD,
     filter_registry_for_shard,
+    owned_destination_set,
+    owner_shard_of_destination,
     require_unified_store,
     shard_ids,
     shard_of,
@@ -255,3 +258,146 @@ async def test_engine_reload_reapplies_shard_filter(tmp_path: Path) -> None:
         assert "OB" in eng.registry_runner.registry.outbound
     finally:
         await eng.stop()
+
+
+# --- outbound-lane ownership (owner_shard_of_destination, ADR 0073) ----------
+
+
+def test_owner_is_deterministic_across_repeated_calls() -> None:
+    ids = ["a", "b", "c"]
+    for dest in ("OB_ACME_ADT", "OB_LAB_ORU", "ob"):
+        owners = {owner_shard_of_destination(dest, ids) for _ in range(10)}
+        assert len(owners) == 1  # same inputs -> same owner, every call
+
+
+def test_owner_is_independent_of_universe_order_and_duplicates() -> None:
+    # Rendezvous hashing must depend on the SET of shard ids, not the sequence handed in — every
+    # process derives the same owner regardless of how its config happened to enumerate shards.
+    base = owner_shard_of_destination("OB_ACME_ADT", ["a", "b", "c"])
+    for ids in (["c", "b", "a"], ["b", "a", "c"], ["a", "a", "b", "c", "c"]):
+        assert owner_shard_of_destination("OB_ACME_ADT", ids) == base
+
+
+def test_owner_golden_values_pin_the_hash_scheme() -> None:
+    # Hard-coded owners computed from the shipped sha256 rendezvous scheme. Ownership must be
+    # restart-stable ACROSS VERSIONS (recovery + single-consumer gates key off it), so an accidental
+    # change to the hash input format / algorithm must fail this test loudly.
+    assert owner_shard_of_destination("OB_ACME_ADT", ["a", "b", "c"]) == "c"
+    assert owner_shard_of_destination("OB_LAB_ORU", ["a", "b", "c"]) == "c"
+    assert owner_shard_of_destination("ob", ["shard1", "shard2"]) == "shard1"
+    assert owner_shard_of_destination("OB_UNICODE_éè☃", ["a", "b", "c", "d"]) == "b"
+
+
+def test_owner_raises_on_empty_universe() -> None:
+    with pytest.raises(ValueError, match="empty shard universe"):
+        owner_shard_of_destination("OB", [])
+
+
+def test_owner_is_total_over_arbitrary_lane_names() -> None:
+    # A destination dropped from config but still draining queued rows keeps exactly one owner — the
+    # function must be total over ANY string, including names in no registry and unicode.
+    ids = ["a", "b"]
+    assert owner_shard_of_destination("ghost-dest not in any registry", ids) == "b"
+    for dest in ("", " ", "\x00weird", "éè☃", "OB|caret^tilde~"):
+        assert owner_shard_of_destination(dest, ids) in ids
+
+
+def _registry_with_outbounds(names: list[str]) -> Registry:
+    reg = Registry()
+    for name in names:
+        reg.add_outbound(build_outbound_connection(name, File(directory=".")))
+    return reg
+
+
+def test_ownership_partitions_all_destinations_exactly_once() -> None:
+    # Every outbound lane has EXACTLY one owner: the per-shard owned sets are pairwise disjoint and
+    # their union covers the whole outbound map (no lane is orphaned, none double-claimed).
+    ids = ["a", "b", "c"]
+    names = [f"OB_{i:02d}" for i in range(20)]
+    reg = _registry_with_outbounds(names)
+    owned = {shard: owned_destination_set(reg, shard, ids) for shard in ids}
+    for shard, dests in owned.items():
+        for dest in dests:
+            assert owner_shard_of_destination(dest, ids) == shard
+    all_owned = sorted(d for dests in owned.values() for d in dests)
+    assert all_owned == sorted(names)  # union covers everything AND no duplicates (disjoint)
+
+
+def test_adding_a_destination_moves_no_other_lane() -> None:
+    ids = ["a", "b", "c"]
+    names = [f"OB_{i:02d}" for i in range(20)]
+    before = {d: owner_shard_of_destination(d, ids) for d in names}
+    # Add a destination to the registry: ownership is per-lane, so every existing lane keeps its owner.
+    reg = _registry_with_outbounds([*names, "OB_BRAND_NEW"])
+    for shard in ids:
+        for dest in owned_destination_set(reg, shard, ids):
+            if dest != "OB_BRAND_NEW":
+                assert before[dest] == shard
+
+
+def test_adding_a_shard_moves_only_lanes_the_new_shard_wins() -> None:
+    # Minimal disruption: growing the universe from {a,b,c} to {a,b,c,d} may reassign a lane ONLY
+    # to the new shard 'd' — a lane never migrates between the pre-existing shards.
+    names = [f"OB_{i:02d}" for i in range(20)]
+    before = {d: owner_shard_of_destination(d, ["a", "b", "c"]) for d in names}
+    after = {d: owner_shard_of_destination(d, ["a", "b", "c", "d"]) for d in names}
+    moved = {d for d in names if after[d] != before[d]}
+    assert all(after[d] == "d" for d in moved)
+    assert (
+        moved
+    )  # sanity: with 20 lanes, ~1/4 should move to 'd' (zero would make the test vacuous)
+
+
+# --- shard identity on the filtered registry (ADR 0073) ----------------------
+
+
+def test_filter_attaches_shard_identity_on_multi_shard_config() -> None:
+    reg = _registry()  # shards a, b + untagged default -> 3 distinct ids
+    a = filter_registry_for_shard(reg, "a")
+    assert a.shard_id == "a"
+    # The pinned universe is ALL ids from the UNFILTERED config, sorted, as a tuple.
+    assert a.all_shard_ids == ("a", "b", DEFAULT_SHARD)
+    assert filter_registry_for_shard(reg, "b").shard_id == "b"
+
+
+def test_filter_attaches_identity_even_for_shard_with_no_inbounds() -> None:
+    # A shard id matching no inbound still gets the identity: an empty-intake shard can still own
+    # outbound lanes (recovery + delivery gates need shard_id + the full universe regardless).
+    reg = _registry()
+    ghost = filter_registry_for_shard(reg, "nope")
+    assert ghost.inbound == {}
+    assert ghost.shard_id == "nope"
+    assert ghost.all_shard_ids == ("a", "b", DEFAULT_SHARD)
+
+
+def test_filter_single_shard_config_attaches_no_identity() -> None:
+    # Single-shard (tagged or untagged) stays byte-identical to plain `serve`: no sharded-mode
+    # behaviors arm, so neither identity field is set.
+    tagged = Registry()
+    tagged.add_inbound(_inb("ib1", 2575, shard="only"))
+    tagged.add_inbound(_inb("ib2", 2576, shard="only"))
+    f = filter_registry_for_shard(tagged, "only")
+    assert f.shard_id is None and f.all_shard_ids is None
+
+    untagged = Registry()
+    untagged.add_inbound(_inb("ib3", 2577))
+    d = filter_registry_for_shard(untagged, DEFAULT_SHARD)
+    assert d.shard_id is None and d.all_shard_ids is None
+
+
+def test_source_registry_identity_defaults_none_and_is_untouched() -> None:
+    reg = _registry()
+    assert reg.shard_id is None and reg.all_shard_ids is None
+    filter_registry_for_shard(reg, "a")
+    assert reg.shard_id is None and reg.all_shard_ids is None  # filter never mutates the source
+
+
+def test_filter_carries_fhir_lookups_through() -> None:
+    # Regression: filter_registry_for_shard used to DROP fhir_lookups (rebuilt the Registry without
+    # them), silently disarming every shard's FHIR read executor. They must ride along shared by
+    # reference like the SQL lookups.
+    reg = _registry()
+    reg.add_fhir_lookup(FhirLookupSpec(name="clarity_fhir", settings={"url": "https://h/fhir"}))
+    a = filter_registry_for_shard(reg, "a")
+    assert a.fhir_lookups is reg.fhir_lookups
+    assert "clarity_fhir" in a.fhir_lookups

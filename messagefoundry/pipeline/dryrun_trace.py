@@ -27,6 +27,13 @@ site keeps them unchanged).
 * *Locals-diff attribution.* ``sys.settrace`` "line" events fire on line **entry**, so a value assigned
   on line *N* is first observed at the line event for *N+1*; each diff is attributed back to the
   **producing** line *N*.
+* *Passive per-line timing (#84 profiling).* Each line event also carries a ``t`` field — the wall time
+  (``time.perf_counter``) between this line's event and the next (or the return), attributed to the
+  **producing** line just like the locals diff. It is a *passive read*: it never mutates a frame, gates
+  nothing, and cannot change disposition / routed-to / would-send outbounds (byte-identical is
+  preserved). Timings are **not PHI** — they are emitted regardless of ``show_phi`` — but, being
+  ``sys.settrace``-based, they *include the tracer's own overhead*, so they are comparative (hot-line /
+  hot-handler ranking), not absolute wall-clock.
 * *Thread-locality.* ``sys.settrace`` is per-thread. The pure dry-run runs the Router/Handler
   **synchronously on the calling thread**, so the tracer is installed on that same thread; ``trace_ok``
   in the result verifies a non-empty trace was actually captured.
@@ -45,6 +52,7 @@ import inspect
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
+from time import perf_counter
 from types import CodeType, FrameType
 from typing import Any, Iterator
 
@@ -148,6 +156,8 @@ class _Recorder:
         # trace state
         self.frame: FrameType | None = None
         self._last_line: int | None = None
+        # perf_counter of the last line event, to attribute per-line wall time (passive #84 timing)
+        self._last_ts: float | None = None
         self._snap_before: dict[str, Any] = {}
         self._writes_by_line: dict[int, list[dict[str, Any]]] = {}
 
@@ -157,30 +167,40 @@ class _Recorder:
         self.frame = frame
         self._snap_before = _safe_snapshot(frame)
         self._last_line = None
+        self._last_ts = None
+
+    def _elapsed(self, now_ts: float) -> float:
+        """Wall time attributed to the just-finished line (this event minus the previous one). The
+        first line of a frame has no predecessor, so it is 0.0 rather than a bogus large delta."""
+        return now_ts - self._last_ts if self._last_ts is not None else 0.0
 
     def on_line(self, frame: FrameType) -> None:
+        now_ts = perf_counter()
         current = frame.f_lineno
         if self._last_line is not None:
-            self._finalize(frame, self._last_line)
+            self._finalize(frame, self._last_line, self._elapsed(now_ts))
         self._last_line = current
+        self._last_ts = now_ts
 
     def on_return(self, frame: FrameType) -> None:
+        now_ts = perf_counter()
         if self._last_line is not None:
-            self._finalize(frame, self._last_line)
+            self._finalize(frame, self._last_line, self._elapsed(now_ts))
             self._last_line = None
 
     # on an exception propagating out of the frame, the last executed line's effect is still worth
     # attributing; a trailing return event then finds _last_line cleared (no double emit).
     on_exception = on_return
 
-    def _finalize(self, frame: FrameType, line: int) -> None:
+    def _finalize(self, frame: FrameType, line: int, elapsed: float) -> None:
         if len(self.events) >= _MAX_EVENTS:
             self.truncated = True
             return
         now = _safe_snapshot(frame)
         assigned = _diff(now, self._snap_before, self.show_phi)
         self._snap_before = now
-        event: dict[str, Any] = {"line": line, "event": "line", "assigned": assigned}
+        # ``t`` (seconds on this line) is a passive, non-PHI timing read — always emitted (#84).
+        event: dict[str, Any] = {"line": line, "event": "line", "assigned": assigned, "t": elapsed}
         writes = self._writes_by_line.pop(line, None)
         if writes:
             event["writes"] = writes

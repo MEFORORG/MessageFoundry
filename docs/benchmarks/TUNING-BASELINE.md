@@ -90,8 +90,21 @@ Tuning that materially affects throughput. Full reference: [`../CONFIGURATION.md
 | Backend | Recommended | Why |
 |---|---|---|
 | **SQLite** | `synchronous=NORMAL`, WAL (default) | The single-writer fsync is the wall; `NORMAL`+WAL is the safe throughput sweet spot for a single node. |
-| **PostgreSQL** | `[store].pool_size ≥ 3` (≥ 2 required in cluster mode); server on a low-latency link | Each stage handoff is a committed round-trip; a pool of 1 serializes the background workers against intake. |
-| **SQL Server** | `[store].pool_size ≥ 3`; **RCSI on** (auto-enabled at open); a real `command_timeout` | RCSI removes reader/writer blocking on the finalizer; the pool feeds the per-stage workers concurrently. |
+| **PostgreSQL** | `[store].pool_size` — **leave the shipped default (40)**, do not raise it standalone (see the inverted-U note below); ≥ 2 required in cluster mode; server on a low-latency link | Each stage handoff is a committed round-trip; the default 40 feeds the per-stage workers concurrently at the measured optimum without the over-provisioning cliff ([ADR 0062](../adr/0062-default-store-pool-size.md)). |
+| **SQL Server** | `[store].pool_size` — **leave the shipped default (40)**, do not raise it standalone (see the inverted-U note below); **RCSI on** (auto-enabled at open); a real `command_timeout` | RCSI removes reader/writer blocking on the finalizer; the default 40 feeds the per-stage workers at the measured optimum ([ADR 0062](../adr/0062-default-store-pool-size.md)). |
+
+> **Do not raise `[store].pool_size` to chase connection count.** The server-DB connection pool is an
+> **inverted-U** ([ADR 0062](../adr/0062-default-store-pool-size.md)): it helps up to ~40 per engine, and
+> **over-provisioning is catastrophic** — past ~40 the extra connections thrash one shared SQL instance
+> (WRITELOG serialization + per-message finalizer applocks) and ACK latency explodes 30–90×. **40 is the
+> shipped default and the measured optimum** — a huge pool for many inbound connections is a *sharding*
+> problem, not a pool one. Server-DB backends only (Postgres / SQL Server); the single-node **SQLite**
+> default has no pool and never reads `pool_size`.
+>
+> **Claim mode:** `[pipeline].claim_mode = pooled` is the **shipped default** (#744) — one `StageDispatcher`
+> per stage sharing a handful of pooled claimer tasks, which collapses the per-connection claim storm and
+> holds zero-loss at high fan-out; `per_lane` is the **byte-identical opt-out**
+> ([ADR 0066](../adr/0066-pooled-stage-claimers.md)).
 
 **Cross-cutting:** intake throughput scales with **per-inbound** parallelism and (future) **multi-process**
 deployment, not by relaxing FIFO order — see [`../THROUGHPUT-IMPROVEMENTS.md`](../THROUGHPUT-IMPROVEMENTS.md).

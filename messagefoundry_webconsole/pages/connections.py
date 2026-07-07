@@ -10,16 +10,18 @@ from __future__ import annotations
 
 import base64
 import binascii
-
+from datetime import UTC, datetime
 from typing import Literal
+from urllib.parse import quote
 
-from messagefoundry.api.models import ConnectionRow
+from messagefoundry.api.models import ConnectionEventInfo, ConnectionRow
 
 from .._html import Markup, el, page, rows_table, text
 from ._common import _num, _secs
 
 __all__ = [
     "bulk_control_result",
+    "connection_details",
     "connections_fragment",
     "dashboard",
     "decode_row_key",
@@ -27,6 +29,36 @@ __all__ = [
     "purge_pending",
     "purge_result",
 ]
+
+
+def _ts(value: float) -> str:
+    """A connection-event timestamp as a UTC wall-clock string."""
+    return datetime.fromtimestamp(value, UTC).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def _display_name(name: str) -> str:
+    """Drop the redundant ' ▸ in'/' ▸ out' direction suffix the engine appends to a source/standalone-
+    outbound display name (#1) — the Dir column already shows direction. A destination's 'channel ▸ dest'
+    name has no such suffix and is left intact. The full name stays the row/detail identity."""
+    for suffix in (" ▸ in", " ▸ out"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _name_cell(r: ConnectionRow) -> Markup:
+    """The Connection cell: the name (direction suffix stripped, #1) links to that connection's pre-filled
+    message search (#4b), with a small 'details' link to its detail page (#4a). Both escaped by the
+    builder; the details link keeps the FULL name so the route can look the row up."""
+    return el(
+        "span",
+        el(
+            "a",
+            _display_name(r.name),
+            href=f"/ui/messages?channel_id={quote(r.channel_id)}&defer=1",
+        ),
+        el("a", "details", href=f"/ui/connection/{quote(r.name)}", class_="detail-link"),
+    )
 
 
 def _b64url(value: str) -> str:
@@ -138,7 +170,7 @@ def connections_fragment(rows: list[ConnectionRow]) -> Markup:
     body = [
         [
             _selection_checkbox(r),
-            r.name,
+            _name_cell(r),
             r.direction,
             el("span", r.status, class_=f"status status-{r.status}"),
             _num(r.read),
@@ -172,6 +204,22 @@ def _controls_toolbar() -> Markup:
     )
 
 
+def _filter_box() -> Markup:
+    """A filter-as-you-type box over the connections table (client-side, ``app.js``). It lives OUTSIDE the
+    ``[data-poll]`` container so its typed value survives the live swap; ``app.js`` hides rows whose text
+    doesn't match and re-applies the filter after each poll/ws swap. Purely presentational — the server
+    still sends every row, and a hidden row's checkbox value stays in the selection (filter is view-only)."""
+    return el(
+        "input",
+        type="search",
+        placeholder="Filter connections…",
+        data_mf_conns_filter=True,
+        class_="filterbox",
+        autocomplete="off",
+        aria_label="Filter connections",
+    )
+
+
 def dashboard(rows: list[ConnectionRow]) -> Markup:
     """The connections dashboard page; the table auto-refreshes via the first-party poll script.
 
@@ -179,7 +227,8 @@ def dashboard(rows: list[ConnectionRow]) -> Markup:
     and replaces this container's content with the server-rendered, already-escaped fragment. The
     ``#livestats`` strip is filled live by ``app.js`` over the ``/ws/stats`` WebSocket (M-ws); it
     degrades to empty (the polled table still updates) if the socket can't connect. The bulk-action
-    ``[data-mf-conns-toolbar]`` is a sibling OUTSIDE ``[data-poll]`` so a swap never wipes it.
+    ``[data-mf-conns-toolbar]`` and the ``[data-mf-conns-filter]`` box are siblings OUTSIDE ``[data-poll]``
+    so a swap never wipes them.
     """
     live = el(
         "div",
@@ -191,11 +240,71 @@ def dashboard(rows: list[ConnectionRow]) -> Markup:
     return page(
         "Connections",
         el("h1", "Connections"),
-        _controls_toolbar(),
+        # Toolbar (bulk actions) + the filter box on one horizontal row.
+        el("div", _controls_toolbar(), _filter_box(), class_="ctlrow"),
         livestats,
         live,
         active="dashboard",
     )
+
+
+def connection_details(row: ConnectionRow, events: list[ConnectionEventInfo]) -> Markup:
+    """Read-only detail view for one connection (#4a): transport/status, live stats, and recent
+    connection/transport events — all metadata (no PHI), composed from existing monitoring handlers."""
+    peer = row.peer or "—"
+    if row.port:
+        peer = f"{peer}:{row.port}"
+    info = rows_table(
+        ["Field", "Value"],
+        [
+            ["Role", row.role],
+            ["Direction", row.direction],
+            ["Method", row.method],
+            ["Peer", peer],
+            ["Channel", row.channel_id],
+            ["Status", el("span", row.status, class_=f"status status-{row.status}")],
+        ],
+    )
+    stats = rows_table(
+        ["Metric", "Value"],
+        [
+            ["In", _num(row.read)],
+            ["Out", _num(row.written)],
+            ["Queued", _num(row.queue_depth)],
+            ["Errors", _num(row.errored)],
+            ["Alerts", _num(row.alerts_active)],
+            ["Idle", _secs(row.idle_seconds)],
+        ],
+    )
+    if events:
+        events_tbl: Markup = rows_table(
+            ["When", "Kind", "Dir", "Peer", "Reason"],
+            [[_ts(e.ts), e.kind, e.direction, e.peer_host or "—", e.reason or "—"] for e in events],
+        )
+    else:
+        events_tbl = el("p", "No recent events.", class_="muted")
+    body = el(
+        "div",
+        el("h1", _display_name(row.name)),
+        el(
+            "p",
+            el(
+                "a",
+                "View messages →",
+                href=f"/ui/messages?channel_id={quote(row.channel_id)}&defer=1",
+            ),
+            class_="muted",
+        ),
+        el("h2", "Connection"),
+        info,
+        el("h2", "Statistics"),
+        stats,
+        el("h2", "Recent events"),
+        events_tbl,
+        el("p", el("a", "← Connections", href="/ui")),
+        class_="card",
+    )
+    return page(f"{_display_name(row.name)} — details", body, active="dashboard")
 
 
 # --- bulk-action result / confirm pages (connection controls) --------------------
