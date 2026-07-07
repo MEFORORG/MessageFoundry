@@ -469,7 +469,7 @@ async def _token(engine: Engine, service: AuthService, user: str) -> tuple[objec
 
 
 async def test_ws_cookie_auth_same_origin_ok(engine: Engine) -> None:
-    from messagefoundry.api.webui import authorize_ui_ws
+    from messagefoundry_webconsole import authorize_ui_ws
     from messagefoundry.auth import Permission
 
     service = await _service(engine)
@@ -482,7 +482,7 @@ async def test_ws_cookie_auth_same_origin_ok(engine: Engine) -> None:
 
 async def test_ws_cookie_auth_rejects_cross_origin(engine: Engine) -> None:
     # CSWSH gate: a cross-origin handshake is rejected even with a valid cookie value.
-    from messagefoundry.api.webui import authorize_ui_ws
+    from messagefoundry_webconsole import authorize_ui_ws
     from messagefoundry.auth import Permission
 
     service = await _service(engine)
@@ -494,7 +494,7 @@ async def test_ws_cookie_auth_rejects_cross_origin(engine: Engine) -> None:
 
 
 async def test_ws_cookie_auth_requires_cookie_and_origin(engine: Engine) -> None:
-    from messagefoundry.api.webui import authorize_ui_ws
+    from messagefoundry_webconsole import authorize_ui_ws
     from messagefoundry.auth import Permission
 
     service = await _service(engine)
@@ -549,7 +549,7 @@ async def test_parse_tree_requires_view_raw(engine: Engine) -> None:
 
 
 def test_is_safe_ui_action_per_destination() -> None:
-    from messagefoundry.api.webui import is_safe_ui_action
+    from messagefoundry_webconsole import is_safe_ui_action
 
     assert is_safe_ui_action("/ui/dead-letters/CH/OB_DEST/replay")
     assert is_safe_ui_action("/ui/dead-letters/CH/replay")
@@ -652,7 +652,7 @@ async def test_csrf_honors_public_origin(engine: Engine) -> None:
 
 
 async def test_ws_cookie_auth_honors_public_origin(engine: Engine) -> None:
-    from messagefoundry.api.webui import authorize_ui_ws
+    from messagefoundry_webconsole import authorize_ui_ws
     from messagefoundry.auth import Permission
 
     service = await _service(engine)
@@ -675,7 +675,7 @@ def test_public_origin_matching_is_case_insensitive() -> None:
     # Scheme + host are case-insensitive (RFC 3986 §3.2.2): the validator lowercases the configured
     # origin, and _origin_matches canonicalizes the incoming Origin — so a case variant is not a false
     # reject (and can never be a bypass; it fails closed).
-    from messagefoundry.api.webui._auth import _origin_matches
+    from messagefoundry_webconsole._auth import _origin_matches
     from messagefoundry.config.settings import ApiSettings
 
     assert (
@@ -749,7 +749,7 @@ def test_alerts_builder_escapes_hostile() -> None:
         AlertInstanceList,
         AlertsConfig,
     )
-    from messagefoundry.api.webui.pages import alerts
+    from messagefoundry_webconsole.pages import alerts
 
     instances = AlertInstanceList(
         alerts=[
@@ -785,7 +785,7 @@ def test_alerts_builder_escapes_hostile() -> None:
 
 def test_events_builder_escapes_hostile() -> None:
     from messagefoundry.api.models import ConnectionEventInfo
-    from messagefoundry.api.webui.pages import events
+    from messagefoundry_webconsole.pages import events
 
     rows = [
         ConnectionEventInfo(
@@ -842,7 +842,7 @@ def test_status_builder_escapes_and_formats() -> None:
         SecurityPosture,
         SystemStatus,
     )
-    from messagefoundry.api.webui.pages import status
+    from messagefoundry_webconsole.pages import status
 
     sys_status = SystemStatus(
         engine=EngineInfo(
@@ -914,8 +914,8 @@ def test_register_ui_action_extends_the_stepup_allowlist() -> None:
     # A write-page lane extends the auto-retry allow-list by REGISTERING its action — never by editing
     # is_safe_ui_action. The migrated replay actions still resolve (behavior-preserving); a freshly
     # registered action becomes auto-retryable; the ".." reject still holds; registration is idempotent.
-    from messagefoundry.api.webui import is_safe_ui_action, register_ui_action
-    from messagefoundry.api.webui._auth import _UI_WRITE_ACTIONS
+    from messagefoundry_webconsole import is_safe_ui_action, register_ui_action
+    from messagefoundry_webconsole._auth import _UI_WRITE_ACTIONS
     from messagefoundry.auth import Permission
 
     # Migrated phase-0 replay actions are still allowed.
@@ -999,7 +999,7 @@ def test_alerts_builder_renders_write_controls() -> None:
         AlertInstanceList,
         AlertsConfig,
     )
-    from messagefoundry.api.webui.pages import alerts
+    from messagefoundry_webconsole.pages import alerts
 
     instances = AlertInstanceList(
         alerts=[
@@ -1082,7 +1082,7 @@ async def test_purge_after_login_stepup_reaches_handler(engine: Engine) -> None:
 async def test_purge_action_registered_in_stepup_allowlist(engine: Engine) -> None:
     # Creating the /ui app registers the purge action, so the re-auth flow may auto-retry it (path-based,
     # body-less). A non-purge or query-bearing path is not accepted.
-    from messagefoundry.api.webui import is_safe_ui_action
+    from messagefoundry_webconsole import is_safe_ui_action
 
     service = await _service(engine)
     create_app(engine, auth=service, serve_ui=True)
@@ -1094,8 +1094,8 @@ async def test_purge_action_registered_in_stepup_allowlist(engine: Engine) -> No
 
 def test_connections_fragment_renders_selection_checkbox() -> None:
     from messagefoundry.api.models import ConnectionRow
-    from messagefoundry.api.webui.pages import connections_fragment
-    from messagefoundry.api.webui.pages.connections import _row_key
+    from messagefoundry_webconsole.pages import connections_fragment
+    from messagefoundry_webconsole.pages.connections import _row_key
 
     dest = ConnectionRow(
         role="destination",
@@ -1131,7 +1131,7 @@ def test_connections_fragment_renders_selection_checkbox() -> None:
 
 def test_connections_fragment_failed_but_paused_row_is_purge_eligible() -> None:
     from messagefoundry.api.models import ConnectionRow
-    from messagefoundry.api.webui.pages import connections_fragment
+    from messagefoundry_webconsole.pages import connections_fragment
 
     # A destination whose lane FAILED to build (collapsed status "failed") but is ALSO operator-paused-
     # AND-quiesced: the checkbox still carries data-paused="1", so the toolbar keeps it purge-eligible.
@@ -1207,7 +1207,7 @@ async def test_config_reload_rejects_cross_site(engine: Engine) -> None:
 
 
 async def test_config_reload_registered_in_stepup_allowlist(engine: Engine) -> None:
-    from messagefoundry.api.webui import is_safe_ui_action
+    from messagefoundry_webconsole import is_safe_ui_action
 
     service = await _service(engine)
     create_app(engine, auth=service, serve_ui=True)
@@ -1222,7 +1222,7 @@ async def test_write_action_method_matches_its_continuation(engine: Engine) -> N
     #     side-effecting GET (CSRF / idempotency).
     #   * an ``unlock`` action is a GET admin form page the re-auth 303-GET-redirects to — it must never
     #     be a POST (a GET-redirect to a state-changing POST would be an open-POST gadget).
-    from messagefoundry.api.webui._auth import _UI_WRITE_ACTIONS
+    from messagefoundry_webconsole._auth import _UI_WRITE_ACTIONS
 
     service = await _service(engine)
     app = create_app(engine, auth=service, serve_ui=True)
@@ -1260,7 +1260,7 @@ _UNLOCK_PAT = r"^/ui/testunlock/[^/?#]+$"  # a synthetic unlock form path, names
 def test_is_unlock_action_gate() -> None:
     # is_unlock_action is the GET-form analogue of is_safe_ui_action: it matches ONLY registered
     # ``unlock`` entries, is ``..``-guarded, and is disjoint from the auto-retry (POST) allow-list.
-    from messagefoundry.api.webui import (
+    from messagefoundry_webconsole import (
         is_safe_ui_action,
         is_unlock_action,
         register_ui_action,
@@ -1284,8 +1284,8 @@ def test_register_ui_action_rejects_auto_retry_and_unlock() -> None:
     # continuation branches on exactly these flags, so an action that is both is a mis-registration.
     import re
 
-    from messagefoundry.api.webui import register_ui_action
-    from messagefoundry.api.webui._auth import UiWriteAction
+    from messagefoundry_webconsole import register_ui_action
+    from messagefoundry_webconsole._auth import UiWriteAction
     from messagefoundry.auth import Permission
 
     with pytest.raises(ValueError):
@@ -1296,7 +1296,7 @@ def test_register_ui_action_rejects_auto_retry_and_unlock() -> None:
 
 async def test_reauth_form_renders_for_unlock_next(engine: Engine) -> None:
     # The re-auth form accepts an ``unlock`` next (a GET admin form), exactly as it accepts a replay next.
-    from messagefoundry.api.webui import register_ui_action
+    from messagefoundry_webconsole import register_ui_action
     from messagefoundry.auth import Permission
 
     register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
@@ -1313,7 +1313,7 @@ async def test_reauth_form_renders_for_unlock_next(engine: Engine) -> None:
 async def test_reauth_get_unlock_redirects_after_stepup(engine: Engine) -> None:
     # THE primitive: a successful step-up whose next is an ``unlock`` form 303-GET-redirects BACK to the
     # form (so it re-opens fresh) — it does NOT render the POST auto-submit page. No body is carried.
-    from messagefoundry.api.webui import register_ui_action
+    from messagefoundry_webconsole import register_ui_action
     from messagefoundry.auth import Permission
 
     register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
@@ -1352,7 +1352,7 @@ async def test_reauth_post_rejects_unregistered_next(engine: Engine) -> None:
 async def test_reauth_failed_stepup_rerenders_form_not_redirect(engine: Engine) -> None:
     # A WRONG password on an unlock next must re-render the reauth form (with the hidden next), never
     # 303 to the unlock target — the GET-redirect happens only after a successful re-verification.
-    from messagefoundry.api.webui import register_ui_action
+    from messagefoundry_webconsole import register_ui_action
     from messagefoundry.auth import Permission
 
     register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
@@ -1452,7 +1452,7 @@ async def test_users_page_lists_accounts(engine: Engine) -> None:
 async def test_l4a_actions_registered_in_correct_allowlists(engine: Engine) -> None:
     # Form pages are unlock targets; body-less path actions are auto-retry; body-carrying POST paths
     # are in NEITHER list (they can only be reached by a fresh same-origin form submit).
-    from messagefoundry.api.webui import is_safe_ui_action, is_unlock_action
+    from messagefoundry_webconsole import is_safe_ui_action, is_unlock_action
 
     service = await _service(engine)
     create_app(engine, auth=service, serve_ui=True)
@@ -2234,7 +2234,7 @@ async def test_mfa_verify_wrong_code_and_no_enrollment(engine: Engine) -> None:
 async def test_mfa_confirm_form_is_unlock_reentry(engine: Engine) -> None:
     # The standalone GET confirm form never re-shows the secret, and the L4b actions sit in the
     # right continuation registries (password POST in NEITHER).
-    from messagefoundry.api.webui import is_safe_ui_action, is_unlock_action
+    from messagefoundry_webconsole import is_safe_ui_action, is_unlock_action
 
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
@@ -2600,7 +2600,7 @@ async def test_search_requires_messages_read(engine: Engine) -> None:
 
 
 async def test_search_registered_as_unlock_action(engine: Engine) -> None:
-    from messagefoundry.api.webui import is_safe_ui_action, is_unlock_action
+    from messagefoundry_webconsole import is_safe_ui_action, is_unlock_action
 
     service = await _service(engine)
     create_app(engine, auth=service, serve_ui=True)
@@ -3508,7 +3508,7 @@ async def test_dead_letters_shows_replay_all_button(engine: Engine) -> None:
 
 
 async def test_replay_all_dead_letters_registered_and_gated(engine: Engine) -> None:
-    from messagefoundry.api.webui import is_safe_ui_action
+    from messagefoundry_webconsole import is_safe_ui_action
 
     # The new action is in the auto-retry allow-list (so a stale step-up can continue it).
     assert is_safe_ui_action("/ui/dead-letters/replay-all")
@@ -3528,7 +3528,7 @@ async def test_replay_all_dead_letters_registered_and_gated(engine: Engine) -> N
 
 
 def test_events_filter_renders_kind_dropdown() -> None:
-    from messagefoundry.api.webui.pages import events
+    from messagefoundry_webconsole.pages import events
 
     html = str(events([], connection="", kind="peer_reset"))
     assert 'name="kind"' in html
@@ -3586,7 +3586,7 @@ def _status_html(sys_status: object) -> str:
         SecurityPosture,
         ServiceStatusInfo,
     )
-    from messagefoundry.api.webui.pages import status
+    from messagefoundry_webconsole.pages import status
 
     posture = SecurityPosture(
         backend="sqlite",
@@ -3660,7 +3660,7 @@ def _conn_row(
 
 
 def test_connections_fragment_has_no_per_row_control_forms() -> None:
-    from messagefoundry.api.webui.pages import connections_fragment
+    from messagefoundry_webconsole.pages import connections_fragment
 
     html = str(
         connections_fragment(
@@ -3683,7 +3683,7 @@ def test_connections_fragment_has_no_per_row_control_forms() -> None:
 
 
 def test_dashboard_renders_bulk_toolbar_outside_conns_fragment() -> None:
-    from messagefoundry.api.webui.pages import connections_fragment, dashboard
+    from messagefoundry_webconsole.pages import connections_fragment, dashboard
 
     rows = [_conn_row("source", "IB_ACME_ADT")]
     page_html = str(dashboard(rows))
@@ -4043,7 +4043,7 @@ async def test_reset_many_requires_diagnose(engine: Engine) -> None:
 
 
 async def test_purge_confirm_registered_as_unlock(engine: Engine) -> None:
-    from messagefoundry.api.webui import is_safe_ui_action, is_unlock_action
+    from messagefoundry_webconsole import is_safe_ui_action, is_unlock_action
 
     service = await _service(engine)
     create_app(engine, auth=service, serve_ui=True)

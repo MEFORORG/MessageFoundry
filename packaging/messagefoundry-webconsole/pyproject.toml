@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Second distribution: the MessageFoundry WEB CONSOLE (ADR 0065, Option B). Published alongside the
+# engine but SEPARATELY VERSIONED — its OWN version root, tag, changelog, and PyPI cadence (the key
+# departure from messagefoundry-harness, which is deliberately lockstep). The import package
+# messagefoundry_webconsole/ lives at the REPO ROOT (so `from messagefoundry_webconsole import ...`
+# works from a checkout); this build pulls it into the wheel via force-include. The ENGINE wheel does
+# NOT contain messagefoundry_webconsole/ — the console is an optional [webconsole] extra, and a
+# JSON-only (serve_ui-off) install stays byte-identical.
+
+[tool.hatch.version]
+path = "../../messagefoundry_webconsole/__init__.py"  # independent: the console's OWN __version__
+
+[project]
+name = "messagefoundry-webconsole"
+dynamic = ["version"]
+description = "Web ops console for MessageFoundry — the same-origin browser dashboard mounted onto the engine (ADR 0065)"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "MessageFoundry Organization and contributors" }]
+keywords = ["hl7", "healthcare", "integration", "web-console", "dashboard", "fastapi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: System Administrators",
+    "Topic :: Communications",
+    "Topic :: Internet :: WWW/HTTP :: WSGI :: Application",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Web Environment",
+]
+dependencies = [
+    # The engine: the console mounts onto its FastAPI app and reuses its JSON handlers, DTOs, security
+    # deps, and the pure parsing lib. A PEP 508 compat RANGE is ideal (messagefoundry>=X,<Y); a bare
+    # dep is fine for now — the ENGINE_UI_SEAM handshake (assert_engine_seam) is the runtime backstop.
+    "messagefoundry",
+]
+
+[project.optional-dependencies]
+# The ASGI end-to-end tests drive create_app(serve_ui=True) via the async test client — they need the
+# engine's dev/test stack (httpx, pytest-asyncio, ...), mirroring how the harness pulls [console].
+dev = ["messagefoundry[dev]"]
+
+[project.urls]
+Homepage = "https://messagefoundry.org/"
+Source = "https://github.com/MEFORORG/MessageFoundry"
+Issues = "https://github.com/MEFORORG/MessageFoundry/issues"
+
+[tool.hatch.build.targets.wheel]
+# The import package is two levels up (the repo root); pull the whole tree into the wheel. The static
+# assets (app.js/app.css) ride along as ordinary package data — no force-include double-add.
+force-include = { "../../messagefoundry_webconsole" = "messagefoundry_webconsole" }
+
+[tool.pytest.ini_options]
+# REVIEW FIX (high): asyncio_mode="auto" is MANDATORY — the relocated ASGI/security tests are bare
+# `async def test_*` with no @pytest.mark.asyncio marker, so without it they would silently NOT RUN
+# behind a green board. The two session loop-scope keys match the engine's config; the timeout addopts
+# make a hung ASGI test fail fast rather than wedge the leg.
+asyncio_mode = "auto"
+asyncio_default_test_loop_scope = "session"
+asyncio_default_fixture_loop_scope = "session"
+addopts = "--timeout=60 --timeout-method=thread"

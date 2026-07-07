@@ -114,12 +114,23 @@
   },
   "MEFOR database lookup": {
     "prefix": "mefordblookup",
+    "context": "handler",
     "body": [
       "rows = db_lookup(\"${1:connection}\", \"SELECT ${2:name} FROM ${3:patients} WHERE ${4:mrn} = :${4:mrn}\", {\"${4:mrn}\": msg[\"${5:PID-3.1}\"]})",
       "if rows:",
       "\t${6:value} = rows[0][\"${2:name}\"]"
     ],
     "description": "Lookup · Live read-only DB lookup (Handler only)"
+  },
+  "MEFOR FHIR lookup": {
+    "prefix": "meforfhirlookup",
+    "context": "handler",
+    "body": [
+      "${1:bundle} = fhir_lookup(\"${2:connection}\", \"${3:Patient}?identifier=MRN|\" + (msg[\"${4:PID-3.1}\"] or \"\"))",
+      "if ${1:bundle}.get(\"entry\"):",
+      "\t${5:resource} = ${1:bundle}[\"entry\"][0][\"resource\"]"
+    ],
+    "description": "Lookup · Live read-only FHIR lookup (Handler only)"
   },
   "MEFOR convert a timestamp": {
     "prefix": "mefordate",
@@ -128,18 +139,164 @@
     ],
     "description": "Date · Convert / re-timezone an HL7 timestamp"
   },
+  "MEFOR stamp the current time (outbound only)": {
+    "prefix": "meforstamp",
+    "body": [
+      "# hl7_now() reads the wall clock -- keep it OUT of routing/transform decisions (it would break",
+      "# at-least-once re-run purity); only use it to stamp a freshly built OUTBOUND message.",
+      "msg[\"${1:OBR-7}\"] = hl7_now()"
+    ],
+    "description": "Date · Stamp the current time on an outbound message (hl7_now)"
+  },
+  "MEFOR compute length of stay": {
+    "prefix": "meforlos",
+    "body": [
+      "${1:stay} = msg.length_of_stay()  # PV1-44/PV1-45 by default; None if not yet discharged",
+      "if ${1:stay} is not None:",
+      "\t${2:days} = ${1:stay}.days"
+    ],
+    "description": "Date · Compute the encounter length of stay"
+  },
+  "MEFOR default a field to the ingest time": {
+    "prefix": "meforingesttime",
+    "body": [
+      "import datetime",
+      "${1:ts} = current_ingest_time()  # re-run-stable (persisted enqueue time); None outside a run",
+      "if ${1:ts} is not None and not msg[\"${2:OBR-7}\"]:",
+      "\tmsg[\"${2:OBR-7}\"] = datetime.datetime.fromtimestamp(${1:ts}).strftime(\"%Y%m%d%H%M%S\")"
+    ],
+    "description": "Date · Default an empty timestamp field to the message's re-run-stable ingest time"
+  },
+  "MEFOR uppercase a field": {
+    "prefix": "meforupper",
+    "body": [
+      "msg[\"${1:PID-5.1}\"] = (msg[\"${1:PID-5.1}\"] or \"\").upper()"
+    ],
+    "description": "Format · Uppercase a field"
+  },
+  "MEFOR lowercase a field": {
+    "prefix": "meforlower",
+    "body": [
+      "msg[\"${1:PID-5.1}\"] = (msg[\"${1:PID-5.1}\"] or \"\").lower()"
+    ],
+    "description": "Format · Lowercase a field"
+  },
+  "MEFOR trim a field": {
+    "prefix": "meforstrip",
+    "body": [
+      "msg[\"${1:PID-5.1}\"] = (msg[\"${1:PID-5.1}\"] or \"\").strip()"
+    ],
+    "description": "Format · Trim whitespace from a field"
+  },
+  "MEFOR substring a field": {
+    "prefix": "meforsubstr",
+    "body": [
+      "${1:value} = (msg[\"${2:PID-5.1}\"] or \"\")[${3:0}:${4:10}]"
+    ],
+    "description": "Format · Substring a field"
+  },
+  "MEFOR pad a field": {
+    "prefix": "meforpad",
+    "body": [
+      "msg[\"${1:PID-3.1}\"] = (msg[\"${1:PID-3.1}\"] or \"\").rjust(${2:10}, \"${3:0}\")"
+    ],
+    "description": "Format · Pad a field to a fixed width"
+  },
+  "MEFOR regex replace in a field": {
+    "prefix": "meforregex",
+    "body": [
+      "import re",
+      "msg[\"${1:PID-5.1}\"] = re.sub(r\"${2:pattern}\", \"${3:replacement}\", msg[\"${1:PID-5.1}\"] or \"\")"
+    ],
+    "description": "Transform · Regex replace in a field"
+  },
+  "MEFOR numeric compute on a field": {
+    "prefix": "meforcalc",
+    "body": [
+      "${1:value} = float(msg[\"${2:OBX-5}\"] or 0) * ${3:2.20462}  # e.g. kg -> lb",
+      "msg[\"${2:OBX-5}\"] = f\"{${1:value}:.2f}\""
+    ],
+    "description": "Transform · Numeric compute on a field"
+  },
+  "MEFOR decide with match/case": {
+    "prefix": "meformatch",
+    "body": [
+      "match msg[\"${1:MSH-9.1}\"]:",
+      "\tcase \"${2:ADT}\":",
+      "\t\t${3:pass}",
+      "\tcase \"${4:ORU}\":",
+      "\t\t${5:pass}",
+      "\tcase _:",
+      "\t\t${6:pass}"
+    ],
+    "description": "Decision · Branch with match/case on a field value"
+  },
+  "MEFOR clear a field": {
+    "prefix": "meforclear",
+    "body": [
+      "msg[\"${1:PID-5.2}\"] = \"\""
+    ],
+    "description": "Field · Clear a field"
+  },
+  "MEFOR parse a JSON body": {
+    "prefix": "meforjson",
+    "body": [
+      "${1:data} = msg.json()  # non-HL7 inbound only (content_type != hl7v2)",
+      "${2:value} = ${1:data}[\"${3:key}\"]"
+    ],
+    "description": "Raw · Parse a non-HL7 JSON body"
+  },
+  "MEFOR read a raw text body": {
+    "prefix": "meforrawtext",
+    "body": [
+      "${1:value} = msg.text  # non-HL7 inbound body verbatim (RawMessage.text)"
+    ],
+    "description": "Raw · Read a non-HL7 body as text"
+  },
   "MEFOR send to an outbound": {
     "prefix": "meforsend",
+    "context": "handler",
     "body": [
       "return Send(\"${1:outbound_name}\", msg)"
     ],
     "description": "Send · Return a Send to one outbound"
   },
+  "MEFOR fan out to multiple outbounds": {
+    "prefix": "meforfanout",
+    "context": "handler",
+    "body": [
+      "return [Send(\"${1:outbound_a}\", msg), Send(\"${2:outbound_b}\", msg)]"
+    ],
+    "description": "Send · Fan out to two or more outbounds"
+  },
   "MEFOR split a batch and send each": {
     "prefix": "meforsplit",
+    "context": "handler",
     "body": [
       "return [Send(\"${1:outbound_name}\", part) for part in split_by_obr(msg)]"
     ],
     "description": "Send · Split a batch by OBR and send each"
+  },
+  "MEFOR route by message type": {
+    "prefix": "meforroutetype",
+    "context": "router",
+    "body": [
+      "match msg[\"${1:MSH-9.1}\"]:",
+      "\tcase \"${2:ADT}\":",
+      "\t\treturn [\"${3:adt_handler}\"]",
+      "\tcase \"${4:ORU}\":",
+      "\t\treturn [\"${5:oru_handler}\"]",
+      "\tcase _:",
+      "\t\treturn []  # routed nowhere -> UNROUTED"
+    ],
+    "description": "Router · Route by message type (match/case)"
+  },
+  "MEFOR route to multiple handlers": {
+    "prefix": "meforroutemulti",
+    "context": "router",
+    "body": [
+      "return [\"${1:handler_a}\", \"${2:handler_b}\"]  # fan out to more than one handler"
+    ],
+    "description": "Router · Route to multiple handlers"
   }
 }

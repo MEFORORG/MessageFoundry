@@ -89,6 +89,11 @@ class ConfigCodeLensProvider implements vscode.CodeLensProvider {
           tooltip: "Validate the config",
           command: "messagefoundry.validate",
         }),
+        new vscode.CodeLens(range, {
+          title: "$(symbol-snippet) Insert Element",
+          tooltip: "Insert a MessageFoundry idiom (field/lookup/date/send/…) as editable Python here",
+          command: "messagefoundry.insertElement",
+        }),
       );
     }
     return lenses;

@@ -166,6 +166,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="include full message bodies (raw + payloads) — PHI; redacted by default",
     )
+    dryrun.add_argument(
+        "--trace",
+        nargs="?",
+        const="json",
+        default=None,
+        choices=["json"],
+        help="emit a line-addressable sys.settrace execution trace of the Router/Handler run as JSON "
+        "(ADR 0072; preview-only + additive — no dispatch change). Feeds the #92 live-debug loop and "
+        "#84 profiling/coverage. Assigned locals and msg writes are PHI: REDACTED unless --show-phi. "
+        "`--trace` is equivalent to `--trace json`.",
+    )
 
     check = sub.add_parser(
         "check", help="run validate + dryrun (+ advisory ruff/mypy) as a commit/CI gate"
@@ -982,6 +993,21 @@ def _serve(args: argparse.Namespace) -> int:
             )
             return 2
 
+    # The browser ops console ([api].serve_ui, ADR 0065) is a SEPARATE optional wheel
+    # (messagefoundry-webconsole) mounted same-origin in-process. Refuse serve_ui when it is absent with
+    # a clean, actionable message BEFORE the exposure gates below (mirrors the sqlserver find_spec
+    # precedent) — the guarded mount_ui import in create_app would otherwise RuntimeError deeper in.
+    if settings.api.serve_ui:
+        import importlib.util
+
+        if importlib.util.find_spec("messagefoundry_webconsole") is None:
+            print(
+                "error: [api].serve_ui needs the web console package 'messagefoundry-webconsole', "
+                "which is not installed; install it and retry (or unset [api].serve_ui)",
+                file=sys.stderr,
+            )
+            return 2
+
     # The browser ops dashboard ([api].serve_ui, ADR 0065) is a STRICTER surface than the JSON API: it
     # puts an HttpOnly session cookie and PHI-rendering HTML on the wire. An off-loopback /ui bind
     # therefore REQUIRES exposure_protected (in-process TLS or a declared upstream terminator) and is
@@ -1478,6 +1504,22 @@ def _dryrun(args: argparse.Namespace) -> int:
             "note: message bodies redacted; pass --show-phi to include raw/payloads (PHI)",
             file=sys.stderr,
         )
+
+    # Traced dry-run (ADR 0072): a sys.settrace execution trace of each Router/Handler, byte-identical
+    # in disposition/routing to a plain dryrun. Preview-only and additive — no dispatch change. Assigned
+    # locals + msg writes are PHI, so they honor the same --show-phi gate.
+    if args.trace is not None:
+        from messagefoundry.pipeline.dryrun_trace import trace_dry_run
+
+        traced: list[dict[str, Any]] = []
+        try:
+            for source, path, raw in messages:
+                entry = trace_dry_run(reg, raw, inbound=args.inbound, show_phi=show_phi)
+                traced.append({"source": source, "path": path, **entry})
+        except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
+            return _emit_error(str(exc), as_json=args.json)
+        _print_json(traced, compact=args.json)
+        return 0
 
     out: list[dict[str, Any]] = []
     try:

@@ -46,7 +46,13 @@ jobs:
     # required `test (…, py3.14)` context stays present + green. (changes never fails, so this needs
     # edge can't wedge the required context.)
     needs: changes
-    runs-on: ${{ fromJSON(matrix.runner) }}
+    # On the PUBLIC mirror (MEFORORG) the self-hosted NucBox runners don't exist — and must NEVER be
+    # exposed to a public repo (a fork PR on a self-hosted runner is RCE on the owner's LAN) — so the
+    # Windows legs run on FREE GitHub-hosted runners there (hosted Actions minutes are free on public,
+    # no 2x Windows billing). The private repo keeps its $0 self-hosted boxes. `matrix.hosted` is the
+    # hosted equivalent (ubuntu is hosted on both). This is the same repo-slug gate codeql.yml/
+    # scorecard.yml already use to run natively on the mirror.
+    runs-on: ${{ (github.repository == 'MEFORORG/MessageFoundry' && fromJSON(matrix.hosted)) || fromJSON(matrix.runner) }}
     # Wall-clock backstop: bound each leg so a hung test fails in minutes, not the 6h default. Three
     # nested watchdogs catch a hang at increasing scope (#55): the pytest-timeout per-test cap (60s,
     # pyproject addopts) + the faulthandler belt fire FIRST and name the stuck frame; the pytest STEP
@@ -59,14 +65,16 @@ jobs:
         include:
           # `runner` is a JSON string consumed by fromJSON (runs-on above) so a Windows leg can target a
           # self-hosted label WITHOUT changing the context NAME (which comes from `os`). Both Server SKUs
-          # now run on self-hosted NucBox runners ($0 minutes); they keep the tuned-for-hosted ubuntu leg
-          # on GitHub. The self-hosted (slower) boxes get a longer job cap / per-test timeout so a
-          # thermal-throttled run isn't a false timeout; the hosted ubuntu leg keeps 15/13/60/90.
+          # run on self-hosted NucBox runners ($0 minutes) ON THE PRIVATE REPO; `hosted` is the GitHub-
+          # hosted equivalent used ON THE MIRROR (runs-on picks it via the repo-slug gate above). They
+          # keep the tuned-for-hosted ubuntu leg on GitHub; the self-hosted (slower) boxes get a longer
+          # job cap / per-test timeout so a thermal-throttled run isn't a false timeout (harmless-but-
+          # generous on the mirror's faster hosted Windows). The hosted ubuntu leg keeps 15/13/60/90.
           #   NB windows-2022 targets its OWN label `mefor-ci-win2022` (a real Server-2022 box — a Hyper-V
           #   guest on a NucBox; it CANNOT share the Server-2025 runners, the OS SKU is what's under test).
-          - { os: ubuntu-latest, python-version: "3.14", runner: '["ubuntu-latest"]', job_timeout: 15, step_timeout: 13, pytest_timeout: 60, fault_timeout: 90 }
-          - { os: windows-2022, python-version: "3.14", runner: '["self-hosted", "windows", "mefor-ci-win2022"]', job_timeout: 30, step_timeout: 26, pytest_timeout: 120, fault_timeout: 150 }
-          - { os: windows-2025, python-version: "3.14", runner: '["self-hosted", "windows", "mefor-ci-win2025"]', job_timeout: 30, step_timeout: 26, pytest_timeout: 120, fault_timeout: 150 }
+          - { os: ubuntu-latest, python-version: "3.14", runner: '["ubuntu-latest"]', hosted: '["ubuntu-latest"]', job_timeout: 15, step_timeout: 13, pytest_timeout: 60, fault_timeout: 90 }
+          - { os: windows-2022, python-version: "3.14", runner: '["self-hosted", "windows", "mefor-ci-win2022"]', hosted: '["windows-2022"]', job_timeout: 30, step_timeout: 26, pytest_timeout: 120, fault_timeout: 150 }
+          - { os: windows-2025, python-version: "3.14", runner: '["self-hosted", "windows", "mefor-ci-win2025"]', hosted: '["windows-2025"]', job_timeout: 30, step_timeout: 26, pytest_timeout: 120, fault_timeout: 150 }
     defaults:
       run:
         shell: bash  # available on all runners (Git Bash on Windows) -> one set of commands
@@ -123,7 +131,10 @@ jobs:
           # and the hardened XML/SOAP codec (#31) tests run their assertions instead of importorskip-skipping.
           # [webauthn] (ADR 0068) so the passkey ceremony tests run real verify_* assertions instead of
           # importorskip-skipping, and mypy sees the py.typed library rather than Any.
-          uv pip install --system -e ".[dev,console,fhir,dicom,x12,xml,webauthn]"
+          # + the browser ops console as a second editable wheel (Option B) so the moved /ui tests
+          # (tests/test_webui.py etc. now import messagefoundry_webconsole) run on this full-suite leg.
+          # It is NOT a published extra yet (would break uv lock), so install it by path.
+          uv pip install --system -e ".[dev,console,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
 
       # ruff (lint + format) and mypy are PLATFORM-INDEPENDENT results — a ruff/format outcome is
       # identical on every OS, and mypy's platform-specific branches are covered by running it for
@@ -132,7 +143,7 @@ jobs:
       # result genuinely differs by OS (real sockets, ProactorEventLoop, Windows service paths).
       - name: Lint (ruff)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
-        run: ruff check messagefoundry tests
+        run: ruff check messagefoundry messagefoundry_webconsole tests
 
       - name: Format check (ruff)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
@@ -146,7 +157,7 @@ jobs:
       # this resolves on a Linux runner. Verified: both passes clean on 204 files.)
       - name: Type-check (mypy, strict — linux platform)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
-        run: mypy messagefoundry
+        run: mypy messagefoundry messagefoundry_webconsole
 
       - name: Type-check (mypy, strict — win32 platform)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'

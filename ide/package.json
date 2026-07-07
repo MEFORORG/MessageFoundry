@@ -200,6 +200,10 @@
         {
           "command": "messagefoundry.newHandler",
           "group": "2_scaffold@2"
+        },
+        {
+          "command": "messagefoundry.insertElement",
+          "group": "2_scaffold@3"
         }
       ],
       "view/title": [
@@ -285,6 +289,14 @@
         }
       ]
     },
+    "keybindings": [
+      {
+        "command": "messagefoundry.insertElement",
+        "key": "ctrl+alt+i",
+        "mac": "cmd+alt+i",
+        "when": "editorTextFocus && messagefoundry.isConfigFile"
+      }
+    ],
     "snippets": [
       {
         "language": "python",

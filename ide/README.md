@@ -79,12 +79,23 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   (e.g. the GitHub Copilot Chat extension) to host the Chat view.
 - **Scaffold snippets**: `meforinbound`, `meforoutbound`, `meforrouter`, `meforhandler` (and matching
   *MessageFoundry: … Wizard* commands).
-- **Insert Element** (*MessageFoundry: Insert Element*, keybindable) — a quick-pick of the most-used
-  Handler/Router idioms that drops **real, editable Python** at the cursor: field read/set/copy, code-set
-  and `db_lookup` lookups, repetition/segment loops, timestamp conversion, `Send`/split-and-send, etc.
-  Each is also a tab-completion snippet (`meforget`, `meforcopy`, `meforcodelookup`, `mefordblookup`,
-  `mefordate`, `meforsend`, `meforsplit`, …). It's a typing accelerator, not a visual/declarative builder —
-  you still read and edit the Python.
+- **Insert Element** (*MessageFoundry: Insert Element*, `Ctrl+Alt+I` / `Cmd+Alt+I`, a CodeLens above each
+  `@router`/`@handler`/`inbound()`/`outbound()`, and the editor-title MessageFoundry submenu) — a
+  quick-pick of ~30 Handler/Router idioms, grouped by category (Field, Format, Transform, Decision,
+  Date, Lookup, Send, Raw, Router, …), that drops **real, editable Python** at the cursor: field read/
+  set/copy/clear, case conversion/trim/substring/pad, regex replace, numeric compute, `match`/`case`
+  decisions, code-set/`db_lookup`/`fhir_lookup` lookups, repetition/segment loops, timestamp conversion/
+  stamping/length-of-stay, non-HL7 `msg.json()`/`msg.text` access, `Send`/fan-out/split-and-send, and
+  route-by-type/route-to-multiple. The quick-pick is **context-aware**: inside a `@router` def it hides
+  idioms that need a Handler-only capability (`Send`, `db_lookup`, `fhir_lookup` all raise on a Router —
+  ADR 0010/0043) and shows router-only ones (route-by-type, route-to-multiple); inside a `@handler` def
+  it's the reverse; elsewhere it shows everything. Each idiom is also a tab-completion snippet
+  (`meforget`, `meforcopy`, `meforcodelookup`, `mefordblookup`, `meforfhirlookup`, `mefordate`,
+  `meforstamp`, `meforlos`, `meforregex`, `meforcalc`, `meformatch`, `meforsend`, `meforfanout`,
+  `meforsplit`, `meforroutetype`, `meforroutemulti`, …). It's a typing accelerator, not a visual/
+  declarative builder — you still read and edit the Python. **Deliberately omitted:** DB *write*
+  idioms (insert/update/delete/call a stored proc) — transforms stay pure (message in → message out);
+  the only sanctioned live DB access is the read-only `db_lookup` carve-out (ADR 0010).
 
 ## Settings
 

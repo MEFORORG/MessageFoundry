@@ -17,7 +17,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.api.models import ConfigProvenance
-from messagefoundry.api.webui.pages.config import config_page
+from messagefoundry_webconsole.pages.config import config_page
 from messagefoundry.config.fingerprint import config_fingerprint
 from messagefoundry.pipeline import Engine
 

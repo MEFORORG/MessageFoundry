@@ -118,6 +118,12 @@ xml = ["lxml>=6.0.0", "xmlschema>=4.0.0", "signxml>=4.0.0"]
 # CVE-2026-30922 decoder-DoS fix version; treat 0.6.3 as a floor, never let a re-lock regress it).
 # OSV sweep 2026-07-03: all five pins CLEAR (webauthn/pyopenssl/pyasn1/pyasn1-modules/cbor2).
 webauthn = ["webauthn>=3.0.0,<4"]
+# The browser ops console ([api].serve_ui, ADR 0065) is a separately-versioned second wheel
+# (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin in-process via
+# mount_ui. It is deliberately NOT declared as a [webconsole] extra yet: the wheel isn't published to an
+# index, so a `messagefoundry-webconsole` dep would break `uv lock`. Until the release phase publishes it
+# (adding the extra + a PEP 508 range), install it editable — CI uses `-e packaging/messagefoundry-webconsole`.
+# serve_ui=true without the package installed fails LOUD at startup (__main__ find_spec guard).
 dev = [
     "pytest>=9.0.3",        # >=9.0.3 fixes CVE-2025-71176 (insecure /tmp dir perms, CWE-379; dev/UNIX-only)
     "pytest-asyncio>=0.26",  # >=0.26 adds asyncio_default_test_loop_scope (BACKLOG #17 shared-loop fix)

@@ -16,7 +16,7 @@ import time
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.models import ConnectorType, ContentType
@@ -25,6 +25,7 @@ from messagefoundry.config.wiring import (
     HandlerFn,
     InboundConnection,
     Registry,
+    RouterFn,
     Send,
     SetState,
     StateValue,
@@ -46,6 +47,7 @@ __all__ = [
     "StateOpPreview",
     "RouteOutcome",
     "DryRunResult",
+    "TraceHook",
     "route_message",
     "route_only",
     "transform_one",
@@ -58,6 +60,25 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+
+
+class TraceHook(Protocol):
+    """An optional observer the traced dry-run (ADR 0072) passes in to wrap the Router/Handler call.
+
+    When a ``tracer`` is supplied, :func:`route_only` / :func:`transform_one` invoke the Router/Handler
+    **through** the hook instead of calling it directly, so the hook can install ``sys.settrace`` around
+    exactly that call. The hook is a *pure observer* — it returns the callable's result unchanged and
+    re-raises any exception — so the traced path is byte-identical to the default (``tracer=None``). The
+    concrete implementation lives in :mod:`messagefoundry.pipeline.dryrun_trace`; this Protocol keeps
+    ``dryrun`` free of any dependency on it (one-way import)."""
+
+    def trace_router(
+        self, fn: RouterFn, name: str, payload: Message | RawMessage
+    ) -> list[str] | str | None: ...
+
+    def trace_handler(
+        self, fn: HandlerFn, name: str, payload: Message | RawMessage
+    ) -> Send | SetState | list[Send | SetState] | None: ...
 
 
 def _handler_names(result: list[str] | str | None) -> list[str]:
@@ -155,6 +176,7 @@ def route_only(
     raw: str | bytes,
     *,
     payload: Message | RawMessage | None = None,
+    tracer: TraceHook | None = None,
 ) -> list[str]:
     """Run ``ic``'s Router and return the handler name(s) it selected (``[]`` = routed nowhere).
 
@@ -170,11 +192,18 @@ def route_only(
     :func:`_shareable_payload` — passes it to skip a redundant construct). The caller is responsible
     for the payload being a faithful, *isolated-where-mutable* view of ``raw``; ``None`` (the default)
     keeps the self-parsing behavior, so every existing call site is byte-identical.
+
+    ``tracer`` (ADR 0072) is an optional observer: when given, the Router is invoked **through**
+    ``tracer.trace_router`` (which installs ``sys.settrace`` around the call) instead of called directly.
+    The hook returns the Router's result unchanged, so the routing decision is byte-identical.
     """
     route = registry.routers[ic.router]
     if payload is None:
         payload = _payload(raw, ic.content_type.value)
-    names = _handler_names(route(payload))
+    raw_result = (
+        route(payload) if tracer is None else tracer.trace_router(route, ic.router, payload)
+    )
+    names = _handler_names(raw_result)
     for hname in names:
         if hname not in registry.handlers:
             raise ValueError(f"router {ic.router!r} returned unknown handler {hname!r}")
@@ -188,6 +217,7 @@ def transform_one(
     content_type: str = ContentType.HL7V2.value,
     *,
     payload: Message | RawMessage | None = None,
+    tracer: TraceHook | None = None,
 ) -> tuple[list[DeliveryPreview], list[StateOpPreview]]:
     """Run **one** Handler on its own freshly-built payload; return ``(deliveries, state_ops)``.
 
@@ -208,11 +238,16 @@ def transform_one(
     mutate in isolation** — a read-only :class:`RawMessage` (see :func:`_shareable_payload`) qualifies
     and may be shared across a message's handlers; a mutable HL7 :class:`Message` must *not* be reused
     across handlers (the caller passes ``None`` for HL7 so each handler re-parses its own).
+
+    ``tracer`` (ADR 0072) is an optional observer: when given, the Handler is invoked **through**
+    ``tracer.trace_handler`` (which installs ``sys.settrace`` around the call) instead of called
+    directly. The hook returns the Handler's result unchanged, so the deliveries are byte-identical.
     """
     handle: HandlerFn = registry.handlers[hname]
     if payload is None:
         payload = _payload(raw, content_type)
-    sends, ops = _partition(handle(payload))
+    raw_result = handle(payload) if tracer is None else tracer.trace_handler(handle, hname, payload)
+    sends, ops = _partition(raw_result)
     deliveries: list[DeliveryPreview] = []
     for send in sends:
         # A Send.to names a known OUTBOUND (deliver there) OR a pass-through (PT) INBOUND (ADR 0013,
@@ -255,6 +290,7 @@ def route_message(
     raw: str | bytes,
     *,
     ingest_time: float | None = None,
+    tracer: TraceHook | None = None,
 ) -> RouteOutcome:
     """Run ``ic``'s Router then the named Handlers; return what they selected and would send.
 
@@ -267,6 +303,9 @@ def route_message(
     instead runs the two halves at *separate* stages (router worker → transform worker), so it and the
     dry-run path route identically. Each handler still gets its own :class:`Message` (via
     :func:`transform_one`). Router/Handler exceptions propagate to the caller.
+
+    ``tracer`` (ADR 0072) is threaded to :func:`route_only` / :func:`transform_one` so the traced
+    dry-run can observe each Router/Handler call; it is a pure observer, so the outcome is byte-identical.
     """
     # Publish the graph's code sets so a call-time code_set(...) inside a Router/Handler resolves
     # during a dry-run / Test Bench / `messagefoundry check` preview (the loader only had them active
@@ -306,9 +345,9 @@ def route_message(
         # Message in place — see _shareable_payload — so each consumer re-parses its own, which is
         # also cheaper than parse-once-then-deep-copy). Value-identical either way.
         shared = _shareable_payload(raw, ct)
-        names = route_only(registry, ic, raw, payload=shared)
+        names = route_only(registry, ic, raw, payload=shared, tracer=tracer)
         for hname in names:
-            ds, ops = transform_one(registry, hname, raw, ct, payload=shared)
+            ds, ops = transform_one(registry, hname, raw, ct, payload=shared, tracer=tracer)
             deliveries.extend(ds)
             for op in ops:
                 sim_state[(op.namespace, op.key)] = op.value  # visible to subsequent handlers
@@ -361,11 +400,17 @@ def select_inbound(registry: Registry, name: str | None = None) -> InboundConnec
     )
 
 
-def _dry_run_raw(registry: Registry, ic: InboundConnection, raw: str | bytes) -> DryRunResult:
+def _dry_run_raw(
+    registry: Registry,
+    ic: InboundConnection,
+    raw: str | bytes,
+    *,
+    tracer: TraceHook | None = None,
+) -> DryRunResult:
     """Dry-run a non-HL7 inbound (ADR 0004): no HL7 peek/validate; route the body as a RawMessage."""
     text = raw if isinstance(raw, str) else raw.decode("utf-8")
     try:
-        outcome = route_message(registry, ic, text, ingest_time=time.time())
+        outcome = route_message(registry, ic, text, ingest_time=time.time(), tracer=tracer)
     except Exception as exc:  # a router/handler script raised
         return DryRunResult(
             inbound=ic.name,
@@ -385,14 +430,24 @@ def _dry_run_raw(registry: Registry, ic: InboundConnection, raw: str | bytes) ->
     )
 
 
-def dry_run(registry: Registry, raw: str | bytes, *, inbound: str | None = None) -> DryRunResult:
+def dry_run(
+    registry: Registry,
+    raw: str | bytes,
+    *,
+    inbound: str | None = None,
+    tracer: TraceHook | None = None,
+) -> DryRunResult:
     """Parse → (strict-validate) → route one message, returning disposition + would-send payloads.
 
     Mirrors the engine's disposition logic with **no side effects**.
+
+    ``tracer`` (ADR 0072) is an optional observer threaded to the routing core so the traced dry-run
+    (:func:`messagefoundry.pipeline.dryrun_trace.trace_dry_run`) can capture the Router/Handler execution;
+    it does not change the disposition or would-send payloads (byte-identical to ``tracer=None``).
     """
     ic = select_inbound(registry, inbound)
     if ic.content_type is not ContentType.HL7V2:
-        return _dry_run_raw(registry, ic, raw)
+        return _dry_run_raw(registry, ic, raw, tracer=tracer)
     text = normalize(raw)
 
     try:
@@ -418,7 +473,7 @@ def dry_run(registry: Registry, raw: str | bytes, *, inbound: str | None = None)
             )
 
     try:
-        outcome = route_message(registry, ic, text, ingest_time=time.time())
+        outcome = route_message(registry, ic, text, ingest_time=time.time(), tracer=tracer)
     except Exception as exc:  # a router/handler script raised
         return DryRunResult(
             inbound=ic.name,

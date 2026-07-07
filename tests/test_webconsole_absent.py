@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Option B Phase 0 (ADR 0065): the engine imports, boots, and serves the JSON API with the web
-console (``messagefoundry.api.webui`` / the ``messagefoundry-webconsole`` package) ABSENT, while
-``serve_ui`` still fails LOUD at construction with a clear ``RuntimeError``.
+"""Option B (ADR 0065): the engine imports, boots, and serves the JSON API with the web console (the
+``messagefoundry_webconsole`` package) ABSENT, while ``serve_ui`` still fails LOUD at construction with
+a clear ``RuntimeError``.
 
-Guards the three always-on couplings that were severed so the console can move to an optional
-package: (1) the top-level ``from messagefoundry.api import webui`` in ``app.py``/``auth_routes.py``
-became a guarded import inside the ``serve_ui`` branch; (2) the ``/ui`` CSP became the
-``app.state.ui_csp`` hook; (3) the ``/ws/stats`` browser augmentation became the
-``app.state.ui_ws_authorize`` / ``app.state.ui_connections_render`` hooks. With the console absent the
-default (JSON-only) deployment is unaffected."""
+Guards the couplings that were severed so the console could move to an optional package: (1) neither
+``app.py`` nor ``auth_routes.py`` carries a module-scope console reference — ``app.py`` imports
+``messagefoundry_webconsole`` only inside its guarded ``serve_ui`` branch, and ``auth_routes.py``
+returns an engine-side ``AdminHandlers`` bundle (leaf type in ``api._ui_seam``) and imports the console
+not at all; (2) the ``/ui`` CSP is the ``app.state.ui_csp`` hook; (3) the ``/ws/stats`` browser
+augmentation is the ``app.state.ui_ws_authorize`` / ``app.state.ui_connections_render`` hooks. With the
+console absent the default (JSON-only) deployment is unaffected."""
 
 from __future__ import annotations
 
@@ -50,9 +51,9 @@ async def _service(engine: Engine) -> AuthService:
 
 def _block_webui_import() -> Callable[..., Any]:
     """A ``builtins.__import__`` replacement that makes importing the web console raise ``ImportError``
-    — simulating the optional package being absent. ``from messagefoundry.api import webui`` compiles
-    to ``__import__('messagefoundry.api', fromlist=('webui',))``, so intercept exactly that shape (and
-    any direct ``messagefoundry.api.webui`` import); everything else passes through unchanged."""
+    — simulating the optional package being absent. ``from messagefoundry_webconsole import mount_ui``
+    compiles to ``__import__('messagefoundry_webconsole', fromlist=('mount_ui',))``, so intercept any
+    ``messagefoundry_webconsole`` import; everything else passes through unchanged."""
     real_import = builtins.__import__
 
     def fake_import(
@@ -62,21 +63,21 @@ def _block_webui_import() -> Callable[..., Any]:
         fromlist: Any = (),
         level: int = 0,
     ) -> Any:
-        if name == "messagefoundry.api" and fromlist and "webui" in fromlist:
-            raise ImportError("simulated: messagefoundry.api.webui is absent")
-        if name == "messagefoundry.api.webui" or name.startswith("messagefoundry.api.webui."):
-            raise ImportError("simulated: messagefoundry.api.webui is absent")
+        if name == "messagefoundry_webconsole" or name.startswith("messagefoundry_webconsole."):
+            raise ImportError("simulated: messagefoundry_webconsole is absent")
         return real_import(name, globals, locals, fromlist, level)
 
     return fake_import
 
 
 def test_no_module_level_webui_reference() -> None:
-    """``app.py`` and ``auth_routes.py`` must carry ZERO module-scope reference to ``webui`` — that is
-    the structural guarantee that importing them never touches the optional console package. (The
-    reference now lives only inside each module's guarded ``serve_ui`` branch.)"""
+    """``app.py`` and ``auth_routes.py`` must carry ZERO module-scope reference to the console — that is
+    the structural guarantee that importing them never touches the optional package. ``app.py``'s
+    reference lives only inside its guarded ``serve_ui`` branch; ``auth_routes.py`` has none."""
     assert not hasattr(app_module, "webui")
+    assert not hasattr(app_module, "mount_ui")
     assert not hasattr(auth_routes_module, "webui")
+    assert not hasattr(auth_routes_module, "mount_ui")
 
 
 async def test_serve_ui_off_builds_json_app_with_webui_absent(
@@ -104,8 +105,8 @@ async def test_serve_ui_on_raises_clear_error_when_webui_absent(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With the console absent, ``create_app(serve_ui=True)`` fails LOUD at construction with a clear
-    ``RuntimeError`` (never a bare ``ImportError`` nor a mid-request 500). ``add_auth_routes`` runs the
-    guarded import first, so the error surfaces regardless of which host module hits it first."""
+    ``RuntimeError`` (never a bare ``ImportError`` nor a mid-request 500) from the guarded ``mount_ui``
+    import in the ``serve_ui`` tail — before any ``/ui`` route or deps bundle is built."""
     service = await _service(engine)
     monkeypatch.setattr(builtins, "__import__", _block_webui_import())
 
@@ -114,7 +115,7 @@ async def test_serve_ui_on_raises_clear_error_when_webui_absent(
 
 
 def test_engine_imports_and_boots_in_fresh_interpreter_without_webui() -> None:
-    """The strongest proof: in a FRESH interpreter where ``messagefoundry.api.webui`` is unimportable
+    """The strongest proof: in a FRESH interpreter where ``messagefoundry_webconsole`` is unimportable
     from the very start, ``import messagefoundry.api.app`` / ``.auth_routes`` still succeed, a
     JSON-only app builds, and ``serve_ui=True`` raises the clear ``RuntimeError``. Running it in a
     subprocess guarantees the console module was NEVER imported (which the in-process tests cannot,
@@ -124,14 +125,15 @@ def test_engine_imports_and_boots_in_fresh_interpreter_without_webui() -> None:
         import sys
 
         # Make the optional console package unimportable before anything imports the engine API.
-        sys.modules["messagefoundry.api.webui"] = None
+        sys.modules["messagefoundry_webconsole"] = None
 
-        # (1) The engine API imports cleanly with the console absent (no module-scope webui coupling).
+        # (1) The engine API imports cleanly with the console absent (no module-scope console coupling).
         import messagefoundry.api.app as app_module
         import messagefoundry.api.auth_routes as auth_routes_module
         from messagefoundry.api import create_app
 
         assert not hasattr(app_module, "webui"), "app.py leaked a module-scope webui reference"
+        assert not hasattr(app_module, "mount_ui"), "app.py leaked a module-scope mount_ui reference"
         assert not hasattr(
             auth_routes_module, "webui"
         ), "auth_routes.py leaked a module-scope webui reference"

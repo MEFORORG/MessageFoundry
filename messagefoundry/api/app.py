@@ -22,8 +22,6 @@ remote exposure (TLS) is later.
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import json
 import logging
 import os
@@ -32,8 +30,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
-from urllib.parse import parse_qsl
+from typing import Any, AsyncIterator
 
 from fastapi import (
     Body,
@@ -46,9 +43,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import ValidationError
+from fastapi.responses import JSONResponse
 
 from messagefoundry import __version__
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
@@ -101,18 +96,17 @@ from messagefoundry.api.models import (
     SecurityPosture,
     StatsResetRequest,
     StatsResetResult,
-    StatsResetTarget,
     StatsResponse,
     ServiceStatusInfo,
     SystemStatus,
     UpdateInfo,
 )
+from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, CoreHandlers, UiDeps
 from messagefoundry.api.auth_routes import add_auth_routes
 from messagefoundry.api.field_authz import count_exposed, redact_unauthorized
 from messagefoundry.api.metrics import METRICS_CONTENT_TYPE, render_metrics
 from messagefoundry.api.security import (
     authorize_ws,
-    get_auth,
     optional_identity,
     require,
     require_phi_read,
@@ -120,15 +114,13 @@ from messagefoundry.api.security import (
     ws_token,
 )
 
-# NOTE: messagefoundry.api.webui is deliberately NOT imported at module scope (ADR 0065 / Option B
-# Phase 0). It is a GUARDED, lazy import inside create_app's / add_auth_routes' serve_ui branch, so
-# the engine imports + boots + serves the JSON API with the web console ABSENT. serve_ui-on behavior
-# is preserved via three seams: app.state.ui_csp, app.state.ui_ws_authorize,
-# app.state.ui_connections_render (set in the serve_ui path, read by the always-on middleware/routes).
+# NOTE: the web console (messagefoundry_webconsole) is deliberately NOT imported at module scope
+# (ADR 0065 / Option B). It is a GUARDED import inside create_app's serve_ui tail (mounted via
+# mount_ui), so the engine imports + boots + serves the JSON API with the console ABSENT. serve_ui-on
+# behavior is preserved via three seams the console installs: app.state.ui_csp,
+# app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission
-from messagefoundry.auth.identity import AuthProvider
-from messagefoundry.auth.service import AuthService, BootstrapAdmin, MfaStatus
-from messagefoundry.parsing import HL7PeekError, parse_tree
+from messagefoundry.auth.service import AuthService, BootstrapAdmin
 from messagefoundry.config.ai_policy import resolve_effective_policy
 from messagefoundry.config.models import (
     AckAfter,
@@ -692,9 +684,11 @@ def create_app(
     app.state.exposure_protected = exposure_protected
     app.state.tls_terminated_upstream = tls_terminated_upstream
     app.state.summary_auditor = _SummaryAuditCoalescer()  # coalesced PHI-summary access audit (M-5)
-    # serve_ui also registers the /ui admin pages (L4a) — they live in add_auth_routes because they
-    # reuse its nested user-admin JSON handlers directly (see the serve_ui block there).
-    add_auth_routes(app, serve_ui=serve_ui)
+    # add_auth_routes registers the auth/user-admin JSON routes and RETURNS an AdminHandlers bundle of
+    # its nested handlers; the /ui admin pages that reuse them now live in messagefoundry_webconsole and
+    # are wired via mount_ui in the serve_ui tail below (Option B, ADR 0065). It runs UNCONDITIONALLY, so
+    # its returned bundle's type lives in the engine leaf api._ui_seam (never the console package).
+    admin = add_auth_routes(app)
 
     @app.exception_handler(Exception)
     async def _unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
@@ -2540,1116 +2534,70 @@ def create_app(
 
     # --- /ui: read-only browser ops dashboard (ADR 0065, BACKLOG #75) ----------
     # Registered ONLY when [api].serve_ui is on (a JSON-only deployment is byte-identical otherwise).
-    # The /ui routes are CLIENTS of the JSON handlers above — they call them directly, so the single
-    # audited PHI path + per-channel RBAC + view_summary redaction are reused verbatim (no second PHI
-    # path). Auth is the CONFINED mf_session cookie (webui.require_ui), never the Authorization header,
-    # so bearer_token() stays header-only and a JSON route with only the cookie still 401s. Rendering is
-    # a stdlib autoescape-by-default builder (messagefoundry.api.webui) — zero new runtime dependency.
+    # The web console — its /ui routes, rendering, the confined mf_session cookie auth, and the write-
+    # action registry — lives in the separately-versioned messagefoundry_webconsole package, mounted
+    # same-origin in-process via one mount_ui(app, deps) call (Option B, ADR 0065). The /ui routes are
+    # CLIENTS of the JSON handlers above — mount_ui wires them to the reused handlers through the typed
+    # UiDeps bundle, so the single audited PHI path + per-channel RBAC + view_summary redaction are
+    # reused verbatim (no second PHI path). serve_ui-off deployments never import the package.
     if serve_ui:
-        # GUARDED, lazy import (Option B Phase 0): the web console is an optional package, so the engine
-        # imports + boots + serves the JSON API without it. It is required only when serve_ui is on, and
-        # a missing install fails LOUD at startup here — never a mid-request 500. (The absent path is
-        # exercised by tests/test_webconsole_absent.py, which shadows the import.)
+        # GUARDED import (Option B): the web console is an optional package, so the engine imports +
+        # boots + serves the JSON API without it. It is required only when serve_ui is on, and a missing
+        # install fails LOUD at startup here — never a mid-request 500. (The absent path is exercised by
+        # tests/test_webconsole_absent.py, which shadows the import.)
         try:
-            from messagefoundry.api import webui
+            from messagefoundry_webconsole import assert_engine_seam, mount_ui
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError(
-                "serve_ui requires the web console (messagefoundry.api.webui / the "
-                "messagefoundry-webconsole package) which could not be imported"
+                "serve_ui requires the web console — install it: "
+                "pip install messagefoundry[webconsole]"
             ) from exc
 
-        # Install the always-on seams the JSON engine reads when serve_ui is on: the /ui CSP (co-
-        # versioned with app.js/app.css), the browser-cookie WS authorizer (CSWSH-guarded), and the
-        # server-rendered connections fragment pushed over /ws/stats. With serve_ui off these stay
-        # unset, so the security-headers middleware and /ws/stats take their JSON-only fallbacks.
-        app.state.ui_csp = webui.UI_CSP
-        app.state.ui_ws_authorize = webui.authorize_ui_ws
-        app.state.ui_connections_render = webui.pages.connections_fragment
-
-        app.mount("/ui/static", StaticFiles(directory=str(webui.STATIC_DIR)), name="ui-static")
-
-        def _register_core(app: FastAPI) -> None:
-            """Register the phase-0 /ui routes (login, dashboard, messages, dead-letters, replay,
-            reauth). Runs first in ``_UI_REGISTRARS``; a page lane adds its own
-            ``_register_<area>(app)`` + one tuple entry below, so parallel lanes never edit this
-            shared block (ADR 0065 §multi-session-build)."""
-
-            @app.get("/ui/login", response_class=HTMLResponse)
-            async def ui_login_form(
-                request: Request, e: str | None = Query(None, max_length=32)
-            ) -> HTMLResponse:
-                auth = get_auth(request)
-                ad_enabled = auth is not None and auth.ad_enabled
-                sso_enabled = auth is not None and auth.kerberos_available
-                return HTMLResponse(
-                    webui.pages.login(e, ad_enabled=ad_enabled, sso_enabled=sso_enabled)
-                )
-
-            @app.post("/ui/login")
-            async def ui_login(request: Request) -> Response:
-                auth = get_auth(request)
-                if auth is None or not auth.enabled:
-                    raise HTTPException(503, "authentication is not configured")
-                client = request.client.host if request.client else None
-                if not auth.allow_login_attempt(client):
-                    raise HTTPException(
-                        429, "too many login attempts", headers={"Retry-After": "30"}
-                    )
-                # Parse the urlencoded login form with stdlib — the engine has no python-multipart dep, so
-                # Form()/request.form() would fail; a same-origin login POST is always urlencoded here.
-                form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
-                # L5b (ADR 0068 §8): browser AD-password login rides the SAME auth.login seam as the
-                # JSON surface — allow-listed provider values only; absent stays LOCAL (regression-
-                # pinned). ONE session is minted per form POST, so the AD role-resync/revocation side
-                # effect fires once at login, never per navigation.
-                provider_value = form.get("provider", "local")
-                if provider_value not in ("local", "ad"):
-                    return RedirectResponse("/ui/login?e=bad", status_code=303)
-                outcome = await auth.login(
-                    form.get("username", ""),
-                    form.get("password", ""),
-                    provider=AuthProvider.AD if provider_value == "ad" else AuthProvider.LOCAL,
-                    client=client,
-                )
-                if not outcome.ok or outcome.token is None:
-                    return RedirectResponse("/ui/login?e=bad", status_code=303)
-                # A must-change account goes straight to the browser rotation page (L4b) — every other
-                # /ui route would bounce it there anyway (require_ui).
-                target = "/ui/account/password" if outcome.must_change_password else "/ui"
-                resp = RedirectResponse(target, status_code=303)
-                webui.set_session_cookie(resp, outcome.token, secure=_cookie_secure(request))
-                return resp
-
-            @app.post("/ui/logout")
-            async def ui_logout(request: Request) -> Response:
-                auth = get_auth(request)
-                token = request.cookies.get(webui.COOKIE_NAME)
-                if auth is not None and token:
-                    await auth.logout(token)
-                resp = RedirectResponse("/ui/login?e=loggedout", status_code=303)
-                webui.clear_session_cookie(resp)
-                return resp
-
-            @app.get("/ui", response_class=HTMLResponse)
-            async def ui_dashboard(
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MONITORING_READ)),
-            ) -> HTMLResponse:
-                rows = await list_connections(engine=engine, identity=identity)
-                return HTMLResponse(webui.pages.dashboard(rows))
-
-            @app.get("/ui/connections", response_class=HTMLResponse)
-            async def ui_connections(
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MONITORING_READ)),
-            ) -> HTMLResponse:
-                rows = await list_connections(engine=engine, identity=identity)
-                return HTMLResponse(webui.pages.connections_fragment(rows))
-
-            @app.get("/ui/messages", response_class=HTMLResponse)
-            async def ui_messages(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MESSAGES_READ, phi=True)),
-                channel_id: str | None = Query(None, max_length=256),
-                status_filter: str | None = Query(None, alias="status", max_length=64),
-                message_type: str | None = Query(None, max_length=64),
-                control_id: str | None = Query(None, max_length=256),
-                limit: int = Query(50, ge=1, le=500),
-                offset: int = Query(0, ge=0),
-            ) -> HTMLResponse:
-                data = await list_messages(
-                    request,
-                    engine=engine,
-                    identity=identity,
-                    channel_id=channel_id,
-                    status=status_filter,
-                    message_type=message_type,
-                    control_id=control_id,
-                    limit=limit,
-                    offset=offset,
-                )
-                return HTMLResponse(
-                    webui.pages.messages(
-                        data,
-                        channel_id=channel_id or "",
-                        status=status_filter or "",
-                        message_type=message_type or "",
-                        control_id=control_id or "",
-                    )
-                )
-
-            @app.get("/ui/messages/{message_id}", response_class=HTMLResponse)
-            async def ui_message_detail(
-                message_id: str,
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(
-                    webui.require_ui(Permission.MESSAGES_VIEW_RAW, phi=True)
-                ),
-            ) -> HTMLResponse:
-                detail = await get_message(message_id, request, engine=engine, identity=identity)
-                return HTMLResponse(webui.pages.message_detail(detail))
-
-            @app.get("/ui/messages/{message_id}/parse-tree", response_class=HTMLResponse)
-            async def ui_message_parse_tree(
-                message_id: str,
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(
-                    webui.require_ui(Permission.MESSAGES_VIEW_RAW, phi=True)
-                ),
-            ) -> HTMLResponse:
-                # Reuse the single audited PHI path (get_message → record_view + record_audit), then render
-                # the tree server-side via the pure parsing lib. Non-HL7 bodies (X12/DICOM/binary) have no
-                # HL7 tree — surface that rather than 500. No new PHI egress beyond the audited raw fetch.
-                detail = await get_message(message_id, request, engine=engine, identity=identity)
-                try:
-                    nodes = parse_tree(detail.raw)
-                except HL7PeekError as exc:
-                    return HTMLResponse(webui.pages.parse_tree_unavailable(message_id, str(exc)))
-                return HTMLResponse(webui.pages.parse_tree_page(message_id, nodes))
-
-            @app.get("/ui/dead-letters", response_class=HTMLResponse)
-            async def ui_dead_letters(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MESSAGES_READ, phi=True)),
-                channel_id: str | None = Query(None, max_length=256),
-                destination_name: str | None = Query(None, max_length=256),
-                limit: int = Query(50, ge=1, le=500),
-                offset: int = Query(0, ge=0),
-            ) -> HTMLResponse:
-                data = await list_dead_letters(
-                    request,
-                    engine=engine,
-                    identity=identity,
-                    channel_id=channel_id,
-                    destination_name=destination_name,
-                    limit=limit,
-                    offset=offset,
-                )
-                return HTMLResponse(webui.pages.dead_letters(data))
-
-            # Safe operator actions (M2): inbound connection start/stop/restart. These reuse the JSON
-            # control handlers (require CONNECTIONS_CONTROL + the per-channel _control_guard), and add
-            # webui.assert_same_origin as CSRF defense-in-depth on top of the SameSite=Strict cookie (a
-            # cross-site POST carries no cookie, so require_ui already 303s). No step-up gate applies to
-            # start/stop/restart (unlike replay, which is require_step_up and lands with the browser MFA
-            # flow in a later milestone). Each redirects back to the dashboard.
-            async def _ui_control(
-                request: Request,
-                name: str,
-                engine: Engine,
-                identity: Identity,
-                action: Callable[..., Any],
-            ) -> Response:
-                webui.assert_same_origin(request)
-                await action(name, engine=engine, identity=identity)
-                return RedirectResponse("/ui", status_code=303)
-
-            @app.post("/ui/connections/{name}/start")
-            async def ui_start_connection(
-                name: str,
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.CONNECTIONS_CONTROL)),
-            ) -> Response:
-                return await _ui_control(request, name, engine, identity, start_connection)
-
-            @app.post("/ui/connections/{name}/stop")
-            async def ui_stop_connection(
-                name: str,
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.CONNECTIONS_CONTROL)),
-            ) -> Response:
-                return await _ui_control(request, name, engine, identity, stop_connection)
-
-            @app.post("/ui/connections/{name}/restart")
-            async def ui_restart_connection(
-                name: str,
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.CONNECTIONS_CONTROL)),
-            ) -> Response:
-                return await _ui_control(request, name, engine, identity, restart_connection)
-
-            # Sensitive action (M2b): single-message replay. It is require_step_up in the JSON API, so the
-            # /ui route uses require_ui_step_up — which, if the session hasn't recently stepped up, 303s the
-            # browser to /ui/reauth?next=<this action> instead of returning a 403 header the browser can't
-            # act on. After re-auth the browser auto-retries this POST (now inside the step-up window).
-            @app.post("/ui/messages/{message_id}/replay")
-            async def ui_replay_message(
-                message_id: str,
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui_step_up(Permission.MESSAGES_REPLAY)),
-            ) -> Response:
-                webui.assert_same_origin(request)
-                await replay_message(message_id, engine=engine, identity=identity)
-                return RedirectResponse(f"/ui/messages/{message_id}", status_code=303)
-
-            async def _reauth_webauthn_state(
-                request: Request,
-                auth: AuthService,
-                token: str | None,
-                mfa: MfaStatus,
-                satisfied: bool,
-            ) -> tuple[str | None, str | None]:
-                """(assertion-options JSON, fail-closed notice) for the reauth page's passkey leg.
-
-                Options are freshly staged per render (the prior challenge is single-use — ADR 0068
-                decision 1(e): the passkey button must survive a failed password/code attempt). The
-                notice is the legible dead-end copy when ceremonies can't run (extra absent /
-                rp unavailable) — never a redirect loop."""
-                if satisfied or not mfa.webauthn_enrolled:
-                    return None, None
-                if not auth.webauthn_available():
-                    return None, webui.WEBAUTHN_EXTRA_MISSING_NOTICE
-                rp = webui.webauthn_rp(request)
-                if rp is None:
-                    return None, webui.WEBAUTHN_RP_MISSING_NOTICE
-                options = await auth.begin_webauthn_assertion(token, rp_id=rp[0])
-                if options is None:
-                    # Enrolled, but every credential was minted under a DIFFERENT rp_id (the
-                    # origin-migration case, ADR 0068 §7) — a legible dead-end naming the
-                    # admin-reset recovery, never a bare password form with a misleading
-                    # "complete the passkey prompt" error (PR-A review finding).
-                    return None, webui.WEBAUTHN_RP_CHANGED_NOTICE
-                return options, None
-
-            @app.get("/ui/reauth", response_class=HTMLResponse)
-            async def ui_reauth_form(
-                request: Request,
-                next_: str = Query("", alias="next", max_length=512),
-            ) -> Response:
-                # next MUST be a registered /ui action — a body-less POST the re-auth may auto-retry
-                # (is_safe_ui_action) OR a GET admin form page it may unlock (is_unlock_action). Never an
-                # arbitrary URL (anti open-redirect) — an unregistered next bounces to /ui.
-                action = webui.lookup_ui_action(next_)
-                if action is None:
-                    return RedirectResponse("/ui", status_code=303)
-                auth = get_auth(request)
-                token = request.cookies.get(webui.COOKIE_NAME)
-                identity = await auth.identity_for_token(token) if auth is not None else None
-                if auth is None or identity is None:
-                    return RedirectResponse("/ui/login", status_code=303)
-                if identity.must_change_password:
-                    # Mirror require_ui's confinement: a must-change session can only rotate (L4b).
-                    return RedirectResponse("/ui/account/password", status_code=303)
-                mfa = await auth.mfa_status(identity)
-                if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:
-                    # A full-step-up action a required-but-UNENROLLED session (no factor of EITHER
-                    # kind — ADR 0068 decision 1(a)) can NEVER satisfy — send it to enroll instead
-                    # of a password form that would loop straight back. Enrollment itself is
-                    # step_up=False (below).
-                    return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
-                # The rendering splits BY FACTOR (decision 1(b)): the TOTP code field renders iff
-                # TOTP is enrolled (a required-but-unenrolled account can never produce a code —
-                # demanding one would deadlock, L4b); the passkey hook renders iff WebAuthn is
-                # enrolled — a WebAuthn-only user sees password + passkey, never an unanswerable
-                # code field; a both-enrolled user sees both, either satisfies.
-                satisfied = await auth.mfa_satisfied(token)
-                mfa_needed = not satisfied and mfa.enabled
-                wa_options, wa_notice = await _reauth_webauthn_state(
-                    request, auth, token, mfa, satisfied
-                )
-                return HTMLResponse(
-                    webui.pages.reauth(
-                        next_,
-                        mfa_needed=mfa_needed,
-                        webauthn_options=wa_options,
-                        webauthn_notice=wa_notice,
-                    )
-                )
-
-            @app.post("/ui/reauth")
-            async def ui_reauth(request: Request) -> Response:
-                webui.assert_same_origin(request)
-                auth = get_auth(request)
-                token = request.cookies.get(webui.COOKIE_NAME)
-                identity = await auth.identity_for_token(token) if auth is not None else None
-                if auth is None or not token or identity is None:
-                    return RedirectResponse("/ui/login", status_code=303)
-                if identity.must_change_password:
-                    # Mirror require_ui's confinement: a must-change session can only rotate (L4b).
-                    return RedirectResponse("/ui/account/password", status_code=303)
-                form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
-                next_ = form.get("next", "")
-                action = webui.lookup_ui_action(next_)
-                if action is None:
-                    return RedirectResponse("/ui", status_code=303)
-                mfa = await auth.mfa_status(identity)
-                if mfa.required and not (mfa.enabled or mfa.webauthn_enrolled) and action.step_up:
-                    # See ui_reauth_form: a full-step-up action this session can never satisfy (no
-                    # factor of EITHER kind — ADR 0068 decision 1(a)) — send it to enroll rather
-                    # than loop. Checked BEFORE the rate limiter so a correct password isn't burned
-                    # into a 429 (the review's silent-loop finding; the ordering pin covers the
-                    # generalized condition too).
-                    return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
-                satisfied = await auth.mfa_satisfied(token)
-                if not satisfied and not mfa.enabled and mfa.webauthn_enrolled:
-                    # ADR 0068 decision 1(d): a WebAuthn-ONLY user's password form can never satisfy
-                    # MFA by itself — the passkey leg (POST /ui/reauth/webauthn) must run first.
-                    # Checked BEFORE the rate limiter (parallel to the anti-loop check) so a
-                    # password-first submission burns no limiter slot and no password verify runs
-                    # before the ceremony. Never "Invalid code." — the user has no code to type.
-                    wa_options, wa_notice = await _reauth_webauthn_state(
-                        request, auth, token, mfa, satisfied
-                    )
-                    return HTMLResponse(
-                        webui.pages.reauth(
-                            next_,
-                            mfa_needed=False,
-                            webauthn_options=wa_options,
-                            webauthn_notice=wa_notice,
-                            error=wa_notice
-                            or "Complete the passkey prompt first, then re-enter your password.",
-                        ),
-                        status_code=400,
-                    )
-                client = request.client.host if request.client else None
-                if not auth.allow_login_attempt(client):
-                    raise HTTPException(429, "too many attempts", headers={"Retry-After": "30"})
-                # Satisfy whichever factor is pending — TOTP first (mirrors require_step_up), then
-                # password. The code is only demanded from a user with an ENROLLED authenticator
-                # (decision 1(c): the code branch keys on TOTP enrollment alone — a WebAuthn-only
-                # user is never asked for a code): a required-but-unenrolled account reaches this
-                # page on its way to enrolling (L4b) and has nothing to type — its enrollment routes
-                # gate on the password step-up alone (require_ui_reauth_only), exactly like the JSON
-                # require_reauth_only. Error re-renders re-stage FRESH assertion options (decision
-                # 1(e)): the prior challenge was single-use, and the passkey button must survive a
-                # failed password/code attempt.
-                mfa_enrolled = mfa.enabled
-                if mfa_enrolled and not satisfied:
-                    code = form.get("code", "").strip()
-                    if not code or not await auth.verify_mfa(token, code, client=client):
-                        wa_options, wa_notice = await _reauth_webauthn_state(
-                            request, auth, token, mfa, await auth.mfa_satisfied(token)
-                        )
-                        return HTMLResponse(
-                            webui.pages.reauth(
-                                next_,
-                                mfa_needed=True,
-                                webauthn_options=wa_options,
-                                webauthn_notice=wa_notice,
-                                error="Invalid code.",
-                            )
-                        )
-                if not await auth.reauth(
-                    identity, form.get("password", ""), token=token, client=client
-                ):
-                    still_unsatisfied = not await auth.mfa_satisfied(token)
-                    wa_options, wa_notice = await _reauth_webauthn_state(
-                        request, auth, token, mfa, not still_unsatisfied
-                    )
-                    return HTMLResponse(
-                        webui.pages.reauth(
-                            next_,
-                            mfa_needed=mfa_enrolled and still_unsatisfied,
-                            webauthn_options=wa_options,
-                            webauthn_notice=wa_notice,
-                            error="Incorrect password.",
-                        )
-                    )
-                # Fully stepped up. Hand control back per the action's continuation style:
-                #  - an unlock target is a GET admin form → 303-GET-redirect so it re-opens inside the now
-                #    fresh window; the operator then submits the body-carrying POST (incl. a create-user
-                #    password) once, never crossing /ui/reauth (the stateless confirm-after-step-up path).
-                #  - otherwise it is a body-less POST action → auto-retry it via the same-origin submit form.
-                if webui.is_unlock_action(next_):
-                    return RedirectResponse(next_, status_code=303)
-                return HTMLResponse(webui.pages.reauth_continue(next_))
-
-            # ADR 0068 decision 6: the browser passkey leg of step-up. A cookie-authed JSON POST
-            # (the sanctioned /ui carve — the cookie stays confined to /ui deps; bearer_token()
-            # is untouched) that verifies an assertion and stamps the session's MFA leg ONLY —
-            # the operator still submits POST /ui/reauth (password) for reauth_at + the WP-L3-13
-            # client re-anchor. NOT registered as a continuation (body-carrying JSON — part of the
-            # step-up mechanism itself). MFA-pending sessions pass (the assertion IS the proof);
-            # must-change confinement is mirrored manually like both /ui/reauth handlers.
-            @app.post("/ui/reauth/webauthn")
-            async def ui_reauth_webauthn(request: Request) -> Response:
-                webui.assert_same_origin(request)
-                auth = get_auth(request)
-                token = request.cookies.get(webui.COOKIE_NAME)
-                identity = await auth.identity_for_token(token) if auth is not None else None
-                if auth is None or not token or identity is None:
-                    return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
-                if identity.must_change_password:
-                    # Mirror require_ui's confinement: a must-change session can only rotate (L4b).
-                    return JSONResponse(
-                        {"ok": False, "error": "password change required"}, status_code=403
-                    )
-                rp = webui.webauthn_rp(request)
-                if rp is None:
-                    return JSONResponse({"ok": False, "error": "rp_unavailable"}, status_code=409)
-                client = request.client.host if request.client else None
-                if not auth.allow_login_attempt(client):
-                    return JSONResponse(
-                        {"ok": False, "error": "too many attempts"},
-                        status_code=429,
-                        headers={"Retry-After": "30"},
-                    )
-                try:
-                    body = await request.json()
-                    response_json = json.dumps(body["response"])
-                except (ValueError, KeyError, TypeError):
-                    return JSONResponse(
-                        {"ok": False, "error": "malformed request"}, status_code=400
-                    )
-                ok = await auth.finish_webauthn_assertion(
-                    token, response_json, client=client, rp_id=rp[0], origin=rp[1]
-                )
-                if not ok:
-                    return JSONResponse(
-                        {"ok": False, "error": "passkey verification failed"}, status_code=400
-                    )
-                return JSONResponse({"ok": True})
-
-            # Bulk dead-letter replay (M3): re-queue ALL dead deliveries for one channel. Like message
-            # replay it is require_step_up (→ require_ui_step_up, which 303s to /ui/reauth on a stale
-            # step-up; the channel is in the PATH so the auto-retry re-POST carries it — no lost body).
-            # Reuses the JSON replay_dead_letters handler, so the dual-control approval gate applies: when
-            # it holds the op for a second approver, surface that instead of redirecting.
-            async def _ui_dl_replay(
-                request: Request,
-                channel_id: str | None,
-                destination_name: str | None,
-                engine: Engine,
-                identity: Identity,
-                gate: ApprovalGate | None,
-            ) -> Response:
-                webui.assert_same_origin(request)
-                # channel_id=None ⇒ every channel (the all-channels scope, L6b); the JSON handler
-                # pre-checks scope and refuses a channel-scoped user before mutating anything.
-                result = await replay_dead_letters(
-                    DeadLetterReplayRequest(
-                        channel_id=channel_id, destination_name=destination_name
-                    ),
-                    Response(),
-                    engine=engine,
-                    identity=identity,
-                    gate=gate,
-                )
-                if isinstance(result, PendingApprovalResponse):
-                    return HTMLResponse(webui.pages.dead_letter_pending(result))
-                return RedirectResponse("/ui/dead-letters", status_code=303)
-
-            # L6b (#75 parity): replay ALL dead deliveries across every channel in one action (the
-            # desktop's null-scope "Replay all"). Declared before the {channel_id} routes; the
-            # literal `replay-all` can't be a channel id (it has no `/replay` suffix). Same
-            # step-up + dual-control gate; the JSON handler still denies channel-scoped users.
-            @app.post("/ui/dead-letters/replay-all")
-            async def ui_replay_all_dead_letters(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui_step_up(Permission.MESSAGES_REPLAY)),
-                gate: ApprovalGate | None = Depends(_get_gate),
-            ) -> Response:
-                return await _ui_dl_replay(request, None, None, engine, identity, gate)
-
-            @app.post("/ui/dead-letters/{channel_id}/replay")
-            async def ui_replay_dead_letters(
-                channel_id: str,
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui_step_up(Permission.MESSAGES_REPLAY)),
-                gate: ApprovalGate | None = Depends(_get_gate),
-            ) -> Response:
-                # All dead deliveries for the channel (every destination).
-                return await _ui_dl_replay(request, channel_id, None, engine, identity, gate)
-
-            @app.post("/ui/dead-letters/{channel_id}/{destination_name}/replay")
-            async def ui_replay_dead_letters_dest(
-                channel_id: str,
-                destination_name: str,
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui_step_up(Permission.MESSAGES_REPLAY)),
-                gate: ApprovalGate | None = Depends(_get_gate),
-            ) -> Response:
-                # Just the dead deliveries for this (channel, destination).
-                return await _ui_dl_replay(
-                    request, channel_id, destination_name, engine, identity, gate
-                )
-
-        def _register_monitoring(app: FastAPI) -> None:
-            """L1a: read-only monitoring pages (alerts + event log). Reuses the metadata-only JSON
-            handlers (no PHI, no step-up) — ADR 0065, BACKLOG #75 phase 1."""
-
-            @app.get("/ui/alerts", response_class=HTMLResponse)
-            async def ui_alerts(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(
-                    webui.require_ui(Permission.MONITORING_READ, Permission.MONITORING_DIAGNOSE)
-                ),
-            ) -> HTMLResponse:
-                # Active instances need monitoring:diagnose, rules need monitoring:read — the page
-                # requires BOTH (fail-closed), then calls the handlers directly (their own gates are
-                # skipped, so require_ui re-asserts the permissions the same way the other /ui routes do).
-                # Pass every param explicitly: calling the handler directly (not via Depends) leaves
-                # its Query(...) defaults unresolved, so limit must be a real int here.
-                instances = await list_active_alerts(engine=engine, identity=identity, limit=200)
-                config = await alerts_rules(request, _user=identity)
-                return HTMLResponse(webui.pages.alerts(instances, config))
-
-            @app.get("/ui/events", response_class=HTMLResponse)
-            async def ui_events(
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MONITORING_READ)),
-                connection: str | None = Query(None, max_length=256),
-                kind: str | None = Query(None, max_length=64),
-            ) -> HTMLResponse:
-                # L6b (#75 parity): expose the JSON handler's event-kind filter (a single kind from
-                # the fixed dropdown → a one-element kinds list; blank/unknown = no filter).
-                kinds = [kind] if kind else None
-                rows = await list_connection_events(
-                    engine=engine,
-                    identity=identity,
-                    connection=connection,
-                    kind=kinds,
-                    since=None,
-                    limit=100,
-                )
-                return HTMLResponse(
-                    webui.pages.events(rows, connection=connection or "", kind=kind or "")
-                )
-
-        def _register_status(app: FastAPI) -> None:
-            """L1b: read-only engine status page (engine/store metrics, effective security posture,
-            cluster + DR state). Reuses the monitoring:read JSON handlers — no PHI, no step-up."""
-
-            @app.get("/ui/status", response_class=HTMLResponse)
-            async def ui_status(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MONITORING_READ)),
-            ) -> HTMLResponse:
-                sys_status = await system_status(request, engine=engine, _user=identity)
-                posture = await security_posture(request, engine=engine, identity=identity)
-                cluster = await cluster_status(engine=engine, _user=identity)
-                nodes = await cluster_nodes(engine=engine, _user=identity)
-                dr = await dr_status(engine=engine, _user=identity)
-                svc = await service_status(request, _user=identity)
-                return HTMLResponse(
-                    webui.pages.status(sys_status, posture, cluster, nodes, dr, svc)
-                )
-
-        def _register_monitoring_writes(app: FastAPI) -> None:
-            """L3a: monitoring write actions (alert ack/resolve, statistics reset, DB integrity check,
-            DR activate/release). Permission-gated to MATCH the JSON handlers (no step-up — they are not
-            require_step_up), CSRF-guarded by assert_same_origin, each redirecting back to its page.
-
-            These deliberately do NOT call webui.register_ui_action(): that registry only gates the
-            step-up re-auth AUTO-RETRY allow-list (is_safe_ui_action), and these use plain require_ui —
-            they never route through /ui/reauth, so they have nothing to register."""
-
-            @app.post("/ui/alerts/{alert_id}/ack")
-            async def ui_ack_alert(
-                alert_id: int,
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MONITORING_DIAGNOSE)),
-            ) -> Response:
-                webui.assert_same_origin(request)
-                await ack_alert(alert_id, engine=engine, identity=identity)
-                return RedirectResponse("/ui/alerts", status_code=303)
-
-            @app.post("/ui/alerts/{alert_id}/resolve")
-            async def ui_resolve_alert(
-                alert_id: int,
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MONITORING_DIAGNOSE)),
-            ) -> Response:
-                webui.assert_same_origin(request)
-                await resolve_alert(alert_id, engine=engine, identity=identity)
-                return RedirectResponse("/ui/alerts", status_code=303)
-
-            @app.post("/ui/statistics/reset")
-            async def ui_reset_statistics(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MONITORING_DIAGNOSE)),
-            ) -> Response:
-                webui.assert_same_origin(request)
-                # The status-page "Reset statistics" button zeroes ALL cumulative counters.
-                await reset_statistics(
-                    StatsResetRequest(all=True), engine=engine, identity=identity
-                )
-                return RedirectResponse("/ui/status", status_code=303)
-
-            @app.post("/ui/statistics/reset-one")
-            async def ui_reset_statistics_one(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MONITORING_DIAGNOSE)),
-            ) -> Response:
-                # L6b (#75 parity): reset ONE connection's counters from its dashboard row (the
-                # desktop's per-row/selected reset). role/channel_id/destination arrive as hidden
-                # form fields (names aren't path-safe); build a single-target request. The finer
-                # per-channel scope check runs inside reset_statistics (403 for an out-of-scope
-                # user), exactly like the reset-all path.
-                webui.assert_same_origin(request)
-                form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
-                role: Literal["source", "destination"]
-                if form.get("role") == "source":
-                    role = "source"
-                elif form.get("role") == "destination":
-                    role = "destination"
-                else:
-                    return RedirectResponse("/ui", status_code=303)
-                channel_id = form.get("channel_id", "")
-                destination = form.get("destination") or None
-                if not channel_id:
-                    return RedirectResponse("/ui", status_code=303)
-                try:
-                    target = StatsResetTarget(
-                        role=role, channel_id=channel_id, destination=destination
-                    )
-                except ValidationError:
-                    return RedirectResponse("/ui", status_code=303)
-                await reset_statistics(
-                    StatsResetRequest(targets=[target]), engine=engine, identity=identity
-                )
-                return RedirectResponse("/ui", status_code=303)
-
-            @app.post("/ui/statistics/reset-many")
-            async def ui_reset_statistics_many(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MONITORING_DIAGNOSE)),
-            ) -> Response:
-                # Bulk counter reset over a selection of dashboard rows (both roles). Each `sel` is an
-                # encoded _row_key (role|b64url(channel_id)|b64url(destination)); build ONE
-                # StatsResetRequest and call reset_statistics directly — its per-channel scope check runs
-                # per target (a single out-of-scope target 403s the batch, matching reset-one). Undecodable
-                # sels are dropped (never reflected). require_ui already re-asserted MONITORING_DIAGNOSE.
-                webui.assert_same_origin(request)
-                pairs = parse_qsl((await request.body()).decode("utf-8", "replace"))
-                targets: list[StatsResetTarget] = []
-                seen: set[tuple[str, str, str]] = set()
-                for key, value in pairs:
-                    if key != "sel":
-                        continue
-                    decoded = webui.pages.decode_row_key(value)
-                    if decoded is None or decoded in seen:
-                        continue
-                    seen.add(decoded)
-                    role, channel_id, destination = decoded
-                    try:
-                        targets.append(
-                            StatsResetTarget(
-                                role=role,
-                                channel_id=channel_id,
-                                destination=destination or None,
-                            )
-                        )
-                    except ValidationError:
-                        continue
-                await reset_statistics(
-                    StatsResetRequest(targets=targets), engine=engine, identity=identity
-                )
-                return RedirectResponse("/ui", status_code=303)
-
-            @app.post("/ui/status/integrity-check")
-            async def ui_integrity_check(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MONITORING_DIAGNOSE)),
-            ) -> HTMLResponse:
-                webui.assert_same_origin(request)
-                result = await integrity_check(engine=engine, _user=identity)
-                return HTMLResponse(webui.pages.integrity_result(result))
-
-            @app.post("/ui/dr/activate")
-            async def ui_dr_activate(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.DR_OPERATE)),
-            ) -> Response:
-                webui.assert_same_origin(request)
-                await dr_activate(engine=engine, identity=identity, body=None)
-                return RedirectResponse("/ui/status", status_code=303)
-
-            @app.post("/ui/dr/release")
-            async def ui_dr_release(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.DR_OPERATE)),
-            ) -> Response:
-                webui.assert_same_origin(request)
-                await dr_release(engine=engine, identity=identity)
-                return RedirectResponse("/ui/status", status_code=303)
-
-        # L3b: the queue purge is step-up-gated, so register it in the write-action allow-list — this is
-        # the first extension of the registry L0b introduced (the step-up re-auth may auto-retry the
-        # body-less POST because both params, name + scope, live in the PATH).
-        webui.register_ui_action(
-            r"^/ui/connections/[^/?#]+/purge/(top|all)$", Permission.MESSAGES_PURGE
+        # Assert the seam BEFORE building the deps bundle (review fix): a package that changed the
+        # UiDeps/CoreHandlers shape for a new seam would otherwise trip at construction with a raw
+        # kwargs TypeError; this raises a clear UiSeamMismatch first.
+        assert_engine_seam(ENGINE_UI_SEAM)
+        deps = UiDeps(
+            engine_seam=ENGINE_UI_SEAM,
+            get_engine=_get_engine,
+            get_gate=_get_gate,
+            cookie_secure=_cookie_secure,
+            default_scan_limit=DEFAULT_CONTENT_SCAN_LIMIT,
+            core=CoreHandlers(
+                list_connections=list_connections,
+                list_messages=list_messages,
+                get_message=get_message,
+                list_dead_letters=list_dead_letters,
+                start_connection=start_connection,
+                stop_connection=stop_connection,
+                restart_connection=restart_connection,
+                replay_message=replay_message,
+                replay_dead_letters=replay_dead_letters,
+                list_active_alerts=list_active_alerts,
+                alerts_rules=alerts_rules,
+                list_connection_events=list_connection_events,
+                system_status=system_status,
+                security_posture=security_posture,
+                cluster_status=cluster_status,
+                cluster_nodes=cluster_nodes,
+                dr_status=dr_status,
+                service_status=service_status,
+                ack_alert=ack_alert,
+                resolve_alert=resolve_alert,
+                reset_statistics=reset_statistics,
+                integrity_check=integrity_check,
+                dr_activate=dr_activate,
+                dr_release=dr_release,
+                dual_role_control=_dual_role_control,
+                purge_connection=purge_connection,
+                config_provenance=config_provenance,
+                reload_config=reload_config,
+                search_messages=search_messages,
+                audit_channel_denied=_audit_channel_denied,
+            ),
+            admin=admin,
         )
-        # The bulk purge CONFIRM page is a step-up-UNLOCK GET form (like content-search / create-user): a
-        # stale step-up 303s to /ui/reauth and, after re-verification, 303-GET-redirects BACK to it (the
-        # ?dest/?scope query is deliberately NOT carried across — the operator re-selects on the fresh
-        # page; fail-safe for a destructive op). auto_retry=False so it is never re-POSTed body-less.
-        webui.register_ui_action(
-            r"^/ui/connections/purge-confirm$",
-            Permission.MESSAGES_PURGE,
-            auto_retry=False,
-            unlock=True,
-        )
-
-        def _register_connection_writes(app: FastAPI) -> None:
-            """L3b: outbound queue purge (soft-cancel an outbound's queued deliveries) + the bulk
-            connection-control surface. Purge is step-up-gated (require_ui_step_up → /ui/reauth) +
-            dual-control (may hold for a second approver) and acts on an OUTBOUND, so a channel-scoped user
-            is refused; bulk-control mirrors the per-name control primitive (CONNECTIONS_CONTROL, no
-            step-up). The literal bulk paths are registered BEFORE the ``{name}/purge/{scope}`` route so a
-            literal always wins over the path-param route."""
-
-            @app.post("/ui/connections/bulk-control")
-            async def ui_bulk_control(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.CONNECTIONS_CONTROL)),
-            ) -> HTMLResponse:
-                # Bulk Start/Stop/Restart over selected rows (both roles). require_ui re-asserts
-                # CONNECTIONS_CONTROL (the dual-role handler's own Depends is skipped on a direct call).
-                # Each `sel` is an encoded _row_key; dispatch per unique control target (a multi-edge
-                # outbound → one destination name → fires once), capturing each per-target failure so one
-                # bad target never aborts the batch. Undecodable sels render the fixed label, never bytes.
-                webui.assert_same_origin(request)
-                pairs = parse_qsl((await request.body()).decode("utf-8", "replace"))
-                action = next((v for k, v in pairs if k == "action"), "")
-                if action not in ("start", "stop", "restart"):
-                    raise HTTPException(404, "unknown control action")
-                outcomes: list[tuple[str | None, str]] = []
-                seen: set[tuple[str, str]] = set()
-                for key, value in pairs:
-                    if key != "sel":
-                        continue
-                    decoded = webui.pages.decode_row_key(value)
-                    if decoded is None:
-                        outcomes.append((None, "not applied"))
-                        continue
-                    role, channel_id, destination = decoded
-                    name = channel_id if role == "source" else destination
-                    if not name:  # a destination row with no destination name is malformed
-                        outcomes.append((None, "not applied"))
-                        continue
-                    # Dedupe per (role, name): a multi-edge outbound is controlled once, but a same-named
-                    # source and destination are two distinct control targets — never collapsed to one.
-                    if (role, name) in seen:
-                        continue
-                    seen.add((role, name))
-                    try:
-                        result = await _dual_role_control(engine, identity, name, action, role=role)
-                        outcomes.append((name, f"applied (running={result['running']})"))
-                    except HTTPException as exc:
-                        outcomes.append((name, f"{exc.status_code}: {exc.detail}"))
-                    except Exception:  # noqa: BLE001 - capture-and-continue; one bad target never aborts the batch
-                        _log.exception("bulk control %s failed for %r", action, name)
-                        outcomes.append((name, "error"))
-                return HTMLResponse(webui.pages.bulk_control_result(action, outcomes))
-
-            @app.get("/ui/connections/purge-confirm", response_class=HTMLResponse)
-            async def ui_purge_confirm(
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui_step_up(Permission.MESSAGES_PURGE)),
-                dest: list[str] | None = Query(None),
-                scope: str = Query("all", max_length=8),
-            ) -> HTMLResponse:
-                # Step-up-unlock confirm page for the bulk purge. A channel-scoped user can't purge a
-                # shared outbound (mirrors purge_connection); validate the scope (404, not 422, matching
-                # the per-name route); then RE-DERIVE eligibility from LIVE quiescence — intersect the
-                # requested ?dest with rr.outbound_quiesced(d), dropping anything since-started / not-yet-
-                # quiesced. On a stale step-up, require_ui_step_up already 303'd to /ui/reauth and the
-                # unlock flow GET-redirects back here WITHOUT the query, so dest is empty → nothing pre-
-                # armed (the operator re-selects). The confirm form POSTs to /ui/connections/purge-bulk.
-                if identity.allowed_channels is not None:
-                    await _audit_channel_denied(engine, identity, None)
-                    raise HTTPException(
-                        403, "channel-scoped users cannot purge a shared outbound connection"
-                    )
-                if scope not in ("top", "all"):
-                    raise HTTPException(404, "unknown purge scope")
-                rr = engine.registry_runner
-                eligible: list[str] = []
-                seen_dest: set[str] = set()
-                for d in dest or []:
-                    if d in seen_dest:
-                        continue
-                    seen_dest.add(d)
-                    if rr is not None and rr.outbound_quiesced(d):
-                        eligible.append(d)
-                return HTMLResponse(webui.pages.purge_confirm(eligible, scope))
-
-            @app.post("/ui/connections/purge-bulk")
-            async def ui_purge_bulk(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(
-                    webui.require_ui_step_up(
-                        Permission.MESSAGES_PURGE,
-                        reauth_next=lambda _r: "/ui/connections/purge-confirm",
-                    )
-                ),
-                gate: ApprovalGate | None = Depends(_get_gate),
-            ) -> HTMLResponse:
-                # The body-carrying bulk purge. require_ui_step_up re-asserts MESSAGES_PURGE + the step-up
-                # window (mapping a stale window's re-auth to the confirm UNLOCK page, never a body-less
-                # re-POST). Validate the scope BEFORE fan-out (a directly-called purge_connection skips its
-                # own Query pattern, so an unvalidated scope would silently become purge-all). Then, per
-                # UNIQUE dest, call purge_connection DIRECTLY (its require_step_up Depends is skipped, so
-                # the 409 require-quiesced guard + the ApprovalGate dual-control run per dest), capturing
-                # PurgeResult / PendingApprovalResponse / HTTPException(403/404/409) — one bad dest never
-                # aborts the batch.
-                webui.assert_same_origin(request)
-                pairs = parse_qsl((await request.body()).decode("utf-8", "replace"))
-                scope = next((v for k, v in pairs if k == "scope"), "all")
-                if scope not in ("top", "all"):
-                    raise HTTPException(404, "unknown purge scope")
-                outcomes: list[tuple[str | None, str]] = []
-                seen_dest: set[str] = set()
-                for key, value in pairs:
-                    if key != "dest":
-                        continue
-                    if value in seen_dest:
-                        continue
-                    seen_dest.add(value)
-                    try:
-                        result = await purge_connection(
-                            value,
-                            Response(),
-                            engine=engine,
-                            scope=scope,
-                            identity=identity,
-                            gate=gate,
-                        )
-                        if isinstance(result, PendingApprovalResponse):
-                            outcomes.append((value, f"held for approval ({result.approval_id})"))
-                        else:
-                            outcomes.append((value, f"purged {result.cancelled}"))
-                    except HTTPException as exc:
-                        outcomes.append((value, f"{exc.status_code}: {exc.detail}"))
-                    except Exception:  # noqa: BLE001 - capture-and-continue; one bad dest never aborts the batch
-                        _log.exception("bulk purge failed for %r", value)
-                        outcomes.append((value, "error"))
-                return HTMLResponse(webui.pages.purge_result(scope, outcomes))
-
-            @app.post("/ui/connections/{name}/purge/{scope}")
-            async def ui_purge_connection(
-                name: str,
-                scope: str,
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui_step_up(Permission.MESSAGES_PURGE)),
-                gate: ApprovalGate | None = Depends(_get_gate),
-            ) -> Response:
-                webui.assert_same_origin(request)
-                if scope not in ("top", "all"):
-                    raise HTTPException(404, "unknown purge scope")
-                result = await purge_connection(
-                    name, Response(), engine=engine, scope=scope, identity=identity, gate=gate
-                )
-                if isinstance(result, PendingApprovalResponse):
-                    return HTMLResponse(webui.pages.purge_pending(result))
-                return RedirectResponse("/ui", status_code=303)
-
-        # L3c: config reload is step-up-gated, so register it in the write-action allow-list (body-less
-        # POST, no path params — the /ui/reauth flow may auto-retry it after step-up).
-        webui.register_ui_action(r"^/ui/config/reload$", Permission.CONFIG_DEPLOY)
-
-        def _register_config(app: FastAPI) -> None:
-            """L3c: config-deploy — reload the engine's ALREADY-CONFIGURED graph from its own startup dir.
-            STRICTLY within #26: no module editor, no filesystem picker, no dry-run diff. The reload is
-            step-up-gated (CONFIG_DEPLOY) + dual-control; it passes a fixed ReloadRequest() so config_dir
-            is ALWAYS the server startup dir (never user input) and dry_run is False."""
-
-            @app.get("/ui/config", response_class=HTMLResponse)
-            async def ui_config(
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui(Permission.MONITORING_READ)),
-            ) -> HTMLResponse:
-                prov = await config_provenance(engine=engine, _user=identity)
-                return HTMLResponse(webui.pages.config_page(prov))
-
-            @app.post("/ui/config/reload")
-            async def ui_config_reload(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui_step_up(Permission.CONFIG_DEPLOY)),
-                gate: ApprovalGate | None = Depends(_get_gate),
-            ) -> HTMLResponse:
-                webui.assert_same_origin(request)
-                # Bright line: a FIXED request — config_dir=None (the server's startup dir) + dry_run=False.
-                # The /ui never lets the browser choose a path (the loader executes Python).
-                result = await reload_config(
-                    ReloadRequest(config_dir=None, dry_run=False),
-                    Response(),
-                    engine=engine,
-                    user=identity,
-                    gate=gate,
-                )
-                if isinstance(result, PendingApprovalResponse):
-                    return HTMLResponse(webui.pages.reload_pending(result))
-                return HTMLResponse(webui.pages.reload_result(result))
-
-        # content-search (ADR 0046 #51): the search PAGE is step-up-gated (bulk-PHI decrypt), so register
-        # it as an UNLOCK form — a stale step-up 303s to /ui/reauth and GET-redirects back to the fresh
-        # search form (the L0c step-up-to-unlock primitive; the PHI-shaped search term is a GET query, so
-        # it is deliberately NOT carried across the redirect — the operator re-enters it in the window).
-        webui.register_ui_action(
-            r"^/ui/messages/search$", Permission.MESSAGES_READ, auto_retry=False, unlock=True
-        )
-
-        def _register_search(app: FastAPI) -> None:
-            """content-search: a step-up-unlock GET page over the JSON search_messages handler."""
-
-            @app.get("/ui/messages/search", response_class=HTMLResponse)
-            async def ui_message_search(
-                request: Request,
-                engine: Engine = Depends(_get_engine),
-                identity: Identity = Depends(webui.require_ui_step_up(Permission.MESSAGES_READ)),
-                content: str | None = Query(None, max_length=512),
-                field_path: str | None = Query(None, max_length=32),
-                field_value: str | None = Query(None, max_length=512),
-                target: str = Query("both", pattern="^(raw|summary|both)$"),
-                channel_id: str | None = Query(None, max_length=256),
-                status_filter: str | None = Query(None, alias="status", max_length=64),
-                message_type: str | None = Query(None, max_length=64),
-                control_id: str | None = Query(None, max_length=256),
-                limit: int = Query(50, ge=1, le=500),
-            ) -> HTMLResponse:
-                # A criterion is required to search; with none, render the bare form (no decrypt/audit).
-                # A field_path alone is a valid presence-test search (matches make_spec/row_matches),
-                # so it counts as a criterion too — keeping /ui at parity with the JSON API.
-                has_criteria = bool(content) or bool(field_value) or bool(field_path)
-                shared = dict(
-                    content=content or "",
-                    field_path=field_path or "",
-                    field_value=field_value or "",
-                    target=target,
-                    channel_id=channel_id or "",
-                    status=status_filter or "",
-                    message_type=message_type or "",
-                    control_id=control_id or "",
-                )
-                if not has_criteria:
-                    return HTMLResponse(webui.pages.message_search(None, **shared))
-                try:
-                    # Call the JSON handler directly (its require_step_up Depends is skipped —
-                    # require_ui_step_up above re-asserted it); pass every param explicitly.
-                    results = await search_messages(
-                        request,
-                        engine=engine,
-                        identity=identity,
-                        content=content,
-                        field_path=field_path,
-                        field_value=field_value,
-                        target=target,
-                        channel_id=channel_id,
-                        status=status_filter,
-                        message_type=message_type,
-                        control_id=control_id,
-                        limit=limit,
-                        scan_limit=DEFAULT_CONTENT_SCAN_LIMIT,
-                    )
-                except HTTPException as exc:
-                    if (
-                        exc.status_code == 400
-                    ):  # make_spec rejected the criteria — re-render the form
-                        return HTMLResponse(
-                            webui.pages.message_search(None, error=str(exc.detail), **shared),
-                            status_code=400,
-                        )
-                    raise
-                return HTMLResponse(webui.pages.message_search(results, **shared))
-
-        def _register_sso(app: FastAPI) -> None:
-            """L5c (ADR 0068 §9): the browser Kerberos SSO challenge route — RFC 4559,
-            Kerberos-only SINGLE-LEG, off by default ([auth].kerberos_enabled, experimental)."""
-
-            @app.get("/ui/sso")
-            async def ui_sso(request: Request) -> Response:
-                auth = get_auth(request)
-                if auth is None or not auth.kerberos_available:
-                    # Disabled/degraded: redirect WITHOUT auditing (review carve-out, ADR 0068 §9).
-                    # There is no rate limiter in front of this branch, so auditing a token-bearing
-                    # attempt here would be an unbounded unauthenticated DB-write amplifier — the
-                    # exact anti-flood invariant the JSON rate-limit path preserves. The attempt is
-                    # a no-op (SSO is off); its visibility is the operator-facing serve-time state.
-                    return RedirectResponse("/ui/login?e=sso_unavailable", status_code=303)
-                header = request.headers.get("Authorization", "")
-                if not header.startswith("Negotiate "):
-                    # The RFC 4559 challenge leg — deliberately NOT rate-limited: every
-                    # unauthenticated SSO navigation produces one 401 before the browser attaches
-                    # its token; throttling it would self-lock normal traffic (ADR 0068 §9). The
-                    # HTML body keeps a browser without SSO configured from dead-ending.
-                    return HTMLResponse(
-                        webui.pages.sso_challenge(),
-                        status_code=401,
-                        headers={"WWW-Authenticate": "Negotiate"},
-                    )
-                # Token-bearing leg. The rate limiter runs FIRST (review fix, ADR 0068 §9): it
-                # bounds EVERY downstream audit write to the limiter's rate, so an attacker looping
-                # token requests can't amplify into unbounded audit_log growth. The rate-limit
-                # reject itself is a _log.warning (NOT an audit) — parity with the JSON
-                # _rate_limited path's anti-flood posture — so exhaustion writes zero DB rows.
-                client = request.client.host if request.client else None
-                if not auth.allow_login_attempt(client):
-                    _log.warning("SSO rate limit exceeded for %s", client or "<unknown>")
-                    return RedirectResponse("/ui/login?e=rate_limited", status_code=303)
-                # Cross-site hygiene — an audited SSO reject (AUTH-K-AUDIT), now behind the limiter
-                # so the audit is bounded: a non-navigation fetch is drive-by ambient-auth probing.
-                # A cross-site TOP-LEVEL navigation is allowed (intranet links keep working; the
-                # residual harm of a forced navigation is self-login only — server-minted token, no
-                # fixation, ADR 0068 §9 threat model).
-                mode = request.headers.get("Sec-Fetch-Mode")
-                if mode is not None and mode != "navigate":
-                    await auth.audit_kerberos_reject("non_navigation_fetch")
-                    return RedirectResponse("/ui/login?e=sso_failed", status_code=303)
-                try:
-                    token_bytes = base64.b64decode(header[len("Negotiate ") :], validate=True)
-                except (binascii.Error, ValueError):
-                    await auth.audit_kerberos_reject("malformed_token")
-                    return RedirectResponse("/ui/login?e=sso_failed", status_code=303)
-                # seed_reauth=False (ADR 0068 §9): the SSO proof is AMBIENT — the session must not
-                # be born with a free step-up window; the first sensitive action forces the
-                # directory-password step-up at /ui/reauth. ONE session per navigation into this
-                # route (the resync side effect fires here, never per page).
-                outcome = await auth.authenticate_kerberos(
-                    token_bytes, client=client, seed_reauth=False
-                )
-                if not outcome.ok or outcome.token is None:
-                    # authenticate_kerberos audited the reject. NEVER a second 401 — no challenge
-                    # loops (Kerberos-only single-leg is a hard line; an NTLM NegTokenInit from an
-                    # IP-hosted/SPN-less URL, an expired ticket, or an unknown principal all land
-                    # here). The single-leg helper deliberately discards the acceptor's out_token —
-                    # no mutual-auth response header (SECURITY.md's "no mutual authentication"; ADR
-                    # 0068 §9 records this as the current posture).
-                    return RedirectResponse("/ui/login?e=sso_failed", status_code=303)
-                resp = RedirectResponse("/ui", status_code=303)
-                webui.set_session_cookie(resp, outcome.token, secure=_cookie_secure(request))
-                return resp
-
-        _UI_REGISTRARS: tuple[Callable[[FastAPI], None], ...] = (
-            # _register_search FIRST: its literal /ui/messages/search must be matched BEFORE
-            # _register_core's /ui/messages/{message_id}, which would otherwise capture it as an id.
-            _register_search,
-            _register_core,
-            _register_monitoring,
-            _register_status,
-            _register_monitoring_writes,
-            _register_connection_writes,
-            _register_config,
-            _register_sso,
-        )
-        for _register in _UI_REGISTRARS:
-            _register(app)
+        mount_ui(app, deps)
 
     return app
 

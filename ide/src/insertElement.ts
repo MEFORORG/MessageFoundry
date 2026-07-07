@@ -7,11 +7,21 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 
+import { findElements } from "./editorToolbar";
+
 interface SnippetDef {
   prefix?: string;
   body: string | string[];
   description?: string;
+  // Restricts the idiom to inside a `@router` or `@handler` def (e.g. `Send`/`db_lookup`/`fhir_lookup`
+  // are Handler-only capabilities that raise on a Router — ADR 0010/0043; a Router-returned handler
+  // name list is meaningless inside a Handler). Absent = context-agnostic, always shown.
+  context?: "router" | "handler";
 }
+
+/** The cursor's enclosing element, for filtering the picks — `null` outside any router/handler def
+ * (e.g. top-level connection wiring, or a file with none), the fallback case that shows every idiom. */
+export type CursorContext = "router" | "handler" | null;
 
 export interface ElementPick extends vscode.QuickPickItem {
   body?: string; // the snippet text to insert (absent on separator rows)
@@ -49,6 +59,46 @@ export function buildPicks(snippets: Record<string, SnippetDef>): ElementPick[] 
   return picks;
 }
 
+/**
+ * Which enclosing element (if any) `cursorLine` (0-based) sits inside — reusing the editor toolbar's
+ * simple line-scan `findElements` locator: the nearest router/handler/inbound/outbound declaration at
+ * or above the cursor defines the scope until the next one (an `inbound`/`outbound` line, or leaving a
+ * `router`/`handler` for a later one, resets the scope). Not a full Python parse — a deliberately
+ * simple heuristic, same spirit as `findElements` itself. Pure so it is unit-testable.
+ */
+export function detectContext(text: string, cursorLine: number): CursorContext {
+  let current: CursorContext = null;
+  for (const el of findElements(text)) {
+    if (el.line > cursorLine) {
+      break;
+    }
+    current = el.kind === "router" || el.kind === "handler" ? el.kind : null;
+  }
+  return current;
+}
+
+/**
+ * Narrow the snippet catalog to those valid in `cursorContext`. A snippet with no `context` tag is
+ * context-agnostic and always kept; one tagged `"router"`/`"handler"` is kept only when it matches (or
+ * when `cursorContext` is `null` — outside any router/handler def, where every idiom is offered as a
+ * fallback). Pure so it is unit-testable.
+ */
+export function filterSnippetsForContext(
+  snippets: Record<string, SnippetDef>,
+  cursorContext: CursorContext,
+): Record<string, SnippetDef> {
+  if (cursorContext === null) {
+    return snippets;
+  }
+  const out: Record<string, SnippetDef> = {};
+  for (const [name, def] of Object.entries(snippets)) {
+    if (!def.context || def.context === cursorContext) {
+      out[name] = def;
+    }
+  }
+  return out;
+}
+
 export function registerInsertElement(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("messagefoundry.insertElement", async () => {
@@ -61,7 +111,8 @@ export function registerInsertElement(context: vscode.ExtensionContext): void {
       }
       let picks: ElementPick[];
       try {
-        picks = buildPicks(loadSnippets(context.extensionPath));
+        const cursorContext = detectContext(editor.document.getText(), editor.selection.active.line);
+        picks = buildPicks(filterSnippetsForContext(loadSnippets(context.extensionPath), cursorContext));
       } catch (e) {
         void vscode.window.showErrorMessage(`MessageFoundry: could not load snippets — ${String(e)}`);
         return;
