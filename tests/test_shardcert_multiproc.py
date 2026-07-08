@@ -351,9 +351,11 @@ async def test_worker_fails_loud_on_empty_slice(
 
 
 def _drive_report(**over: Any) -> sc.ShardCertDriveReport:
-    """A BALANCED synthetic drive report (A=150 intake, dests=2 fan-out ⇒ engine_done == S == 300),
-    overridable field-by-field to exercise each loss signal. offered=120 (< A/(1-TOL)) so a balanced
-    report is not a ceiling."""
+    """A BALANCED synthetic drive report (A=150 intake, dests=2 fan-out ⇒ S == 300), overridable
+    field-by-field to exercise each loss signal. offered=120 (< A/(1-TOL)) so a balanced report is not
+    a ceiling. The poller fields (engine_done/engine_dead/in_pipeline_final/drained) are ADVISORY only —
+    the gated verdict keys off the SINK count (S) alone; they are set here to healthy values so tests can
+    prove the verdict is INDEPENDENT of them by overriding them to unhealthy values."""
     base: dict[str, Any] = dict(
         shards=("a", "b"),
         dests=2,
@@ -394,22 +396,35 @@ def test_reconcile_fails_on_sink_short_of_fanout() -> None:
     assert r.no_loss is False and r.ok is False
 
 
-def test_reconcile_fails_on_engine_dead() -> None:
-    # (b) a dead-letter ⇒ acknowledged loss.
+def test_reconcile_passes_despite_advisory_engine_dead() -> None:
+    # PR-C1b: engine_dead is the ADVISORY poller cross-check, NOT gated on the DRIVE box (dead-letters
+    # are the ENGINE half's store-truth verdict). With perfect sink balance the DRIVE still PASSes.
     r = _drive_report(engine_dead=1)
-    assert r.no_loss is False and r.ok is False
+    assert r.no_loss is True and r.ok is True
 
 
-def test_reconcile_fails_on_engine_done_mismatch() -> None:
-    # engine store-marked deliveries fell short of A*dests (store-truth loss), even with S intact.
-    r = _drive_report(engine_done=299)
-    assert r.no_loss is False and r.ok is False
+def test_reconcile_passes_despite_advisory_engine_done_mismatch() -> None:
+    # PR-C1b: engine_done is advisory (4x shard-API overcount / zeroes under load on a unified store).
+    # It must NOT drive the DRIVE verdict — sink socket-truth (S == A*dests) alone certifies no-loss.
+    r = _drive_report(engine_done=1)
+    assert r.no_loss is True and r.ok is True
 
 
-def test_reconcile_fails_on_not_drained() -> None:
-    r = _drive_report(drained=False, drain_seconds=None)
-    assert r.no_loss is False and r.ok is False
-    assert r.ceiling is True  # a non-draining step is a throughput ceiling too
+def test_reconcile_r2_regression_passes_despite_dead_poller() -> None:
+    # r2 REGRESSION (rig HANDOFF#2 2026-07-08, the whole point): the remote /stats poller returned
+    # done=0, dead=0, in_pipeline=-1 AND drained=False (drain_seconds=None) on a PROVABLY lossless run,
+    # which false-FAILed under the old poller-gated formula. With the sink balance PERFECT the DRIVE must
+    # now PASS — the verdict no longer depends on the (unreliable) poller.
+    r = _drive_report(
+        engine_done=0,
+        engine_dead=0,
+        in_pipeline_final=-1,
+        drained=False,
+        drain_seconds=None,
+    )
+    assert r.no_loss is True
+    assert r.ok is True
+    assert r.ceiling is False  # sink-based no_loss holds and intake >= offered*(1-TOL)
 
 
 def test_reconcile_fails_on_inversions() -> None:
@@ -431,10 +446,10 @@ def test_reconcile_fails_on_vacuous_lanes() -> None:
 
 
 def test_reconcile_fails_on_zero_intake() -> None:
-    # (e) A == 0 ⇒ no_loss is VACUOUSLY true (0 == 0 == 0), but the collector-nonzero gate fails it: a
-    # run that ingested/delivered nothing must never silently certify "no loss".
+    # (e) A == 0 would make the count identity VACUOUSLY hold (0 == 0), but the collector-nonzero gate
+    # (A > 0) folds into no_loss now, so a run that ingested nothing does NOT certify "no loss".
     r = _drive_report(acked=0, sink_received=0, engine_done=0)
-    assert r.no_loss is True
+    assert r.no_loss is False
     assert r.ok is False
 
 
@@ -451,13 +466,35 @@ def test_drive_report_ceiling_on_intake_shortfall() -> None:
     assert r.no_loss is True and r.ceiling is True
 
 
+def test_reconcile_r1_real_loss_ceiling_regardless_of_poller() -> None:
+    # r1 (real loss): sinks delivered far fewer than A*dests (S=100 << 300) ⇒ no_loss False, ok False,
+    # and ceiling True (not no_loss). A HEALTHY poller (done==A*dests, drained, dead=0) must NOT mask it —
+    # the verdict is sink-truth, so a store-marked-done-but-socket-dropped loss is still caught.
+    r = _drive_report(sink_received=100, engine_done=300, engine_dead=0, drained=True)
+    assert r.no_loss is False
+    assert r.ok is False
+    assert r.ceiling is True
+
+
 def test_drive_report_renders_and_serializes() -> None:
     r = _drive_report()
     text = r.render()
     assert "verdict=PASS" in text and "fanout(dests)=2" in text
+    # The poller cross-check is rendered but clearly labeled advisory / NOT gated.
+    assert "advisory" in text and "NOT gated" in text
     js = r.to_json_dict()
     assert js["kind"] == "shardcert_drive" and js["verdict"] == "PASS"
     assert js["traffic"]["acked"] == 150 and js["traffic"]["sink_received"] == 300
+    # The gated correctness block is sink-truth only — the poller terms are NOT in it.
+    correctness = js["correctness"]
+    assert isinstance(correctness, dict)
+    assert "engine_done" not in correctness and "engine_dead" not in correctness
+    # The advisory poller fields are retained for telemetry, in their own labeled block.
+    advisory = js["advisory_poller"]
+    assert isinstance(advisory, dict)
+    assert advisory["engine_done"] == 300 and advisory["engine_dead"] == 0
+    assert advisory["in_pipeline_final"] == 0 and advisory["drained"] is True
+    assert "NOT gated" in str(advisory["note"])
 
 
 # --- Layer 3: full coordinator round-trip (faked spawn + poller) ------------------------------------

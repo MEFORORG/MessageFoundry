@@ -1984,30 +1984,32 @@ class ShardCertDriveReport:
 
     @property
     def no_loss(self) -> bool:
-        """Count-balance + engine REMOTE store-truth (NO-KILL, strict): the fleet drained, no engine
-        dead-letters, and BOTH the engine's store-marked deliveries (``engine_done``) AND the sinks'
-        socket-observed deliveries (``S``) equal ``A * dests`` — the sink cross-check catches a
-        store-marked-done-but-socket-dropped delivery the engine gauge alone would miss."""
+        """Count-balance on SINK SOCKET-TRUTH ONLY (NO-KILL, strict): the sinks' socket-observed
+        deliveries (``S``) equal the accept-ACK'd intake fanned out (``A * dests``), with both sides
+        non-vacuous (``A > 0``, ``S > 0``).
+
+        Deliberately does NOT gate on the poller terms (``drained``, ``engine_dead``, ``engine_done``):
+        they are read from the engine ``/stats`` REMOTELY and are UNRELIABLE on a unified store — the
+        gauges SUM ``done``/``dead`` over all shard APIs (4× overcount) and ``await_drain`` zeroes/misses
+        under load (the exact metric ``mf-bench-attribution-policy`` + the C1 runbook say to NEVER gate
+        on). The strand / dead-at-any-stage authority is the ENGINE half's report, which reads the store
+        DIRECTLY (store-truth) and owns that verdict; the sinks are the DRIVE box's only reliable truth.
+        The poller terms remain as ADVISORY cross-check fields (see ``render``/``to_json_dict``)."""
         fanout = self.acked * self.dests
-        return (
-            self.drained
-            and self.engine_dead == 0
-            and self.engine_done == fanout
-            and self.sink_received == fanout
-        )
+        return self.sink_received == fanout and self.acked > 0 and self.sink_received > 0
 
     @property
     def ok(self) -> bool:
-        """Pass bar: no-loss AND per-lane FIFO (non-vacuous, ``lanes_observed >= 2``) AND no duplicates
-        AND the collector-nonzero gates (``A > 0``, ``S > 0``) — a vacuous run that sent or delivered
-        nothing must NOT silently certify."""
+        """Pass bar: sink-truth no-loss AND per-lane FIFO (non-vacuous, ``lanes_observed >= 2``) AND no
+        duplicates. The collector-nonzero gates (``A > 0``, ``S > 0``) fold into ``no_loss`` — a vacuous
+        run that sent or delivered nothing must NOT silently certify. Excludes the poller terms
+        (``drained``/``engine_dead``/``engine_done``) for the reason stated on ``no_loss``: they are
+        advisory here; dead-letters + strands are the engine half's store-truth verdict, not the drive's."""
         return (
             self.no_loss
             and self.lane_inversions == 0
             and self.lanes_observed >= 2
             and self.lane_repeats == 0
-            and self.acked > 0
-            and self.sink_received > 0
         )
 
     @property
@@ -2037,13 +2039,17 @@ class ShardCertDriveReport:
             f"K={self.driver_count}sender x M={self.sink_count}sink  fanout(dests)={self.dests}",
             f"  rate={self.aggregate_rate:g}/s hold={self.hold_seconds:g}s offered={self.offered} "
             f"sent={self.sent} acked(A)={a} sink_received(S)={self.sink_received}",
-            f"  no-loss: drained={self.drained} engine_done={self.engine_done} "
-            f"(expect A*dests={a * self.dests}) engine_dead={self.engine_dead} "
-            f"in_pipeline_final={self.in_pipeline_final} -> {'OK' if self.no_loss else 'LOSS'}",
+            f"  no-loss (SINK truth): sink_received(S)={self.sink_received} "
+            f"(expect A*dests={a * self.dests}) -> {'OK' if self.no_loss else 'LOSS'}",
             f"  FIFO: lane_inversions={self.lane_inversions} lanes_observed={self.lanes_observed} "
             f"lane_repeats(dups)={self.lane_repeats}",
             f"  ack p50/p99(max over senders)={self.ack_p50_ms:.1f}/{self.ack_p99_ms:.1f}ms "
             f"drain_s={self.drain_seconds}" + ("  <= CEILING" if self.ceiling else ""),
+            # ADVISORY poller cross-check, NOT gated (unreliable on a unified store: 4x shard-API
+            # overcount / zeroes under load; the engine half's DIRECT store-truth owns strand/dead).
+            f"  advisory (poller x-check, NOT gated): engine_done={self.engine_done} "
+            f"engine_dead={self.engine_dead} in_pipeline_final={self.in_pipeline_final} "
+            f"drained={self.drained}",
         ]
         for n in self.notes:
             lines.append(f"  note: {n}")
@@ -2070,18 +2076,27 @@ class ShardCertDriveReport:
                 "sink_received": self.sink_received,
             },
             "correctness": {
+                # SINK socket-truth only — the gated verdict. See ``no_loss``/``ok`` for why the
+                # poller terms (engine_done/engine_dead/drained) are excluded (they live in
+                # ``advisory_poller`` below).
                 "no_loss": self.no_loss,
                 "lane_inversions": self.lane_inversions,
                 "lanes_observed": self.lanes_observed,
                 "lane_repeats": self.lane_repeats,
-                "engine_done": self.engine_done,
-                "engine_dead": self.engine_dead,
             },
             "throughput": {
-                "in_pipeline_final": self.in_pipeline_final,
-                "drained": self.drained,
                 "drain_seconds": self.drain_seconds,
                 "ceiling": self.ceiling,
+            },
+            "advisory_poller": {
+                # Poller cross-check, NOT gated: unreliable on a unified store (4x shard-API overcount
+                # on done/dead; await_drain zeroes/misses under load). Retained for telemetry; the
+                # engine half's DIRECT store-truth is the strand/dead authority.
+                "note": "poller cross-check, NOT gated (unreliable on a unified store)",
+                "engine_done": self.engine_done,
+                "engine_dead": self.engine_dead,
+                "in_pipeline_final": self.in_pipeline_final,
+                "drained": self.drained,
             },
             "ack_ms": {"p50": round(self.ack_p50_ms, 3), "p99": round(self.ack_p99_ms, 3)},
             "notes": self.notes,
