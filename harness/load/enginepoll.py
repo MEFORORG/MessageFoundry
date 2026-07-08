@@ -187,10 +187,18 @@ class EnginePoller:
     drain across the whole cluster."""
 
     def __init__(
-        self, engine_urls: str | Sequence[str], token: str | None, *, origin: float
+        self,
+        engine_urls: str | Sequence[str],
+        token: str | None,
+        *,
+        origin: float,
+        allow_insecure: bool = False,
     ) -> None:
         # Accept a single URL (back-compat) or a list. The first URL is the "primary" whose `client`
-        # is exposed for one-off preflight reads (served-ports check).
+        # is exposed for one-off preflight reads (served-ports check). `allow_insecure` (default False)
+        # is REQUIRED to poll a REMOTE engine over plaintext http (a co-located loopback engine is
+        # always allowed) — the two-box shardcert drives poll the engine box's http API off-box, so
+        # they thread it True; without it EngineClient fail-closes on the non-loopback http URL.
         urls = [engine_urls] if isinstance(engine_urls, str) else list(engine_urls)
         if not urls:
             raise ValueError("EnginePoller needs at least one engine URL")
@@ -206,6 +214,7 @@ class EnginePoller:
         self._urls = deduped
         self._token = token
         self._origin = origin
+        self._allow_insecure = allow_insecure
         self._clients: list[EngineClient] = []
         self._samples: list[EngineSample] = []
 
@@ -283,7 +292,7 @@ class EnginePoller:
     def _open_sync(self) -> None:
         clients: list[EngineClient] = []
         for url in self._urls:
-            client = EngineClient(url)
+            client = EngineClient(url, allow_insecure=self._allow_insecure)
             if self._token:
                 client.set_token(self._token)  # does a /me request to validate
             clients.append(client)

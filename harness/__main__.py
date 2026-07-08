@@ -918,12 +918,21 @@ def _run_shardcert_driver(argv: list[str]) -> int:
         help="interface the correlation sink binds LOCALLY (0.0.0.0 on the load-gen box; loopback "
         "co-located). Must be reachable at the engine's --sink-host delivery target",
     )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="allow the REMOTE /stats poller to use plaintext http to the engine box (a trusted-network "
+        "dev/bench setup; loopback never needs it). REQUIRED when the engine API is http, else the poller "
+        "fail-closes on the non-loopback URL at drain",
+    )
     _add_coord_args(parser)
     parser.add_argument("--report-json", help="write the JSON report to this path")
     args = parser.parse_args(argv)
 
     import json
     from pathlib import Path
+
+    from messagefoundry.console.client import ApiError
 
     from harness.load.coord import CoordTimeout, FileDropCoord
     from harness.load.shardcert import run_shardcert_driver
@@ -939,8 +948,17 @@ def _run_shardcert_driver(argv: list[str]) -> int:
                 drain_timeout=args.drain_timeout,
                 coord=coord,
                 sink_host=args.sink_host,
+                allow_insecure=args.insecure,
             )
         )
+    except (
+        ApiError
+    ) as exc:  # plaintext http to a remote engine without --insecure — actionable, not a crash
+        print(
+            f"shardcert-driver: {exc}\n(hint: pass --insecure for a trusted-network http engine)",
+            file=sys.stderr,
+        )
+        return 2
     except CoordTimeout as exc:
         print(f"shardcert-driver: {exc}", file=sys.stderr)
         return 2
@@ -1167,9 +1185,18 @@ def _run_shardcert_drive(argv: list[str]) -> int:
         help="interface the sink children bind LOCALLY (0.0.0.0 on the load-gen box; loopback co-located). "
         "Must be reachable at the engine's --sink-host delivery target",
     )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="allow the engine /stats poller to use plaintext http to the REMOTE engine box (a "
+        "trusted-network dev/bench setup; loopback never needs it). REQUIRED for a two-box drive whose "
+        "engine API is http, else the poller fail-closes on the non-loopback URL after spawning children",
+    )
     _add_coord_args(parser)
     parser.add_argument("--report-json", help="write the JSON report to this path")
     args = parser.parse_args(argv)
+
+    from messagefoundry.console.client import ApiError
 
     from harness.load.coord import CoordTimeout, FileDropCoord
     from harness.load.shardcert import run_shardcert_drive
@@ -1186,12 +1213,21 @@ def _run_shardcert_drive(argv: list[str]) -> int:
                 sink_count=args.sink_count,
                 sink_host=args.sink_host,
                 coord=coord,
+                allow_insecure=args.insecure,
             )
         )
     except (
         ValueError
     ) as exc:  # a mis-sized fleet (partition/slice can't tile) — fail loud, setup error
         print(f"shardcert-drive: {exc}", file=sys.stderr)
+        return 2
+    except (
+        ApiError
+    ) as exc:  # plaintext http to a remote engine without --insecure — actionable, not a crash
+        print(
+            f"shardcert-drive: {exc}\n(hint: pass --insecure for a trusted-network http engine)",
+            file=sys.stderr,
+        )
         return 2
     except CoordTimeout as exc:
         print(f"shardcert-drive: {exc}", file=sys.stderr)

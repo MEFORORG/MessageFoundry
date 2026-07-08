@@ -1425,6 +1425,7 @@ async def run_shardcert_driver(
     sink_host: str = "127.0.0.1",
     shards_ready_timeout: float = 300.0,
     inbound_ready_timeout: float = 60.0,
+    allow_insecure: bool = False,
 ) -> ShardCertDriverReport:
     """The LOAD-GEN-box half (WS-C option #2). Waits for :data:`SHARDS_READY`, binds the correlation
     sink LOCALLY (``sink_host`` — the load-gen box) over the advertised port band, opens one persistent
@@ -1498,8 +1499,10 @@ async def run_shardcert_driver(
         await asyncio.gather(*(c.stop(2.0) for c in conns))
 
         # Drain against the engines' REMOTE /stats — the authoritative drain signal, polled off-box.
+        # allow_insecure: the remote engine API is plaintext http, so the poller needs it (loopback
+        # never does) — else poller.open() fail-closes on the non-loopback http URL.
         urls = [f"http://{engine_host}:{p}" for p in api_ports]
-        poller = EnginePoller(urls, None, origin=time.perf_counter())
+        poller = EnginePoller(urls, None, origin=time.perf_counter(), allow_insecure=allow_insecure)
         await poller.open()
         drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
         final = poller.final
@@ -2100,6 +2103,7 @@ async def run_shardcert_drive(
     sink_done_timeout: float = 120.0,
     drain_timeout: float = 90.0,
     reap_grace: float = 10.0,
+    allow_insecure: bool = False,
 ) -> ShardCertDriveReport:
     """The multi-process SIZING drive COORDINATOR (load-gen box). Learns the topology from
     :data:`SHARDS_READY` (the engine half posts it), spawns ``sink_count`` :func:`run_shardcert_sink` +
@@ -2211,7 +2215,11 @@ async def run_shardcert_drive(
             coord, DRIVER_DONE, driver_count, timeout=driver_done_timeout
         )
         urls = [f"http://{engine_host}:{p}" for p in api_ports]
-        poller = EnginePoller(urls, None, origin=time.perf_counter())
+        # allow_insecure threads the plaintext-http-to-remote posture: the engine box's API is http and
+        # off-box, so without it EngineClient fail-closes and poller.open() raises AFTER the children are
+        # spawned. (A loopback co-located engine never needs it.) The finally below still tears the
+        # children down on any early failure, but threading this is what makes the run succeed.
+        poller = EnginePoller(urls, None, origin=time.perf_counter(), allow_insecure=allow_insecure)
         await poller.open()
         drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
         final = poller.final
@@ -2223,8 +2231,15 @@ async def run_shardcert_drive(
         if poller is not None:
             with contextlib.suppress(Exception):
                 await poller.close()
-        for label, proc in procs:
-            notes.append(await _reap_child(label, proc, grace=reap_grace))
+        # Reap CONCURRENTLY so an early failure (e.g. a poller.open() raise while M+K children are still
+        # live, some blocked on DRIVE_COMPLETE) tears the whole tier down in ~one reap_grace, not
+        # (M+K)*reap_grace — no lingering child processes on the load-gen box between ladder steps.
+        if procs:
+            notes.extend(
+                await asyncio.gather(
+                    *(_reap_child(label, proc, grace=reap_grace) for label, proc in procs)
+                )
+            )
 
     # (6) Aggregate the children's coord DONE files (the authority) + the engine's REMOTE drain gauge.
     a = sum(int(d["acked"]) for d in driver_dones)

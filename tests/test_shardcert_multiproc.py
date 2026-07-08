@@ -492,6 +492,7 @@ def _install_coordinator_fakes(
     worker_tally: dict[int, dict[str, Any]],
     engine_final: Any,
     drain_seconds: float | None = 0.01,
+    insecure_seen: list[bool] | None = None,
 ) -> list[list[str]]:
     """Fake the subprocess spawn seam + the engine poller. The faked ``_spawn_proc`` itself WRITES each
     child's expected coord messages (SINK_BOUND/DONE, DRIVER_ARMED/DONE) from the per-index tallies, so
@@ -513,7 +514,16 @@ def _install_coordinator_fakes(
         return _FakeProc()
 
     class FakePoller:
-        def __init__(self, urls: Any, token: Any = None, *, origin: Any = None) -> None:
+        def __init__(
+            self,
+            urls: Any,
+            token: Any = None,
+            *,
+            origin: Any = None,
+            allow_insecure: bool = False,
+        ) -> None:
+            if insecure_seen is not None:
+                insecure_seen.append(allow_insecure)
             self.final = engine_final
 
         async def open(self) -> None:
@@ -621,6 +631,62 @@ async def test_coordinator_round_trip_aggregates_sum_of_fakes(
     assert coord.read(DRIVE_COMPLETE) is not None
     # Diagnostic child tails were captured (never the authority) — one note per spawned child.
     assert sum(n.startswith("[sink-") or n.startswith("[worker-") for n in report.notes) == 4
+
+
+async def test_coordinator_threads_allow_insecure_to_remote_poller(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """REGRESSION (rig STEP A 2026-07-08): the coordinator polls the engine's /stats over plaintext http
+    to a REMOTE box, so `--insecure` MUST reach the EnginePoller → EngineClient, else it fail-closes on
+    the non-loopback URL after spawning children. Assert `allow_insecure` threads through (and defaults
+    False so a loopback drive is unaffected)."""
+    import types
+
+    worker_tally = {
+        0: {"sent": 40, "acked": 40, "ack_p50_ms": 1.0, "ack_p99_ms": 2.0, "bands": [0]}
+    }
+    sink_tally = {
+        0: {
+            "sink_received": 40,
+            "lane_inversions": 0,
+            "lane_repeats": 0,
+            "lanes_observed": 2,
+            "ports": [3700],
+        }
+    }
+    ready = {
+        "shards": ["a"],
+        "inbound_base": 3600,
+        "lanes": 1,
+        "dests": 1,
+        "api_ports": [9001],
+        "sink_base": 3700,
+        "sink_ports": 1,
+        "sink_port": 3700,
+    }
+
+    for want in (True, False):
+        seen: list[bool] = []
+        _install_coordinator_fakes(
+            monkeypatch,
+            sink_tally=sink_tally,
+            worker_tally=worker_tally,
+            engine_final=types.SimpleNamespace(done=40, dead=0, in_pipeline=0),
+            insecure_seen=seen,
+        )
+        coord = FileDropCoord(tmp_path, run_id=f"ins{want}")
+        coord.post(SHARDS_READY, ready)
+        await sc.run_shardcert_drive(
+            engine_host="10.0.0.5",
+            aggregate_rate=20.0,
+            hold_seconds=1.0,
+            driver_count=1,
+            sink_count=1,
+            sink_host="10.0.0.9",
+            coord=coord,
+            allow_insecure=want,
+        )
+        assert seen == [want], f"poller allow_insecure should be {want}, got {seen}"
 
 
 async def test_coordinator_fails_loud_on_oversized_sink_count(

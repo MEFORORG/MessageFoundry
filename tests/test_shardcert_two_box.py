@@ -118,7 +118,14 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
             return None
 
     class FakePoller:
-        def __init__(self, urls: Any, token: Any = None, *, origin: Any = None) -> None:
+        def __init__(
+            self,
+            urls: Any,
+            token: Any = None,
+            *,
+            origin: Any = None,
+            allow_insecure: bool = False,
+        ) -> None:
             self.final = types.SimpleNamespace(done=0, dead=0, in_pipeline=0)
 
         async def open(self) -> None:
