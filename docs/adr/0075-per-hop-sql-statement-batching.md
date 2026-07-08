@@ -1,6 +1,6 @@
 # 0075 — Per-hop SQL statement batching (`batch_handoff_statements`)
 
-- **Status:** Accepted (2026-07-07) — owner ratified; prototype built (#820, CI SS-gated). **Promote target reframed 2026-07-07: `default-ON` gated on a _harmless-near + helps-far_ rig result (see Amendment below), not the single-RTT ≥10% bar.**
+- **Status:** Accepted (2026-07-07) — owner ratified; prototype built (#820, CI SS-gated). **Promote target reframed 2026-07-07: `default-ON` gated on a _harmless-near + helps-far_ rig result (see Amendment below), not the single-RTT ≥10% bar.** **PROMOTED default-ON 2026-07-08** — Bench B met the reframed criterion over a green SS correctness precondition (see the _Promoted_ section below + `docs/benchmarks/results/2026-07-08-adr0075-batch-ab/`); the flag is retained only as an emergency off-switch.
 - **Deciders:** throughput working group (owner ratifies; build + promote gated on a live-rig A/B)
 - **Related:** **builds the lever [ADR 0069](0069-durable-write-throughput-lever.md) named and left un-attacked** ("batching SQL statements per executor hop" — the round-trip half of the feed wall, distinct from its rejected durable-write levers) · **complements [ADR 0071](0071-cut-executor-round-trips-b5.md)** (B5 thread-hop fusion — NO-GO 2026-07-06; cut executor→loop *crossings* but not the per-hop *network round-trips* the fusion NO-GO explicitly attributed part of its dilution to) · [ADR 0055](0055-group-commit-durable-write.md) / [ADR 0053](0053-free-threaded-multicore-engine.md) (the other throughput levers) · [ADR 0001](0001-staged-pipeline-architecture.md) / [ADR 0066](0066-pooled-stage-claimers.md) (staged-pipeline + pooled-claimer invariants) · CLAUDE.md §2 (reliability / at-least-once / count-and-log invariants) · the throughput-microbench statement/RT inventory (`docs/benchmarks/results/2026-07-04-adr0071-b5-executor-marshaling/statement_rt_inventory.py`)
 
@@ -35,6 +35,34 @@ that threshold becomes the deployment note ("on for engines running more than ~X
 (`tests/test_adr0075_batch_sqlserver.py` — real-driver positioning, fail-closed on a real applock timeout,
 serialization, ON/OFF disposition parity) must pass on the CI SQL-Server leg / the rig. That is the
 precondition; the harmless-near + helps-far sweep is the promote decision.
+
+---
+
+## Promoted (2026-07-08) — default-ON shipped
+
+The reframed criterion above is **met**, so the flag introduced default-OFF by the Decision below is now
+**default-ON** (`[pipeline].batch_handoff_statements`); it is retained **only as an emergency off-switch**
+(`set false` to disable), never an operational control. What flipped: only the `PipelineSettings` field
+default — SS-only + fail-closed activation is unchanged, and Postgres/SQLite remain byte-identical no-ops.
+
+- **Correctness precondition — GREEN.** `tests/test_adr0075_batch_sqlserver.py` = **9 passed** on real SQL
+  Server (fail-closed on applock timeout, concurrent-finalizer serialization, ON/OFF disposition parity).
+- **Bench B (distance insurance) — harmless-near + helps-far.** A single-box in-process A/B
+  (`python -m harness --connscale batch_ab`, loopback, SQL Server store, `fuse_thread_hops` OFF; far RTTs via
+  WinDivert latency injection on the engine→store link):
+  - **HARMLESS NEAR** (~0.28 ms same-AZ, 100/s): batch ON vs OFF within **±0.4%** throughput (none
+    significant), zero-loss, delivered/offered = 1.00 → no regression.
+  - **HELPS FAR** (both arms zero-loss + full delivery + drained): +20 ms RTT → ACK p99 **475 → 391 ms
+    (−18%, −84 ms)**; +50 ms RTT → ACK p99 **1168 → 956 ms (−18%, −212 ms)** — a constant ~−18% p99 whose
+    absolute saving **widens with RTT** (the distance-insurance curve).
+  - `commits/msg = 2.000` identity held in both arms (per-message statement folding, no commit boundary moves).
+- **Decision: default-ON.** near-harmless + far-helps + green precondition ⇒ flip the default; keep the flag as
+  the emergency off-switch. Evidence: `docs/benchmarks/results/2026-07-08-adr0075-batch-ab/`.
+
+The historical **Decision / Gate / Acceptance-Criteria** below are preserved as authored (the flag *was*
+introduced default-OFF pending this A/B); **AC-6 remains the fallback semantics** — had the A/B not met the
+(now-superseded) bar, the flag stays default-OFF. It did meet the reframed criterion, so this promotion
+executes it.
 
 ---
 

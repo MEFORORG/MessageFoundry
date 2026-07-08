@@ -29,6 +29,36 @@
                                                 connection names), drive per-engine load, and read whether
                                                 one store is the aggregate ceiling. Exits 0 (zero-loss at
                                                 every N) / 1 (loss) / 2 (setup) / 3 (interrupted).
+``python -m harness shardcert ...``   → run the N-active engine-shard SIZING bench (ADR 0073): N
+                                                `serve --shard` engines on ONE unified server store with
+                                                OVERLAPPING outbound destinations, driven at a single rate
+                                                or an ascending --rate-ladder (ceiling hunt), with the W1
+                                                persistent-outbound + many-thin-lane knobs. Exits 0 (every
+                                                step held the correctness invariants) / 1 (an invariant
+                                                broke) / 2 (setup) / 3 (interrupted).
+``python -m harness shardcert-engine ...`` → the ENGINE-box half of the WS-C two-box N-active cert: bring
+                                                the `serve --shard` fleet up against the unified store,
+                                                post SHARDS_READY, run the LOCAL kill timer, drain, report.
+                                                Does NOT drive load. Exits 0 (drained, no stranded rows) /
+                                                1 (store-truth fail) / 3 (interrupted).
+``python -m harness shardcert-driver ...`` → the LOAD-GEN-box half: wait for SHARDS_READY, bind the sink
+                                                locally, open one MLLP connection per (shard, lane), drive
+                                                + post DRIVE_START, drain the REMOTE /stats, emit the
+                                                sink/tracker verdict. Does NOT spawn engines. Exits 0
+                                                (no-loss + FIFO) / 1 (verdict fail) / 2 (setup/timeout).
+``python -m harness shardcert-sink ...`` → one SINK-tier process of the WS-C multi-process SIZING drive
+                                                (PR-C): bind a correlation sink over a contiguous chunk of
+                                                the destination-port band, post SINK_BOUND.<i>, absorb the
+                                                fan-out until DRIVE_COMPLETE, post SINK_DONE.<i> with its
+                                                delivered/order tally. Does NOT drive or spawn. Exit 0.
+``python -m harness shardcert-driver-worker ...`` → one SENDER-tier process: learn the topology from
+                                                SHARDS_READY, own a contiguous band slice, arm + post
+                                                DRIVER_ARMED.<j>, wait for DRIVE_GO, drive its bands, post
+                                                DRIVER_DONE.<j>. Binds no sink. Exit 0 (armed + drove) / 2.
+``python -m harness shardcert-drive ...`` → the multi-process drive COORDINATOR: spawn K sender + M sink
+                                                children, handshake the engine + children, drain the REMOTE
+                                                /stats, aggregate + count-balance reconcile. Exits 0 (no-loss
+                                                + FIFO + non-vacuous) / 1 (verdict fail) / 2 (setup/timeout).
 
 The headless paths import no PySide6, so they run on a display-less runner; the GUI import is
 deferred into :func:`_launch_gui`.
@@ -51,11 +81,24 @@ def main(argv: list[str] | None = None) -> int:
         except (AttributeError, ValueError, OSError):
             pass
 
-    # `multishard` is a positional subcommand with its own option set (the flag-based `--connscale`/
-    # `--load` style doesn't fit an N-engine sweep), so route it before the shared flag parser.
+    # `multishard` / `shardcert` (+ the WS-C two-box `shardcert-engine`/`shardcert-driver`) are positional
+    # subcommands with their own option sets (the flag-based `--connscale`/`--load` style doesn't fit an
+    # N-engine sweep or a driver/engine split), so route them before the shared flag parser.
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "multishard":
         return _run_multishard(raw[1:])
+    if raw and raw[0] == "shardcert":
+        return _run_shardcert(raw[1:])
+    if raw and raw[0] == "shardcert-engine":
+        return _run_shardcert_engine(raw[1:])
+    if raw and raw[0] == "shardcert-driver":
+        return _run_shardcert_driver(raw[1:])
+    if raw and raw[0] == "shardcert-sink":
+        return _run_shardcert_sink(raw[1:])
+    if raw and raw[0] == "shardcert-driver-worker":
+        return _run_shardcert_driver_worker(raw[1:])
+    if raw and raw[0] == "shardcert-drive":
+        return _run_shardcert_drive(raw[1:])
 
     parser = argparse.ArgumentParser(prog="harness", description="MessageFoundry test harness")
     parser.add_argument(
@@ -537,6 +580,635 @@ def _run_multishard(argv: list[str]) -> int:
             json.dumps(report.to_json_dict(), indent=2), encoding="utf-8"
         )
     return report.exit_code
+
+
+def _run_shardcert(argv: list[str]) -> int:
+    import asyncio
+    import json
+    import os
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(
+        prog="harness shardcert",
+        description="N-active engine-shard SIZING bench (ADR 0073): N `serve --shard` engines on ONE "
+        "unified server store with OVERLAPPING outbound destinations, driven at a single --rate or an "
+        "ascending --rate-ladder ceiling hunt.",
+    )
+    parser.add_argument(
+        "--shards", default="a,b,c,d", help="comma list of shard ids (default 4: a,b,c,d)"
+    )
+    parser.add_argument(
+        "--dests", type=int, default=8, help="shared outbound destinations every shard sends to"
+    )
+    parser.add_argument(
+        "--lanes-per-shard",
+        type=int,
+        default=1,
+        help="inbound->router->handler chains per shard (many-thin-lanes; 1 = one fat lane, today)",
+    )
+    parser.add_argument(
+        "--persistent",
+        action="store_true",
+        help="give the shared outbounds the ADR 0067 persistent connection (the W1 sizing fix)",
+    )
+    parser.add_argument(
+        "--rate-ladder",
+        help="ascending aggregate rates for the ceiling hunt: a comma list (e.g. 40,80,120) or a "
+        "start:stop:step range (e.g. 40:200:40). Omit to drive the single --rate.",
+    )
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=40.0,
+        help="single aggregate msg/s when --rate-ladder is not given",
+    )
+    parser.add_argument(
+        "--hold-seconds", type=float, default=60.0, help="steady-state hold per rate step"
+    )
+    parser.add_argument(
+        "--drain-timeout", type=float, default=120.0, help="post-hold drain timeout per step"
+    )
+    parser.add_argument("--sink-host", default="127.0.0.1", help="correlation-sink bind host")
+    parser.add_argument(
+        "--sink-port", type=int, help="pin the correlation-sink port (default: an ephemeral port)"
+    )
+    parser.add_argument(
+        "--store",
+        default="sqlserver",
+        choices=("sqlserver",),
+        help="server store backend LABEL (SQL Server only — this bench's reset/queue helpers are "
+        "SqlServerStore-specific); the connection itself comes from MEFOR_STORE_*",
+    )
+    parser.add_argument("--report-json", help="write the JSON report to this path")
+    args = parser.parse_args(argv)
+
+    if args.lanes_per_shard < 1:
+        print("--lanes-per-shard must be >= 1", file=sys.stderr)
+        return 2
+
+    # Wire the graph-shape env knobs BEFORE the loader discovery + the serve subprocesses read them.
+    os.environ["MEFOR_SHARDCERT_SHARDS"] = args.shards
+    os.environ["MEFOR_SHARDCERT_LANES_PER_SHARD"] = str(args.lanes_per_shard)
+    os.environ["MEFOR_SHARDCERT_PERSISTENT"] = "1" if args.persistent else "0"
+
+    # N shards on ONE unified store ⇒ a server-DB backend is required (mirrors _run_multishard).
+    backend = os.environ.get("MEFOR_STORE_BACKEND", "").strip().lower()
+    if backend != args.store:
+        print(
+            f"--store {args.store} needs MEFOR_STORE_BACKEND={args.store} (+ the MEFOR_STORE_* "
+            f"connection env); got {backend or '(unset)'!r}",
+            file=sys.stderr,
+        )
+        return 2
+    store_env = {k: v for k, v in os.environ.items() if k.startswith("MEFOR_STORE_")}
+
+    from harness.load.shardcert import parse_rate_ladder, run_shardcert, run_shardcert_ladder
+
+    try:
+        if args.rate_ladder:
+            try:
+                rates = parse_rate_ladder(args.rate_ladder)
+            except ValueError as exc:
+                print(f"bad --rate-ladder: {exc}", file=sys.stderr)
+                return 2
+            ladder = asyncio.run(
+                run_shardcert_ladder(
+                    rates=rates,
+                    dests=args.dests,
+                    hold_seconds=args.hold_seconds,
+                    drain_timeout=args.drain_timeout,
+                    sink_host=args.sink_host,
+                    sink_port=args.sink_port,
+                    store_env=store_env,
+                )
+            )
+            print(ladder.render())
+            if args.report_json:
+                Path(args.report_json).write_text(
+                    json.dumps(ladder.to_json_dict(), indent=2), encoding="utf-8"
+                )
+            return ladder.exit_code
+
+        single = asyncio.run(
+            run_shardcert(
+                dests=args.dests,
+                aggregate_rate=args.rate,
+                hold_seconds=args.hold_seconds,
+                drain_timeout=args.drain_timeout,
+                sink_host=args.sink_host,
+                sink_port=args.sink_port,
+                store_env=store_env,
+                capture_peak=True,
+            )
+        )
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(single.render())
+    if args.report_json:
+        Path(args.report_json).write_text(
+            json.dumps(single.to_json_dict(), indent=2), encoding="utf-8"
+        )
+    return 0 if single.ok else 1
+
+
+# --- WS-C two-box shardcert drive (engine box + load-gen box) ----------------------------------------
+
+
+def _store_env_from_os() -> dict[str, str]:
+    """The ambient ``MEFOR_STORE_*`` connection env — the unified-store connection every ``serve --shard``
+    shares (the shardcert engine launcher adds the graph shape + auth/insecure escapes itself)."""
+    import os
+
+    return {k: v for k, v in os.environ.items() if k.startswith("MEFOR_STORE_")}
+
+
+def _coord_from_args(args: argparse.Namespace) -> object:
+    from harness.load.coord import FileDropCoord, default_coord_dir
+
+    return FileDropCoord(args.coord_dir or default_coord_dir(), run_id=args.run_id)
+
+
+def _add_coord_args(parser: argparse.ArgumentParser, *, default_run_id: str = "shardcert") -> None:
+    from harness.load.coord import default_coord_dir
+
+    parser.add_argument(
+        "--coord-dir",
+        default=None,
+        help=f"the shared file-drop coord directory both halves rendezvous in (default: "
+        f"$MEFOR_COORD_DIR or {default_coord_dir()!r})",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=default_run_id,
+        help=f"coord run id — scopes the handshake files so parallel runs don't cross (default "
+        f"{default_run_id!r})",
+    )
+
+
+def _run_shardcert_engine(argv: list[str]) -> int:
+    import asyncio
+    import os
+
+    parser = argparse.ArgumentParser(
+        prog="harness shardcert-engine",
+        description="ENGINE-box half of the WS-C two-box N-active cert (ADR 0073): bring the serve --shard "
+        "fleet up against the unified store, handshake with the driver via the file-drop coord, run the "
+        "LOCAL kill timer, drain, report. Does NOT drive load — that is the load-gen box's shardcert-driver.",
+    )
+    parser.add_argument(
+        "--shards", default="a,b,c,d", help="comma list of shard ids (default 4: a,b,c,d)"
+    )
+    parser.add_argument(
+        "--dests",
+        type=int,
+        default=8,
+        help="shared overlapping outbound destinations every shard sends to",
+    )
+    parser.add_argument(
+        "--lanes-per-shard",
+        type=int,
+        default=1,
+        help="inbound->router->handler chains per shard (many-thin-lanes; 1 = one fat lane). The engine "
+        "reserves N*lanes contiguous inbound ports and advertises `lanes` in SHARDS_READY so the driver "
+        "opens N*lanes connections",
+    )
+    parser.add_argument(
+        "--persistent",
+        action="store_true",
+        help="give the shared outbounds the ADR 0067 persistent connection (the W1 sizing fix)",
+    )
+    parser.add_argument(
+        "--hold-seconds", type=float, default=20.0, help="the driver's steady-state hold"
+    )
+    parser.add_argument("--drain-timeout", type=float, default=90.0, help="post-hold drain timeout")
+    parser.add_argument(
+        "--kill", action="store_true", help="the crash leg: SIGKILL the max-owner shard mid-hold"
+    )
+    parser.add_argument(
+        "--kill-shard", help="pin which shard to kill (default: the one owning most lanes)"
+    )
+    parser.add_argument(
+        "--kill-at-fraction",
+        type=float,
+        default=0.4,
+        help="fire the LOCAL SIGKILL this fraction into the hold (anchored on observing DRIVE_START)",
+    )
+    parser.add_argument(
+        "--sink-port",
+        type=int,
+        required=True,
+        help="the agreed BASE sink port the DRIVER binds (advertised in SHARDS_READY; the shards deliver here)",
+    )
+    parser.add_argument(
+        "--sink-ports",
+        type=int,
+        default=1,
+        help="width of the sink port band the driver binds (single sink for the correctness cert; the "
+        "fan-out width is exercised in a later PR)",
+    )
+    parser.add_argument(
+        "--sink-host",
+        default="127.0.0.1",
+        help="the LOAD-GEN box IP the shards deliver their outbound fan-out to (MEFOR_SHARDCERT_SINK_HOST)",
+    )
+    parser.add_argument(
+        "--inbound-bind-host",
+        default="0.0.0.0",
+        help="interface every shard's inbound MLLP listener binds (0.0.0.0 so the off-box driver reaches it)",
+    )
+    parser.add_argument(
+        "--claim-mode",
+        default="pooled",
+        choices=("pooled", "per_lane"),
+        help="pipeline claim mode set on every serve --shard subprocess (MEFOR_PIPELINE_CLAIM_MODE) for "
+        "the ADR 0066 §8.2 pooled-vs-per_lane A/B (default pooled)",
+    )
+    parser.add_argument(
+        "--store",
+        default="sqlserver",
+        choices=("sqlserver",),
+        help="server store backend LABEL (SQL Server only — this bench's reset/queue helpers are "
+        "SqlServerStore-specific); the connection itself comes from MEFOR_STORE_*",
+    )
+    _add_coord_args(parser)
+    args = parser.parse_args(argv)
+
+    if args.lanes_per_shard < 1:
+        print("--lanes-per-shard must be >= 1", file=sys.stderr)
+        return 2
+
+    # Wire the graph-shape env knobs BEFORE run_shardcert_engine's config discovery + the serve
+    # subprocesses read them (mirrors the single-box `_run_shardcert`).
+    os.environ["MEFOR_SHARDCERT_SHARDS"] = args.shards
+    os.environ["MEFOR_SHARDCERT_LANES_PER_SHARD"] = str(args.lanes_per_shard)
+    os.environ["MEFOR_SHARDCERT_PERSISTENT"] = "1" if args.persistent else "0"
+
+    # N shards on ONE unified store ⇒ a server-DB backend is required (mirrors _run_shardcert).
+    backend = os.environ.get("MEFOR_STORE_BACKEND", "").strip().lower()
+    if backend != args.store:
+        print(
+            f"--store {args.store} needs MEFOR_STORE_BACKEND={args.store} (+ the MEFOR_STORE_* "
+            f"connection env); got {backend or '(unset)'!r}",
+            file=sys.stderr,
+        )
+        return 2
+
+    from harness.load.coord import FileDropCoord
+    from harness.load.shardcert import run_shardcert_engine
+
+    coord = _coord_from_args(args)
+    assert isinstance(coord, FileDropCoord)
+    coord.clear()  # the engine is the first mover — clear any stale prior-run handshake files
+
+    try:
+        report = asyncio.run(
+            run_shardcert_engine(
+                dests=args.dests,
+                hold_seconds=args.hold_seconds,
+                kill=args.kill,
+                kill_shard=args.kill_shard,
+                kill_at_fraction=args.kill_at_fraction,
+                drain_timeout=args.drain_timeout,
+                sink_port=args.sink_port,
+                sink_ports=args.sink_ports,
+                store_env=_store_env_from_os(),
+                coord=coord,
+                inbound_bind_host=args.inbound_bind_host,
+                sink_host=args.sink_host,
+                claim_mode=args.claim_mode,
+            )
+        )
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render())
+    # The engine half's gate is store-truth: drained, no stranded non-terminal rows, no dead-letters.
+    # The no-loss/FIFO VERDICT is the driver half's report (it holds the sink/tracker).
+    return 0 if report.ok else 1
+
+
+def _run_shardcert_driver(argv: list[str]) -> int:
+    import asyncio
+
+    parser = argparse.ArgumentParser(
+        prog="harness shardcert-driver",
+        description="LOAD-GEN-box half of the WS-C two-box N-active cert (ADR 0073): wait for SHARDS_READY, "
+        "bind the sink locally, open one MLLP connection per (shard, lane), drive the fleet + post "
+        "DRIVE_START, drain the REMOTE /stats, emit the sink/tracker verdict. Does NOT spawn engines.",
+    )
+    parser.add_argument(
+        "--engine-host",
+        required=True,
+        help="the engine box's inbound IP the senders dial (inbound_base + i*lanes + l, learned from "
+        "SHARDS_READY)",
+    )
+    parser.add_argument(
+        "--aggregate-rate", type=float, default=40.0, help="aggregate offered msg/s"
+    )
+    parser.add_argument("--hold-seconds", type=float, default=20.0, help="steady-state hold")
+    parser.add_argument(
+        "--drain-timeout", type=float, default=90.0, help="post-hold REMOTE drain timeout"
+    )
+    parser.add_argument(
+        "--sink-host",
+        default="127.0.0.1",
+        help="interface the correlation sink binds LOCALLY (0.0.0.0 on the load-gen box; loopback "
+        "co-located). Must be reachable at the engine's --sink-host delivery target",
+    )
+    _add_coord_args(parser)
+    parser.add_argument("--report-json", help="write the JSON report to this path")
+    args = parser.parse_args(argv)
+
+    import json
+    from pathlib import Path
+
+    from harness.load.coord import CoordTimeout, FileDropCoord
+    from harness.load.shardcert import run_shardcert_driver
+
+    coord = _coord_from_args(args)
+    assert isinstance(coord, FileDropCoord)
+    try:
+        report = asyncio.run(
+            run_shardcert_driver(
+                engine_host=args.engine_host,
+                aggregate_rate=args.aggregate_rate,
+                hold_seconds=args.hold_seconds,
+                drain_timeout=args.drain_timeout,
+                coord=coord,
+                sink_host=args.sink_host,
+            )
+        )
+    except CoordTimeout as exc:
+        print(f"shardcert-driver: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render())
+    if args.report_json:
+        Path(args.report_json).write_text(
+            json.dumps(
+                {
+                    "kind": "shardcert_driver",
+                    "verdict": "PASS" if report.ok else "FAIL",
+                    "killed_shard": report.killed_shard,
+                    "sent": report.sent,
+                    "acked": report.acked,
+                    "sink_received": report.sink_received,
+                    "acked_not_delivered": report.acked_not_delivered,
+                    "lane_inversions": report.lane_inversions,
+                    "lanes_observed": report.lanes_observed,
+                    "lane_repeats": report.lane_repeats,
+                    "engine_done": report.engine_done,
+                    "engine_dead": report.engine_dead,
+                    "in_pipeline_final": report.in_pipeline_final,
+                    "drained": report.drained,
+                    "drain_seconds": report.drain_seconds,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    return 0 if report.ok else 1
+
+
+def _run_shardcert_sink(argv: list[str]) -> int:
+    import asyncio
+
+    parser = argparse.ArgumentParser(
+        prog="harness shardcert-sink",
+        description="One SINK-tier process of the WS-C multi-process SIZING drive (PR-C, ADR 0073): bind a "
+        "correlation sink over a CONTIGUOUS chunk of the destination-port band, post SINK_BOUND.<i>, absorb "
+        "the engine's outbound fan-out until DRIVE_COMPLETE, then post SINK_DONE.<i> with its delivered/order "
+        "tally. Binds no engine and drives no load — the coordinator (shardcert-drive) spawns it.",
+    )
+    parser.add_argument(
+        "--sink-host",
+        default="127.0.0.1",
+        help="interface the correlation sink binds LOCALLY (0.0.0.0 on the load-gen box; loopback "
+        "co-located). Must be reachable at the engine's --sink-host delivery target",
+    )
+    parser.add_argument(
+        "--sink-base",
+        type=int,
+        required=True,
+        help="base of the destination-port band (== the engine's advertised sink_base; == dests wide)",
+    )
+    parser.add_argument(
+        "--sink-ports",
+        type=int,
+        required=True,
+        help="width of the destination-port band (set == dests for sizing so each dest binds its own port)",
+    )
+    parser.add_argument(
+        "--sink-index",
+        type=int,
+        required=True,
+        help="which contiguous chunk (0-based) THIS sink binds",
+    )
+    parser.add_argument(
+        "--sink-count",
+        type=int,
+        required=True,
+        help="how many sinks the band is partitioned across (M)",
+    )
+    _add_coord_args(parser)
+    parser.add_argument("--report-json", help="write the JSON report to this path")
+    args = parser.parse_args(argv)
+
+    from harness.load.coord import FileDropCoord
+    from harness.load.shardcert import run_shardcert_sink
+
+    coord = _coord_from_args(args)
+    assert isinstance(coord, FileDropCoord)
+    try:
+        report = asyncio.run(
+            run_shardcert_sink(
+                sink_host=args.sink_host,
+                sink_base=args.sink_base,
+                sink_ports=args.sink_ports,
+                sink_index=args.sink_index,
+                sink_count=args.sink_count,
+                coord=coord,
+            )
+        )
+    except ValueError as exc:  # a bad partition / out-of-range index — fail loud, setup error
+        print(f"shardcert-sink: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render())
+    if args.report_json:
+        import json
+        from pathlib import Path
+
+        Path(args.report_json).write_text(
+            json.dumps(report.to_json_dict(), indent=2), encoding="utf-8"
+        )
+    return 0
+
+
+def _run_shardcert_driver_worker(argv: list[str]) -> int:
+    import asyncio
+
+    parser = argparse.ArgumentParser(
+        prog="harness shardcert-driver-worker",
+        description="One SENDER-tier process of the WS-C multi-process SIZING drive (PR-C, ADR 0073): learn "
+        "the topology from SHARDS_READY, own a CONTIGUOUS slice of the G=shards*lanes inbound bands, open one "
+        "MLLP connection per owned band, post DRIVER_ARMED.<j>, wait for DRIVE_GO, drive its slice, post "
+        "DRIVER_DONE.<j>. Binds no sink and spawns no engine — the coordinator (shardcert-drive) spawns it.",
+    )
+    parser.add_argument(
+        "--engine-host",
+        required=True,
+        help="the engine box's inbound IP the senders dial (inbound_base + band, learned from SHARDS_READY)",
+    )
+    parser.add_argument(
+        "--aggregate-rate",
+        type=float,
+        default=40.0,
+        help="the WHOLE-FLEET aggregate offered msg/s; this worker drives len(slice)/G of it",
+    )
+    parser.add_argument("--hold-seconds", type=float, default=20.0, help="steady-state hold")
+    parser.add_argument(
+        "--driver-index",
+        type=int,
+        required=True,
+        help="which contiguous band slice (0-based) THIS worker owns",
+    )
+    parser.add_argument(
+        "--driver-count",
+        type=int,
+        required=True,
+        help="how many sender-workers the bands are split across (K)",
+    )
+    _add_coord_args(parser)
+    parser.add_argument("--report-json", help="write the JSON report to this path")
+    args = parser.parse_args(argv)
+
+    from harness.load.coord import CoordTimeout, FileDropCoord
+    from harness.load.shardcert import run_shardcert_driver_worker
+
+    coord = _coord_from_args(args)
+    assert isinstance(coord, FileDropCoord)
+    try:
+        report = asyncio.run(
+            run_shardcert_driver_worker(
+                engine_host=args.engine_host,
+                aggregate_rate=args.aggregate_rate,
+                hold_seconds=args.hold_seconds,
+                driver_index=args.driver_index,
+                driver_count=args.driver_count,
+                coord=coord,
+            )
+        )
+    except ValueError as exc:  # a bad band slice / out-of-range index — fail loud, setup error
+        print(f"shardcert-driver-worker: {exc}", file=sys.stderr)
+        return 2
+    except CoordTimeout as exc:
+        print(f"shardcert-driver-worker: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render())
+    if args.report_json:
+        import json
+        from pathlib import Path
+
+        Path(args.report_json).write_text(
+            json.dumps(report.to_json_dict(), indent=2), encoding="utf-8"
+        )
+    return 0
+
+
+def _run_shardcert_drive(argv: list[str]) -> int:
+    import asyncio
+
+    parser = argparse.ArgumentParser(
+        prog="harness shardcert-drive",
+        description="The COORDINATOR of the WS-C multi-process SIZING drive (PR-C, ADR 0073): learn the "
+        "topology from SHARDS_READY, spawn K sender-worker + M sink CHILD processes on the load-gen box, "
+        "orchestrate the handshake, drain the engine's REMOTE /stats, then aggregate the children's coord "
+        "DONE files into a count-balance + engine-store-truth no-loss reconcile. Runs (with its children) "
+        "on the load-gen box — NEVER co-located with the engine fleet (the attribution isolation).",
+    )
+    parser.add_argument(
+        "--engine-host",
+        required=True,
+        help="the engine box's inbound IP the sender-workers dial (learned bands from SHARDS_READY)",
+    )
+    parser.add_argument(
+        "--aggregate-rate",
+        type=float,
+        default=40.0,
+        help="the WHOLE-FLEET aggregate offered msg/s (split across the K sender-workers' band slices)",
+    )
+    parser.add_argument("--hold-seconds", type=float, default=20.0, help="steady-state hold")
+    parser.add_argument(
+        "--driver-count",
+        type=int,
+        default=1,
+        help="how many sender-worker child processes to spawn (K)",
+    )
+    parser.add_argument(
+        "--sink-count", type=int, default=1, help="how many sink child processes to spawn (M)"
+    )
+    parser.add_argument(
+        "--sink-host",
+        default="127.0.0.1",
+        help="interface the sink children bind LOCALLY (0.0.0.0 on the load-gen box; loopback co-located). "
+        "Must be reachable at the engine's --sink-host delivery target",
+    )
+    _add_coord_args(parser)
+    parser.add_argument("--report-json", help="write the JSON report to this path")
+    args = parser.parse_args(argv)
+
+    from harness.load.coord import CoordTimeout, FileDropCoord
+    from harness.load.shardcert import run_shardcert_drive
+
+    coord = _coord_from_args(args)
+    assert isinstance(coord, FileDropCoord)
+    try:
+        report = asyncio.run(
+            run_shardcert_drive(
+                engine_host=args.engine_host,
+                aggregate_rate=args.aggregate_rate,
+                hold_seconds=args.hold_seconds,
+                driver_count=args.driver_count,
+                sink_count=args.sink_count,
+                sink_host=args.sink_host,
+                coord=coord,
+            )
+        )
+    except (
+        ValueError
+    ) as exc:  # a mis-sized fleet (partition/slice can't tile) — fail loud, setup error
+        print(f"shardcert-drive: {exc}", file=sys.stderr)
+        return 2
+    except CoordTimeout as exc:
+        print(f"shardcert-drive: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render())
+    if args.report_json:
+        import json
+        from pathlib import Path
+
+        Path(args.report_json).write_text(
+            json.dumps(report.to_json_dict(), indent=2), encoding="utf-8"
+        )
+    return 0 if report.ok else 1
 
 
 def _launch_gui() -> int:

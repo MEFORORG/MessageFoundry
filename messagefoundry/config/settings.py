@@ -707,7 +707,8 @@ class PipelineSettings(_Section):
     # reserve 256 slots for a handful of workers, inflating in_pipeline + the crash-replay recovery set).
     pooled_fusing_workers: int = Field(default=8, ge=1)
 
-    # ADR 0075 per-hop SQL statement batching. DEFAULT-OFF and SQL-Server-scoped: when True AND the store
+    # ADR 0075 per-hop SQL statement batching. DEFAULT-ON (retained only as an emergency off-switch —
+    # promoted 2026-07-08 as a distance-insurance lever; set false to disable) and SQL-Server-scoped: when True AND the store
     # backend is SQL Server, each per-hop staged handoff (route_handoff / transform_handoff) folds the
     # non-result-returning DML of its body into the fewest ``pyodbc.execute()`` T-SQL batches — same
     # ordered (sql, params) sequence, one round-trip per batch (the _SQL_APPLOCK precedent), still
@@ -722,7 +723,7 @@ class PipelineSettings(_Section):
     # non-SS store ignores the flag (logged). Reliability-core + read ONCE at engine construction (a
     # /config/reload does NOT re-read it — restart to change, exactly like claim_mode / fuse_thread_hops).
     # Harness A/B via MEFOR_PIPELINE_BATCH_HANDOFF_STATEMENTS.
-    batch_handoff_statements: bool = Field(default=False)
+    batch_handoff_statements: bool = Field(default=True)
 
 
 class DiagnosticsSettings(_Section):

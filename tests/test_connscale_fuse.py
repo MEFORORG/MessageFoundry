@@ -431,6 +431,15 @@ def test_json_and_table_render() -> None:
     table = cmp.render_table()
     assert "Thread-hop-fusion A/B" in table
     assert "GO" in table
+    # The shared arm/builder also surfaces the informational ACK-latency columns on the fusion axis
+    # (equal arms in this fixture ⇒ 0% deltas); they never move the GO/NO-GO verdict.
+    lat = body["rows"][0]["latency"]
+    assert lat["b0_ack_p99_ms"] == 3.0 and lat["b1_ack_p99_ms"] == 3.0
+    assert lat["ack_p99_delta_pct"] == 0.0 and lat["ack_p50_delta_pct"] == 0.0
+    # The mean-drain column was dropped (warm-up-dominated, not a batch signal); it must not reappear
+    # on either axis, in the JSON block or the console table.
+    assert "b0_drain_s" not in lat and "b1_drain_s" not in lat and "drain_delta_pct" not in lat
+    assert "ack_p99_ms (mean)" in table and "drain_seconds (mean)" not in table
 
 
 def test_default_single_arm_sweep_is_byte_identical() -> None:

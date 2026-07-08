@@ -33,8 +33,10 @@ def _restore(monkeypatch: pytest.MonkeyPatch) -> object:
     ss.uuid4 = saved_uuid  # type: ignore[assignment]
 
 
-def test_flag_default_off() -> None:
-    assert PipelineSettings().batch_handoff_statements is False
+def test_flag_default_on() -> None:
+    # Default-guard: promoted default-ON 2026-07-08 (ADR 0075, distance-insurance lever); the flag is
+    # retained only as an emergency off-switch. SS-only + fail-closed activation is exercised below.
+    assert PipelineSettings().batch_handoff_statements is True
 
 
 async def test_off_path_never_renders_a_batch(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -50,19 +50,30 @@ for _d in range(_SHAPE.dests):
     _host, _port = _SHAPE.sink_endpoint(_d)
     outbound(
         shared_dest_name(_d),
-        MLLP(host=_host, port=_port, connect_timeout=2.0, timeout_seconds=5.0),
+        # persistent=_SHAPE.persistent (default False) flips these from connect-per-delivery to the
+        # ADR 0067 persistent connection for the sizing bench — off ⇒ byte-identical to today.
+        MLLP(
+            host=_host,
+            port=_port,
+            connect_timeout=2.0,
+            timeout_seconds=5.0,
+            persistent=_SHAPE.persistent,
+        ),
         retry=_RETRY,
     )
 
 
-def _make_handler(shape: ShardCertShape, shard: str, dest_index: int) -> HandlerFn:
-    """A per-(shard, destination) handler: transform + stamp the (shard,dest) FIFO lane into MSH-6, then
-    deliver to the SHARED destination. Each handler runs on its own fresh parse of the raw (one routed
-    row per handler), so mutation is isolated."""
+def _make_handler(
+    shape: ShardCertShape, shard: str, dest_index: int, lane_index: int | None = None
+) -> HandlerFn:
+    """A per-(shard, lane, destination) handler: transform + stamp the (shard, [lane,] dest) FIFO lane
+    into MSH-6, then deliver to the SHARED destination. Each handler runs on its own fresh parse of the
+    raw (one routed row per handler), so mutation is isolated. ``lane_index`` is ``None`` for the
+    single-lane shape (key stays ``{shard}_{dest}``)."""
     dest = shared_dest_name(dest_index)
 
     def handle(msg: Message | RawMessage) -> Send:
-        return Send(dest, apply_transform(msg, shape, shard, dest_index))
+        return Send(dest, apply_transform(msg, shape, shard, dest_index, lane_index))
 
     return handle
 
@@ -77,20 +88,26 @@ def _make_router(handler_names: list[str]) -> RouterFn:
     return route
 
 
-# For each shard: one inbound tagged shard=<id> on a contiguous port, plus a handler per shared
-# destination (so the shard fans every message to ALL shared destinations = maximal overlap), and a
-# router fanning to that shard's handlers.
+# For each shard: ``lanes_per_shard`` DISTINCT inbound→router→handler chains (one fat lane by default),
+# each on a contiguous port, each with a handler per shared destination (so every lane fans every
+# message to ALL shared destinations = maximal overlap). The lane index is folded into the connection /
+# router / handler names AND the MSH-6 FIFO lane key so many-thin-lanes keep per-lane FIFO accounting.
+# With lanes_per_shard == 1 the suffix/lane index vanish → byte-identical to the single-lane graph.
+_LANES = _SHAPE.lanes_per_shard
 for _i, _shard in enumerate(_SHAPE.shards):
-    _handler_names: list[str] = []
-    for _d in range(_SHAPE.dests):
-        _hname = f"H_{_shard}_{_d:02d}"
-        handler(_hname)(_make_handler(_SHAPE, _shard, _d))
-        _handler_names.append(_hname)
-    _rname = f"route_{_shard}"
-    router(_rname)(_make_router(_handler_names))
-    inbound(
-        f"IB_S_{_shard}",
-        MLLP(port=_SHAPE.inbound_port(_i)),
-        router=_rname,
-        shard=_shard,
-    )
+    for _l in range(_LANES):
+        _suffix = "" if _LANES == 1 else f"_L{_l:02d}"
+        _lane_index = None if _LANES == 1 else _l
+        _handler_names: list[str] = []
+        for _d in range(_SHAPE.dests):
+            _hname = f"H_{_shard}{_suffix}_{_d:02d}"
+            handler(_hname)(_make_handler(_SHAPE, _shard, _d, _lane_index))
+            _handler_names.append(_hname)
+        _rname = f"route_{_shard}{_suffix}"
+        router(_rname)(_make_router(_handler_names))
+        inbound(
+            f"IB_S_{_shard}{_suffix}",
+            MLLP(port=_SHAPE.inbound_port(_i, _l)),
+            router=_rname,
+            shard=_shard,
+        )

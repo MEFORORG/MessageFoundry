@@ -6,6 +6,17 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **pipeline: `batch_handoff_statements` now defaults ON on SQL Server** ([ADR 0075](docs/adr/0075-per-hop-sql-statement-batching.md))
+  — per-hop SQL statement batching (a **distance-insurance** lever: folds each message's per-hop store round-trips
+  into the fewest `pyodbc.execute()` T-SQL batches, cutting **network round-trips, NOT transactions** — the
+  single per-hop `COMMIT` is untouched, `commits/msg` stays 2.000) now activates **by default** on the SQL Server
+  store. Promoted 2026-07-08 after Bench B showed **harmless-near** (batch ON vs OFF within ±0.4% at ~0.28 ms RTT,
+  zero-loss) and **helps-far** (constant ~−18% ACK-p99, absolute saving widening with RTT: −84 ms @ +20 ms,
+  −212 ms @ +50 ms) over a green SS correctness precondition (`tests/test_adr0075_batch_sqlserver.py`, 9 passed).
+  **Fail-closed + SQL-Server-only** — Postgres (asyncpg) and SQLite are byte-identical no-ops; the flag is retained
+  **only as an emergency off-switch**: set `[pipeline].batch_handoff_statements = false` to disable.
+
 ## [0.2.15] — 2026-07-06 — Early Access
 
 **Thread-hop fusion (ADR 0071 B5, flagged default-OFF) + the browser ops dashboard, pooled-claimer

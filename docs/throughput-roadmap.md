@@ -25,12 +25,17 @@ Two levers on this roadmap moved, and they are **complementary, not competing** 
   is now a built runtime — gated only on the clean **4-engine no-loss bench** before SYSTEM-REQUIREMENTS
   calls it a supported topology.
 - **Cut the chain (TIER 1) — statement batching quantified + ratified.**
-  [ADR 0075](adr/0075-per-hop-sql-statement-batching.md) (`batch_handoff_statements`, default-OFF, SS-only)
+  [ADR 0075](adr/0075-per-hop-sql-statement-batching.md) (`batch_handoff_statements`, default-ON (emergency
+  off-switch), SS-only)
   is Accepted. A microbench off the real handoffs (adversarially re-reviewed, counts verified honest)
   measured a per-hop **round-trip drop of 27–50%** — but the **≥40% figure is conditional on the
-  applock-rc fold** (strict interpretation 27–33%, clears nothing), so it *justifies* a live-rig e2e A/B and
-  does not substitute for it. The prototype build **and** promote both remain **gated on that rig A/B**
-  (standard conjunctive ≥10% / >2σ / zero-loss bar). The one unconditional result: per-hop batching is
+  applock-rc fold** (strict interpretation 27–33%, clears nothing), so it *justified* a live-rig e2e A/B and
+  did not substitute for it. **Bench B ran (2026-07-08) and reframed the lever as _distance insurance_**: a
+  single-box in-process A/B showed **harmless-near** (batch ON vs OFF within ±0.4% at the co-located ~0.28 ms
+  RTT, zero-loss) and **helps-far** (a constant ~−18% ACK-p99 with the absolute saving widening with RTT:
+  −84 ms @ +20 ms, −212 ms @ +50 ms), over a green SS correctness precondition — so the default **flipped to
+  ON 2026-07-08**, the flag retained only as an emergency off-switch (see
+  `docs/benchmarks/results/2026-07-08-adr0075-batch-ab/`). The one unconditional result: per-hop batching is
   **not** invariant-blocked (commits/msg stays 2.000; only *cross-lane* batching hits the ADR 0069 fence).
 - **Settled dead-ends (do not re-rank as live levers):** B5 thread-hop fusion **NO-GO** 2026-07-06 (below
   the ≥10% bar; [ADR 0071](adr/0071-cut-executor-round-trips-b5.md), stays default-OFF); free-threading

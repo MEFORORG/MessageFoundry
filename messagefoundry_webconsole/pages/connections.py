@@ -57,7 +57,14 @@ def _name_cell(r: ConnectionRow) -> Markup:
             _display_name(r.name),
             href=f"/ui/messages?channel_id={quote(r.channel_id)}&defer=1",
         ),
-        el("a", "details", href=f"/ui/connection/{quote(r.name)}", class_="detail-link"),
+        el(
+            "a",
+            "ⓘ",
+            href=f"/ui/connection/{quote(r.name)}",
+            class_="detail-link",
+            title="Connection details",
+            aria_label=f"Details for {_display_name(r.name)}",
+        ),
     )
 
 
@@ -196,9 +203,12 @@ def _controls_toolbar() -> Markup:
     options = [el("option", label, value=value) for value, label in _TOOLBAR_ACTIONS]
     return el(
         "div",
+        _filter_box(),  # filter first, then the bulk-action dropdown + Apply
         el("select", *options, data_mf_conns_action=True),
-        el("button", "Apply", type="button", data_mf_conns_apply=True),
-        el("span", data_mf_conns_feedback=True, class_="muted"),
+        el("button", "Go", type="button", data_mf_conns_apply=True),
+        el(
+            "span", data_mf_conns_feedback=True, class_="muted"
+        ),  # dynamic feedback (empty when idle)
         data_mf_conns_toolbar=True,
         class_="ctlbar",
     )
@@ -239,9 +249,8 @@ def dashboard(rows: list[ConnectionRow]) -> Markup:
     livestats = el("div", id="livestats", class_="livestats")
     return page(
         "Connections",
-        el("h1", "Connections"),
-        # Toolbar (bulk actions) + the filter box on one horizontal row.
-        el("div", _controls_toolbar(), _filter_box(), class_="ctlrow"),
+        # Header + the filter/bulk-action toolbar on one row.
+        el("div", el("h1", "Connections"), _controls_toolbar(), class_="page-head"),
         livestats,
         live,
         active="dashboard",
@@ -264,6 +273,7 @@ def connection_details(row: ConnectionRow, events: list[ConnectionEventInfo]) ->
             ["Channel", row.channel_id],
             ["Status", el("span", row.status, class_=f"status status-{row.status}")],
         ],
+        adjustable=False,
     )
     stats = rows_table(
         ["Metric", "Value"],
@@ -275,11 +285,13 @@ def connection_details(row: ConnectionRow, events: list[ConnectionEventInfo]) ->
             ["Alerts", _num(row.alerts_active)],
             ["Idle", _secs(row.idle_seconds)],
         ],
+        adjustable=False,
     )
     if events:
         events_tbl: Markup = rows_table(
             ["When", "Kind", "Dir", "Peer", "Reason"],
             [[_ts(e.ts), e.kind, e.direction, e.peer_host or "—", e.reason or "—"] for e in events],
+            adjustable=False,
         )
     else:
         events_tbl = el("p", "No recent events.", class_="muted")
@@ -302,7 +314,7 @@ def connection_details(row: ConnectionRow, events: list[ConnectionEventInfo]) ->
         el("h2", "Recent events"),
         events_tbl,
         el("p", el("a", "← Connections", href="/ui")),
-        class_="card",
+        class_="card detail-card",
     )
     return page(f"{_display_name(row.name)} — details", body, active="dashboard")
 

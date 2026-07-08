@@ -17,6 +17,7 @@ GET /ui/messages
 GET /ui/messages/search
 GET /ui/messages/{message_id}
 GET /ui/messages/{message_id}/parse-tree
+GET /ui/nav-status
 GET /ui/reauth
 GET /ui/roles
 GET /ui/roles/new

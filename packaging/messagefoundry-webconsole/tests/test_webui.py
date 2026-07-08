@@ -521,6 +521,198 @@ def test_rows_table_marks_adjustable() -> None:
     assert "<thead>" in html and "<th>Name</th>" in html and "<td>a</td>" in html
 
 
+def test_rows_table_info_is_not_adjustable() -> None:
+    """A key/value readout table (adjustable=False) is a plain wrapping table (class ``grid info``) with
+    NO ``data-mf-table`` marker — so app.js leaves it alone (no fixed-layout/explicit-width grid) and CSS
+    wraps long values instead of showing a horizontal scrollbar. Used for the status + connection-detail
+    readouts. Cells/headers/escaping are otherwise identical to the grid form."""
+    from messagefoundry_webconsole._html import rows_table
+
+    html = str(rows_table(["Field", "Value"], [["Path", "C:/x/y"]], adjustable=False))
+    assert 'class="grid info"' in html and "data-mf-table" not in html
+    assert "<th>Field</th>" in html and "<td>Path</td>" in html
+
+
+def test_status_and_detail_tables_are_non_adjustable() -> None:
+    """The status page + connection-detail key/value tables render as non-adjustable ``info`` tables (no
+    horizontal scrollbar); the connection-detail card is widened. Locks the fix so a future rows_table
+    refactor can't silently reintroduce the scroll."""
+    from messagefoundry_webconsole.pages.connections import connection_details
+
+    row = _ux_conn_row(name="IB_ORDERS ▸ in", channel_id="IB_ORDERS")
+    html = str(connection_details(row, []))
+    assert "detail-card" in html  # widened container
+    assert 'class="grid info"' in html  # the Connection + Statistics readouts wrap, not scroll
+    assert "data-mf-table" not in html  # nothing on this page is an adjustable (scrolling) grid
+
+
+def test_default_nav_renders_dropdown_groups() -> None:
+    """The top nav groups its links into CSS-only dropdowns (a <button> toggle + a <div class=navmenu>
+    of links), opening on :hover/:focus-within with no JS (CSP 'self'). Every member link stays in the
+    DOM (CSS hides the menu), so text/hrefs remain assertable. The group whose page is active is marked
+    active on its toggle button — NOT via an attribute on the wrapper div (locks a past regression)."""
+    from messagefoundry_webconsole._html import _default_nav
+
+    html = str(_default_nav("dashboard"))
+    # Dropdown scaffolding: one toggle button + one menu per group, labelled by area.
+    assert 'class="navtop active">Traffic ▾</button>' in html  # active group (dashboard is in it)
+    assert 'class="navtop">Monitoring ▾</button>' in html  # an inactive group
+    assert html.count('aria-haspopup="menu"') == 4  # each toggle marks itself a menu opener (a11y)
+    assert html.count('class="navmenu"') == 4
+    # Member links are present (menu is CSS-hidden, not removed) and none leaked as a top-level <a>.
+    assert '<a href="/ui/messages">Messages</a>' in html
+    assert '<a href="/ui/config">Configuration</a>' in html
+    assert "<div active=" not in html  # active drives a button class, never a wrapper attribute
+    # Active highlight follows the current page to a different group.
+    assert 'class="navtop active">Monitoring ▾</button>' in str(_default_nav("alerts"))
+
+
+def test_default_nav_renders_status_icons() -> None:
+    """The nav pins two live status glyphs to the right (left of Sign out): the alerts bell then the
+    engine-health heart, in that order. Each is a LINK to its detail page (bell → /ui/alerts, heart →
+    /ui/status). They render NEUTRAL (gray) with app.js data hooks; app.js polls /ui/nav-status and
+    recolors them. Monochrome inline SVG (fill=currentColor) so CSS `color` tints them — not an emoji."""
+    from messagefoundry_webconsole._html import _default_nav
+
+    html = str(_default_nav("dashboard"))
+    assert "data-mf-nav-status" in html  # the always-on app.js poller hook (present on every page)
+    assert "data-mf-nav-alerts" in html and "alerts-unknown" in html
+    assert "data-mf-nav-health" in html and "health-unknown" in html
+    # Each glyph is an anchor to its detail page (the app.js hook rides the same <a>).
+    assert '<a href="/ui/alerts"' in html and "data-mf-nav-alerts" in html  # bell → alerts
+    assert '<a href="/ui/status"' in html and "data-mf-nav-health" in html  # heart → status
+    assert 'role="status"' not in html  # a link, not a live-region that re-announces every poll
+    # alerts left of heart, both left of Sign out
+    assert (
+        html.index("data-mf-nav-alerts") < html.index("data-mf-nav-health") < html.index("Sign out")
+    )
+    assert 'fill="currentColor"' in html  # colorable monochrome glyph, not an emoji
+
+
+_GIB = 1024**3
+
+
+def _sysinfo(disk_free: int, *, logs_free: int | None = None, pool_idle: int | None = None):
+    """A minimal SystemStatus for _derive_health tests — only the fields the rollup reads matter."""
+    from messagefoundry.api.models import (
+        DbInfo,
+        EngineInfo,
+        LogInfo,
+        PoolInfo,
+        PoolWaitInfo,
+        SystemStatus,
+    )
+
+    return SystemStatus(
+        engine=EngineInfo(
+            version="0",
+            uptime_seconds=1.0,
+            pid=1,
+            channels_total=0,
+            channels_running=0,
+            channels_stopped=0,
+            outbox_by_status={},
+        ),
+        db=DbInfo(
+            path="db",
+            size_bytes=1,
+            disk_free_bytes=disk_free,
+            journal_mode="wal",
+            messages=0,
+            events=0,
+            audit=0,
+        ),
+        logs=None
+        if logs_free is None
+        else LogInfo(path="l", size_bytes=1, disk_free_bytes=logs_free),
+        pool=None
+        if pool_idle is None
+        else PoolInfo(
+            backend="postgres",
+            max_size=10,
+            size=10,
+            idle=pool_idle,
+            acquire_wait=PoolWaitInfo(
+                count=0, p50_ms=0.0, mean_ms=0.0, p95_ms=0.0, p99_ms=0.0, max_ms=0.0
+            ),
+        ),
+    )
+
+
+def test_derive_health_ok_when_healthy() -> None:
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    assert _derive_health(_sysinfo(50 * _GIB), None, None, None) == ("ok", None)
+
+
+def test_derive_health_warns_on_low_disk() -> None:
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(3 * _GIB), None, None, None)
+    assert health == "warn" and reason is not None and "low disk" in reason
+
+
+def test_derive_health_critical_on_very_low_disk() -> None:
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, _ = _derive_health(_sysinfo(512 * 1024**2), None, None, None)  # 0.5 GiB free
+    assert health == "down"
+
+
+def test_derive_health_down_when_store_unreachable() -> None:
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    assert _derive_health(None, None, None, None) == ("down", "store unreachable")
+
+
+def test_derive_health_warns_on_saturated_pool() -> None:
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    health, reason = _derive_health(_sysinfo(50 * _GIB, pool_idle=0), None, None, None)
+    assert health == "warn" and reason == "DB connection pool saturated"
+
+
+def test_derive_health_warns_on_dr_active() -> None:
+    from messagefoundry.api.models import DrStatus
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    dr = DrStatus(enabled=True, active=True, threshold="P1", activation_mode="manual")
+    health, reason = _derive_health(_sysinfo(50 * _GIB), dr, None, None)
+    assert health == "warn" and reason is not None and "failover" in reason
+
+
+def test_derive_health_down_when_cluster_leaderless() -> None:
+    from messagefoundry.api.models import ClusterNodeList, ClusterStatus
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    cluster = ClusterStatus(
+        node_id="n1", clustered=True, is_leader=False, role="standby", config_version=1
+    )
+    nodes = ClusterNodeList(nodes=[], leader_node_id=None, lease_owner=None, lease_expires_at=None)
+    health, reason = _derive_health(_sysinfo(50 * _GIB), None, cluster, nodes)
+    assert health == "down" and reason == "cluster has no leader"
+
+
+def test_derive_health_worst_issue_wins_not_composite() -> None:
+    """Owner spec: the color is the WORST single issue, not a composite. A critical disk + warn signals
+    (saturated pool, DR-active) still resolves to down, and the reason is the critical one."""
+    from messagefoundry.api.models import DrStatus
+    from messagefoundry_webconsole.routes.status import _derive_health
+
+    dr = DrStatus(enabled=True, active=True, threshold="P1", activation_mode="manual")
+    health, reason = _derive_health(_sysinfo(512 * 1024**2, pool_idle=0), dr, None, None)
+    assert health == "down" and reason is not None and "low disk" in reason
+
+
+def test_worst_severity_ranks_critical_highest() -> None:
+    from messagefoundry_webconsole.routes.status import _worst_severity
+
+    assert _worst_severity(["info", "critical", "warning"]) == "critical"
+    assert _worst_severity(["info", "warning"]) == "warning"
+    assert _worst_severity(["info"]) == "info"
+    assert _worst_severity([]) is None
+
+
 def test_dashboard_has_connections_filter_box() -> None:
     """The connections dashboard renders a client-side filter-as-you-type box (app.js hides rows that
     don't match). It's an <input type=search> outside the polled table so its value survives the swap."""
@@ -3889,6 +4081,73 @@ async def _wait_quiesced(engine: Engine, name: str) -> None:
             return
         await asyncio.sleep(0.02)
     raise AssertionError(f"{name} never quiesced")
+
+
+async def test_connection_details_route_renders(engine: Engine, tmp_path: Path) -> None:
+    """#4a route end-to-end: GET /ui/connection/<name> must render (not 500). The events handler is
+    called DIRECTLY (not over HTTP), so every FastAPI Query(...) param must be passed explicitly — a
+    regression guard for the 'Query object is not iterable' 500. The name is the composite display
+    string ('in1 ▸ in'); the page strips it to 'in1' for the heading."""
+    await _start_two_out(engine, tmp_path)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.get("/ui/connection/in1 ▸ in")
+        assert r.status_code == 200, r.text
+        assert "<h1>in1</h1>" in r.text  # stripped display name in the heading
+
+
+async def test_nav_status_route_operator_sees_health_and_alerts(engine: Engine) -> None:
+    """GET /ui/nav-status: the metadata-only rollup the nav heart + bell poll (~15s, every page). A fresh
+    engine on a temp DB is reachable (store OK) with no active alerts, so an operator (monitoring:read +
+    diagnose) gets a valid health verdict AND an alerts object with count 0 — never a 500, never any PHI."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.get("/ui/nav-status")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["health"] in ("ok", "warn", "down")
+        assert body["alerts"] == {"count": 0, "severity": None}
+
+
+async def test_nav_status_route_hides_alert_count_without_diagnose(engine: Engine) -> None:
+    """A viewer has monitoring:read (so the endpoint is allowed and health is reported) but NOT
+    monitoring:diagnose — the alert count is withheld (alerts=null) so the bell hides itself rather than
+    imply 'no alerts' to a viewer who can't see them. Guards the direct-call gate-bypass (the handler's own
+    Depends(require(diagnose)) is skipped when called in-process, so the route gates on identity.has())."""
+    service = await _service(engine)
+    await _add(service, "viewer", Role.VIEWER)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "viewer")
+        r = await c.get("/ui/nav-status")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["health"] in ("ok", "warn", "down")
+        assert body["alerts"] is None
+
+
+async def test_nav_status_route_counts_active_alerts_worst_severity(engine: Engine) -> None:
+    """With active alerts seeded, an operator's nav-status returns the count + the WORST severity (the bell
+    colors by it) — exercising the non-empty diagnose-gated count path, not just the zero case."""
+    await engine.store.upsert_alert_instance(
+        event_type="queue_depth", connection="in1", severity="warning"
+    )
+    await engine.store.upsert_alert_instance(
+        event_type="dead_letter", connection="in2", severity="critical"
+    )
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.get("/ui/nav-status")
+        assert r.status_code == 200, r.text
+        assert r.json()["alerts"] == {
+            "count": 2,
+            "severity": "critical",
+        }  # worst of warning+critical
 
 
 # --- bulk-control (dual-role start/stop/restart over a selection) ----------------------------------

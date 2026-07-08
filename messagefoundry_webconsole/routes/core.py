@@ -136,8 +136,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             row.destination if (row.role == "destination" and row.destination) else row.channel_id
         )
         try:
+            # Pass EVERY param explicitly: called directly (not over HTTP), any FastAPI Query(...) default
+            # left unfilled arrives as a Query object (kind would reach the store un-iterable → 500).
             events = await core.list_connection_events(
-                engine=engine, identity=identity, connection=events_key, limit=50
+                engine=engine,
+                identity=identity,
+                connection=events_key,
+                kind=None,
+                since=None,
+                limit=50,
             )
         except HTTPException:
             events = []  # still show the connection's info + stats if events are RBAC-scoped out

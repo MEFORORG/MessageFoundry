@@ -210,6 +210,8 @@ def _rec(
     written: float | None = None,
     drain_seconds: float | None = 1.0,
     backlog: int = 0,
+    ack_p50: float = 1.0,
+    ack_p99: float = 3.0,
 ) -> ConnScaleRecord:
     written = read if written is None else written
     detail = "ok" if no_loss_ok else f"lost {sent - sink_received}"
@@ -237,9 +239,9 @@ def _rec(
         wake_fanout_per_s=0.0,
         fd_count_peak=100,
         reload_seconds=None,
-        ack_p50_ms=1.0,
-        ack_p95_ms=2.0,
-        ack_p99_ms=3.0,
+        ack_p50_ms=ack_p50,
+        ack_p95_ms=(ack_p50 + ack_p99) / 2.0,
+        ack_p99_ms=ack_p99,
         claim_mode=claim_mode,
         achieved_read_per_s=read,
         achieved_written_per_s=written,
@@ -432,6 +434,49 @@ def test_batch_labels_and_kind_are_the_batch_axis() -> None:
     table = cmp.render_table()
     assert "Statement-batching A/B" in table and "ADR 0075" in table
     assert "Thread-hop-fusion" not in table  # not mislabelled as the fusion axis
+
+
+def test_batch_comparison_surfaces_ack_latency_signal() -> None:
+    # ADR 0075's benefit is a LATENCY / distance-insurance signal, not throughput: on a real bench at an
+    # injected +20 ms engine→store RTT, batch-ON showed a LOWER ACK p99 (391 vs 475 ms), both arms
+    # zero-loss. Surface ACK p50/p99 as first-class B0-vs-B1 columns (console table + the batch_comparison
+    # JSON block) so operators no longer hand-diff them out of the raw records. "ON (B1) lower than OFF
+    # (B0)" — a NEGATIVE delta — is the good sign. (A companion mean-drain column was dropped: bench
+    # validation showed it was warm-up-dominated — one cold OFF trial spiked in-pipeline and skewed the
+    # trial mean — so it was not a reliable batch signal; the ACK percentiles are.)
+    b0 = _trials(False, [100.0, 101.0, 99.0], ack_p50=10.0, ack_p99=475.0)
+    b1 = _trials(True, [100.0, 101.0, 99.0], ack_p50=8.0, ack_p99=391.0)
+    cmp = build_batch_comparison(b0 + b1, (False, True))
+    assert cmp is not None
+    row = cmp.rows[0]
+    assert row.candidate is not None
+
+    # Per-arm aggregates (trial means) land on the shared arm dataclass — for BOTH arms.
+    assert row.baseline.mean_ack_p50_ms == pytest.approx(10.0)
+    assert row.candidate.mean_ack_p50_ms == pytest.approx(8.0)
+    assert row.baseline.mean_ack_p99_ms == pytest.approx(475.0)
+    assert row.candidate.mean_ack_p99_ms == pytest.approx(391.0)
+
+    body = json.loads(json.dumps(cmp.to_json_dict()))  # JSON-serializable
+    lat = body["rows"][0]["latency"]
+    assert lat["b0_ack_p50_ms"] == 10.0 and lat["b1_ack_p50_ms"] == 8.0
+    assert lat["b0_ack_p99_ms"] == 475.0 and lat["b1_ack_p99_ms"] == 391.0
+    # ON lower than OFF ⇒ NEGATIVE delta (the good, distance-insurance direction).
+    assert lat["ack_p50_delta_pct"] is not None and lat["ack_p50_delta_pct"] < 0.0
+    assert lat["ack_p99_delta_pct"] is not None and lat["ack_p99_delta_pct"] < 0.0
+    # The dropped (warm-up-dominated) mean-drain column must NOT reappear in the JSON latency block.
+    assert "b0_drain_s" not in lat and "b1_drain_s" not in lat and "drain_delta_pct" not in lat
+
+    # It is a REPORTED signal, not a gate: with a flat 0% throughput lift the verdict stays NO-GO even
+    # though every latency column improved — the latency columns never move the GO/NO-GO decision.
+    assert row.verdict == FUSE_NO_GO
+
+    # And it reads in the console table too (B0, B1, and the delta columns); the dropped mean-drain
+    # column is gone from the table.
+    table = cmp.render_table()
+    assert "ack_p50_ms (mean)" in table
+    assert "ack_p99_ms (mean)" in table
+    assert "drain_seconds (mean)" not in table
 
 
 # --------------------------------------------------------------------------- #

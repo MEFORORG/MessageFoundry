@@ -213,7 +213,7 @@
           msg += "; skipped " + skips + ": " + reasons.join(", ");
         }
       } else if (eligible === 0) {
-        msg = "Select one or more connections.";
+        msg = ""; // idle: no clutter text — feedback only appears once an action targets a selection
       } else {
         msg = label + " → " + eligible + " selected";
       }
@@ -507,7 +507,7 @@
   // which is keyed by row value, so reordering rows never disturbs it. localStorage failures (private
   // mode / quota) degrade to session-only, never throw.
   feature("[data-mf-table]", function () {
-    var PREFIX = "mfcols:";
+    var PREFIX = "mfcols:v2:"; // v2: reset stale widths once so the fill-to-container default applies
     var MINW = 50; // minimum column width (px)
     var reorderFrom = null; // ORIGINAL index of the column being drag-reordered (one drag at a time)
     function readState(key) {
@@ -690,6 +690,34 @@
       });
       var widths = [];
       for (var wi = 0; wi < ncols; wi++) widths[wi] = (st.widths && st.widths[wi]) || natural[wi];
+
+      // Fill to the container's right edge. The table uses an explicit width = sum(col widths) so a resized
+      // column keeps its exact width (no width:100% "snap back wider" redistribution). But when that sum
+      // falls SHORT of the space available — few columns, or remembered narrow widths — the table stops
+      // before the right edge. Grow the LAST resizable column to absorb the slack so the table stays flush
+      // with the container's right edge (a real data-grid look); the other columns keep their exact widths.
+      // When columns already overflow (sum >= space) it's left alone → horizontal scroll, unchanged. Uses the
+      // scroll-wrap's clientWidth (padding-box, minus any scrollbar); it's re-run on each poll re-enhance, so
+      // the live table re-fills after a window resize.
+      var availW = table.parentElement ? table.parentElement.clientWidth : 0;
+      var sumW = 0;
+      for (var sw = 0; sw < widths.length; sw++) sumW += widths[sw];
+      var noStored = !(st.widths && st.widths.length);
+      if (availW && sumW) {
+        var lastIdx = ncols - 1;
+        while (lastIdx > 0 && head.cells[lastIdx].querySelector("input")) lastIdx--; // skip control cols
+        var delta = availW - sumW;
+        if (delta > 0) {
+          widths[lastIdx] += delta; // grow the last column to reach the right edge
+        } else if (noStored && -delta <= 32 && widths[lastIdx] + delta >= MINW) {
+          // Trim a SMALL rounding overshoot on a fresh table: the natural widths are summed integer
+          // offsetWidths (border-box), which can total a few px OVER the container and trip overflow-x:auto —
+          // a spurious horizontal scrollbar on a table that visually fits (e.g. the narrow key/value info
+          // tables on the connection-detail + status pages). A large (content-driven) overflow is left to
+          // scroll, and a user-resized column (stored widths) is never trimmed.
+          widths[lastIdx] += delta;
+        }
+      }
       table.__mfWidths = widths.slice(); // seed for a first resize (numeric intent, never offsetWidth)
 
       // Inject <colgroup> + switch to fixed layout with an explicit table width = sum(widths). Each
@@ -876,6 +904,101 @@
     // back into this observer (it watches childList), so no loop.
     new MutationObserver(apply).observe(poll, { childList: true, subtree: true });
     apply();
+  });
+
+  // --- Live engine-health + alerts nav glyphs ------------------------------------------------------
+  // The nav renders on EVERY page, so this is the one always-on poller. It fetches the metadata-only
+  // GET /ui/nav-status (~15s) and recolors two server-rendered <span> glyphs via classList + title/
+  // aria-label only — never innerHTML (CSP script-src 'self'; the count is a number, set as text/aria, not
+  // markup). Engine health: ok=green, warn=orange, down=blinking-red; a fetch/network failure means the
+  // ENGINE itself is unreachable → down. Alerts: gray at zero, else colored by worst severity; a null
+  // payload (viewer lacks monitoring:diagnose) HIDES the bell rather than showing a gray "no alerts" it
+  // isn't cleared to trust. A 403 (no monitoring:read at all) hides the whole cluster.
+  feature("[data-mf-nav-status]", function (box) {
+    var heart = box.querySelector("[data-mf-nav-health]");
+    var bell = box.querySelector("[data-mf-nav-alerts]");
+    var HEALTH_CLS = ["health-unknown", "health-ok", "health-warn", "health-down"];
+    var ALERT_CLS = ["alerts-unknown", "alerts-none", "alerts-info", "alerts-warning", "alerts-critical"];
+
+    function setClass(node, all, one) {
+      if (!node) return;
+      for (var i = 0; i < all.length; i++) node.classList.remove(all[i]);
+      node.classList.add(one);
+    }
+    function label(node, text) {
+      if (!node) return;
+      node.setAttribute("title", text);
+      node.setAttribute("aria-label", text);
+    }
+    function setHealth(state, reason) {
+      var cls =
+        state === "ok"
+          ? "health-ok"
+          : state === "warn"
+            ? "health-warn"
+            : state === "down"
+              ? "health-down"
+              : "health-unknown";
+      setClass(heart, HEALTH_CLS, cls);
+      label(heart, "Engine health: " + (reason || state || "unknown"));
+    }
+    function setAlerts(info) {
+      if (!bell) return;
+      if (!info) {
+        bell.style.display = "none"; // no monitoring:diagnose → don't imply "no alerts"
+        return;
+      }
+      bell.style.display = "";
+      var n = info.count || 0;
+      var sev = info.severity;
+      var cls =
+        n === 0
+          ? "alerts-none"
+          : sev === "critical"
+            ? "alerts-critical"
+            : sev === "warning"
+              ? "alerts-warning"
+              : "alerts-info";
+      setClass(bell, ALERT_CLS, cls);
+      label(
+        bell,
+        n === 0
+          ? "No active alerts"
+          : n + " active alert" + (n === 1 ? "" : "s") + (sev ? " (worst: " + sev + ")" : "")
+      );
+    }
+    async function poll() {
+      try {
+        var resp = await fetch("/ui/nav-status", {
+          credentials: "same-origin",
+          redirect: "manual", // don't FOLLOW an auth 303 into the login page (see below)
+          headers: { "X-Requested-With": "fetch" },
+          cache: "no-store",
+        });
+        // Session expired: require_ui answers 303 → /ui/login. With redirect:"manual" that surfaces as an
+        // opaque redirect (type "opaqueredirect", status 0) instead of being transparently followed into a
+        // 200 login PAGE — which we'd then JSON.parse and, on the throw, falsely paint the heart blinking-red
+        // "engine unreachable". Treat it as a no-op: the next real navigation takes the user to login. (Same
+        // idiom as the step-up fetches above.)
+        if (resp.type === "opaqueredirect" || resp.status === 0) return;
+        if (resp.status === 403) {
+          box.style.display = "none"; // not permitted to see engine status at all
+          return;
+        }
+        if (resp.status === 401) return; // auth edge — don't alarm; a navigation redirects to login
+        if (!resp.ok) {
+          setHealth("down", "status unavailable");
+          return;
+        }
+        var d = JSON.parse(await resp.text()) || {};
+        setHealth(d.health, d.reason);
+        setAlerts(Object.prototype.hasOwnProperty.call(d, "alerts") ? d.alerts : null);
+      } catch (e) {
+        setHealth("down", "engine unreachable"); // network error → the engine/API is down
+      }
+    }
+    poll();
+    setInterval(poll, 15000);
   });
 
   // Deferred script → DOM already parsed. Run each feature whose hook is present on this page.

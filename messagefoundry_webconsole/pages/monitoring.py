@@ -136,6 +136,7 @@ def alerts(instances: AlertInstanceList, config: AlertsConfig) -> Markup:
             ["Email recipients", config.email_recipient_count],
             ["Re-alert after", f"{config.realert_seconds:.0f}s"],
         ],
+        adjustable=False,
     )
     rule_rows = [
         [
@@ -262,6 +263,7 @@ def status(
                 ", ".join(f"{k}: {v}" for k, v in e.outbox_by_status.items()) or "—",
             ],
         ],
+        adjustable=False,
     )
     store_tbl = rows_table(
         ["Field", "Value"],
@@ -281,6 +283,7 @@ def status(
             ["Events", db.events],
             ["Audit rows", db.audit],
         ],
+        adjustable=False,
     )
     cluster_tbl = rows_table(
         ["Field", "Value"],
@@ -293,6 +296,7 @@ def status(
             ["Leader", _opt(nodes.leader_node_id)],
             ["Lease owner", _opt(nodes.lease_owner)],
         ],
+        adjustable=False,
     )
     node_rows = [
         [
@@ -305,7 +309,9 @@ def status(
         ]
         for n in nodes.nodes
     ]
-    node_tbl = rows_table(["Node", "Host", "PID", "Status", "Leader", "Last seen"], node_rows)
+    node_tbl = rows_table(
+        ["Node", "Host", "PID", "Status", "Leader", "Last seen"], node_rows, adjustable=False
+    )
     dr_tbl = rows_table(
         ["Field", "Value"],
         [
@@ -314,6 +320,7 @@ def status(
             ["Threshold", dr.threshold],
             ["Activation", dr.activation_mode],
         ],
+        adjustable=False,
     )
     dr_actions: list[object] = []
     if dr.active:
@@ -345,6 +352,7 @@ def status(
             rows_table(
                 ["Field", "Value"],
                 [["Service", _opt(service.service_name)], ["State", badge]],
+                adjustable=False,
             )
         )
     # L6b (#75 parity): the no-network update-available signal (#30, ADR 0026) — the desktop shows

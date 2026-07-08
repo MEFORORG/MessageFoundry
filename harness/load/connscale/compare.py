@@ -544,6 +544,16 @@ def _drain_fmt(drain_seconds_worst: float | None) -> str:
     return "TIMED-OUT" if drain_seconds_worst is None else f"{drain_seconds_worst:.2f}"
 
 
+def _pct_delta(base: float | None, candidate: float | None) -> float | None:
+    """(candidate - base) / base * 100 for an INFORMATIONAL latency-signal column (the ACK p50/p99
+    means), or ``None`` when it can't be computed (either value missing or a zero/negative base). A
+    NEGATIVE result means the candidate (B1) is LOWER than the baseline (B0): the good, distance-insurance
+    direction. This is a reported signal, never a gate — it does not touch the throughput verdict."""
+    if base is None or candidate is None or base <= 0.0:
+        return None
+    return (candidate - base) / base * 100.0
+
+
 # =============================================================================
 # Thread-hop-fusion A/B (ADR 0071 B5) — B0 (fusion off) vs B1 (fusion on).
 # =============================================================================
@@ -649,6 +659,17 @@ class _FuseArm:
     delivered_offered: float | None  # mean sink_received/sent across trials (None if no sent)
     zero_loss_ok: bool  # every trial held the at-least-once reconcile
     offered_rate: float
+    # --- latency SIGNAL (INFORMATIONAL, not gated) — the "distance insurance" readout the ADR 0075
+    # statement-batching bench surfaced: at an injected engine→store RTT, batch-ON showed a LOWER ACK p99
+    # (both arms zero-loss). It is a LATENCY signal, not a throughput one, so it does NOT feed the GO/NO-GO
+    # verdict — it is reported alongside. ``mean_ack_p50_ms`` / ``mean_ack_p99_ms`` are the trial means of
+    # the record's ACK-on-receipt percentiles. "ON (B1) lower than OFF (B0)" (a negative delta) is the good
+    # direction. (A companion mean-drain column was dropped after bench validation showed it was warm-up-
+    # dominated — one cold OFF trial spiked in-pipeline and skewed the trial mean, so it was not a reliable
+    # batch signal; the ACK percentiles are. The worst-case ``drain_seconds_worst`` above stays the drain
+    # gate.) ---
+    mean_ack_p50_ms: float
+    mean_ack_p99_ms: float
 
     @property
     def drain_completed(self) -> bool:
@@ -668,6 +689,8 @@ class _FuseArm:
         # reach 0, so there is no finite whole-pipeline drain time to trust — the arm did NOT fully
         # drain. Only when EVERY trial completed is the worst-case the max of the finite drain times.
         drain_seconds_worst = max(completed) if recs and len(completed) == len(drains) else None
+        ack_p50s = [r.ack_p50_ms for r in recs]
+        ack_p99s = [r.ack_p99_ms for r in recs]
         return cls(
             fuse=fuse,
             trials=len(recs),
@@ -679,6 +702,10 @@ class _FuseArm:
             delivered_offered=statistics.fmean(ratios) if ratios else None,
             zero_loss_ok=all(r.no_loss.ok for r in recs) and bool(recs),
             offered_rate=recs[0].offered_aggregate_rate if recs else 0.0,
+            # The informational latency signal (see the field docstring) — trial means of the record's
+            # ACK-on-receipt percentiles.
+            mean_ack_p50_ms=statistics.fmean(ack_p50s) if ack_p50s else 0.0,
+            mean_ack_p99_ms=statistics.fmean(ack_p99s) if ack_p99s else 0.0,
         )
 
 
@@ -858,6 +885,20 @@ class FuseModeComparison:
             lines.append(
                 f"  zero_loss                 B0={_yn(b.zero_loss_ok):>9}  "
                 f"B1={_yn(cand.zero_loss_ok):>9}  {'':>9}  candidate_lost: {_yn(row.candidate_lost)}"
+            )
+            # Latency / drain SIGNAL (ADR 0075 distance insurance) — INFORMATIONAL, not gated: B1 LOWER
+            # than B0 (a negative delta) is the good direction; the throughput verdict above is unchanged.
+            lines.append(
+                f"  ack_p50_ms (mean)         B0={b.mean_ack_p50_ms:>9.2f}  "
+                f"B1={cand.mean_ack_p50_ms:>9.2f}  "
+                f"{_delta(_pct_delta(b.mean_ack_p50_ms, cand.mean_ack_p50_ms)):>9}  "
+                f"lower-is-better (not gated)"
+            )
+            lines.append(
+                f"  ack_p99_ms (mean)         B0={b.mean_ack_p99_ms:>9.2f}  "
+                f"B1={cand.mean_ack_p99_ms:>9.2f}  "
+                f"{_delta(_pct_delta(b.mean_ack_p99_ms, cand.mean_ack_p99_ms)):>9}  "
+                f"lower-is-better (not gated)"
             )
             lines.append(_fuse_metric_line("trials", b.trials, cand.trials))
             lines.append(
@@ -1252,6 +1293,35 @@ def _fuse_row_json(row: FuseComparisonRow) -> dict[str, object]:
             "candidate_lost": row.candidate_lost,
             "b0_zero_loss": row.baseline.zero_loss_ok,
             "b1_zero_loss": (None if row.candidate is None else row.candidate.zero_loss_ok),
+        },
+        # INFORMATIONAL latency signal (ADR 0075 distance insurance) — NOT a gate: the GO/NO-GO verdict
+        # above is unchanged. ``*_delta_pct`` is (B1 - B0) / B0 * 100, so a NEGATIVE value means B1 is
+        # LOWER than B0 — the good direction. (The worst-case post-load drain lives in the guards block's
+        # ``*_drain_seconds_worst``; a companion mean-drain column was dropped as warm-up-dominated, not a
+        # reliable batch signal.)
+        "latency": {
+            "b0_ack_p50_ms": round(row.baseline.mean_ack_p50_ms, 3),
+            "b1_ack_p50_ms": (
+                None if row.candidate is None else round(row.candidate.mean_ack_p50_ms, 3)
+            ),
+            "ack_p50_delta_pct": (
+                None
+                if row.candidate is None
+                else _round_or_none(
+                    _pct_delta(row.baseline.mean_ack_p50_ms, row.candidate.mean_ack_p50_ms), 2
+                )
+            ),
+            "b0_ack_p99_ms": round(row.baseline.mean_ack_p99_ms, 3),
+            "b1_ack_p99_ms": (
+                None if row.candidate is None else round(row.candidate.mean_ack_p99_ms, 3)
+            ),
+            "ack_p99_delta_pct": (
+                None
+                if row.candidate is None
+                else _round_or_none(
+                    _pct_delta(row.baseline.mean_ack_p99_ms, row.candidate.mean_ack_p99_ms), 2
+                )
+            ),
         },
     }
     return out

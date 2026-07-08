@@ -222,6 +222,7 @@ def message_detail(detail: MessageDetail) -> Markup:
             ["Summary", detail.summary],
             ["Error", detail.error],
         ],
+        adjustable=False,
     )
     # The raw body is attacker-influenced HL7 — rendered as escaped text inside <pre>, never as markup.
     raw = el("pre", detail.raw, class_="raw")

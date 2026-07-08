@@ -78,6 +78,7 @@ def reload_result(result: ReloadResult) -> Markup:
             ["Outbound connections", result.outbound],
             ["Routers", result.routers],
         ],
+        adjustable=False,
     )
     body = el(
         "div",
