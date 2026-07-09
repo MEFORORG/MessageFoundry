@@ -27,6 +27,7 @@ import errno
 import functools
 import json
 import logging
+import os
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
@@ -241,6 +242,103 @@ class EmptyClaimCounters:
             self.wake_fanout += 1
         else:
             self.idle_poll += 1
+
+
+# --- bench-gated per-delivery phase timing (default OFF) --------------------------------------------
+# The rig measured a ~83 ms/delivery outbound ceiling (~96 deliveries/s) with every tier idle; static
+# analysis exonerated engine CPU, the store, the claim path, and the dispatcher cadence, so the ~83 ms
+# is a RUNTIME cross-box latency INSIDE the per-delivery body that loopback can't reproduce — it is
+# either the connector send->ACK round-trip or the store completion (mark_done) round-trip. This lever
+# times BOTH sub-phases so one rig run attributes the ceiling. Metrics only (count/mean/max) — NEVER a
+# payload or control-id (PHI). Default OFF: when off the per-item body is a single bool check (no
+# perf_counter, no allocation); the rig sets the env var per engine subprocess and reads the throttled
+# summary from that shard's captured stdout.
+DELIVERY_PHASE_TIMING_ENV = "MEFOR_DELIVERY_PHASE_TIMING"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+# How often (monotonic seconds) each process emits its rolling phase-timing summary, then resets the
+# window. Bounded — a per-process INFO line every ~5 s, never a line per delivery.
+_DELIVERY_PHASE_EMIT_INTERVAL = 5.0
+
+
+def delivery_phase_timing_enabled() -> bool:
+    """Whether the bench-only per-delivery phase-timing lever is on (``MEFOR_DELIVERY_PHASE_TIMING``
+    truthy). Default OFF — read ONCE per runner at construction (never per delivery)."""
+    return os.environ.get(DELIVERY_PHASE_TIMING_ENV, "").strip().lower() in _TRUTHY
+
+
+@dataclass
+class _PhaseWindow:
+    """One phase's rolling window: bounded aggregates only (count + sum + max nanoseconds), never a
+    per-sample list — so the accumulator can't grow with delivery volume. Reset each emit window."""
+
+    count: int = 0
+    sum_ns: int = 0
+    max_ns: int = 0
+
+    def add(self, ns: int) -> None:
+        self.count += 1
+        self.sum_ns += ns
+        if ns > self.max_ns:
+            self.max_ns = ns
+
+    def reset(self) -> None:
+        self.count = 0
+        self.sum_ns = 0
+        self.max_ns = 0
+
+    def mean_ms(self) -> float:
+        return (self.sum_ns / self.count) / 1e6 if self.count else 0.0
+
+    def max_ms(self) -> float:
+        return self.max_ns / 1e6
+
+
+class DeliveryPhaseTiming:
+    """Bench-gated accumulator for the two per-delivery sub-phases (see the module note above):
+    ``send_ack`` (the ``await connector.send`` round-trip to the partner) and ``mark_done`` (the store
+    completion round-trip — ``mark_done`` / ``complete_with_response``). It holds BOUNDED aggregates
+    (count + sum + max per phase) and emits a throttled INFO summary every
+    ``_DELIVERY_PHASE_EMIT_INTERVAL`` seconds, then resets the window.
+
+    Mutated only on the engine event loop — ``_process_delivery_item`` records synchronously (no await
+    between reading and writing the counters) so pooled claimers can't interleave a partial update; no
+    lock needed (same discipline as :class:`EmptyClaimCounters`). Never records or logs a payload /
+    control-id (PHI rule)."""
+
+    def __init__(self) -> None:
+        self.send_ack = _PhaseWindow()
+        self.mark_done = _PhaseWindow()
+        # 0.0 (not now) so the FIRST recorded delivery emits immediately, then throttles — one prompt
+        # datapoint per process on the rig, without waiting a full window for the first line.
+        self._last_emit = 0.0
+
+    def record_send_ack(self, ns: int) -> None:
+        self.send_ack.add(ns)
+
+    def record_mark_done(self, ns: int) -> None:
+        self.mark_done.add(ns)
+
+    def maybe_emit(self, *, stage: str = "outbound") -> None:
+        """Emit the throttled summary + reset the window when the interval has elapsed. Called after
+        each recorded delivery; a no-op between windows (one monotonic subtraction)."""
+        now = time.monotonic()
+        if now - self._last_emit < _DELIVERY_PHASE_EMIT_INTERVAL:
+            return
+        self._last_emit = now
+        # Metrics only — count/mean/max in ms, never a message body or control-id.
+        log.info(
+            "delivery phase timing (stage=%s): send_ack n=%d mean=%.2fms max=%.2fms | "
+            "mark_done n=%d mean=%.2fms max=%.2fms",
+            stage,
+            self.send_ack.count,
+            self.send_ack.mean_ms(),
+            self.send_ack.max_ms(),
+            self.mark_done.count,
+            self.mark_done.mean_ms(),
+            self.mark_done.max_ms(),
+        )
+        self.send_ack.reset()
+        self.mark_done.reset()
 
 
 class _ItemOutcome(Enum):
@@ -658,6 +756,12 @@ class RegistryRunner:
         # split into idle-poll re-SELECTs vs per-commit wake-fanout (the thundering herd). Surfaced via
         # /stats; default 0, so byte-identical when the connection-scale harness never reads it.
         self._empty_claims = EmptyClaimCounters()
+        # Bench-gated per-delivery phase timing (default OFF). Resolved ONCE here (not per delivery) so
+        # the per-item body is a single bool check when off — no perf_counter, no allocation. BOTH the
+        # pooled OUTBOUND StageDispatcher (_dispatch_delivery) and the per_lane _delivery_worker flow
+        # through _process_delivery_item, so timing there covers both claim modes with one change.
+        self._delivery_phase_timing = delivery_phase_timing_enabled()
+        self._delivery_phase_stats = DeliveryPhaseTiming()
 
     @property
     def running(self) -> bool:
@@ -2762,7 +2866,14 @@ class RegistryRunner:
                 # capturing/reingress_to outbound therefore captures nothing in simulate.)
                 response = None
             else:
+                # PHASE (a): the connector send->ACK round-trip. On a real cross-box outbound this is
+                # the partner dial + write + wait-for-ACK — a prime suspect for the ~83 ms ceiling that
+                # loopback can't reproduce. Timed only when the bench lever is on (else `_send_t0 = 0`,
+                # no perf_counter). See the DeliveryPhaseTiming note.
+                _send_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
                 response = await connector.send(item.payload)
+                if self._delivery_phase_timing:
+                    self._delivery_phase_stats.record_send_ack(time.perf_counter_ns() - _send_t0)
         except NegativeAckError as exc:
             # Partner rejection. AR/CR (permanent) → fail-fast: the partner will never
             # accept this message, so dead-letter it now rather than block the FIFO lane
@@ -2832,6 +2943,9 @@ class RegistryRunner:
                 # re-ingress worker. Read live from the registry (a reload swaps it).
                 oc = self.registry.outbound.get(name)
                 reingress_to = oc.spec.settings.get("reingress_to") if oc is not None else None
+                # PHASE (b): the store completion round-trip (the other ~83 ms suspect). Timed around
+                # the store call ONLY (not the registry read / wake). See DeliveryPhaseTiming.
+                _done_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
                 await self.store.complete_with_response(
                     item.id,
                     body=response.body,
@@ -2839,12 +2953,23 @@ class RegistryRunner:
                     detail=response.detail,
                     reingress_to=reingress_to,
                 )
+                if self._delivery_phase_timing:
+                    self._delivery_phase_stats.record_mark_done(time.perf_counter_ns() - _done_t0)
                 if reingress_to is not None:
                     # B12 (ADR 0061): CROSS-LANE — wake the loopback's RESPONSE lane
                     # (reingress_to), NOT this delivery worker's own OUTBOUND lane.
                     self._wake_lane(Stage.RESPONSE, reingress_to)
             else:
+                # PHASE (b): the store completion round-trip (plain mark_done — the non-capturing path).
+                _done_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
                 await self.store.mark_done(item.id)
+                if self._delivery_phase_timing:
+                    self._delivery_phase_stats.record_mark_done(time.perf_counter_ns() - _done_t0)
+            # Emit the throttled per-process summary (send_ack vs mark_done) after a delivered row —
+            # a no-op between windows. Only on the delivered path (a retried/dead-lettered row records
+            # neither phase, so there is nothing new to summarize).
+            if self._delivery_phase_timing:
+                self._delivery_phase_stats.maybe_emit(stage="outbound")
         return _ItemOutcome.PROCESSED, retry_until
 
     async def _router_worker(self, name: str) -> None:

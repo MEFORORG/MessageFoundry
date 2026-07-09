@@ -214,20 +214,24 @@ jobs:
   # deployment target.
   ide:
     name: ide build (${{ matrix.os }})
-    # `ide` is NOT a required check and ci-gate does NOT `needs: ide`, so a skip here can't wedge any
-    # required context. It runs ONLY when it can be affected: a PR that touches ide/** or this workflow
-    # (the `changes.ide` path-gate) + on-demand dispatch. Dropped from push-to-main — the merge just
-    # re-validated what the ide PR already built, and the ide is an isolated npm project, so a non-ide
-    # push cannot break it (changes.ide already covers ide/** AND ci.yml). This removes both the Linux
-    # and the 2x-billed Windows ide legs from ~every push to main. Not on the nightly cron either: the
-    # engine heavy legs need that safety net, an isolated npm build gated on its own paths does not.
+    # `ide` is NOT a required check and ci-gate does NOT `needs: ide`, so skipping it — or varying its
+    # matrix per repo (below) — can't wedge any required context. It runs when it can be affected:
+    # push-to-main + workflow_dispatch (full coverage), and PRs that touch ide/** or this workflow (the
+    # `changes.ide` path-gate) — a pure-Python PR can't change the isolated npm project's result, so it's
+    # skipped there. Not on the nightly cron: the engine heavy legs need that safety net, an isolated npm
+    # build gated on its own paths does not. The per-repo os matrix below keeps the 2x-billed windows-latest
+    # electron leg off the private repo while still running it free on the mirror.
     needs: changes
     if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.ide == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+      # Per-repo os matrix (built in `changes`): ubuntu-only on the private repo; ubuntu + windows-latest
+      # on the mirror. The windows-latest leg is the 2x-billed one that runs the @vscode/test-electron
+      # integration suite — running it ONLY on the free public mirror keeps that Windows cost off the
+      # private repo without losing the coverage. `ide` is not a required check and ci-gate does not
+      # `needs` it, so dropping the windows leg here can't wedge anything.
+      matrix: ${{ fromJSON(needs.changes.outputs.ide_matrix) }}
     defaults:
       run:
         working-directory: ide
@@ -283,6 +287,10 @@ jobs:
       # self-hosted Windows runners are retired), full ubuntu+windows matrix on the mirror (free
       # hosted). Consumed as `matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}` in `test`.
       matrix: ${{ steps.f.outputs.matrix }}
+      # `ide_matrix`: the `ide` job's os matrix, per-repo — ubuntu-only on the private repo; ubuntu +
+      # windows-latest on the mirror, where the 2x-billed VS Code electron leg runs FREE. Consumed as
+      # `matrix: ${{ fromJSON(needs.changes.outputs.ide_matrix) }}` in `ide`.
+      ide_matrix: ${{ steps.f.outputs.ide_matrix }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -308,6 +316,16 @@ jobs:
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else
             echo "matrix={\"include\":[$U]}" >> "$GITHUB_OUTPUT"
+          fi
+          # ide matrix, per-repo (computed here with the test matrix, before any early exit): the
+          # 2x-billed windows-latest electron leg runs ONLY on the FREE public mirror; the private repo
+          # builds + type-checks the extension on ubuntu only. Consumed as
+          # matrix: fromJSON(needs.changes.outputs.ide_matrix) in the ide job. (No shell vars here, so a
+          # single-quoted literal JSON needs no escaping and carries no run-block workflow expression.)
+          if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
+            echo 'ide_matrix={"os":["ubuntu-latest","windows-latest"]}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'ide_matrix={"os":["ubuntu-latest"]}' >> "$GITHUB_OUTPUT"
           fi
           # Manual dispatch = full coverage: force every gate true so the whole workflow runs.
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
@@ -896,7 +914,10 @@ jobs:
   # re-validates a specific merge on demand.
   windows-service-smoke:
     name: windows service smoke (${{ matrix.os }}, py${{ matrix.python-version }})
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Mirror-only: this spins up 2x-billed hosted Windows runners on BOTH Server SKUs, so run it FREE on
+    # the public mirror's nightly schedule and never on the private repo. ci-gate `needs` this job, but a
+    # `skipped` leg counts as a pass there, so gating it off the private repo cannot wedge the gate.
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

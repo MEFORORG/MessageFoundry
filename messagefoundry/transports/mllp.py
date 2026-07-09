@@ -20,7 +20,9 @@ MSA-1 code family: ``original`` → AA/AE/AR, ``enhanced`` → CA/CE/CR.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import socket
 import ssl
 import time
 from collections.abc import Callable, Mapping
@@ -84,6 +86,22 @@ DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this lo
 # in-flight commit before the connection tasks are cancelled — bounds shutdown so a peer holding a
 # connection open can't hang it (review H-2).
 _CLIENT_SHUTDOWN_GRACE = 5.0
+
+
+def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:
+    """Disable Nagle's algorithm on the underlying TCP socket.
+
+    MLLP is a small-frame request-response protocol (write one framed message, drain, block on the
+    ACK). With Nagle on, a small write that has no unacked data outstanding is held until the peer's
+    delayed-ACK timer fires, so the request-response round-trip eats a ~tens-of-ms stall per exchange
+    — crippling on the ADR 0067 persistent path where every delivery is one tiny frame each way. This
+    also covers the underlying TCP socket under TLS (the option lives on the raw socket). Best-effort:
+    a missing socket or an OS that rejects the option is harmless (framing correctness is unaffected).
+    """
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
 # MLLP's frame-too-large error is the shared codec error under its historical name (subclassing keeps
@@ -505,7 +523,7 @@ class MLLPDestination(DestinationConnector):
         failure is a **charged** :class:`DeliveryError` carrying ``_describe_error`` detail — there is
         exactly one dial per send in every mode, never an internal connect-retry loop."""
         try:
-            return await asyncio.wait_for(
+            reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(
                     self.host,
                     self.port,
@@ -521,6 +539,11 @@ class MLLPDestination(DestinationConnector):
             raise DeliveryError(
                 f"MLLP connect to {self.host}:{self.port} failed: {self._describe_error(exc)}"
             ) from exc
+        # Kill Nagle/delayed-ACK on the request-response round-trip (see _set_tcp_nodelay). Set here on
+        # every dial so both the connect-per-send (_send_once) and persistent (_send_persistent, ADR
+        # 0067) paths — and every reconnect — get it.
+        _set_tcp_nodelay(writer)
+        return reader, writer
 
     async def _send_once(self, payload: str) -> DeliveryResponse | None:
         """The historical connect-per-send path (``persistent=false``) — one connection per delivery,
@@ -930,6 +953,9 @@ class MLLPSource(SourceConnector):
         self._clients.add(writer)
         if task is not None:
             self._client_tasks.add(task)
+        # Kill Nagle/delayed-ACK so our framed ACK reply is not held back on the request-response
+        # round-trip with the sender (see _set_tcp_nodelay). Applies to the accepted client socket.
+        _set_tcp_nodelay(writer)
         peer_host = _peer_host(writer)
         established = False  # paired with a single `closed` event on a clean/idle end
         failed = False  # an error close is covered by its specific failure kind — don't double-emit

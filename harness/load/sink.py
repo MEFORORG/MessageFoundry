@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import socket
 import time
 from collections.abc import Sequence
 
@@ -91,6 +92,13 @@ class CorrelationSink:
 
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._writers.add(writer)
+        # Kill Nagle/delayed-ACK so the sink's AA reply isn't held back on the request-response
+        # round-trip (mirrors messagefoundry.transports.mllp._set_tcp_nodelay). Without this the rig
+        # measures the sink's delayed-ACK stall, not the engine — masking the fix under test.
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         decoder = MLLPDecoder()
         try:
             while True:
