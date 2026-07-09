@@ -44,7 +44,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import httpx
 
@@ -100,9 +100,24 @@ class EngineNode:
         self._config_dir = config_dir
         self._cwd = cwd
         self._proc: asyncio.subprocess.Process | None = None
-        self._log = tempfile.NamedTemporaryFile(  # noqa: SIM115 — closed in stop()
-            prefix=f"mefor-failover-{node_id}-", suffix=".log", delete=False
-        )
+        # Bench-only (default OFF): when MEFOR_BENCH_KEEP_NODE_LOGS names a directory, persist this
+        # node's captured stdout to <dir>/<node_id>.log and do NOT unlink it on stop() — so a rig run
+        # can read each shard's throttled phase-timing summary after the fleet is torn down. Unset =>
+        # byte-identical to the original tmp-file behavior (deleted on stop). Touches only the harness
+        # log sink, never the engine subprocess under test, so measurement fidelity is unaffected.
+        self._log: IO[bytes]
+        keep_dir = env.get("MEFOR_BENCH_KEEP_NODE_LOGS")
+        if keep_dir:
+            os.makedirs(keep_dir, exist_ok=True)
+            self._keep_log = True
+            self._log = open(  # noqa: SIM115 — closed in stop()
+                os.path.join(keep_dir, f"{node_id}.log"), "wb"
+            )
+        else:
+            self._keep_log = False
+            self._log = tempfile.NamedTemporaryFile(  # noqa: SIM115 — closed in stop()
+                prefix=f"mefor-failover-{node_id}-", suffix=".log", delete=False
+            )
 
     async def start(self) -> None:
         self._proc = await asyncio.create_subprocess_exec(
@@ -156,8 +171,11 @@ class EngineNode:
             self._log.close()
         # The startup-failure tail is captured into the FailoverError before teardown, so the log file is
         # no longer needed once the node is stopped — unlink it rather than leak one per node per run.
-        with contextlib.suppress(OSError):
-            Path(self._log.name).unlink()
+        # Bench keep-logs mode (MEFOR_BENCH_KEEP_NODE_LOGS) deliberately preserves it for post-run
+        # phase-timing extraction.
+        if not self._keep_log:
+            with contextlib.suppress(OSError):
+                Path(self._log.name).unlink()
 
     def log_tail(self, limit: int = 4000) -> str:
         """The end of this node's captured stdout/stderr — for diagnosing a failed start in CI."""

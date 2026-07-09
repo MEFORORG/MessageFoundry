@@ -76,6 +76,37 @@ DRIVER_DONE = "DRIVER_DONE"
 #: starting to drive right after it posts DRIVE_START.
 DRIVE_GO = "DRIVE_GO"
 
+#: The turnkey two-box SIZING LADDER (PR-C2) automates the manual per-rung ceiling hunt: an
+#: ``shardcert-engine-ladder`` (engine box) and an ``shardcert-drive-ladder`` (load-gen box) iterate the
+#: SAME fixed rung plan in lockstep, meeting per rung under a per-rung ``run_id`` via
+#: :meth:`FileDropCoord.for_run` (``"<base>.r<i>"``) — the exact per-cell scope the batch matrix drive was
+#: designed around. Four coordination messages ride the SAME file-drop channel; all carry counts + the
+#: synthetic topology only (never control-ids / message bodies — PHI rule):
+#:
+#: * :data:`ENGINE_DRAINED` (engine→drive, per rung) — the **reliable drain gate**. The engine posts it
+#:   after its DIRECT store-truth read confirms the pipeline drained (``stranded``/``dead`` from the store,
+#:   NOT the unreliable remote poller), so the drive tallies its sinks ONLY after a teardown-frozen tail
+#:   would have been fully absorbed. This is the "post-hold drain window" that lets the ladder tell true
+#:   congestion-collapse from a latency tail (a rung that drains within the window is sustainable, not
+#:   collapsed). Default-off on the standalone two-box halves (so the C1 cert path stays byte-identical);
+#:   the ladder turns it on.
+#: * :data:`ENGINE_RUNG_REPORT` (engine→drive, per rung, ``f"{ENGINE_RUNG_REPORT}"`` under the rung
+#:   ``run_id``) — the engine box's per-rung store-truth verdict + its LOCAL per-shard send_ack/mark_done
+#:   phase-timing aggregate (read off the persisted ``MEFOR_BENCH_KEEP_NODE_LOGS`` node logs after
+#:   teardown). The drive-ladder reads it back over the shared coord dir to fold into the ONE consolidated
+#:   report — the store-truth authority never leaves the engine box, only its metadata summary does.
+#: * :data:`LADDER_STOP` (drive→engine) — the early-stop signal: once the drive classifies a rung as not
+#:   sustained (the first ceiling rung), it posts this so the engine skips the remaining climb rungs. It is
+#:   an OPTIMISATION, not a correctness gate: the engine polls it non-blocking between rungs, and if the
+#:   signal is lost both halves simply finish the bounded fixed plan (no hang).
+#: * :data:`LADDER_SOAK` (drive→engine) — after the climb, the drive picks the soak rate (the highest
+#:   sustained rung, or an override) and posts it so the engine arms one final long-hold soak rung under
+#:   ``run_id`` ``"<base>.soak"`` — or ``{"skip": true}`` when there is no sustained rung to soak.
+ENGINE_DRAINED = "ENGINE_DRAINED"
+ENGINE_RUNG_REPORT = "ENGINE_RUNG_REPORT"
+LADDER_STOP = "LADDER_STOP"
+LADDER_SOAK = "LADDER_SOAK"
+
 #: Default coord directory. A Windows path because the rig runs on Windows Server; override with the
 #: ``MEFOR_COORD_DIR`` env var or the ``--coord-dir`` CLI flag for a POSIX box or a shared mount.
 DEFAULT_COORD_DIR = r"C:\mefor_coord"

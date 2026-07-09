@@ -50,6 +50,7 @@ from harness.load.coord import (
     DRIVE_START,
     DRIVER_ARMED,
     DRIVER_DONE,
+    ENGINE_DRAINED,
     SHARDS_READY,
     SINK_BOUND,
     SINK_DONE,
@@ -427,6 +428,35 @@ async def _sample_in_pipeline_peak(
             sample = await poller.sample_once()
             if sample is not None and sample.in_pipeline > out[0]:
                 out[0] = sample.in_pipeline
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+    finally:
+        await poller.close()
+
+
+async def _sample_in_pipeline_trace(
+    urls: list[str],
+    stop: asyncio.Event,
+    out: list[list[float]],
+    *,
+    interval: float = 2.0,
+    origin: float | None = None,
+) -> None:
+    """Poll the fleet's aggregate in-pipeline gauge every ``interval`` until ``stop``, APPENDING each
+    ``[elapsed_s, in_pipeline]`` reading to ``out`` (the full bounded trace, not just the peak). The PR-C2
+    soak uses the trace SLOPE (flat/draining vs monotonic growth) to tell a sustainable plateau from a
+    slow-saturation one; a short-lived poller so the correctness/climb path (``sample_in_pipeline=False``)
+    adds no concurrent poller during the hold."""
+    t0 = origin if origin is not None else time.perf_counter()
+    poller = EnginePoller(urls, None, origin=t0)
+    await poller.open()
+    try:
+        while not stop.is_set():
+            sample = await poller.sample_once()
+            if sample is not None:
+                out.append([round(time.perf_counter() - t0, 3), float(sample.in_pipeline)])
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except (asyncio.TimeoutError, TimeoutError):
@@ -1123,6 +1153,13 @@ class ShardCertEngineReport:
     # killed shard's PID is its RESTARTED subprocess's (the one that survives to drain) — the pre-kill PID
     # is gone. Defaulted so an older report / a partial run deserializes unchanged.
     node_pids: dict[str, tuple[str, int | None]] = field(default_factory=dict)
+    # Soak-only (default empty ⇒ the correctness/climb path is unchanged): a bounded in-HOLD trace of the
+    # fleet's OWN /stats in_pipeline gauge, ``[[elapsed_s, in_pipeline], ...]``, sampled when
+    # ``sample_in_pipeline=True``. The unified-store poller 4×-overcounts the ABSOLUTE value, but the TREND
+    # (flat/draining vs monotonic growth) is the reliable sustainable-vs-slow-saturation discriminator the
+    # PR-C2 soak needs — a slow-saturation plateau looks lossless for ~60s but its backlog slope is
+    # positive. Metadata only (a gauge count over time — never a payload / control-id).
+    in_pipeline_trace: list[list[float]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -1243,6 +1280,9 @@ async def run_shardcert_engine(
     claim_mode: str = "pooled",
     drive_start_timeout: float = 300.0,
     post_drain_grace: float = 3.0,
+    signal_drained: bool = False,
+    sample_in_pipeline: bool = False,
+    sample_interval: float = 2.0,
 ) -> ShardCertEngineReport:
     """The ENGINE-box half (WS-C option #2). Brings the ``serve --shard`` fleet up against the ONE
     unified store, posts :data:`SHARDS_READY` with the topology, waits for the driver's
@@ -1261,7 +1301,14 @@ async def run_shardcert_engine(
 
     ``claim_mode`` (``pooled`` | ``per_lane``, ADR 0066 §8.2) is set first-class on EVERY ``serve --shard``
     subprocess via ``MEFOR_PIPELINE_CLAIM_MODE`` so the pooled-vs-per_lane A/B arm is unambiguous in the
-    run record, not left to whatever happened to be in the parent env."""
+    run record, not left to whatever happened to be in the parent env.
+
+    ``signal_drained`` (default OFF ⇒ the standalone C1 cert path is byte-identical) posts the
+    :data:`ENGINE_DRAINED` message once the DIRECT store-truth read confirms the pipeline drained — the
+    reliable drain gate the PR-C2 ladder's DRIVE half waits on before tallying its sinks, so a
+    teardown-frozen in-flight tail is absorbed BEFORE the tally rather than mis-read as loss. It is posted
+    with the store-truth (``drained``/``stranded``/``dead_total``/``in_pipeline_final``), never the remote
+    poller's gauges."""
     import os
 
     cwd = cwd or Path.cwd()
@@ -1291,6 +1338,7 @@ async def run_shardcert_engine(
     engine_dead = 0
     in_pipeline_final = -1
     node_pids: dict[str, tuple[str, int | None]] = {}
+    in_pipeline_trace: list[list[float]] = []
     try:
         # Bring the fleet up. Preflight the engine's OWN inbound bind on loopback (127.0.0.1 reaches a
         # 0.0.0.0 listener) — the DRIVER separately proves off-box reachability from its side.
@@ -1355,7 +1403,27 @@ async def run_shardcert_engine(
             )
 
         # Hold locally so the killed shard is restarted AFTER the hold (mirrors the co-located sequence).
-        await asyncio.sleep(max(0.0, hold_seconds - (time.monotonic() - t0_local)))
+        # Soak-only: sample the fleet's OWN in_pipeline gauge across the hold so the PR-C2 soak can report
+        # the backlog SLOPE (flat/draining vs a slow-saturation positive slope). Off by default ⇒ the
+        # correctness/climb path adds no concurrent poller during the hold.
+        trace_stop = asyncio.Event()
+        trace_task: asyncio.Task[None] | None = None
+        if sample_in_pipeline:
+            trace_task = asyncio.create_task(
+                _sample_in_pipeline_trace(
+                    [nodes[s].url for s in ids_list],
+                    trace_stop,
+                    in_pipeline_trace,
+                    interval=sample_interval,
+                )
+            )
+        try:
+            await asyncio.sleep(max(0.0, hold_seconds - (time.monotonic() - t0_local)))
+        finally:
+            if trace_task is not None:
+                trace_stop.set()
+                with contextlib.suppress(Exception):
+                    await trace_task
         kill_at: float | None = None
         if kill_task is not None:
             kill_at = await kill_task
@@ -1393,6 +1461,24 @@ async def run_shardcert_engine(
         engine_dead = final.dead if final else 0
         in_pipeline_final = final.in_pipeline if final else -1
         stranded, dead_total, breakdown = await _queue_breakdown(node_env)
+        # PR-C2 ladder drain gate (default OFF): once the DIRECT store read above confirms drain, tell the
+        # DRIVE half it is safe to tally its sinks — the reliable authority (stranded/dead), never the
+        # remote poller. Posted BEFORE the grace/teardown, but by construction stranded==0 means every
+        # delivery already landed on the sink sockets, so there is no tail left to lose at teardown.
+        if signal_drained:
+            coord.post(
+                ENGINE_DRAINED,
+                {
+                    "drained": drained,
+                    "stranded": stranded,
+                    "dead_total": dead_total,
+                    "in_pipeline_final": in_pipeline_final,
+                    # engine-side store-truth pass bar for THIS rung (drive folds it into the classifier)
+                    "engine_ok": bool(
+                        drained and stranded == 0 and engine_dead == 0 and dead_total == 0
+                    ),
+                },
+            )
         await asyncio.sleep(post_drain_grace)
     finally:
         for node in nodes.values():
@@ -1411,6 +1497,7 @@ async def run_shardcert_engine(
         in_pipeline_final=in_pipeline_final,
         recovery_seconds=recovery_seconds,
         node_pids=node_pids,
+        in_pipeline_trace=in_pipeline_trace,
         notes=notes,
     )
 
@@ -2119,6 +2206,8 @@ async def run_shardcert_drive(
     drain_timeout: float = 90.0,
     reap_grace: float = 10.0,
     allow_insecure: bool = False,
+    await_engine_drained: bool = False,
+    engine_drained_timeout: float = 300.0,
 ) -> ShardCertDriveReport:
     """The multi-process SIZING drive COORDINATOR (load-gen box). Learns the topology from
     :data:`SHARDS_READY` (the engine half posts it), spawns ``sink_count`` :func:`run_shardcert_sink` +
@@ -2133,7 +2222,15 @@ async def run_shardcert_drive(
 
     The coordinator + all spawned children run on the load-gen box — NEVER co-located with the engine
     fleet (the attribution isolation; an operator/runbook concern). **Fail loud** early on a mis-sized
-    fleet (a sink partition or band slice that doesn't tile) rather than spawning doomed children."""
+    fleet (a sink partition or band slice that doesn't tile) rather than spawning doomed children.
+
+    ``await_engine_drained`` (default OFF ⇒ the standalone C1 drive path is byte-identical) is the PR-C2
+    ladder's **drain gate**: before signalling :data:`DRIVE_COMPLETE` (which releases the sinks to record
+    their final tally), wait for the ENGINE half's RELIABLE store-truth :data:`ENGINE_DRAINED`. The remote
+    ``/stats`` poller below is advisory (it can zero out under load on a unified store), so tallying on it
+    alone risks reading a teardown-frozen in-flight tail as loss; awaiting the engine's DIRECT store read
+    closes that window. Bounded + best-effort — a missing signal degrades to the advisory-drain fallback
+    with a note, never a hang."""
     ready = await coord.await_message(SHARDS_READY, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     dests = int(ready["dests"])
@@ -2238,6 +2335,26 @@ async def run_shardcert_drive(
         await poller.open()
         drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
         final = poller.final
+
+        # (4b) PR-C2 ladder drain gate (default OFF): before releasing the sinks to tally, wait for the
+        # ENGINE half's RELIABLE store-truth drain signal. The remote poller above is advisory (zeroes
+        # under load on a unified store), so tallying on it alone can read a teardown-frozen tail as loss;
+        # the engine's DIRECT store read closes that window. Best-effort — a missing signal degrades to the
+        # advisory-drain fallback (note it) rather than hanging.
+        if await_engine_drained:
+            try:
+                drained_msg = await coord.await_message(
+                    ENGINE_DRAINED, timeout=engine_drained_timeout
+                )
+                notes.append(
+                    f"engine drain gate: engine_ok={drained_msg.get('engine_ok')} "
+                    f"stranded={drained_msg.get('stranded')} dead_total={drained_msg.get('dead_total')}"
+                )
+            except CoordTimeout:
+                notes.append(
+                    f"ENGINE_DRAINED not seen within {engine_drained_timeout}s — tallying on the "
+                    "advisory remote-drain fallback (drain-window gate degraded)"
+                )
 
         # (5) Signal drained → every sink records its final tally and posts SINK_DONE.<m>.
         coord.post(DRIVE_COMPLETE, {"t": time.time()})

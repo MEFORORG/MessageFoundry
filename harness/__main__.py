@@ -59,6 +59,16 @@
                                                 children, handshake the engine + children, drain the REMOTE
                                                 /stats, aggregate + count-balance reconcile. Exits 0 (no-loss
                                                 + FIFO + non-vacuous) / 1 (verdict fail) / 2 (setup/timeout).
+``python -m harness shardcert-engine-ladder ...`` → the ENGINE-box half of the TURNKEY two-box SIZING
+                                                ceiling ladder (PR-C2): loop the fixed rung plan (fresh
+                                                store + run_id per rung), post each rung's store-truth +
+                                                phase timing, honour LADDER_STOP, arm the soak. Pair it with
+                                                shardcert-drive-ladder. Exit 0.
+``python -m harness shardcert-drive-ladder ...`` → the LOAD-GEN-box half + consolidated report: loop the
+                                                same rungs, drive each under the drain gate, classify
+                                                (sustained / collapsed / frozen-tail), early-stop at the
+                                                ceiling, soak, and emit the ONE consolidated report. Exits 0
+                                                (correctness held) / 1 (correctness break) / 2 (setup/timeout).
 
 The headless paths import no PySide6, so they run on a display-less runner; the GUI import is
 deferred into :func:`_launch_gui`.
@@ -99,6 +109,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_shardcert_driver_worker(raw[1:])
     if raw and raw[0] == "shardcert-drive":
         return _run_shardcert_drive(raw[1:])
+    if raw and raw[0] == "shardcert-engine-ladder":
+        return _run_shardcert_engine_ladder(raw[1:])
+    if raw and raw[0] == "shardcert-drive-ladder":
+        return _run_shardcert_drive_ladder(raw[1:])
 
     parser = argparse.ArgumentParser(prog="harness", description="MessageFoundry test harness")
     parser.add_argument(
@@ -1245,6 +1259,284 @@ def _run_shardcert_drive(argv: list[str]) -> int:
             json.dumps(report.to_json_dict(), indent=2), encoding="utf-8"
         )
     return 0 if report.ok else 1
+
+
+# --- PR-C2 turnkey two-box SIZING ceiling ladder (engine box + load-gen box) -------------------------
+
+
+def _run_shardcert_engine_ladder(argv: list[str]) -> int:
+    import asyncio
+    import os
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(
+        prog="harness shardcert-engine-ladder",
+        description="ENGINE-box half of the TURNKEY two-box SIZING ceiling ladder (PR-C2, ADR 0073): loop "
+        "the fixed rung plan (fresh store + run_id per rung), post each rung's store-truth drain gate + "
+        "phase timing, honour the drive's LADDER_STOP, and arm the soak rung. Reuses the merged "
+        "shardcert-engine primitive per rung. Pair with shardcert-drive-ladder on the load-gen box. Set "
+        "MEFOR_DELIVERY_PHASE_TIMING=1 for the send_ack/mark_done split.",
+    )
+    parser.add_argument(
+        "--shards", default="a,b,c,d", help="comma list of shard ids (default a,b,c,d)"
+    )
+    parser.add_argument(
+        "--dests", type=int, default=8, help="shared overlapping outbound destinations"
+    )
+    parser.add_argument(
+        "--lanes-per-shard", type=int, default=1, help="inbound->router->handler chains per shard"
+    )
+    parser.add_argument(
+        "--persistent", action="store_true", help="ADR 0067 persistent outbound (W1 fix)"
+    )
+    parser.add_argument(
+        "--rate-ladder",
+        required=True,
+        help="ascending INGRESS msg/s ladder — a comma list (24,28,32) or start:stop:step (24:64:4). "
+        "Outbound = ingress*dests; must match the drive box's --rate-ladder exactly",
+    )
+    parser.add_argument(
+        "--hold-seconds", type=float, default=60.0, help="per-climb-rung steady-state hold"
+    )
+    parser.add_argument(
+        "--drain-timeout", type=float, default=150.0, help="per-climb-rung post-hold drain"
+    )
+    parser.add_argument(
+        "--soak-hold-seconds", type=float, default=300.0, help="soak hold (>=5 min)"
+    )
+    parser.add_argument(
+        "--soak-drain-timeout", type=float, default=300.0, help="soak post-hold drain"
+    )
+    parser.add_argument(
+        "--sink-port", type=int, required=True, help="BASE sink port the driver binds"
+    )
+    parser.add_argument(
+        "--sink-ports", type=int, default=8, help="sink port band width (== --dests)"
+    )
+    parser.add_argument(
+        "--sink-host", default="127.0.0.1", help="the LOAD-GEN box IP the shards deliver to"
+    )
+    parser.add_argument(
+        "--inbound-bind-host", default="0.0.0.0", help="interface each shard's inbound binds"
+    )
+    parser.add_argument(
+        "--claim-mode",
+        default="pooled",
+        choices=("pooled", "per_lane"),
+        help="MEFOR_PIPELINE_CLAIM_MODE",
+    )
+    parser.add_argument(
+        "--keep-logs-dir",
+        default="./shardcert-ladder-nodelogs",
+        help="base dir for the persisted per-rung/per-shard node logs (phase-timing source). A per-rung "
+        "subdir is created under it. MEFOR_BENCH_KEEP_NODE_LOGS is set per rung",
+    )
+    parser.add_argument(
+        "--store", default="sqlserver", choices=("sqlserver",), help="server store backend LABEL"
+    )
+    parser.add_argument(
+        "--drive-start-timeout",
+        type=float,
+        default=300.0,
+        help="per-rung wait for the drive's DRIVE_START — MUST exceed the drive's K+M child bring-up "
+        "(spawns fresh interpreters each rung); a slow/cold load-gen box under this window is mis-read as "
+        "'drive unresponsive'. Generous (minutes) by design; the early-stop stays cheap via a bounded poll",
+    )
+    parser.add_argument(
+        "--soak-timeout",
+        type=float,
+        default=900.0,
+        help="how long the engine waits for the drive's LADDER_SOAK after the climb",
+    )
+    _add_coord_args(parser)
+    args = parser.parse_args(argv)
+
+    if args.lanes_per_shard < 1:
+        print("--lanes-per-shard must be >= 1", file=sys.stderr)
+        return 2
+
+    from harness.load.coord import FileDropCoord
+    from harness.load.shardcert import parse_rate_ladder
+    from harness.load.shardcert_ladder import run_engine_ladder
+
+    try:
+        rates = parse_rate_ladder(args.rate_ladder)
+    except ValueError as exc:
+        print(f"shardcert-engine-ladder: {exc}", file=sys.stderr)
+        return 2
+
+    # Wire the graph-shape env knobs BEFORE the per-rung config discovery reads them (mirrors
+    # _run_shardcert_engine — the shape is ambient on os.environ, read at config load).
+    os.environ["MEFOR_SHARDCERT_SHARDS"] = args.shards
+    os.environ["MEFOR_SHARDCERT_LANES_PER_SHARD"] = str(args.lanes_per_shard)
+    os.environ["MEFOR_SHARDCERT_PERSISTENT"] = "1" if args.persistent else "0"
+
+    backend = os.environ.get("MEFOR_STORE_BACKEND", "").strip().lower()
+    if backend != args.store:
+        print(
+            f"--store {args.store} needs MEFOR_STORE_BACKEND={args.store} (+ the MEFOR_STORE_* env); "
+            f"got {backend or '(unset)'!r}",
+            file=sys.stderr,
+        )
+        return 2
+
+    coord = _coord_from_args(args)
+    assert isinstance(coord, FileDropCoord)
+    try:
+        result = asyncio.run(
+            run_engine_ladder(
+                rates=rates,
+                dests=args.dests,
+                hold_seconds=args.hold_seconds,
+                drain_timeout=args.drain_timeout,
+                sink_port=args.sink_port,
+                sink_ports=args.sink_ports,
+                sink_host=args.sink_host,
+                inbound_bind_host=args.inbound_bind_host,
+                claim_mode=args.claim_mode,
+                store_env=_store_env_from_os(),
+                base_coord=coord,
+                keep_logs_base=Path(args.keep_logs_dir),
+                soak_hold_seconds=args.soak_hold_seconds,
+                soak_drain_timeout=args.soak_drain_timeout,
+                climb_drive_start_timeout=args.drive_start_timeout,
+                soak_timeout=args.soak_timeout,
+            )
+        )
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(result.render())
+    return 0
+
+
+def _run_shardcert_drive_ladder(argv: list[str]) -> int:
+    import asyncio
+    import json
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(
+        prog="harness shardcert-drive-ladder",
+        description="LOAD-GEN-box half + CONSOLIDATED REPORT of the turnkey two-box SIZING ceiling ladder "
+        "(PR-C2, ADR 0073): loop the same rungs the engine arms, drive each with the multi-process drive "
+        "under the drain gate, classify (sustained / collapsed / frozen-tail) by the RELIABLE authorities "
+        "only, early-stop at the first collapse (LADDER_STOP), soak the pinned rate, and emit one report "
+        "(JSON + human-readable). Runs with its K+M children on the load-gen box — NEVER co-located.",
+    )
+    parser.add_argument(
+        "--engine-host", required=True, help="the engine box's inbound IP the senders dial"
+    )
+    parser.add_argument(
+        "--rate-ladder",
+        required=True,
+        help="ascending INGRESS msg/s ladder — must match the engine box's --rate-ladder exactly",
+    )
+    parser.add_argument(
+        "--hold-seconds", type=float, default=60.0, help="per-climb-rung steady-state hold"
+    )
+    parser.add_argument(
+        "--drain-timeout", type=float, default=150.0, help="per-climb-rung post-hold drain"
+    )
+    parser.add_argument(
+        "--soak-hold-seconds", type=float, default=300.0, help="soak hold (>=5 min)"
+    )
+    parser.add_argument(
+        "--soak-drain-timeout", type=float, default=300.0, help="soak post-hold drain"
+    )
+    parser.add_argument(
+        "--soak-rate",
+        type=float,
+        default=None,
+        help="pin the soak ingress rate (default: highest sustained rung)",
+    )
+    parser.add_argument("--no-soak", action="store_true", help="skip the soak (climb only)")
+    parser.add_argument(
+        "--driver-count",
+        type=int,
+        default=4,
+        help="K sender-worker child processes (K | shards*lanes)",
+    )
+    parser.add_argument(
+        "--sink-count", type=int, default=8, help="M sink child processes (M | dests)"
+    )
+    parser.add_argument(
+        "--sink-host",
+        default="127.0.0.1",
+        help="interface the sink children bind LOCALLY (0.0.0.0 on the load-gen box)",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="allow the REMOTE /stats poller plaintext http to the engine box (REQUIRED for a two-box http engine)",
+    )
+    parser.add_argument(
+        "--engine-report-timeout",
+        type=float,
+        default=120.0,
+        help="per-rung wait for the engine's ENGINE_RUNG_REPORT (phase timing + soak slope). The rung "
+        "VERDICT does not depend on it (that uses the reliable ENGINE_DRAINED gate) — a lost report only "
+        "drops the phase timing",
+    )
+    _add_coord_args(parser)
+    parser.add_argument("--report-json", help="write the consolidated JSON report to this path")
+    args = parser.parse_args(argv)
+
+    from messagefoundry.console.client import ApiError
+
+    from harness.load.coord import CoordTimeout, FileDropCoord
+    from harness.load.shardcert import parse_rate_ladder
+    from harness.load.shardcert_ladder import run_drive_ladder
+
+    try:
+        rates = parse_rate_ladder(args.rate_ladder)
+    except ValueError as exc:
+        print(f"shardcert-drive-ladder: {exc}", file=sys.stderr)
+        return 2
+
+    coord = _coord_from_args(args)
+    assert isinstance(coord, FileDropCoord)
+    try:
+        report = asyncio.run(
+            run_drive_ladder(
+                engine_host=args.engine_host,
+                rates=rates,
+                hold_seconds=args.hold_seconds,
+                drain_timeout=args.drain_timeout,
+                driver_count=args.driver_count,
+                sink_count=args.sink_count,
+                sink_host=args.sink_host,
+                base_coord=coord,
+                allow_insecure=args.insecure,
+                soak_hold_seconds=args.soak_hold_seconds,
+                soak_drain_timeout=args.soak_drain_timeout,
+                soak_rate_override=args.soak_rate,
+                do_soak=not args.no_soak,
+                engine_rung_report_timeout=args.engine_report_timeout,
+            )
+        )
+    except ValueError as exc:  # a mis-sized fleet / bad ladder — fail loud, setup error
+        print(f"shardcert-drive-ladder: {exc}", file=sys.stderr)
+        return 2
+    except ApiError as exc:  # plaintext http to a remote engine without --insecure
+        print(
+            f"shardcert-drive-ladder: {exc}\n(hint: pass --insecure for a trusted-network http engine)",
+            file=sys.stderr,
+        )
+        return 2
+    except CoordTimeout as exc:
+        print(f"shardcert-drive-ladder: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render())
+    if args.report_json:
+        Path(args.report_json).write_text(
+            json.dumps(report.to_json_dict(), indent=2), encoding="utf-8"
+        )
+    return report.exit_code
 
 
 def _launch_gui() -> int:
