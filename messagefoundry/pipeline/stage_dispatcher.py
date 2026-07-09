@@ -42,6 +42,7 @@ from enum import Enum, auto
 from typing import Protocol
 
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.phase_timing import ClaimPhaseTiming, delivery_phase_timing_enabled
 from messagefoundry.store import ClaimedHeads, OutboxItem, QueueStore, Stage
 
 log = logging.getLogger(__name__)
@@ -263,6 +264,11 @@ class StageDispatcher:
 
         self._states: dict[str, _LaneState] = {}
         self._claimers: list[_Claimer] = [_Claimer() for _ in range(claimers_per_stage)]
+        # Bench-gated claim-phase timing (default OFF, read ONCE here — never per claim). A claimer's
+        # loop is serial, so this stage's lanes are re-fed at most K times per claim round-trip; timing
+        # the round-trip makes that bound measurable instead of inferred (see phase_timing.py).
+        self._claim_phase_timing = delivery_phase_timing_enabled()
+        self._claim_phase_stats = ClaimPhaseTiming(logger=log)
         self._sweep_task: asyncio.Task[None] | None = None
         self._sweep_now = asyncio.Event()
         # Per-lane coalesced timer handles + their armed deadlines (earliest-wins refresh).
@@ -541,6 +547,11 @@ class StageDispatcher:
         return lanes
 
     async def _claim_and_dispatch(self, claimer: _Claimer, lanes: list[str]) -> None:
+        # perf_counter_ns ONLY when the bench lever is on — otherwise a single bool check, no syscall.
+        # A claim that RAISES is not timed: it takes the backoff path below (logged with a traceback),
+        # and its timeout-capped duration would distort the very claim-latency figure this measures.
+        # The tempdb signature is slow-but-SUCCESSFUL claims, which are recorded.
+        _claim_t0 = time.perf_counter_ns() if self._claim_phase_timing else 0
         try:
             # Pass the dispatcher's clock so claim due-ness uses the SAME time base as the sweep +
             # park timers (one coherent clock). In production clock is time.time(), so this is
@@ -562,6 +573,21 @@ class StageDispatcher:
             )
             await self._sleep_or_stop(_CLAIM_ERROR_BACKOFF_SECONDS)
             return
+        if self._claim_phase_timing:
+            # Recorded synchronously (no await between the read and the counter writes), so a sibling
+            # claimer at K>1 can never interleave a partial update. Counts only — a lane is a
+            # destination_name, so lane NAMES never reach the log (PHI rule). `rearm` lanes were
+            # consumed in place by the H2 skip-and-complete: real work, so booking them as empty
+            # overhead would invert the churn metric during a dedup/failover pass.
+            self._claim_phase_stats.record_claim(
+                time.perf_counter_ns() - _claim_t0,
+                lanes=len(lanes),
+                rows=sum(len(v) for v in result.by_lane.values()),
+                rearm=len(result.rearm),
+            )
+            self._claim_phase_stats.maybe_emit(
+                stage=self._stage.value, claimers=len(self._claimers)
+            )
         for lane in lanes:
             st = self._states[lane]
             items = result.by_lane.get(lane)

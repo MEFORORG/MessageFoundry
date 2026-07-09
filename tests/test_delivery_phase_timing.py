@@ -87,7 +87,11 @@ def test_accumulator_bounded_aggregates() -> None:
 
 
 def test_accumulator_emits_then_resets_then_throttles(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.INFO, logger=_LOGGER)
+    # The accumulator now lives in pipeline.phase_timing and defaults to that module's logger; the
+    # RUNNER injects wiring_runner's logger so the shipped INFO line is unchanged (asserted by the
+    # RegistryRunner tests below, which still capture on _LOGGER). Capture at the root so this unit
+    # test pins the emit/reset/throttle behaviour rather than the class's home module.
+    caplog.set_level(logging.INFO)
     acc = DeliveryPhaseTiming()  # _last_emit starts at 0.0 → the first maybe_emit always emits
     acc.record_send_ack(5_000_000)
     acc.record_mark_done(7_000_000)
