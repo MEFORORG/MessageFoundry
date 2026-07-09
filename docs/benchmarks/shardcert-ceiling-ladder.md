@@ -1,5 +1,34 @@
 # ShardCert two-box SIZING ceiling ladder (PR-C2)
 
+> ## ⚠️ Measurement caveats — read before trusting any number this emits
+>
+> Verified 2026-07-09 against the raw artifacts of the first full run. The pass/fail **verdicts** are
+> sound (they are store-truth driven); several of the **rates** are not.
+>
+> 1. **The climb is a volume test, not a rate test.** `offered = ingress_rate × hold_seconds`, and the
+>    rung then gets a fixed `hold + drain` budget to drain it. A rung passes iff
+>    `offered × dests ≤ D × (hold + drain)`. So `ceiling.pinned_ingress_rate` overstates the true
+>    sustainable ingress by exactly **`(hold + drain) / hold`**, independent of `D`, `dests` and `N` —
+>    **3.5×** at the documented `--hold-seconds 60 --drain-timeout 150`.
+>    **Consequently `ceiling.clears_target_ingress` — the flag that feeds the §8 decision — turns true at
+>    a true sustained ingress of ~149/s, not 521/s.** Do not let it drive that decision.
+> 2. **`--soak-drain-timeout` defaults to 300 s** and is *separate* from `--drain-timeout`. A 300 s soak
+>    can therefore pass at roughly **2×** the true sustainable rate. Only `in_pipeline_slope` catches it.
+> 3. **`in_pipeline` (and its slope) is exactly 4× overcounted** — the advisory `/stats` poller is summed
+>    across the shard APIs over one unified store. Confirmed: `in_pipeline_final / stranded` = 4.000 in
+>    every collapsed run. Note this inflation currently *masks* caveat 2 by making the slope gate ~4×
+>    more sensitive: **fix 2 and 3 in the same change**, or soaks will start passing spuriously.
+> 4. **Delivered rate uses the wrong denominator.** Deliveries span `hold + drain`, not `hold`. Recover
+>    the true span from the phase-timing lines: `span ≈ (windows / shards) × 5 s`.
+>
+> **Workaround until fixed** — make the climb a formality and put the real test in the soak:
+> `--rate-ladder 4 --hold-seconds 60 --drain-timeout 150 --soak-hold-seconds 300 --soak-drain-timeout 30`
+> plus `--soak-rate <target>` on the drive box (`pick_soak_rate` honors an explicit override). Judge only
+> on the soak's store-truth (`drained ∧ stranded==0 ∧ dead_total==0`) and the sink socket-truth.
+>
+> What the ceiling actually is, and why `mark_done` was the wrong suspect:
+> [`outbound-claim-wall.md`](outbound-claim-wall.md).
+
 The **turnkey** automation of the manual per-rung ceiling hunt (`C1-MANUAL-LADDER-runbook.md`). It pins
 the post-#842 delivered-throughput ceiling of the N-active engine-shard fleet against the 45M-messages/day
 target, then feeds the `SYSTEM-REQUIREMENTS.md §8` N-active decision. **This bench reports numbers; it does
