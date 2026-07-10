@@ -423,11 +423,17 @@ async def _sample_in_pipeline_peak(
     drive stays byte-identical."""
     poller = EnginePoller(urls, None, origin=time.perf_counter())
     await poller.open()
+    # De-dup the unified-store gauge: each shard's /stats in_pipeline counts the WHOLE store and the poller
+    # SUMS across the N shard URLs, so the aggregate is N× the true fleet backlog (#841). Divide by the
+    # distinct-shard count to record a SINGLE store view as the high-water.
+    n_shards = max(1, len(set(urls)))
     try:
         while not stop.is_set():
             sample = await poller.sample_once()
-            if sample is not None and sample.in_pipeline > out[0]:
-                out[0] = sample.in_pipeline
+            if sample is not None:
+                depth = sample.in_pipeline // n_shards
+                if depth > out[0]:
+                    out[0] = depth
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except (asyncio.TimeoutError, TimeoutError):
@@ -452,11 +458,17 @@ async def _sample_in_pipeline_trace(
     t0 = origin if origin is not None else time.perf_counter()
     poller = EnginePoller(urls, None, origin=t0)
     await poller.open()
+    # De-inflate the unified-store in_pipeline: each shard's gauge counts the whole store and the poller
+    # sums the N shard URLs (#841). Divide by the distinct-shard count so the recorded trace is a SINGLE
+    # store view — which ALSO de-inflates the least-squares SLOPE by the same N, removing the accidental
+    # N× slope sensitivity the soak's flat-or-draining gate would otherwise apply (paired with the tightened
+    # _SLOPE_FLAT_TOL in shardcert_ladder.py and the bounded soak drain, D2).
+    n_shards = max(1, len(set(urls)))
     try:
         while not stop.is_set():
             sample = await poller.sample_once()
             if sample is not None:
-                out.append([round(time.perf_counter() - t0, 3), float(sample.in_pipeline)])
+                out.append([round(time.perf_counter() - t0, 3), sample.in_pipeline / n_shards])
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except (asyncio.TimeoutError, TimeoutError):
@@ -696,7 +708,9 @@ async def run_shardcert(
         lane_repeats=tracker.lane_repeats,
         engine_done=(final.done if final else 0),
         engine_dead=(final.dead if final else 0),
-        in_pipeline_final=(final.in_pipeline if final else -1),
+        # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This value
+        # feeds ShardCertReport.ok/drained, unlike the advisory drive-side poller cross-checks (left as N×).
+        in_pipeline_final=(final.in_pipeline // max(1, len(ids_list)) if final else -1),
         drained=drain_s is not None,
         drain_seconds=drain_s,
         stranded_nonterminal=stranded,
@@ -1147,6 +1161,11 @@ class ShardCertEngineReport:
     dead_total: int = 0
     in_pipeline_final: int = -1
     recovery_seconds: float | None = None
+    #: D1: the engine-side drain duration (this box's own await_drain elapsed) — the RELIABLE drain the drive
+    #: uses for the honest sustainable rate (its own remote drain misses under load). Guaranteed non-None
+    #: whenever the fleet drained (drained ⇒ drain_s is not None). Defaulted so an older report deserializes
+    #: unchanged.
+    drain_seconds: float | None = None
     # Per-shard subprocess identity for the operator's EXTERNAL per-PID CPU capture (Get-Process
     # TotalProcessorTime deltas): shard id -> (node_id, live PID). The SAME map is advertised in
     # SHARDS_READY, so a per-PID CPU sample maps unambiguously to a node identity. On the kill leg the
@@ -1155,8 +1174,10 @@ class ShardCertEngineReport:
     node_pids: dict[str, tuple[str, int | None]] = field(default_factory=dict)
     # Soak-only (default empty ⇒ the correctness/climb path is unchanged): a bounded in-HOLD trace of the
     # fleet's OWN /stats in_pipeline gauge, ``[[elapsed_s, in_pipeline], ...]``, sampled when
-    # ``sample_in_pipeline=True``. The unified-store poller 4×-overcounts the ABSOLUTE value, but the TREND
-    # (flat/draining vs monotonic growth) is the reliable sustainable-vs-slow-saturation discriminator the
+    # ``sample_in_pipeline=True``. Each shard's /stats in_pipeline counts the WHOLE unified store and the
+    # poller sums the N shard URLs, so the sampler DE-DUPS by dividing each reading by the distinct-shard
+    # count (#841) — the recorded absolute value AND the derived slope are a single store view, not N×. The
+    # TREND (flat/draining vs monotonic growth) is the sustainable-vs-slow-saturation discriminator the
     # PR-C2 soak needs — a slow-saturation plateau looks lossless for ~60s but its backlog slope is
     # positive. Metadata only (a gauge count over time — never a payload / control-id).
     in_pipeline_trace: list[list[float]] = field(default_factory=list)
@@ -1459,7 +1480,10 @@ async def run_shardcert_engine(
             await poller.close()
         drained = drain_s is not None
         engine_dead = final.dead if final else 0
-        in_pipeline_final = final.in_pipeline if final else -1
+        # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This is
+        # stored on ShardCertEngineReport AND posted in the ENGINE_DRAINED gate, so the two-box report's
+        # engine_in_pipeline_final is the TRUE fleet backlog, not N× it.
+        in_pipeline_final = final.in_pipeline // max(1, len(ids_list)) if final else -1
         stranded, dead_total, breakdown = await _queue_breakdown(node_env)
         # PR-C2 ladder drain gate (default OFF): once the DIRECT store read above confirms drain, tell the
         # DRIVE half it is safe to tally its sinks — the reliable authority (stranded/dead), never the
@@ -1473,6 +1497,10 @@ async def run_shardcert_engine(
                     "stranded": stranded,
                     "dead_total": dead_total,
                     "in_pipeline_final": in_pipeline_final,
+                    # The RELIABLE engine-side drain time (this box's own await_drain). Guaranteed non-None
+                    # whenever engine_ok (drained ⇒ drain_s is not None), so the drive uses it for the honest
+                    # sustainable rate (D1) instead of its advisory remote drain, which misses under load.
+                    "drain_seconds": drain_s,
                     # engine-side store-truth pass bar for THIS rung (drive folds it into the classifier)
                     "engine_ok": bool(
                         drained and stranded == 0 and engine_dead == 0 and dead_total == 0
@@ -1496,6 +1524,7 @@ async def run_shardcert_engine(
         dead_total=dead_total,
         in_pipeline_final=in_pipeline_final,
         recovery_seconds=recovery_seconds,
+        drain_seconds=drain_s,
         node_pids=node_pids,
         in_pipeline_trace=in_pipeline_trace,
         notes=notes,

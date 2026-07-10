@@ -68,13 +68,35 @@ TARGET_INGRESS_PER_S = 45_000_000 / 86_400  # ≈ 520.833…
 
 #: A slope (in_pipeline rows per second over the soak hold) at or below this magnitude reads as
 #: "flat or draining" — a sustainable plateau. Above it, the backlog is growing = slow saturation.
-_SLOPE_FLAT_TOL = 1.0
+#: D4 coupling: the soak's in_pipeline trace/slope are now a SINGLE-store view (shardcert.py de-dups the
+#: N×-summed unified-store poller). Pre-fix, this threshold was applied to an N×-inflated slope, so the
+#: EFFECTIVE true-growth sensitivity was ~tol/N (≈0.25 rows/s at the N=4 rig). Dropping 1.0 → 0.25 preserves
+#: that effective sensitivity, now N-INDEPENDENT (the slope is a true per-store rate for any shard count).
+#: Left at 1.0 the gate would be ~N× too loose and a slow-saturating soak would pass spuriously (the
+#: handoff's "12–23/s" warning); paired with the bounded soak drain (D2). Re-calibrate against a rig soak if
+#: the true "flat" bar differs.
+_SLOPE_FLAT_TOL = 0.25
 
 #: The phase-timing INFO line the bench-gated ``MEFOR_DELIVERY_PHASE_TIMING`` lever emits per window (from
 #: ``messagefoundry.pipeline.wiring_runner``). Same shape the rig's ``aggregate.py`` parsed.
 _PHASE_RE = re.compile(
     r"send_ack n=(\d+) mean=([\d.]+)ms max=([\d.]+)ms "
     r"\| mark_done n=(\d+) mean=([\d.]+)ms max=([\d.]+)ms"
+)
+
+#: Each ``delivery phase timing`` INFO line covers a fixed 5-second window; ``wiring_runner`` emits one per
+#: 5s for as long as deliveries flow — through the hold AND the post-hold drain — so the window COUNT
+#: recovers the TRUE delivery SPAN (unlike ``hold_seconds``, which omits the drain tail). Used for the
+#: span-correct MEASURED delivered rate (D3): span ≈ (Σ windows across shards / shard count) × 5s.
+_PHASE_WINDOW_SECONDS = 5.0
+
+#: The CLAIM phase-timing INFO line the SAME ``MEFOR_DELIVERY_PHASE_TIMING`` lever emits per window (from
+#: ``messagefoundry.pipeline.phase_timing.ClaimPhaseTiming``) — the store-claim round-trip #842 could not
+#: see. Deliberately DISJOINT from ``_PHASE_RE`` (no send_ack/mark_done fields; ``_claim_lines`` guards on
+#: the distinct "claim phase timing" substring) so the two phase lines can never cross-match.
+_CLAIM_RE = re.compile(
+    r"claim n=(\d+) mean=([\d.]+)ms max=([\d.]+)ms \| "
+    r"lanes/claim=([\d.]+) rows/claim=([\d.]+) rearm=(\d+) empty=(\d+) claimers=(\d+)"
 )
 
 
@@ -184,6 +206,128 @@ def aggregate_phase_timing(
         send_ack_max_ms=sa_max,
         mark_done_mean_ms=(md_num / md_n) if md_n else 0.0,
         mark_done_max_ms=md_max,
+    )
+
+
+@dataclass(frozen=True)
+class ClaimTiming:
+    """The per-claim store round-trip (the phase #842 could not see), n-weighted across every shard ×
+    steady-state window of a rung (each shard's first ramp window dropped). Counts + latencies + ratios
+    only — never a payload / control-id / lane name (PHI rule)."""
+
+    windows: int
+    claims: int  # Σ claim n over the aggregated windows (the n-weighted denominator)
+    claim_mean_ms: float
+    claim_max_ms: float
+    lanes_per_claim: float  # n-weighted mean lanes offered per claim
+    rows_per_claim: float  # n-weighted mean rows returned per claim
+    rearm: int  # Σ H2 skip-and-complete lanes (real work, not overhead)
+    empty: int  # Σ pure-overhead claims (returned nothing AND rearmed nothing)
+
+    @property
+    def is_empty(self) -> bool:
+        return self.windows == 0
+
+    def render(self) -> str:
+        if self.is_empty:
+            return "claim timing: (none captured — MEFOR_DELIVERY_PHASE_TIMING off or no claims)"
+        return (
+            f"claim timing: claims={self.claims} windows={self.windows} | "
+            f"claim mean/max={self.claim_mean_ms:.2f}/{self.claim_max_ms:.2f}ms | "
+            f"lanes/claim={self.lanes_per_claim:.2f} rows/claim={self.rows_per_claim:.2f} "
+            f"rearm={self.rearm} empty={self.empty}"
+        )
+
+    def to_json_dict(self) -> dict[str, object]:
+        return {
+            "windows": self.windows,
+            "claims": self.claims,
+            "claim_mean_ms": round(self.claim_mean_ms, 3),
+            "claim_max_ms": round(self.claim_max_ms, 3),
+            "lanes_per_claim": round(self.lanes_per_claim, 3),
+            "rows_per_claim": round(self.rows_per_claim, 3),
+            "rearm": self.rearm,
+            "empty": self.empty,
+        }
+
+    @classmethod
+    def from_json_dict(cls, d: Mapping[str, Any]) -> ClaimTiming:
+        return cls(
+            windows=int(d.get("windows", 0)),
+            claims=int(d.get("claims", 0)),
+            claim_mean_ms=float(d.get("claim_mean_ms", 0.0)),
+            claim_max_ms=float(d.get("claim_max_ms", 0.0)),
+            lanes_per_claim=float(d.get("lanes_per_claim", 0.0)),
+            rows_per_claim=float(d.get("rows_per_claim", 0.0)),
+            rearm=int(d.get("rearm", 0)),
+            empty=int(d.get("empty", 0)),
+        )
+
+
+#: An empty :class:`ClaimTiming` — the default when a rung's ENGINE_RUNG_REPORT carried no claim aggregate
+#: (report absent, or the MEFOR_DELIVERY_PHASE_TIMING lever off), mirroring the empty ``PhaseTiming`` default.
+_EMPTY_CLAIM_TIMING = ClaimTiming(0, 0, 0.0, 0.0, 0.0, 0.0, 0, 0)
+
+
+def _claim_lines(text: str) -> list[re.Match[str]]:
+    """Every ``claim phase timing`` INFO line in ``text``, as regex matches (in file order). Guarded on the
+    distinct "claim phase timing" substring so the delivery (send_ack/mark_done) line can never match here."""
+    out: list[re.Match[str]] = []
+    for line in text.splitlines():
+        if "claim phase timing" not in line:
+            continue
+        m = _CLAIM_RE.search(line)
+        if m is not None:
+            out.append(m)
+    return out
+
+
+def aggregate_claim_timing(
+    log_paths: Sequence[Path], *, drop_first_window: bool = True
+) -> ClaimTiming:
+    """Aggregate the CLAIM phase-timing windows across the per-shard node logs of ONE rung into a single
+    n-weighted :class:`ClaimTiming` — the store-claim round-trip #842 could not see, now carried into the
+    consolidated report (D6). Each log's FIRST claim window is dropped (the ramp window) exactly as
+    :func:`aggregate_phase_timing` does; the n-weighted mean is ``Σ(mean×n) / Σn`` (n = claim count), the max
+    is the max over windows, lanes/rows-per-claim are n-weighted, and rearm/empty are summed. A
+    missing/empty/unreadable log contributes nothing (never raises — a bench report must not crash on a
+    truncated log)."""
+    claim_num = 0.0
+    claim_n = 0
+    claim_max = 0.0
+    lanes_num = 0.0
+    rows_num = 0.0
+    rearm = 0
+    empty = 0
+    windows = 0
+    for path in log_paths:
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        matches = _claim_lines(text)
+        if drop_first_window and matches:
+            matches = matches[1:]  # drop this shard's first (ramp) window
+        for m in matches:
+            cn, cm, cmx = int(m.group(1)), float(m.group(2)), float(m.group(3))
+            lpc, rpc = float(m.group(4)), float(m.group(5))
+            rearm += int(m.group(6))
+            empty += int(m.group(7))
+            claim_num += cm * cn
+            claim_n += cn
+            claim_max = max(claim_max, cmx)
+            lanes_num += lpc * cn
+            rows_num += rpc * cn
+            windows += 1
+    return ClaimTiming(
+        windows=windows,
+        claims=claim_n,
+        claim_mean_ms=(claim_num / claim_n) if claim_n else 0.0,
+        claim_max_ms=claim_max,
+        lanes_per_claim=(lanes_num / claim_n) if claim_n else 0.0,
+        rows_per_claim=(rows_num / claim_n) if claim_n else 0.0,
+        rearm=rearm,
+        empty=empty,
     )
 
 
@@ -366,13 +510,66 @@ class RungOutcome:
     in_pipeline_slope: float | None
     phase: PhaseTiming
     verdict: RungVerdict
+    #: D6: the per-claim store round-trip aggregate (the phase #842 could not see). Defaults empty when the
+    #: rung's ENGINE_RUNG_REPORT is absent or carried no claim timing (mirrors the empty ``phase`` fallback).
+    claim: ClaimTiming = _EMPTY_CLAIM_TIMING
+    #: D1: the RELIABLE engine-side drain time (from the ENGINE_DRAINED gate / ENGINE_RUNG_REPORT) — the
+    #: authority the verdict already trusts, guaranteed present for a SUSTAINED rung (drained ⇒ drain_s is not
+    #: None). Preferred over the advisory ``drive_drain_seconds`` (which "zeroes/misses under load") for the
+    #: honest sustainable rate, so a load-correlated drive-poll miss can't drop a sustained rung's ceiling.
+    engine_drain_seconds: float | None = None
     notes: tuple[str, ...] = ()
+
+    @property
+    def rate_drain_seconds(self) -> float | None:
+        """The drain used for the honest sustainable rate: the RELIABLE engine-side drain when present (the
+        authority the verdict trusts, guaranteed for a SUSTAINED rung), else the advisory drive-side drain."""
+        return (
+            self.engine_drain_seconds
+            if self.engine_drain_seconds is not None
+            else self.drive_drain_seconds
+        )
 
     def outbound_rate(self) -> float:
         return self.ingress_rate * self.dests
 
     def outbound_delivered_expected(self) -> int:
         return self.acked * self.dests
+
+    @property
+    def sustainable_ingress_rate(self) -> float | None:
+        """The HONEST sustainable INGRESS rate this rung actually proves (D1). A SUSTAINED rung only shows
+        the engine DELIVERED all ``offered × dests`` messages within ``hold + drain`` — NOT that it kept up
+        at the offered ``ingress_rate`` in real time. The honest rate spreads the offer over the REAL span it
+        took to clear: ``ingress_rate × hold / (hold + drain)`` using the RELIABLE measured drain
+        (:attr:`rate_drain_seconds` — the engine-side store-truth drain preferred over the advisory drive
+        poll), never the drain TIMEOUT. A rung that only drained its backlog post-hold reports a rate well
+        below its offered ``ingress_rate`` (the raw offered rate overstates it by ``(hold + drain) / hold``).
+        ``None`` only when NO drain was measured at all — which for a SUSTAINED rung cannot happen (the engine
+        drain is guaranteed present), so a sustained rung is never dropped from the pinned ceiling."""
+        drain = self.rate_drain_seconds
+        if drain is None:
+            return None
+        span = self.hold_seconds + drain
+        if span <= 0:
+            return None
+        return self.ingress_rate * self.hold_seconds / span
+
+    def delivered_rate_per_s(self, shard_count: int) -> float | None:
+        """The HONEST MEASURED outbound delivery rate (D3): socket-observed deliveries (``sink_received``)
+        over the TRUE delivery SPAN — NOT ``sink_received / hold_seconds``. Deliveries continue through the
+        post-hold drain, so dividing by the hold alone overstates the rate by ~``(hold + drain) / hold``. The
+        span is recovered from the per-5s ``delivery phase timing`` windows: ``phase.windows`` sums across
+        ``shard_count`` concurrent shards, so ``(phase.windows / shard_count) × _PHASE_WINDOW_SECONDS`` is the
+        wall-clock span over which the shards delivered. ``None`` when no phase windows were captured
+        (``MEFOR_DELIVERY_PHASE_TIMING`` off / no delivered rows) or ``shard_count`` is non-positive — an
+        unmeasured span cannot honestly denominate a rate."""
+        if self.phase.windows <= 0 or shard_count <= 0:
+            return None
+        span_s = (self.phase.windows / shard_count) * _PHASE_WINDOW_SECONDS
+        if span_s <= 0:
+            return None
+        return self.sink_received / span_s
 
     def render(self) -> str:
         tag = "soak" if self.is_soak else f"r{self.index}"
@@ -387,8 +584,13 @@ class RungOutcome:
             if self.in_pipeline_slope is None
             else f" in_pipeline_slope={self.in_pipeline_slope:+.2f}/s"
         )
+        sustain = (
+            ""
+            if self.sustainable_ingress_rate is None
+            else f" sustainable_ingress={self.sustainable_ingress_rate:g}/s"
+        )
         return (
-            f"{tag:5} ingress={self.ingress_rate:g}/s outbound={self.outbound_rate():g}/s "
+            f"{tag:5} ingress={self.ingress_rate:g}/s outbound={self.outbound_rate():g}/s{sustain} "
             f"offered={self.offered} A={self.acked} S={self.sink_received} "
             f"(expect A*dests={self.outbound_delivered_expected()}) | {eng} | "
             f"inv={self.lane_inversions} rep={self.lane_repeats} lanes={self.lanes_observed}{slope} "
@@ -402,6 +604,13 @@ class RungOutcome:
             "verdict": self.verdict.value,
             "ingress_rate": round(self.ingress_rate, 3),
             "outbound_rate": round(self.outbound_rate(), 3),
+            # D1: the HONEST sustainable ingress this rung proves (offered spread over hold + MEASURED
+            # drain), not the inflated raw offered ingress_rate. None when the drain was not measured.
+            "sustainable_ingress_rate": (
+                None
+                if self.sustainable_ingress_rate is None
+                else round(self.sustainable_ingress_rate, 3)
+            ),
             "dests": self.dests,
             "hold_seconds": self.hold_seconds,
             "offered_ingress": self.offered,
@@ -414,6 +623,7 @@ class RungOutcome:
             "lanes_observed": self.lanes_observed,
             "ack_ms": {"p50": round(self.ack_p50_ms, 3), "p99": round(self.ack_p99_ms, 3)},
             "drive_drain_seconds": self.drive_drain_seconds,
+            "engine_drain_seconds": self.engine_drain_seconds,  # D1: the reliable drain used for the rate
             "engine": {
                 "reported": self.engine_reported,
                 "ok": self.engine_ok,
@@ -424,6 +634,7 @@ class RungOutcome:
             },
             "in_pipeline_slope": self.in_pipeline_slope,
             "phase_timing": self.phase.to_json_dict(),
+            "claim_timing": self.claim.to_json_dict(),  # D6: the store-claim round-trip #842 could not see
             "notes": list(self.notes),
         }
 
@@ -447,6 +658,9 @@ def build_rung_outcome(
     notes: list[str] = list(drive.notes)
     truth = gate if gate is not None else report  # prefer the reliable drain gate for store-truth
     engine_reported = truth is not None
+    engine_drain_seconds: float | None = (
+        None  # D1: the RELIABLE engine drain (gate/report) for the rate
+    )
     if truth is None:
         engine_ok = False
         engine_drained = False
@@ -463,6 +677,8 @@ def build_rung_outcome(
         engine_stranded = int(truth.get("stranded", -1))
         engine_dead_total = int(truth.get("dead_total", -1))
         engine_in_pipeline_final = int(truth.get("in_pipeline_final", -1))
+        _raw_drain = truth.get("drain_seconds")
+        engine_drain_seconds = None if _raw_drain is None else float(_raw_drain)
         if gate is None:
             notes.append(
                 "engine store-truth from ENGINE_RUNG_REPORT (drain gate absent — degraded)"
@@ -471,12 +687,16 @@ def build_rung_outcome(
     # Phase timing + the soak in_pipeline slope live ONLY on ENGINE_RUNG_REPORT (the gate has neither).
     slope: float | None = None
     phase = PhaseTiming(0, 0, 0.0, 0.0, 0.0, 0.0)
+    claim = _EMPTY_CLAIM_TIMING
     if report is not None:
         raw_slope = report.get("in_pipeline_slope")
         slope = None if raw_slope is None else float(raw_slope)
         phase_raw = report.get("phase_timing")
         if isinstance(phase_raw, Mapping):
             phase = PhaseTiming.from_json_dict(phase_raw)
+        claim_raw = report.get("claim_timing")  # D6: the store-claim round-trip aggregate
+        if isinstance(claim_raw, Mapping):
+            claim = ClaimTiming.from_json_dict(claim_raw)
         for note in report.get("notes", []) or []:
             notes.append(f"engine: {note}")
     elif engine_reported:
@@ -513,6 +733,8 @@ def build_rung_outcome(
         engine_in_pipeline_final=engine_in_pipeline_final,
         in_pipeline_slope=slope,
         phase=phase,
+        claim=claim,
+        engine_drain_seconds=engine_drain_seconds,
         verdict=verdict,
         notes=tuple(notes),
     )
@@ -555,15 +777,44 @@ class ConsolidatedLadderReport:
 
     @property
     def pinned_ingress_rate(self) -> float | None:
-        """The highest SUSTAINED climb-rung ingress rate — the pinned sustainable ceiling (a floor if the
-        climb never collapsed). ``None`` if no rung sustained."""
-        sustained = [r.ingress_rate for r in self.climb if r.verdict is RungVerdict.SUSTAINED]
-        return max(sustained) if sustained else None
+        """The pinned HONEST sustainable-ingress ceiling (D1): the highest per-rung
+        ``sustainable_ingress_rate`` (offered spread over hold + MEASURED drain) over the SUSTAINED climb
+        rungs — NOT the raw offered ``ingress_rate``. The raw offered rate overstates the sustainable rate by
+        ``(hold + drain) / hold`` because a SUSTAINED rung merely DELIVERED all offered messages within
+        hold + drain; it never proved it KEPT UP at the offered rate. A floor if the climb never collapsed.
+        ``None`` if no rung sustained (or none had a measured drain to compute an honest rate)."""
+        honest = [
+            r.sustainable_ingress_rate
+            for r in self.climb
+            if r.verdict is RungVerdict.SUSTAINED and r.sustainable_ingress_rate is not None
+        ]
+        return max(honest) if honest else None
 
     @property
     def pinned_outbound_rate(self) -> float | None:
         p = self.pinned_ingress_rate
         return None if p is None else p * self.dests
+
+    @property
+    def pinned_rung(self) -> RungOutcome | None:
+        """The SUSTAINED climb rung whose HONEST ``sustainable_ingress_rate`` IS the pinned ceiling — the
+        rung ``pinned_ingress_rate`` reports. ``None`` if nothing sustained with a measured drain."""
+        candidates = [
+            r
+            for r in self.climb
+            if r.verdict is RungVerdict.SUSTAINED and r.sustainable_ingress_rate is not None
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda r: r.sustainable_ingress_rate or 0.0)
+
+    @property
+    def pinned_measured_delivered_rate_per_s(self) -> float | None:
+        """The pinned rung's HONEST MEASURED outbound delivery rate (D3) — socket-observed deliveries over
+        the span-correct (phase-window) denominator, NOT ``sink_received / hold_seconds``. A cross-check on
+        the ingress-derived ``pinned_outbound_rate``. ``None`` if nothing pinned or no phase windows."""
+        pinned = self.pinned_rung
+        return None if pinned is None else pinned.delivered_rate_per_s(len(self.shards))
 
     @property
     def first_collapse_ingress_rate(self) -> float | None:
@@ -665,6 +916,16 @@ class ConsolidatedLadderReport:
             )
         else:
             out = self.pinned_outbound_rate or 0.0
+            pinned = self.pinned_rung
+            pin_drain = None if pinned is None else pinned.rate_drain_seconds
+            honest_ctx = (
+                ""
+                if pinned is None or pin_drain is None
+                else (
+                    f"  [honest: offered {pinned.ingress_rate:g}/s over hold {pinned.hold_seconds:g}s "
+                    f"+ measured drain {pin_drain:.1f}s]"
+                )
+            )
             lines.append(
                 f"  pinned sustainable ceiling: {pin:g} ingress/s = {out:g} outbound/s"
                 + (
@@ -672,6 +933,7 @@ class ConsolidatedLadderReport:
                     if self.ceiling_bracketed
                     else "  (FLOOR — climb never collapsed; raise the ladder)"
                 )
+                + honest_ctx
             )
             fc = self.first_collapse_ingress_rate
             if fc is not None:
@@ -703,9 +965,18 @@ class ConsolidatedLadderReport:
             lines.append("  soak: (skipped — no sustained rung to soak)")
         lines.append("")
         lines.append("  per-rung phase timing (send_ack vs mark_done, n-weighted):")
+        n_shards = len(self.shards)
         for r in self.all_records:
             tag = "soak" if r.is_soak else f"r{r.index}"
-            lines.append(f"    {tag:5} {r.phase.render()}")
+            dr = r.delivered_rate_per_s(n_shards)  # D3: span-correct MEASURED delivered rate
+            dr_txt = "" if dr is None else f"  measured delivered={dr:g}/s (span-correct)"
+            lines.append(f"    {tag:5} {r.phase.render()}{dr_txt}")
+        lines.append(
+            "  per-rung claim timing (store-claim round-trip #842 could not see, n-weighted):"
+        )
+        for r in self.all_records:
+            tag = "soak" if r.is_soak else f"r{r.index}"
+            lines.append(f"    {tag:5} {r.claim.render()}")
         for note in self.notes:
             lines.append(f"  note: {note}")
         lines.append("")
@@ -740,8 +1011,23 @@ class ConsolidatedLadderReport:
             },
             "target_ingress_per_s": round(TARGET_INGRESS_PER_S, 3),
             "ceiling": {
-                "pinned_ingress_rate": self.pinned_ingress_rate,
-                "pinned_outbound_rate": self.pinned_outbound_rate,
+                # D1: honest sustainable rate (offered spread over hold + MEASURED drain), not the inflated
+                # raw offered ingress_rate. clears_target_ingress keys off pinned_ingress_rate.
+                "pinned_ingress_rate": (
+                    None if self.pinned_ingress_rate is None else round(self.pinned_ingress_rate, 3)
+                ),
+                "pinned_outbound_rate": (
+                    None
+                    if self.pinned_outbound_rate is None
+                    else round(self.pinned_outbound_rate, 3)
+                ),
+                # D3: span-correct MEASURED delivered rate (phase-window denominator), a cross-check on the
+                # ingress-derived pinned_outbound_rate — NOT sink_received / hold_seconds.
+                "pinned_measured_delivered_rate_per_s": (
+                    None
+                    if self.pinned_measured_delivered_rate_per_s is None
+                    else round(self.pinned_measured_delivered_rate_per_s, 3)
+                ),
                 "first_collapse_ingress_rate": self.first_collapse_ingress_rate,
                 "bracketed": self.ceiling_bracketed,
                 "clears_target_ingress": self.clears_target_ingress,
@@ -827,8 +1113,21 @@ def _engine_rung_payload(report: ShardCertEngineReport) -> dict[str, object]:
         "engine_dead": report.engine_dead,
         "in_pipeline_final": report.in_pipeline_final,
         "in_pipeline_slope": in_pipeline_slope(report.in_pipeline_trace),
+        # The RELIABLE engine-side drain time (D1): the drive prefers it over its advisory remote drain for
+        # the honest sustainable rate. Present on the report path too (not just the ENGINE_DRAINED gate).
+        "drain_seconds": report.drain_seconds,
         "notes": list(report.notes),
     }
+
+
+def _attach_rung_timings(payload: dict[str, object], rung_logs: Sequence[Path]) -> None:
+    """Attach BOTH phase-timing aggregates to an ENGINE_RUNG_REPORT payload from the rung's per-shard node
+    logs: the delivery ``send_ack``/``mark_done`` split (``phase_timing``) AND the CLAIM store round-trip
+    (``claim_timing``, D6 — the phase #842 could not see). The claim aggregate is a SIBLING of phase_timing,
+    gated by the same ``MEFOR_DELIVERY_PHASE_TIMING`` lever; BOTH must be attached or the drive box's claim
+    aggregate stays empty despite the node logs carrying the claim lines."""
+    payload["phase_timing"] = aggregate_phase_timing(rung_logs).to_json_dict()
+    payload["claim_timing"] = aggregate_claim_timing(rung_logs).to_json_dict()
 
 
 async def run_engine_ladder(
@@ -921,9 +1220,7 @@ async def run_engine_ladder(
                 )
             break
         payload = _engine_rung_payload(report)
-        payload["phase_timing"] = aggregate_phase_timing(
-            _rung_log_paths(keep_dir, report.shards)
-        ).to_json_dict()
+        _attach_rung_timings(payload, _rung_log_paths(keep_dir, report.shards))
         rung_coord.post(ENGINE_RUNG_REPORT, payload)
         result.rungs_armed.append(rung.run_suffix)
 
@@ -973,9 +1270,7 @@ async def run_engine_ladder(
         result.notes.append("soak: no DRIVE_START from the drive")
         return result
     payload = _engine_rung_payload(report)
-    payload["phase_timing"] = aggregate_phase_timing(
-        _rung_log_paths(keep_dir, report.shards)
-    ).to_json_dict()
+    _attach_rung_timings(payload, _rung_log_paths(keep_dir, report.shards))
     soak_coord.post(ENGINE_RUNG_REPORT, payload)
     result.rungs_armed.append("soak")
     return result

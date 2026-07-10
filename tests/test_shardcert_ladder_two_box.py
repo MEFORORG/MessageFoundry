@@ -21,13 +21,20 @@ import math
 import pytest
 
 from harness.load import coord
+from harness.load import shardcert as _shardcert
 from harness.load.shardcert import ShardCertDriveReport
 from harness.load.shardcert_ladder import (
     TARGET_INGRESS_PER_S,
+    ClaimTiming,
     ConsolidatedLadderReport,
     LadderRung,
     PhaseTiming,
     RungVerdict,
+    _CLAIM_RE,
+    _PHASE_RE,
+    _claim_lines,
+    _phase_lines,
+    aggregate_claim_timing,
     aggregate_phase_timing,
     build_consolidated_report,
     build_rung_outcome,
@@ -332,10 +339,16 @@ def test_in_pipeline_slope_too_few_points() -> None:
 
 
 def test_slope_is_draining_bar() -> None:
+    # _SLOPE_FLAT_TOL dropped 1.0 -> 0.25 in LOCKSTEP with D4's slope de-inflation (shardcert.py divides the
+    # N×-summed unified-store in_pipeline, hence the slope, by the shard count). The pair is gate-invariant
+    # on any physical run; the threshold is now the TRUE, N-independent backlog-growth rate.
     assert slope_is_draining(0.0) is True
     assert slope_is_draining(-5.0) is True
-    assert slope_is_draining(1.0) is True  # exactly at the flat tolerance
-    assert slope_is_draining(5.0) is False  # growing
+    assert slope_is_draining(0.25) is True  # exactly at the flat tolerance (the new bar)
+    assert slope_is_draining(0.5) is False  # growing
+    assert (
+        slope_is_draining(1.0) is False
+    )  # the OLD bar now reads GROWING — the de-inflation coupling
     assert slope_is_draining(None) is False  # no trace ⇒ cannot certify the plateau
 
 
@@ -399,8 +412,12 @@ def _outcome(rate: float, verdict: RungVerdict, *, is_soak: bool = False, lanes_
     )
     drive = _drive(ingress=rate, acked=int(rate * 60), lanes_observed=lanes_observed)
     out = build_rung_outcome(rung, drive, _gate(), _report())
-    # force the verdict/shape for report-shape tests independent of the drive's actual numbers
-    return type(out)(**{**out.__dict__, "verdict": verdict, "is_soak": is_soak})
+    # force the verdict/shape for report-shape tests independent of the drive's actual numbers. Kept-up
+    # rungs (drive_drain_seconds=0.0 ⇒ honest sustainable rate == offered) so these SELECTION/shape tests
+    # read in offered terms; the D1 drain-discount is exercised by the dedicated tests below.
+    return type(out)(
+        **{**out.__dict__, "verdict": verdict, "is_soak": is_soak, "drive_drain_seconds": 0.0}
+    )
 
 
 def test_pick_soak_rate_highest_sustained() -> None:
@@ -588,3 +605,371 @@ def test_report_empty_climb_is_not_ok() -> None:
     assert rep.correctness_ok is False  # nothing driven ⇒ cannot certify
     assert rep.pinned_ingress_rate is None
     assert rep.exit_code == 1  # empty (non-aborted) climb ⇒ correctness fail, not setup abort
+
+
+# --- D1: honest sustainable-ingress rate (offered spread over hold + MEASURED drain) ------------------
+
+
+def _honest_rung(
+    rate: float,
+    verdict: RungVerdict = RungVerdict.SUSTAINED,
+    *,
+    drain_seconds: float | None,
+    hold: float = 60.0,
+    sink_received: int | None = None,
+    phase_windows: int = 0,
+):
+    """A RungOutcome with an EXPLICIT measured drain + phase windows / sink count for the honest-rate +
+    delivered-rate tests — unlike ``_outcome`` (kept-up, drain 0). Phase is ALWAYS set (windows=0 ⇒ no
+    delivered rate)."""
+    base = _outcome(rate, verdict)
+    overrides: dict[str, object] = {
+        "drive_drain_seconds": drain_seconds,
+        "hold_seconds": hold,
+        "phase": PhaseTiming(phase_windows, phase_windows, 1.0, 2.0, 1.0, 2.0),
+    }
+    if sink_received is not None:
+        overrides["sink_received"] = sink_received
+    return type(base)(**{**base.__dict__, **overrides})
+
+
+def test_sustainable_ingress_rate_penalizes_post_hold_drain() -> None:
+    # A rung offered 521/s over a 60s hold that the engine could only clear by draining 150s more (span =
+    # 3.5×hold) proves a TRUE sustainable ingress of 521 × 60/210 ≈ 148.86/s — the (hold+drain)/hold = 3.5×
+    # overstatement is removed.
+    r = _honest_rung(521.0, drain_seconds=150.0, hold=60.0)
+    assert r.sustainable_ingress_rate == pytest.approx(521.0 * 60.0 / 210.0)
+    assert r.sustainable_ingress_rate == pytest.approx(148.857, abs=1e-2)
+    # a rung that KEPT UP in real time (drain ≈ 0) is not penalized — honest == offered
+    assert _honest_rung(521.0, drain_seconds=0.0).sustainable_ingress_rate == pytest.approx(521.0)
+
+
+def test_sustainable_ingress_rate_none_when_drain_unmeasured_and_excluded_from_pinned() -> None:
+    # No measured drain ⇒ no honest rate ⇒ the rung is EXCLUDED from the pinned ceiling (never silently
+    # reported at the inflated offered rate).
+    r = _honest_rung(521.0, drain_seconds=None)
+    assert r.sustainable_ingress_rate is None
+    assert _rep([r]).pinned_ingress_rate is None
+
+
+def test_pinned_ingress_rate_is_honest_not_offered() -> None:
+    # The pinned ceiling + the §8 gate key off the HONEST rate, not max(offered).
+    rep = _rep([_honest_rung(521.0, drain_seconds=150.0, hold=60.0)])
+    assert rep.pinned_ingress_rate == pytest.approx(148.857, abs=1e-2)
+    assert rep.pinned_outbound_rate == pytest.approx(148.857 * 8, abs=1e-1)
+
+
+def test_clears_target_ingress_no_longer_fires_at_true_149() -> None:
+    # The literal §8-gate correction: a rung offered 521 that only cleared via a long drain sustains ~149/s
+    # and must NOT clear the 521/s ingress target.
+    assert (
+        _rep([_honest_rung(521.0, drain_seconds=150.0, hold=60.0)]).clears_target_ingress is False
+    )
+
+
+def test_clears_target_ingress_fires_only_when_honest_ge_target() -> None:
+    # Kept-up (drain ≈ 0) at >= 520.833/s clears; the SAME offered rate with a large measured drain (honest
+    # below target) does not.
+    assert _rep([_honest_rung(521.0, drain_seconds=0.0)]).clears_target_ingress is True
+    assert _rep([_honest_rung(521.0, drain_seconds=60.0, hold=60.0)]).clears_target_ingress is False
+
+
+def test_pinned_picks_max_honest_not_max_offered() -> None:
+    # r_hi offers MORE (200) but only cleared via a long drain (honest = 200×60/300 = 40); r_lo offers less
+    # (100) but kept up (honest = 100). The honest ceiling is r_lo — a higher-offered rung that only drained
+    # must not out-rank the lower-offered rung that kept up.
+    r_lo = _honest_rung(100.0, drain_seconds=0.0, hold=60.0)
+    r_hi = _honest_rung(200.0, drain_seconds=240.0, hold=60.0)
+    rep = _rep([r_lo, r_hi])
+    assert rep.pinned_ingress_rate == pytest.approx(100.0)
+    assert rep.pinned_rung is r_lo
+
+
+# --- D3: span-correct MEASURED delivered rate (phase-window denominator, not sink/hold) ---------------
+
+
+def test_delivered_rate_per_s_span_correct_not_hold() -> None:
+    from harness.load.shardcert_ladder import _PHASE_WINDOW_SECONDS
+
+    n = 4
+    windows = 168  # Σ across n shards ⇒ span = (168/4)×5 = 210s (== hold+drain of a 3.5× rung)
+    r = _honest_rung(
+        521.0, drain_seconds=150.0, hold=60.0, sink_received=42000, phase_windows=windows
+    )
+    span = (windows / n) * _PHASE_WINDOW_SECONDS
+    assert r.delivered_rate_per_s(n) == pytest.approx(42000 / span)
+    # deliveries span hold+drain, so the span-correct rate is far below the naive sink/hold
+    assert r.delivered_rate_per_s(n) < (42000 / 60.0) / 3.0
+    # no phase windows / non-positive shard count ⇒ None (no spurious rate when phase timing is off)
+    assert (
+        _honest_rung(
+            521.0, drain_seconds=1.0, sink_received=42000, phase_windows=0
+        ).delivered_rate_per_s(n)
+        is None
+    )
+    assert r.delivered_rate_per_s(0) is None
+
+
+# --- verdict invariance: the rate fixes touch reported numbers only, never classification ------------
+
+
+def test_classify_and_verdicts_unchanged_by_rate_fix() -> None:
+    # classify_rung is a pure function of the reliable authorities; the D1/D3/D4/D6 work never feeds it.
+    cases = [
+        (True, True, 0, True, RungVerdict.SUSTAINED),
+        (False, True, 0, True, RungVerdict.COLLAPSED),
+        (True, False, 0, True, RungVerdict.FROZEN_TAIL),
+        (True, True, 1, True, RungVerdict.CORRECTNESS_FAIL),
+        (True, True, 0, False, RungVerdict.INCONCLUSIVE),
+    ]
+    for eng_ok, no_loss, inv, reported, expect in cases:
+        assert (
+            classify_rung(
+                engine_reported=reported,
+                engine_ok=eng_ok,
+                no_loss=no_loss,
+                lane_inversions=inv,
+                lane_repeats=0,
+            )
+            is expect
+        )
+
+
+# --- D6: the store-claim round-trip #842 could not see (aggregated, disjoint from the delivery line) --
+
+
+def _claim_line(
+    n: int, mean: float, mx: float, lpc: float, rpc: float, rearm: int, empty: int
+) -> str:
+    return (
+        "2026-07-09T00:38:11Z INFO     messagefoundry.pipeline.phase_timing: "
+        f"claim phase timing (stage=outbound): claim n={n} mean={mean:.2f}ms max={mx:.2f}ms | "
+        f"lanes/claim={lpc:.2f} rows/claim={rpc:.2f} rearm={rearm} empty={empty} claimers=1"
+    )
+
+
+def test_claim_line_not_false_matched() -> None:
+    delivery = _phase_line(100, 1.5, 9.0, 100, 12.0, 40.0)
+    claim = _claim_line(50, 53.0, 90.0, 8.0, 6.0, 2, 1)
+    both = delivery + "\n" + claim
+    # the delivery aggregator sees ONLY the delivery line; the claim aggregator ONLY the claim line
+    assert len(_phase_lines(both)) == 1
+    assert len(_claim_lines(both)) == 1
+    # neither regex can cross-match the other's line
+    assert _PHASE_RE.search(claim) is None
+    assert _CLAIM_RE.search(delivery) is None
+
+
+def test_aggregate_claim_timing_nweighted_drops_first_window(tmp_path) -> None:
+    log_a = tmp_path / "shard-a.log"
+    log_b = tmp_path / "shard-b.log"
+    # first line per log is the ramp window and is DROPPED
+    log_a.write_text(
+        "\n".join(
+            [
+                _claim_line(1, 999.0, 999.0, 0.0, 0.0, 0, 0),  # ramp — dropped
+                _claim_line(10, 50.0, 80.0, 8.0, 6.0, 1, 0),
+                _claim_line(30, 60.0, 90.0, 8.0, 5.0, 0, 2),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    log_b.write_text(
+        "\n".join(
+            [
+                _claim_line(1, 999.0, 999.0, 0.0, 0.0, 0, 0),  # ramp — dropped
+                _claim_line(20, 55.0, 70.0, 8.0, 4.0, 3, 1),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    agg = aggregate_claim_timing(
+        [log_a, log_b, tmp_path / "missing.log"]
+    )  # missing contributes nothing
+    assert agg.windows == 3
+    assert agg.claims == 60  # 10 + 30 + 20
+    assert agg.claim_mean_ms == pytest.approx((10 * 50 + 30 * 60 + 20 * 55) / 60)  # n-weighted
+    assert agg.claim_max_ms == 90.0
+    assert agg.lanes_per_claim == pytest.approx(8.0)
+    assert agg.rows_per_claim == pytest.approx((10 * 6 + 30 * 5 + 20 * 4) / 60)
+    assert agg.rearm == 4  # 1 + 0 + 3
+    assert agg.empty == 3  # 0 + 2 + 1
+
+
+def test_claim_timing_flows_to_rung_json() -> None:
+    rung = LadderRung(index=0, ingress_rate=24.0, hold_seconds=60.0, drain_timeout=150.0)
+    drive = _drive(ingress=24.0, acked=1440)
+    claim = ClaimTiming(
+        windows=5,
+        claims=250,
+        claim_mean_ms=53.0,
+        claim_max_ms=90.0,
+        lanes_per_claim=8.0,
+        rows_per_claim=6.0,
+        rearm=2,
+        empty=1,
+    )
+    report = {**_report(), "claim_timing": claim.to_json_dict()}
+    out = build_rung_outcome(rung, drive, _gate(), report)
+    assert out.claim == claim
+    assert out.to_json_dict()["claim_timing"]["claim_mean_ms"] == 53.0
+    # report=None ⇒ empty ClaimTiming (no crash), mirroring the empty-PhaseTiming fallback
+    out2 = build_rung_outcome(rung, drive, _gate(), None)
+    assert out2.claim.is_empty
+    assert out2.to_json_dict()["claim_timing"]["claims"] == 0
+
+
+# --- D4: the unified-store in_pipeline is de-duped (single store view) so its slope is not N× ----------
+
+
+def test_in_pipeline_trace_dedups_unified_store_sum(monkeypatch) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    n = 4
+    urls = [f"http://h{i}" for i in range(n)]
+    stop = asyncio.Event()
+    seq = [
+        n * 100,
+        n * 200,
+        n * 300,
+        n * 400,
+    ]  # each shard reports the SAME whole-store depth; poller SUMS
+
+    class _FakePoller:
+        def __init__(self, urls, *a, **k):
+            self._i = 0
+
+        async def open(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+        async def sample_once(self):
+            v = seq[self._i] if self._i < len(seq) else seq[-1]
+            self._i += 1
+            if self._i >= len(seq):
+                stop.set()  # deterministic stop after the fixed sequence (no timing race)
+            return SimpleNamespace(in_pipeline=v)
+
+    monkeypatch.setattr(_shardcert, "EnginePoller", _FakePoller)
+    out: list[list[float]] = []
+    asyncio.run(_shardcert._sample_in_pipeline_trace(urls, stop, out, interval=0.001))
+    vals = [v for _, v in out]
+    # every recorded point is the SINGLE-store view (summed N× ÷ N), never the N× aggregate
+    assert vals == [100.0, 200.0, 300.0, 400.0]  # NOT the raw summed [400, 800, 1200, 1600]
+    assert float(n * 400) not in vals  # 1600 (the raw summed high point) never appears
+    # de-inflating every point divides the least-squares slope by N — the coupling with _SLOPE_FLAT_TOL=0.25
+    slope = in_pipeline_slope(out)
+    assert slope is not None and slope > 0
+
+
+def test_peak_sampler_dedups(monkeypatch) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    n = 4
+    urls = [f"http://h{i}" for i in range(n)]
+    stop = asyncio.Event()
+
+    class _FakePoller:
+        def __init__(self, urls, *a, **k):
+            self._i = 0
+
+        async def open(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+        async def sample_once(self):
+            self._i += 1
+            if self._i >= 3:
+                stop.set()
+            return SimpleNamespace(in_pipeline=n * 250)  # summed high-water
+
+    monkeypatch.setattr(_shardcert, "EnginePoller", _FakePoller)
+    out = [0]
+    asyncio.run(_shardcert._sample_in_pipeline_peak(urls, stop, out, interval=0.001))
+    assert out[0] == 250  # the SINGLE-store high-water, not n×250
+
+
+# --- D1 (finding-2 fix): the honest rate uses the RELIABLE engine drain, not the advisory drive drain -
+
+
+def test_honest_rate_prefers_reliable_engine_drain_over_drive_miss() -> None:
+    # The drive's remote await_drain MISSED (None) under load, but the engine store-truth drain IS present (a
+    # SUSTAINED rung always has one). The honest rate must use the RELIABLE engine drain, NOT drop the rung
+    # from the ceiling — else clears_target_ingress reads False for a fleet that provably cleared the target.
+    base = _outcome(600.0, RungVerdict.SUSTAINED)
+    rung = type(base)(
+        **{
+            **base.__dict__,
+            "drive_drain_seconds": None,  # remote poll missed under load
+            "engine_drain_seconds": 5.0,  # reliable engine store-truth drain
+            "hold_seconds": 60.0,
+        }
+    )
+    assert (
+        rung.rate_drain_seconds == 5.0
+    )  # prefers the reliable engine drain over the missing drive drain
+    assert rung.sustainable_ingress_rate == pytest.approx(600.0 * 60.0 / 65.0)  # computed, NOT None
+    rep = _rep([rung])
+    assert rep.pinned_ingress_rate == pytest.approx(
+        600.0 * 60.0 / 65.0
+    )  # sustained rung NOT excluded
+    assert (
+        rep.clears_target_ingress is True
+    )  # 553.8 >= 520.833 — the fleet's clear is not mis-reported
+
+
+def test_build_rung_outcome_reads_engine_drain_and_prefers_it() -> None:
+    # The ENGINE_DRAINED gate carries the reliable engine drain; build_rung_outcome folds it into RungOutcome
+    # and the honest rate prefers it over the drive report's own (advisory) drain.
+    rung = LadderRung(index=0, ingress_rate=600.0, hold_seconds=60.0, drain_timeout=150.0)
+    drive = _drive(ingress=600.0, acked=36000)  # drive.drain_seconds == 1.0
+    out = build_rung_outcome(rung, drive, {**_gate(), "drain_seconds": 5.0}, None)
+    assert out.engine_drain_seconds == 5.0
+    assert out.rate_drain_seconds == 5.0  # engine (5.0) preferred over drive (1.0)
+    assert out.sustainable_ingress_rate == pytest.approx(600.0 * 60.0 / 65.0)
+    assert out.to_json_dict()["engine_drain_seconds"] == 5.0
+    # a gate WITHOUT drain_seconds (older engine) falls back to the drive drain
+    out2 = build_rung_outcome(rung, drive, _gate(), None)
+    assert out2.engine_drain_seconds is None
+    assert out2.rate_drain_seconds == 1.0  # drive fallback
+
+
+# --- D6 (finding-1 fix): the ENGINE_RUNG_REPORT producer attaches BOTH phase AND claim timing -----------
+
+
+def test_attach_rung_timings_carries_nonempty_claim_timing(tmp_path) -> None:
+    # The bug was: run_engine_ladder attached only payload["phase_timing"], so claim_timing was ALWAYS empty
+    # in a real run despite the node logs carrying claim lines. _attach_rung_timings must attach BOTH.
+    from harness.load.shardcert_ladder import _attach_rung_timings
+
+    log = tmp_path / "shard-a.log"
+    log.write_text(
+        "\n".join(
+            [
+                _phase_line(1, 1.0, 1.0, 1, 1.0, 1.0),  # delivery ramp window (dropped)
+                _phase_line(100, 1.5, 9.0, 100, 12.0, 40.0),  # delivery steady window
+                _claim_line(1, 999.0, 999.0, 0.0, 0.0, 0, 0),  # claim ramp window (dropped)
+                _claim_line(50, 53.0, 90.0, 8.0, 6.0, 2, 1),  # claim steady window
+            ]
+        ),
+        encoding="utf-8",
+    )
+    payload: dict[str, object] = {}
+    _attach_rung_timings(payload, [log])
+    assert payload["phase_timing"]["deliveries"] == 100  # type: ignore[index]
+    assert payload["claim_timing"]["claims"] == 50  # type: ignore[index]  # NON-empty — the producer fix
+    assert payload["claim_timing"]["windows"] == 1  # type: ignore[index]
+    # and it flows to the consumer end-to-end
+    out = build_rung_outcome(
+        LadderRung(index=0, ingress_rate=24.0, hold_seconds=60.0, drain_timeout=150.0),
+        _drive(ingress=24.0, acked=1440),
+        _gate(),
+        payload,
+    )
+    assert out.claim.claims == 50

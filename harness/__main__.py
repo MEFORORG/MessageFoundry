@@ -761,6 +761,55 @@ def _add_coord_args(parser: argparse.ArgumentParser, *, default_run_id: str = "s
     )
 
 
+def _log_store_env_source(label: str, store_env: dict[str, str]) -> None:
+    """D5 P3: surface that the store connection is sourced from the ambient ``MEFOR_STORE_*`` env (no --dsn
+    flag). Print KEY NAMES ONLY (sorted) — NEVER values, so ``MEFOR_STORE_PASSWORD`` can't leak (secrets
+    rule). Advisory stderr line; writes no file."""
+    keys = ", ".join(sorted(store_env)) or "(none set)"
+    print(
+        f"{label}: store connection from ambient MEFOR_STORE_* env (values not shown): {keys}",
+        file=sys.stderr,
+    )
+
+
+def _git_commit_sha() -> str | None:
+    """Best-effort HEAD SHA for report provenance (D5 P2). Never raises — a missing git or a non-repo
+    checkout yields None so a completed run's report still writes."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
+def _write_json_report(path: str, payload: dict[str, object], *, label: str) -> None:
+    """Robustly persist a report JSON (D5 P1): create the parent dir and NEVER let a bad --report-json path
+    lose a completed (multi-minute) run — an OSError is WARNED to stderr, not raised, so the honest exit
+    code still returns. Metadata/counts only; the payload carries no store secrets or message bodies (PHI
+    rule)."""
+    import json
+    from pathlib import Path
+
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(
+            f"{label}: WARNING could not write --report-json {path!r}: {exc} "
+            "(run completed; report not persisted)",
+            file=sys.stderr,
+        )
+
+
 def _run_shardcert_engine(argv: list[str]) -> int:
     import asyncio
     import os
@@ -1305,7 +1354,13 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
         "--soak-hold-seconds", type=float, default=300.0, help="soak hold (>=5 min)"
     )
     parser.add_argument(
-        "--soak-drain-timeout", type=float, default=300.0, help="soak post-hold drain"
+        "--soak-drain-timeout",
+        type=float,
+        default=None,
+        help="soak post-hold drain — a bounded TAIL-absorption window, NOT a backlog dump (D2). Default: "
+        "couple to --drain-timeout so a soak gets the SAME tail as a climb rung (a soak is not entitled to "
+        "drain a growing backlog for minutes and still 'pass'). This ENGINE value is only a fallback; the "
+        "DRIVE half's posted LADDER_SOAK drain_timeout is authoritative.",
     )
     parser.add_argument(
         "--sink-port", type=int, required=True, help="BASE sink port the driver binds"
@@ -1380,6 +1435,19 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
         )
         return 2
 
+    # D5 P3: the store DSN is sourced PURELY from the ambient MEFOR_STORE_* env (no --dsn flag) — surface
+    # which connection this rung fleet keys off. KEY NAMES ONLY, never values (secrets rule).
+    store_env = _store_env_from_os()
+    _log_store_env_source("shardcert-engine-ladder", store_env)
+
+    # D2: couple the soak drain to the climb --drain-timeout unless explicitly overridden. Honest ONLY
+    # together with D4's de-inflated in_pipeline slope (+ _SLOPE_FLAT_TOL=0.25) and D1's drain-discounted
+    # rate: a bounded tail means a saturating soak can no longer drain its backlog post-offer and still be
+    # SUSTAINED. This ENGINE value is a fallback; the DRIVE half's posted LADDER_SOAK value wins.
+    soak_drain_timeout = (
+        args.drain_timeout if args.soak_drain_timeout is None else args.soak_drain_timeout
+    )
+
     coord = _coord_from_args(args)
     assert isinstance(coord, FileDropCoord)
     try:
@@ -1394,11 +1462,11 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
                 sink_host=args.sink_host,
                 inbound_bind_host=args.inbound_bind_host,
                 claim_mode=args.claim_mode,
-                store_env=_store_env_from_os(),
+                store_env=store_env,
                 base_coord=coord,
                 keep_logs_base=Path(args.keep_logs_dir),
                 soak_hold_seconds=args.soak_hold_seconds,
-                soak_drain_timeout=args.soak_drain_timeout,
+                soak_drain_timeout=soak_drain_timeout,
                 climb_drive_start_timeout=args.drive_start_timeout,
                 soak_timeout=args.soak_timeout,
             )
@@ -1413,8 +1481,7 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
 
 def _run_shardcert_drive_ladder(argv: list[str]) -> int:
     import asyncio
-    import json
-    from pathlib import Path
+    from datetime import datetime, timezone
 
     parser = argparse.ArgumentParser(
         prog="harness shardcert-drive-ladder",
@@ -1442,7 +1509,12 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         "--soak-hold-seconds", type=float, default=300.0, help="soak hold (>=5 min)"
     )
     parser.add_argument(
-        "--soak-drain-timeout", type=float, default=300.0, help="soak post-hold drain"
+        "--soak-drain-timeout",
+        type=float,
+        default=None,
+        help="soak post-hold drain — a bounded TAIL-absorption window, NOT a backlog dump (D2). Default: "
+        "couple to --drain-timeout so a soak cannot 'pass' by draining a growing backlog for minutes. This "
+        "is the AUTHORITATIVE value (posted in LADDER_SOAK; the engine half prefers it).",
     )
     parser.add_argument(
         "--soak-rate",
@@ -1494,6 +1566,14 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         print(f"shardcert-drive-ladder: {exc}", file=sys.stderr)
         return 2
 
+    # D2: couple the soak drain to the climb --drain-timeout unless overridden. This DRIVE value is the
+    # AUTHORITATIVE one — posted in LADDER_SOAK, and run_engine_ladder prefers it — so a soak cannot 'pass'
+    # by draining a growing backlog for minutes. Honest ONLY together with D4's de-inflated in_pipeline slope
+    # (+ _SLOPE_FLAT_TOL=0.25) and D1's drain-discounted rate.
+    soak_drain_timeout = (
+        args.drain_timeout if args.soak_drain_timeout is None else args.soak_drain_timeout
+    )
+
     coord = _coord_from_args(args)
     assert isinstance(coord, FileDropCoord)
     try:
@@ -1509,7 +1589,7 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
                 base_coord=coord,
                 allow_insecure=args.insecure,
                 soak_hold_seconds=args.soak_hold_seconds,
-                soak_drain_timeout=args.soak_drain_timeout,
+                soak_drain_timeout=soak_drain_timeout,
                 soak_rate_override=args.soak_rate,
                 do_soak=not args.no_soak,
                 engine_rung_report_timeout=args.engine_report_timeout,
@@ -1533,9 +1613,16 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
 
     print(report.render())
     if args.report_json:
-        Path(args.report_json).write_text(
-            json.dumps(report.to_json_dict(), indent=2), encoding="utf-8"
-        )
+        # D5 P2: stamp run provenance (run_id + UTC ISO timestamp + best-effort git SHA). Metadata only —
+        # no store secrets, no message bodies (PHI rule). to_json_dict() returns a fresh dict, safe to mutate.
+        payload = report.to_json_dict()
+        payload["run"] = {
+            "run_id": args.run_id,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "commit_sha": _git_commit_sha(),
+        }
+        # D5 P1: parent-mkdir + never raise on a bad path (a completed run's exit_code must still return).
+        _write_json_report(args.report_json, payload, label="shardcert-drive-ladder")
     return report.exit_code
 
 
