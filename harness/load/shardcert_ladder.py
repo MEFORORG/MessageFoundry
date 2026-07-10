@@ -52,6 +52,7 @@ from harness.load.coord import (
     ENGINE_RUNG_REPORT,
     LADDER_SOAK,
     LADDER_STOP,
+    RUNG_ABORTED,
     SHARDS_READY,
     CoordTimeout,
     FileDropCoord,
@@ -768,6 +769,11 @@ class ConsolidatedLadderReport:
     # NOT a clean collapse/exhaustion — an infrastructure failure, not a bench result. Drives exit_code 2
     # (setup/timeout) so an exit-code-gated harness never reads a mid-run infra death as a PASS.
     climb_aborted: bool = False
+    # The SOAK-stage two-box rendezvous/timeout broke (a CoordTimeout in run_shardcert_drive's soak leg), so
+    # the soak never produced a measurement — DISTINCT from a legitimately-skipped soak (no sustained rung,
+    # which posts LADDER_SOAK {"skip": true}). Folded into setup_degraded (exit 2) so an aborted soak renders
+    # ABORTED, never a clean PASS with soak=null (B2).
+    soak_aborted: bool = False
 
     # --- derived measurements (the ceiling is a MEASUREMENT; only correctness fails the verdict) ---
 
@@ -844,13 +850,15 @@ class ConsolidatedLadderReport:
 
     @property
     def soak_ok(self) -> bool:
-        """The soak (if run) held: SUSTAINED and its in_pipeline slope is flat/draining (not slow
-        saturation). No soak ⇒ vacuously False (nothing to certify)."""
+        """The soak (if run) HELD by the two RELIABLE authorities ALONE: its verdict is SUSTAINED — which
+        already encodes the engine store-truth (drained ∧ stranded==0 ∧ dead==0) AND the drive sink
+        socket-truth (no_loss). The in_pipeline slope is REPORTED as advisory context (render's flat/GROWING
+        label) but is NOT gated on (B5): the D4-de-inflated slope proved SIGN-UNSTABLE across rates and read
+        False on runs passing both authorities. Saturation is instead caught by verdict==SUSTAINED requiring
+        the backlog to DRAIN inside the bounded soak window (D2). No soak ⇒ vacuously False."""
         if self.soak is None:
             return False
-        return self.soak.verdict is RungVerdict.SUSTAINED and slope_is_draining(
-            self.soak.in_pipeline_slope
-        )
+        return self.soak.verdict is RungVerdict.SUSTAINED
 
     @property
     def correctness_ok(self) -> bool:
@@ -877,9 +885,10 @@ class ConsolidatedLadderReport:
 
     @property
     def setup_degraded(self) -> bool:
-        """The run hit a two-box coord/infra degradation (a rendezvous abort or an unconfirmed store-truth),
-        NOT a clean measurement — surfaced as exit 2 so an exit-code-gated harness never reads it as PASS."""
-        return self.climb_aborted or self.store_truth_unconfirmed
+        """The run hit a two-box coord/infra degradation (a climb OR soak rendezvous abort, or an unconfirmed
+        store-truth), NOT a clean measurement — surfaced as exit 2 so an exit-code-gated harness never reads
+        it as PASS."""
+        return self.climb_aborted or self.soak_aborted or self.store_truth_unconfirmed
 
     @property
     def ok(self) -> bool:
@@ -961,6 +970,10 @@ class ConsolidatedLadderReport:
                 f"-> soak_ok={self.soak_ok}"
             )
             lines.append("    " + self.soak.phase.render())
+        elif self.soak_aborted:
+            lines.append(
+                "  soak: ABORTED (two-box rendezvous/timeout broke during the soak — NOT a bench result)"
+            )
         else:
             lines.append("  soak: (skipped — no sustained rung to soak)")
         lines.append("")
@@ -981,11 +994,12 @@ class ConsolidatedLadderReport:
             lines.append(f"  note: {note}")
         lines.append("")
         if self.setup_degraded:
-            reason = (
-                "two-box rendezvous/timeout broke mid-run"
-                if self.climb_aborted
-                else "engine store-truth never confirmed (INCONCLUSIVE) — nothing certified"
-            )
+            if self.climb_aborted:
+                reason = "two-box rendezvous/timeout broke mid-run"
+            elif self.soak_aborted:
+                reason = "two-box rendezvous/timeout broke during the soak — soak not measured"
+            else:
+                reason = "engine store-truth never confirmed (INCONCLUSIVE) — nothing certified"
             lines.append(
                 f"RESULT: SETUP-DEGRADED ({reason} — NOT a bench result) -> exit {self.exit_code}"
             )
@@ -1002,6 +1016,7 @@ class ConsolidatedLadderReport:
             "result": "SETUP_DEGRADED" if self.setup_degraded else ("PASS" if self.ok else "FAIL"),
             "exit_code": self.exit_code,
             "climb_aborted": self.climb_aborted,
+            "soak_aborted": self.soak_aborted,
             "store_truth_unconfirmed": self.store_truth_unconfirmed,
             "topology": {
                 "shards": list(self.shards),
@@ -1049,6 +1064,7 @@ def build_consolidated_report(
     soak: RungOutcome | None,
     notes: Sequence[str] = (),
     climb_aborted: bool = False,
+    soak_aborted: bool = False,
 ) -> ConsolidatedLadderReport:
     """Assemble the consolidated report from the driven rung outcomes — a thin, PURE constructor so the
     report shape can be unit-tested from synthetic outcomes without a live fleet."""
@@ -1061,6 +1077,7 @@ def build_consolidated_report(
         soak=soak,
         notes=list(notes),
         climb_aborted=climb_aborted,
+        soak_aborted=soak_aborted,
     )
 
 
@@ -1113,6 +1130,10 @@ def _engine_rung_payload(report: ShardCertEngineReport) -> dict[str, object]:
         "engine_dead": report.engine_dead,
         "in_pipeline_final": report.in_pipeline_final,
         "in_pipeline_slope": in_pipeline_slope(report.in_pipeline_trace),
+        # B3: whether this rung's store-truth was INVALIDATED by a drive abort (sinks reaped mid-delivery) —
+        # so the engine never reports a fabricated collapse. valid is the convenience inverse for consumers.
+        "aborted": report.aborted,
+        "valid": not report.aborted,
         # The RELIABLE engine-side drain time (D1): the drive prefers it over its advisory remote drain for
         # the honest sustainable rate. Present on the report path too (not just the ENGINE_DRAINED gate).
         "drain_seconds": report.drain_seconds,
@@ -1184,7 +1205,9 @@ async def run_engine_ladder(
             break
         rung_coord = base_coord.for_run(f"{base_coord.run_id}.{rung.run_suffix}")
         # Fresh per-rung handshake: a re-run with the same base run_id must not read a stale drop.
-        rung_coord.clear_messages(SHARDS_READY, DRIVE_START, ENGINE_DRAINED, ENGINE_RUNG_REPORT)
+        rung_coord.clear_messages(
+            SHARDS_READY, DRIVE_START, ENGINE_DRAINED, ENGINE_RUNG_REPORT, RUNG_ABORTED
+        )
         keep_dir = keep_logs_base / rung.run_suffix
         keep_dir.mkdir(parents=True, exist_ok=True)
         rung_env = {**store_env, "MEFOR_BENCH_KEEP_NODE_LOGS": str(keep_dir)}
@@ -1205,6 +1228,7 @@ async def run_engine_ladder(
                 drive_start_timeout=climb_drive_start_timeout,
                 post_drain_grace=post_drain_grace,
                 signal_drained=True,
+                abort_signal=RUNG_ABORTED,
             )
         except CoordTimeout:
             # The drive did not drive this rung within the (short) DRIVE_START window. If it stopped (STOP
@@ -1223,6 +1247,13 @@ async def run_engine_ladder(
         _attach_rung_timings(payload, _rung_log_paths(keep_dir, report.shards))
         rung_coord.post(ENGINE_RUNG_REPORT, payload)
         result.rungs_armed.append(rung.run_suffix)
+        if report.aborted:
+            # B3 belt-and-suspenders: the drive aborted this rung mid-delivery (store-truth INVALID). Stop
+            # the climb even if LADDER_STOP was lost — a torn-down rung is not a measurement to climb past.
+            result.notes.append(
+                f"{rung.run_suffix}: store-truth INVALID — drive aborted mid-delivery (stopping climb)"
+            )
+            break
 
     # Soak: the drive picks the rate (highest sustained, or an override) and posts LADDER_SOAK.
     try:
@@ -1243,7 +1274,9 @@ async def run_engine_ladder(
         is_soak=True,
     )
     soak_coord = base_coord.for_run(f"{base_coord.run_id}.soak")
-    soak_coord.clear_messages(SHARDS_READY, DRIVE_START, ENGINE_DRAINED, ENGINE_RUNG_REPORT)
+    soak_coord.clear_messages(
+        SHARDS_READY, DRIVE_START, ENGINE_DRAINED, ENGINE_RUNG_REPORT, RUNG_ABORTED
+    )
     keep_dir = keep_logs_base / "soak"
     keep_dir.mkdir(parents=True, exist_ok=True)
     soak_env = {**store_env, "MEFOR_BENCH_KEEP_NODE_LOGS": str(keep_dir)}
@@ -1264,6 +1297,7 @@ async def run_engine_ladder(
             drive_start_timeout=soak_drive_start_timeout,
             post_drain_grace=post_drain_grace,
             signal_drained=True,
+            abort_signal=RUNG_ABORTED,
             sample_in_pipeline=True,
         )
     except CoordTimeout:
@@ -1310,6 +1344,7 @@ async def run_drive_ladder(
 
     stopped = False
     climb_aborted = False
+    soak_aborted = False
     for rung in climb:
         rung_coord = base_coord.for_run(f"{base_coord.run_id}.{rung.run_suffix}")
         try:
@@ -1335,8 +1370,12 @@ async def run_drive_ladder(
             base_coord.post(
                 LADDER_STOP, {"stopped_at": rung.run_suffix, "verdict": "drive_aborted"}
             )
+            # B3: also tell the ENGINE on the RUNG coord that THIS rung aborted, so its in-flight drain —
+            # failing only because we reaped its sinks — marks the rung's store-truth INVALID rather than
+            # posting a fabricated collapse. LADDER_STOP is polled only BETWEEN rungs; this is per-rung.
+            rung_coord.post(RUNG_ABORTED, {"reason": "drive_aborted", "detail": str(exc)})
             notes.append(
-                f"{rung.run_suffix}: drive aborted ({exc}) — posted LADDER_STOP, setup-abort"
+                f"{rung.run_suffix}: drive aborted ({exc}) — posted LADDER_STOP + RUNG_ABORTED, setup-abort"
             )
             climb_aborted = True
             stopped = True
@@ -1406,9 +1445,16 @@ async def run_drive_ladder(
             )
             soak_outcome = build_rung_outcome(soak_rung, drive, gate, report_msg)
         except CoordTimeout as exc:
-            # A soak rendezvous failure is noted but does NOT set climb_aborted — the CLIMB already pinned
-            # the ceiling; the soak is supplementary.
-            notes.append(f"soak: drive aborted ({exc}) — soak inconclusive")
+            # A soak rendezvous failure does NOT set climb_aborted (the CLIMB already pinned the ceiling), but
+            # it IS a setup degradation: the soak never produced a measurement, so it must read as ABORTED
+            # (exit 2), never a clean PASS with soak=null (B2). Also tell the ENGINE on the RUNG coord so its
+            # soak drain failure — from our reaped sinks — marks the soak store-truth INVALID, not a collapse
+            # (B3).
+            soak_aborted = True
+            soak_coord.post(RUNG_ABORTED, {"reason": "soak_drive_aborted", "detail": str(exc)})
+            notes.append(
+                f"soak: drive aborted ({exc}) — soak ABORTED (setup-degraded, not a bench result)"
+            )
 
     if stopped and not climb_aborted:
         notes.append("climb stopped at the ceiling (early-stop)")
@@ -1421,6 +1467,7 @@ async def run_drive_ladder(
         soak=soak_outcome,
         notes=notes,
         climb_aborted=climb_aborted,
+        soak_aborted=soak_aborted,
     )
 
 

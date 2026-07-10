@@ -170,6 +170,9 @@ def test_report_json_writes_provenance_and_creates_parents(monkeypatch, tmp_path
     assert out.exists()
     doc = json.loads(out.read_text(encoding="utf-8"))
     assert doc["run"]["run_id"] == "RID-123"
+    assert (
+        doc["run"]["rate_ladder"] == "24,28"
+    )  # P2: the raw ladder string, so the JSON is self-describing
     assert isinstance(doc["run"]["generated_at"], str) and "T" in doc["run"]["generated_at"]
     assert doc["run"]["commit_sha"] is None or isinstance(doc["run"]["commit_sha"], str)
     assert rc == _empty_report().exit_code  # the honest exit code is returned

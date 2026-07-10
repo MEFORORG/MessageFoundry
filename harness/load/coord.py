@@ -102,10 +102,16 @@ DRIVE_GO = "DRIVE_GO"
 #: * :data:`LADDER_SOAK` (drive→engine) — after the climb, the drive picks the soak rate (the highest
 #:   sustained rung, or an override) and posts it so the engine arms one final long-hold soak rung under
 #:   ``run_id`` ``"<base>.soak"`` — or ``{"skip": true}`` when there is no sustained rung to soak.
+#: * :data:`RUNG_ABORTED` (drive→engine, PER-RUNG) — the drive posts this on the RUNG coord the instant it
+#:   aborts a rung (a broken rendezvous / timeout). It tells the engine that its sinks were torn down mid-
+#:   delivery, so the drain failure it is about to see is a HARNESS artifact, not a product collapse: the
+#:   engine marks that rung's store-truth INVALID rather than posting a fabricated collapse (B3). Orthogonal
+#:   to :data:`LADDER_STOP` (the between-rungs skip optimisation) — this is per-rung and rides the rung coord.
 ENGINE_DRAINED = "ENGINE_DRAINED"
 ENGINE_RUNG_REPORT = "ENGINE_RUNG_REPORT"
 LADDER_STOP = "LADDER_STOP"
 LADDER_SOAK = "LADDER_SOAK"
+RUNG_ABORTED = "RUNG_ABORTED"
 
 #: Default coord directory. A Windows path because the rig runs on Windows Server; override with the
 #: ``MEFOR_COORD_DIR`` env var or the ``--coord-dir`` CLI flag for a POSIX box or a shared mount.

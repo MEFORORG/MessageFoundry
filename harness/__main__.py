@@ -1618,6 +1618,9 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         payload = report.to_json_dict()
         payload["run"] = {
             "run_id": args.run_id,
+            # P2: the raw --rate-ladder string (the invocation's primary independent variable, and the value
+            # that must match the engine box verbatim) so the consolidated JSON is self-describing.
+            "rate_ladder": args.rate_ladder,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "commit_sha": _git_commit_sha(),
         }

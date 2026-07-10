@@ -96,6 +96,31 @@ duration_s = 10.0
 _TOKEN_BATCH_CAP = 4096
 _MAX_TICK_SLEEP = 0.05
 
+#: The DRIVE half awaits every sender child's DRIVER_DONE BEFORE draining, and a child posts DRIVER_DONE only
+#: AFTER it finishes its full hold — so the await necessarily spans the whole hold. A FIXED timeout under-
+#: shoots any hold approaching it: a soak whose hold nears this many seconds would abort mid-send, reaping the
+#: sinks while the engine still holds backlog and manufacturing a fake collapse in the engine's store-truth
+#: (B1 -> B3). So the timeout is DERIVED from the hold (+ drain + this margin), not fixed.
+_DRIVER_DONE_MARGIN = 60.0
+
+
+def _derive_driver_done_timeout(
+    hold_seconds: float, drain_timeout: float, override: float | None
+) -> float:
+    """The DRIVER_DONE await timeout (B1): an explicit ``override`` if given, else ``hold + drain + margin``.
+    DRIVER_DONE precedes the drain, so strictly only ``hold + margin`` is needed; ``+ drain`` is a harmless-
+    conservative bound. A fixed default (the old 600s) caps long soaks and is the observed B3 trigger."""
+    if override is not None:
+        return override
+    return hold_seconds + drain_timeout + _DRIVER_DONE_MARGIN
+
+
+#: B3: how long the engine waits, ONLY after a FAILED drain, for the drive's RUNG_ABORTED marker before
+#: concluding the failure was a genuine collapse rather than a drive-abort artifact. The drive posts the
+#: marker the instant it aborts (well before our drain times out), so this only absorbs coord timing jitter;
+#: a genuine collapse pays it once as a small tail. Small on purpose.
+_ABORT_MARKER_GRACE = 15.0
+
 # Intake-shortfall tolerance for the rate-ladder ceiling test. The token-bucket drive does NOT emit
 # exactly ``offered`` messages: above ~200 msg/s it drops a handful of boundary tokens even in a
 # perfectly HEALTHY run, so ``achieved_intake`` lands a few short of the theoretical ``offered``. This
@@ -1181,6 +1206,11 @@ class ShardCertEngineReport:
     # PR-C2 soak needs — a slow-saturation plateau looks lossless for ~60s but its backlog slope is
     # positive. Metadata only (a gauge count over time — never a payload / control-id).
     in_pipeline_trace: list[list[float]] = field(default_factory=list)
+    #: B3: this rung's store-truth was INVALIDATED — the drive aborted mid-delivery (a broken rendezvous) and
+    #: reaped its sinks, so the fleet's stranded/dead are a teardown ARTIFACT, not a product collapse. When
+    #: True the render + the ENGINE_DRAINED gate report INVALID(abort), never FAIL — an abort must NEVER read
+    #: as a fabricated collapse. Defaulted so an older report deserializes unchanged.
+    aborted: bool = False
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -1198,8 +1228,9 @@ class ShardCertEngineReport:
         )
 
     def render(self) -> str:
+        verdict = "INVALID(abort)" if self.aborted else ("PASS" if self.ok else "FAIL")
         lines = [
-            f"ShardCert ENGINE {'/'.join(self.shards)}  verdict={'PASS' if self.ok else 'FAIL'}"
+            f"ShardCert ENGINE {'/'.join(self.shards)}  verdict={verdict}"
             + (f"  killed={self.killed_shard}" if self.killed_shard else "  (baseline, no kill)"),
             f"  stranded_nonterminal_rows={self.stranded_nonterminal} "
             f"drained={self.drained} engine_dead={self.engine_dead} "
@@ -1209,6 +1240,10 @@ class ShardCertEngineReport:
             + " ".join(f"{s}->[{','.join(self.owned[s]) or '-'}]" for s in self.shards),
             f"  {self.queue_breakdown}",
         ]
+        if self.aborted:
+            lines.append(
+                "  store-truth INVALID: drive aborted mid-delivery (sinks reaped) — NOT a product collapse"
+            )
         if self.node_pids:
             lines.append(
                 "  node PIDs (for per-PID CPU correlation): "
@@ -1302,6 +1337,10 @@ async def run_shardcert_engine(
     drive_start_timeout: float = 300.0,
     post_drain_grace: float = 3.0,
     signal_drained: bool = False,
+    #: B3: the per-rung coord signal (RUNG_ABORTED) the drive posts when it aborts this rung. When set and the
+    #: drain fails, the engine marks the rung's store-truth INVALID instead of posting a fabricated collapse.
+    #: None (the default) keeps the standalone shardcert-engine path byte-identical (the marker never arrives).
+    abort_signal: str | None = None,
     sample_in_pipeline: bool = False,
     sample_interval: float = 2.0,
 ) -> ShardCertEngineReport:
@@ -1479,17 +1518,48 @@ async def run_shardcert_engine(
         finally:
             await poller.close()
         drained = drain_s is not None
+        # B3: distinguish a REAL congestion collapse from a drive-abort ARTIFACT. Only on a FAILED drain: if
+        # the drive reaped its sinks mid-delivery (a broken rendezvous), our still-in-flight rows strand with
+        # nowhere to go — manufacturing stranded/dead in our OWN store-truth that looks exactly like a product
+        # collapse. A RUNG_ABORTED marker from the drive means the latter → mark this rung INVALID. The clean
+        # (drained) path is byte-identical: the check is skipped.
+        rung_aborted = False
+        if not drained and abort_signal is not None:
+            with contextlib.suppress(CoordTimeout):
+                await coord.await_message(abort_signal, timeout=_ABORT_MARKER_GRACE)
+                rung_aborted = True
         engine_dead = final.dead if final else 0
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This is
         # stored on ShardCertEngineReport AND posted in the ENGINE_DRAINED gate, so the two-box report's
         # engine_in_pipeline_final is the TRUE fleet backlog, not N× it.
         in_pipeline_final = final.in_pipeline // max(1, len(ids_list)) if final else -1
-        stranded, dead_total, breakdown = await _queue_breakdown(node_env)
+        # On an abort the store's stranded/dead are a teardown artifact, not a measurement — do not read them
+        # (they would only re-confirm the fabricated collapse). A genuine failed drain still reads them.
+        if rung_aborted:
+            stranded, dead_total, breakdown = -1, -1, "(rung aborted — store-truth not read)"
+        else:
+            stranded, dead_total, breakdown = await _queue_breakdown(node_env)
         # PR-C2 ladder drain gate (default OFF): once the DIRECT store read above confirms drain, tell the
         # DRIVE half it is safe to tally its sinks — the reliable authority (stranded/dead), never the
         # remote poller. Posted BEFORE the grace/teardown, but by construction stranded==0 means every
         # delivery already landed on the sink sockets, so there is no tail left to lose at teardown.
-        if signal_drained:
+        if signal_drained and rung_aborted:
+            # B3: the drive tore its sinks down mid-delivery — our drain failure is a HARNESS artifact, not a
+            # product collapse. Post the rung's store-truth as INVALID so the drive/operator can never read it
+            # as a fabricated collapse (the drive independently marks the run setup-degraded, B2).
+            coord.post(
+                ENGINE_DRAINED,
+                {
+                    "valid": False,
+                    "aborted": True,
+                    "engine_ok": False,
+                    "drained": False,
+                    "note": (
+                        "drive aborted mid-delivery — sinks torn down; store-truth INVALID, not a collapse"
+                    ),
+                },
+            )
+        elif signal_drained:
             coord.post(
                 ENGINE_DRAINED,
                 {
@@ -1527,6 +1597,7 @@ async def run_shardcert_engine(
         drain_seconds=drain_s,
         node_pids=node_pids,
         in_pipeline_trace=in_pipeline_trace,
+        aborted=rung_aborted,
         notes=notes,
     )
 
@@ -2230,7 +2301,7 @@ async def run_shardcert_drive(
     coord: FileDropCoord,
     shards_ready_timeout: float = 300.0,
     child_ready_timeout: float = 120.0,
-    driver_done_timeout: float = 600.0,
+    driver_done_timeout: float | None = None,
     sink_done_timeout: float = 120.0,
     drain_timeout: float = 90.0,
     reap_grace: float = 10.0,
@@ -2351,9 +2422,15 @@ async def run_shardcert_drive(
         coord.post(DRIVE_GO, {"go": True})
 
         # (4) Await every sender-worker's DONE, then drain the engine's REMOTE /stats (the authoritative
-        #     drain signal, polled off-box) before declaring the pipeline empty.
+        #     drain signal, polled off-box) before declaring the pipeline empty. B1: a child posts DRIVER_DONE
+        #     only AFTER its full hold, so a FIXED timeout under-shoots any hold near it — a long soak would
+        #     abort mid-send, reaping the sinks while the engine still delivers and manufacturing a fake
+        #     collapse (B3). Derive the timeout from hold + drain + margin instead.
+        driver_done_wait = _derive_driver_done_timeout(
+            hold_seconds, drain_timeout, driver_done_timeout
+        )
         driver_dones = await _await_indexed(
-            coord, DRIVER_DONE, driver_count, timeout=driver_done_timeout
+            coord, DRIVER_DONE, driver_count, timeout=driver_done_wait
         )
         urls = [f"http://{engine_host}:{p}" for p in api_ports]
         # allow_insecure threads the plaintext-http-to-remote posture: the engine box's API is http and

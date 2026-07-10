@@ -22,7 +22,11 @@ import pytest
 
 from harness.load import coord
 from harness.load import shardcert as _shardcert
-from harness.load.shardcert import ShardCertDriveReport
+from harness.load.shardcert import (
+    ShardCertDriveReport,
+    ShardCertEngineReport,
+    _derive_driver_done_timeout,
+)
 from harness.load.shardcert_ladder import (
     TARGET_INGRESS_PER_S,
     ClaimTiming,
@@ -33,6 +37,7 @@ from harness.load.shardcert_ladder import (
     _CLAIM_RE,
     _PHASE_RE,
     _claim_lines,
+    _engine_rung_payload,
     _phase_lines,
     aggregate_claim_timing,
     aggregate_phase_timing,
@@ -443,7 +448,9 @@ def test_pick_soak_rate_none_when_nothing_sustained() -> None:
 # --- consolidated report -----------------------------------------------------
 
 
-def _rep(climb, soak=None, climb_aborted: bool = False) -> ConsolidatedLadderReport:
+def _rep(
+    climb, soak=None, climb_aborted: bool = False, soak_aborted: bool = False
+) -> ConsolidatedLadderReport:
     return build_consolidated_report(
         shards=("a", "b", "c", "d"),
         dests=8,
@@ -452,6 +459,7 @@ def _rep(climb, soak=None, climb_aborted: bool = False) -> ConsolidatedLadderRep
         climb=climb,
         soak=soak,
         climb_aborted=climb_aborted,
+        soak_aborted=soak_aborted,
     )
 
 
@@ -559,17 +567,32 @@ def test_report_inconclusive_climb_is_setup_degraded_not_pass() -> None:
     assert clean.exit_code == 0
 
 
-def test_report_soak_ok_requires_sustained_and_draining_slope() -> None:
+def test_report_soak_ok_gates_on_verdict_only_not_slope() -> None:
+    # B5: soak_ok gates on verdict==SUSTAINED ONLY (the two reliable authorities). The D4-de-inflated
+    # in_pipeline slope proved SIGN-UNSTABLE across rates, so a SUSTAINED soak is ok regardless of it.
     climb = [_outcome(24.0, RungVerdict.SUSTAINED)]
-    soak_ok = _outcome(24.0, RungVerdict.SUSTAINED, is_soak=True)
-    soak_ok = type(soak_ok)(**{**soak_ok.__dict__, "in_pipeline_slope": 0.2})
-    rep = _rep(climb, soak=soak_ok)
-    assert rep.soak_ok is True
-    # soak sustained but GROWING slope ⇒ NOT ok (slow saturation)
-    soak_grow = type(soak_ok)(**{**soak_ok.__dict__, "in_pipeline_slope": 12.0})
-    assert _rep(climb, soak=soak_grow).soak_ok is False
+    soak = _outcome(24.0, RungVerdict.SUSTAINED, is_soak=True)
+    for slope in (-3.5, 0.1, 3.94, 10.98):  # the exact rig slopes, incl. the sign flip
+        s = type(soak)(**{**soak.__dict__, "in_pipeline_slope": slope})
+        assert _rep(climb, soak=s).soak_ok is True
+    # a flat slope cannot rescue a NON-SUSTAINED soak — the verdict is the gate
+    not_sustained = type(soak)(
+        **{**soak.__dict__, "verdict": RungVerdict.FROZEN_TAIL, "in_pipeline_slope": 0.0}
+    )
+    assert _rep(climb, soak=not_sustained).soak_ok is False
     # no soak ⇒ soak_ok False
     assert _rep(climb).soak_ok is False
+
+
+def test_report_soak_slope_still_rendered_as_advisory() -> None:
+    # B5: the honest slope is still REPORTED (render's flat/GROWING label) even though it no longer gates.
+    soak = _outcome(24.0, RungVerdict.SUSTAINED, is_soak=True)
+    soak = type(soak)(**{**soak.__dict__, "in_pipeline_slope": 10.98})
+    rep = _rep([_outcome(24.0, RungVerdict.SUSTAINED)], soak=soak)
+    text = rep.render()
+    assert rep.soak_ok is True  # the gate ignores the slope
+    assert "GROWING (slow saturation)" in text  # but it is still shown as advisory context
+    assert "+10.98 rows/s" in text
 
 
 def test_report_renders_and_serializes() -> None:
@@ -973,3 +996,77 @@ def test_attach_rung_timings_carries_nonempty_claim_timing(tmp_path) -> None:
         payload,
     )
     assert out.claim.claims == 50
+
+
+# --- B1: the DRIVER_DONE await timeout is derived from the hold (long soaks are runnable) --------------
+
+
+def test_derive_driver_done_timeout() -> None:
+    # A long soak (hold 700s) derives a timeout well above the old fixed 600s, so it no longer aborts
+    # mid-send (which reaped the sinks and manufactured a fake collapse, B3). An explicit override wins.
+    assert _derive_driver_done_timeout(700.0, 300.0, None) == 700.0 + 300.0 + 60.0
+    assert _derive_driver_done_timeout(60.0, 90.0, None) == 210.0
+    assert _derive_driver_done_timeout(60.0, 90.0, 25.0) == 25.0  # explicit override wins
+
+
+# --- B2: an ABORTED soak reads as setup-degraded (exit 2), never a clean PASS with soak=null -----------
+
+
+def test_report_soak_aborted_exits_setup_code_2() -> None:
+    rep = _rep([_outcome(20.0, RungVerdict.SUSTAINED)], soak=None, soak_aborted=True)
+    assert rep.soak is None
+    assert rep.soak_ok is False
+    assert rep.climb_aborted is False
+    assert rep.setup_degraded is True
+    assert rep.exit_code == 2
+    assert rep.to_json_dict()["result"] == "SETUP_DEGRADED"
+    assert rep.to_json_dict()["soak_aborted"] is True
+    text = rep.render()
+    assert "ABORTED" in text
+    assert "skipped" not in text
+    assert "SETUP-DEGRADED" in text
+    assert "during the soak" in text
+
+
+def test_report_skipped_soak_is_not_degraded() -> None:
+    # Guard: a legitimately-skipped soak (no sustained rung to soak) stays a benign exit 0 — distinct from an
+    # abort, which the rig bug conflated.
+    rep = _rep([_outcome(20.0, RungVerdict.SUSTAINED)], soak=None, soak_aborted=False)
+    assert rep.setup_degraded is False
+    assert rep.exit_code == 0
+    assert "skipped" in rep.render()
+    assert "ABORTED" not in rep.render()
+    assert rep.to_json_dict()["soak_aborted"] is False
+
+
+# --- B3: an aborted rung's ENGINE store-truth reads INVALID(abort), never a fabricated collapse --------
+
+
+def _engine_report(
+    *, aborted: bool, drained: bool = False, stranded: int = -1
+) -> ShardCertEngineReport:
+    return ShardCertEngineReport(
+        shards=("a",),
+        owned={"a": ["a"]},
+        killed_shard=None,
+        stranded_nonterminal=stranded,
+        queue_breakdown="(rung aborted — store-truth not read)" if aborted else "(clean)",
+        drained=drained,
+        aborted=aborted,
+    )
+
+
+def test_engine_report_aborted_renders_invalid_not_fail() -> None:
+    rep = _engine_report(aborted=True)
+    assert rep.ok is False  # not a PASS
+    text = rep.render()
+    assert "verdict=INVALID(abort)" in text
+    assert "verdict=FAIL" not in text  # an abort must NEVER read as a fabricated collapse
+    assert "NOT a product collapse" in text
+
+
+def test_engine_rung_payload_marks_aborted_invalid() -> None:
+    p = _engine_rung_payload(_engine_report(aborted=True))
+    assert p["aborted"] is True and p["valid"] is False and p["engine_ok"] is False
+    p2 = _engine_rung_payload(_engine_report(aborted=False, drained=True, stranded=0))
+    assert p2["aborted"] is False and p2["valid"] is True and p2["engine_ok"] is True
