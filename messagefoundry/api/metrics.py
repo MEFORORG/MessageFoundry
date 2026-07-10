@@ -27,6 +27,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import psutil
 from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, generate_latest
 from prometheus_client.core import (
     CounterMetricFamily,
@@ -67,6 +68,43 @@ DEFAULT_LATENCY_BUCKETS: tuple[float, ...] = (
 METRICS_CONTENT_TYPE = CONTENT_TYPE_LATEST
 _RATE_WINDOW = 60.0  # seconds; window for connection_metrics' throughput aggregates
 
+# Host resource gauges (BACKLOG #74). psutil reads are microsecond-scale OS-counter reads, so they run
+# inline in gather_snapshot (off the pure-sync scrape path). cpu_percent(interval=None) is non-blocking
+# and reports the busy fraction since the *previous* call; prime it once at import so the first scrape
+# reports a real interval rather than 0. Values are host/process aggregates — never PHI, and carry no
+# labels, so they leave the strict {connection,destination,status,version,le} label allowlist untouched.
+_PROC = psutil.Process()
+try:  # pragma: no cover - priming; the returned 0.0 first-call value is discarded
+    psutil.cpu_percent(interval=None)
+except psutil.Error:
+    pass
+
+
+@dataclass(frozen=True)
+class _HostMetrics:
+    cpu_percent: float | None
+    mem_used_bytes: float | None
+    mem_total_bytes: float | None
+    process_rss_bytes: float | None
+
+
+def _read_host_metrics() -> _HostMetrics:
+    """Read host CPU%/memory + this process's RSS via psutil.
+
+    Returns all-``None`` if psutil cannot read the counters (e.g. a locked-down container that blocks
+    ``/proc`` or the perf counters) so a scrape never fails on the host-metrics addition.
+    """
+    try:
+        vm = psutil.virtual_memory()
+        return _HostMetrics(
+            cpu_percent=psutil.cpu_percent(interval=None),
+            mem_used_bytes=float(vm.total - vm.available),
+            mem_total_bytes=float(vm.total),
+            process_rss_bytes=float(_PROC.memory_info().rss),
+        )
+    except psutil.Error:  # pragma: no cover - only in a sandbox that blocks counters
+        return _HostMetrics(None, None, None, None)
+
 
 @dataclass(frozen=True)
 class _Snapshot:
@@ -83,6 +121,11 @@ class _Snapshot:
     outbox_by_status: dict[str, int]  # OutboxStatus value -> count
     in_pipeline: int  # not-done rows across every stage
     now: float
+    # Host resource gauges (BACKLOG #74); None when psutil cannot read the counters.
+    host_cpu_percent: float | None = None
+    host_mem_used_bytes: float | None = None
+    host_mem_total_bytes: float | None = None
+    process_rss_bytes: float | None = None
 
 
 async def gather_snapshot(engine: Engine) -> _Snapshot:
@@ -99,6 +142,7 @@ async def gather_snapshot(engine: Engine) -> _Snapshot:
     )
     outbox = await engine.store.stats()
     in_pipeline = await engine.store.in_pipeline_depth()
+    host = _read_host_metrics()
     return _Snapshot(
         version=__version__,
         inbound=cm.inbound,
@@ -107,6 +151,10 @@ async def gather_snapshot(engine: Engine) -> _Snapshot:
         outbox_by_status=outbox,
         in_pipeline=in_pipeline,
         now=now,
+        host_cpu_percent=host.cpu_percent,
+        host_mem_used_bytes=host.mem_used_bytes,
+        host_mem_total_bytes=host.mem_total_bytes,
+        process_rss_bytes=host.process_rss_bytes,
     )
 
 
@@ -130,6 +178,36 @@ class _MetricsCollector:
         )
         build.add_metric([s.version], 1.0)
         yield build
+
+        # --- host resource gauges (BACKLOG #74) ------------------------------
+        # Host/process aggregates, no PHI, no labels — absent when psutil couldn't read the counters.
+        if s.host_cpu_percent is not None:
+            cpu = GaugeMetricFamily(
+                "messagefoundry_host_cpu_percent",
+                "Host-wide CPU utilization percent (0-100) since the previous scrape.",
+            )
+            cpu.add_metric([], s.host_cpu_percent)
+            yield cpu
+        if s.host_mem_used_bytes is not None and s.host_mem_total_bytes is not None:
+            mem_used = GaugeMetricFamily(
+                "messagefoundry_host_memory_used_bytes",
+                "Host physical memory in use (total - available), bytes.",
+            )
+            mem_used.add_metric([], s.host_mem_used_bytes)
+            yield mem_used
+            mem_total = GaugeMetricFamily(
+                "messagefoundry_host_memory_total_bytes",
+                "Host total physical memory, bytes.",
+            )
+            mem_total.add_metric([], s.host_mem_total_bytes)
+            yield mem_total
+        if s.process_rss_bytes is not None:
+            rss = GaugeMetricFamily(
+                "messagefoundry_process_resident_memory_bytes",
+                "Resident set size (RSS) of the engine process, bytes.",
+            )
+            rss.add_metric([], s.process_rss_bytes)
+            yield rss
 
         # --- inbound counters (per connection) -------------------------------
         # CounterMetricFamily names omit the _total suffix; prometheus appends it on render.

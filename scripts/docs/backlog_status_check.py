@@ -127,7 +127,7 @@ def scan(backlog: str, changelog: str | None = None) -> tuple[list[str], list[st
             errors.append(
                 f"BACKLOG.md:{it.line}: item #{it.num} declares no status. Add exactly one leading "
                 f"banner: '> ✅ **SHIPPED …**', '> ⛔ **DECLINED …**', '> 🪦 **RETIRED …**', "
-                f"'> 🔢 **Re-prioritized …**', or '> 🚧 **Status …**'."
+                f"'> 🔢 **Re-scored …**', or '> 🚧 **Status …**'."
             )
         elif it.closed and it.open:
             errors.append(

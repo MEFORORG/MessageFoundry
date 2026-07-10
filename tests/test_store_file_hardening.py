@@ -55,6 +55,35 @@ def test_connection_string_neutralizes_password_injection() -> None:
     assert "Encrypt=yes" in dsn
 
 
+# --- BACKLOG #100: AOAG multi-subnet fast failover ---------------------------
+
+
+def _sqlserver_settings(**over: object) -> StoreSettings:
+    return StoreSettings(
+        backend=StoreBackend.SQLSERVER,
+        server="db",
+        database="mf",
+        username="svc",
+        password="pw",
+        auth=SqlAuth.SQL,
+        encrypt=True,
+        **over,
+    )
+
+
+def test_multi_subnet_failover_default_off() -> None:
+    dsn = connection_string(_sqlserver_settings())
+    assert "MultiSubnetFailover" not in dsn
+
+
+def test_multi_subnet_failover_emitted_when_enabled() -> None:
+    dsn = connection_string(_sqlserver_settings(multi_subnet_failover=True))
+    assert "MultiSubnetFailover=Yes" in dsn
+    # It must sit BEFORE the TLS tail so ODBC last-wins keeps the secure Encrypt/Trust flags final.
+    assert dsn.index("MultiSubnetFailover=Yes") < dsn.index("Encrypt=yes")
+    assert dsn.rstrip(";").endswith("TrustServerCertificate=no")
+
+
 # --- FILE-1: filename path traversal -----------------------------------------
 
 

@@ -46,6 +46,7 @@ dependencies = [
     "tzdata>=2024.1",       # IANA tz database for stdlib zoneinfo (Windows has no system tzdata)
     "prometheus-client>=0.20",  # Prometheus /metrics exposition (BACKLOG #21)
     "defusedxml>=0.7.1",    # hardened XML parse for RawMessage.xml() — XXE/DTD/entity-expansion safe (ADR 0004, BACKLOG #31)
+    "psutil>=6.0",          # host CPU/mem gauges on the /metrics surface (BACKLOG #74)
 ]
 
 # Shown on the PyPI sidebar; point at the PUBLIC repo/site (the wshallwshall repo is private).
@@ -186,5 +187,5 @@ strict = true
 
 # Third-party libraries that ship no type stubs / py.typed marker.
 [[tool.mypy.overrides]]
-module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "defusedxml", "defusedxml.*", "pyx12", "pyx12.*", "lxml", "lxml.*", "xmlschema", "xmlschema.*", "signxml", "signxml.*"]
+module = ["hl7", "hl7.*", "hl7apy.*", "aiosqlite.*", "aioodbc.*", "pyodbc.*", "asyncpg.*", "ldap3.*", "paramiko.*", "opentelemetry.*", "defusedxml", "defusedxml.*", "pyx12", "pyx12.*", "lxml", "lxml.*", "xmlschema", "xmlschema.*", "signxml", "signxml.*", "psutil", "psutil.*"]
 ignore_missing_imports = true

@@ -890,6 +890,10 @@ def connection_string(settings: StoreSettings) -> str:
         parts.append("Trusted_Connection=yes")
     elif settings.auth is SqlAuth.ENTRA:
         parts.append("Authentication=ActiveDirectoryDefault")
+    # AOAG multi-subnet fast failover (BACKLOG #100). Not a TLS keyword, so it goes before the
+    # Encrypt/TrustServerCertificate tail and cannot disturb the last-wins TLS posture.
+    if settings.multi_subnet_failover:
+        parts.append("MultiSubnetFailover=Yes")
     parts.append(f"Encrypt={'yes' if settings.encrypt else 'no'}")
     parts.append(f"TrustServerCertificate={'yes' if settings.trust_server_certificate else 'no'}")
     return ";".join(parts) + ";"

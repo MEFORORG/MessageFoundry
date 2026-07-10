@@ -87,7 +87,7 @@ jobs:
 
               > ✅ **SHIPPED in <version> (<ADR / PR>).** <one line of evidence>
 
-          and remove its '🔢 Re-prioritized' banner (an item must declare exactly one status).
+          and remove its '🔢 Re-scored' banner (an item must declare exactly one status).
 
           This gate exists because #60 shipped while its banner still said "PRE-RESERVED", and that
           stale banner was later repeated as fact. A doc that lies about build state silently

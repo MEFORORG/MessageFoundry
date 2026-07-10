@@ -286,6 +286,11 @@ class StoreSettings(_Section):
     # so it is REJECTED for the sqlserver backend (install the CA into the Windows machine trust store
     # instead). A path, not a secret. Empty = use the system trust store (the secure default).
     ssl_root_cert: str | None = None
+    # SQL SERVER ONLY: emit the ODBC `MultiSubnetFailover=Yes` keyword so a client connecting to an
+    # Always On Availability Group *listener* reaches the current PRIMARY promptly across subnets,
+    # instead of serially waiting out each replica subnet's DNS/TCP timeout on failover. A no-op for
+    # Postgres/SQLite (they never see the ODBC string). Default off — only multi-subnet AOAG needs it.
+    multi_subnet_failover: bool = False
     pool_size: int = 40
     connect_timeout: int = 15  # seconds
     command_timeout: int = 30  # seconds
