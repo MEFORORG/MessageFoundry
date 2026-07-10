@@ -2,29 +2,67 @@
 
 > ## ⚠️ Measurement caveats — read before trusting any number this emits
 >
-> Verified 2026-07-09 against the raw artifacts of the first full run. The pass/fail **verdicts** are
-> sound (they are store-truth driven); several of the **rates** are not.
+> Originally written 2026-07-09 against the first full run. **Re-verified 2026-07-10 against the code:
+> caveats 1, 2 and 3 are now FIXED and must NOT be re-applied by hand — doing so double-corrects an
+> already-corrected number.** The errata below say what changed. The pass/fail **verdicts** were always
+> sound (they are store-truth driven).
 >
 > 1. **The climb is a volume test, not a rate test.** `offered = ingress_rate × hold_seconds`, and the
 >    rung then gets a fixed `hold + drain` budget to drain it. A rung passes iff
->    `offered × dests ≤ D × (hold + drain)`. So `ceiling.pinned_ingress_rate` overstates the true
->    sustainable ingress by exactly **`(hold + drain) / hold`**, independent of `D`, `dests` and `N` —
->    **3.5×** at the documented `--hold-seconds 60 --drain-timeout 150`.
->    **Consequently `ceiling.clears_target_ingress` — the flag that feeds the §8 decision — turns true at
->    a true sustained ingress of ~149/s, not 521/s.** Do not let it drive that decision.
-> 2. **`--soak-drain-timeout` defaults to 300 s** and is *separate* from `--drain-timeout`. A 300 s soak
->    can therefore pass at roughly **2×** the true sustainable rate. Only `in_pipeline_slope` catches it.
-> 3. **`in_pipeline` (and its slope) is exactly 4× overcounted** — the advisory `/stats` poller is summed
->    across the shard APIs over one unified store. Confirmed: `in_pipeline_final / stranded` = 4.000 in
->    every collapsed run. Note this inflation currently *masks* caveat 2 by making the slope gate ~4×
->    more sensitive: **fix 2 and 3 in the same change**, or soaks will start passing spuriously.
+>    `offered × dests ≤ D × (hold + drain)`. The raw **offered** `ingress_rate` therefore overstates the
+>    true sustainable ingress by exactly `(hold + drain) / hold`.
+>    > **✅ FIXED — do not re-apply the 3.5× discount.** `ceiling.pinned_ingress_rate` is now the **D1
+>    > drain-discounted honest rate** (`RungOutcome.sustainable_ingress_rate` = `ingress × hold /
+>    > (hold + drain)`, using the *measured* engine drain, never the drain *timeout*), and
+>    > `clears_target_ingress` keys off it. Multiplying by `(hold+drain)/hold` again **double-discounts**.
+>    >
+>    > **Read the honest series, not just the pin.** It *declines* as the offer rises — the fleet is not
+>    > gaining headroom, it is absorbing a larger burst and draining it afterwards. On the pooled ceiling
+>    > re-run: offered `16→36/s` gave honest `13.05 → 10.93/s`, so the pin (`max`) was the **lowest** rung,
+>    > and the top rung was the **worst** estimator. Treat the pin as the optimistic end of a bracket and
+>    > let a long soak settle the real sustained point.
+> 2. **`--soak-drain-timeout` used to default to 300 s**, separate from `--drain-timeout`, so a soak could
+>    pass by draining a growing backlog for minutes.
+>    > **✅ FIXED.** It now defaults to `None` ⇒ **coupled to `--drain-timeout`** (D2), giving the soak the
+>    > same bounded tail-absorption window as a climb rung. Pass it explicitly only to override.
+> 3. **`in_pipeline` used to be N× overcounted** — the advisory `/stats` poller sums the whole unified
+>    store once per shard API.
+>    > **✅ FIXED for the consolidated report.** `engine.in_pipeline_final` is de-duped to a single store
+>    > view (`// len(ids)`, D4 / #841 — `shardcert.py`), and the peak sampler divides by `n_shards`.
+>    > **Do NOT re-apply `/4`** to the reported value. (The advisory drive-side cross-checks are still
+>    > left at N× on purpose; they are not verdict inputs.)
 > 4. **Delivered rate uses the wrong denominator.** Deliveries span `hold + drain`, not `hold`. Recover
->    the true span from the phase-timing lines: `span ≈ (windows / shards) × 5 s`.
+>    the true span from the phase-timing lines: `span ≈ (windows / shards) × 5 s`. *(Still true.)*
+> 5. **Soak rate auto-pick was dishonest before 2026-07-10 (B8).** `pick_soak_rate` selected the top
+>    sustained rung's **offered** rate while `pinned_ingress_rate` published the **honest** one — so the
+>    soak ran at `(hold+drain)/hold` times the ceiling the very same report printed, and collapsed by
+>    construction. **✅ FIXED:** it now selects `max(sustainable_ingress_rate)` over the sustained rungs,
+>    i.e. exactly `pinned_ingress_rate`. **Reading an older report JSON: check whether its `soak.ingress_rate`
+>    is far above its `ceiling.pinned_ingress_rate` — if so, that soak's collapse is an artifact.**
 >
-> **Workaround until fixed** — make the climb a formality and put the real test in the soak:
-> `--rate-ladder 4 --hold-seconds 60 --drain-timeout 150 --soak-hold-seconds 300 --soak-drain-timeout 30`
-> plus `--soak-rate <target>` on the drive box (`pick_soak_rate` honors an explicit override). Judge only
-> on the soak's store-truth (`drained ∧ stranded==0 ∧ dead_total==0`) and the sink socket-truth.
+> **⛔ The old "workaround until fixed" recipe is now HARMFUL — do not use it.** It read
+> `--rate-ladder 4 --hold-seconds 60 --drain-timeout 150 --soak-hold-seconds 300 --soak-drain-timeout 30`.
+> Its premise (caveats 1–3) is fixed, and the explicit **`--soak-drain-timeout 30`** now *undercuts* the
+> coupled climb tail: the soak gets a 30 s window to absorb a tail sized for 150 s, so the sinks can tally
+> early and a healthy soak renders a **false `FROZEN_TAIL`**.
+>
+> **Current recipe for a real sustained number** — leave `--soak-drain-timeout` unset (it couples), and
+> **bracket** the ceiling with two long soaks around `pinned_ingress_rate` using `--soak-rate <N>` on the
+> **drive box** (it overrides the auto-pick, and still runs the soak even if nothing sustained). Judge on
+> the soak's store-truth (`drained ∧ stranded==0 ∧ dead_total==0`) + the sink socket-truth.
+>
+> **⚠️ A collapsed soak still exits `0`** (B9 — corrects an earlier claim in this box that it exits `1`).
+> `exit_code` encodes **correctness only**: `0` correctness held · `1` FIFO inversion/duplicate · `2` setup
+> degradation. A throughput ceiling is a *measurement*, not a correctness verdict, so a 900 s soak that
+> saturated exits `0`. **Never gate automation on the exit code alone** — read `result`
+> (`SOAK_NOT_SUSTAINED`) or `soak_ok` / `soak_not_sustained`. And when a soak did not hold, **do not quote
+> that run's `pinned_ingress_rate`**: it is derived from the 60 s climb, which the soak just disproved.
+>
+> **Harness reliability fixes (2026-07-10)** — a `≥900 s` soak is now trustworthy: the sink's
+> `DRIVE_COMPLETE` bound is derived rather than a fixed 600 s (**B6** — it used to truncate every sink's
+> tally mid-soak and fabricate a collapse with no abort marker), and the `ENGINE_DRAINED` gate wait is
+> derived from `--drain-timeout` rather than a fixed 300 s (**B7** — a raised drain window silently
+> outgrew it; missing the gate is a *false negative*, never a fabricated collapse).
 >
 > What the ceiling actually is, and why `mark_done` was the wrong suspect:
 > [`outbound-claim-wall.md`](outbound-claim-wall.md).
@@ -104,6 +142,8 @@ python -m harness shardcert-drive-ladder --engine-host <ENGINE_IP> `
 The `--rate-ladder`, `--hold-seconds`, `--drain-timeout`, and `--run-id` **must match** on both boxes (both
 halves derive the identical rung plan and per-rung `run_id`). The drive box emits the consolidated report
 (`ladder1.json` + stdout) and exits `0` (correctness held) / `1` (a correctness break) / `2` (setup/timeout).
+**The exit code says nothing about whether the soak sustained** — a saturating soak exits `0`. Read the
+`result` field instead: `PASS` · `SOAK_NOT_SUSTAINED` · `FAIL` · `SETUP_DEGRADED`.
 Then **stop the instances** (a stopped instance loses the ephemeral store on restart anyway).
 
 ## Reading the result
@@ -112,7 +152,10 @@ Then **stop the instances** (a stopped instance loses the ephemeral store on res
   climb never collapsed → raise the ladder); `first_collapse_ingress_rate` brackets it from above.
 - `ceiling.clears_target_ingress` — whether the pinned **ingress** rate clears ~521/s. This is the number
   the §8 decision keys off, but the bench only reports it.
-- `soak_ok` — the soak held (SUSTAINED + a flat/draining `in_pipeline` slope).
+- `soak_ok` — the soak held: its verdict is **SUSTAINED**, and that alone. B5 removed the `in_pipeline`
+  slope from this gate (the de-inflated slope proved sign-unstable across rates); the slope is still
+  *printed* as advisory context. Saturation is caught by SUSTAINED requiring the backlog to drain inside
+  the bounded soak window. Do not read the printed flat/GROWING label as pass/fail.
 - `climb[].phase_timing` / `soak.phase_timing` — the `send_ack` vs `mark_done` split (needs
   `MEFOR_DELIVERY_PHASE_TIMING=1`).
 

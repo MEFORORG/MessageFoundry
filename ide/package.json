@@ -130,6 +130,11 @@
         "icon": "$(symbol-snippet)"
       },
       {
+        "command": "messagefoundry.openCookbook",
+        "title": "MessageFoundry: Open Cookbook",
+        "icon": "$(book)"
+      },
+      {
         "command": "messagefoundry.showAiPolicy",
         "title": "MessageFoundry: Show AI Policy"
       },
@@ -209,6 +214,10 @@
         {
           "command": "messagefoundry.insertElement",
           "group": "2_scaffold@3"
+        },
+        {
+          "command": "messagefoundry.openCookbook",
+          "group": "2_scaffold@4"
         }
       ],
       "view/title": [
@@ -339,6 +348,70 @@
           {
             "name": "test",
             "description": "Generate a synthetic HL7 sample for the active code"
+          }
+        ]
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "messagefoundry.gettingStarted",
+        "title": "Get Started with MessageFoundry",
+        "description": "Wire your first Connection, Route, and Handler — then test it, without touching a real engine.",
+        "steps": [
+          {
+            "id": "newConnection",
+            "title": "Create a Connection",
+            "description": "Wire an inbound or outbound endpoint (MLLP, file, …).\n[Open Connection Wizard](command:messagefoundry.newConnection)",
+            "media": {
+              "markdown": "media/walkthrough/new-connection.md"
+            },
+            "completionEvents": [
+              "onCommand:messagefoundry.newConnection"
+            ]
+          },
+          {
+            "id": "newRoute",
+            "title": "Wire a Route",
+            "description": "Bind a Router + Handler(s) between two Connections — no bundled \"channel\" element, just named pieces.\n[Open Route Wizard](command:messagefoundry.newRoute)",
+            "media": {
+              "markdown": "media/walkthrough/new-route.md"
+            },
+            "completionEvents": [
+              "onCommand:messagefoundry.newRoute"
+            ]
+          },
+          {
+            "id": "insertElement",
+            "title": "Insert a Handler idiom",
+            "description": "Drop a field copy, lookup, loop, or Send as real, editable Python.\n[Insert Element](command:messagefoundry.insertElement)",
+            "media": {
+              "markdown": "media/walkthrough/insert-element.md"
+            },
+            "completionEvents": [
+              "onCommand:messagefoundry.insertElement"
+            ]
+          },
+          {
+            "id": "testBench",
+            "title": "Dry-run in the Test Bench",
+            "description": "Load a message set and see disposition + before/after — no engine, no sending.\n[Open Test Bench](command:messagefoundry.openTestBench)",
+            "media": {
+              "markdown": "media/walkthrough/test-bench.md"
+            },
+            "completionEvents": [
+              "onCommand:messagefoundry.openTestBench"
+            ]
+          },
+          {
+            "id": "cookbook",
+            "title": "Browse the Cookbook",
+            "description": "Search solved problems — crosswalks, batch splits, enrichment, fan-out — and insert the editable Python.\n[Open Cookbook](command:messagefoundry.openCookbook)",
+            "media": {
+              "markdown": "media/walkthrough/cookbook.md"
+            },
+            "completionEvents": [
+              "onCommand:messagefoundry.openCookbook"
+            ]
           }
         ]
       }

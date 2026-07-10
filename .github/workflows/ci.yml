@@ -135,7 +135,7 @@ jobs:
       # result genuinely differs by OS (real sockets, ProactorEventLoop, Windows service paths).
       - name: Lint (ruff)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
-        run: ruff check messagefoundry messagefoundry_webconsole tests packaging/messagefoundry-webconsole scripts/webconsole_seam_snapshot.py
+        run: ruff check messagefoundry messagefoundry_webconsole tests packaging/messagefoundry-webconsole scripts/webconsole_seam_snapshot.py scripts/docs/backlog_status_check.py
 
       - name: Format check (ruff)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'

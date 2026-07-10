@@ -120,6 +120,33 @@ def _derive_driver_done_timeout(
 #: DRIVE_COMPLETE lands — so over-shooting costs nothing, while under-shooting fabricates a collapse.
 _DRIVE_COMPLETE_MARGIN = 60.0
 
+#: B7: the ENGINE_DRAINED gate wait must cover the ENGINE's own drain (bounded by the SAME ``drain_timeout``
+#: we were given) plus its ``_queue_breakdown`` store read plus coord jitter. A fixed 300.0 silently
+#: under-shoots once ``--drain-timeout``/``--soak-drain-timeout`` is raised past ~300 — and there was no CLI
+#: flag to raise it with, so lengthening the drain window quietly disarmed the gate.
+_ENGINE_DRAINED_MARGIN = 150.0
+
+
+def _derive_engine_drained_timeout(drain_timeout: float, override: float | None) -> float:
+    """The ENGINE_DRAINED gate wait (B7): an explicit ``override`` if given, else ``drain + margin``.
+
+    The drive opens this await AFTER its own advisory ``/stats`` drain returns — which "zeroes under load on
+    a unified store", so it can return early — and the engine posts ENGINE_DRAINED only once ITS real
+    store-truth drain (bounded by the same ``drain_timeout``) plus ``_queue_breakdown`` completes. So the
+    wait scales with ``drain_timeout``, and the old fixed ``300.0`` was safe only while the drain stayed
+    under ~150s. At ``drain_timeout=150`` this derives 300.0 — byte-identical to the old default.
+
+    NOTE on severity, against the obvious reading: missing this gate does **not** fabricate a collapse.
+    :func:`classify_rung` never consumes the advisory poller, and :func:`build_rung_outcome` falls back to
+    ENGINE_RUNG_REPORT for store-truth, so ``engine_ok`` is unaffected. A missed gate only lets the sinks
+    tally BEFORE the engine finished delivering, which lands on FROZEN_TAIL (engine drained clean, sink tally
+    short) — explicitly benign, excluded from the ceiling, and non-climb-stopping. The real cost is a FALSE
+    NEGATIVE: a soak that genuinely held renders FROZEN_TAIL, and ``soak_ok`` (== verdict is SUSTAINED)
+    reads False. Conservative direction, still wrong. Hence: derive it, don't re-classify on it."""
+    if override is not None:
+        return override
+    return drain_timeout + _ENGINE_DRAINED_MARGIN
+
 
 def _derive_drive_complete_timeout(
     hold_seconds: float,
@@ -2364,7 +2391,7 @@ async def run_shardcert_drive(
     reap_grace: float = 10.0,
     allow_insecure: bool = False,
     await_engine_drained: bool = False,
-    engine_drained_timeout: float = 300.0,
+    engine_drained_timeout: float | None = None,
 ) -> ShardCertDriveReport:
     """The multi-process SIZING drive COORDINATOR (load-gen box). Learns the topology from
     :data:`SHARDS_READY` (the engine half posts it), spawns ``sink_count`` :func:`run_shardcert_sink` +
@@ -2428,11 +2455,14 @@ async def run_shardcert_drive(
     # They cannot derive it (they never see hold/drain), so derive it HERE and thread it into the argv. A
     # sink that fires early truncates its tally with no RUNG_ABORTED marker, so B3 cannot invalidate the
     # rung and the engine reports a real stranded>0: a fabricated collapse.
+    # B7: resolve the gate wait FIRST — B6's sink bound has to dominate it, so it must be the value we will
+    # actually wait on, not the bare default it used to be.
+    engine_drained_wait = _derive_engine_drained_timeout(drain_timeout, engine_drained_timeout)
     sink_drive_complete_wait = _derive_drive_complete_timeout(
         hold_seconds,
         drain_timeout,
         child_ready_timeout=child_ready_timeout,
-        engine_drained_timeout=engine_drained_timeout,
+        engine_drained_timeout=engine_drained_wait,
         await_engine_drained=await_engine_drained,
         driver_done_timeout=driver_done_timeout,
         override=drive_complete_timeout,
@@ -2518,21 +2548,26 @@ async def run_shardcert_drive(
         # (4b) PR-C2 ladder drain gate (default OFF): before releasing the sinks to tally, wait for the
         # ENGINE half's RELIABLE store-truth drain signal. The remote poller above is advisory (zeroes
         # under load on a unified store), so tallying on it alone can read a teardown-frozen tail as loss;
-        # the engine's DIRECT store read closes that window. Best-effort — a missing signal degrades to the
-        # advisory-drain fallback (note it) rather than hanging.
+        # the engine's DIRECT store read closes that window. B7: the wait is now DERIVED from drain_timeout
+        # (it must cover the engine's own drain + its store read), not a fixed 300s that a raised drain
+        # window silently outgrew. Best-effort — a missing signal is noted rather than hanging.
         if await_engine_drained:
             try:
-                drained_msg = await coord.await_message(
-                    ENGINE_DRAINED, timeout=engine_drained_timeout
-                )
+                drained_msg = await coord.await_message(ENGINE_DRAINED, timeout=engine_drained_wait)
                 notes.append(
                     f"engine drain gate: engine_ok={drained_msg.get('engine_ok')} "
                     f"stranded={drained_msg.get('stranded')} dead_total={drained_msg.get('dead_total')}"
                 )
             except CoordTimeout:
+                # NOT "tallying on the advisory poller" — the VERDICT never consumes it (classify_rung takes
+                # store-truth from the gate or, failing that, ENGINE_RUNG_REPORT). What is actually lost is
+                # the barrier: the sinks tally before the engine finished delivering, so a healthy rung can
+                # render FROZEN_TAIL (benign, excluded from the ceiling) and a healthy SOAK can read
+                # soak_ok=False. A false negative, never a fabricated collapse.
                 notes.append(
-                    f"ENGINE_DRAINED not seen within {engine_drained_timeout}s — tallying on the "
-                    "advisory remote-drain fallback (drain-window gate degraded)"
+                    f"ENGINE_DRAINED not seen within {engine_drained_wait}s — sinks tally WITHOUT the "
+                    "store-truth drain barrier; an early tally may render FROZEN_TAIL (a false negative). "
+                    "Store-truth still comes from ENGINE_RUNG_REPORT, never the advisory poller"
                 )
 
         # (5) Signal drained → every sink records its final tally and posts SINK_DONE.<m>.

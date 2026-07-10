@@ -9,6 +9,7 @@ import * as vscode from "vscode";
 import { openAlertEditor } from "./alertEditor";
 import { showAiPolicy } from "./aiPolicy";
 import { isExecGated, workspaceDir } from "./cli";
+import { CookbookPanel } from "./cookbook";
 import { registerCompletion } from "./completion";
 import { registerChat } from "./chat";
 import { registerEditorToolbar } from "./editorToolbar";
@@ -74,9 +75,11 @@ export function activate(context: vscode.ExtensionContext): void {
   // Live-debug v1 (#92): status-bar toggle + on-save dryrun → CodeLens summaries (off by default).
   registerLiveDebug(context);
   const testBench = new TestBench(context);
+  const cookbook = new CookbookPanel(context);
 
   context.subscriptions.push(
     vscode.commands.registerCommand("messagefoundry.openTestBench", () => testBench.open()),
+    vscode.commands.registerCommand("messagefoundry.openCookbook", () => cookbook.open()),
     vscode.commands.registerCommand("messagefoundry.validate", () => validator.run()),
     vscode.commands.registerCommand("messagefoundry.refreshGraph", () => graph.refresh()),
     vscode.commands.registerCommand("messagefoundry.filterConnections", async () => {

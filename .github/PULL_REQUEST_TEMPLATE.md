@@ -6,6 +6,13 @@
 
 Closes #
 
+<!-- If this PR completes (or partly completes) a numbered item in docs/BACKLOG.md, name it here as
+     `BACKLOG #N`. CI then requires you to update that item's status banner in this same PR — the
+     step whose omission left #60 (turnkey DR) reading "PRE-RESERVED" long after it had shipped, and
+     that stale banner was later repeated as fact. Delete the line if no backlog item applies. -->
+
+Implements: BACKLOG #
+
 ## Type of change
 
 - [ ] Bug fix (a test reproducing the bug is included)
@@ -27,3 +34,6 @@ Closes #
 - [ ] Uses **Connection / Router / Handler** vocabulary; no new declarative "channel" element; no
       GUI/web-framework imports in the engine packages; no Black.
 - [ ] Docs updated if behavior or configuration changed.
+- [ ] If this completes a `docs/BACKLOG.md` item, its status banner is updated in **this** PR
+      (`> ✅ **SHIPPED …**`), and the item no longer carries an open `🔢`/`🚧` banner. Every item must
+      declare exactly one status — enforced by `tests/test_backlog_status_check.py`.

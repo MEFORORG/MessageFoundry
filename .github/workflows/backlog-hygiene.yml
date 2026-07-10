@@ -1,0 +1,96 @@
+# Backlog status hygiene — stop `docs/BACKLOG.md` from lying about build state.
+#
+# WHY. Work ships, the item's banner is never updated, and the backlog goes on describing finished
+# work as open. A 2026-07-09 audit found 11 items misfiled as open — including #60 (turnkey DR),
+# which shipped with ADR 0049 and a working `backup` / `restore-verify` CLI while its banner still
+# read "PRE-RESERVED, owner-gated". That stale banner was then repeated as fact in a merged PR. The
+# same rot left the Corepoint gap analysis ~22% obsolete. A doc that lies about build state is worse
+# than no doc: it silently misdirects planning.
+#
+# TWO HALVES.
+#   * The STRUCTURAL half ("every item declares exactly one status") is enforced by pytest —
+#     `tests/test_backlog_status_check.py` runs the checker against the real file on every PR, so it
+#     rides the existing test matrix and needs no job here.
+#   * The BEHAVIOURAL half is here, because only the PR context can see it: if a PR claims to
+#     implement a backlog item (`BACKLOG #N` in its title or body) and touches engine/IDE code, then
+#     it must also update `docs/BACKLOG.md`. That is the step whose omission caused #60.
+#
+# Read-only. No secrets. Workflow expressions are hoisted into `env` and never interpolated into a
+# `run:` body (zizmor: a PR title/body is attacker-controlled on a fork PR and must arrive as data).
+name: backlog-hygiene
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backlog-hygiene-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  banner-on-implementation:
+    name: a PR that implements BACKLOG #N must update BACKLOG.md
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a backlog update when a PR claims to implement an item
+        env:
+          # Hoisted, never interpolated into the script body (zizmor: template injection).
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Does this PR *claim* to implement a backlog item? Only the explicit `BACKLOG #N` token
+          # counts — a bare `#123` is ambiguous in this repo (it is usually a PR number).
+          claim="$(printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | grep -oiE 'BACKLOG #[0-9]+' | head -1 || true)"
+          if [ -z "$claim" ]; then
+            echo "No 'BACKLOG #N' claim in this PR — nothing to enforce."
+            echo "(If this PR completes a backlog item, say so with 'BACKLOG #N' and update its banner.)"
+            exit 0
+          fi
+
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          touches_code=false
+          case "$changed" in
+            *messagefoundry/*|*ide/*|*messagefoundry_webconsole/*) touches_code=true ;;
+          esac
+
+          if [ "$touches_code" != true ]; then
+            echo "PR claims '$claim' but changes no engine/IDE code — no banner update required."
+            exit 0
+          fi
+
+          if printf '%s\n' "$changed" | grep -qx 'docs/BACKLOG.md'; then
+            echo "OK — PR claims '$claim', touches code, and updates docs/BACKLOG.md."
+            exit 0
+          fi
+
+          n="$(printf '%s' "$claim" | grep -oE '[0-9]+')"
+          cat >&2 <<EOF
+          ERROR: this PR says it implements '$claim' and changes engine/IDE code, but it does not
+          touch docs/BACKLOG.md.
+
+          Update item #$n's status banner in the same PR. If the work is complete:
+
+              > ✅ **SHIPPED in <version> (<ADR / PR>).** <one line of evidence>
+
+          and remove its '🔢 Re-prioritized' banner (an item must declare exactly one status).
+
+          This gate exists because #60 shipped while its banner still said "PRE-RESERVED", and that
+          stale banner was later repeated as fact. A doc that lies about build state silently
+          misdirects planning.
+
+          If this PR only *partially* implements the item, keep the open banner and say so in the
+          item body — then drop the 'BACKLOG #$n' token from this PR's title/body.
+          EOF
+          exit 1

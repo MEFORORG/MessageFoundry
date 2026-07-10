@@ -742,15 +742,35 @@ def build_rung_outcome(
 
 
 def pick_soak_rate(records: Sequence[RungOutcome], override: float | None = None) -> float | None:
-    """The soak rate: an explicit ``override`` if given, else the highest SUSTAINED climb rung's ingress
-    rate (the "supported operating point" — the last rung that held losslessly AND drained clean). ``None``
-    when there is nothing sustained to soak (⇒ the ladder skips the soak and says so)."""
+    """The soak rate: an explicit ``override`` if given, else the highest HONEST SUSTAINABLE rate any
+    SUSTAINED climb rung actually proved (:attr:`RungOutcome.sustainable_ingress_rate`). ``None`` when
+    nothing sustained (⇒ the ladder skips the soak and says so).
+
+    B8: this used to select the rung's raw OFFERED ``ingress_rate``, which is not a sustainable rate. A climb
+    rung is a VOLUME test — a SUSTAINED rung proves only that the fleet DELIVERED ``offered × dests`` within
+    ``hold + drain``, never that it kept up at ``ingress_rate`` in real time. The offered rate overstates the
+    honest one by ``(hold + drain) / hold`` (see :attr:`sustainable_ingress_rate`).
+
+    Worse, ``max()`` over OFFERED rates selects the HIGHEST sustained rung — which is the rung with the
+    LONGEST drain, i.e. the MOST overstated estimator on the whole ladder. The soak then offers a rate the
+    fleet was never shown to sustain and collapses by construction. And a long soak amortizes the drain
+    discount away (at ``hold=900`` the overstatement factor is ~1.03, not ~2.8), so nothing is left to hide
+    it: the collapse looks real. Observed on the pooled ceiling re-run — offered climb pinned at 36/s while
+    the honest rate sat flat at ~13/s across every rung, so the auto-picked 900s soak ran at ~2.8x
+    sustainable. Selecting on the drain-discounted rate picks the operating point the climb actually proved.
+
+    A rung whose drain was never measured yields ``None`` (an unmeasured span cannot denominate a rate) and
+    is skipped. For a SUSTAINED rung the engine-side drain is guaranteed present, so this cannot silently
+    empty the candidate set and turn a real ceiling into a skipped soak."""
     if override is not None:
         return override
-    sustained = [
-        r.ingress_rate for r in records if not r.is_soak and r.verdict is RungVerdict.SUSTAINED
+    proved = [
+        r.sustainable_ingress_rate
+        for r in records
+        if not r.is_soak and r.verdict is RungVerdict.SUSTAINED
     ]
-    return max(sustained) if sustained else None
+    measured = [rate for rate in proved if rate is not None]
+    return max(measured) if measured else None
 
 
 @dataclass
@@ -891,6 +911,42 @@ class ConsolidatedLadderReport:
         return self.climb_aborted or self.soak_aborted or self.store_truth_unconfirmed
 
     @property
+    def soak_store_truth_unconfirmed(self) -> bool:
+        """B9: a soak RAN, but its ENGINE store-truth never arrived (INCONCLUSIVE — neither the ENGINE_DRAINED
+        gate nor the ENGINE_RUNG_REPORT). Nothing was proven about the soak either way: it is UNKNOWN, not
+        proven-failed.
+
+        Deliberately NOT folded into :attr:`setup_degraded`, because :attr:`store_truth_unconfirmed` already
+        rules that "a soak-only inconclusive is supplementary ... the climb still pinned the ceiling" — so it
+        stays exit 0. But it must not read as a PASS either, hence its own ``SOAK_UNCONFIRMED`` label."""
+        return (
+            self.soak is not None
+            and not self.soak_aborted
+            and self.soak.verdict is RungVerdict.INCONCLUSIVE
+        )
+
+    @property
+    def soak_not_sustained(self) -> bool:
+        """B9: a soak RAN, its store-truth WAS confirmed, and it did not hold — COLLAPSED or FROZEN_TAIL.
+
+        Excluding INCONCLUSIVE is load-bearing, not defensive. Without it a soak whose engine store-truth
+        never arrived (a coord glitch — ``classify_rung`` returns INCONCLUSIVE exactly when
+        ``engine_reported`` is False) would be stamped "did NOT hold", fabricating a proven negative out of
+        an unknown. That is the same fabrication class as B6/B7, and the codebase refuses it everywhere else:
+        ``classify_rung`` will not score an unconfirmed rung COLLAPSED, and ``first_collapse_ingress_rate``
+        requires ``engine_reported``. An unconfirmed soak is :attr:`soak_store_truth_unconfirmed`, not this.
+
+        Distinct from :attr:`soak_aborted` (the soak never produced a measurement ⇒ ``setup_degraded`` ⇒
+        exit 2) and from a legitimately SKIPPED soak (no sustained rung to soak). This one is a real PRODUCT
+        signal: the offered operating point was not sustainable over the long hold."""
+        return (
+            self.soak is not None
+            and not self.soak_aborted
+            and self.soak.verdict is not RungVerdict.INCONCLUSIVE
+            and not self.soak_ok
+        )
+
+    @property
     def ok(self) -> bool:
         """Correctness held (the throughput ceiling is a measurement, not a pass/fail). A setup degradation
         is surfaced via ``exit_code`` (2), not by flipping ``ok``."""
@@ -900,10 +956,41 @@ class ConsolidatedLadderReport:
     def exit_code(self) -> int:
         """0 (correctness held) / 1 (a correctness break) / 2 (a setup degradation — a two-box rendezvous
         abort OR an unconfirmed store-truth — so a mid-run infra glitch or a nothing-certified run never
-        reads as a PASS)."""
+        reads as a PASS).
+
+        **B9 — the exit code does NOT encode whether the soak sustained.** A collapsed 900s soak exits **0**,
+        because a throughput ceiling is a MEASUREMENT, not a correctness verdict (see :attr:`ok`). That is
+        deliberate, but it is a trap for an exit-code-gated harness: a run that saturated still exits 0.
+        Automation that wants "did the offered operating point hold?" must read :attr:`soak_ok` /
+        :attr:`soak_not_sustained` (or the ``result`` field, which no longer says ``PASS`` in that case) —
+        never the exit code alone."""
         if self.setup_degraded:
             return 2
         return 0 if self.ok else 1
+
+    @property
+    def result_label(self) -> str:
+        """The single-token result. B9: a run whose soak COLLAPSED used to report ``PASS`` (because ``ok``
+        tracks correctness only), so the JSON headline of a saturating run read as a pass — alongside a
+        ``pinned_ingress_rate`` taken from the 60s climb, which the soak had just disproved. Now:
+
+        * ``SETUP_DEGRADED`` — not a bench result (exit 2).
+        * ``FAIL`` — a correctness break: FIFO inversion or duplicate delivery (exit 1).
+        * ``SOAK_NOT_SUSTAINED`` — correctness held, and the soak's store-truth was CONFIRMED and did not
+          hold (exit 0; a product measurement, not a correctness failure). **Do not quote this run's pinned
+          ceiling** — it comes from the short climb, which this soak just disproved.
+        * ``SOAK_UNCONFIRMED`` — correctness held, but the soak's store-truth never arrived (exit 0). Nothing
+          was proven about the soak; re-run it. Neither a pass nor a proven saturation.
+        * ``PASS`` — correctness held, and the soak either sustained or was legitimately skipped."""
+        if self.setup_degraded:
+            return "SETUP_DEGRADED"
+        if not self.ok:
+            return "FAIL"
+        if self.soak_not_sustained:
+            return "SOAK_NOT_SUSTAINED"
+        if self.soak_store_truth_unconfirmed:
+            return "SOAK_UNCONFIRMED"
+        return "PASS"
 
     def render(self) -> str:
         lines = [
@@ -1007,16 +1094,37 @@ class ConsolidatedLadderReport:
             lines.append(
                 f"RESULT: {'PASS' if self.ok else 'FAIL'} (correctness) -> exit {self.exit_code}"
             )
+            if self.soak_not_sustained and self.soak is not None:
+                # B9: exit stays 0 (throughput is a measurement) — but say so loudly, because the JSON
+                # headline and the climb-derived pinned ceiling both otherwise read as a clean pass.
+                lines.append(
+                    f"        SOAK NOT SUSTAINED (soak verdict={self.soak.verdict.value} @ "
+                    f"{self.soak.ingress_rate:g}/s ingress over {self.soak.hold_seconds:g}s) — the offered "
+                    "operating point did NOT hold. Do not quote this run's pinned ceiling."
+                )
+            elif self.soak_store_truth_unconfirmed and self.soak is not None:
+                # NOT "did not hold" — nothing was proven either way. Asserting a negative here would be the
+                # same fabrication B6/B7 were about.
+                lines.append(
+                    f"        SOAK UNCONFIRMED (store-truth never arrived @ {self.soak.ingress_rate:g}/s "
+                    f"ingress over {self.soak.hold_seconds:g}s) — the soak proved NOTHING either way; "
+                    "re-run it. The climb still pinned the ceiling."
+                )
         return "\n".join(lines)
 
     def to_json_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            # v2 (B9): `result` gained SOAK_NOT_SUSTAINED + SOAK_UNCONFIRMED, and the two booleans below are
+            # new. A collapsed soak used to serialize as "PASS". `exit_code` is unchanged (0 — a throughput
+            # ceiling is a measurement, not a correctness verdict), so gate automation on `result`, not exit.
+            "schema_version": 2,
             "kind": "shardcert_ladder_two_box",
-            "result": "SETUP_DEGRADED" if self.setup_degraded else ("PASS" if self.ok else "FAIL"),
+            "result": self.result_label,
             "exit_code": self.exit_code,
             "climb_aborted": self.climb_aborted,
             "soak_aborted": self.soak_aborted,
+            "soak_not_sustained": self.soak_not_sustained,
+            "soak_store_truth_unconfirmed": self.soak_store_truth_unconfirmed,
             "store_truth_unconfirmed": self.store_truth_unconfirmed,
             "topology": {
                 "shards": list(self.shards),
@@ -1327,7 +1435,7 @@ async def run_drive_ladder(
     do_soak: bool = True,
     shards_ready_timeout: float = 300.0,
     engine_rung_report_timeout: float = 120.0,
-    engine_drained_timeout: float = 300.0,
+    engine_drained_timeout: float | None = None,
 ) -> ConsolidatedLadderReport:
     """The LOAD-GEN-box ladder loop + the consolidated report. Iterates the SAME climb plan the engine
     arms, driving each rung with the merged multi-process :func:`run_shardcert_drive` (K senders + M sinks)

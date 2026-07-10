@@ -42,8 +42,29 @@ jobs:
     if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
     timeout-minutes: 10
     steps:
+      # A Dependabot-triggered `pull_request` run reads **Dependabot** secrets, not Actions secrets
+      # (https://docs.github.com/code-security/dependabot/working-with-dependabot/automating-dependabot-with-github-actions).
+      # If LOCK_RESYNC_APP_* live only under Actions secrets, `create-github-app-token` receives an
+      # empty client-id and fails the job — reddening every Dependabot PR for a reason that has
+      # nothing to do with the dependency (this is what happened on #801). Detect that and skip with
+      # an actionable notice instead. Skipping is SAFE: lock/DEP-1 sync is independently enforced by
+      # the `pip-audit` job in security.yml, which fails a genuinely stale lock.
+      - name: Are the App credentials visible to this run?
+        id: creds
+        env:
+          APP_ID: ${{ secrets.LOCK_RESYNC_APP_ID }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APP_ID:-}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=lock-resync skipped::LOCK_RESYNC_APP_ID / LOCK_RESYNC_APP_PRIVATE_KEY are not visible to this run. A Dependabot-triggered pull_request run reads Dependabot secrets, not Actions secrets — add them under Settings > Secrets and variables > Dependabot to enable automatic lock re-export. DEP-1 lock sync is still enforced by the pip-audit job in security.yml."
+          fi
+
       - name: Mint a scoped GitHub App token
         id: app-token
+        if: steps.creds.outputs.present == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ secrets.LOCK_RESYNC_APP_ID }}
@@ -51,6 +72,7 @@ jobs:
           permission-contents: write
 
       - name: Check out the PR head
+        if: steps.creds.outputs.present == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -60,9 +82,11 @@ jobs:
           # code runs in this job (uv lock --check + uv export only).
 
       - name: Set up uv
+        if: steps.creds.outputs.present == 'true'
         uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
 
       - name: Re-export the lock files (DEP-1 — byte-for-byte identical flags/paths)
+        if: steps.creds.outputs.present == 'true'
         run: |
           set -euo pipefail
           # Mirror the DEP-1 gate (security.yml, pip-audit job) EXACTLY. "--check" validates the
@@ -75,6 +99,7 @@ jobs:
           uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
 
       - name: Commit and push the resynced locks
+        if: steps.creds.outputs.present == 'true'
         env:
           # Pass the PR head ref through the environment, NOT inline ${{ }} in the run block, so a branch
           # name containing shell metacharacters can never be evaluated as code (template injection).

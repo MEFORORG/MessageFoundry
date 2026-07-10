@@ -27,6 +27,7 @@ from harness.load.shardcert import (
     ShardCertEngineReport,
     _derive_drive_complete_timeout,
     _derive_driver_done_timeout,
+    _derive_engine_drained_timeout,
 )
 from harness.load.shardcert_ladder import (
     TARGET_INGRESS_PER_S,
@@ -534,6 +535,101 @@ def test_report_vacuous_fifo_gate_scoped_to_sustained() -> None:
     assert rep.exit_code == 0
 
 
+# --- B9: a run whose SOAK collapsed must not report PASS --------------------------------------------
+
+
+def test_collapsed_soak_reports_soak_not_sustained_not_pass() -> None:
+    """B9 (found on redo-pooled-soak12-01, 2026-07-10). `ok` tracks CORRECTNESS only — a throughput ceiling
+    is a measurement, not a pass/fail — so a 900s soak that collapsed still exits 0. That is deliberate, but
+    it used to serialize as `result: "PASS"` alongside a `pinned_ingress_rate` taken from the 60s climb that
+    the soak had just disproved. The exit code keeps its meaning; the LABEL stops lying."""
+    climb = [_outcome(10.0, RungVerdict.SUSTAINED)]
+    soak = _outcome(12.0, RungVerdict.COLLAPSED, is_soak=True)
+    rep = _rep(climb, soak=soak)
+
+    assert rep.correctness_ok is True  # no FIFO inversion / dup
+    assert rep.exit_code == 0  # unchanged: throughput is a measurement
+    assert rep.soak_ok is False
+    assert rep.soak_not_sustained is True
+    assert rep.result_label == "SOAK_NOT_SUSTAINED"
+
+    js = rep.to_json_dict()
+    assert js["result"] == "SOAK_NOT_SUSTAINED"  # was "PASS" before B9
+    assert js["soak_not_sustained"] is True
+    assert js["exit_code"] == 0
+    assert js["schema_version"] == 2
+    assert "SOAK NOT SUSTAINED" in rep.render()
+
+
+def test_frozen_tail_soak_also_reads_not_sustained() -> None:
+    # A FROZEN_TAIL soak (the B7 degraded-drain-gate false negative) did not hold either — soak_ok is
+    # verdict==SUSTAINED alone, so it must not read PASS.
+    rep = _rep(
+        [_outcome(10.0, RungVerdict.SUSTAINED)],
+        soak=_outcome(10.0, RungVerdict.FROZEN_TAIL, is_soak=True),
+    )
+    assert rep.result_label == "SOAK_NOT_SUSTAINED"
+    assert rep.exit_code == 0
+
+
+def test_sustained_and_skipped_soaks_still_pass() -> None:
+    sustained = _rep(
+        [_outcome(10.0, RungVerdict.SUSTAINED)],
+        soak=_outcome(10.0, RungVerdict.SUSTAINED, is_soak=True),
+    )
+    assert sustained.result_label == "PASS" and sustained.soak_not_sustained is False
+    # A legitimately SKIPPED soak (nothing sustained to soak) is benign — not a product signal.
+    skipped = _rep([_outcome(10.0, RungVerdict.SUSTAINED)], soak=None)
+    assert skipped.result_label == "PASS" and skipped.soak_not_sustained is False
+    # The warning lines must NOT appear on a clean run — otherwise a too-broad guard goes unnoticed.
+    for text in (sustained.render(), skipped.render()):
+        assert "SOAK NOT SUSTAINED" not in text
+        assert "SOAK UNCONFIRMED" not in text
+
+
+def test_inconclusive_soak_is_unconfirmed_not_a_proven_saturation() -> None:
+    """B9 / adversarial review. An INCONCLUSIVE soak means the engine store-truth NEVER ARRIVED — a coord
+    glitch. It is UNKNOWN, not proven-failed. Labelling it SOAK_NOT_SUSTAINED ("the offered operating point
+    did NOT hold") would fabricate a negative the verdict explicitly disclaims — the same fabrication class
+    as B6/B7, and one the codebase refuses everywhere else (`classify_rung` will not score an unconfirmed
+    rung COLLAPSED; `first_collapse_ingress_rate` requires `engine_reported`).
+
+    It must NOT become SETUP_DEGRADED either: `store_truth_unconfirmed` deliberately inspects only the CLIMB,
+    ruling that "a soak-only inconclusive is supplementary — the climb still pinned the ceiling". So it keeps
+    exit 0 and gets its own honest label."""
+    rep = _rep(
+        [_outcome(10.0, RungVerdict.SUSTAINED)],
+        soak=_outcome(12.0, RungVerdict.INCONCLUSIVE, is_soak=True),
+    )
+    assert rep.soak_ok is False  # it did not sustain ...
+    assert rep.soak_not_sustained is False  # ... but nothing was PROVEN about it
+    assert rep.soak_store_truth_unconfirmed is True
+    assert rep.setup_degraded is False  # a soak-only inconclusive is supplementary
+    assert rep.exit_code == 0
+    assert rep.result_label == "SOAK_UNCONFIRMED"
+
+    text = rep.render()
+    assert "SOAK UNCONFIRMED" in text
+    assert "SOAK NOT SUSTAINED" not in text  # never assert a negative we cannot substantiate
+    js = rep.to_json_dict()
+    assert js["result"] == "SOAK_UNCONFIRMED"
+    assert js["soak_store_truth_unconfirmed"] is True and js["soak_not_sustained"] is False
+
+
+def test_soak_not_sustained_never_masks_a_degradation_or_a_correctness_break() -> None:
+    # Precedence: an ABORTED soak is a setup degradation (exit 2, no measurement), NOT a product signal —
+    # it must not be relabelled SOAK_NOT_SUSTAINED, which would read as a real saturation result.
+    aborted = _rep([_outcome(10.0, RungVerdict.SUSTAINED)], soak=None, soak_aborted=True)
+    assert aborted.soak_not_sustained is False
+    assert aborted.result_label == "SETUP_DEGRADED" and aborted.exit_code == 2
+    # A correctness break outranks everything, even with a collapsed soak.
+    broke = _rep(
+        [_outcome(10.0, RungVerdict.CORRECTNESS_FAIL)],
+        soak=_outcome(12.0, RungVerdict.COLLAPSED, is_soak=True),
+    )
+    assert broke.result_label == "FAIL" and broke.exit_code == 1
+
+
 def test_report_climb_aborted_exits_setup_code_2() -> None:
     # A two-box rendezvous/timeout abort mid-run must surface exit 2 (setup), never a false PASS — even
     # when the rungs that DID run were clean.
@@ -681,6 +777,61 @@ def test_pinned_ingress_rate_is_honest_not_offered() -> None:
     rep = _rep([_honest_rung(521.0, drain_seconds=150.0, hold=60.0)])
     assert rep.pinned_ingress_rate == pytest.approx(148.857, abs=1e-2)
     assert rep.pinned_outbound_rate == pytest.approx(148.857 * 8, abs=1e-1)
+
+
+# --- B8: the SOAK rate is the honest sustainable rate, never the raw offered rate --------------------
+#
+# The real pooled ceiling re-run (2026-07-10), per-rung engine drains from the report JSON. The offered rate
+# CLIMBS 16→36 while the honest rate DECLINES 13.05→10.93: the fleet is not gaining headroom, it is absorbing
+# a bigger burst and draining it afterwards. r6=40 never drained at all (COLLAPSED, no honest rate).
+_POOLED_CLIMB = (
+    (16.0, 13.5),
+    (20.0, 32.5),
+    (24.0, 56.8),
+    (28.0, 81.4),
+    (32.0, 109.6),
+    (36.0, 137.5),
+)
+
+
+def test_pick_soak_rate_uses_honest_rate_not_offered() -> None:
+    """B8. A climb rung is a VOLUME test: SUSTAINED proves the fleet DELIVERED offered×dests within
+    hold+drain, never that it KEPT UP at the offered rate. Picking the raw offered rate hands the soak a rate
+    the fleet was never shown to sustain — and because max() over OFFERED selects the highest sustained rung,
+    which is the rung with the LONGEST drain, it selects the MOST overstated estimator on the ladder. On this
+    real data the old code picked 36/s against a true ~13/s, so the 900s soak collapsed by construction."""
+    climb = [_honest_rung(rate, drain_seconds=d) for rate, d in _POOLED_CLIMB]
+    picked = pick_soak_rate(climb)
+    assert picked is not None
+    assert picked == pytest.approx(13.053, abs=1e-2)  # r0: the MAX of a DECLINING series
+    assert picked < 36.0  # never the top sustained rung's offered rate (what the old code returned)
+
+    # The honest series declines monotonically as the offer rises — that is the burst-absorption signature.
+    honest = [r.sustainable_ingress_rate for r in climb]
+    assert all(a is not None and b is not None and a > b for a, b in zip(honest, honest[1:]))
+    # ... so the pin is the max of a decline, NOT a flat series: the top rung is the WORST estimator.
+    assert honest[0] == pytest.approx(13.053, abs=1e-2)
+    assert honest[-1] == pytest.approx(10.934, abs=1e-2)
+
+
+def test_pick_soak_rate_equals_the_pinned_ceiling_the_report_publishes() -> None:
+    """The contradiction B8 closes. `pinned_ingress_rate` already computed the HONEST rate and published it
+    as the ladder's ceiling, while `pick_soak_rate` — forty lines away — fed the soak the OFFERED rate. The
+    ladder must not soak at a rate above the ceiling it publishes."""
+    climb = [_honest_rung(rate, drain_seconds=d) for rate, d in _POOLED_CLIMB]
+    assert pick_soak_rate(climb) == _rep(climb).pinned_ingress_rate
+
+
+def test_pick_soak_rate_skips_rungs_with_no_measured_drain() -> None:
+    """An unmeasured span cannot denominate a rate — mirrors `pinned_ingress_rate`'s own exclusion. A rung
+    that never drained has no honest rate precisely BECAUSE it collapsed; it must not poison the pick."""
+    climb = [
+        _honest_rung(16.0, drain_seconds=13.5),
+        _honest_rung(40.0, RungVerdict.COLLAPSED, drain_seconds=None),
+    ]
+    assert pick_soak_rate(climb) == pytest.approx(13.053, abs=1e-2)
+    # An override still wins outright, even with nothing sustained (the deliberate bracket-testing path).
+    assert pick_soak_rate(climb, override=12.0) == 12.0
 
 
 def test_clears_target_ingress_no_longer_fires_at_true_149() -> None:
@@ -1068,6 +1219,43 @@ def test_derive_drive_complete_timeout_climb_rung_and_toggles() -> None:
     assert _soak_sink_wait(driver_done_timeout=25.0) == 240.0 + 25.0 + 150.0 + 300.0 + 60.0
     # An explicit sink override wins outright — the escape hatch, as with driver_done.
     assert _soak_sink_wait(override=42.0) == 42.0
+
+
+# --- B7: the ENGINE_DRAINED gate wait scales with the drain window it is waiting on ------------------
+
+
+def test_derive_engine_drained_timeout_scales_with_the_drain_window() -> None:
+    # The gate wait must cover the ENGINE's own drain (bounded by the same drain_timeout) + its store read.
+    # At the ladder's shipped drain of 150s this reproduces the old fixed 300.0 exactly — no behaviour change
+    # for the default run — but a raised drain window now raises the gate with it, instead of outgrowing it.
+    assert _derive_engine_drained_timeout(150.0, None) == 300.0  # byte-identical to the old default
+    assert (
+        _derive_engine_drained_timeout(600.0, None) == 750.0
+    )  # the old 300.0 silently under-shot here
+    assert _derive_engine_drained_timeout(30.0, None) == 180.0
+    assert _derive_engine_drained_timeout(600.0, 42.0) == 42.0  # explicit override wins
+
+
+def test_a_lost_drain_gate_can_never_produce_a_collapsed_verdict() -> None:
+    """GUARD (B7 severity). The obvious reading — "a lost gate makes the drive tally on the advisory /stats
+    poller, which zeroes under load, so a frozen tail reads as a collapse" — is WRONG, and B7's fix must NOT
+    'correct' it by re-classifying the rung INVALID. `classify_rung` never consumes the poller (its own
+    docstring: "The remote poller is NEVER an input"), and COLLAPSED requires the ENGINE's own store-truth to
+    say it did not drain. A lost gate cannot touch `engine_ok`; it only removes the barrier, so the sinks may
+    tally early — which lands on FROZEN_TAIL: benign, excluded from the ceiling, non-climb-stopping. The real
+    cost is a false NEGATIVE (a healthy soak reads soak_ok=False). Hence: derive the wait, don't re-classify.
+
+    The per-cell truth table is covered above; this pins the INVARIANT across the gate-loss scenario."""
+    for no_loss in (True, False):  # the sink tally may or may not be short when the barrier is lost
+        verdict = classify_rung(
+            engine_reported=True,  # store-truth still arrives, via ENGINE_RUNG_REPORT
+            engine_ok=True,  # ... and the engine really did drain clean
+            no_loss=no_loss,
+            lane_inversions=0,
+            lane_repeats=0,
+        )
+        assert verdict is not RungVerdict.COLLAPSED  # never fabricated
+        assert not stops_climb(verdict)  # and never halts the climb
 
 
 # --- B2: an ABORTED soak reads as setup-degraded (exit 2), never a clean PASS with soak=null -----------

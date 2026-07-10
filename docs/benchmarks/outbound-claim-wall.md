@@ -171,7 +171,14 @@ Runbook: `aws-bench/HANDOFF_rig_claim-mode-AB_2026-07-09.md`.
 
 ## 7. Reading the harness's numbers
 
-Do not take `shardcert_ladder`'s reported rates at face value — see
-[`shardcert-ceiling-ladder.md`](shardcert-ceiling-ladder.md) §"Measurement caveats". In particular the
-climb's `pinned_ingress_rate` overstates sustainable ingress by exactly `(hold+drain)/hold`, and
-`in_pipeline` is 4× overcounted on a unified store.
+Read `shardcert_ladder`'s reported rates against
+[`shardcert-ceiling-ladder.md`](shardcert-ceiling-ladder.md) §"Measurement caveats" — but note those
+caveats were **fixed on 2026-07-10** and must **not** be re-applied by hand:
+
+- `pinned_ingress_rate` **is already** the drain-discounted honest rate. Multiplying it by
+  `(hold+drain)/hold` again **double-discounts**. (The honest series *declines* as the offer rises, so the
+  pin is the max of a declining series — the optimistic end of a bracket, not a flat plateau.)
+- `engine.in_pipeline_final` **is already** de-duped to a single store view. Do **not** re-apply `/N`.
+- The soak's auto-picked rate now equals `pinned_ingress_rate` (B8). Older report JSONs picked the raw
+  **offered** rate, so an old soak that collapsed at a rate far above the report's own published ceiling
+  is an artifact, not a product result.

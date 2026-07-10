@@ -1560,6 +1560,15 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         "VERDICT does not depend on it (that uses the reliable ENGINE_DRAINED gate) — a lost report only "
         "drops the phase timing",
     )
+    parser.add_argument(
+        "--engine-drained-timeout",
+        type=float,
+        default=None,
+        help="B7: per-rung wait for the engine's ENGINE_DRAINED store-truth drain gate, which the drive "
+        "awaits before releasing the sinks to tally. Default: DERIVED as --drain-timeout + 150s (so a "
+        "raised drain window cannot silently outgrow it, as the old fixed 300s did). Missing the gate is a "
+        "false NEGATIVE (an early sink tally can render FROZEN_TAIL), never a fabricated collapse",
+    )
     _add_coord_args(parser)
     parser.add_argument("--report-json", help="write the consolidated JSON report to this path")
     args = parser.parse_args(argv)
@@ -1603,6 +1612,7 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
                 soak_rate_override=args.soak_rate,
                 do_soak=not args.no_soak,
                 engine_rung_report_timeout=args.engine_report_timeout,
+                engine_drained_timeout=args.engine_drained_timeout,
             )
         )
     except ValueError as exc:  # a mis-sized fleet / bad ladder — fail loud, setup error
