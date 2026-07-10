@@ -25,6 +25,7 @@ from harness.load import shardcert as _shardcert
 from harness.load.shardcert import (
     ShardCertDriveReport,
     ShardCertEngineReport,
+    _derive_drive_complete_timeout,
     _derive_driver_done_timeout,
 )
 from harness.load.shardcert_ladder import (
@@ -1007,6 +1008,66 @@ def test_derive_driver_done_timeout() -> None:
     assert _derive_driver_done_timeout(700.0, 300.0, None) == 700.0 + 300.0 + 60.0
     assert _derive_driver_done_timeout(60.0, 90.0, None) == 210.0
     assert _derive_driver_done_timeout(60.0, 90.0, 25.0) == 25.0  # explicit override wins
+
+
+# --- B6: the SINK's DRIVE_COMPLETE bound must dominate every coordinator step, not just the hold --------
+
+
+def _soak_sink_wait(
+    *,
+    await_engine_drained: bool = True,
+    driver_done_timeout: float | None = None,
+    override: float | None = None,
+) -> float:
+    """The 900s soak's sink bound, at the ladder's own child_ready/engine_drained defaults."""
+    return _derive_drive_complete_timeout(
+        900.0,
+        150.0,
+        child_ready_timeout=120.0,
+        engine_drained_timeout=300.0,
+        await_engine_drained=await_engine_drained,
+        driver_done_timeout=driver_done_timeout,
+        override=override,
+    )
+
+
+def test_derive_drive_complete_timeout_covers_a_900s_soak() -> None:
+    # B6 is B1's sibling and nastier. The sink's await opens at SINK_BOUND — before the other sinks bind,
+    # before the senders arm, before DRIVE_GO — and closes only after DRIVER_DONE + the /stats drain + the
+    # ENGINE_DRAINED gate. The old FIXED 600.0 therefore fired ~300s into a 900s hold: every sink recorded a
+    # partial tally and dropped its socket while the engine was still delivering. And because a sink
+    # self-timeout is not a drive CoordTimeout, no RUNG_ABORTED marker is posted, so B3's abort-invalidation
+    # never fires: the engine reads a REAL stranded>0 from store-truth and the soak renders a fabricated
+    # COLLAPSED, indistinguishable from a genuine product collapse. So the bound must DOMINATE the sum of
+    # the coordinator's own step timeouts across that window.
+    soak = _soak_sink_wait()
+    # 2*120 (sinks bind, senders arm) + (900+150+60 DRIVER_DONE) + 150 (drain) + 300 (engine gate) + 60
+    assert soak == 1860.0
+    assert soak > 600.0  # the bug: the old fixed default, blown by any hold >~540s
+    assert soak > 900.0 + 150.0  # clears the hold + drain outright
+    # The sink's window strictly CONTAINS the coordinator's DRIVER_DONE wait, so it must outlast it.
+    assert soak > _derive_driver_done_timeout(900.0, 150.0, None)
+
+
+def test_derive_drive_complete_timeout_climb_rung_and_toggles() -> None:
+    # A climb rung (hold 60, drain 150) also clears comfortably — closing the handback's secondary worry
+    # that a SLOW-DRAIN rung's SINK_BOUND->DRIVE_COMPLETE wall-time could itself approach the old 600s.
+    climb = _derive_drive_complete_timeout(
+        60.0,
+        150.0,
+        child_ready_timeout=120.0,
+        engine_drained_timeout=300.0,
+        await_engine_drained=True,
+    )
+    assert climb == 240.0 + 270.0 + 150.0 + 300.0 + 60.0 == 1020.0
+    assert climb > 600.0
+
+    # Without the PR-C2 store-truth drain gate the engine_drained term drops out entirely.
+    assert _soak_sink_wait(await_engine_drained=False) == 1860.0 - 300.0
+    # A driver_done override propagates into the sink's bound (the sink still contains that window).
+    assert _soak_sink_wait(driver_done_timeout=25.0) == 240.0 + 25.0 + 150.0 + 300.0 + 60.0
+    # An explicit sink override wins outright — the escape hatch, as with driver_done.
+    assert _soak_sink_wait(override=42.0) == 42.0
 
 
 # --- B2: an ABORTED soak reads as setup-degraded (exit 2), never a clean PASS with soak=null -----------

@@ -670,6 +670,80 @@ async def test_coordinator_round_trip_aggregates_sum_of_fakes(
     assert sum(n.startswith("[sink-") or n.startswith("[worker-") for n in report.notes) == 4
 
 
+async def test_coordinator_threads_derived_drive_complete_timeout_to_sinks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """REGRESSION (B6, rig handback 2026-07-10): a sink bounds its DRIVE_COMPLETE await, but that window
+    OPENS at its SINK_BOUND post and CLOSES at the coordinator's DRIVE_COMPLETE — strictly WIDER than the
+    coordinator's own DRIVER_DONE wait, which the B1 fix already derived. The sink child cannot derive it
+    (it never sees hold/drain), so the coordinator must compute it and pass it in the spawn argv. Before
+    this fix the child fell back to a hardcoded 600.0: any hold >~540s made every sink truncate its tally
+    and drop its socket mid-delivery, and — posting no RUNG_ABORTED marker — slipped past B3's
+    abort-invalidation into a REAL stranded>0, i.e. a fabricated collapse. Assert the derived bound
+    actually reaches the argv and that a 900s hold clears it."""
+    import types
+
+    worker_tally = {
+        0: {"sent": 10, "acked": 10, "ack_p50_ms": 1.0, "ack_p99_ms": 2.0, "bands": [0]}
+    }
+    sink_tally = {
+        0: {
+            "sink_received": 10,
+            "lane_inversions": 0,
+            "lane_repeats": 0,
+            "lanes_observed": 1,
+            "ports": [3700],
+        }
+    }
+    spawned = _install_coordinator_fakes(
+        monkeypatch,
+        sink_tally=sink_tally,
+        worker_tally=worker_tally,
+        engine_final=types.SimpleNamespace(done=10, dead=0, in_pipeline=0),
+    )
+
+    coord = FileDropCoord(tmp_path, run_id="b6")
+    coord.post(
+        SHARDS_READY,
+        {
+            "shards": ["a"],
+            "inbound_base": 3600,
+            "lanes": 1,
+            "dests": 1,
+            "api_ports": [9001],
+            "sink_base": 3700,
+            "sink_ports": 1,
+            "sink_port": 3700,
+        },
+    )
+    # The soak's shape: a 900s hold with the ladder's real drain/gate values.
+    await sc.run_shardcert_drive(
+        engine_host="10.0.0.5",
+        aggregate_rate=16.0,
+        hold_seconds=900.0,
+        driver_count=1,
+        sink_count=1,
+        sink_host="10.0.0.9",
+        coord=coord,
+        drain_timeout=150.0,
+        await_engine_drained=False,  # keep the fake handshake short; the gate term is unit-tested
+    )
+
+    sink_argv = [_flags(a) for a in spawned if a[0] == "shardcert-sink"]
+    assert len(sink_argv) == 1
+    passed = float(sink_argv[0]["--drive-complete-timeout"])
+    expected = sc._derive_drive_complete_timeout(
+        900.0,
+        150.0,
+        child_ready_timeout=120.0,
+        engine_drained_timeout=300.0,
+        await_engine_drained=False,
+    )
+    assert passed == expected
+    assert passed > 600.0  # the old hardcoded default the sink would otherwise have used
+    assert passed > 900.0  # ... and it outlasts the hold itself
+
+
 async def test_coordinator_threads_allow_insecure_to_remote_poller(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

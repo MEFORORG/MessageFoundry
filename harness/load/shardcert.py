@@ -115,6 +115,57 @@ def _derive_driver_done_timeout(
     return hold_seconds + drain_timeout + _DRIVER_DONE_MARGIN
 
 
+#: B6: slack added on top of the SUM of the coordinator's own step timeouts, to absorb coord-file polling
+#: jitter and child spawn cost. The sink budget is a bound, never a wait — a sink returns the instant
+#: DRIVE_COMPLETE lands — so over-shooting costs nothing, while under-shooting fabricates a collapse.
+_DRIVE_COMPLETE_MARGIN = 60.0
+
+
+def _derive_drive_complete_timeout(
+    hold_seconds: float,
+    drain_timeout: float,
+    *,
+    child_ready_timeout: float,
+    engine_drained_timeout: float,
+    await_engine_drained: bool,
+    driver_done_timeout: float | None = None,
+    override: float | None = None,
+) -> float:
+    """The sink's DRIVE_COMPLETE await timeout (B6): an explicit ``override`` if given, else a bound that
+    strictly DOMINATES every coordinator step between the sink's ``SINK_BOUND`` post and the coordinator's
+    ``DRIVE_COMPLETE`` post.
+
+    B6 is B1's sibling, and nastier. ``_derive_driver_done_timeout`` fixed only the COORDINATOR's wait; the
+    SINK ran a separate hardcoded 600s. The sink's window strictly CONTAINS the driver's — it opens EARLIER
+    (at ``SINK_BOUND``, before the remaining sinks bind, before the senders arm, before ``DRIVE_GO``) and
+    closes LATER (``DRIVE_COMPLETE`` trails ``DRIVER_DONE`` by the /stats drain poll AND the ENGINE_DRAINED
+    gate). So reusing ``hold + drain + margin`` here would still under-shoot. The interval the sink must
+    survive, in coordinator order:
+
+    1. ``child_ready_timeout``  — the remaining ``M-1`` sinks spawn and post SINK_BOUND (this sink is already
+       waiting; the FIRST sink to bind waits longest).
+    2. ``child_ready_timeout``  — the ``K`` sender children spawn and post DRIVER_ARMED.
+    3. ``driver_done_wait``     — DRIVE_GO → every DRIVER_DONE (spans the full hold; == the B1 derivation).
+    4. ``drain_timeout``        — the advisory remote ``/stats`` drain poll.
+    5. ``engine_drained_timeout`` — the PR-C2 store-truth drain gate, when ``await_engine_drained``.
+
+    Each term is the coordinator's OWN timeout for that step, so the sum is the longest run the coordinator
+    can have before it gives up and reaps us anyway. A sink that fires earlier records a partial tally and
+    drops its socket while the engine is still delivering — and because a sink self-timeout posts no
+    ``RUNG_ABORTED`` marker, B3's abort-invalidation never fires and the engine reads a REAL ``stranded>0``
+    from store-truth. The result is indistinguishable from a genuine product collapse. Hence: dominate."""
+    if override is not None:
+        return override
+    driver_done_wait = _derive_driver_done_timeout(hold_seconds, drain_timeout, driver_done_timeout)
+    return (
+        2.0 * child_ready_timeout
+        + driver_done_wait
+        + drain_timeout
+        + (engine_drained_timeout if await_engine_drained else 0.0)
+        + _DRIVE_COMPLETE_MARGIN
+    )
+
+
 #: B3: how long the engine waits, ONLY after a FAILED drain, for the drive's RUNG_ABORTED marker before
 #: concluding the failure was a genuine collapse rather than a drive-abort artifact. The drive posts the
 #: marker the instant it aborts (well before our drain times out), so this only absorbs coord timing jitter;
@@ -1838,6 +1889,11 @@ async def run_shardcert_sink(
     engine's outbound fan-out until it observes the coordinator's :data:`DRIVE_COMPLETE` (or a bounded
     ``drive_complete_timeout``), then records its final tally and posts :data:`SINK_DONE`.``<sink_index>``.
 
+    B6: ``drive_complete_timeout``'s 600s default applies ONLY to a manual standalone ``shardcert-sink``
+    run. The coordinator ALWAYS threads its :func:`_derive_drive_complete_timeout` value into the spawn
+    argv, because the safe bound depends on the run's hold/drain — which this child cannot see. Do not
+    "simplify" that back to the default: a hold ≳540s then silently truncates the tally (see B6 there).
+
     It binds a sink but NEVER drives load and NEVER spawns an engine — the sender tier
     (:func:`run_shardcert_driver_worker`) drives, the coordinator (:func:`run_shardcert_drive`) spawns.
     **Fail loud** if ``sink_index`` is out of range or the band does not partition cleanly (see
@@ -2302,6 +2358,7 @@ async def run_shardcert_drive(
     shards_ready_timeout: float = 300.0,
     child_ready_timeout: float = 120.0,
     driver_done_timeout: float | None = None,
+    drive_complete_timeout: float | None = None,
     sink_done_timeout: float = 120.0,
     drain_timeout: float = 90.0,
     reap_grace: float = 10.0,
@@ -2366,6 +2423,20 @@ async def run_shardcert_drive(
     procs: list[tuple[str, Any]] = []
     notes: list[str] = []
     poller: EnginePoller | None = None
+    # B6: the sink children each bound their DRIVE_COMPLETE await, and their window OPENS at SINK_BOUND
+    # (below) and CLOSES at our DRIVE_COMPLETE post (step 5) — strictly wider than our own DRIVER_DONE wait.
+    # They cannot derive it (they never see hold/drain), so derive it HERE and thread it into the argv. A
+    # sink that fires early truncates its tally with no RUNG_ABORTED marker, so B3 cannot invalidate the
+    # rung and the engine reports a real stranded>0: a fabricated collapse.
+    sink_drive_complete_wait = _derive_drive_complete_timeout(
+        hold_seconds,
+        drain_timeout,
+        child_ready_timeout=child_ready_timeout,
+        engine_drained_timeout=engine_drained_timeout,
+        await_engine_drained=await_engine_drained,
+        driver_done_timeout=driver_done_timeout,
+        override=drive_complete_timeout,
+    )
     try:
         # (1) Spawn the M sink children over CONTIGUOUS chunks of the [sink_base, sink_base+sink_ports)
         #     (== dests) band; await each SINK_BOUND.<m>.
@@ -2383,6 +2454,8 @@ async def run_shardcert_drive(
                     str(m),
                     "--sink-count",
                     str(sink_count),
+                    "--drive-complete-timeout",
+                    str(sink_drive_complete_wait),
                     "--coord-dir",
                     coord_dir,
                     "--run-id",

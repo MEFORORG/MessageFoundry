@@ -1097,6 +1097,15 @@ def _run_shardcert_sink(argv: list[str]) -> int:
         required=True,
         help="how many sinks the band is partitioned across (M)",
     )
+    parser.add_argument(
+        "--drive-complete-timeout",
+        type=float,
+        default=600.0,
+        help="B6: bounded max-wait from SINK_BOUND to the coordinator's DRIVE_COMPLETE, after which this "
+        "sink reports a PARTIAL tally. The coordinator (shardcert-drive) always passes a value derived "
+        "from the run's hold/drain, so this default applies only to a manual standalone sink. Raise it "
+        "for a long hold: a sink that fires early truncates its tally and fabricates a collapse",
+    )
     _add_coord_args(parser)
     parser.add_argument("--report-json", help="write the JSON report to this path")
     args = parser.parse_args(argv)
@@ -1115,6 +1124,7 @@ def _run_shardcert_sink(argv: list[str]) -> int:
                 sink_index=args.sink_index,
                 sink_count=args.sink_count,
                 coord=coord,
+                drive_complete_timeout=args.drive_complete_timeout,
             )
         )
     except ValueError as exc:  # a bad partition / out-of-range index — fail loud, setup error
