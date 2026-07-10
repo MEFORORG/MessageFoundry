@@ -878,6 +878,12 @@ def _throughput_rates(samples: list[EngineSample]) -> tuple[float, float]:
     return max(0.0, read), max(0.0, written)
 
 
+#: A3: a readable process whose cumulative CPU counter is EXACTLY flat across at least this many seconds
+#: is a wrong binding, not an idle engine — the CPU fields degrade to None (a visible gap) rather than a
+#: plausible 0.00. Sized above the sampler's coarse tick so a single short window can't trip it.
+_CPU_FLAT_GAP_SPAN_S = 5.0
+
+
 @dataclass(frozen=True)
 class _ProcDerived:
     """Derived process-footprint gauges over the window (each None where the OS probe couldn't read)."""
@@ -893,7 +899,15 @@ def _drain_proc(samples: list[EngineSample]) -> _ProcDerived:
     """Drain the per-sample :class:`ProcSample` side map and derive the footprint gauges: peak handle
     count, peak working set, total CPU-seconds consumed over the window (Δcumulative), and the peak/
     mean CPU utilisation (cores busy) derived from consecutive cumulative-CPU readings. A cumulative
-    CPU-seconds counter isn't meaningfully "averaged", so peak/mean are reported as cores-busy."""
+    CPU-seconds counter isn't meaningfully "averaged", so peak/mean are reported as cores-busy.
+
+    .. warning::
+       Each reading is a SUM over the engine subtree, and the subtree can change between ticks (a shard
+       worker spawns or exits). Differencing sums taken over DIFFERENT process sets is not a clean CPU
+       delta: a joining PID inflates it by that process's whole lifetime CPU, and a departing PID makes it
+       negative (clamped to ``0.0`` below). In practice the subtree grows once at engine start and is then
+       stable for the run, so the window's endpoints agree — but the gauge is only sound over a stable
+       subtree. See BACKLOG #220."""
     readings: list[tuple[float, ProcSample]] = []
     for s in samples:
         proc = _PROC_BY_SAMPLE.pop(id(s), None)
@@ -913,6 +927,21 @@ def _drain_proc(samples: list[EngineSample]) -> _ProcDerived:
         (e0, c0), (e1, c1) = cpu_pairs[0], cpu_pairs[-1]
         span = e1 - e0
         cpu_total = max(0.0, c1 - c0)
+        # A3 / B-class guard: a FLAT cumulative CPU counter over a non-trivial span is not a physical
+        # "0% CPU" — the counter's unit is 100 ns (Windows ticks) / a clock tick (POSIX), and we only got
+        # here because the process was READABLE (its handles/RSS parsed). A live process that consumed
+        # literally zero CPU across seconds does not exist; the sampler is bound to the wrong process —
+        # an idle launcher/supervisor, or a subtree cached before the shard workers spawned. Reporting
+        # 0.00 here is the signature defect of this harness: a plausible number where there is no
+        # measurement. Emit an explicit gap (None) so it renders as "n/a" and no CPU verdict is drawn.
+        if cpu_total == 0.0 and span >= _CPU_FLAT_GAP_SPAN_S:
+            return _ProcDerived(
+                handles_peak=handles_peak,
+                cpu_seconds_total=None,
+                cpu_util_cores_peak=None,
+                cpu_util_cores_mean=None,
+                working_set_peak_bytes=ws_peak,
+            )
         if span > 0.0:
             cpu_mean = cpu_total / span
         peak = 0.0

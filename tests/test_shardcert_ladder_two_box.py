@@ -30,7 +30,7 @@ from harness.load.shardcert import (
     _derive_engine_drained_timeout,
 )
 from harness.load.shardcert_ladder import (
-    TARGET_INGRESS_PER_S,
+    TARGET_EVENTS_PER_S,
     ClaimTiming,
     ConsolidatedLadderReport,
     LadderRung,
@@ -503,13 +503,48 @@ def test_report_floor_when_never_collapsed() -> None:
     assert "FLOOR" in rep.render()
 
 
-def test_report_target_clearing_ingress() -> None:
-    # 521/s is an INGRESS target (45M/day). A pinned 64/s ingress does NOT clear it; a pinned 600/s does.
-    below = _rep([_outcome(64.0, RungVerdict.SUSTAINED), _outcome(80.0, RungVerdict.COLLAPSED)])
-    assert below.clears_target_ingress is False
-    above = _rep([_outcome(600.0, RungVerdict.SUSTAINED), _outcome(640.0, RungVerdict.COLLAPSED)])
-    assert above.clears_target_ingress is True
-    assert math.isclose(TARGET_INGRESS_PER_S, 45_000_000 / 86_400)
+def test_report_target_clearing_events() -> None:
+    # B10: 520.83/s is a TOTAL-EVENTS target (45M/day, in + out), NOT an ingress target. At dests=8 each
+    # ingress message yields 9 events, so the boundary ingress is 520.833/9 = 57.87/s.
+    below = _rep([_outcome(50.0, RungVerdict.SUSTAINED), _outcome(56.0, RungVerdict.COLLAPSED)])
+    assert below.sustained_events_per_s == pytest.approx(450.0)  # 50 x 9
+    assert below.clears_target_events is False
+    above = _rep([_outcome(64.0, RungVerdict.SUSTAINED), _outcome(80.0, RungVerdict.COLLAPSED)])
+    assert above.sustained_events_per_s == pytest.approx(576.0)  # 64 x 9
+    assert above.clears_target_events is True  # under the OLD ingress gate this read False
+    assert math.isclose(TARGET_EVENTS_PER_S, 45_000_000 / 86_400)
+
+
+@pytest.mark.parametrize("dests", [1, 2, 4, 8, 16])
+def test_target_gate_fires_exactly_at_total_events_boundary(dests: int) -> None:
+    # The A0 falsifier. The gate must fire exactly at ingress = 520.8333 / (1 + dests), for every fan-out.
+    # A drain of 0 makes pinned_ingress_rate == the offered rate exactly, isolating the gate arithmetic.
+    boundary = TARGET_EVENTS_PER_S / (1 + dests)
+
+    def rep_at(ingress: float) -> ConsolidatedLadderReport:
+        return build_consolidated_report(
+            shards=("a", "b", "c", "d"),
+            dests=dests,
+            driver_count=4,
+            sink_count=8,
+            climb=[_honest_rung(ingress, drain_seconds=0.0)],
+            soak=None,
+            climb_aborted=False,
+            soak_aborted=False,
+        )
+
+    assert rep_at(boundary).clears_target_events is True  # >= fires AT the boundary
+    assert rep_at(boundary * 1.001).clears_target_events is True
+    assert rep_at(boundary * 0.999).clears_target_events is False
+    assert rep_at(boundary).sustained_events_per_s == pytest.approx(TARGET_EVENTS_PER_S)
+
+
+def test_target_gate_is_not_the_old_ingress_gate() -> None:
+    # Regression guard on B10 itself: at dests=8 the OLD gate demanded 520.83 ingress/s where the correct
+    # demand is 57.87 ingress/s — a 9x phantom. Pin a rate between the two and assert it now clears.
+    rep = _rep([_honest_rung(100.0, drain_seconds=0.0)])
+    assert 57.87 < 100.0 < TARGET_EVENTS_PER_S  # between the true and the phantom threshold
+    assert rep.clears_target_events is True
 
 
 def test_report_correctness_break_fails_verdict() -> None:
@@ -557,7 +592,7 @@ def test_collapsed_soak_reports_soak_not_sustained_not_pass() -> None:
     assert js["result"] == "SOAK_NOT_SUSTAINED"  # was "PASS" before B9
     assert js["soak_not_sustained"] is True
     assert js["exit_code"] == 0
-    assert js["schema_version"] == 2
+    assert js["schema_version"] == 3
     assert "SOAK NOT SUSTAINED" in rep.render()
 
 
@@ -705,7 +740,9 @@ def test_report_renders_and_serializes() -> None:
     text = rep.render()
     assert "SIZING ladder" in text
     assert "pinned sustainable ceiling: 24 ingress/s = 192 outbound/s" in text
-    assert "521/s INGRESS target" in text
+    assert "TOTAL-EVENTS target" in text
+    # B10: the render must show the total-events arithmetic, not compare ingress against the budget.
+    assert "24 ingress/s x (1 + 8 dests) = 216 events/s" in text
     assert "soak" in text.lower()
 
     js = rep.to_json_dict()
@@ -715,7 +752,12 @@ def test_report_renders_and_serializes() -> None:
     assert js["ceiling"]["pinned_ingress_rate"] == 24.0
     assert js["ceiling"]["pinned_outbound_rate"] == 192.0
     assert js["ceiling"]["first_collapse_ingress_rate"] == 28.0
-    assert js["ceiling"]["clears_target_ingress"] is False
+    assert js["ceiling"]["sustained_events_per_s"] == 216.0  # 24 ingress x (1 + 8 dests)
+    assert js["ceiling"]["clears_target_events"] is False  # 216 < 520.83
+    # B10 (v3): the old ingress-denominated keys are REMOVED, not redefined — a stale consumer must
+    # KeyError rather than branch on a boolean whose meaning silently flipped.
+    assert "clears_target_ingress" not in js["ceiling"]
+    assert "target_ingress_per_s" not in js
     assert isinstance(js["climb"], list) and len(js["climb"]) == 3
     assert js["soak"] is not None
 
@@ -834,19 +876,27 @@ def test_pick_soak_rate_skips_rungs_with_no_measured_drain() -> None:
     assert pick_soak_rate(climb, override=12.0) == 12.0
 
 
-def test_clears_target_ingress_no_longer_fires_at_true_149() -> None:
-    # The literal §8-gate correction: a rung offered 521 that only cleared via a long drain sustains ~149/s
-    # and must NOT clear the 521/s ingress target.
-    assert (
-        _rep([_honest_rung(521.0, drain_seconds=150.0, hold=60.0)]).clears_target_ingress is False
-    )
+def test_honest_rate_discounts_a_rung_that_only_cleared_via_a_long_drain() -> None:
+    # B8: a rung offered 521 that only cleared via a 150 s drain over a 60 s hold sustains 521*60/210 = 149/s.
+    # The honest-rate discount is what this asserts; it is INDEPENDENT of the B10 target-units question.
+    rep = _rep([_honest_rung(521.0, drain_seconds=150.0, hold=60.0)])
+    assert rep.pinned_ingress_rate == pytest.approx(521.0 * 60.0 / 210.0)  # ~148.9, not 521
+
+    # B10: that honest 148.9 ingress/s IS 1340 total events/s at dests=8, so it clears the 45M/day budget.
+    # The old gate compared 148.9 against 520.83 and reported NO — the 9x phantom. This is the correction.
+    assert rep.sustained_events_per_s == pytest.approx(521.0 * 60.0 / 210.0 * 9.0)
+    assert rep.clears_target_events is True
 
 
-def test_clears_target_ingress_fires_only_when_honest_ge_target() -> None:
-    # Kept-up (drain ≈ 0) at >= 520.833/s clears; the SAME offered rate with a large measured drain (honest
-    # below target) does not.
-    assert _rep([_honest_rung(521.0, drain_seconds=0.0)]).clears_target_ingress is True
-    assert _rep([_honest_rung(521.0, drain_seconds=60.0, hold=60.0)]).clears_target_ingress is False
+def test_target_gate_keys_off_the_honest_rate_not_the_offered_rate() -> None:
+    # The honest-rate discount still governs the gate: two rungs at the SAME offered 60/s ingress differ only
+    # in measured drain, and only the kept-up one clears. (60 x 9 = 540 >= 520.83; 30 x 9 = 270 < 520.83.)
+    kept_up = _rep([_honest_rung(60.0, drain_seconds=0.0)])
+    long_drain = _rep([_honest_rung(60.0, drain_seconds=60.0, hold=60.0)])
+    assert kept_up.pinned_ingress_rate == pytest.approx(60.0)
+    assert long_drain.pinned_ingress_rate == pytest.approx(30.0)  # 60 * 60/120
+    assert kept_up.clears_target_events is True
+    assert long_drain.clears_target_events is False
 
 
 def test_pinned_picks_max_honest_not_max_offered() -> None:
@@ -1076,7 +1126,7 @@ def test_peak_sampler_dedups(monkeypatch) -> None:
 def test_honest_rate_prefers_reliable_engine_drain_over_drive_miss() -> None:
     # The drive's remote await_drain MISSED (None) under load, but the engine store-truth drain IS present (a
     # SUSTAINED rung always has one). The honest rate must use the RELIABLE engine drain, NOT drop the rung
-    # from the ceiling — else clears_target_ingress reads False for a fleet that provably cleared the target.
+    # from the ceiling — else clears_target_events reads False for a fleet that provably cleared the target.
     base = _outcome(600.0, RungVerdict.SUSTAINED)
     rung = type(base)(
         **{
@@ -1095,8 +1145,8 @@ def test_honest_rate_prefers_reliable_engine_drain_over_drive_miss() -> None:
         600.0 * 60.0 / 65.0
     )  # sustained rung NOT excluded
     assert (
-        rep.clears_target_ingress is True
-    )  # 553.8 >= 520.833 — the fleet's clear is not mis-reported
+        rep.clears_target_events is True
+    )  # 553.8 ingress x 9 = 4984 events/s — the fleet's clear is not mis-reported
 
 
 def test_build_rung_outcome_reads_engine_drain_and_prefers_it() -> None:

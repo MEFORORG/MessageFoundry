@@ -14,7 +14,7 @@
 >    > **✅ FIXED — do not re-apply the 3.5× discount.** `ceiling.pinned_ingress_rate` is now the **D1
 >    > drain-discounted honest rate** (`RungOutcome.sustainable_ingress_rate` = `ingress × hold /
 >    > (hold + drain)`, using the *measured* engine drain, never the drain *timeout*), and
->    > `clears_target_ingress` keys off it. Multiplying by `(hold+drain)/hold` again **double-discounts**.
+>    > `clears_target_events` keys off it. Multiplying by `(hold+drain)/hold` again **double-discounts**.
 >    >
 >    > **Read the honest series, not just the pin.** It *declines* as the offer rises — the fleet is not
 >    > gaining headroom, it is absorbing a larger burst and draining it afterwards. On the pooled ceiling
@@ -150,8 +150,16 @@ Then **stop the instances** (a stopped instance loses the ephemeral store on res
 
 - `ceiling.pinned_ingress_rate` / `pinned_outbound_rate` — the highest sustained rung (a **floor** if the
   climb never collapsed → raise the ladder); `first_collapse_ingress_rate` brackets it from above.
-- `ceiling.clears_target_ingress` — whether the pinned **ingress** rate clears ~521/s. This is the number
+- `ceiling.sustained_events_per_s` — the pinned rate in **total message events/s**
+  (`pinned_ingress_rate × (1 + dests)`), the currency the 45M/day budget is denominated in.
+- `ceiling.clears_target_events` — whether that **total-events** rate clears ~521/s. This is the number
   the §8 decision keys off, but the bench only reports it.
+  > **B10 (schema_version 3, 2026-07-10).** This was `clears_target_ingress`, and it compared a pure
+  > *ingress* rate against the *total-events* budget — a units defect that made the gate `(1 + dests)`×
+  > too strict (**9×** at the bench default `dests=8`). Every "52× short" figure published before that
+  > date carries the inflation; the honest pooled gap is **5.79×**. The old keys `clears_target_ingress`
+  > and `target_ingress_per_s` were **removed rather than redefined**, so a stale consumer raises
+  > `KeyError` instead of silently branching on a boolean whose meaning flipped.
 - `soak_ok` — the soak held: its verdict is **SUSTAINED**, and that alone. B5 removed the `in_pipeline`
   slope from this gate (the de-inflated slope proved sign-unstable across rates); the slope is still
   *printed* as advisory context. Saturation is caught by SUSTAINED requiring the backlog to drain inside

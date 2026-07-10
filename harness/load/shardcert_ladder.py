@@ -29,10 +29,18 @@ never gated on. **This bench REPORTS numbers; it does NOT flip ``SYSTEM-REQUIREM
 own fix** (the two-box governance rule). Counts + synthetic topology only — never message bodies /
 control-ids (PHI rule).
 
-The **target** is the 45M-messages/day figure = 45_000_000 / 86_400 ≈ **520.83 msg/s of INGRESS**
-(:data:`TARGET_INGRESS_PER_S`). Because every accepted message fans out to ``dests`` destinations,
-``delivered = ingress * dests``, so the report always states BOTH figures and is explicit that 521/s is
-measured against INGRESS, not the outbound delivery rate.
+The **target** is the 45M-messages/day figure = 45_000_000 / 86_400 ≈ **520.83 TOTAL message events/s**
+(:data:`TARGET_EVENTS_PER_S`) — inbound *and* outbound, per the owner ruling. Because every accepted
+message fans out to ``dests`` destinations, one ingress message produces ``1 + dests`` total events
+(``delivered = ingress * dests``). So the sustainable ingress that saturates the budget is
+``TARGET_EVENTS_PER_S / (1 + dests)``, and the report states BOTH figures.
+
+.. warning::
+   Until 2026-07-10 this constant was named ``TARGET_INGRESS_PER_S`` and the gate compared it against a
+   pure **ingress** rate — a units defect (harness defect **B10**) that made the gate ``(1 + dests)``x too
+   strict, i.e. **9x** at the bench default ``dests=8``. Every "52x short" figure published before that
+   date carries that inflation. The JSON keys were renamed in ``schema_version`` 3 so that a stale
+   consumer fails loudly with a ``KeyError`` rather than silently reading a boolean whose meaning flipped.
 """
 
 from __future__ import annotations
@@ -64,8 +72,10 @@ from harness.load.shardcert import (
     run_shardcert_engine,
 )
 
-#: 45M messages/day, expressed as the sustained INGRESS rate the ladder pins against.
-TARGET_INGRESS_PER_S = 45_000_000 / 86_400  # ≈ 520.833…
+#: 45M messages/day as the sustained TOTAL message-event rate (inbound + outbound) the ladder pins
+#: against. NOT an ingress rate: one ingress message with ``dests`` destinations produces ``1 + dests``
+#: events, so the ingress that saturates this budget is ``TARGET_EVENTS_PER_S / (1 + dests)``.
+TARGET_EVENTS_PER_S = 45_000_000 / 86_400  # ≈ 520.833…
 
 #: A slope (in_pipeline rows per second over the soak hold) at or below this magnitude reads as
 #: "flat or draining" — a sustainable plateau. Above it, the backlog is growing = slow saturation.
@@ -862,11 +872,21 @@ class ConsolidatedLadderReport:
         return self.pinned_ingress_rate is not None and self.first_collapse_ingress_rate is not None
 
     @property
-    def clears_target_ingress(self) -> bool:
-        """Whether the pinned SUSTAINED ingress rate clears the 45M/day = ~521 msg/s INGRESS target. This
-        is the number the §8 N-active decision keys off — but the bench only REPORTS it; the owner decides."""
+    def sustained_events_per_s(self) -> float | None:
+        """The pinned SUSTAINED rate expressed in TOTAL message events/s — the currency the 45M/day budget
+        is denominated in. One ingress message yields itself plus one event per destination."""
         p = self.pinned_ingress_rate
-        return p is not None and p >= TARGET_INGRESS_PER_S
+        return None if p is None else p * (1 + self.dests)
+
+    @property
+    def clears_target_events(self) -> bool:
+        """Whether the pinned SUSTAINED rate clears the 45M/day = ~521 TOTAL events/s target. This is the
+        number the §8 N-active decision keys off — but the bench only REPORTS it; the owner decides.
+
+        B10: this used to compare a pure ingress rate against the total-events budget, making the gate
+        ``(1 + dests)``x too strict (9x at the bench default ``dests=8``)."""
+        e = self.sustained_events_per_s
+        return e is not None and e >= TARGET_EVENTS_PER_S
 
     @property
     def soak_ok(self) -> bool:
@@ -994,11 +1014,11 @@ class ConsolidatedLadderReport:
 
     def render(self) -> str:
         lines = [
-            "ShardCert two-box SIZING ladder — pin the post-#842 delivered ceiling vs the 521/s ingress "
-            "target (45M/day)",
+            "ShardCert two-box SIZING ladder — pin the post-#842 delivered ceiling vs the 521/s "
+            "TOTAL-EVENTS target (45M/day, inbound + outbound)",
             f"  topology: shards={'/'.join(self.shards)} dests={self.dests} "
             f"K={self.driver_count} senders x M={self.sink_count} sinks   "
-            f"(delivered = ingress x dests; 521/s target is INGRESS)",
+            f"(delivered = ingress x dests; total events = ingress x (1 + dests))",
             "",
             "  climb (ascending ingress rate; stops at the first collapse):",
         ]
@@ -1036,9 +1056,12 @@ class ConsolidatedLadderReport:
                 lines.append(
                     f"    first collapse at: {fc:g} ingress/s = {fc * self.dests:g} outbound/s"
                 )
+            ev = self.sustained_events_per_s
             lines.append(
-                f"    clears 521/s INGRESS target? {'YES' if self.clears_target_ingress else 'NO'} "
-                f"({pin:g} vs {TARGET_INGRESS_PER_S:.1f} ingress/s)"
+                f"    clears {TARGET_EVENTS_PER_S:.1f}/s TOTAL-EVENTS target? "
+                f"{'YES' if self.clears_target_events else 'NO'} "
+                f"({pin:g} ingress/s x (1 + {self.dests} dests) = {ev:g} events/s "
+                f"vs {TARGET_EVENTS_PER_S:.1f} events/s)"
             )
         lines.append("")
         if self.soak is not None:
@@ -1117,7 +1140,13 @@ class ConsolidatedLadderReport:
             # v2 (B9): `result` gained SOAK_NOT_SUSTAINED + SOAK_UNCONFIRMED, and the two booleans below are
             # new. A collapsed soak used to serialize as "PASS". `exit_code` is unchanged (0 — a throughput
             # ceiling is a measurement, not a correctness verdict), so gate automation on `result`, not exit.
-            "schema_version": 2,
+            #
+            # v3 (B10): the 45M/day target is TOTAL message events/s (in + out), not ingress/s. The keys
+            # `target_ingress_per_s` and `ceiling.clears_target_ingress` are REMOVED, not redefined — a
+            # boolean whose meaning silently flipped is exactly this harness's signature defect, so a stale
+            # consumer must KeyError rather than branch on a wrong-but-plausible value. Replacements:
+            # `target_events_per_s`, `ceiling.sustained_events_per_s`, `ceiling.clears_target_events`.
+            "schema_version": 3,
             "kind": "shardcert_ladder_two_box",
             "result": self.result_label,
             "exit_code": self.exit_code,
@@ -1132,10 +1161,10 @@ class ConsolidatedLadderReport:
                 "driver_count": self.driver_count,
                 "sink_count": self.sink_count,
             },
-            "target_ingress_per_s": round(TARGET_INGRESS_PER_S, 3),
+            "target_events_per_s": round(TARGET_EVENTS_PER_S, 3),
             "ceiling": {
                 # D1: honest sustainable rate (offered spread over hold + MEASURED drain), not the inflated
-                # raw offered ingress_rate. clears_target_ingress keys off pinned_ingress_rate.
+                # raw offered ingress_rate. clears_target_events keys off pinned_ingress_rate x (1 + dests).
                 "pinned_ingress_rate": (
                     None if self.pinned_ingress_rate is None else round(self.pinned_ingress_rate, 3)
                 ),
@@ -1153,7 +1182,13 @@ class ConsolidatedLadderReport:
                 ),
                 "first_collapse_ingress_rate": self.first_collapse_ingress_rate,
                 "bracketed": self.ceiling_bracketed,
-                "clears_target_ingress": self.clears_target_ingress,
+                # B10: total events = ingress x (1 + dests). Gate on events, never on ingress alone.
+                "sustained_events_per_s": (
+                    None
+                    if self.sustained_events_per_s is None
+                    else round(self.sustained_events_per_s, 3)
+                ),
+                "clears_target_events": self.clears_target_events,
             },
             "soak": None if self.soak is None else self.soak.to_json_dict(),
             "soak_ok": self.soak_ok,

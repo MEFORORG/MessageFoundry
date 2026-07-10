@@ -39,16 +39,32 @@ jobs:
   resync:
     name: Re-export lock files and push to the PR branch
     runs-on: ubuntu-latest
-    if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
+    # TWO conditions, both required. This is a conjunction — it only ever NARROWS who can run the job.
+    #
+    #  1. pull_request.user.login — the IMMUTABLE PR author. A third party pushing commits into a
+    #     Dependabot PR still cannot make this job run. (Unchanged; see SECURITY MODEL above.)
+    #
+    #  2. github.triggering_actor — who caused THIS run. Dependabot secrets are exposed only when the
+    #     run is triggered by dependabot[bot]. When this job pushes the resynced locks, that push
+    #     fires a `synchronize` event whose triggering actor is the App (mefor-lock-resync[bot]); the
+    #     follow-up run therefore sees NO Dependabot secrets, `create-github-app-token` gets an empty
+    #     client-id, and the job dies — a phantom red on a PR whose resync had already SUCCEEDED
+    #     seconds earlier. Observed on #801:
+    #         00:04:30  triggering_actor=dependabot[bot]        -> success, pushed the resync commit
+    #         00:04:48  triggering_actor=mefor-lock-resync[bot] -> failure, "client-id ... is required"
+    #     Skipping the self-triggered re-run is correct: the work is already done. The secrets are
+    #     configured correctly under Settings > Secrets and variables > Dependabot; nothing to add.
+    if: >-
+      ${{ github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.triggering_actor == 'dependabot[bot]' }}
     timeout-minutes: 10
     steps:
-      # A Dependabot-triggered `pull_request` run reads **Dependabot** secrets, not Actions secrets
-      # (https://docs.github.com/code-security/dependabot/working-with-dependabot/automating-dependabot-with-github-actions).
-      # If LOCK_RESYNC_APP_* live only under Actions secrets, `create-github-app-token` receives an
-      # empty client-id and fails the job — reddening every Dependabot PR for a reason that has
-      # nothing to do with the dependency (this is what happened on #801). Detect that and skip with
-      # an actionable notice instead. Skipping is SAFE: lock/DEP-1 sync is independently enforced by
-      # the `pip-audit` job in security.yml, which fails a genuinely stale lock.
+      # Belt and braces. With the triggering_actor gate above, a run that reaches this step IS
+      # Dependabot-triggered, so the Dependabot secrets should be visible. If they are not, that is a
+      # genuine misconfiguration (the App was removed, or the secrets were added under *Actions*
+      # secrets rather than *Dependabot* secrets) — say so precisely rather than dying on an opaque
+      # "client-id is required". Skipping stays SAFE: DEP-1 lock/export sync is independently enforced
+      # by the `pip-audit` job in security.yml, which fails a genuinely stale lock.
       - name: Are the App credentials visible to this run?
         id: creds
         env:
@@ -59,7 +75,7 @@ jobs:
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=lock-resync skipped::LOCK_RESYNC_APP_ID / LOCK_RESYNC_APP_PRIVATE_KEY are not visible to this run. A Dependabot-triggered pull_request run reads Dependabot secrets, not Actions secrets — add them under Settings > Secrets and variables > Dependabot to enable automatic lock re-export. DEP-1 lock sync is still enforced by the pip-audit job in security.yml."
+            echo "::warning title=lock-resync skipped (misconfiguration)::This run WAS triggered by dependabot[bot], yet LOCK_RESYNC_APP_ID is empty. The App credentials must live under Settings > Secrets and variables > *Dependabot* (not Actions) for a Dependabot-triggered run to read them. Skipping the re-export; DEP-1 lock sync is still enforced by the pip-audit job in security.yml."
           fi
 
       - name: Mint a scoped GitHub App token

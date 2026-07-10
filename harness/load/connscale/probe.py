@@ -40,6 +40,10 @@ _PROBE_TIMEOUT_S = 5.0
 # Windows TotalProcessorTime is exposed as .Ticks (100-ns units); seconds = ticks / this. Reading the
 # integer ticks (not the culture-formatted .CPU double) keeps the parse locale-proof.
 _WIN_CPU_TICKS_PER_S = 10_000_000.0
+# A3: re-walk the process table every N sample ticks so a sharded engine's late-spawned `serve --shard`
+# workers join the subtree. A full walk is the expensive part of a tick, so amortise it rather than
+# paying it every time; at the runner's poll cadence this re-checks the topology every few seconds.
+_RESOLVE_EVERY_TICKS = 8
 
 
 @dataclass(frozen=True)
@@ -69,14 +73,20 @@ class FdSampler:
     handle-count-only shape (``int | None``). Every field is ``None`` when nothing in the subtree could
     be read (a dead tree / a missing tool) so a poll tick records a gap, never raises."""
 
-    def __init__(self, pid: int) -> None:
+    def __init__(self, pid: int, *, resolve_every: int = _RESOLVE_EVERY_TICKS) -> None:
         self._pid = pid
-        self._pids: list[int] | None = None  # [root, *descendants], resolved lazily once
+        self._pids: list[int] | None = None  # [root, *descendants], re-resolved every N ticks
         # True while the last subtree resolution ERRORED (Windows enumeration failed/timed out) — as
         # opposed to a genuine no-descendants result. An errored resolution is NOT cached (so a later
         # tick retries) and its samples are reported probe-degraded (all None) rather than measuring the
         # thin launcher process, whose footprint is NOT the engine's on Windows.
         self._resolve_errored = False
+        # A3: the subtree is NOT stable for a SHARDED engine — ADR 0037's supervisor spawns one
+        # `serve --shard` subprocess per shard, and a subtree cached before they appear measures an idle
+        # supervisor forever (a flat CPU counter that used to render as a plausible 0.00). Re-resolve
+        # periodically so late-spawned workers are counted. `resolve_every=1` re-walks every tick.
+        self._resolve_every = max(1, resolve_every)
+        self._ticks_since_resolve = 0
 
     @property
     def pid(self) -> int:
@@ -103,9 +113,16 @@ class FdSampler:
         return self._sample_posix(pids)
 
     def _resolve_pids(self) -> list[int]:
-        """Resolve the engine's process subtree ONCE (root + descendants). The tree is stable during a
-        run (the engine doesn't re-spawn mid-hold), so a SUCCESSFUL resolution pays one process-table
-        walk, not one per tick.
+        """Resolve the engine's process subtree (root + descendants), re-walking every
+        ``resolve_every`` ticks so a sharded engine's late-spawned workers are picked up. A cached
+        resolution serves the ticks in between, so this costs one process-table walk per N ticks, not one
+        per tick.
+
+        A3: the subtree was previously resolved exactly ONCE, on the premise that "the engine doesn't
+        re-spawn mid-hold". That holds for a single-process engine but NOT for a sharded one (ADR 0037
+        spawns one ``serve --shard`` subprocess per shard). A subtree resolved before those children
+        appear pins the sampler to an idle supervisor for the whole run — its CPU counter never advances,
+        which used to surface as a plausible ``0.00`` rather than a gap.
 
         An ERRORED Windows resolution (enumeration failed/timed out under load) is deliberately NOT
         cached: on Windows the real engine is a CHILD of the thin launcher ``self._pid``, so caching a
@@ -114,7 +131,15 @@ class FdSampler:
         the launcher footprint), and leaves ``_pids`` unresolved so the next tick retries. A GENUINE
         no-descendants result (``[]`` — the normal Linux case, engine == root) IS cached and NOT flagged."""
         if self._pids is not None:
-            return self._pids
+            self._ticks_since_resolve += 1
+            if self._ticks_since_resolve < self._resolve_every:
+                # Serving a previously-VALIDATED subtree. If the last re-resolve errored, that error
+                # applied to that tick only — the cached subtree is still the best known truth, and
+                # degrading every tick until the next re-walk would turn one transient enumeration
+                # failure into a run-long blackout. Clear the flag so this tick reports a real reading.
+                self._resolve_errored = False
+                return self._pids
+        self._ticks_since_resolve = 0
         descendants = self._descendants_windows() if _WINDOWS else self._descendants_posix()
         if descendants is None:
             self._resolve_errored = True

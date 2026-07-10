@@ -134,7 +134,18 @@ def test_changelog_crossref_is_quiet_for_closed_items() -> None:
     assert bsc.scan(backlog, changelog)[1] == []
 
 
+_BACKLOG = _ROOT / "docs" / "BACKLOG.md"
+
+
+@pytest.mark.skipif(
+    not _BACKLOG.exists(),
+    reason="docs/BACKLOG.md is private-only (OSS-mirror deny-list); absent on the mirror snapshot",
+)
 def test_the_real_backlog_satisfies_the_invariant() -> None:
-    """The operative guard: `docs/BACKLOG.md` itself must pass on every PR."""
-    errors, _ = bsc.scan((_ROOT / "docs" / "BACKLOG.md").read_text(encoding="utf-8"))
+    """The operative guard: `docs/BACKLOG.md` itself must pass on every PR.
+
+    On the public mirror the file is deny-listed (never published), so this test skips there —
+    the guard is enforced by the private repo's CI, where the file always exists.
+    """
+    errors, _ = bsc.scan(_BACKLOG.read_text(encoding="utf-8"))
     assert errors == [], "docs/BACKLOG.md violates the status invariant:\n" + "\n".join(errors)

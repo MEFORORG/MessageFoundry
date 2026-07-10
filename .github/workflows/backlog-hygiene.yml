@@ -32,7 +32,10 @@ concurrency:
 
 jobs:
   banner-on-implementation:
-    name: a PR that implements BACKLOG #N must update BACKLOG.md
+    # QUOTED: an unquoted YAML scalar ends at " #" (comment start), which silently truncated this to
+    # "a PR that implements BACKLOG". The job name is the required-status-check *context* string, so
+    # a truncated name is what you would have to add to branch protection.
+    name: "a PR that implements BACKLOG #N must update BACKLOG.md"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
