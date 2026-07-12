@@ -483,6 +483,14 @@ class Destination(BaseModel):
     # even on production-PHI. Default False → keyed purely on posture (existing outbounds byte-identical).
     tls_hop_attested: bool = False
     tls_hop_attested_reason: str | None = None
+    # #201 (ADR 0078 amendment): per-connection attestation that a revocation-checking PKI backs a
+    # VERIFYING outbound TLS hop (MLLP-over-TLS / https REST-SOAP-FHIR). The engine performs no OCSP/CRL
+    # (stdlib ssl has none), so an off-loopback production-PHI verified hop is REFUSED at construction /
+    # check / dry-run unless this flag (or the blanket MEFOR_TLS_REVOCATION_ATTESTED env) is set — the
+    # operator taking responsibility for revocation, exactly like the ADR 0078 in-process [api] gate.
+    # Default False → keyed purely on posture (existing verifying outbounds are byte-identical). Distinct
+    # from tls_hop_attested (which attests a CLEARTEXT/verify-off hop is secure by other means, #200).
+    tls_revocation_attested: bool = False
     # #190 (ADR 0093): the instance-wide [tls] client trust-anchor policy, threaded by the runner's
     # _dest_config so the internal-outbound TLS context builders (MLLP/DICOM/FTPS) resolve the same
     # anchor at build_check AND live construction. Default = system/None → a no-op (the OS trust store

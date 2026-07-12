@@ -129,3 +129,68 @@ async def test_dead_letter_batch_skips_vanished(store: Any) -> None:
     _mids, ids = await _n_outbound(store, 2)
     await store.dead_letter_batch([ids[0], "gone", ids[1]], "AR", now=300.0)
     assert await store.count_dead() == 2
+
+
+# --- H-8 lock ordering: every multi-message finalizer takes its per-message locks in SORTED order --
+#
+# The ADR 0082 batch primitives each finalize N distinct message_ids in ONE transaction, and the
+# finalizer takes a per-message lock (a SQL Server applock / a Postgres advisory lock). They built
+# their finalize set as a dict keyed in *caller* (outbox_ids) order and then iterated it, so two
+# concurrent batches holding overlapping id sets could take the same two locks in OPPOSITE orders and
+# deadlock (SQL Server 1205). A fan-out message has one outbound row per destination and each
+# destination lane batches independently, so overlapping sets are reachable in normal operation.
+#
+# The store's documented H-8 rule is that a finalizer spanning more than one message acquires in
+# CANONICAL (sorted) id order — see _lock_finalize_batch. These pin that the batch primitives obey it.
+# They fail on the pre-fix code (which yielded caller order) for any batch whose ids arrive unsorted.
+
+
+def _descending(mids: list[str], ids: list[str]) -> list[str]:
+    """Outbox ids ordered so their message_ids DESCEND — the worst case for the pre-fix code, and
+    deterministic: for n>=2 distinct ids, descending can never coincide with ascending."""
+    return [i for _m, i in sorted(zip(mids, ids), reverse=True)]
+
+
+async def _finalize_order(store: Any, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Spy the per-message finalizer, returning the message_ids in the order it was called."""
+    seen: list[str] = []
+    name = "_maybe_finalize" if hasattr(store, "_maybe_finalize") else "_maybe_finalize_message"
+    original = getattr(store, name)
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        # message_id is the first str positional (SQL Server passes a cursor/conn ahead of it).
+        seen.append(next(a for a in args if isinstance(a, str)))
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(store, name, spy)
+    return seen
+
+
+async def test_mark_batch_done_finalizes_in_sorted_id_order(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mids, ids = await _n_outbound(store, 4)
+    seen = await _finalize_order(store, monkeypatch)
+    await store.mark_batch_done(_descending(mids, ids), now=300.0)
+    assert seen == sorted(mids), "H-8: multi-message finalize must acquire in canonical id order"
+
+
+async def test_mark_batch_failed_finalizes_in_sorted_id_order(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mids, ids = await _n_outbound(store, 4)
+    seen = await _finalize_order(store, monkeypatch)
+    # max_attempts=0 => the batch dead-letters, which is the path that finalizes every member.
+    await store.mark_batch_failed(
+        _descending(mids, ids), "boom", RetryPolicy(max_attempts=0), now=300.0
+    )
+    assert seen == sorted(mids), "H-8: multi-message finalize must acquire in canonical id order"
+
+
+async def test_dead_letter_batch_finalizes_in_sorted_id_order(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mids, ids = await _n_outbound(store, 4)
+    seen = await _finalize_order(store, monkeypatch)
+    await store.dead_letter_batch(_descending(mids, ids), "boom", now=300.0)
+    assert seen == sorted(mids), "H-8: multi-message finalize must acquire in canonical id order"

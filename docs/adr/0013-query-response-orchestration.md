@@ -488,3 +488,34 @@ A task isn't done until these pass (CLAUDE.md §5 — new behavior gets a test):
 | **DATABASE capture via a separate post-write `SELECT`** | Works on any backend | Runs **after** `send`'s commit ([database.py:237](../../messagefoundry/transports/database.py)) in a new txn; a crash-re-run re-executes the non-idempotent write and the `SELECT` reads different state. Not re-run-stable | **Rejected (→ `RETURNING`/`OUTPUT` only)** |
 | **Re-ingress via a bare `enqueue_ingress` (Increment 2)** | Reuses the existing ingress entry point | `enqueue_ingress` mints a new `uuid4().hex` and consumes no row ([store.py:1062](../../messagefoundry/store/store.py)) → a re-run double-injects the answer | **Rejected (→ atomic `ingress_handoff`)** |
 | **Do nothing (keep discarding the reply)** | Zero risk to invariants | Forecloses request/response + ACK-reconciliation feeds central to the Corepoint migration; the reply already exists in the transport and is wasted | **Rejected** |
+
+## Amendment (2026-07-12) — captured HTTP response headers (BACKLOG #154)
+
+`DeliveryResponse` (Increment 1) round-tripped the reply **body / outcome / detail**, but read **no**
+response headers — so a `Location`/`ETag` from a FHIR `create` (the actionable result lives in a header,
+not the body) was unreachable. #154 folds a per-connection **allow-list** of HTTP response header names
+into the *existing* DeliveryResponse carriage.
+
+**Contract.**
+
+- `DeliveryResponse` gains `headers: Mapping[str, str]` (default `{}` → every non-HTTP / non-configured
+  destination is **byte-identical**). It is a **captured external value** — read off the wire at delivery,
+  like the `fhir_lookup` read-only carve-out (ADR 0043) — so it reflects the partner's reply at that pass;
+  the capture is **deterministic per reply** (the same allow-listed names off the same reply → the same
+  map), so it re-ingresses re-run-stably from the immutable stored copy.
+- **Allow-list is the PHI gate.** REST/SOAP/FHIR each take `capture_response_headers` (a list of header
+  names, case-insensitive). **Only** those names are ever captured — never all headers, because a partner
+  reply header could carry sensitive data. Empty / unset → capture nothing.
+- **Store carry.** A new **nullable `resp_headers` column** on the `response` table (SQLite / Postgres /
+  SQL Server — schema + idempotent add-column migration) holds the JSON-encoded map, **encrypted at rest**
+  and **rekey / retention-null / encrypt-existing covered** exactly like `detail`. `complete_with_response`
+  gains `response_headers=`; `correlate_response` surfaces it as `CapturedResponse.headers`.
+- **Surface.** A re-ingressed answer's Handler reads them through the **already-shipped**
+  `response_get(dest).headers` seam (Increment 2, Q6) — the transform worker's `response_view` already
+  carries the origin's `CapturedResponse` in both the normal and fused (SS) paths, so **no new reader
+  contract** was added.
+
+**Why a new column (over folding into `detail`).** `detail` is a short human-readable reason
+(`HTTP 201`) shown verbatim; overloading it with structured header JSON would break that contract and every
+reader. The nullable encrypted column reuses the store's existing column-migration + PHI-at-rest machinery
+and reaches the designed `response_get` reader with zero new surface.

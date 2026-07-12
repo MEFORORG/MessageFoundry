@@ -66,11 +66,26 @@ _SYNTHETIC = HopPosture(is_phi=False, production=False)  # no PHI on the wire
 _CELLS = list(_CLEARTEXT)
 
 
-def _build(spec: tuple[Any, Any, str], *, attested: bool = False, **over: Any) -> object:
+def _build(
+    spec: tuple[Any, Any, str],
+    *,
+    attested: bool = False,
+    revocation_attested: bool = False,
+    **over: Any,
+) -> object:
     ctype, factory, url = spec
     settings = factory(url=url, **over).settings
     return build_destination(
-        Destination(name="OB", type=ctype, settings=settings, tls_hop_attested=attested)
+        Destination(
+            name="OB",
+            type=ctype,
+            settings=settings,
+            tls_hop_attested=attested,
+            # #201 (ADR 0078 amendment): a VERIFYING https hop now also carries a revocation refusal;
+            # tests that build a prod-PHI verified remote hop and expect SUCCESS attest revocation here
+            # so the (distinct) cleartext #200 assertions stay the subject under test.
+            tls_revocation_attested=revocation_attested,
+        )
     )
 
 
@@ -307,8 +322,10 @@ def test_https_verified_connector_has_no_send_guard(
     cell: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    # A verified https hop carries no CLEARTEXT send guard (#200). It DOES now carry a #201 revocation
+    # refusal on a prod-PHI remote hop, so attest revocation to keep the subject (the cleartext guard).
     with active_hop_posture(_PROD):
-        dest = _build(_HTTPS[cell])
+        dest = _build(_HTTPS[cell], revocation_attested=True)
     assert dest._hop_guard is None  # type: ignore[attr-defined]
 
 

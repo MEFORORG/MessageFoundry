@@ -1,5 +1,20 @@
 # ADR 0057 — Inline Step-A Fast-Path: Collapse the Routed Stage for No-Lookup, All-Deliver, Single-Handler Messages
 
+> # ⚠️ GATED (2026-07-12) by [ADR 0099](0099-phase-4-group-commit-amortize-the-per-event-transaction-cost.md) — **measure before you build**
+> **This is now the ONLY surviving Phase-4 mechanism** — [ADR 0055](0055-group-commit-durable-write.md)
+> (group-commit), which the Status line below says this "builds on", has been **WITHDRAWN** (its premise was measured
+> false and delayed durability breaks at-least-once on PHI). **Inline fusion stands on its own; it does not depend on
+> 0055.**
+>
+> **It is already implemented and shipping in the tree — and it has NEVER been enabled in a single rig run.**
+>
+> **No further production code may be written for it until a pre-registered P0 measurement clears its bar**
+> ([ADR 0101](0101-pre-registered-falsifier-discipline-for-performance-measurement.md)): a decision rule fixed before
+> the run, a manipulation check on `committed_txns`, a same-session OFF control, a stated null band, **and a
+> regression band** — because fusion *removes stage-level overlap*, which is structurally the trade **C7's `MAXDOP=1`
+> made, and it lost.** P0's first job is to measure **`txn/s`**, which has never been counted. If it sits far below
+> the store's ~27–29k commits/s ceiling, **the whole Phase-4 premise is dead and we stop.**
+
 **Status:** Proposed · **Date:** 2026-06-30 · **Supersedes/Amends:** ADR 0001 (staged pipeline), builds on ADR 0055 (group-commit durable-write). **ADR number to use: 0057** (next free; 0056 is the highest present).
 
 This is the chosen design out of three candidates. It is the **smallest, default-OFF, byte-identical-when-OFF** lever that meaningfully cuts the 7-deep commit chain, and it survives adversarial review **with a fixed set of guardrails** (all of which are cheap, code-local, and verified against the checkout below). The two rejected alternatives and why are in *Consequences → Alternatives*.

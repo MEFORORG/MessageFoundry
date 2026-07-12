@@ -2,7 +2,7 @@
   "name": "messagefoundry",
   "displayName": "MessageFoundry",
   "description": "Author, test, and monitor MessageFoundry HL7 v2 interfaces in VS Code.",
-  "version": "0.0.20",
+  "version": "0.0.24",
   "publisher": "messagefoundry",
   "icon": "media/icon.png",
   "license": "SEE LICENSE IN LICENSE",
@@ -44,27 +44,27 @@
       {
         "command": "messagefoundry.refreshGraph",
         "title": "MessageFoundry: Refresh Connections",
-        "icon": "$(refresh)"
+        "icon": "media/refresh-amber.svg"
       },
       {
         "command": "messagefoundry.filterConnections",
         "title": "MessageFoundry: Filter Connections",
-        "icon": "$(filter)"
+        "icon": "media/filter-amber.svg"
       },
       {
         "command": "messagefoundry.groupConnections",
         "title": "MessageFoundry: Group Connections",
-        "icon": "$(list-tree)"
+        "icon": "media/list-tree-amber.svg"
       },
       {
         "command": "messagefoundry.toggleGraphPerspective",
         "title": "MessageFoundry: Toggle Element / Flow View",
-        "icon": "$(arrow-swap)"
+        "icon": "media/arrow-swap-amber.svg"
       },
       {
         "command": "messagefoundry.openConnectionSettings",
         "title": "MessageFoundry: Open Connection Settings",
-        "icon": "$(gear)"
+        "icon": "media/gear-amber.svg"
       },
       {
         "command": "messagefoundry.newConnection",
@@ -81,7 +81,7 @@
       {
         "command": "messagefoundry.newCodeSet",
         "title": "MessageFoundry: New Translation Table",
-        "icon": "$(add)"
+        "icon": "media/add-amber.svg"
       },
       {
         "command": "messagefoundry.editCodeSet",
@@ -98,7 +98,7 @@
       {
         "command": "messagefoundry.refreshCodeSets",
         "title": "MessageFoundry: Refresh Translation Tables",
-        "icon": "$(refresh)"
+        "icon": "media/refresh-amber.svg"
       },
       {
         "command": "messagefoundry.newRoute",
@@ -131,17 +131,17 @@
       {
         "command": "messagefoundry.promote",
         "title": "MessageFoundry: Stage → Promote",
-        "icon": "$(rocket)"
+        "icon": "media/rocket-amber.svg"
       },
       {
         "command": "messagefoundry.insertElement",
         "title": "MessageFoundry: Insert Element",
-        "icon": "$(symbol-snippet)"
+        "icon": "media/symbol-snippet-amber.svg"
       },
       {
         "command": "messagefoundry.openCookbook",
         "title": "MessageFoundry: Open Cookbook",
-        "icon": "$(book)"
+        "icon": "media/book-amber.svg"
       },
       {
         "command": "messagefoundry.showAiPolicy",
@@ -173,7 +173,7 @@
       {
         "command": "messagefoundry.openSettings",
         "title": "MessageFoundry: Settings",
-        "icon": "$(gear)"
+        "icon": "media/gear-amber.svg"
       },
       {
         "command": "messagefoundry.openConfigDir",

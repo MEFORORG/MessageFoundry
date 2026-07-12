@@ -50,7 +50,12 @@ LOOPBACK = "127.0.0.1"
 
 
 def mllp_cfg(
-    host: str, *, tls: bool = False, attested: bool = False, reason: str | None = None
+    host: str,
+    *,
+    tls: bool = False,
+    attested: bool = False,
+    reason: str | None = None,
+    revocation_attested: bool = False,
 ) -> Destination:
     settings: dict[str, object] = {"host": host, "port": 5000}
     if tls:
@@ -61,6 +66,7 @@ def mllp_cfg(
         settings=settings,
         tls_hop_attested=attested,
         tls_hop_attested_reason=reason,
+        tls_revocation_attested=revocation_attested,
     )
 
 
@@ -186,8 +192,10 @@ def test_construction_unstamped_is_noop(build_cfg, connector) -> None:
 
 
 def test_mllp_tls_has_no_hop_guard() -> None:
+    # A verified TLS hop needs no CLEARTEXT guard (#200). It DOES now carry a #201 revocation guard on a
+    # prod-PHI remote hop, so attest revocation to keep the subject here (the cleartext guard is None).
     with active_hop_posture(PROD_PHI):
-        dest = MLLPDestination(mllp_cfg(REMOTE, tls=True))
+        dest = MLLPDestination(mllp_cfg(REMOTE, tls=True, revocation_attested=True))
     assert dest._hop_guard is None  # a verified TLS hop needs no cleartext guard
 
 

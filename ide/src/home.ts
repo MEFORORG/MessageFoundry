@@ -66,17 +66,35 @@ function esc(s: string): string {
 }
 
 export class HomeView implements vscode.WebviewViewProvider {
+  private view: vscode.WebviewView | undefined;
+
+  // `onFilter` drives the Connections tree filter live from the persistent search box (the always-
+  // visible sibling of the funnel command — a TreeView can't host an input, so it lives here at the top
+  // of the sidebar). `currentFilter` seeds the box with any filter already active.
+  constructor(
+    private readonly onFilter: (text: string) => void = () => {},
+    private readonly currentFilter: () => string = () => "",
+  ) {}
+
   resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view;
     view.webview.options = { enableScripts: true };
-    view.webview.onDidReceiveMessage((m: { command?: string; id?: string }) => {
+    view.webview.onDidReceiveMessage((m: { command?: string; id?: string; text?: string }) => {
       if (m?.command === "run" && typeof m.id === "string") {
         void vscode.commands.executeCommand(m.id);
+      } else if (m?.command === "filter") {
+        this.onFilter(typeof m.text === "string" ? m.text : "");
       }
     });
-    view.webview.html = this.html(view.webview);
+    view.webview.html = this.html(view.webview, this.currentFilter());
   }
 
-  private html(webview: vscode.Webview): string {
+  /** Reflect an externally-set filter (e.g. the funnel command) back into the search box. */
+  setFilterText(text: string): void {
+    void this.view?.webview.postMessage({ command: "setFilter", text });
+  }
+
+  private html(webview: vscode.Webview, initialFilter: string): string {
     const n = nonce();
     const groups = GROUPS.map(
       (g) =>
@@ -102,6 +120,12 @@ export class HomeView implements vscode.WebviewViewProvider {
         content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${n}';" />
   <style>
     body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 4px 8px; }
+    .search { margin: 3px 2px 9px; }
+    .search input { width: 100%; box-sizing: border-box; font-family: inherit; font-size: 13px;
+      color: var(--vscode-input-foreground); background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 3px;
+      padding: 4px 8px; }
+    .search input::placeholder { color: var(--vscode-input-placeholderForeground); }
     .group { margin-bottom: 6px; }
     summary.title { display: flex; align-items: center; gap: 4px; font-size: 11px; text-transform: uppercase;
       letter-spacing: .04em; color: var(--vscode-descriptionForeground); margin: 3px 2px; cursor: pointer;
@@ -120,9 +144,33 @@ export class HomeView implements vscode.WebviewViewProvider {
   </style>
 </head>
 <body>
+  <div class="search">
+    <input id="search" type="search" spellcheck="false"
+           placeholder="Find connection, handler, router, transform…" value="${esc(initialFilter)}" />
+  </div>
   ${groups}
   <script nonce="${n}">
     const vscode = acquireVsCodeApi();
+    // Persistent filter box for the Connections tree (drives graph.setFilter → also the #228
+    // Definitions). Debounced so each keystroke doesn't re-project the tree; two-way synced with the
+    // funnel command via an inbound 'setFilter' message.
+    const search = document.getElementById('search');
+    let filterTimer;
+    search.addEventListener('input', () => {
+      clearTimeout(filterTimer);
+      filterTimer = setTimeout(() => vscode.postMessage({ command: 'filter', text: search.value }), 150);
+    });
+    search.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && search.value) {
+        search.value = '';
+        vscode.postMessage({ command: 'filter', text: '' });
+      }
+    });
+    window.addEventListener('message', (e) => {
+      if (e.data && e.data.command === 'setFilter' && e.data.text !== search.value) {
+        search.value = e.data.text;
+      }
+    });
     const state = vscode.getState() || {};
     const collapsed = state.collapsed || (state.collapsed = {});
     for (const d of document.querySelectorAll('details.group')) {

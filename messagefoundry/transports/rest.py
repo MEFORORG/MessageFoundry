@@ -46,6 +46,7 @@ from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
+    RevocationHopGuard,
     current_hop_posture,
     enforce_insecure_hop,
     insecure_hop_disposition,
@@ -65,11 +66,14 @@ __all__ = [
     "DYNAMIC_HEADER_PREFIX",
     "InsecureHopGuard",
     "RestDestination",
+    "capture_response_headers",
     "enforce_outbound_length_limits",
+    "normalize_header_allowlist",
     "outbound_headers_from_metadata",
     "refuse_cleartext_credential_hop",
     "refuse_cleartext_credentials",
     "refuse_cleartext_egress",
+    "refuse_unrevoked_verified_hop",
     "refuse_verify_off",
 ]
 
@@ -98,6 +102,54 @@ def _strip_header_control_chars(value: str) -> str:
     (< 0x20 — incl. CR/LF) and DEL (0x7F) so the value can never split the request line or inject an
     extra header. Returns the value with those bytes removed (a single, safe header value)."""
     return "".join(ch for ch in value if not (ord(ch) < 0x20 or ord(ch) == 0x7F))
+
+
+# --- captured HTTP response headers (BACKLOG #154, ADR 0013 amendment) -----------------------------
+#
+# A REST/SOAP/FHIR reply may carry a header the pipeline needs — a FHIR `create` returns the new
+# resource's `Location`/`ETag`, a partner returns a correlation id. The delivery worker persists a
+# capturing reply as a DeliveryResponse (ADR 0013); #154 folds a CONFIGURED ALLOW-LIST of response
+# header names into that carriage so a re-ingressed answer's Handler reads them via
+# `response_get(dest).headers`. Only the allow-listed names are ever captured — NEVER all headers:
+# a partner reply header could carry sensitive data, so the allow-list is the PHI gate (the captured
+# value is then encrypted at rest exactly like the reply body/detail).
+
+
+def normalize_header_allowlist(setting: Any) -> frozenset[str]:
+    """The per-connection ``capture_response_headers`` allow-list as a frozenset of **lowercased** header
+    names (HTTP header names are case-insensitive, RFC 7230). Accepts a list/tuple/set of names or a
+    single comma-separated string; anything else (incl. ``None``) → empty (capture nothing → the reply's
+    ``DeliveryResponse.headers`` stays ``{}``, byte-identical). Blank entries are dropped."""
+    if not setting:
+        return frozenset()
+    names: list[str]
+    if isinstance(setting, str):
+        names = setting.split(",")
+    elif isinstance(setting, (list, tuple, set, frozenset)):
+        names = [str(x) for x in setting]
+    else:
+        return frozenset()
+    return frozenset(n.strip().lower() for n in names if n and str(n).strip())
+
+
+def capture_response_headers(resp_headers: Any, allowlist: frozenset[str]) -> dict[str, str]:
+    """The allow-listed subset of a reply's HTTP response headers as ``{name: value}`` (#154).
+
+    ``resp_headers`` is a urllib/``http.client`` response header object (an ``email.message.Message``
+    exposing ``.items()``). Only names whose lowercase form is in ``allowlist`` are kept (case-
+    insensitive match); the header's own casing is preserved as the key. An empty ``allowlist`` → ``{}``
+    (byte-identical — no capture). On a repeated header the LAST value wins (deterministic per reply, so
+    re-ingress stays re-run-stable). Defensive: a header object without ``.items()`` → ``{}``."""
+    if not allowlist:
+        return {}
+    items = getattr(resp_headers, "items", None)
+    if items is None:
+        return {}
+    out: dict[str, str] = {}
+    for name, value in items():
+        if isinstance(name, str) and name.lower() in allowlist:
+            out[name] = str(value)
+    return out
 
 
 def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[str, str]:
@@ -386,6 +438,32 @@ def refuse_verify_off(
     return InsecureHopGuard(posture=posture, attested=attested, cell=cell)
 
 
+def refuse_unrevoked_verified_hop(
+    scheme: str, url: str, *, connector: str, revocation_attested: bool = False
+) -> None:
+    """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
+
+    The revocation twin of :func:`refuse_verify_off`, for the *verify-ON* https path the HTTP-family cells
+    (REST/SOAP/FHIR) take when ``verify_tls`` is true: urllib rides stdlib ssl, which validates the chain
+    (+ strict RFC 5280) but performs NO OCSP/CRL, so a revoked-but-unexpired server cert is still accepted.
+    A production-PHI verified hop to a non-loopback host is REFUSED at construction unless revocation is
+    attested (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED``
+    env, folded in by :meth:`RevocationHopGuard.capture`); a non-prod PHI hop WARNs; loopback / synthetic /
+    attested hops are byte-identical. Only meaningful for ``https`` — an ``http`` url has no TLS (its
+    cleartext body is refused by :func:`refuse_cleartext_egress`) and ``verify_tls=false`` is not a
+    verifying hop (refused by :func:`refuse_verify_off`), so the revocation gate and the #200 cleartext /
+    verify-off gates key on disjoint conditions and never double-refuse one hop."""
+    if scheme != "https":
+        return
+    host = urllib.parse.urlsplit(url).hostname or ""
+    RevocationHopGuard.capture(
+        host=host,
+        cell=f"{connector} (verified TLS, no revocation check)",
+        description="delivers over verified https but performs no certificate revocation checking",
+        attested=revocation_attested,
+    ).enforce_construction()
+
+
 def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
     """Reject an over-length outbound URL or request-header value at connector construction (ASVS
     4.2.5). Shared by the REST and SOAP destinations (SOAP reuses REST's HTTP plumbing). Raises
@@ -424,6 +502,11 @@ class RestDestination(DestinationConnector):
         # with a body → outcome='accepted'; a 2xx with an empty body → outcome='no_reply' (a successful
         # round-trip, not an error). Non-2xx keeps today's DeliveryError/NegativeAckError classification.
         self.capture_response: bool = bool(s.get("capture_response", False))
+        # #154: the allow-list of HTTP response header names to capture into the DeliveryResponse. Empty
+        # (the default) → no headers captured, byte-identical. Only meaningful when the reply is captured.
+        self.capture_response_headers = normalize_header_allowlist(
+            s.get("capture_response_headers")
+        )
         # #68: opt in to per-message HTTP headers stamped by a Handler into the ADR 0081 metadata bag
         # (http.header.* entries). Default False → the delivery worker skips the metadata read and send
         # is byte-identical. When True, consumes_metadata tells the worker to pass this message's bag.
@@ -442,12 +525,14 @@ class RestDestination(DestinationConnector):
         # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
         # dry-run/start), like a bad TLS cert; the per-request signature is minted in _post (off-loop).
         self._signer: MessageSigner | None = signer_from_destination(config)
-        # ADR 0024: opt-in SMART Backend Services token provider. None = off (byte-identical). Lazy
-        # import breaks the rest <-> smart cycle (smart reuses rest's opener); built here so a bad
-        # key/curve/token_url fails loud. The minted bearer is injected per-request in _post.
-        from messagefoundry.transports.smart import token_provider_from_destination
+        # ADR 0024 + #65: opt-in bearer-token auth — SMART Backend Services (asymmetric JWT) OR OAuth2
+        # client-credentials (symmetric secret), unified behind the one bearer seam. None = off (byte-
+        # identical). Lazy import breaks the rest <-> http_auth/smart cycle (they reuse rest's opener);
+        # built here so a bad key/secret/token_url fails loud. The minted bearer is injected per-request
+        # in _post; the two modes are mutually exclusive (a loud HttpAuthError otherwise).
+        from messagefoundry.transports.http_auth import bearer_provider_from_settings
 
-        self._token_provider = token_provider_from_destination(config)
+        self._token_provider = bearer_provider_from_settings(s)
         if self._token_provider is not None:
             # The SMART bearer is injected per-request in _post, so the static-header cleartext check
             # above can't see it. Re-run the check treating the connection as credential-bearing, so a
@@ -457,6 +542,17 @@ class RestDestination(DestinationConnector):
                 scheme, {**self._headers, "Authorization": "Bearer"}, self.url, attested=attested
             )
         if bool(s.get("verify_tls", True)):
+            # #201 (ADR 0078 amendment): the verify-ON https hop validates the peer cert but does no
+            # OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI verified
+            # hop unless revocation is attested (loopback / synthetic / non-prod / attested byte-identical).
+            # Composes with #200: it keys on the verify-ON https path, disjoint from the cleartext /
+            # verify-off gates above, so no hop is ever double-refused.
+            refuse_unrevoked_verified_hop(
+                scheme,
+                self.url,
+                connector="REST destination",
+                revocation_attested=config.tls_revocation_attested,
+            )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired server cert (opt-in; default off = the shared verifying opener, byte-identical). It
             # keeps verification ON, so it is NOT an insecure hop in the #200 sense (no refusal keys on it).
@@ -480,6 +576,22 @@ class RestDestination(DestinationConnector):
                 _redact_url(self.url),
             )
             self._opener = _insecure_opener()
+        # #65: HTTP Digest (RFC 7616) — fold the challenge-answering handler into a PER-CONNECTION opener
+        # (never mutate the shared _NO_REDIRECT_OPENER). urllib answers the 401 + retries within
+        # opener.open(). None (default) → byte-identical. Mutually exclusive with a bearer provider.
+        from messagefoundry.transports.http_auth import HttpAuthError, digest_handler_from_settings
+
+        digest = digest_handler_from_settings(s, url=self.url)
+        if digest is not None:
+            if self._token_provider is not None:
+                raise HttpAuthError(
+                    "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
+                    "(mutually exclusive — configure exactly one)"
+                )
+            if self._opener is _NO_REDIRECT_OPENER:
+                # Rebuild a per-connection verifying opener so add_handler never touches the shared one.
+                self._opener = urllib.request.build_opener(_NoRedirectHandler)
+            self._opener.add_handler(digest)
 
     @staticmethod
     def _build_headers(s: dict[str, Any]) -> dict[str, str]:
@@ -505,14 +617,18 @@ class RestDestination(DestinationConnector):
         # #68: build this message's dynamic headers from its user-metadata bag (pure; None → {} → byte-
         # identical). urllib is blocking — keep it off the event loop (the delivery worker awaits this).
         dynamic_headers = outbound_headers_from_metadata(metadata)
-        body, status = await asyncio.to_thread(self._post, payload, dynamic_headers)
+        body, status, headers = await asyncio.to_thread(self._post, payload, dynamic_headers)
         if not self.capture_response:
             return None
         if body == "":
             # A successful round-trip with no payload — captured as a deliberate empty reply, NOT an
             # error (the request succeeded). Distinct from a read failure, which raised above.
-            return DeliveryResponse(body="", outcome="no_reply", detail=f"HTTP {status}")
-        return DeliveryResponse(body=body, outcome="accepted", detail=f"HTTP {status}")
+            return DeliveryResponse(
+                body="", outcome="no_reply", detail=f"HTTP {status}", headers=headers
+            )
+        return DeliveryResponse(
+            body=body, outcome="accepted", detail=f"HTTP {status}", headers=headers
+        )
 
     async def test_connection(self) -> None:
         await asyncio.to_thread(self._probe)
@@ -547,7 +663,9 @@ class RestDestination(DestinationConnector):
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"REST {_redact_url(self.url)} failed: {exc}") from exc
 
-    def _post(self, payload: str, dynamic_headers: dict[str, str] | None = None) -> tuple[str, int]:
+    def _post(
+        self, payload: str, dynamic_headers: dict[str, str] | None = None
+    ) -> tuple[str, int, dict[str, str]]:
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop, before
         # a single byte crosses — defense against a reload / per-message target sneaking PHI past the
         # construction-only gate. A None guard (secure/loopback hop) is byte-identical.
@@ -586,7 +704,11 @@ class RestDestination(DestinationConnector):
                 # is off (the worker just ignores the return).
                 body = resp.read().decode(self.encoding, errors="replace")
                 status = int(getattr(resp, "status", 200))
-                return body, status
+                # #154: capture only the allow-listed response headers (empty allow-list → {}).
+                headers = capture_response_headers(
+                    getattr(resp, "headers", None), self.capture_response_headers
+                )
+                return body, status, headers
         except urllib.error.HTTPError as exc:
             status = exc.code
             if self._token_provider is not None and status == 401:

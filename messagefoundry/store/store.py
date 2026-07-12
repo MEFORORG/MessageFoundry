@@ -18,6 +18,18 @@ identity otherwise — so encryption is transparent to callers (STORE-1).
 
 Time is injected (``now`` params default to ``time.time()``) so retry scheduling and
 dead-lettering are deterministically testable.
+
+H-8 LOCK ORDERING (multi-message finalizers). :meth:`_maybe_finalize` takes a per-message finalize
+lock, so any primitive that finalizes MORE THAN ONE message in a single transaction holds N of them
+at once and MUST acquire them in CANONICAL (sorted) message_id order — otherwise two such callers
+with overlapping id sets can take the same two locks in opposite orders and deadlock (SQL Server
+1205). ``cancel_queued`` and the dead-letter sweeps do this via :meth:`_lock_finalize_batch`;
+``claim_fifo_heads``' H2 sorts its own. The ADR 0082 batch primitives (:meth:`mark_batch_done`,
+:meth:`mark_batch_failed`, :meth:`dead_letter_batch`) are ALSO multi-message finalizers — they
+originally iterated their finalize dict in *insertion* (caller ``outbox_ids``) order, which is a real
+cycle: a fan-out message has one outbound row per destination and each destination lane batches
+independently, so overlapping id sets are reachable in normal operation. They now sort.
+**Adding a new multi-message finalizer? Sort, or use _lock_finalize_batch.**
 """
 
 from __future__ import annotations
@@ -34,7 +46,7 @@ import subprocess
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -50,7 +62,11 @@ from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.metadata import merge_user_metadata
+from messagefoundry.store.metadata import (
+    decode_response_headers,
+    encode_response_headers,
+    merge_user_metadata,
+)
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
@@ -524,6 +540,10 @@ class CapturedResponse:
     kind: str = "response"
     ack_code: str | None = None
     ack_phase: str | None = None
+    # BACKLOG #154 (ADR 0013 amendment): the captured allow-listed HTTP response headers ({} when none /
+    # once retention nulls them). Decrypted + JSON-decoded here; a re-ingressed Handler reads it via
+    # response_get(dest).headers.
+    headers: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1151,6 +1171,8 @@ CREATE TABLE IF NOT EXISTS response (
     body             TEXT,               -- partner reply, encrypted at rest; NULL once retention purges
     outcome          TEXT    NOT NULL,   -- 'accepted' | 'rejected' | 'unparseable' | 'no_reply'
     detail           TEXT,               -- short reason (MSA-1 / HTTP status), encrypted at rest
+    resp_headers     TEXT,               -- BACKLOG #154: captured allow-listed HTTP response headers
+                                         -- (JSON), encrypted at rest; NULL when none / purged
     captured_at      REAL    NOT NULL,
     -- ADR 0021 "Response Sent": the inbound ACK we returned rides this table via a `kind` discriminator.
     kind             TEXT    NOT NULL DEFAULT 'response',  -- 'response' (outbound reply) | 'ack_sent'
@@ -1911,9 +1933,9 @@ class MessageStore:
                 await self._commit()
                 total += len(rows)
             # The `response` table (composite PK message_id,destination_name,response_seq — ADR 0013) has
-            # TWO encrypted columns (body, detail) and no `id`; migrate each on its own pass. (A brand-new
-            # table, so normally a no-op — present for parity with state/reference.)
-            for column in ("body", "detail"):
+            # encrypted columns (body, detail, resp_headers — #154) and no `id`; migrate each on its own
+            # pass. (A brand-new table, so normally a no-op — present for parity with state/reference.)
+            for column in ("body", "detail", "resp_headers"):
                 while True:
                     cur = await self._db.execute(
                         f"SELECT message_id, destination_name, response_seq, {column} FROM response"
@@ -2089,12 +2111,14 @@ class MessageStore:
     async def _reencrypt_response_to_active(
         self, cipher: AesGcmCipher, active_like: str, batch: int
     ) -> int:
-        """Re-encrypt the ``response`` table's body+detail under the active key (caller holds the lock).
+        """Re-encrypt the ``response`` table's body+detail+resp_headers under the active key (caller
+        holds the lock).
 
         Mirrors :meth:`_reencrypt_state_to_active` but keys on the composite PK
-        (message_id,destination_name,response_seq) and covers BOTH PHI columns (ADR 0013)."""
+        (message_id,destination_name,response_seq) and covers every PHI column (ADR 0013; resp_headers
+        added in #154)."""
         rotated = 0
-        for column in ("body", "detail"):
+        for column in ("body", "detail", "resp_headers"):
             while True:
                 cur = await self._db.execute(
                     f"SELECT message_id, destination_name, response_seq, {column} FROM response"
@@ -2171,6 +2195,12 @@ class MessageStore:
         # The body_ref deref index lives here (not _SCHEMA) so it is created only AFTER the column is
         # guaranteed present — on a Step-A queue it'd otherwise reference a not-yet-added column.
         await db.execute("CREATE INDEX IF NOT EXISTS ix_queue_body_ref ON queue(body_ref)")
+        # BACKLOG #154: a DB whose `response` table predates resp_headers gains it here (NULL on existing
+        # rows = "no captured headers", byte-identical). The table itself is created by _SCHEMA.
+        cur = await db.execute("PRAGMA table_info(response)")
+        response_cols = {row["name"] for row in await cur.fetchall()}
+        if response_cols and "resp_headers" not in response_cols:
+            await db.execute("ALTER TABLE response ADD COLUMN resp_headers TEXT")
         # FIFO covering-index rename (ADR 0060). ADR 0059 re-keyed the per-lane FIFO indexes to trail in
         # seq/rowid but KEPT the names ix_queue_fifo_in/out with CREATE IF NOT EXISTS — so an upgraded DB
         # silently keeps its old created_at-trailing index and never adopts the seq-only claim's index.
@@ -3634,7 +3664,7 @@ class MessageStore:
         now = time.time() if now is None else now
 
         async def _body() -> None:
-            finalize: dict[str, None] = {}  # distinct message_ids, insertion-ordered
+            finalize: dict[str, None] = {}  # distinct message_ids; CONSUMED in sorted() order (H-8)
             for outbox_id in outbox_ids:
                 row = await self._row(outbox_id)
                 if row is None:
@@ -3658,7 +3688,7 @@ class MessageStore:
                     now,
                 )
                 finalize[row["message_id"]] = None
-            for message_id in finalize:
+            for message_id in sorted(finalize):  # H-8 canonical order (see below)
                 await self._maybe_finalize_message(message_id, now)
 
         await self._run_grouped(_body)
@@ -3670,6 +3700,7 @@ class MessageStore:
         body: str,
         outcome: str,
         detail: str | None = None,
+        response_headers: Mapping[str, str] | None = None,
         reingress_to: str | None = None,
         now: float | None = None,
     ) -> None:
@@ -3713,10 +3744,14 @@ class MessageStore:
             seq_row = await cur.fetchone()
             # COALESCE(...,0) always returns one row, so seq_row is never None; guard for the type.
             seq = (int(seq_row["m"]) if seq_row else 0) + 1
+            # BACKLOG #154: JSON-encode the captured allow-listed headers and encrypt at rest exactly
+            # like `detail` (NULL when none → byte-identical to a pre-#154 capture).
+            headers_json = encode_response_headers(response_headers)
             await self._db.execute(
                 "INSERT INTO response"
-                " (message_id, destination_name, response_seq, body, outcome, detail, captured_at)"
-                " VALUES (?,?,?,?,?,?,?)",
+                " (message_id, destination_name, response_seq, body, outcome, detail, resp_headers,"
+                " captured_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
                 (
                     message_id,
                     destination_name,
@@ -3724,6 +3759,7 @@ class MessageStore:
                     self._enc(body),
                     outcome,
                     self._enc(detail),
+                    self._enc(headers_json),
                     now,
                 ),
             )
@@ -4226,7 +4262,7 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT message_id, destination_name, response_seq, body, outcome, detail,"
-                " captured_at, kind, ack_code, ack_phase FROM response"
+                " resp_headers, captured_at, kind, ack_code, ack_phase FROM response"
                 " WHERE message_id=? ORDER BY destination_name, response_seq",
                 (message_id,),
             )
@@ -4243,6 +4279,7 @@ class MessageStore:
                 kind=r["kind"],
                 ack_code=r["ack_code"],
                 ack_phase=r["ack_phase"],
+                headers=decode_response_headers(self._dec(r["resp_headers"])),
             )
             for r in rows
         ]
@@ -4344,7 +4381,7 @@ class MessageStore:
                 )
                 if status == OutboxStatus.DEAD.value:
                     finalize[row["message_id"]] = None
-            for message_id in finalize:
+            for message_id in sorted(finalize):  # H-8 canonical order (see below)
                 await self._maybe_finalize_message(message_id, now)
 
         await self._run_grouped(_body)
@@ -4374,7 +4411,7 @@ class MessageStore:
                 )
                 await self._event(row["message_id"], "dead", row["destination_name"], error, now)
                 finalize[row["message_id"]] = None
-            for message_id in finalize:
+            for message_id in sorted(finalize):  # H-8 canonical order (see below)
                 await self._maybe_finalize_message(message_id, now)
 
         await self._run_grouped(_body)
@@ -6671,8 +6708,9 @@ class MessageStore:
                 # null body+detail in place (the row is kept, like messages.raw). The FK to messages(id)
                 # is never violated — purge keeps the messages row (Mirth Data-Pruner). Idempotent.
                 await self._db.execute(
-                    f"UPDATE response SET body=NULL, detail=NULL "
-                    f"WHERE (body IS NOT NULL OR detail IS NOT NULL) AND message_id IN ({eligible})",
+                    f"UPDATE response SET body=NULL, detail=NULL, resp_headers=NULL "
+                    f"WHERE (body IS NOT NULL OR detail IS NOT NULL OR resp_headers IS NOT NULL) "
+                    f"AND message_id IN ({eligible})",
                     (*cutoff_params, *inflight),
                 )
                 await self._commit()

@@ -65,6 +65,7 @@ from messagefoundry.transports.rest import (
     enforce_outbound_length_limits,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
+    refuse_unrevoked_verified_hop,
     refuse_verify_off,
 )
 
@@ -164,6 +165,18 @@ class DicomWebDestination(DestinationConnector):
         # egress to a non-loopback host is refused even without credentials (loopback byte-identical).
         self._hop_guard = refuse_cleartext_egress(scheme, self.base_url, attested=attested)
         if bool(s.get("verify_tls", True)):
+            # #201 (ADR 0078 amendment): the verify-ON https hop validates the DICOMweb-server cert but
+            # does no OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI
+            # verified STOW-RS hop unless revocation is attested (loopback / synthetic / non-prod /
+            # attested byte-identical). Same posture-keyed guard as its REST/SOAP/FHIR siblings; composes
+            # with #200 (fires only on the verify-ON https path, disjoint from the cleartext/verify-off
+            # gates above, so no hop is ever double-refused).
+            refuse_unrevoked_verified_hop(
+                scheme,
+                self.base_url,
+                connector="DICOMweb destination",
+                revocation_attested=config.tls_revocation_attested,
+            )
             self._opener: urllib.request.OpenerDirector = _NO_REDIRECT_OPENER
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).

@@ -53,6 +53,7 @@ __all__ = [
     "HopDisposition",
     "HopPosture",
     "InsecureHopRefused",
+    "RevocationHopGuard",
     "TrustAnchor",
     "TrustAnchorMode",
     "TrustAnchorPolicy",
@@ -67,6 +68,7 @@ __all__ = [
     "insecure_hop_disposition",
     "is_loopback_hop_host",
     "resolve_trust_anchor",
+    "revocation_hop_disposition",
     "tls_revocation_attested",
     "validate_proxy_tls_posture",
     "validate_tls_ciphers",
@@ -467,6 +469,156 @@ def current_hop_posture() -> HopPosture | None:
     means the connector is being built outside the construction gate (an embedding/test) — the cell
     fail-closes (treats the hop as prod-PHI) rather than crossing on an unknown posture."""
     return _ACTIVE_HOP_POSTURE.get()
+
+
+# --- posture-keyed OUTBOUND revocation-hop refusal (#201, ADR 0078 amendment) ------------------
+#
+# ADR 0078 ENFORCED the "no in-engine OCSP/CRL — refuse an unproven off-loopback in-process [api] TLS
+# bind" posture for the LISTENER (in_process_tls_revocation_refused, wired in _serve). The identical
+# blind spot exists on every OUTBOUND connector that VERIFIES a downstream server cert over stdlib ssl
+# (MLLP-over-TLS, REST/SOAP/FHIR https, the asyncpg store hop): the chain is validated (+ strict RFC
+# 5280 via harden_verify_flags) but a REVOKED-but-unexpired peer cert is still accepted — Python's ssl
+# has no OCSP/CRL fetch and the engine deliberately attempts none (offline-by-default, CLAUDE.md §2).
+# So a verified outbound hop that is off-loopback, PHI, and production is REFUSED at construction /
+# `messagefoundry check` / dry-run unless revocation is proven in front (a revocation-checking egress
+# terminator) or the operator attests a revocation-checking PKI — per-connection `tls_revocation_attested`
+# or the blanket `MEFOR_TLS_REVOCATION_ATTESTED` env (the same opt-out ADR 0078 gave the listener).
+#
+# COMPOSES with #200 (ADR 0092): #200 refuses the CLEARTEXT / verify-off hop, so revocation only matters
+# on a VERIFYING hop — the two gates key on disjoint conditions and never double-refuse the same hop.
+
+
+def revocation_hop_disposition(
+    *,
+    is_phi: bool,
+    production: bool,
+    is_loopback_hop: bool,
+    proxy_proven: bool,
+    attested: bool,
+) -> HopDisposition:
+    """Decide what to do with a VERIFYING outbound TLS hop that does no revocation checking (#201 — PURE).
+
+    The outbound sibling of :func:`in_process_tls_revocation_refused`, reusing the :class:`HopDisposition`
+    gradient of :func:`insecure_hop_disposition` so the outbound connectors decide identically. Explicit
+    early-return precedence:
+
+    #. ``is_loopback_hop`` → :attr:`~HopDisposition.ALLOW` — an on-box hop is not a network exposure, and
+       a revoked cert on the local box is not the threat this gate addresses.
+    #. ``proxy_proven`` → :attr:`~HopDisposition.ALLOW` — revocation is *proven in front* by a declared
+       revocation-checking egress terminator (the outbound analogue of ADR 0078's ``proxy_terminated``).
+    #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
+       this hop (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED``).
+    #. not ``is_phi`` (synthetic instance) → :attr:`~HopDisposition.ALLOW` — no PHI rides the hop.
+    #. ``production`` → :attr:`~HopDisposition.REFUSE` — a production PHI hop with unchecked revocation.
+    #. else (non-production PHI — dev/staging) → :attr:`~HopDisposition.WARN`.
+
+    Unlike :func:`insecure_hop_disposition` this carries NO global-escape (``audited_opt_out``) arm — the
+    ONLY relaxations are the on-box carve-out, a declared revocation-checking terminator, an operator
+    attestation, or a synthetic instance. This never turns verification off (the caller has already built
+    a verifying context) — it only decides whether the *unchecked-revocation* property of that verified
+    hop is tolerable, so it composes with (never weakens) the #200 cleartext/verify-off refusals."""
+    if is_loopback_hop:
+        return HopDisposition.ALLOW
+    if proxy_proven:
+        return HopDisposition.ALLOW
+    if attested:
+        return HopDisposition.ALLOW
+    if not is_phi:
+        return HopDisposition.ALLOW
+    if production:
+        return HopDisposition.REFUSE
+    return HopDisposition.WARN
+
+
+@dataclass(frozen=True, slots=True)
+class RevocationHopGuard:
+    """A captured revocation-refusal decision for one VERIFYING outbound TLS hop (#201, ADR 0078 amend).
+
+    The revocation twin of the transports' cleartext :class:`InsecureHopGuard`. Built once at connector
+    construction via :meth:`capture`, which snapshots the active hop posture
+    (:func:`current_hop_posture`) and folds the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env into the
+    per-connection attestation. :meth:`enforce_construction` is the ENFORCED gate — it fires inside
+    ``build_check`` (``messagefoundry check`` / dry-run / reload / the serve pre-flight), where the derived
+    posture IS stamped, and refuses a production-PHI verified-but-unrevoked hop off-loopback there. It
+    **no-ops when the posture is unstamped** (``None`` — a live serve build after the pre-flight, or a
+    direct test/embedding): the enforced gate has already validated the config, so re-refusing here would
+    wrongly break every live serve of a legitimately-attested / non-prod lane (identical semantics to the
+    cleartext :class:`InsecureHopGuard`)."""
+
+    host: str
+    cell: str
+    description: str
+    attested: bool
+    proxy_proven: bool
+    posture: HopPosture | None
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        host: str,
+        cell: str,
+        description: str,
+        attested: bool,
+        proxy_proven: bool = False,
+    ) -> RevocationHopGuard:
+        """Snapshot the decision inputs + the active hop posture for a verifying outbound TLS hop.
+
+        ``attested`` is the per-connection ``tls_revocation_attested`` flag; the blanket
+        ``MEFOR_TLS_REVOCATION_ATTESTED`` env is OR'd in here so either form suppresses the refusal (the
+        same opt-out ADR 0078 gave the in-process listener). ``cell`` is a short PHI-free label of the
+        crossing; ``description`` explains the hop (scheme/host only — never a credential or a body)."""
+        return cls(
+            host=host,
+            cell=cell,
+            description=description,
+            attested=attested or tls_revocation_attested(),
+            proxy_proven=proxy_proven,
+            posture=current_hop_posture(),
+        )
+
+    def _disposition(self, posture: HopPosture) -> HopDisposition:
+        return revocation_hop_disposition(
+            is_phi=posture.is_phi,
+            production=posture.production,
+            is_loopback_hop=is_loopback_hop_host(self.host),
+            proxy_proven=self.proxy_proven,
+            attested=self.attested,
+        )
+
+    def _detail(self) -> str:
+        return (
+            f"{self.description} to {self.host}: the peer certificate is verified but NO certificate "
+            "revocation checking (OCSP/CRL) is performed — stdlib ssl has none (ASVS 12.1.4, ADR 0078). "
+            "Terminate at a revocation-checking egress proxy, or set tls_revocation_attested=true / "
+            f"{TLS_REVOCATION_ATTESTED_ENV}=1 to attest a revocation-checking PKI backs this hop."
+        )
+
+    def enforce_construction(self) -> None:
+        """The ENFORCED construction gate: raise :class:`InsecureHopRefused` on a production-PHI
+        verified-but-unrevoked hop off-loopback, loud-log (+audit the attestation) on a warned hop, allow
+        the rest. No-op when the posture is unstamped (``None``) — the build_check gate is the authority."""
+        posture = self.posture
+        if posture is None:
+            return
+        disposition = self._disposition(posture)
+        # Audit an attestation / proven terminator that SUPPRESSED a would-be production-PHI refusal: the
+        # disposition is ALLOW only because tls_revocation_attested / proxy_proven fired before the REFUSE
+        # arm, so an operator should see the unchecked-revocation hop was crossed on their attestation.
+        if (
+            disposition is HopDisposition.ALLOW
+            and (self.attested or self.proxy_proven)
+            and posture.is_phi
+            and posture.production
+            and not is_loopback_hop_host(self.host)
+        ):
+            logger.warning(
+                "verified TLS hop crossed WITHOUT certificate revocation checking on operator "
+                "attestation — %s: %s",
+                self.cell,
+                self._detail(),
+            )
+        enforce_insecure_hop(disposition, message=self._detail(), cell=self.cell)
 
 
 # --- pinned internal-CA trust anchor (#190, ADR 0093) ------------------------------------------

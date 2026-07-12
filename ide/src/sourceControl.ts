@@ -5,7 +5,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { configDir, messageSetsDir, workspaceDir } from "./cli";
+import { configDir, messageSetsDir, run, workspaceDir } from "./cli";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
 
 const GITIGNORE_MARKER = "# --- MessageFoundry ---";
@@ -350,7 +350,8 @@ async function promptAndSetRemote(bin: string, ws: string, current?: string): Pr
 
 // "MessageFoundry: Config Repo Storage Location" — view or change where the config repo is stored,
 // after setup. The git 'origin' remote IS the storage location (single source of truth — no separate
-// MEFOR setting to drift from it); this command is a friendly, offline-safe front for it.
+// MEFOR setting to drift from it). This is a small, offline-safe FORM over it (a webview panel, not a
+// modal QuickPick chain) so the current location and the local-vs-remote choice are visible at once.
 export async function setRepoStorage(): Promise<void> {
   const ws = workspaceDir();
   if (!ws) {
@@ -373,76 +374,227 @@ export async function setRepoStorage(): Promise<void> {
     }
     return;
   }
-  const current = await getRemoteUrl(bin, ws);
-  if (current) {
-    const pick = await vscode.window.showQuickPick(
-      [
-        { label: "Change the remote URL…", action: "change" as const },
-        { label: "Switch to local only (remove remote)", action: "remove" as const },
-        { label: "Cancel", action: "cancel" as const },
-      ],
-      { placeHolder: `Stored on a shared remote: ${current}`, ignoreFocusOut: true },
-    );
-    if (pick?.action === "change") {
-      await promptAndSetRemote(bin, ws, current);
-    } else if (pick?.action === "remove") {
-      const res = await git(bin, ["remote", "remove", "origin"], ws);
-      if (res.code === 0) {
-        void vscode.window.showInformationMessage(
-          "MessageFoundry: now local-only. Your history stays on this machine; nothing was deleted on the remote.",
-        );
-      } else {
-        void vscode.window.showErrorMessage(
-          `MessageFoundry: could not remove remote — ${res.stderr.trim()}`,
-        );
+  const current = (await getRemoteUrl(bin, ws)) ?? "";
+  const panel = vscode.window.createWebviewPanel(
+    "messagefoundry.repoStorage",
+    "Config Repo Storage",
+    vscode.ViewColumn.Active,
+    { enableScripts: true },
+  );
+  panel.webview.html = renderRepoStorageHtml(current);
+  panel.webview.onDidReceiveMessage(
+    async (m: { command?: string; mode?: string; url?: string }) => {
+      if (m.command === "cancel") {
+        panel.dispose();
+        return;
       }
-    }
-    return;
-  }
-  // Currently local-only: offer to add a shared remote.
-  const pick = await vscode.window.showQuickPick(
-    [
-      { label: "Store on a shared remote…", action: "add" as const },
-      { label: "Keep it local only", action: "cancel" as const },
-    ],
-    {
-      placeHolder: "Stored on this machine only. Add a remote for HA, a team, or off-machine backup?",
-      ignoreFocusOut: true,
+      if (m.command !== "save") {
+        return;
+      }
+      const hadRemote = Boolean(await getRemoteUrl(bin, ws));
+      if (m.mode === "local") {
+        if (hadRemote) {
+          const res = await git(bin, ["remote", "remove", "origin"], ws);
+          if (res.code !== 0) {
+            panel.webview.postMessage({ command: "error", text: `Could not remove remote — ${res.stderr.trim()}` });
+            return;
+          }
+          void vscode.window.showInformationMessage(
+            "MessageFoundry: now local-only. Your history stays on this machine; nothing was deleted on the remote.",
+          );
+        } else {
+          void vscode.window.showInformationMessage("MessageFoundry: storage stays local-only.");
+        }
+        panel.dispose();
+        return;
+      }
+      // Shared remote: set-url if one exists, else add. Never fetches/pushes — provider-agnostic.
+      const url = (m.url ?? "").trim();
+      if (!url) {
+        panel.webview.postMessage({ command: "error", text: "Enter a remote URL or path." });
+        return;
+      }
+      const res = hadRemote
+        ? await git(bin, ["remote", "set-url", "origin", url], ws)
+        : await git(bin, ["remote", "add", "origin", url], ws);
+      if (res.code !== 0) {
+        panel.webview.postMessage({ command: "error", text: `Could not set remote — ${res.stderr.trim()}` });
+        return;
+      }
+      void vscode.window.showInformationMessage(
+        "MessageFoundry: remote 'origin' set. Push later via the Source Control view (nothing was sent).",
+      );
+      panel.dispose();
     },
   );
-  if (pick?.action === "add") {
-    await promptAndSetRemote(bin, ws);
-  }
 }
 
-async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
-  const pick = await vscode.window.showInformationMessage(
-    "Make the first commit now? The MessageFoundry checks will run so you can watch them pass.",
-    "Commit now",
-    "Skip",
-  );
-  if (pick !== "Commit now") {
-    return;
+function scNonce(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let s = "";
+  for (let i = 0; i < 24; i++) {
+    s += chars[Math.floor(Math.random() * chars.length)];
   }
-  await git(bin, ["add", "-A"], ws);
-  const res = await git(
-    bin,
-    ["commit", "-m", "Initial commit (MessageFoundry checks enabled)"],
-    ws,
-  );
-  out().appendLine("--- first commit ---");
+  return s;
+}
+
+function scEscape(v: string): string {
+  return v
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function renderRepoStorageHtml(current: string): string {
+  const n = scNonce();
+  const isRemote = current.length > 0;
+  const currentLabel = isRemote
+    ? `Shared remote — <code>${scEscape(current)}</code>`
+    : "On this machine only (local)";
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${n}';" />
+  <style>
+    body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 16px 20px; max-width: 640px; }
+    h2 { margin: 0 0 4px; font-size: 16px; }
+    .sub { color: var(--vscode-descriptionForeground); font-size: 13px; margin: 0 0 14px; }
+    .current { margin: 0 0 16px; padding: 8px 10px; border: 1px solid var(--vscode-panel-border); border-radius: 4px;
+               background: var(--vscode-editorWidget-background, rgba(127,127,127,0.06)); font-size: 13px; }
+    .current code { font-family: var(--vscode-editor-font-family, monospace); }
+    fieldset { border: none; padding: 0; margin: 0; }
+    .opt { margin: 10px 0 2px; }
+    .opt label { font-weight: 600; cursor: pointer; }
+    .hint { color: var(--vscode-descriptionForeground); font-size: 12px; margin: 0 0 6px 22px; }
+    #url { width: calc(100% - 22px); margin: 4px 0 0 22px; box-sizing: border-box;
+           font-family: var(--vscode-editor-font-family, monospace); font-size: 12px;
+           color: var(--vscode-input-foreground); background: var(--vscode-input-background);
+           border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 2px; padding: 4px 6px; }
+    #url:disabled { opacity: 0.5; }
+    .err { color: var(--vscode-errorForeground); font-size: 12px; margin: 10px 0 0; min-height: 16px; }
+    .actions { margin-top: 18px; display: flex; gap: 8px; }
+    button { font-family: inherit; color: var(--vscode-button-foreground); background: var(--vscode-button-background);
+             border: none; padding: 5px 14px; cursor: pointer; border-radius: 2px; font-size: 13px; }
+    button:hover { background: var(--vscode-button-hoverBackground); }
+    button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
+    button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+  </style>
+</head>
+<body>
+  <h2>Config Repo Storage</h2>
+  <p class="sub">Where this MessageFoundry config repo lives. Nothing is contacted here — you push later from the Source Control view.</p>
+  <div class="current">Current: ${currentLabel}</div>
+  <fieldset>
+    <div class="opt"><label><input type="radio" name="mode" value="local" ${isRemote ? "" : "checked"} /> On this machine only</label></div>
+    <div class="hint">Fine for a single-box (non-HA) engine, dev, or air-gapped work with no server.</div>
+    <div class="opt"><label><input type="radio" name="mode" value="remote" ${isRemote ? "checked" : ""} /> Shared remote</label></div>
+    <div class="hint">Recommended for high availability (multiple engine hosts), a team, or off-machine backup. Any git host, scp-style, or a local/UNC bare path.</div>
+    <input id="url" type="text" value="${scEscape(current)}" placeholder="https://forgejo.example/org/cfg.git &middot; git@host:repo.git &middot; \\\\server\\repos\\cfg.git" ${isRemote ? "" : "disabled"} />
+  </fieldset>
+  <div class="err" id="err"></div>
+  <div class="actions">
+    <button id="save">Save</button>
+    <button id="cancel" class="secondary">Cancel</button>
+  </div>
+  <script nonce="${n}">
+    const vscode = acquireVsCodeApi();
+    const url = document.getElementById('url');
+    const err = document.getElementById('err');
+    function mode() { return document.querySelector('input[name=mode]:checked').value; }
+    function sync() { const remote = mode() === 'remote'; url.disabled = !remote; if (remote) url.focus(); }
+    document.querySelectorAll('input[name=mode]').forEach(function (r) {
+      r.addEventListener('change', function () { err.textContent = ''; sync(); });
+    });
+    document.getElementById('save').addEventListener('click', function () {
+      err.textContent = '';
+      vscode.postMessage({ command: 'save', mode: mode(), url: url.value });
+    });
+    document.getElementById('cancel').addEventListener('click', function () {
+      vscode.postMessage({ command: 'cancel' });
+    });
+    window.addEventListener('message', function (e) {
+      if (e.data && e.data.command === 'error') { err.textContent = e.data.text; }
+    });
+    sync();
+  </script>
+</body>
+</html>`;
+}
+
+function logResult(label: string, res: { stdout: string; stderr: string }): void {
+  out().appendLine(label);
   if (res.stdout.trim()) {
     out().appendLine(res.stdout.trim());
   }
   if (res.stderr.trim()) {
     out().appendLine(res.stderr.trim());
   }
-  if (res.code === 0) {
-    void vscode.window.showInformationMessage("MessageFoundry: first commit created — checks passed. ✓");
-  } else {
-    out().show();
-    void vscode.window.showErrorMessage(
-      "MessageFoundry: commit blocked by checks — see the 'MessageFoundry Checks' output. Bypass once with `git commit --no-verify`.",
+}
+
+// The first commit is the project's BASELINE snapshot. Rather than run `git commit` blind and let the
+// freshly-installed hook block it with a bare "bypass with --no-verify" (which reads as a dead-end and
+// teaches bypass on day one), we PRE-FLIGHT the same gate and branch on the result. Exit 0 iff no
+// REQUIRED check failed — advisories (e.g. dead-config) print but never block (checks.py / __main__).
+// A required failure doesn't stop the baseline: the seed is conventionally exempt, so we offer to
+// commit it and fix forward, with the details one click away — never leading with --no-verify.
+async function maybeFirstCommit(bin: string, ws: string): Promise<void> {
+  const pick = await vscode.window.showInformationMessage(
+    "Make the first commit now? MessageFoundry will run the checks first so you can see the results.",
+    "Run checks & commit",
+    "Skip",
+  );
+  if (pick !== "Run checks & commit") {
+    return;
+  }
+  await git(bin, ["add", "-A"], ws);
+
+  out().appendLine("--- pre-flight: messagefoundry check ---");
+  const chk = await run(["check", "--config", configDir(), "--messages", messageSetsDir()], ws);
+  logResult("", chk);
+
+  if (chk.code === 0) {
+    const res = await git(bin, ["commit", "-m", "Initial commit (MessageFoundry checks enabled)"], ws);
+    logResult("--- baseline commit ---", res);
+    if (res.code === 0) {
+      void vscode.window.showInformationMessage(
+        "MessageFoundry: baseline committed — all required checks passed. ✓",
+      );
+    } else {
+      out().show();
+      void vscode.window.showWarningMessage(
+        "MessageFoundry: the commit hook reported an issue — see the 'MessageFoundry Checks' output.",
+      );
+    }
+    return;
+  }
+
+  // A required check failed. Offer the baseline anyway (fix-forward) — the seed commit is the only one
+  // exempted; every commit after it runs the hook.
+  out().show();
+  const choice = await vscode.window.showWarningMessage(
+    "A required check hasn't passed yet. You can still commit this as your baseline snapshot — the checks run on every commit after it, so you can fix the flagged items next. Details are in the 'MessageFoundry Checks' output.",
+    "Commit baseline anyway",
+    "Show details",
+    "Cancel",
+  );
+  if (choice === "Commit baseline anyway") {
+    const res = await git(
+      bin,
+      ["commit", "-m", "Initial commit (MessageFoundry checks enabled)", "--no-verify"],
+      ws,
     );
+    logResult("--- baseline commit (seed, checks enforced from the next commit) ---", res);
+    if (res.code === 0) {
+      void vscode.window.showInformationMessage(
+        "MessageFoundry: baseline committed. Checks are active for your next commit — fix the flagged items in 'MessageFoundry Checks' before then.",
+      );
+    } else {
+      void vscode.window.showErrorMessage(`MessageFoundry: commit failed — ${res.stderr.trim()}`);
+    }
+  } else if (choice === "Show details") {
+    out().show();
   }
 }

@@ -20,6 +20,7 @@ import {
   buildToolbarInsertRequest,
   canDropRow,
   captureBlock,
+  contextMenuEnablement,
   drainEdits,
   editableParamNames,
   insertionBarAnchor,
@@ -29,6 +30,7 @@ import {
   parseRewriteResult,
   physicalLines,
   renderRowHtml,
+  renderStepsContextMenuHtml,
   resolveDrop,
   scopeLabel,
   walkMove,
@@ -854,6 +856,135 @@ suite("Steps toolbar — the top-of-lens INSERT toolbar (Corepoint-style Add)", 
     );
     assert.strictEqual(req.expect_src, undefined);
     assert.deepStrictEqual(req.params, { segment_id: "" });
+  });
+});
+
+// The right-click ROW CONTEXT MENU (ADR 0103) — the pure half: the explicit before/after insert mapping,
+// the item-enablement matrix, the server-rendered menu template, and the [blank] placeholder. The webview
+// WIRING (positioning, dismissal, keyboard) lives in media/stepsWebview.js and is NOT unit-tested here —
+// like the file's other webview mirrors (walkMove/captureBlock DnD), it is verified manually; these
+// node-side tests cover the pure model + the rendered markup it consumes.
+suite("Steps context menu — explicit before/after insert (right-click, ADR 0103)", () => {
+  const anchor = {
+    handler: "enrich",
+    lineStart: 6,
+    lineEnd: 6,
+    expectSrc: '    copy_field(msg, "A", "B")',
+    kind: "action" as const,
+  };
+
+  test("an explicit 'before' position overrides the kind-derived default", () => {
+    const req = buildToolbarInsertRequest(anchor, "set_field", "before");
+    assert.strictEqual(req.position, "before");
+    assert.deepStrictEqual(req.params, { path: "", value: "" });
+    assert.strictEqual(req.expect_src, '    copy_field(msg, "A", "B")');
+  });
+
+  test("an explicit 'after' position is honored on a non-send anchor", () => {
+    assert.strictEqual(buildToolbarInsertRequest(anchor, "set_field", "after").position, "after");
+  });
+
+  test("an explicit position is honored on a send anchor too (the pure fn stays literal)", () => {
+    const send = { handler: "h", lineStart: 9, lineEnd: 9, kind: "send" as const };
+    assert.strictEqual(buildToolbarInsertRequest(send, "set_field", "before").position, "before");
+    assert.strictEqual(buildToolbarInsertRequest(send, "set_field", "after").position, "after");
+  });
+
+  test("omitting position keeps the toolbar Add's derived behavior byte-identical (backward compatible)", () => {
+    assert.strictEqual(buildToolbarInsertRequest(anchor, "set_field").position, "after");
+    const send = { handler: "h", lineStart: 9, lineEnd: 9, kind: "send" as const };
+    assert.strictEqual(buildToolbarInsertRequest(send, "set_field").position, "before");
+  });
+});
+
+suite("Steps context menu — item enablement matrix (ADR 0103)", () => {
+  test("an editable action row that can walk both ways enables every item", () => {
+    assert.deepStrictEqual(contextMenuEnablement("action", { canMoveUp: true, canMoveDown: true }), {
+      insertBefore: true,
+      insertAfter: true,
+      deleteRow: true,
+      moveUp: true,
+      moveDown: true,
+    });
+  });
+
+  test("a send row suppresses Insert after (dead code after the return) but stays deletable", () => {
+    const e = contextMenuEnablement("send", { canMoveUp: true, canMoveDown: false });
+    assert.strictEqual(e.insertBefore, true);
+    assert.strictEqual(e.insertAfter, false);
+    assert.strictEqual(e.deleteRow, true);
+    assert.strictEqual(e.moveDown, false);
+  });
+
+  test("code/control rows are read-only: Insert both ways, but never Delete", () => {
+    for (const kind of ["code", "control"] as const) {
+      const e = contextMenuEnablement(kind, { canMoveUp: false, canMoveDown: false });
+      assert.strictEqual(e.insertBefore, true, kind);
+      assert.strictEqual(e.insertAfter, true, kind);
+      assert.strictEqual(e.deleteRow, false, kind);
+      assert.strictEqual(e.moveUp, false, kind);
+      assert.strictEqual(e.moveDown, false, kind);
+    }
+  });
+
+  test("move up/down follow the walk booleans verbatim", () => {
+    const e = contextMenuEnablement("lookup", { canMoveUp: false, canMoveDown: true });
+    assert.strictEqual(e.moveUp, false);
+    assert.strictEqual(e.moveDown, true);
+  });
+});
+
+suite("Steps context menu — the server-rendered menu template (ADR 0103)", () => {
+  const html = renderStepsContextMenuHtml();
+
+  test("it is the single hidden #stepsCtxMenu root", () => {
+    assert.ok(html.includes('id="stepsCtxMenu"'));
+    assert.ok(html.includes("hidden"), "rendered hidden — the script reveals it on right-click");
+    assert.ok(html.includes('role="menu"'));
+  });
+
+  test("Insert before/after parents each carry a submenu of the INSERT_ACTION_LABELS catalog", () => {
+    assert.ok(html.includes('data-sub="before"') && html.includes('data-sub="after"'));
+    for (const position of ["before", "after"] as const) {
+      for (const { value } of INSERT_ACTION_LABELS) {
+        assert.ok(
+          html.includes(`data-cmd="insert" data-position="${position}" data-action="${value}"`),
+          `${value} @ ${position}`,
+        );
+      }
+    }
+    for (const { label } of INSERT_ACTION_LABELS) {
+      assert.ok(html.includes(`>${label}</button>`), label);
+    }
+  });
+
+  test("the leaf verbs are Delete / Move up / Move down (Copy/Cut/Paste stay keyboard-served, out of the menu)", () => {
+    assert.ok(html.includes('data-cmd="deleteRow"'));
+    assert.ok(html.includes('data-cmd="moveUp"'));
+    assert.ok(html.includes('data-cmd="moveDown"'));
+    assert.ok(!/data-cmd="(copy|cut|paste)/i.test(html), "no copy/cut/paste items in the menu");
+  });
+
+  test("the submenu arrow is an HTML entity (the escaper ran)", () => {
+    assert.ok(html.includes("&#9656;"), "the submenu arrow is emitted as an entity, not a raw glyph");
+  });
+});
+
+suite("Steps [blank] placeholder — empty editable inputs hint, saved value stays empty (ADR 0103)", () => {
+  test('a recognized editable input carries placeholder="[blank]"', () => {
+    const parse = loadFixture("IB_ACME_ADT");
+    const vm = buildHandlerViewModels(parse, syntheticSource(parse))[0];
+    const html = renderRowHtml(vm.rows[0], vm.handler);
+    assert.ok(html.includes('class="edit"'), "precondition: the send `to` field is editable");
+    assert.ok(html.includes('placeholder="[blank]"'), "the editable input hints [blank] when empty");
+  });
+
+  test("a read-only projection (no handler) has no editable input and no [blank] placeholder", () => {
+    const parse = loadFixture("IB_ACME_ADT");
+    const vm = buildHandlerViewModels(parse, syntheticSource(parse))[0];
+    const html = renderRowHtml(vm.rows[0]); // read-only caller
+    assert.ok(!html.includes('class="edit"'));
+    assert.ok(!html.includes('placeholder="[blank]"'), "no placeholder on a disabled read-only field");
   });
 });
 

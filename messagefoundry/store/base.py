@@ -603,6 +603,7 @@ class QueueStore(StoreLifecycle, Protocol):
         body: str,
         outcome: str,
         detail: str | None = None,
+        response_headers: Mapping[str, str] | None = None,
         reingress_to: str | None = None,
         now: float | None = None,
     ) -> None:
@@ -615,7 +616,13 @@ class QueueStore(StoreLifecycle, Protocol):
 
         When ``reingress_to`` is set (Increment 2), the same transaction *also* inserts a drainable
         ``Stage.RESPONSE`` work-row on the named loopback inbound's lane (a token referencing the
-        artifact) so the reply is re-ingressed; ``None`` is byte-identical to Increment 1 (no work-row)."""
+        artifact) so the reply is re-ingressed; ``None`` is byte-identical to Increment 1 (no work-row).
+
+        ``response_headers`` (BACKLOG #154) is the connector's captured **allow-listed** HTTP response
+        headers; ``None``/empty stores ``NULL`` (byte-identical). It is JSON-encoded and encrypted at
+        rest exactly like ``detail``, and surfaced back through :meth:`correlate_response` as
+        :attr:`CapturedResponse.headers` (so a re-ingressed Handler reads it via
+        ``response_get(dest).headers``)."""
         ...
 
     async def correlate_response(self, message_id: str) -> list[CapturedResponse]:

@@ -3316,6 +3316,8 @@ class RegistryRunner:
                     body=response.body,
                     outcome=response.outcome,
                     detail=response.detail,
+                    # #154: the captured allow-listed HTTP response headers ({} → NULL, byte-identical).
+                    response_headers=response.headers,
                     reingress_to=reingress_to,
                 )
                 if self._delivery_phase_timing:
@@ -4583,6 +4585,10 @@ def _dest_config(
         # legitimately-secure egress hop even on production-PHI. Default False → keyed purely on posture.
         tls_hop_attested=bool(settings.get("tls_hop_attested", False)),
         tls_hop_attested_reason=_hop_attested_reason(settings),
+        # #201 (ADR 0078 amendment): per-connection attestation that revocation is checked for a VERIFYING
+        # outbound TLS hop, typed here so the connector's revocation gate can ALLOW it even on prod-PHI.
+        # Default False → keyed purely on posture (existing verifying outbounds byte-identical).
+        tls_revocation_attested=bool(settings.get("tls_revocation_attested", False)),
         # #190 (ADR 0093): thread the instance-wide [tls] client trust-anchor policy onto the outbound
         # (the SINGLE choke point feeding build_check AND live construction, so the internal-outbound TLS
         # context builders resolve the same anchor both places). None → the default system/no-op policy,

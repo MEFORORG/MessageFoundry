@@ -78,8 +78,17 @@ export function activate(context: vscode.ExtensionContext): void {
   // Helper: read a code-set name off a tree node (its label) for the item-context commands.
   const codeSetName = (node?: vscode.TreeItem): string | undefined =>
     typeof node?.label === "string" ? node.label : undefined;
+  // Home hosts the persistent Connections search box (a TreeView can't host an input): typing drives
+  // the same graph filter as the funnel command — and thus the #228 handler/router/transform matches.
+  const home = new HomeView(
+    (text) => {
+      graph.setFilter(text);
+      graphView.message = graph.statusMessage();
+    },
+    () => graph.getFilter(),
+  );
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider("messagefoundry.home", new HomeView()),
+    vscode.window.registerWebviewViewProvider("messagefoundry.home", home),
   );
 
   // Opt-in per workspace: open straight to the MessageFoundry sidebar instead of the Explorer.
@@ -128,6 +137,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       graph.setFilter(value);
       graphView.message = graph.statusMessage();
+      home.setFilterText(value); // keep the persistent search box in sync
     }),
     vscode.commands.registerCommand("messagefoundry.groupConnections", async () => {
       const pick = await vscode.window.showQuickPick(

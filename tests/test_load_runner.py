@@ -167,13 +167,19 @@ def test_run_load_end_to_end_no_loss(engine: tuple[str, int, int]) -> None:
     assert report.counters.sent > 0
     # Every send resolves to exactly one of acked / nak / timeout (the sender's _fail_inflight
     # reclassifies anything in-flight at a connection close as a timeout). A timeout is a client-side
-    # unconfirmed ACK (a reset/teardown under CI contention), not an engine failure — the reconcile
-    # accounts for it as unconfirmed, never as loss. But the count is BOUNDED here: the excusable CI
-    # flake is one-or-two stranded in-flight frames at teardown, while a systemic ACK-path regression
-    # (an engine that receives but never ACKs) strands the whole run — nak==0 + the identity alone
-    # would pass that (acked=0, timeouts=sent satisfies both), so the cap is the load-bearing assert.
+    # unconfirmed ACK — a frame the engine received (and, per no_loss below, delivered) but whose ACK
+    # hadn't landed within the stop grace when the connection tore down under CI contention. It is not
+    # an engine failure; the reconcile accounts for it as unconfirmed, never as loss (no_loss below is
+    # the correctness authority). This is NOT a tight timing bound: a slow runner (windows-2025) can
+    # strand a large share of in-flight frames at teardown — observed ~half (timeouts=46/sent=90) with
+    # zero loss — so a fixed small cap flakes. What this MUST still catch is a systemic ACK-path
+    # regression: an engine that receives-but-never-ACKs strands the WHOLE run (acked~0, timeouts~sent)
+    # yet still passes no_loss (internal delivery is fine, only the client-facing ACK never returns).
+    # nak==0 + the identity alone would pass that, so require that a real fraction of sends were
+    # ACKed — proof the client-facing ACK path works — which acked~0 fails while teardown weather does
+    # not.
     assert report.counters.nak == 0
-    assert report.counters.timeouts <= 2, report.counters
+    assert report.counters.acked >= report.counters.sent // 4, report.counters
     assert report.counters.acked + report.counters.timeouts == report.counters.sent
     assert report.no_loss.ok, report.no_loss.detail
     # Fan-out 2 → every ACKed message (ACK == durable ingress commit) MUST reach the sink twice; the

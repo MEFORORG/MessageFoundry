@@ -1,5 +1,26 @@
 # 0055 — Group-commit for the staged queue — the durable-write ceiling-mover
 
+> # ⛔ SUPERSEDED / WITHDRAWN (2026-07-12) — by [ADR 0099](0099-phase-4-group-commit-amortize-the-per-event-transaction-cost.md)
+> **DO NOT BUILD THIS. The "build authorized now as a no-regret lever" line below is REVOKED.**
+>
+> This ADR was never withdrawn when it should have been. **[ADR 0069](0069-durable-write-throughput-lever.md)
+> (2026-07-03) measured its central premise and refuted it** — *"durable-write is **not** the throughput wall"* — and
+> the two ADRs then sat side by side, both `Proposed`, contradicting each other for nine days. Whoever read this one
+> first would have built the wrong thing.
+>
+> **Two independent reasons it is dead:**
+> 1. **The premise is measured false.** The store absorbs **~27–29k commits/s**; demand at the *full* 45M/day target
+>    is **~2,416 commits/s** — the commit tier is **~9% utilised**. You cannot buy throughput by consuming less of a
+>    resource you are barely touching.
+> 2. **The mechanism breaks a hard invariant, on PHI.** `DELAYED_DURABILITY` returns from `COMMIT` *before* the log
+>    block is flushed — so `enqueue_ingress` commits, the listener **ACKs**, the sender drops its copy, and a power
+>    failure loses up to 60 KB of unflushed log. **An ACKed message that does not exist.** CLAUDE.md §2 is explicit:
+>    the inbound is ACKed *"only after the raw message is durably committed to the ingress stage."*
+>
+> **Do not enable `DELAYED_DURABILITY` on the store, ever.** The surviving Phase-4 mechanism is
+> [ADR 0057](0057-inline-step-a-fast-path.md) inline stage-fusion — a *different* mechanism — and it is itself gated
+> behind a pre-registered measurement (ADR 0099 §Decision 4). This ADR is retained for the record only.
+
 - **Status:** **Proposed** (2026-06-29) — design; the build is **authorized now as a no-regret lever** by
   [ADR 0051](0051-corepoint-throughput-parity-strategy.md)'s delayed-hardware adjustment, with its relative
   fsync/msg delta **proxy-measured on the 265KF** (consumer floor). The *absolute* throughput claim still

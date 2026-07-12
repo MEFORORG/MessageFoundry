@@ -607,6 +607,10 @@ _SECRET_SETTING_KEYS = frozenset(
         # are runtime-only and never persisted, so only the key inputs need redacting in /metadata).
         "smart_private_key",
         "smart_private_key_password",
+        # BACKLOG #65 — generic outbound HTTP auth secrets (OAuth2 client-credentials symmetric secret;
+        # HTTP Digest / NTLM password). The minted bearer / digest response are runtime-only.
+        "oauth2_client_secret",
+        "http_auth_password",
     }
 )
 
@@ -1052,6 +1056,8 @@ def Rest(
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the HTTP response body as a reply (ADR 0013)
+    capture_response_headers: list[str]
+    | None = None,  # #154: allow-list of response header names to capture (e.g. ["Location", "ETag"])
     reingress_to: str
     | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
     dynamic_headers: bool = False,  # #68: apply a Handler's per-message http.header.* SetMeta as headers
@@ -1077,6 +1083,7 @@ def Rest(
             "tls_allow_expired": tls_allow_expired,
             "encoding": encoding,
             "capture_response": capture_response,
+            "capture_response_headers": capture_response_headers,
             "reingress_to": reingress_to,
             "dynamic_headers": dynamic_headers,
         },
@@ -1103,6 +1110,8 @@ def FHIR(
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the server reply / OperationOutcome (ADR 0013)
+    capture_response_headers: list[str]
+    | None = None,  # #154: allow-list of response header names to capture (Location/ETag of a create)
     reingress_to: str
     | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
     dynamic_headers: bool = False,  # #68: apply a Handler's per-message http.header.* SetMeta as headers
@@ -1138,6 +1147,7 @@ def FHIR(
             "tls_allow_expired": tls_allow_expired,
             "encoding": encoding,
             "capture_response": capture_response,
+            "capture_response_headers": capture_response_headers,
             "reingress_to": reingress_to,
             "dynamic_headers": dynamic_headers,
         },
@@ -1545,6 +1555,8 @@ def Soap(
     tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the SOAP response envelope as a reply (ADR 0013)
+    capture_response_headers: list[str]
+    | None = None,  # #154: allow-list of response header names to capture
     reingress_to: str
     | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
     # --- ADR 0015: mutual TLS + WS-* (Timestamp / UsernameToken / WS-Addressing) ---
@@ -1591,6 +1603,7 @@ def Soap(
             "tls_allow_expired": tls_allow_expired,
             "encoding": encoding,
             "capture_response": capture_response,
+            "capture_response_headers": capture_response_headers,
             "reingress_to": reingress_to,
             "client_cert_file": client_cert_file,
             "client_key_file": client_key_file,

@@ -522,4 +522,200 @@
         }
       });
     }
-  
+
+    // ---- ROW CONTEXT MENU (right-click) — a new surface onto the EXISTING row ops (#222 follow-up) ------
+    // A right-click on a row SELECTS it (reusing selectRow) and opens the server-rendered #stepsCtxMenu at
+    // the pointer. Every item posts the SAME insertToolbar / deleteRow / moveTo(walkMove) messages the
+    // toolbar Add and the per-row ↑/↓/🗑 buttons post — NO second execution path. Enablement mirrors the
+    // pure stepsModel.contextMenuEnablement (unit-tested there). Copy/Cut/Paste stay keyboard-served (they
+    // are deliberately NOT in this menu). Dispatch helpers use the currently `selected` row. These post to
+    // the SAME provider handlers, so the byte-stable lens-rewrite path + F7 stale guard are unchanged.
+    function menuInsert(action, position) {
+      if (!selected || !action || (position !== 'before' && position !== 'after')) { return; }
+      // Remember which row to re-select after the insert re-projects (the new neighbour of the anchor),
+      // exactly as the toolbar Add does — the position drives before/after neighbour selection.
+      vscode.setState(Object.assign({}, vscode.getState() || {}, {
+        selectAfterInsert: { handler: selected.handler, anchorExpectSrc: selected.expectSrc, position: position },
+      }));
+      vscode.postMessage({
+        command: 'insertToolbar', action: action, position: position,
+        handler: selected.handler, lineStart: selected.lineStart, lineEnd: selected.lineEnd,
+        expectSrc: selected.expectSrc, kind: selected.kind,
+      });
+    }
+    function menuDelete() {
+      if (!selected) { return; }
+      vscode.postMessage({ command: 'deleteRow', handler: selected.handler,
+        lineStart: selected.lineStart, lineEnd: selected.lineEnd, expectSrc: selected.expectSrc });
+    }
+    function menuMove(direction) {
+      if (!selectedEl) { return; }
+      const res = walkMove(stepsCtxRows(), Number(selectedEl.dataset.lineStart), direction);
+      if (!res) { return; } // at the top/bottom of the handler or the sole statement of its block — a no-op
+      vscode.postMessage({ command: 'moveTo', handler: selectedEl.dataset.handler,
+        lineStart: Number(selectedEl.dataset.lineStart), lineEnd: Number(selectedEl.dataset.lineEnd),
+        toLineStart: res.anchorLineStart, toLineEnd: res.anchorLineEnd,
+        toPosition: res.toPosition, toSuite: res.toSuite, expectSrc: selectedEl.dataset.expectSrc });
+    }
+
+    // Wrapped in try/catch → stepsDiag so a throw in the menu wiring can NEVER silently kill the row
+    // selection / toolbar wiring above it (the class of bug this whole file guards against).
+    try {
+      (function wireContextMenu() {
+        const menu = document.getElementById('stepsCtxMenu');
+        if (!menu) { return; }
+        const insertParents = Array.from(menu.querySelectorAll('.ctx-parent'));
+        const itemByCmd = (cmd) => menu.querySelector('.ctx-item[data-cmd="' + cmd + '"]');
+        const delItem = itemByCmd('deleteRow');
+        const upItem = itemByCmd('moveUp');
+        const downItem = itemByCmd('moveDown');
+        let open = false;
+
+        function closeSubmenus() {
+          for (const s of menu.querySelectorAll('.ctx-sub')) { s.classList.remove('ctx-open'); }
+        }
+        // Open EXACTLY ONE submenu (mouse or keyboard) — the mutual-exclusion the CSS can't guarantee (a
+        // focused parent + a hovered sibling would both reveal, overlapping). A disabled parent opens none.
+        function openSubmenu(sub) {
+          const btn = sub && sub.querySelector('.ctx-parent');
+          for (const s of menu.querySelectorAll('.ctx-sub')) {
+            s.classList.toggle('ctx-open', s === sub && !(btn && btn.disabled));
+          }
+        }
+        function closeMenu() {
+          if (!open) { return; }
+          open = false;
+          menu.hidden = true;
+          menu.classList.remove('ctx-flip-sub');
+          closeSubmenus();
+        }
+        function setDisabled(el, disabled) {
+          if (!el) { return; }
+          el.disabled = !!disabled;
+          // A disabled Insert parent must also suppress its submenu (belt-and-suspenders with openSubmenu).
+          const sub = el.closest('.ctx-sub');
+          if (sub) { sub.classList.toggle('ctx-disabled', !!disabled); }
+        }
+        // The visible, ENABLED items at a level (top-level, or within one submenu) — for arrow navigation.
+        function enabledItemsIn(container, topLevel) {
+          return Array.from(container.querySelectorAll('.ctx-item')).filter(
+            (b) => !b.disabled && (topLevel ? !b.closest('.ctx-submenu') : true));
+        }
+        function openMenu(el, x, y) {
+          const kind = el.dataset.kind;
+          const ls = Number(el.dataset.lineStart);
+          const ctxRows = stepsCtxRows();
+          // Mirrors stepsModel.contextMenuEnablement: Insert before always; Insert after not on a send
+          // (dead code after the return); Delete only on an editable action/lookup/send row; ↑/↓ per walk.
+          for (const p of insertParents) {
+            setDisabled(p, p.dataset.sub === 'after' && kind === 'send');
+          }
+          setDisabled(delItem, !(kind === 'action' || kind === 'lookup' || kind === 'send'));
+          setDisabled(upItem, !walkMove(ctxRows, ls, 'up'));
+          setDisabled(downItem, !walkMove(ctxRows, ls, 'down'));
+          // Reveal (hidden=false) so it can be measured, then clamp into the viewport (flip up/left at edges).
+          menu.hidden = false;
+          menu.classList.remove('ctx-flip-sub');
+          menu.style.left = '0px'; menu.style.top = '0px';
+          const rect = menu.getBoundingClientRect();
+          const vw = window.innerWidth, vh = window.innerHeight;
+          let left = x, top = y;
+          if (left + rect.width > vw - 4) { left = Math.max(4, vw - rect.width - 4); }
+          if (top + rect.height > vh - 4) { top = Math.max(4, vh - rect.height - 4); }
+          menu.style.left = left + 'px';
+          menu.style.top = top + 'px';
+          // Open submenus on whichever side has more room (default right; flip LEFT only when the right
+          // can't fit the submenu AND the left is roomier — so a near-left-edge narrow column doesn't flip
+          // into an even smaller gap). In an extremely narrow column neither side fully fits; we still pick
+          // the roomier side and keyboard nav (→ / ↑↓ / Enter) reaches every item regardless.
+          const SUBMENU_W = 156;
+          const spaceRight = vw - (left + rect.width);
+          if (spaceRight < SUBMENU_W && left > spaceRight) { menu.classList.add('ctx-flip-sub'); }
+          closeSubmenus(); // start with the top level only (focusing a parent no longer auto-reveals it)
+          open = true;
+          const firstEnabled = menu.querySelector('.ctx-item:not(:disabled)');
+          if (firstEnabled) { firstEnabled.focus(); }
+        }
+
+        for (const el of rows) {
+          el.addEventListener('contextmenu', (ev) => {
+            // DEFER to the native text menu inside an EDITABLE param input — right-click-to-paste must keep
+            // working in the very fields the [blank] hint invites you to fill (mirrors the click/keydown
+            // bails on inputs above). A read-only/disabled input still gets the row menu (nothing to edit).
+            const field = ev.target.closest('input, textarea, select');
+            if (field && !field.disabled) { return; }
+            ev.preventDefault();
+            ev.stopPropagation();
+            selectRow(el);
+            openMenu(el, ev.clientX, ev.clientY);
+          });
+        }
+
+        // Submenu reveal is JS-controlled (mutually exclusive): hovering an Insert parent opens ITS submenu
+        // and closes the other; hovering a top-level leaf (Delete / Move up / Move down) closes any submenu.
+        // Moving the pointer INTO an open submenu stays within its .ctx-sub, so it does not close.
+        for (const sub of menu.querySelectorAll('.ctx-sub')) {
+          sub.addEventListener('mouseenter', () => openSubmenu(sub));
+        }
+        for (const leaf of menu.querySelectorAll('.ctx-item[data-cmd]')) {
+          if (leaf.closest('.ctx-submenu')) { continue; } // the insert items INSIDE a submenu are not leaves
+          leaf.addEventListener('mouseenter', () => closeSubmenus());
+        }
+
+        menu.addEventListener('click', (ev) => {
+          const item = ev.target.closest('.ctx-item');
+          if (!item || item.disabled) { return; }
+          const cmd = item.dataset.cmd;
+          if (cmd === 'insert') { menuInsert(item.dataset.action, item.dataset.position); }
+          else if (cmd === 'deleteRow') { menuDelete(); }
+          else if (cmd === 'moveUp') { menuMove('up'); }
+          else if (cmd === 'moveDown') { menuMove('down'); }
+          else { return; } // an Insert PARENT — its submenu opens on hover/focus, a click is not an action
+          closeMenu();
+        });
+
+        // Keyboard navigation while open: ↑/↓ move within the current level, → opens a submenu, ← returns.
+        menu.addEventListener('keydown', (ev) => {
+          if (!open) { return; }
+          const focused = document.activeElement;
+          const inSub = focused && focused.closest('.ctx-submenu');
+          if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+            ev.preventDefault();
+            const list = inSub ? enabledItemsIn(inSub, false) : enabledItemsIn(menu, true);
+            if (!list.length) { return; }
+            let i = list.indexOf(focused);
+            i = ev.key === 'ArrowDown' ? (i + 1) % list.length : (i - 1 + list.length) % list.length;
+            if (!inSub) { closeSubmenus(); } // moving among top-level items closes any open submenu
+            list[i].focus();
+          } else if (ev.key === 'ArrowRight' && focused && focused.classList.contains('ctx-parent') && !focused.disabled) {
+            const wrap = focused.closest('.ctx-sub');
+            openSubmenu(wrap); // reveal it (JS-controlled) before entering
+            const items = enabledItemsIn(wrap.querySelector('.ctx-submenu'), false);
+            if (items.length) { ev.preventDefault(); items[0].focus(); }
+          } else if (ev.key === 'ArrowLeft' && inSub) {
+            ev.preventDefault();
+            const parent = inSub.closest('.ctx-sub').querySelector('.ctx-parent');
+            closeSubmenus();
+            if (parent) { parent.focus(); }
+          }
+        });
+
+        // Dismiss: outside click (mousedown catches it before a row re-selects), Escape, scroll, resize, blur.
+        document.addEventListener('mousedown', (ev) => {
+          if (open && !menu.contains(ev.target)) { closeMenu(); }
+        });
+        document.addEventListener('keydown', (ev) => {
+          if (open && ev.key === 'Escape') {
+            ev.preventDefault();
+            closeMenu();
+            if (selectedEl) { selectedEl.focus(); } // return focus to the row for continuity
+          }
+        });
+        window.addEventListener('scroll', () => closeMenu(), true);
+        window.addEventListener('resize', () => closeMenu());
+        window.addEventListener('blur', () => closeMenu());
+      })();
+    } catch (e) {
+      vscode.postMessage({ command: 'stepsDiag', level: 'error', text: 'context-menu wiring failed: ' + e });
+    }
+

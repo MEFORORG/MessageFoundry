@@ -3,6 +3,7 @@
 // view-model in graphModel.ts (ADR 0091 D2): an element-centric four-section perspective (default)
 // and a legacy by-flow chain perspective, toggled from the view title. Every element row jumps to
 // its definition; every cross-reference row reveals its target element in the tree.
+import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, runJson, workspaceDir } from "./cli";
 import {
@@ -16,6 +17,7 @@ import {
   type RuntimeMap,
   type VmNode,
 } from "./graphModel";
+import { buildSymbolIndex, matchSymbols, type SymbolDef, type SymbolKind } from "./symbolIndex";
 
 export type { Graph, GroupingMode, Perspective };
 
@@ -70,6 +72,7 @@ export class GraphProvider implements vscode.TreeDataProvider<Node> {
   private perspective: Perspective = "elements";
   private roots: Node[] | undefined;
   private runtime: RuntimeMap | undefined;
+  private symbols: SymbolDef[] = [];
 
   getGraph(): Graph | undefined {
     return this.graph;
@@ -140,6 +143,9 @@ export class GraphProvider implements vscode.TreeDataProvider<Node> {
         this.error = String(e);
       }
     }
+    // The name-search index (#228) is a pure file scan, independent of the CLI graph fetch — refreshed
+    // alongside it so a save picks up added/renamed transforms. Cheap and never throws.
+    this.symbols = cwd ? buildSymbolIndex(path.join(cwd, configDir())) : [];
     this.invalidate();
   }
 
@@ -170,8 +176,18 @@ export class GraphProvider implements vscode.TreeDataProvider<Node> {
         ? buildElementsView(g, this.filter, this.runtime)
         : buildFlowView(g, this.filter, this.grouping);
     const roots = vms.map((vm) => new Node(vm, undefined));
+    // While searching, append a "Definitions" section for handler/router/transform *symbols* matched by
+    // name (#228) — the graph view only reaches element names, so a transform (`def xform_…`) or a
+    // differently-named handler function inside a role-combined feed is otherwise unfindable. Names
+    // already shown as element rows are excluded so nothing double-lists.
+    const f = this.filter.trim();
+    if (f) {
+      const defs = matchSymbols(this.symbols, f, collectElementNames(vms));
+      if (defs.length > 0) {
+        roots.push(new Node(definitionsSection(defs), undefined));
+      }
+    }
     if (roots.length === 0) {
-      const f = this.filter.trim();
       return this.info(f ? `No elements match "${f}"` : "No connections", "info");
     }
     return roots;
@@ -222,4 +238,48 @@ export class GraphProvider implements vscode.TreeDataProvider<Node> {
     const section = this.roots.find((s) => s.children.some((el) => el.vm.elementKind === kind));
     return section?.children[section.children.length - 1];
   }
+}
+
+const SYMBOL_ICON: Record<SymbolKind, string> = {
+  handler: "symbol-method",
+  router: "git-branch",
+  transform: "symbol-function",
+};
+
+/** Every graph-element name currently shown (any perspective), so the Definitions section can exclude
+ *  names that already appear as element rows and not double-list them. */
+function collectElementNames(vms: VmNode[]): Set<string> {
+  const names = new Set<string>();
+  const walk = (n: VmNode): void => {
+    if (n.kind === "element" && n.elementName) {
+      names.add(n.elementName);
+    }
+    n.children.forEach(walk);
+  };
+  vms.forEach(walk);
+  return names;
+}
+
+/** The "Definitions" search section: one row per matched symbol, each opening its file at the def line.
+ *  A handler/router row also carries its (kind, name) so reveal / open-wiring-map work on it; a
+ *  transform is a pure jump (it is not a graph element). */
+function definitionsSection(defs: SymbolDef[]): VmNode {
+  return {
+    id: "section:definitions",
+    label: `Definitions (${defs.length})`,
+    kind: "section",
+    icon: "search",
+    collapsible: "expanded",
+    children: defs.map((d, i) => ({
+      id: `def:${d.kind}:${d.name}:${d.file}:${d.line}:${i}`,
+      label: d.name,
+      kind: "element",
+      description: `${d.kind} · ${path.basename(d.file)}`,
+      icon: SYMBOL_ICON[d.kind],
+      collapsible: "none",
+      children: [],
+      ...(d.kind === "transform" ? {} : { elementKind: d.kind, elementName: d.name }),
+      open: { file: d.file, line: d.line },
+    })),
+  };
 }

@@ -57,6 +57,7 @@ import {
   mergeLiveValues,
   parseRewriteResult,
   renderHandlersHtml,
+  renderStepsContextMenuHtml,
   shouldAttachLiveValues,
   shouldFallBackToText,
   traceRowValues,
@@ -395,6 +396,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         block?: string;
         text?: string;
         level?: string;
+        position?: string;
       }) => {
         if (m?.command === "test") {
           // Reuse the existing Test Bench (dry-run this workspace's config — no engine, no sending).
@@ -510,11 +512,16 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           typeof m.handler === "string" &&
           typeof m.lineStart === "number" &&
           typeof m.lineEnd === "number" &&
-          typeof m.kind === "string"
+          typeof m.kind === "string" &&
+          // An OPTIONAL explicit position (the right-click "Insert before"/"Insert after") — validated
+          // against the two legal values before it reaches the engine (inbound webview data is untrusted).
+          // Absent (the toolbar Add) → buildToolbarInsertRequest derives it from the anchor kind.
+          (m.position === undefined || m.position === "before" || m.position === "after")
         ) {
           // Insert a DEFAULT-param template at the currently SELECTED row (no InputBox prompts). The
-          // position is derived from the anchor's kind (send → before the return, else after) inside
-          // buildToolbarInsertRequest, which reuses the byte-stable `lens rewrite` path via applyStructural.
+          // position is either the explicit context-menu choice or derived from the anchor's kind (send →
+          // before the return, else after) inside buildToolbarInsertRequest, which reuses the byte-stable
+          // `lens rewrite` path via applyStructural.
           void applyStructural(
             buildToolbarInsertRequest(
               {
@@ -525,6 +532,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
                 kind: m.kind as RowKind,
               },
               m.action,
+              m.position as "before" | "after" | undefined,
             ),
           );
         } else if (
@@ -751,27 +759,90 @@ function pageHtml(
        the lens can't round-trip) is visibly muted. */
     .params .field input:disabled { opacity: 0.6; cursor: default; }
     .params .field input.edit:focus { outline: 1px solid var(--vscode-focusBorder); }
+    /* An empty editable field hints [blank] (a placeholder, never a value) so a freshly-inserted
+       template reads as "fill me in" without the analyst erasing a literal token. Muted + italic so it
+       never reads as real content. */
+    .params .field input::placeholder { color: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground));
+                           opacity: 1; font-style: italic; }
     pre.code { margin: 6px 0 0; padding: 6px 8px; background: var(--vscode-textCodeBlock-background, rgba(127,127,127,0.1));
                border: 1px solid var(--vscode-panel-border); border-radius: 3px; overflow: auto;
                font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; white-space: pre; }
     .empty { color: var(--vscode-descriptionForeground); }
+    /* Hover tooltips anchored ABOVE the control (the native title attribute shows below the cursor
+       after a delay, overlapping the next row). Applied via data-tip; form controls (input/select)
+       can't host a ::after, so they're wrapped in a span[data-tip]. */
+    [data-tip] { position: relative; }
+    [data-tip]:hover::after {
+      content: attr(data-tip); position: absolute; left: 50%; bottom: calc(100% + 8px);
+      transform: translateX(-50%); z-index: 100; width: max-content; max-width: 280px;
+      white-space: normal; text-align: left; padding: 4px 8px; font-size: 12px; line-height: 1.4;
+      border-radius: 4px; color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground));
+      background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background));
+      border: 1px solid var(--vscode-editorHoverWidget-border, var(--vscode-panel-border));
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.36); pointer-events: none; }
+    [data-tip]:hover::before {
+      content: ""; position: absolute; left: 50%; bottom: calc(100% + 3px); transform: translateX(-50%);
+      border: 5px solid transparent; z-index: 100; pointer-events: none;
+      border-top-color: var(--vscode-editorHoverWidget-border, var(--vscode-panel-border)); }
+    span[data-tip] { display: inline-flex; align-items: center; }
+    /* The toolbar is flush against the webview's top edge, so an above-tooltip there would be clipped
+       off-screen. Flip only the toolbar's tooltips below (still fully visible); row tooltips stay above
+       so they never cover the next step. */
+    .bar [data-tip]:hover::after { top: calc(100% + 8px); bottom: auto; }
+    .bar [data-tip]:hover::before { top: calc(100% + 3px); bottom: auto;
+      border-top-color: transparent;
+      border-bottom-color: var(--vscode-editorHoverWidget-border, var(--vscode-panel-border)); }
+    /* Right-click ROW context menu (BACKLOG #222 follow-up). A single hidden template the script positions
+       at the pointer; submenus reveal on hover / keyboard focus-within (no JS show/hide of submenus).
+       Uses VS Code's menu.* tokens with editorWidget/list fallbacks so it reads in every theme. */
+    .ctx-menu { position: fixed; z-index: 30; min-width: 168px; padding: 4px; border-radius: 5px;
+                background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+                color: var(--vscode-menu-foreground, var(--vscode-foreground));
+                border: 1px solid var(--vscode-menu-border, var(--vscode-editorWidget-border, var(--vscode-panel-border)));
+                box-shadow: 0 2px 10px rgba(0,0,0,0.36); font-size: 13px; }
+    .ctx-menu[hidden] { display: none; }
+    .ctx-sub { position: relative; }
+    .ctx-item { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%;
+                box-sizing: border-box; text-align: left; background: transparent; color: inherit; border: none;
+                padding: 3px 8px; font-family: inherit; font-size: 13px; line-height: 20px; border-radius: 3px;
+                cursor: pointer; white-space: nowrap; }
+    .ctx-item:hover:not(:disabled), .ctx-item:focus:not(:disabled) {
+                background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
+                color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground));
+                outline: none; }
+    .ctx-item:disabled { opacity: 0.4; cursor: default; }
+    .ctx-arrow { opacity: 0.75; font-size: 11px; margin-left: auto; }
+    .ctx-sep { height: 1px; margin: 4px 2px; background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border)); }
+    /* Submenu: hidden until the SCRIPT opens it (JS-controlled + mutually exclusive — see openSubmenu in
+       stepsWebview.js). NOT CSS :hover/:focus-within, which let a FOCUSED parent and a HOVERED sibling both
+       open and overlap (two submenus stacked). Opens to the right, flipping left when the root menu sits
+       near the viewport's right edge; a disabled parent (Insert after on a send row) never opens. */
+    .ctx-submenu { position: absolute; top: -5px; left: 100%; min-width: 152px; display: none; }
+    .ctx-sub.ctx-open > .ctx-submenu { display: block; }
+    .ctx-sub.ctx-disabled > .ctx-submenu { display: none !important; }
+    .ctx-root.ctx-flip-sub .ctx-submenu { left: auto; right: 100%; }
   </style>
 </head>
 <body>
   <div class="bar">
-    <input id="stepsFilter" type="search" placeholder="Filter steps…"
-           title="Filter the visible steps by text — segment, field path, action, or Send target" />
+    <span data-tip="Filter the visible steps by text — segment, field path, action, or Send target"><input id="stepsFilter" type="search" placeholder="Filter steps…" /></span>
     <span class="sep"></span>
-    <select id="insertAction" aria-label="Insert action" title="Choose an action to insert at the selected row">${insertOptions}</select>
-    <button id="addAction" disabled title="Insert the chosen action at the selected row">Add</button>
-    <button id="pickSample" title="Pick a synthetic HL7 sample to preview live per-row values (redacted by default — never real PHI)">${sampleBtn}</button>
-    <button id="test" title="Dry-run messages through this config in the Test Bench (no engine, no sending)">Test</button>
-    <button id="openText" class="link" title="Switch to the code (text) view of this Handler. Switch back with the ‘View as Steps’ button in the editor toolbar.">View as Code</button>
-    <span class="ver" title="MessageFoundry extension version (bumps with each change — a preview-install check)">v${escapeHtml(version)}</span>
+    <span data-tip="Choose an action to insert at the selected row"><select id="insertAction" aria-label="Insert action">${insertOptions}</select></span>
+    <button id="addAction" disabled data-tip="Insert the chosen action at the selected row">Add</button>
+    <button id="pickSample" data-tip="Pick a synthetic HL7 sample to preview live per-row values (redacted by default — never real PHI)">${sampleBtn}</button>
+    <button id="test" data-tip="Dry-run messages through this config in the Test Bench (no engine, no sending)">Test</button>
+    <button id="openText" class="link" data-tip="Switch to the code (text) view of this Handler. Switch back with the ‘View as Steps’ button in the editor toolbar.">View as Code</button>
+    <span class="ver" data-tip="MessageFoundry extension version (bumps with each change — a preview-install check)">v${escapeHtml(version)}</span>
   </div>
   <!-- Undo/Redo (Ctrl+Z/Y) and Copy/Cut/Paste (Ctrl+C/X/V) are keyboard-served — the redundant toolbar
-       buttons were removed to keep the bar lean (a right-click row menu for those verbs is a follow-up). -->
+       buttons were removed to keep the bar lean. A right-click ROW context menu (below) now surfaces the
+       structural verbs (Insert before/after, Delete, Move up/down); copy/cut/paste stay keyboard-only. -->
   ${body}
+  <!-- The single, hidden row context-menu template (server-rendered so the CSP webview never innerHTMLs
+       markup + the insert catalog stays the one INSERT_ACTION_LABELS source of truth). The script shows,
+       positions, greys, and dismisses it, then posts the SAME insert/delete/move messages the toolbar and
+       row buttons post — no second execution path. -->
+  ${renderStepsContextMenuHtml()}
   <script nonce="${n}" src="${scriptUri}"></script>
 </body>
 </html>`;

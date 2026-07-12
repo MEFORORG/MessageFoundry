@@ -18,7 +18,7 @@ import abc
 import asyncio
 import ipaddress
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, ClassVar
 
 from messagefoundry.config.models import ContentType, ConnectorType, Destination, Source
@@ -161,11 +161,22 @@ class DeliveryResponse:
       which is a retryable :class:`DeliveryError`), or ``no_reply`` (a successful round-trip with a
       deliberately empty payload — e.g. an empty 2xx).
     * ``detail`` — a short, possibly-PHI reason (``MSA-1=AA``, ``HTTP 201``); encrypted at rest.
+    * ``headers`` — a captured **allow-listed** subset of the reply's HTTP response headers (BACKLOG
+      #154, ADR 0013 amendment 2026-07-12). Empty ``{}`` by default (every non-HTTP / non-configured
+      destination is byte-identical). Only the per-connection ``capture_response_headers`` names are
+      ever captured (PHI gate: a partner reply header could carry sensitive data, so it is opt-in by
+      name — never all headers). This is a **captured external value** (like the ``fhir_lookup``
+      read-only carve-out): it is read off the wire at delivery and, unlike a pure transform output,
+      reflects the partner's reply at that pass — the capture itself is deterministic per reply
+      (the same names off the same reply → the same dict), so it re-ingresses re-run-stably from the
+      immutable stored copy. Surfaced to a re-ingressed answer's Handler via
+      ``response_get(dest).headers`` (ADR 0013 Increment 2).
     """
 
     body: str
     outcome: str
     detail: str | None = None
+    headers: Mapping[str, str] = field(default_factory=dict)
 
 
 class SourceConnector(abc.ABC):

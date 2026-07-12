@@ -294,3 +294,34 @@ so this is a **secret**-handling rule (the token is a bearer credential), parall
   arm; (4) docs — a `### SMART Backend Services` subsection in [CONNECTIONS.md](../CONNECTIONS.md), the
   FEATURE-MAP §7 split, a sample `outbound(...)` config, and flip this ADR's [README.md](README.md) row to
   Accepted.
+
+## Amendment (2026-07-12) — generic outbound HTTP auth (BACKLOG #65)
+
+The SMART provider proved the **bearer-token seam** on the HTTP destinations (mint + cache a short-lived
+bearer, inject `Authorization: Bearer …` per request off-loop past the queue boundary). #65 generalizes
+outbound HTTP auth into a small **pluggable provider seam** ([`transports/http_auth.py`](../../messagefoundry/transports/http_auth.py)),
+additive and **off by default → byte-identical**, selected per connection on REST/SOAP/FHIR.
+
+**Built.**
+
+- **OAuth2 client-credentials with a SYMMETRIC `client_secret`** — `OAuth2ClientCredentialsProvider`, a
+  `BearerTokenProvider` (the same `access_token()` / `invalidate()` structural interface the SMART provider
+  already satisfies), so it slots into the destinations' **existing** per-request bearer-injection seam with
+  no new plumbing. `client_secret_basic` (default) / `client_secret_post`; mint + cache + re-mint on `401`;
+  the token endpoint is refused over cleartext `http`. `bearer_provider_from_settings` unifies SMART +
+  OAuth2-CC and enforces they are **mutually exclusive** on one connection. Composer:
+  `with_oauth2_client_credentials()` (mirrors `with_smart_backend`).
+- **HTTP Digest (RFC 7616)** — the stdlib `urllib.request.HTTPDigestAuthHandler` answers the endpoint's
+  `401` challenge and retries within one `opener.open()` (Digest is request-oriented, no connection pinning).
+  Folded into a **per-connection** opener (never the shared `_NO_REDIRECT_OPENER`); refused over cleartext
+  `http`; mutually exclusive with a bearer provider. Composer: `with_http_digest()`.
+
+**Secrets.** `oauth2_client_secret` / `http_auth_password` are `env()`-resolved and redacted (added to
+`_SECRET_SETTING_KEYS`); the minted bearer / digest response are runtime-only, never logged or persisted.
+**No new dependency** — stdlib `urllib` + rest.py's hardened, TLS-verifying, no-redirect opener.
+
+**Scoped out — NTLM / Negotiate.** NTLM's handshake is **connection-bound** (the type1/type2/type3 legs
+must ride one keep-alive TCP connection). `urllib.request` opens a **fresh connection per `open()`**, so it
+structurally cannot carry the handshake — a correct build needs a keep-alive HTTP client driven by
+`pyspnego` (already in `requirements.lock`, backing the AD/SSO server path). Deferred as a follow-up; the
+provider seam here is shaped to admit it (a challenge/response plug alongside the bearer + digest plugs).

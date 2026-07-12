@@ -167,4 +167,73 @@ serve time (documented residual below).
 
 - [x] Owner ratified the enforced-refusal + attestation-opt-out posture (secure default = refuse).
 - [x] Env escape name fixed: `MEFOR_TLS_REVOCATION_ATTESTED` (sibling of `MEFOR_ALLOW_INSECURE_TLS`).
-- [ ] Follow-on: extend the enforced gate to per-connection MLLP-over-TLS off-loopback termination.
+- [x] Follow-on (see Amendment 2026-07-12): extend the enforced gate to the **OUTBOUND** verifying-TLS
+  connectors (MLLP-over-TLS egress, REST/SOAP/FHIR https, the Postgres asyncpg store hop).
+
+---
+
+## Amendment — 2026-07-12: extend the enforced refusal to OUTBOUND connector TLS (BACKLOG #201 residual)
+
+**Status:** Accepted (2026-07-12) — owner-authorized backlog wave. Closes the *Out of scope* residuals
+above (the MLLP-over-TLS per-connection gate + the Postgres / REST / SOAP / FHIR client paths) with the
+**same posture-keyed start-time refusal**, keyed on the deriving instance's `HopPosture`.
+
+### Context
+
+The original decision ENFORCED the "no in-engine OCSP/CRL → refuse an unproven off-loopback in-process
+`[api]` TLS bind" posture for the **listener** only. The identical blind spot exists on every **OUTBOUND**
+connector that *verifies* a downstream server certificate over Python's `ssl` (which has no OCSP/CRL): the
+chain is validated (+ strict RFC 5280 via `harden_verify_flags`) but a **revoked-but-unexpired** peer cert
+is still accepted. Those were the documented *Out of scope* residuals; this amendment builds them.
+
+### Decision
+
+A **VERIFYING** outbound TLS hop that is **off-loopback, PHI, and production** with revocation **not proven
+in front** is **REFUSED at construction / `messagefoundry check` / dry-run** (the store hop: at store open);
+a non-production PHI hop **WARNs** (crosses, loud-logged); loopback / synthetic (non-PHI) / attested hops
+are **byte-identical**. This reuses `config/tls_policy.py`, mirroring the #200/ADR-0092 seam exactly:
+
+- **Pure predicate** `revocation_hop_disposition(*, is_phi, production, is_loopback_hop, proxy_proven,
+  attested) -> HopDisposition` — the outbound sibling of `in_process_tls_revocation_refused`, using the
+  `HopDisposition` gradient of `insecure_hop_disposition`. Precedence: loopback→ALLOW; `proxy_proven`
+  (a declared revocation-checking egress terminator)→ALLOW; `attested`→ALLOW; synthetic→ALLOW;
+  production→REFUSE; else non-prod-PHI→WARN. It carries **no global-escape arm** — the only relaxations are
+  the on-box carve-out, a proven terminator, an operator attestation, or a synthetic instance.
+- **Thin guard** `RevocationHopGuard.capture(...).enforce_construction()` — snapshots the active
+  `HopPosture` (`current_hop_posture`, stamped by `build_check_registry`'s `active_hop_posture` scope) and
+  folds the blanket `MEFOR_TLS_REVOCATION_ATTESTED` env into the per-connection attestation. No-op when the
+  posture is unstamped (a live serve build after the pre-flight / a direct test), identical to the #200
+  `InsecureHopGuard` — the build-check gate is the authority.
+- **Attestation** — a new per-connection `tls_revocation_attested` flag (Destination), OR the existing
+  blanket `MEFOR_TLS_REVOCATION_ATTESTED` env (the same opt-out the listener got). It is **distinct** from
+  the #200 `tls_hop_attested` (which attests a *cleartext / verify-off* hop is secure by other means).
+
+### Scope built
+
+- **MLLP-over-TLS egress** (`MLLPDestination`) — guarded on the VERIFY path only (`verify_mode !=
+  CERT_NONE`); the `tls_verify=false` / cleartext cases are already refused by `_mllp_ssl_context` / #200.
+- **REST / SOAP / FHIR / DICOMweb https** — the shared `transports/rest.py:refuse_unrevoked_verified_hop(...)`
+  fired on each connector's `verify_tls`-ON https path (covers the shared verifying opener, the ADR-0094
+  expiry-relaxed opener, and SOAP mTLS). DICOMweb STOW-RS reuses REST's verifying urllib opener, so it takes
+  the identical guard — a PHI-bearing verified-https imaging hop is not left unguarded beside its siblings.
+- **SMTP-over-TLS email** (`EmailDestination`, ADR 0029) — guarded on the `use_tls`-ON path (STARTTLS on 587
+  / implicit `SMTP_SSL` on 465). smtplib is a different construction seam (not the urllib/ssl scheme), so it
+  calls `RevocationHopGuard.capture(...).enforce_construction()` directly rather than the https-scheme-keyed
+  `refuse_unrevoked_verified_hop`. The message body carries PHI over the verified SMTP session, so the same
+  posture-keyed refusal applies; the `use_tls=false` cleartext path is already refused separately.
+- **Postgres asyncpg store hop** — `store/postgres.py:_refuse_store_revocation(...)` at `_build_ssl` on the
+  two verifying branches (pinned CA + system trust store); attestation is the blanket env only (the store
+  has no per-connection TOML). Sits beside — and composes with — the existing weakened-TLS refusal.
+
+### Composition with #200 (no double-refusal)
+
+#200 refuses the **cleartext / verify-off** hop; this amendment fires **only on a VERIFYING hop**. The two
+gates key on disjoint conditions, so a given hop is refused by exactly one of them, never both.
+
+### Still out of scope (unchanged, documented)
+
+- **SQL Server / SChannel** — the OS stack already does OS-managed revocation (no change).
+- **DICOM-SCU / FTPS verifying contexts** — a follow-on may extend the identical `RevocationHopGuard` to
+  the DIMSE-over-TLS SCU and the FTPS control/data channel; deferred to bound this wave. No new OCSP.
+- **The FhirLookup read path** (`fhir_lookup`, ADR 0043) — scope-adjacent; the same helper applies when it
+  is a near-term extension. No in-engine OCSP is introduced anywhere — this stays a posture-keyed refusal.

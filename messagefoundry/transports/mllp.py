@@ -44,6 +44,7 @@ from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
+    RevocationHopGuard,
     TrustAnchorPolicy,
     build_verifying_client_context,
     current_hop_posture,
@@ -661,6 +662,24 @@ class MLLPDestination(DestinationConnector):
         )
         if self._hop_guard is not None:
             self._hop_guard.enforce_construction()
+        # #201 (ADR 0078 amendment): a VERIFYING MLLP-over-TLS egress validates the peer cert but does no
+        # OCSP/CRL revocation (stdlib ssl has none). Guard the VERIFY path only — the tls_verify=false /
+        # CERT_NONE case is already refused by _mllp_ssl_context / #200, and the plaintext case by the
+        # cleartext _hop_guard above — so the two gates never double-refuse one hop. A production-PHI hop
+        # off-loopback is refused at the enforced construction gate unless tls_revocation_attested / the
+        # blanket env opts in; loopback / synthetic / non-prod / attested stay byte-identical.
+        self._revocation_guard: RevocationHopGuard | None = (
+            RevocationHopGuard.capture(
+                host=self.host,
+                cell="MLLP outbound",
+                description="verified MLLP-over-TLS egress (no revocation check)",
+                attested=config.tls_revocation_attested,
+            )
+            if self._ssl is not None and self._ssl.verify_mode is not ssl.CERT_NONE
+            else None
+        )
+        if self._revocation_guard is not None:
+            self._revocation_guard.enforce_construction()
 
     @staticmethod
     def _describe_error(exc: BaseException) -> str:

@@ -82,10 +82,13 @@ from messagefoundry.transports.rest import (
     _insecure_opener,
     _redact_url,
     InsecureHopGuard,
+    capture_response_headers,
     enforce_outbound_length_limits,
+    normalize_header_allowlist,
     refuse_cleartext_credential_hop,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
+    refuse_unrevoked_verified_hop,
     refuse_verify_off,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -272,6 +275,11 @@ class SoapDestination(DestinationConnector):
         self.soap_action: str = str(s.get("soap_action") or "")
         # ADR 0013: capture the SOAP response envelope. Default False → returns None, byte-identical.
         self.capture_response: bool = bool(s.get("capture_response", False))
+        # #154: allow-list of HTTP response headers to capture into the DeliveryResponse (empty default →
+        # byte-identical). Shared parser/filter with REST (SOAP reuses REST's HTTP plumbing).
+        self.capture_response_headers = normalize_header_allowlist(
+            s.get("capture_response_headers")
+        )
 
         # --- ADR 0015: WS-* + mutual-TLS settings -----------------------------------------------
         self.client_cert_file: str | None = s.get("client_cert_file") or None
@@ -308,6 +316,19 @@ class SoapDestination(DestinationConnector):
         # signature is minted in _post over the FINAL wire bytes (the WS-* wrapped envelope, ADR 0015).
         self._signer: MessageSigner | None = signer_from_destination(config)
 
+        # #201 (ADR 0078 amendment): the verify-ON https hops below (mTLS + the shared verifying opener)
+        # validate the peer cert but do no OCSP/CRL revocation (stdlib ssl has none) — refuse an
+        # off-loopback production-PHI verified hop unless revocation is attested. Gated on verify-ON so it
+        # is disjoint from the verify_tls=false / cleartext #200 gates (verify_tls=false takes the else
+        # branch below); loopback / synthetic / non-prod / attested stay byte-identical.
+        if bool(s.get("verify_tls", True)):
+            refuse_unrevoked_verified_hop(
+                scheme,
+                self.url,
+                connector="SOAP destination",
+                revocation_attested=config.tls_revocation_attested,
+            )
+
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
                 self.client_cert_file,
@@ -337,6 +358,31 @@ class SoapDestination(DestinationConnector):
                 _redact_url(self.url),
             )
             self._opener = _insecure_opener()
+        # #65: opt-in generic HTTP auth on the SOAP transport (independent of WS-Security, which secures
+        # the SOAP *message*; this secures the HTTP *hop*). A bearer provider (OAuth2 client-credentials —
+        # SMART is FHIR/REST-only) injected per-request in _post, OR HTTP Digest folded into the opener.
+        # Both None (default) → byte-identical. Mutually exclusive with each other.
+        from messagefoundry.transports.http_auth import (
+            HttpAuthError,
+            bearer_provider_from_settings,
+            digest_handler_from_settings,
+        )
+
+        self._token_provider = bearer_provider_from_settings(s)
+        if self._token_provider is not None:
+            refuse_cleartext_credentials(
+                scheme, {**self._headers, "Authorization": "Bearer"}, self.url, attested=attested
+            )
+        digest = digest_handler_from_settings(s, url=self.url)
+        if digest is not None:
+            if self._token_provider is not None:
+                raise HttpAuthError(
+                    "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
+                    "(mutually exclusive — configure exactly one)"
+                )
+            if self._opener is _NO_REDIRECT_OPENER:
+                self._opener = urllib.request.build_opener(_NoRedirectHandler)
+            self._opener.add_handler(digest)
 
     def _validate_ws(self, scheme: str, s: dict[str, Any], *, attested: bool = False) -> None:
         """Runtime validation of the WS-* / mTLS settings (also enforced at wiring time by
@@ -468,7 +514,7 @@ class SoapDestination(DestinationConnector):
         # boundary), so the per-call MessageID/Timestamp/Nonce never live in a pure transform.
         if self._ws_mode:
             payload = self._wrap_envelope(payload)
-        body, status = await asyncio.to_thread(self._post, payload)
+        body, status, headers = await asyncio.to_thread(self._post, payload)
         # A fault can arrive inside a 2xx body, so classify it. Transport-level faults (non-2xx,
         # URL/timeout) already raised inside _post, for both modes.
         failure = _classify_soap(status, body)
@@ -480,11 +526,15 @@ class SoapDestination(DestinationConnector):
             # Capturing: record the application <Fault> as a rejected reply rather than raising, so the
             # row is delivered-with-a-rejection (operators reconcile from the captured response).
             return DeliveryResponse(
-                body=body, outcome="rejected", detail=f"SOAP fault (HTTP {status})"
+                body=body, outcome="rejected", detail=f"SOAP fault (HTTP {status})", headers=headers
             )
         if not body:
-            return DeliveryResponse(body="", outcome="no_reply", detail=f"HTTP {status}")
-        return DeliveryResponse(body=body, outcome="accepted", detail=f"HTTP {status}")
+            return DeliveryResponse(
+                body="", outcome="no_reply", detail=f"HTTP {status}", headers=headers
+            )
+        return DeliveryResponse(
+            body=body, outcome="accepted", detail=f"HTTP {status}", headers=headers
+        )
 
     async def test_connection(self) -> None:
         await asyncio.to_thread(self._probe)
@@ -510,7 +560,7 @@ class SoapDestination(DestinationConnector):
         except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"SOAP {_redact_url(self.url)} failed: {exc}") from exc
 
-    def _post(self, payload: str) -> tuple[str, int]:
+    def _post(self, payload: str) -> tuple[str, int, dict[str, str]]:
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses (a None guard — secure/loopback — is byte-identical).
         if self._hop_guard is not None:
@@ -521,10 +571,16 @@ class SoapDestination(DestinationConnector):
         # so signing over these bytes covers exactly what the partner receives.
         data = payload.encode(self.encoding)
         headers = self._headers
-        if self._signer is not None:
-            # ASVS 4.1.5 (ADR 0018): detached JWS over the envelope, minted off-loop past the queue
-            # boundary so a retry re-mints it (re-run purity holds, like the WS-Security nonce).
-            headers = {**self._headers, **self._signer.signature_headers(data)}
+        if self._token_provider is not None or self._signer is not None:
+            headers = dict(self._headers)
+            if self._token_provider is not None:
+                # #65: a fresh OAuth2-CC bearer per request, acquired off-loop past the queue boundary (a
+                # retry re-mints — re-run purity holds). Overrides any static bearer_token.
+                headers["Authorization"] = f"Bearer {self._token_provider.access_token()}"
+            if self._signer is not None:
+                # ASVS 4.1.5 (ADR 0018): detached JWS over the envelope, minted off-loop past the queue
+                # boundary so a retry re-mints it (re-run purity holds, like the WS-Security nonce).
+                headers.update(self._signer.signature_headers(data))
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self.url,
             data=data,
@@ -535,7 +591,11 @@ class SoapDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 body = resp.read().decode(self.encoding, errors="replace")
                 status = int(getattr(resp, "status", 200))
-                return body, status
+                # #154: capture only the allow-listed response headers (empty allow-list → {}).
+                headers = capture_response_headers(
+                    getattr(resp, "headers", None), self.capture_response_headers
+                )
+                return body, status, headers
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode(self.encoding, errors="replace")

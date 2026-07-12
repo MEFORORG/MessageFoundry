@@ -1,5 +1,12 @@
 # ADR 0069 — Durable-write is not the throughput wall; the lever is engine feed concurrency
 
+> # ✅ RATIFIED (2026-07-12) by [ADR 0099](0099-phase-4-group-commit-amortize-the-per-event-transaction-cost.md) — **you were right, and you were ignored**
+> This ADR measured [ADR 0055](0055-group-commit-durable-write.md)'s premise and refuted it on **2026-07-03**.
+> **0055 was not withdrawn**, and for nine days the ledger simultaneously authorized a group-commit build *and*
+> recorded that durable-write is not the wall. **ADR 0099 has now withdrawn 0055 and adopted this ADR's conclusion.**
+> Its finding stands: the commit tier is **~9% utilised** (~2,416 c/s demand at the full 45M/day target against a
+> **~27–29k commits/s** ceiling). **Do not propose a commit-reduction lever without measuring `txn/s` first.**
+
 **Status:** Proposed (2026-07-03)
 **Deciders:** throughput working group
 **Related:** ADR 0066 (pooled stage claimers), ADR 0055 (group-commit / durable-write), ADR 0001 (staged pipeline), ADR 0037 / ADR 0063 (sharding on a unified store), ADR 0053 (free-threading); [`docs/throughput-roadmap.md`](../throughput-roadmap.md), [`docs/throughput-build-plan.md`](../throughput-build-plan.md)

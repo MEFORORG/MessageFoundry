@@ -176,15 +176,34 @@ export class WiringMapPanel {
     .legend .ln { display: inline-block; width: 26px; border-top: 2px solid var(--vscode-descriptionForeground);
                   margin-right: 4px; vertical-align: 3px; }
     .legend .ln.dash { border-top-style: dashed; }
+    /* Hover tooltips anchored ABOVE the control (the native title attribute shows below the cursor).
+       Toolbar controls sit flush at the top, so their tooltips flip below to stay on-screen (.bar). */
+    [data-tip] { position: relative; }
+    [data-tip]:hover::after {
+      content: attr(data-tip); position: absolute; left: 50%; bottom: calc(100% + 8px);
+      transform: translateX(-50%); z-index: 100; width: max-content; max-width: 280px;
+      white-space: normal; text-align: left; padding: 4px 8px; font-size: 12px; line-height: 1.4;
+      border-radius: 4px; color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground));
+      background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background));
+      border: 1px solid var(--vscode-editorHoverWidget-border, var(--vscode-panel-border));
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.36); pointer-events: none; }
+    [data-tip]:hover::before {
+      content: ""; position: absolute; left: 50%; bottom: calc(100% + 3px); transform: translateX(-50%);
+      border: 5px solid transparent; z-index: 100; pointer-events: none;
+      border-top-color: var(--vscode-editorHoverWidget-border, var(--vscode-panel-border)); }
+    .bar [data-tip]:hover::after { top: calc(100% + 8px); bottom: auto; }
+    .bar [data-tip]:hover::before { top: calc(100% + 3px); bottom: auto;
+      border-top-color: transparent;
+      border-bottom-color: var(--vscode-editorHoverWidget-border, var(--vscode-panel-border)); }
   </style>
 </head>
 <body>
   <div class="bar">
-    <span class="focuslbl" id="focusLbl" title="Current focus element"></span>
+    <span class="focuslbl" id="focusLbl" data-tip="Current focus element"></span>
     <input id="search" list="elementNames" placeholder="Jump to an element…" />
     <datalist id="elementNames"></datalist>
-    <button id="refresh" title="Re-read the wiring graph">Refresh</button>
-    <button id="reveal" disabled title="Reveal the selected node in the Connections tree">Reveal in tree</button>
+    <button id="refresh" data-tip="Re-read the wiring graph">Refresh</button>
+    <button id="reveal" disabled data-tip="Reveal the selected node in the Connections tree">Reveal in tree</button>
   </div>
   <div id="note" class="note"></div>
   <div class="stage">

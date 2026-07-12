@@ -24,7 +24,14 @@ fencing yet — but per-message finalize, the audit chain, and schema init are s
   re-counts on a fresh snapshot — no double-finalize; different ids never contend. A finalizer that
   spans **more than one** message (``cancel_queued`` and the dead-letter sweeps) pre-acquires every
   per-message lock up front in a **canonical (sorted) order** via :meth:`_lock_finalize_batch`, so two
-  such callers with overlapping message sets can't form a lock cycle (no multi-message deadlock). The
+  such callers with overlapping message sets can't form a lock cycle (no multi-message deadlock).
+  **Every multi-message finalizer is bound by this rule, not just the two named above** — the ADR 0082
+  batch primitives (:meth:`mark_batch_done`, :meth:`mark_batch_failed`, :meth:`dead_letter_batch`) each
+  finalize N distinct ids in ONE txn and so MUST iterate in ``sorted()`` id order. They originally
+  iterated a dict in *insertion* (caller ``outbox_ids``) order, which is a real cycle: a fan-out message
+  has one outbound row per destination, each destination lane batches independently, so two concurrent
+  batches can hold overlapping id sets and take the same two locks in opposite orders. **Adding a new
+  multi-message finalizer? Sort, or use :meth:`_lock_finalize_batch`.** The
   per-message lock only mutually-excludes finalize-vs-finalize; the direct ``messages.status`` writers
   (``handoff``/``route_handoff``/``replay``/``replay_dead``) are pipeline-ordered to never overlap a
   finalize for the same id (the router produces the routed rows a later transform consumes+finalizes),
@@ -61,14 +68,24 @@ from messagefoundry.config.settings import (
     StoreSettings,
     weakened_tls_escape_permitted,
 )
-from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.config.tls_policy import (
+    HopDisposition,
+    HopPosture,
+    is_loopback_hop_host,
+    revocation_hop_disposition,
+    tls_revocation_attested,
+)
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import Row, warm_pool_connections, warm_pool_target
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.metadata import merge_user_metadata
+from messagefoundry.store.metadata import (
+    decode_response_headers,
+    encode_response_headers,
+    merge_user_metadata,
+)
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram, PoolStatus
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
@@ -264,6 +281,7 @@ _SCHEMA: list[str] = [
         body             TEXT,
         outcome          TEXT NOT NULL,
         detail           TEXT,
+        resp_headers     TEXT,  -- BACKLOG #154: captured allow-listed HTTP response headers (JSON), encrypted
         captured_at      DOUBLE PRECISION NOT NULL,
         kind             TEXT NOT NULL DEFAULT 'response',  -- ADR 0021: 'response' | 'ack_sent'
         ack_code         TEXT,
@@ -521,6 +539,16 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         ctx.check_hostname = False
         ctx.verify_mode = _ssl.CERT_NONE
         return ctx
+    # #201 (ADR 0078 amendment): the engine->store hop below VERIFIES the peer cert (a pinned CA or the
+    # system trust store) but asyncpg rides stdlib ssl, which does NO OCSP/CRL revocation — a
+    # revoked-but-unexpired store cert would still be accepted. Refuse an off-loopback production-PHI
+    # verifying store hop unless the operator attests a revocation-checking PKI (the blanket
+    # MEFOR_TLS_REVOCATION_ATTESTED env — the store has no per-connection attestation surface). Byte-
+    # identical when the posture is unstamped / non-prod / synthetic / loopback / attested; composes with
+    # (never loosens) the weakened-TLS refusal above (that fires first on the verify-off / cleartext path).
+    # settings.server is str | None; an empty host reads as loopback (is_loopback_hop_host) → ALLOW, so a
+    # missing server (a Postgres config that would fail elsewhere) never trips the revocation refusal.
+    _refuse_store_revocation(host=settings.server or "", posture=posture)
     if settings.ssl_root_cert:
         import ssl as _ssl
 
@@ -529,6 +557,43 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         # check_hostname=True, so this stays a fully-verifying posture (a bad path raises at connect).
         return _ssl.create_default_context(cafile=settings.ssl_root_cert)
     return True  # verifying TLS against the system trust store (the secure default)
+
+
+def _refuse_store_revocation(*, host: str, posture: HopPosture | None) -> None:
+    """Refuse a VERIFYING engine->store TLS hop that does no certificate revocation checking (#201).
+
+    The store-hop twin of :class:`~messagefoundry.config.tls_policy.RevocationHopGuard` — the store is
+    opened outside the connectors' ``active_hop_posture`` construction gate, so it keys directly on the
+    ``posture`` threaded from ``open_store``. ``None`` (a direct test / embedding that derives no posture)
+    is a no-op (byte-identical). Attestation is the blanket ``MEFOR_TLS_REVOCATION_ATTESTED`` env only
+    (the store has no per-connection TOML); no ``proxy_proven`` (an engine->store hop has no declared
+    revocation-checking egress terminator). Raises ``ValueError`` (surfaced at store open, exactly like the
+    weakened-TLS refusal it sits beside) on a production-PHI verifying store hop off-loopback; WARNs on a
+    non-production PHI hop; allows loopback / synthetic / attested (byte-identical)."""
+    if posture is None:
+        return
+    disposition = revocation_hop_disposition(
+        is_phi=posture.is_phi,
+        production=posture.production,
+        is_loopback_hop=is_loopback_hop_host(host),
+        proxy_proven=False,
+        attested=tls_revocation_attested(),
+    )
+    if disposition is HopDisposition.REFUSE:
+        raise ValueError(
+            f"Postgres store TLS verifies the peer certificate for host {host!r} but performs NO "
+            "certificate revocation checking (asyncpg rides stdlib ssl — no OCSP/CRL; ASVS 12.1.4, "
+            "ADR 0078). On a production-PHI instance a revoked-but-unexpired store certificate would "
+            "still be accepted. Terminate the store TLS at a revocation-checking proxy, run short-lived "
+            "certs, or set MEFOR_TLS_REVOCATION_ATTESTED=1 to attest a revocation-checking PKI backs it."
+        )
+    if disposition is HopDisposition.WARN:
+        log.warning(
+            "Postgres store TLS to host %r verifies the peer but performs no certificate revocation "
+            "checking (no OCSP/CRL); a revoked store cert would be accepted. Non-production PHI instance "
+            "— crossing. Set MEFOR_TLS_REVOCATION_ATTESTED=1 once a revocation-checking PKI backs it.",
+            host,
+        )
 
 
 class PostgresStore:
@@ -844,7 +909,7 @@ class PostgresStore:
             for r in await conn.fetch(
                 "SELECT column_name FROM information_schema.columns"
                 " WHERE table_name='response' AND column_name = ANY($1::text[])",
-                ["kind", "ack_code", "ack_phase"],
+                ["kind", "ack_code", "ack_phase", "resp_headers"],
             )
         }
         if "kind" not in response_cols:
@@ -855,6 +920,10 @@ class PostgresStore:
             await conn.execute("ALTER TABLE response ADD COLUMN ack_code TEXT")
         if "ack_phase" not in response_cols:
             await conn.execute("ALTER TABLE response ADD COLUMN ack_phase TEXT")
+        # BACKLOG #154: captured allow-listed HTTP response headers (JSON, encrypted); pre-existing rows
+        # get NULL = "no captured headers".
+        if "resp_headers" not in response_cols:
+            await conn.execute("ALTER TABLE response ADD COLUMN resp_headers TEXT")
         # Active-active scale-out was dropped: drop the retired per-lane FIFO-ownership table from any DB
         # that was opened by an earlier build. Failover FIFO safety no longer depends on a lane lease —
         # claim_next_fifo reclaims a stranded head from the queue table directly. IF EXISTS is a no-op on
@@ -1265,8 +1334,9 @@ class PostgresStore:
         total += await self._encrypt_existing_composite(
             "reference", ("name", "version", "key"), like, encrypt=True
         )
-        # The `response` table (composite PK + TWO cipher columns — ADR 0013) migrates each column.
-        for col in ("body", "detail"):
+        # The `response` table (composite PK + cipher columns — ADR 0013; resp_headers added in #154)
+        # migrates each column.
+        for col in ("body", "detail", "resp_headers"):
             total += await self._encrypt_existing_composite(
                 "response",
                 ("message_id", "destination_name", "response_seq"),
@@ -1355,8 +1425,8 @@ class PostgresStore:
         total += await self._reencrypt_composite(
             cipher, "reference", ("name", "version", "key"), active_like, batch
         )
-        # The `response` table (composite PK + two cipher columns — ADR 0013) rotates each column.
-        for col in ("body", "detail"):
+        # The `response` table (composite PK + cipher columns — ADR 0013; resp_headers #154) rotates each.
+        for col in ("body", "detail", "resp_headers"):
             total += await self._reencrypt_composite(
                 cipher,
                 "response",
@@ -2801,7 +2871,7 @@ class PostgresStore:
                         now,
                     )
                     finalize[row["message_id"]] = None
-                for message_id in finalize:
+                for message_id in sorted(finalize):  # H-8 canonical order (see below)
                     await self._maybe_finalize_message(conn, message_id, now)
 
     async def complete_with_response(
@@ -2811,6 +2881,7 @@ class PostgresStore:
         body: str,
         outcome: str,
         detail: str | None = None,
+        response_headers: Mapping[str, str] | None = None,
         reingress_to: str | None = None,
         now: float | None = None,
     ) -> None:
@@ -2842,16 +2913,19 @@ class PostgresStore:
                     message_id,
                     destination_name,
                 )
+                headers_json = encode_response_headers(response_headers)  # #154
                 await conn.execute(
                     "INSERT INTO response"
-                    " (message_id, destination_name, response_seq, body, outcome, detail, captured_at)"
-                    " VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                    " (message_id, destination_name, response_seq, body, outcome, detail,"
+                    " resp_headers, captured_at)"
+                    " VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
                     message_id,
                     destination_name,
                     seq,
                     self._enc(body),
                     outcome,
                     self._enc(detail),
+                    self._enc(headers_json),
                     now,
                 )
                 if reingress_to is not None:
@@ -3096,8 +3170,8 @@ class PostgresStore:
         ``response_seq``; ``body``/``detail`` decrypted. The PHI read surface behind the audited,
         body-gated ``GET /messages/{id}/responses`` route."""
         rows = await self._pool.fetch(
-            "SELECT message_id, destination_name, response_seq, body, outcome, detail, captured_at,"
-            " kind, ack_code, ack_phase"
+            "SELECT message_id, destination_name, response_seq, body, outcome, detail, resp_headers,"
+            " captured_at, kind, ack_code, ack_phase"
             " FROM response WHERE message_id=$1 ORDER BY destination_name, response_seq",
             message_id,
         )
@@ -3113,6 +3187,7 @@ class PostgresStore:
                 kind=r["kind"],
                 ack_code=r["ack_code"],
                 ack_phase=r["ack_phase"],
+                headers=decode_response_headers(self._dec(r["resp_headers"])),
             )
             for r in rows
         ]
@@ -3474,7 +3549,7 @@ class PostgresStore:
                     )
                     if status == OutboxStatus.DEAD.value:
                         finalize[row["message_id"]] = None
-                for message_id in finalize:
+                for message_id in sorted(finalize):  # H-8 canonical order (see below)
                     await self._maybe_finalize_message(conn, message_id, now)
                 return None if status == OutboxStatus.DEAD.value else next_at
 
@@ -3505,7 +3580,7 @@ class PostgresStore:
                         conn, row["message_id"], "dead", row["destination_name"], error, now
                     )
                     finalize[row["message_id"]] = None
-                for message_id in finalize:
+                for message_id in sorted(finalize):  # H-8 canonical order (see below)
                     await self._maybe_finalize_message(conn, message_id, now)
 
     async def pending_depth(
@@ -5319,8 +5394,9 @@ class PostgresStore:
                 # Captured replies (ADR 0013) are PHI on the same window as the body; null in place
                 # (row kept, FK to messages(id) never violated — purge keeps the messages row).
                 await conn.execute(
-                    f"UPDATE response SET body=NULL, detail=NULL"
-                    f" WHERE (body IS NOT NULL OR detail IS NOT NULL) AND message_id IN ({eligible})",
+                    f"UPDATE response SET body=NULL, detail=NULL, resp_headers=NULL"
+                    f" WHERE (body IS NOT NULL OR detail IS NOT NULL OR resp_headers IS NOT NULL)"
+                    f" AND message_id IN ({eligible})",
                     *lead,
                 )
         return purged

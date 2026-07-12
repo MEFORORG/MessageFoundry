@@ -62,12 +62,16 @@ from messagefoundry.transports.rest import (
     _RETRYABLE_4XX,
     _expiry_relaxed_opener,
     _insecure_opener,
+    _NoRedirectHandler,
     _redact_url,
     InsecureHopGuard,
+    capture_response_headers,
     enforce_outbound_length_limits,
+    normalize_header_allowlist,
     outbound_headers_from_metadata,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
+    refuse_unrevoked_verified_hop,
     refuse_verify_off,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -238,6 +242,11 @@ class FhirDestination(DestinationConnector):
         # ADR 0013: capture the FHIR server reply (assigned resource / ETag / OperationOutcome). Default
         # False → returns None, byte-identical.
         self.capture_response: bool = bool(s.get("capture_response", False))
+        # #154: allow-list of HTTP response headers to capture — Location/ETag of a FHIR create are the
+        # motivating case. Empty default → byte-identical. Shared parser/filter with REST.
+        self.capture_response_headers = normalize_header_allowlist(
+            s.get("capture_response_headers")
+        )
         # #68: opt in to per-message HTTP headers a Handler stamps into the ADR 0081 metadata bag
         # (http.header.* entries). Default False → the delivery worker skips the metadata read and send
         # is byte-identical. When True, consumes_metadata tells the worker to pass this message's bag.
@@ -256,16 +265,17 @@ class FhirDestination(DestinationConnector):
         # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing; None = off (byte-identical). Built here so
         # a bad key fails loud at construction; the signature is minted in _post over the body bytes.
         self._signer: MessageSigner | None = signer_from_destination(config)
-        # ADR 0024: opt-in SMART Backend Services token provider. None = off (byte-identical). Lazy
-        # import breaks the rest <-> smart cycle (smart reuses rest's opener); built here so a bad
-        # key/curve/token_url fails loud. The minted bearer is injected per-request in _post.
-        from messagefoundry.transports.smart import token_provider_from_destination
+        # ADR 0024 + #65: opt-in bearer-token auth — SMART (asymmetric JWT) OR OAuth2 client-credentials
+        # (symmetric secret), unified behind the one bearer seam. None = off (byte-identical). Lazy import
+        # breaks the rest <-> http_auth/smart cycle; built here so a bad key/secret/token_url fails loud.
+        # The minted bearer is injected per-request in _post; the modes are mutually exclusive.
+        from messagefoundry.transports.http_auth import bearer_provider_from_settings
 
-        self._token_provider = token_provider_from_destination(config)
+        self._token_provider = bearer_provider_from_settings(s)
         if self._token_provider is not None:
-            # The SMART bearer is injected per-request in _post, so the static-header cleartext check
-            # above can't see it. Re-run the check treating the connection as credential-bearing, so a
-            # SMART access token never ships over cleartext http.
+            # The bearer is injected per-request in _post, so the static-header cleartext check above
+            # can't see it. Re-run the check treating the connection as credential-bearing, so an access
+            # token never ships over cleartext http.
             refuse_cleartext_credentials(
                 scheme,
                 {**self._headers, "Authorization": "Bearer"},
@@ -274,6 +284,15 @@ class FhirDestination(DestinationConnector):
             )
 
         if bool(s.get("verify_tls", True)):
+            # #201 (ADR 0078 amendment): the verify-ON https hop validates the FHIR-server cert but does no
+            # OCSP/CRL revocation — refuse an off-loopback production-PHI verified hop unless revocation is
+            # attested (loopback / synthetic / non-prod / attested byte-identical; composes with #200).
+            refuse_unrevoked_verified_hop(
+                scheme,
+                self.base_url,
+                connector="FHIR destination",
+                revocation_attested=config.tls_revocation_attested,
+            )
             # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
             # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
             if bool(s.get("tls_allow_expired", False)):
@@ -294,6 +313,20 @@ class FhirDestination(DestinationConnector):
                 _redact_url(self.base_url),
             )
             self._opener = _insecure_opener()
+        # #65: HTTP Digest — fold the challenge-answering handler into a per-connection opener (never the
+        # shared one). None (default) → byte-identical. Mutually exclusive with a bearer provider.
+        from messagefoundry.transports.http_auth import HttpAuthError, digest_handler_from_settings
+
+        digest = digest_handler_from_settings(s, url=self.base_url)
+        if digest is not None:
+            if self._token_provider is not None:
+                raise HttpAuthError(
+                    "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
+                    "(mutually exclusive — configure exactly one)"
+                )
+            if self._opener is _NO_REDIRECT_OPENER:
+                self._opener = urllib.request.build_opener(_NoRedirectHandler)
+            self._opener.add_handler(digest)
 
     def _build_headers(self, s: dict[str, Any]) -> dict[str, str]:
         """FHIR media type on Content-Type + Accept + static ``headers`` + optional bearer/basic auth."""
@@ -399,14 +432,20 @@ class FhirDestination(DestinationConnector):
         # which are semantically required and must win. Pure; None → {} → byte-identical.
         extra_headers = {**outbound_headers_from_metadata(metadata), **extra_headers}
         # urllib is blocking — keep it off the event loop (the delivery worker awaits this).
-        body, status = await asyncio.to_thread(self._post, payload, method, url, extra_headers)
+        body, status, headers = await asyncio.to_thread(
+            self._post, payload, method, url, extra_headers
+        )
         # A non-2xx already raised inside _post (transient retry / permanent dead-letter). Here status is
         # 2xx: FHIR treats a 2xx as delivered (a returned OperationOutcome is captured, not an error).
         if not self.capture_response:
             return None
         if not body:
-            return DeliveryResponse(body="", outcome="no_reply", detail=f"HTTP {status}")
-        return DeliveryResponse(body=body, outcome=_capture_outcome(body), detail=f"HTTP {status}")
+            return DeliveryResponse(
+                body="", outcome="no_reply", detail=f"HTTP {status}", headers=headers
+            )
+        return DeliveryResponse(
+            body=body, outcome=_capture_outcome(body), detail=f"HTTP {status}", headers=headers
+        )
 
     async def test_connection(self) -> None:
         await asyncio.to_thread(self._probe)
@@ -444,7 +483,7 @@ class FhirDestination(DestinationConnector):
 
     def _post(
         self, payload: str, method: str, url: str, extra_headers: dict[str, str]
-    ) -> tuple[str, int]:
+    ) -> tuple[str, int, dict[str, str]]:
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses. ``url`` is a per-message write path but its host is always the base_url host, so
         # a None guard (secure/loopback base) is byte-identical.
@@ -472,7 +511,11 @@ class FhirDestination(DestinationConnector):
             with self._opener.open(req, timeout=self.timeout) as resp:
                 body = resp.read().decode(self.encoding, errors="replace")
                 status = int(getattr(resp, "status", 200))
-                return body, status
+                # #154: capture only the allow-listed response headers (empty allow-list → {}).
+                headers_out = capture_response_headers(
+                    getattr(resp, "headers", None), self.capture_response_headers
+                )
+                return body, status, headers_out
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read().decode(self.encoding, errors="replace")

@@ -720,10 +720,52 @@ export const TOOLBAR_INSERT_DEFAULTS: Record<string, Record<string, string>> = {
 export function buildToolbarInsertRequest(
   anchor: { handler: string; lineStart: number; lineEnd: number; expectSrc?: string; kind: RowKind },
   action: string,
+  position?: "before" | "after",
 ): InsertRequest {
   const params = { ...(TOOLBAR_INSERT_DEFAULTS[action] ?? {}) };
-  const position: "before" | "after" = anchor.kind === "send" ? "before" : "after";
-  return buildInsertRequest(anchor, action, params, position);
+  // An EXPLICIT position (the row context menu's "Insert before"/"Insert after") wins; otherwise DERIVE it
+  // from the anchor kind (the toolbar Add, which passes none) — a `send` row is the handler's return, so a
+  // new action must precede it. Both callers ride the same `insert_row` engine path (no second surface).
+  const pos: "before" | "after" = position ?? (anchor.kind === "send" ? "before" : "after");
+  return buildInsertRequest(anchor, action, params, pos);
+}
+
+// ---- row context menu (right-click, BACKLOG #222 follow-up to ADR 0100) ------------------------------
+//
+// The right-click menu is a NEW SURFACE onto the EXISTING row operations — it posts the same
+// `insertToolbar` / `deleteRow` / `moveTo` (via walkMove) messages the toolbar Add and the per-row ↑/↓/🗑
+// buttons already post (no second execution path). These two pure helpers are the source of truth (the
+// enablement matrix + the server-rendered menu template); the webview mirrors the enablement and renders
+// the template it positions on right-click. Copy/Cut/Paste stay keyboard-served (out of this menu).
+
+/** Which context-menu items are enabled for a row (pure; the webview greys the rest). */
+export interface ContextMenuEnablement {
+  insertBefore: boolean;
+  insertAfter: boolean;
+  deleteRow: boolean;
+  moveUp: boolean;
+  moveDown: boolean;
+}
+
+/**
+ * The enable/disable state of each row context-menu item for a given row (pure; unit-testable). Rules:
+ * Insert BEFORE is always available; Insert AFTER is suppressed on a `send` row (a step after the return
+ * would be dead code — the same reason {@link buildToolbarInsertRequest} derives `before` for a send);
+ * Delete is offered only on an editable `action`/`lookup`/`send` row (a `code`/`control` row is read-only
+ * — the §4 degradation ladder); Move up/down follow the ↑/↓ walk (`canMoveUp`/`canMoveDown` come from
+ * {@link walkMove} returning a destination, so a suite edge / non-movable / sole-child row greys them).
+ */
+export function contextMenuEnablement(
+  kind: RowKind,
+  ctx: { canMoveUp: boolean; canMoveDown: boolean },
+): ContextMenuEnablement {
+  return {
+    insertBefore: true,
+    insertAfter: kind !== "send",
+    deleteRow: isRowEditable(kind),
+    moveUp: ctx.canMoveUp,
+    moveDown: ctx.canMoveDown,
+  };
 }
 
 /** A webview → provider structural-op message (delete/move a row, or begin the add-row flow). */
@@ -1513,7 +1555,11 @@ function renderParamsHtml(params: ParamField[], editable: Set<string>, handlerNa
           // The row's PROJECTION-TIME source, echoed back on edit as `expect_src` so a stale coordinate is
           // refused, not mis-spliced (F7) — never recomputed from the live buffer at edit time.
           `data-expect-src="${escapeHtml(row.expectSrc ?? "")}" ` +
-          `data-name="${escapeHtml(p.name)}" value="${escapeHtml(p.value)}" /></div>`
+          // An empty value shows a `[blank]` placeholder (a hint, NOT a value) so a freshly-inserted
+          // template's empty Set-Field/param inputs read as "fill me in" — the analyst never has to erase a
+          // literal `[blank]`. `placeholder` is inert on submit: the SAVED value stays exactly what's typed
+          // (empty stays empty), so the F7 expect_src round-trip is unaffected.
+          `data-name="${escapeHtml(p.name)}" value="${escapeHtml(p.value)}" placeholder="[blank]" /></div>`
         );
       }
       return (
@@ -1546,7 +1592,7 @@ function renderRowActionsHtml(row: RowViewModel, handlerName: string): string {
     `data-handler="${escapeHtml(handlerName)}" data-line-start="${row.lineStart}" ` +
     `data-line-end="${row.lineEnd}" data-expect-src="${escapeHtml(row.expectSrc ?? "")}"`;
   const btn = (op: string, glyph: string, title: string): string =>
-    `<button class="rowop" data-op="${op}" ${coords} title="${escapeHtml(title)}">${glyph}</button>`;
+    `<button class="rowop" data-op="${op}" ${coords} data-tip="${escapeHtml(title)}">${glyph}</button>`;
   const buttons = [
     btn("moveUp", "&#8593;", "Move up one step (walks into / out of blocks)"),
     btn("moveDown", "&#8595;", "Move down one step (walks into / out of blocks)"),
@@ -1565,7 +1611,7 @@ export function renderRowHtml(row: RowViewModel, handlerName = ""): string {
   const badge = row.badge ? `<span class="badge">${escapeHtml(row.badge)}</span>` : "";
   const subtitle = row.subtitle ? `<span class="subtitle">${escapeHtml(row.subtitle)}</span>` : "";
   const live = row.liveValue
-    ? `<span class="live" title="Live value (redacted by default — synthetic samples only)">${escapeHtml(row.liveValue)}</span>`
+    ? `<span class="live" data-tip="Live value (redacted by default — synthetic samples only)">${escapeHtml(row.liveValue)}</span>`
     : "";
   // A field is editable only when the handler name is known (the write path); read-only callers pass "".
   const editable = new Set(handlerName ? (row.editableParams ?? []) : []);
@@ -1600,7 +1646,7 @@ export function renderRowHtml(row: RowViewModel, handlerName = ""): string {
     subtitle +
     badge +
     live +
-    `<button class="jump" data-line="${row.lineStart}" title="Jump to the source line">${escapeHtml(lineLabel)}</button>` +
+    `<button class="jump" data-line="${row.lineStart}" data-tip="Jump to the source line">${escapeHtml(lineLabel)}</button>` +
     renderRowActionsHtml(row, handlerName) +
     `</div>` +
     body +
@@ -1614,7 +1660,7 @@ export function renderHandlerHtml(handler: HandlerViewModel): string {
   return (
     `<section class="handler">` +
     `<h2>${escapeHtml(handler.handler)}` +
-    `<button class="jump" data-line="${handler.defLine}" title="Jump to the handler definition">def line ${handler.defLine}</button>` +
+    `<button class="jump" data-line="${handler.defLine}" data-tip="Jump to the handler definition">def line ${handler.defLine}</button>` +
     `</h2>` +
     `<ol class="rows">${rows}</ol>` +
     `</section>`
@@ -1627,4 +1673,42 @@ export function renderHandlersHtml(handlers: HandlerViewModel[]): string {
     return `<p class="empty">No handlers to show.</p>`;
   }
   return handlers.map(renderHandlerHtml).join("");
+}
+
+/**
+ * Render the single, hidden row context-menu template the webview positions on right-click (BACKLOG #222
+ * follow-up to ADR 0100 — its own note called a "right-click row menu … a follow-up"). Rendered
+ * SERVER-SIDE so the insert catalog is the same {@link INSERT_ACTION_LABELS} single source of truth the
+ * toolbar uses and NO markup is built by `innerHTML` in the strict-CSP webview — the script only
+ * shows/positions/enables/dismisses this node and posts the SAME `insertToolbar`/`deleteRow`/`moveTo`
+ * messages the toolbar Add + row ↑/↓/🗑 already post (no second execution path). Insert is a two-level
+ * submenu (before / after → one item per insertable action); Delete / Move up / Move down are leaves. The
+ * webview greys items per {@link contextMenuEnablement}. Pure — every label/value is HTML-escaped.
+ */
+export function renderStepsContextMenuHtml(): string {
+  const actionItems = (position: "before" | "after"): string =>
+    INSERT_ACTION_LABELS.map(
+      (o) =>
+        `<button type="button" class="ctx-item" role="menuitem" ` +
+        `data-cmd="insert" data-position="${position}" data-action="${escapeHtml(o.value)}">` +
+        `${escapeHtml(o.label)}</button>`,
+    ).join("");
+  const insertParent = (position: "before" | "after", label: string): string =>
+    `<div class="ctx-sub">` +
+    `<button type="button" class="ctx-item ctx-parent" role="menuitem" aria-haspopup="true" ` +
+    `data-sub="${position}">${escapeHtml(label)}<span class="ctx-arrow" aria-hidden="true">&#9656;</span></button>` +
+    `<div class="ctx-menu ctx-submenu" role="menu" data-for="${position}">${actionItems(position)}</div>` +
+    `</div>`;
+  const leaf = (cmd: string, label: string): string =>
+    `<button type="button" class="ctx-item" role="menuitem" data-cmd="${escapeHtml(cmd)}">${escapeHtml(label)}</button>`;
+  return (
+    `<div id="stepsCtxMenu" class="ctx-menu ctx-root" role="menu" hidden>` +
+    insertParent("before", "Insert before") +
+    insertParent("after", "Insert after") +
+    `<div class="ctx-sep" role="separator"></div>` +
+    leaf("deleteRow", "Delete") +
+    leaf("moveUp", "Move up") +
+    leaf("moveDown", "Move down") +
+    `</div>`
+  );
 }

@@ -14,6 +14,18 @@ RCSI and an ``sp_getapplock``-serialized finalizer, lifting SQLite's single-writ
 Microsoft ODBC Driver 18 at the OS level. It's imported lazily in :meth:`SqlServerStore.open` so
 SQLite-only installs never touch it. Verified against a real SQL Server by the CI service-container job
 (the store suite + the SQL Server load smoke).
+
+H-8 LOCK ORDERING (multi-message finalizers). :meth:`_maybe_finalize` takes a per-message finalize
+lock, so any primitive that finalizes MORE THAN ONE message in a single transaction holds N of them
+at once and MUST acquire them in CANONICAL (sorted) message_id order — otherwise two such callers
+with overlapping id sets can take the same two locks in opposite orders and deadlock (SQL Server
+1205). ``cancel_queued`` and the dead-letter sweeps do this via :meth:`_lock_finalize_batch`;
+``claim_fifo_heads``' H2 sorts its own. The ADR 0082 batch primitives (:meth:`mark_batch_done`,
+:meth:`mark_batch_failed`, :meth:`dead_letter_batch`) are ALSO multi-message finalizers — they
+originally iterated their finalize dict in *insertion* (caller ``outbox_ids``) order, which is a real
+cycle: a fan-out message has one outbound row per destination and each destination lane batches
+independently, so overlapping id sets are reachable in normal operation. They now sort.
+**Adding a new multi-message finalizer? Sort, or use _lock_finalize_batch.**
 """
 
 from __future__ import annotations
@@ -55,7 +67,11 @@ from messagefoundry.store.crypto import (
     cipher_info,
 )
 from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.metadata import merge_user_metadata
+from messagefoundry.store.metadata import (
+    decode_response_headers,
+    encode_response_headers,
+    merge_user_metadata,
+)
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram, PoolStatus
 from messagefoundry.store.store import (
     AlertInstance,
@@ -833,13 +849,17 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('response','U') IS NULL CREATE TABLE response (
         message_id NVARCHAR(64) NOT NULL, destination_name NVARCHAR(256) NOT NULL,
         response_seq INT NOT NULL, body NVARCHAR(MAX) NULL, outcome NVARCHAR(64) NOT NULL,
-        detail NVARCHAR(MAX) NULL, captured_at FLOAT NOT NULL,
+        detail NVARCHAR(MAX) NULL, resp_headers NVARCHAR(MAX) NULL, captured_at FLOAT NOT NULL,
         kind NVARCHAR(32) NOT NULL CONSTRAINT df_response_kind DEFAULT 'response',
         ack_code NVARCHAR(8) NULL, ack_phase NVARCHAR(16) NULL,
         CONSTRAINT pk_response PRIMARY KEY (message_id, destination_name, response_seq),
         CONSTRAINT fk_response_message FOREIGN KEY (message_id) REFERENCES messages(id))""",
     """IF INDEXPROPERTY(OBJECT_ID('response'),'ix_response_message','IndexID') IS NULL
         CREATE INDEX ix_response_message ON response(message_id)""",
+    # BACKLOG #154: captured allow-listed HTTP response headers (JSON, encrypted) on a pre-existing
+    # response table; COL_LENGTH-gated so a re-open is a no-op. NULL on existing rows = "no headers".
+    """IF COL_LENGTH('response','resp_headers') IS NULL
+        ALTER TABLE response ADD resp_headers NVARCHAR(MAX) NULL""",
     # ADR 0021 "Response Sent" columns on a pre-existing response table. Adding NOT NULL `kind` with a
     # CONSTANT default is metadata-only (no rewrite) on SQL Server 2016+ (CI 2022); a migration-timing
     # test on a pre-populated table guards this, with a batched NULLable-add → backfill → SET NOT NULL
@@ -1321,10 +1341,10 @@ class SqlServerStore:
                         await conn.rollback()
                         raise
                 total += len(rows)
-        # `response` body + detail (composite PK) — a separate pass (can't ride the id-keyed loop above).
-        # PG/SQLite migrate these too; without it a no-key -> key -> restart leaves captured reply PHI as
-        # plaintext at rest. body/detail are nullable, so guard `<> '' AND IS NOT NULL`.
-        for rcol in ("body", "detail"):
+        # `response` body + detail + resp_headers (#154, composite PK) — a separate pass (can't ride the
+        # id-keyed loop above). PG/SQLite migrate these too; without it a no-key -> key -> restart leaves
+        # captured reply PHI as plaintext at rest. All are nullable, so guard `<> '' AND IS NOT NULL`.
+        for rcol in ("body", "detail", "resp_headers"):
             while True:
                 rows = await self._fetchall(
                     f"SELECT TOP (500) message_id, destination_name, response_seq, {rcol} AS v"
@@ -2831,6 +2851,7 @@ class SqlServerStore:
         body: str,
         outcome: str,
         detail: str | None = None,
+        response_headers: Mapping[str, str] | None = None,
         reingress_to: str | None = None,
         now: float | None = None,
     ) -> None:
@@ -2872,11 +2893,23 @@ class SqlServerStore:
                 # Inline the PG _enc empty-guard: encrypt only a truthy value (never '' / None).
                 enc_body = self._cipher.encrypt(body) if body else body
                 enc_detail = self._cipher.encrypt(detail) if detail else detail
+                headers_json = encode_response_headers(response_headers)  # #154
+                enc_headers = self._cipher.encrypt(headers_json) if headers_json else headers_json
                 await cur.execute(
                     "INSERT INTO response"
-                    " (message_id, destination_name, response_seq, body, outcome, detail, captured_at)"
-                    " VALUES (?,?,?,?,?,?,?)",
-                    (message_id, destination_name, seq, enc_body, outcome, enc_detail, now),
+                    " (message_id, destination_name, response_seq, body, outcome, detail,"
+                    " resp_headers, captured_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        message_id,
+                        destination_name,
+                        seq,
+                        enc_body,
+                        outcome,
+                        enc_detail,
+                        enc_headers,
+                        now,
+                    ),
                 )
                 if reingress_to is not None:
                     # ADR 0013 Increment 2: a drainable Stage.RESPONSE work-row in the SAME txn (orphan-
@@ -2931,8 +2964,8 @@ class SqlServerStore:
         ciphertext); a NULL (never-captured or purged) body/detail returns ``None`` while an empty ``''``
         round-trips as ``''`` — parity with PG/SQLite ``_dec``; ``outcome`` is plaintext."""
         rows = await self._fetchall(
-            "SELECT message_id, destination_name, response_seq, body, outcome, detail, captured_at,"
-            " kind, ack_code, ack_phase"
+            "SELECT message_id, destination_name, response_seq, body, outcome, detail, resp_headers,"
+            " captured_at, kind, ack_code, ack_phase"
             " FROM response WHERE message_id=? ORDER BY destination_name, response_seq",
             (message_id,),
         )
@@ -2948,6 +2981,11 @@ class SqlServerStore:
                 kind=r["kind"],
                 ack_code=r["ack_code"],
                 ack_phase=r["ack_phase"],
+                headers=decode_response_headers(
+                    self._cipher.decrypt(r["resp_headers"])
+                    if r["resp_headers"] is not None
+                    else None
+                ),
             )
             for r in rows
         ]
@@ -3619,7 +3657,7 @@ class SqlServerStore:
         # response_seq) — their own passes. IS NOT NULL is explicit/defensive: NOT LIKE already excludes
         # NULLs (three-valued logic) and a NULL has no ciphertext to rotate — but these columns are
         # nullable (unlike state.value/messages.raw/queue.payload), so the guard documents that intent.
-        for rcol in ("body", "detail"):
+        for rcol in ("body", "detail", "resp_headers"):  # #154
             while True:
                 rows = await self._fetchall(
                     f"SELECT TOP (?) message_id, destination_name, response_seq, {rcol} AS v"
@@ -3705,8 +3743,8 @@ class SqlServerStore:
                 # NULL captured response bodies/details for eligible messages (ADR 0013 retention) — to
                 # NULL (matching PG/SQLite: correlate then reads None; reencrypt's IS NOT NULL skips them).
                 await cur.execute(
-                    "UPDATE response SET body=NULL, detail=NULL"
-                    " WHERE (body IS NOT NULL OR detail IS NOT NULL)"
+                    "UPDATE response SET body=NULL, detail=NULL, resp_headers=NULL"
+                    " WHERE (body IS NOT NULL OR detail IS NOT NULL OR resp_headers IS NOT NULL)"
                     " AND message_id IN (SELECT id FROM #eligible)"
                 )
                 await cur.execute("DROP TABLE #eligible")
@@ -4812,7 +4850,7 @@ class SqlServerStore:
                         cur, message_id, "delivered", destination_name, f"attempt {attempts}", now
                     )
                     finalize[message_id] = None
-                for message_id in finalize:
+                for message_id in sorted(finalize):  # H-8 canonical order (see below)
                     await self._maybe_finalize(cur, message_id, now)
                 await self._commit(conn)
             except Exception:
@@ -4917,7 +4955,7 @@ class SqlServerStore:
                     )
                     if status == OutboxStatus.DEAD.value:
                         finalize[message_id] = None
-                for message_id in finalize:
+                for message_id in sorted(finalize):  # H-8 canonical order (see below)
                     await self._maybe_finalize(cur, message_id, now)
                 await self._commit(conn)
                 return None if status == OutboxStatus.DEAD.value else next_at
@@ -4951,7 +4989,7 @@ class SqlServerStore:
                     )
                     await self._event(cur, message_id, "dead", destination_name, error, now)
                     finalize[message_id] = None
-                for message_id in finalize:
+                for message_id in sorted(finalize):  # H-8 canonical order (see below)
                     await self._maybe_finalize(cur, message_id, now)
                 await self._commit(conn)
             except Exception:

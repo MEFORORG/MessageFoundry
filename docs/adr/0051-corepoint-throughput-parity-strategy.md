@@ -1,5 +1,23 @@
 # 0051 — Throughput parity with Corepoint — measure-first, durable-write levers, no engine rewrite
 
+> ## ✅ THE MEASURE-FIRST PHASE IS COMPLETE (2026-07-12) — and it vindicated this ADR
+> The measurements this ADR gated everything on **have been taken** (rig runs C1–C7). They **foreclose three of the
+> candidate levers outright** and leave exactly one standing — the **durable-write / txn-per-event** lever this ADR
+> named as its own #1.
+>
+> - **C5:** per-shard ceiling `R ∈ [2,3)`, below the **3.62/shard** a cleared N=16 would need → **N-sizing is
+>   insufficient on its own.** (Decisive — the engine-box carve-out did not fire.)
+> - **C6:** **no convoy** (0 of 288 samples met the floor) → **AMBIGUOUS-STRUCTURAL.** Not a lock, latch, grant, or
+>   spill. **There is no single blocker to rewrite.**
+> - **C7:** **parallelism exonerated and load-bearing** — `MAXDOP=1` made it worse *and* broke a healthy rung.
+>
+> **→ Store-side scaling is CLOSED** — recorded as **[ADR 0098](0098-store-side-scaling-levers-are-exhausted-transaction-amortization-is-the-only-path-to-45m-day.md) (Accepted)**.
+> **→ The one surviving lever is transaction amortization** — **[ADR 0099](0099-phase-4-group-commit-amortize-the-per-event-transaction-cost.md) (Proposed)**;
+> its first piece, `accepts=`, is **merged** ([ADR 0084](0084-accepts-router-seam.md), #952/#213).
+>
+> **"Measure first" is why the wrong thing did not get built.** Everything below stands as written; the ceiling call
+> it defers is now answered. Evidence: `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md` §3, §8.
+
 - **Status:** **Proposed (2026-06-28)** — the *direction* is agreed (measure first; incremental
   durable-write + lean-write levers on the existing Python engine; **no** language rewrite, **no**
   broker); the *build* of each lever is gated on the enterprise-hardware measurement and owner

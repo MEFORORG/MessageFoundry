@@ -43,6 +43,7 @@ from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
+from messagefoundry.config.tls_policy import RevocationHopGuard
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -123,6 +124,22 @@ class EmailDestination(DestinationConnector):
                 "network in CLEARTEXT (dev/trusted-network only)",
                 self.host,
             )
+        else:
+            # #201 (ADR 0078 amendment): STARTTLS (587) / implicit-TLS SMTP_SSL (465) verifies the server
+            # cert, but smtplib's default SSL context does NO OCSP/CRL revocation (stdlib ssl has none) —
+            # so a revoked-but-unexpired SMTP-server cert is still accepted. The message body carries PHI
+            # over this verified hop, so refuse an off-loopback production-PHI hop unless revocation is
+            # attested (loopback / synthetic / non-prod / attested byte-identical). Same posture-keyed
+            # RevocationHopGuard as the REST/SOAP/FHIR/DICOMweb https paths; SMTP is a different construction
+            # seam (smtplib, not the urllib/ssl scheme), so it calls the guard directly rather than the
+            # https-scheme-keyed refuse_unrevoked_verified_hop wrapper. Composes with the cleartext refusal
+            # above (that gate keys on use_tls=false; this one only on the verifying use_tls=true path).
+            RevocationHopGuard.capture(
+                host=self.host,
+                cell="Email destination (verified SMTP TLS, no revocation check)",
+                description="delivers over verified SMTP TLS but performs no certificate revocation checking",
+                attested=config.tls_revocation_attested,
+            ).enforce_construction()
 
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
