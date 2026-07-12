@@ -75,6 +75,39 @@ def test_upsert_quotes_special_cells(tmp_path: Path) -> None:
     assert sets["notes"]["B"] == "line1\nline2"
 
 
+def test_spreadsheet_safe_neutralizes_formula_triggers() -> None:
+    # ASVS 1.2.10 / CWE-1236: a cell beginning with a formula trigger is prefixed with a literal "'".
+    safe = codeset_edit._spreadsheet_safe
+    assert safe("=1+1") == "'=1+1"
+    assert safe("+SUM(A1)") == "'+SUM(A1)"
+    assert safe("-2+cmd") == "'-2+cmd"
+    assert safe("@cmd") == "'@cmd"
+    assert safe("\tTAB") == "'\tTAB"
+    assert safe("\x00NUL") == "'\x00NUL"
+    # Benign codes (and the empty string) pass through untouched → byte-identical round-trip.
+    assert safe("A01") == "A01"
+    assert safe("") == ""
+
+
+def test_upsert_escapes_formula_trigger_cell_on_disk(tmp_path: Path) -> None:
+    # A codeset value beginning with "=" reaches the CSV neutralized (leading "'"), so an operator who
+    # opens the file in Excel/Sheets can't have it execute as a formula. (Round-trip caveat documented
+    # on _spreadsheet_safe: the loader reads the prefixed value verbatim — accepted for these
+    # operator-authored, non-PHI reference cells.)
+    codeset_edit.upsert_code_set(
+        tmp_path,
+        "danger",
+        ["code", "value"],
+        [["A", "=cmd|'/c calc'!A1"], ["B", "safe"]],
+        validate=_validate,
+    )
+    text = (_codesets(tmp_path) / "danger.csv").read_text(encoding="utf-8")
+    assert "'=cmd" in text  # the formula cell was neutralized
+    assert not any(  # no data cell reaches the file starting with a bare formula trigger
+        cell[:1] in "=+-@\t\r\x00" for line in text.splitlines()[1:] for cell in line.split(",")
+    )
+
+
 def test_upsert_replaces_in_place(tmp_path: Path) -> None:
     codeset_edit.upsert_code_set(
         tmp_path, "diets", ["code", "value"], [["A", "Apple"]], validate=_validate

@@ -644,6 +644,9 @@ async def test_cluster_nodes_single_node(client: httpx.AsyncClient) -> None:
     assert body["lease_expires_at"] is None
     # The single-node synthetic entry has no heartbeat history.
     assert node["started_at"] is None and node["last_seen"] is None
+    # ADR 0096: single-node is unhandicapped + promotable (surfaced in /cluster/nodes).
+    assert node["acquire_delay_seconds"] == 0.0
+    assert node["promotable"] is True
 
 
 async def test_connections_includes_registry_connections(

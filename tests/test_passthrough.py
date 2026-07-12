@@ -121,7 +121,7 @@ def test_transform_one_accepts_pt_target_and_tags_it() -> None:
         return [Send(to="OB_REAL", message="A"), Send(to="PT_NEXT", message="B")]
 
     reg.add_handler("h", h)
-    deliveries, _ = transform_one(reg, "h", "MSH|x", ContentType.HL7V2.value)
+    deliveries, _, _ = transform_one(reg, "h", "MSH|x", ContentType.HL7V2.value)
     by_to = {d.to: d for d in deliveries}
     assert by_to["OB_REAL"].is_passthrough is False
     assert by_to["PT_NEXT"].is_passthrough is True

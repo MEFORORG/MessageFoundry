@@ -59,9 +59,12 @@ class _FakeLeasePool:
         # Mirrors _claim_or_renew_lease's INSERT ... ON CONFLICT ... WHERE owner OR expired RETURNING,
         # INCLUDING the H1 leader_epoch maintenance: epoch 1 on a fresh INSERT, +1 on a take-over of an
         # expired/foreign lease, UNCHANGED on a renew (owner == me). RETURNS owner + leader_epoch.
+        # The 4th arg is the ADR-0096 acquire_delay: a take-over requires the lease to have been expired
+        # for `delay` seconds (added to the expiry side); a renew (owner == me) is never delayed.
         assert "leader_lease" in sql and "INSERT" in sql
         assert "leader_epoch" in sql, "claim SQL must maintain the H1 fencing epoch"
-        _lease_key, owner, ttl = args
+        assert "$4" in sql, "claim SQL must carry the acquire_delay handicap param"
+        _lease_key, owner, ttl, delay = args
         now = self._db._db_clock()
         row = self._db.row
         if row is None:
@@ -71,7 +74,8 @@ class _FakeLeasePool:
                 "leader_epoch": 1,  # fresh acquire on an empty table
             }
             return {"owner": owner, "leader_epoch": 1}
-        if row["owner"] == owner or float(row["lease_expires_at"]) < now:  # type: ignore[arg-type]
+        expired = float(row["lease_expires_at"]) + float(delay) < now  # type: ignore[arg-type]
+        if row["owner"] == owner or expired:
             # Renew (owner == me) keeps the epoch; a take-over of an expired/foreign lease bumps it.
             if row["owner"] != owner:
                 row["leader_epoch"] = int(row["leader_epoch"]) + 1  # type: ignore[arg-type]
@@ -98,12 +102,16 @@ def _coord(
     node: str = "A",
     ttl: float = 30.0,
     fence: float = 20.0,
+    acquire_delay_seconds: float = 0.0,
+    promotable: bool = True,
 ) -> DbCoordinator:
     return DbCoordinator(
         pool,
         node,
         leader_lease_ttl_seconds=ttl,
         leader_fence_timeout_seconds=fence,
+        acquire_delay_seconds=acquire_delay_seconds,
+        promotable=promotable,
         monotonic=mono,
     )
 
@@ -336,3 +344,124 @@ async def test_epoch_cleared_on_clean_release() -> None:
     assert a.current_epoch() == 1
     await a._release_leadership()
     assert a.current_epoch() is None
+
+
+# --- ADR 0096: leader preference (acquire_delay_seconds) ---------------------
+
+
+async def test_default_delay_zero_is_byte_identical_takeover() -> None:
+    # delay=0.0 (the default) must behave exactly like the pre-knob `expires_at < now` take-over: a
+    # standby claims the instant the lease has expired.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A")
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", acquire_delay_seconds=0.0)
+    await a._maintain_leadership()  # A leader, expiry 30
+    db_clock.t = 30.1  # just past expiry
+    await b._maintain_leadership()
+    assert b.is_leader() is True  # no handicap → claims at once
+
+
+async def test_delayed_node_cannot_claim_within_the_delay_window() -> None:
+    # A node with acquire_delay=5 must NOT take over an expired lease until now > expiry + 5.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A")
+    b = _coord(_FakeLeasePool(db), _Clock(0.0), node="B", acquire_delay_seconds=5.0)
+    await a._maintain_leadership()  # A leader, expiry 30
+    db_clock.t = 31.0  # lease expired 1s ago — but < delay of 5s past expiry
+    await b._maintain_leadership()
+    assert b.is_leader() is False  # still handicapped out
+    db_clock.t = 35.1  # now > expiry(30) + delay(5)
+    await b._maintain_leadership()
+    assert b.is_leader() is True  # handicap elapsed → B takes over
+
+
+async def test_preferred_node_wins_routine_expired_lease_race() -> None:
+    # The core scenario: a preferred node (delay=0) and a delayed DR node (delay=5) both eligible after
+    # the leader's lease expires. The preferred node may claim the instant the lease expires, so it wins
+    # the routine transition and the delayed node — finding a fresh lease on its next tick — never takes
+    # over.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    leader = _coord(_FakeLeasePool(db), _Clock(0.0), node="L")
+    preferred = _coord(_FakeLeasePool(db), _Clock(0.0), node="P", acquire_delay_seconds=0.0)
+    dr = _coord(_FakeLeasePool(db), _Clock(0.0), node="DR", acquire_delay_seconds=5.0)
+    await leader._maintain_leadership()  # L leader, expiry 30
+    db_clock.t = 30.5  # lease expired; preferred is eligible, DR is still handicapped (needs > 35)
+    await preferred._maintain_leadership()  # P wins the race
+    assert preferred.is_leader() is True
+    db_clock.t = 40.0  # even well past DR's handicap window, the lease is now fresh (owned by P)
+    await dr._maintain_leadership()
+    assert dr.is_leader() is False  # DR never wins — P holds a live lease
+    assert db.row is not None and db.row["owner"] == "P"
+
+
+async def test_delay_does_not_delay_the_current_leaders_renew() -> None:
+    # A delay must NEVER handicap a RENEWAL by the current leader — even a delayed leader renews at `now`.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    mono = _Clock(0.0)
+    a = _coord(_FakeLeasePool(db), mono, node="A", acquire_delay_seconds=5.0)
+    await a._maintain_leadership()  # A acquires on the empty table (delay irrelevant to INSERT)
+    assert a.is_leader() is True
+    for t in (10.0, 20.0):  # renews while the lease is still live — no delay term on owner=me
+        db_clock.t = t
+        mono.t = t
+        await a._maintain_leadership()
+        assert a.is_leader() is True
+        assert db.row is not None and db.row["lease_expires_at"] == t + 30.0
+
+
+# --- ADR 0096: non-promotable standby (promotable=false) ---------------------
+
+
+async def test_non_promotable_never_acquires_empty_lease() -> None:
+    # A non-promotable node must not even INSERT a fresh lease on an empty table.
+    db = _FakeLeaseDB(_Clock(0.0))
+    n = _coord(_FakeLeasePool(db), _Clock(0.0), node="N", promotable=False)
+    await n._maintain_leadership()
+    assert n.is_leader() is False
+    assert db.row is None  # touched no DB row
+
+
+async def test_non_promotable_never_takes_over_expired_lease() -> None:
+    # Even with the lease long expired, a non-promotable node must never take over — a promotable node
+    # would. This is the warm-DR guarantee: the DR node stays passive.
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    a = _coord(_FakeLeasePool(db), _Clock(0.0), node="A")
+    dr = _coord(_FakeLeasePool(db), _Clock(0.0), node="DR", promotable=False)
+    await a._maintain_leadership()  # A leader, expiry 30
+    db_clock.t = 1000.0  # lease long expired (A dead)
+    await dr._maintain_leadership()
+    assert dr.is_leader() is False  # never promotes
+    assert db.row is not None and db.row["owner"] == "A"  # untouched — DR wrote nothing
+
+
+async def test_non_promotable_already_leader_steps_down() -> None:
+    # If a non-promotable node somehow already holds leadership (e.g. a config flip), its next maintenance
+    # tick must demote it cleanly — it stops renewing and returns not-held.
+    db = _FakeLeaseDB(_Clock(0.0))
+    n = _coord(_FakeLeasePool(db), _Clock(0.0), node="N", promotable=False)
+    # Simulate "somehow already leader": force the cached gate + fence baseline as if it had acquired.
+    n._is_leader = True
+    n._last_renew_ok = 0.0
+    n._leader_epoch = 1
+    await n._maintain_leadership()  # non-promotable → claim returns not-held → demote
+    assert n.is_leader() is False
+    assert n.current_epoch() is None  # demotion clears the held token
+
+
+async def test_promotable_standby_takes_over_from_non_promotable_gap() -> None:
+    # A cluster with one non-promotable DR node + one promotable node: the promotable node is the only one
+    # that ever leads. (An ALL-non-promotable cluster would elect no leader — the documented caveat.)
+    db_clock = _Clock(0.0)
+    db = _FakeLeaseDB(db_clock)
+    dr = _coord(_FakeLeasePool(db), _Clock(0.0), node="DR", promotable=False)
+    ha = _coord(_FakeLeasePool(db), _Clock(0.0), node="HA", promotable=True)
+    await dr._maintain_leadership()  # DR never acquires
+    assert dr.is_leader() is False and db.row is None
+    await ha._maintain_leadership()  # HA acquires the empty lease
+    assert ha.is_leader() is True
+    assert db.row is not None and db.row["owner"] == "HA"

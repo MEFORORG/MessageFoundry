@@ -94,7 +94,7 @@ def test_client_cert_opener_loads_chain_and_floors_tls(monkeypatch: pytest.Monke
 
 def test_opener_selection_prefers_client_cert(monkeypatch: pytest.MonkeyPatch) -> None:
     sentinel = object()
-    monkeypatch.setattr(soap_mod, "_client_cert_opener", lambda *a: sentinel)
+    monkeypatch.setattr(soap_mod, "_client_cert_opener", lambda *a, **k: sentinel)
     dest = _dest(
         client_cert_file="client.pem", client_key_file="key.pem"
     )  # verify_tls default True

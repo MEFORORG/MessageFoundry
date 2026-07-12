@@ -34,10 +34,13 @@ from messagefoundry.config.settings import (
     EgressSettings,
     ReferenceSettings,
     RetentionSettings,
+    SandboxSettings,
+    SecretRotationSettings,
     ShadowSettings,
     StoreSettings,
     UpdateCheckSettings,
 )
+from messagefoundry.config.tls_policy import HopPosture, TrustAnchorPolicy
 from messagefoundry.config.wiring import (
     API_LISTENER_LABEL,
     Registry,
@@ -45,6 +48,7 @@ from messagefoundry.config.wiring import (
     load_config,
 )
 from messagefoundry.pipeline.alerts import AlertSink
+from messagefoundry.redaction import safe_exc
 from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
@@ -52,6 +56,11 @@ from messagefoundry.pipeline.dr import DrCoordinator
 from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
+from messagefoundry.pipeline.secret_rotation import (
+    MonitoredSecret,
+    SecretRotationRunner,
+    secrets_from_settings,
+)
 from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.sharding import owned_destination_set
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
@@ -66,6 +75,8 @@ from messagefoundry.store.store import (
     DestinationMetrics,
     InboundMetrics,
     OwnedLanes,
+    ReingressOutcome,
+    ResendOutcome,
 )
 
 __all__ = ["Engine", "ConfigReloadDenied"]
@@ -103,11 +114,14 @@ class Engine:
         infra_fault_policy: str = "stop",
         infra_fault_stop_after: int = 10,
         infra_fault_backoff_cap: float = 60.0,
+        credential_fault_policy: str = "stop",  # #109 (ADR 0095): partner account-lockout protection
+        schedule_tick_seconds: float = 30.0,  # #147 (ADR 0095): active-window scheduler tick
         fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
         pooled_fusing_workers: int = 8,
         batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
         connection_events: bool = True,
         response_sent_default: bool = True,
+        audit_verify_on_start: bool = False,
         config_dir: str | Path | None = None,
         config_reload_roots: Sequence[str | Path] = (),
         inbound_bind_host: str = "127.0.0.1",
@@ -122,6 +136,7 @@ class Engine:
         alert_sink: AlertSink | None = None,
         retention_settings: RetentionSettings | None = None,
         cert_monitor_settings: CertMonitorSettings | None = None,
+        secret_rotation_settings: SecretRotationSettings | None = None,
         update_check_settings: UpdateCheckSettings | None = None,
         backup_settings: BackupSettings | None = None,
         dr_settings: DrSettings | None = None,
@@ -131,6 +146,8 @@ class Engine:
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings | None = None,
+        hop_posture: HopPosture | None = None,
+        trust_anchor_policy: TrustAnchorPolicy | None = None,
         shadow_settings: ShadowSettings | None = None,
         active_environment: str | None = None,
         env_values: Mapping[str, Any] | None = None,
@@ -138,8 +155,14 @@ class Engine:
         coordinator: ClusterCoordinator | None = None,
         cluster_settings: ClusterSettings | None = None,
         registry_filter: Callable[[Registry], Registry] | None = None,
+        sandbox_settings: SandboxSettings | None = None,
+        log_dir: str | None = None,
     ) -> None:
         self.store = store
+        # [sandbox] opt-in Router/Handler subprocess isolation (ADR 0087, #197). None → defaults
+        # (mode=off, byte-identical). Rendered into a SandboxPolicy passed to every runner this engine
+        # builds; read ONCE here (a /config/reload does NOT re-read it — restart to change).
+        self._sandbox_settings = sandbox_settings or SandboxSettings()
         # L3 multi-process sharding (messagefoundry/pipeline/sharding.py): an optional pure transform
         # applied to EVERY loaded graph — at startup (add_registry, applied by the caller) and on each
         # reload here — so a `serve --shard X` process keeps owning only shard X's inbounds across
@@ -191,6 +214,10 @@ class Engine:
         self._infra_fault_policy = infra_fault_policy
         self._infra_fault_stop_after = infra_fault_stop_after
         self._infra_fault_backoff_cap = infra_fault_backoff_cap
+        # #109/#147 (ADR 0095): credential-fault lane policy + active-window scheduler tick; each runner
+        # this engine builds inherits both.
+        self._credential_fault_policy = credential_fault_policy
+        self._schedule_tick_seconds = schedule_tick_seconds
         # ADR 0071 B5 thread-hop fusion (SQL-Server-only, default-OFF); every runner inherits it. Read
         # ONCE here — a /config/reload never re-reads it (restart to change, exactly like claim_mode).
         self._fuse_thread_hops = fuse_thread_hops
@@ -201,12 +228,18 @@ class Engine:
         # [diagnostics] Corepoint-style event log (#46); every runner inherits these master switches.
         self._connection_events = connection_events
         self._response_sent_default = response_sent_default
+        # [integrity].audit_verify_on_start (#190): re-walk the tamper-evident audit chain once at start.
+        # ALERT-ONLY — a break logs WARNING + fires the AlertSink but NEVER crashes startup.
+        self._audit_verify_on_start = audit_verify_on_start
         # Where the runner reports operational alerts; None → the runner's default logging sink.
         self._alert_sink = alert_sink
         # [retention] enforcement. None (embedding/tests) → no retention task; the runner itself is a
         # no-op when nothing is configured, so passing default settings is also safe.
         self._retention_settings = retention_settings
         self._retention_runner: RetentionRunner | None = None
+        # The configured `[logging].log_dir`, handed to the RetentionRunner for application-log-file
+        # retention (#120). None (embedding/tests, or stdout-only) → the app-log sweep is a no-op.
+        self._log_dir = log_dir
         # [cert_monitor] TLS-cert expiry monitor (Q5c). None (embedding/tests) → no monitor task. The
         # set of certs to watch is derived at scan time from the [api] TLS cert + the wired graph's MLLP
         # certs (read live, so a reload that adds/removes a TLS connection is picked up).
@@ -222,6 +255,12 @@ class Engine:
             else ()
         )
         self._cert_expiry_runner: CertExpiryRunner | None = None
+        # [secret_rotation] secret-rotation reminder (#195b, ADR 0019 §5) — the secret-side twin of
+        # cert_monitor. None (embedding/tests) → no reminder task; a no-op when warn_days=0 or nothing is
+        # tracked. The tracked-secret set is derived at scan time from [secret_rotation] so a reload is
+        # reflected. PHI-free: it reads rotation DATES only, never a secret value.
+        self._secret_rotation_settings = secret_rotation_settings
+        self._secret_rotation_runner: SecretRotationRunner | None = None
         # [update_check] no-network version diff (#30, ADR 0026). None (embedding/tests) → no task. A
         # maintenance task like cert_monitor: independent of the message graph, surviving reloads, a no-op
         # when disabled. Its latest result feeds the additive /status `update` field.
@@ -253,6 +292,15 @@ class Engine:
         # Fail-closed outbound destination allowlist (WP-11c); passed to every runner this engine builds
         # (and the reload dry-run checker), so a denied destination is refused at start + on reload.
         self._egress_settings = egress_settings
+        # #200 (ADR 0092): the instance's derived security posture (PHI? production?), passed to every
+        # RegistryRunner this engine builds (and the reload dry-run checker) so the connector-construction
+        # gate keys each cell's posture-keyed insecure-hop refusal on this config's posture. None → a cell
+        # fail-closes (treats the hop as prod-PHI); serve derives it from [ai] and passes it in.
+        self._hop_posture = hop_posture
+        # #190 (ADR 0093): the instance [tls] client trust-anchor policy, passed to every RegistryRunner
+        # this engine builds so the internal-outbound TLS context builders resolve the same org
+        # internal-CA anchor. None → the default system/no-op policy (byte-identical).
+        self._trust_anchor_policy = trust_anchor_policy
         # [shadow] parallel-run egress suppression (#15); simulate_all_egress is threaded into every
         # runner this engine builds so a shadow instance suppresses all delivery. None → defaults (off).
         self._shadow_settings = shadow_settings or ShadowSettings()
@@ -354,11 +402,14 @@ class Engine:
         infra_fault_policy: str = "stop",
         infra_fault_stop_after: int = 10,
         infra_fault_backoff_cap: float = 60.0,
+        credential_fault_policy: str = "stop",  # #109 (ADR 0095)
+        schedule_tick_seconds: float = 30.0,  # #147 (ADR 0095)
         fuse_thread_hops: bool = False,  # ADR 0071 B5
         pooled_fusing_workers: int = 8,
         batch_handoff_statements: bool = False,  # ADR 0075
         connection_events: bool = True,
         response_sent_default: bool = True,
+        audit_verify_on_start: bool = False,
         synchronous: str = "NORMAL",
         config_dir: str | Path | None = None,
         config_reload_roots: Sequence[str | Path] = (),
@@ -373,11 +424,14 @@ class Engine:
         alert_sink: AlertSink | None = None,
         retention_settings: RetentionSettings | None = None,
         cert_monitor_settings: CertMonitorSettings | None = None,
+        secret_rotation_settings: SecretRotationSettings | None = None,
         update_check_settings: UpdateCheckSettings | None = None,
         api_tls_cert_file: str | None = None,
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings | None = None,
+        hop_posture: HopPosture | None = None,
+        trust_anchor_policy: TrustAnchorPolicy | None = None,
         shadow_settings: ShadowSettings | None = None,
         active_environment: str | None = None,
         env_values: Mapping[str, Any] | None = None,
@@ -405,11 +459,14 @@ class Engine:
             infra_fault_policy=infra_fault_policy,
             infra_fault_stop_after=infra_fault_stop_after,
             infra_fault_backoff_cap=infra_fault_backoff_cap,
+            credential_fault_policy=credential_fault_policy,
+            schedule_tick_seconds=schedule_tick_seconds,
             fuse_thread_hops=fuse_thread_hops,
             pooled_fusing_workers=pooled_fusing_workers,
             batch_handoff_statements=batch_handoff_statements,
             connection_events=connection_events,
             response_sent_default=response_sent_default,
+            audit_verify_on_start=audit_verify_on_start,
             config_dir=config_dir,
             config_reload_roots=config_reload_roots,
             inbound_bind_host=inbound_bind_host,
@@ -423,11 +480,14 @@ class Engine:
             alert_sink=alert_sink,
             retention_settings=retention_settings,
             cert_monitor_settings=cert_monitor_settings,
+            secret_rotation_settings=secret_rotation_settings,
             update_check_settings=update_check_settings,
             api_tls_cert_file=api_tls_cert_file,
             api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
+            hop_posture=hop_posture,
+            trust_anchor_policy=trust_anchor_policy,
             shadow_settings=shadow_settings,
             active_environment=active_environment,
             env_values=env_values,
@@ -540,6 +600,23 @@ class Engine:
 
     def add_registry(self, registry: Registry) -> RegistryRunner:
         """Run a code-first Connection/Router/Handler graph (one runner for the whole graph)."""
+        # ADR 0087 (#197): render [sandbox] into the runner's policy + the (config_dir, env) source a
+        # subprocess worker uses to re-load the graph. mode=off (the default) makes _sandbox_for a
+        # no-op — byte-identical, no child ever spawned.
+        from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy
+
+        _sb = self._sandbox_settings
+        sandbox_policy = SandboxPolicy(
+            mode=SandboxMode(_sb.mode),
+            wall_seconds=_sb.wall_seconds,
+            cpu_seconds=_sb.cpu_seconds,
+            mem_mb=_sb.mem_mb,
+            startup_seconds=_sb.startup_seconds,
+        )
+        sandbox_config_source = (
+            str(self.config_dir) if self.config_dir is not None else None,
+            self._active_environment,
+        )
         runner = RegistryRunner(
             registry,
             self.store,
@@ -558,6 +635,8 @@ class Engine:
             dr_threshold=self._dr_run_threshold(),
             alert_sink=self._alert_sink,
             egress=self._egress_settings,
+            hop_posture=self._hop_posture,
+            trust_anchor_policy=self._trust_anchor_policy,
             simulate_all=self._shadow_settings.simulate_all_egress,
             env_values=self._env_values,
             active_environment=self._active_environment,
@@ -573,11 +652,15 @@ class Engine:
             infra_fault_policy=self._infra_fault_policy,
             infra_fault_stop_after=self._infra_fault_stop_after,
             infra_fault_backoff_cap=self._infra_fault_backoff_cap,
+            credential_fault_policy=self._credential_fault_policy,
+            schedule_tick=self._schedule_tick_seconds,
             fuse_thread_hops=self._fuse_thread_hops,
             pooled_fusing_workers=self._fusing_workers,
             batch_handoff_statements=self._batch_handoff_statements,
             connection_events=self._connection_events,
             response_sent_default=self._response_sent_default,
+            sandbox_policy=sandbox_policy,
+            sandbox_config_source=sandbox_config_source,
         )
         self._registry_runner = runner
         return runner
@@ -600,6 +683,15 @@ class Engine:
         the :class:`CertExpiryRunner` as its cert source so each scan reflects the current graph."""
         registry = self._registry_runner.registry if self._registry_runner is not None else None
         return certs_from_registry(registry, self._api_tls_cert_file)
+
+    def _tracked_secrets(self) -> list[MonitoredSecret]:
+        """The long-lived secrets whose rotation age the engine tracks right now (read live off
+        ``[secret_rotation]`` so a config reload is reflected). Passed to the
+        :class:`SecretRotationRunner` as its secret source. PHI-free: rotation dates + identifiers only,
+        never a secret value."""
+        if self._secret_rotation_settings is None:
+            return []
+        return secrets_from_settings(self._secret_rotation_settings)
 
     @property
     def coordinator(self) -> ClusterCoordinator:
@@ -666,6 +758,28 @@ class Engine:
             destinations=owned_destination_set(registry, registry.shard_id, registry.all_shard_ids),
         )
 
+    async def _verify_audit_chain_on_start(self) -> None:
+        """Startup audit-chain tamper check (#190-E), ALERT-ONLY: a broken chain logs a WARNING and
+        fires the AlertSink but NEVER crashes startup — refusing to boot on a tripped tamper alarm would
+        be a self-inflicted DoS, and the alarm may itself be a false positive (e.g. keyed store opened
+        without the DEK). Reuses the ``integrity_drift`` alert channel (the existing in-place-tamper
+        signal). Swallows every error: the check is defense-in-depth, never a startup gate."""
+        try:
+            ok, msg = await self.store.verify_audit_chain()
+        except Exception as exc:  # never let a verify failure crash startup
+            log.warning("startup audit-chain verification could not run: %s", safe_exc(exc))
+            return
+        if ok:
+            log.info("startup audit-chain verification: %s", msg)
+            return
+        reason = msg or "audit chain verification failed"
+        log.warning("startup audit-chain verification FAILED (alert-only): %s", reason)
+        if self._alert_sink is not None:
+            try:
+                self._alert_sink.integrity_drift("audit-chain", reason=reason, drift_count=1)
+            except Exception:  # an alert-sink failure must never break startup
+                log.warning("audit-chain integrity alert could not be delivered")
+
     async def start(self) -> None:
         """Recover crashed in-flight rows (every stage), dead-letter outbound rows for removed
         outbounds, then start the wired graph."""
@@ -692,6 +806,10 @@ class Engine:
         # else clustered (Track B Step 4): the leader's periodic reclaim_expired_leases sweep (started
         # below) recovers expired-lease rows; the unconditional reset ignores leases and would steal a
         # live sibling's in-flight rows, so it must NOT run here.
+        # #190-E: optional startup audit-chain tamper check. ALERT-ONLY (never crashes startup); runs
+        # after recovery so the chain is walked in its post-recovery state.
+        if self._audit_verify_on_start:
+            await self._verify_audit_chain_on_start()
         # Bring cluster membership + leader election up BEFORE the workers run, so the node's heartbeat
         # is registered and leadership is contended the moment it starts processing (Track B Step 3/4).
         # NullCoordinator (the single-node default) is a no-op here, so this line is free for SQLite /
@@ -755,6 +873,8 @@ class Engine:
                 registry_source=lambda: (
                     self._registry_runner.registry if self._registry_runner is not None else None
                 ),
+                # [logging].log_dir for application-log-file retention (#120); None → sweep no-ops.
+                log_dir=self._log_dir,
             )
             self._retention_runner.start()
         # [backup] turnkey DR backup (ADR 0049, #60) — a maintenance task like retention: independent of
@@ -789,6 +909,17 @@ class Engine:
                 alert_sink=self._alert_sink,
             )
             self._cert_expiry_runner.start()
+        # [secret_rotation] secret-rotation reminder (#195b, ADR 0019 §5) — a maintenance task like
+        # cert_monitor: independent of the message graph, surviving reloads, a no-op when warn_days=0 or
+        # nothing is tracked. NOT leader-gated: it reads node-local config dates only and writes no store
+        # rows (the per-secret realert throttle bounds any alert spam), so each node may run it.
+        if self._secret_rotation_settings is not None:
+            self._secret_rotation_runner = SecretRotationRunner(
+                self._tracked_secrets,
+                self._secret_rotation_settings,
+                alert_sink=self._alert_sink,
+            )
+            self._secret_rotation_runner.start()
         # [update_check] no-network version diff (#30, ADR 0026) — a maintenance task like cert_monitor:
         # independent of the message graph, surviving reloads, a no-op when disabled. NOT leader-gated:
         # it reads node-local metadata, writes no store rows, and only reports drift (the per-package
@@ -1113,6 +1244,8 @@ class Engine:
                 dr_threshold=self._dr_run_threshold(),
                 alert_sink=self._alert_sink,
                 egress=self._egress_settings,
+                hop_posture=self._hop_posture,
+                trust_anchor_policy=self._trust_anchor_policy,
                 simulate_all=self._shadow_settings.simulate_all_egress,
                 env_values=self._env_values,
                 coordinator=self._coordinator,
@@ -1176,6 +1309,61 @@ class Engine:
         if self._registry_runner is not None and self._registry_runner.running:
             self._registry_runner.notify_work()
         return requeued
+
+    async def resend(
+        self, message_id: str, *, to: str, idempotency_key: str, source: str | None = None
+    ) -> ResendOutcome:
+        """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090), then
+        wake the alternate lane's delivery worker. The store performs the FIFO-safe, idempotent insert
+        (:meth:`QueueStore.resend_to`); this only adds the ``notify_work`` wake so the new tail row is
+        picked up promptly. Target validation (registered/owned/running) + RBAC are the API's job."""
+        outcome = await self.store.resend_to(
+            message_id=message_id, to=to, idempotency_key=idempotency_key, from_=source
+        )
+        if (
+            outcome.status == "resent"
+            and self._registry_runner is not None
+            and self._registry_runner.running
+        ):
+            self._registry_runner.notify_work()
+        return outcome
+
+    async def edit_resend_reroute(
+        self, message_id: str, *, raw: str, idempotency_key: str
+    ) -> ReingressOutcome:
+        """Edit-and-resubmit RE-ROUTE (ADR 0090 §9, BACKLOG #153): re-ingress an EDITED body as a fresh
+        correlated ``RECEIVED`` message on the ORIGIN's channel, then wake the workers so the router
+        drains the new ingress row promptly. The store (:meth:`QueueStore.reingress`) does the idempotent,
+        original-immutable, correlated insert; RBAC + step-up are the API's job. The original message row
+        is never written."""
+        outcome = await self.store.reingress(
+            origin_message_id=message_id, raw=raw, idempotency_key=idempotency_key
+        )
+        if (
+            outcome.status == "resubmitted"
+            and self._registry_runner is not None
+            and self._registry_runner.running
+        ):
+            self._registry_runner.notify_work()
+        return outcome
+
+    async def edit_resend_direct(
+        self, message_id: str, *, to: str, raw: str, idempotency_key: str
+    ) -> ResendOutcome:
+        """Edit-and-resubmit DIRECT power-path (ADR 0090 §9, BACKLOG #153): deliver an EDITED body
+        straight to a chosen alternate outbound ``to`` (reusing #123's :meth:`QueueStore.resend_to` with
+        a ``body_override``), then wake the alternate lane. Target validation + RBAC are the API's job;
+        the origin row is only read, never written."""
+        outcome = await self.store.resend_to(
+            message_id=message_id, to=to, idempotency_key=idempotency_key, body_override=raw
+        )
+        if (
+            outcome.status == "resent"
+            and self._registry_runner is not None
+            and self._registry_runner.running
+        ):
+            self._registry_runner.notify_work()
+        return outcome
 
     async def replay_dead(
         self, *, channel_id: str | None = None, destination_name: str | None = None
@@ -1288,6 +1476,8 @@ class Engine:
             await self._backup_runner.stop()
         if self._cert_expiry_runner is not None:
             await self._cert_expiry_runner.stop()
+        if self._secret_rotation_runner is not None:
+            await self._secret_rotation_runner.stop()
         if self._update_check_runner is not None:
             await self._update_check_runner.stop()
         # Stop the leader sweep before deregistering membership (it consults the coordinator's gate, so

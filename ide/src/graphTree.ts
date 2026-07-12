@@ -1,114 +1,63 @@
-// Sidebar tree of the wired graph, from `messagefoundry graph --json`. Also the name source for
-// completion (Send(...) / router="..."), so it's refreshed on save. Connections are a flat (or
-// grouped/filtered) list; each inbound expands to its router → handler → outbound flow (edges are
-// best-effort from the CLI). Every node is clickable and jumps to its definition.
+// Sidebar tree of the wired graph, from `messagefoundry graph --json` (v2). Also the name source
+// for completion (Send(...) / router="..."), so it's refreshed on save. Rendering is the pure
+// view-model in graphModel.ts (ADR 0091 D2): an element-centric four-section perspective (default)
+// and a legacy by-flow chain perspective, toggled from the view title. Every element row jumps to
+// its definition; every cross-reference row reveals its target element in the tree.
 import * as vscode from "vscode";
 import { configDir, runJson, workspaceDir } from "./cli";
+import {
+  buildElementsView,
+  buildFlowView,
+  runtimeEquals,
+  type ElementKind,
+  type Graph,
+  type GroupingMode,
+  type Perspective,
+  type RuntimeMap,
+  type VmNode,
+} from "./graphModel";
 
-interface Located {
-  file?: string | null;
-  line?: number | null;
-}
-
-export interface Graph {
-  inbound: ({ name: string; type: string; router: string } & Located)[];
-  outbound: ({ name: string; type: string } & Located)[];
-  routers: ({ name: string; handlers?: string[] } & Located)[];
-  handlers: ({ name: string; sends?: string[] } & Located)[];
-}
+export type { Graph, GroupingMode, Perspective };
 
 class Node extends vscode.TreeItem {
   constructor(
-    label: string,
-    collapsible: vscode.TreeItemCollapsibleState,
-    public readonly children: Node[] = [],
-    icon?: string,
-    description?: string,
+    public readonly vm: VmNode,
+    public readonly parent: Node | undefined,
   ) {
-    super(label, collapsible);
-    if (icon) {
-      this.iconPath = new vscode.ThemeIcon(icon);
+    super(
+      vm.label,
+      vm.collapsible === "none"
+        ? vscode.TreeItemCollapsibleState.None
+        : vm.collapsible === "expanded"
+          ? vscode.TreeItemCollapsibleState.Expanded
+          : vscode.TreeItemCollapsibleState.Collapsed,
+    );
+    this.id = vm.id;
+    this.description = vm.description;
+    if (vm.icon) {
+      this.iconPath = new vscode.ThemeIcon(vm.icon);
     }
-    if (description) {
-      this.description = description;
+    if (vm.contextValue) {
+      this.contextValue = vm.contextValue;
     }
+    if (vm.kind === "ref" && vm.elementKind && vm.elementName) {
+      this.tooltip = `Reveal ${vm.elementKind} '${vm.elementName}' in the tree`;
+      this.command = {
+        command: "messagefoundry.revealElement",
+        title: "Reveal Element",
+        arguments: [vm.elementKind, vm.elementName],
+      };
+    } else if (vm.open) {
+      this.command = {
+        command: "messagefoundry.openSource",
+        title: "Open Definition",
+        arguments: [vm.open.file, vm.open.line],
+      };
+    }
+    this.children = vm.children.map((c) => new Node(c, this));
   }
-}
 
-const NONE = vscode.TreeItemCollapsibleState.None;
-const COLLAPSED = vscode.TreeItemCollapsibleState.Collapsed;
-const EXPANDED = vscode.TreeItemCollapsibleState.Expanded;
-
-export type GroupingMode = "none" | "type" | "partner";
-
-// Group keys parsed from the [TYPE]_[PARTNER]_[MESSAGE] convention name.
-function typeCode(name: string): string {
-  const i = name.indexOf("_");
-  return i > 0 ? name.slice(0, i) : "(other)";
-}
-
-function partnerName(name: string): string {
-  const parts = name.split("_");
-  return parts.length >= 2 && parts[1] ? parts[1] : "(none)";
-}
-
-function openCommand(loc: Located): vscode.Command | undefined {
-  return loc.file
-    ? { command: "messagefoundry.openSource", title: "Open Definition", arguments: [loc.file, loc.line ?? 1] }
-    : undefined;
-}
-
-interface Maps {
-  routers: Map<string, Graph["routers"][number]>;
-  handlers: Map<string, Graph["handlers"][number]>;
-  outbound: Map<string, Graph["outbound"][number]>;
-}
-
-function buildMaps(g: Graph): Maps {
-  return {
-    routers: new Map(g.routers.map((r) => [r.name, r])),
-    handlers: new Map(g.handlers.map((h) => [h.name, h])),
-    outbound: new Map(g.outbound.map((o) => [o.name, o])),
-  };
-}
-
-function outboundRefNode(name: string, maps: Maps): Node {
-  const o = maps.outbound.get(name);
-  const node = new Node(name, NONE, [], "arrow-up", o ? `outbound · ${o.type}` : "outbound");
-  node.command = openCommand(o ?? {});
-  return node;
-}
-
-function handlerNode(name: string, maps: Maps): Node {
-  const h = maps.handlers.get(name);
-  const outs = (h?.sends ?? []).map((s) => outboundRefNode(s, maps));
-  const node = new Node(name, outs.length ? COLLAPSED : NONE, outs, "symbol-method", "handler");
-  node.command = openCommand(h ?? {});
-  return node;
-}
-
-function routerNode(name: string, maps: Maps): Node {
-  const r = maps.routers.get(name);
-  const handlers = (r?.handlers ?? []).map((h) => handlerNode(h, maps));
-  const node = new Node(name, handlers.length ? COLLAPSED : NONE, handlers, "git-branch", "router");
-  node.command = openCommand(r ?? {});
-  return node;
-}
-
-// Inbound: expands to router → handler → outbound. Outbound: a leaf. Both carry contextValue
-// "meforConnection" so the title/inline "settings" action applies, and a command to jump to their def.
-function inboundNode(c: Graph["inbound"][number], maps: Maps): Node {
-  const node = new Node(c.name, COLLAPSED, [routerNode(c.router, maps)], "arrow-right", `inbound · ${c.type} → ${c.router}`);
-  node.command = openCommand(c);
-  node.contextValue = "meforConnection";
-  return node;
-}
-
-function outboundNode(c: Graph["outbound"][number]): Node {
-  const node = new Node(c.name, NONE, [], "arrow-up", `outbound · ${c.type}`);
-  node.command = openCommand(c);
-  node.contextValue = "meforConnection";
-  return node;
+  readonly children: Node[];
 }
 
 export class GraphProvider implements vscode.TreeDataProvider<Node> {
@@ -118,6 +67,9 @@ export class GraphProvider implements vscode.TreeDataProvider<Node> {
   private error: string | undefined;
   private grouping: GroupingMode = "none";
   private filter = "";
+  private perspective: Perspective = "elements";
+  private roots: Node[] | undefined;
+  private runtime: RuntimeMap | undefined;
 
   getGraph(): Graph | undefined {
     return this.graph;
@@ -129,17 +81,40 @@ export class GraphProvider implements vscode.TreeDataProvider<Node> {
 
   setFilter(text: string): void {
     this.filter = text;
-    this._changed.fire();
+    this.invalidate();
   }
 
   setGrouping(mode: GroupingMode): void {
     this.grouping = mode;
-    this._changed.fire();
+    this.invalidate();
   }
 
-  /** A one-line banner for the view (active grouping/filter), or undefined when both are default. */
+  getPerspective(): Perspective {
+    return this.perspective;
+  }
+
+  setPerspective(p: Perspective): void {
+    this.perspective = p;
+    this.invalidate();
+  }
+
+  /** Live per-connection runtime facts from the engine poll (ADR 0091 live decorations), or
+   *  undefined to drop back to the undecorated tree. Skips the rebuild when the picture is
+   *  unchanged so the steady-state poll doesn't flicker the view every interval. */
+  setRuntime(map: RuntimeMap | undefined): void {
+    if (runtimeEquals(this.runtime, map)) {
+      return;
+    }
+    this.runtime = map;
+    this.invalidate();
+  }
+
+  /** A one-line banner for the view (active perspective/grouping/filter), or undefined at defaults. */
   statusMessage(): string | undefined {
     const parts: string[] = [];
+    if (this.perspective === "flow") {
+      parts.push("Flow view");
+    }
     if (this.grouping === "type") {
       parts.push("Grouped by type");
     } else if (this.grouping === "partner") {
@@ -165,51 +140,86 @@ export class GraphProvider implements vscode.TreeDataProvider<Node> {
         this.error = String(e);
       }
     }
+    this.invalidate();
+  }
+
+  private invalidate(): void {
+    this.roots = undefined;
     this._changed.fire();
+  }
+
+  private info(message: string, icon: string): Node[] {
+    return [
+      new Node(
+        { id: `info:${message}`, label: message, kind: "info", icon, collapsible: "none", children: [] },
+        undefined,
+      ),
+    ];
+  }
+
+  private buildRoots(): Node[] {
+    if (this.error) {
+      return this.info(this.error, "error");
+    }
+    const g = this.graph;
+    if (!g) {
+      return this.info("No config loaded", "info");
+    }
+    const vms =
+      this.perspective === "elements"
+        ? buildElementsView(g, this.filter, this.runtime)
+        : buildFlowView(g, this.filter, this.grouping);
+    const roots = vms.map((vm) => new Node(vm, undefined));
+    if (roots.length === 0) {
+      const f = this.filter.trim();
+      return this.info(f ? `No elements match "${f}"` : "No connections", "info");
+    }
+    return roots;
   }
 
   getTreeItem(node: Node): vscode.TreeItem {
     return node;
   }
 
+  getParent(node: Node): Node | undefined {
+    return node.parent;
+  }
+
   getChildren(node?: Node): Node[] {
     if (node) {
       return node.children;
     }
-    if (this.error) {
-      return [new Node(this.error, NONE, [], "error")];
+    if (!this.roots) {
+      this.roots = this.buildRoots();
     }
-    const g = this.graph;
-    if (!g) {
-      return [new Node("No config loaded", NONE, [], "info")];
+    return this.roots;
+  }
+
+  /** The element row for (kind, name) in the ELEMENTS perspective — the reveal target. */
+  findElement(kind: ElementKind, name: string): Node | undefined {
+    if (this.perspective !== "elements") {
+      return undefined;
     }
-    const maps = buildMaps(g);
-    let conns = [...g.inbound.map((c) => inboundNode(c, maps)), ...g.outbound.map((c) => outboundNode(c))];
-    const f = this.filter.trim().toLowerCase();
-    if (f) {
-      conns = conns.filter((n) => String(n.label).toLowerCase().includes(f));
+    if (!this.roots) {
+      this.roots = this.buildRoots();
     }
-    conns.sort((a, b) => String(a.label).localeCompare(String(b.label)));
-    if (conns.length === 0) {
-      return [new Node(f ? `No connections match "${this.filter}"` : "No connections", NONE, [], "info")];
-    }
-    if (this.grouping === "none") {
-      return conns;
-    }
-    // Group into expandable buckets keyed off the convention name (type code or partner).
-    const keyOf = this.grouping === "type" ? typeCode : partnerName;
-    const groups = new Map<string, Node[]>();
-    for (const n of conns) {
-      const key = keyOf(String(n.label));
-      const bucket = groups.get(key);
-      if (bucket) {
-        bucket.push(n);
-      } else {
-        groups.set(key, [n]);
+    for (const sectionNode of this.roots) {
+      for (const el of sectionNode.children) {
+        if (el.vm.elementKind === kind && el.vm.elementName === name) {
+          return el;
+        }
       }
     }
-    return [...groups.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([key, children]) => new Node(key, EXPANDED, children, "folder", String(children.length)));
+    return undefined;
+  }
+
+  /** The LAST element row of the section holding `kind` — revealed first so that revealing the
+   *  real target scrolls upward and docks it at the top of the viewport (see revealElement). */
+  sectionTail(kind: ElementKind): Node | undefined {
+    if (this.perspective !== "elements" || !this.roots) {
+      return undefined;
+    }
+    const section = this.roots.find((s) => s.children.some((el) => el.vm.elementKind === kind));
+    return section?.children[section.children.length - 1];
   }
 }

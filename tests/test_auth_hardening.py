@@ -221,7 +221,9 @@ async def test_ad_login_conflicting_with_local_account_is_rejected(engine: Engin
 
 
 async def test_cannot_remove_last_administrator(engine: Engine) -> None:
-    service = AuthService(engine.store, AuthSettings())
+    # Last-admin guard test (step-up admin CRUD), not an MFA test: pin require_mfa=False so the
+    # BACKLOG #187 secure default (require_mfa now ON) doesn't 403 the roles/CRUD ops first.
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     boot = await service.initialize()
     assert boot is not None
     async with _client(engine, service) as c:
@@ -522,3 +524,32 @@ async def test_ws_permission_denied_is_audited(engine: Engine) -> None:
     assert denied is None
     rows = [a for a in await engine.store.list_audit() if a["action"] == "auth.permission_denied"]
     assert rows and rows[-1]["actor"] == "vw" and "/ws/stats" in (rows[-1]["detail"] or "")
+
+
+async def test_ws_permission_granted_is_audited_for_sensitive_only(engine: Engine) -> None:
+    # BACKLOG #195a (ASVS 16.3.2): an authorization GRANT is audited for the sensitive surface, and a
+    # read-feed grant (the shipped /ws/stats MONITORING_READ) is NOT — so console polling can't flood
+    # the hash-chained audit log (the documented 16.3.2 read-polling deviation).
+    from messagefoundry.api.security import authorize_ws
+    from messagefoundry.auth import Permission
+
+    service = AuthService(engine.store, AuthSettings())
+    assert await service.initialize() is not None
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    await _add(service, "vw", Role.VIEWER)
+    adm_token = (await service.login("adm", PW)).token
+    vw_token = (await service.login("vw", PW)).token
+
+    # A monitoring:read WS grant (the shipped stats feed) leaves NO permission_granted row.
+    allowed = await authorize_ws(_FakeWS(service, vw_token), Permission.MONITORING_READ)  # type: ignore[arg-type]
+    assert allowed is not None and allowed.username == "vw"
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "auth.permission_granted"]
+    assert rows == []  # a polled read grant must never be audited
+
+    # A sensitive WS grant (config:deploy) DOES leave an audited row attributed to the admin.
+    ok = await authorize_ws(_FakeWS(service, adm_token), Permission.CONFIG_DEPLOY)  # type: ignore[arg-type]
+    assert ok is not None and ok.username == "adm"
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "auth.permission_granted"]
+    assert len(rows) == 1
+    assert rows[-1]["actor"] == "adm" and "config:deploy" in (rows[-1]["detail"] or "")
+    assert "/ws/stats" in (rows[-1]["detail"] or "")

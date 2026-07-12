@@ -126,22 +126,55 @@ transport = "mllp"
   connection editor** shells (the gear on a data-authored connection opens the form; a code-authored
   one opens its `.py`). `env()` secrets are never written inline.
 
-### Decomposing by role (connections / routers / transformers)
+### Decomposing by role (connections / routers / handlers / transforms)
 
-Because names resolve **globally** across the config dir, the three concerns can live in separate
-flat files (`load_config` globs `*.py` non-recursively, so use prefixed flat files, not subdirs):
+Names resolve **globally** across the config dir — an inbound names its router, a router returns
+handler name(s), a handler `Send`s to outbound name(s), all wired by **string**, with no enclosing
+"channel" object. So *where* each declaration lives is an authoring choice the engine neither sees nor
+cares about: it globs every `*.py` (`_*` skipped) and `connections.toml`, and merges them into **one**
+registry. A single feed can therefore be **split by role across separate files** instead of bundled
+into one monolithic module.
+
+> **Flat dir, prefixed files.** `load_config` globs `*.py` **non-recursively**, and helpers /
+> `connections.toml` / `codesets/` all resolve at the top level — so decomposition means **prefixed
+> flat files** (e.g. `IB_400_router.py`), **not** a `feeds/IB_400/` subdirectory (those aren't loaded).
+
+**Recommended for a ported / non-trivial feed — the per-feed "Hybrid" layout.** Split one feed's four
+concerns across four artifacts, named after the inbound so they sort and read together:
 
 ```
-connections.toml        all connections (data)
-routers_<area>.py       @router functions (Corepoint "E Process") — each lists its handler(s)
-handlers_<partner>.py   @handler functions (Corepoint "E Child") — a shared handler defined once,
-                        named by multiple routers
+connections.toml            the feed's connections as DATA (transport + the inbound's router binding)
+<INBOUND>_router.py         @router    — Corepoint "E Process": decides forwarding (+ filtering)
+<INBOUND>_handler.py        @handler   — Corepoint "E Child": filter → delegate → Send (kept THIN)
+_<feed>_transforms.py       the field-level transform steps the handler delegates to (a `_`-helper,
+                            skipped as a feed but imported by the handler — the loader resolves it)
 ```
+
+- **Connections → `connections.toml`** puts the transport config (and the inbound `router=` binding)
+  on the GUI-/hand-editable data surface (ADR 0007) — or keep them in an `<INBOUND>_conn.py` if you
+  prefer all-Python. Either way the *logic* stays code-first.
+- **Transforms → a `_`-prefixed helper** keeps the Handler a thin *filter → delegate → Send*; the many
+  field manipulations a ported Corepoint child accumulates live in the helper as small, reviewable,
+  unit-testable functions rather than a wall of inline code. Shared helpers are imported from siblings
+  (the loader skips `_*` as feeds but resolves them as imports).
+
+A **runnable worked example** ships in [`samples/config/`](../samples/config/): `IB_DEMO_ORU` is
+authored exactly this way — the connections in [`connections.toml`](../samples/config/connections.toml),
+[`IB_DEMO_ORU_router.py`](../samples/config/IB_DEMO_ORU_router.py),
+[`IB_DEMO_ORU_handler.py`](../samples/config/IB_DEMO_ORU_handler.py), and
+[`_demo_oru_transforms.py`](../samples/config/_demo_oru_transforms.py).
+
+**Alternative — group by area/partner** (fewer files; best when a handler is *shared* across feeds):
+put several routers in `routers_<area>.py` and shared handlers in `handlers_<partner>.py` (Corepoint
+"E Child" reuse — one handler named by multiple routers). A **trivial** feed (a passthrough with no
+real transform) is also fine as a **single module** — the shipped `IB_ACME_ADT.py` /
+`IB_RTE_ELIGIBILITY.py` samples show that form; reach for the split when a feed grows a router *and*
+non-trivial transform logic.
 
 A **router fans out** by returning multiple handler names (`return ["to_a", "to_b"]`); a **single
 handler fans out** by returning multiple `Send`s (`return [Send("OB_A", msg), Send("OB_B", msg)]`).
 Namespace router/handler names uniquely (e.g. by site/partner) — `messagefoundry check` flags a
-collision.
+duplicate name (across **any** of these files) and an inbound that binds a router that doesn't exist.
 
 > **Transforms & HL7 escaping.** Writing a **component/subcomponent** (`msg["PID-5.1"] = value`)
 > stores `value` as a literal: HL7 delimiters in it (`^ ~ & |`) are **escaped** so they stay data
@@ -174,6 +207,9 @@ collision.
 | `tls_ca_file` | both | — | trust anchor — **in:** verify client certs (opt-in mTLS → require a client cert); **out:** verify the server cert. |
 | `tls_verify` | out | `true` | verify the server's certificate. `false` is MITM-able → refused unless `MEFOR_ALLOW_INSECURE_TLS=1` (loud warning), like LDAPS / SQL Server. |
 | `tls_check_hostname` | out | `true` | require the server cert to match `host` (SNI + hostname check). |
+| `tls_allow_expired` | out | `false` | **(#129, ADR 0094)** honour a partner **server cert whose validity period has lapsed** (`notAfter` past) while STILL validating the chain + hostname + key-usage — the **granular** alternative to `tls_verify=false` for the narrow expired-cert case (it is **not** MITM-able and, because verification stays on, is **not** refused by the #200 posture gate). Logs a WARN when enabled. Relaxes both validity bounds (a not-yet-valid cert is also accepted). `false` (default) = **byte-identical** (an expired cert is rejected as before). Applies to every verifying outbound TLS transport (MLLP / FTPS / DICOM-SCU / REST / SOAP / FHIR). |
+| `encoding_characters` | out | — (off) | **(Corepoint `-override` parity)** re-encode each outgoing message with a different set of HL7 delimiters (the 5 MSH chars in MSH order — MSH-1 + the 4 MSH-2 chars, e.g. `"#@*!%"`) before framing. Validated at build (exactly 5, all distinct). Unset = payload **byte-identical**. |
+| `hl7_raw_separators` | out | `false` | **(BACKLOG #107) escape-hatch for a partner that cannot decode HL7 escapes:** emit the four reserved **structural** separators as RAW bytes (`\F\ \S\ \R\ \T\` → the message's own field/component/repetition/subcomponent char) instead of their escape sequences. Reserved chars are read from the payload's own MSH; re-serialized via the parsed model, never string-slicing. `false` (default) = payload **byte-identical**. Enabling it can produce **non-conformant** output (a formerly-escaped `^` now reads as a component separator) — that is the point; use only for such a broken partner. Composes after `encoding_characters` (delimiter rewrite first, then raw-separator emit). A non-HL7 payload fails the delivery loud (`DeliveryError`). **HL7v2/MLLP outbound only.** |
 
 Plus on `inbound(...)`: `ack_mode` (`original`/`enhanced`/`none`), `strict`, `hl7_version`. On
 `outbound(...)`: `retry` (`RetryPolicy`), `ordering`, `internal_error`, `buildup`, `stall`
@@ -431,10 +467,20 @@ directory, and lock the directory's ACLs down to the engine's service account + 
 For an **in-process** scan, the engine exposes a **pre-ingest scan-hook seam**: an operator/plugin calls
 `messagefoundry.transports.file.set_scan_hook(hook)` to install a scanner that runs over the raw bytes of
 **every** inbound file — both the local `File(...)` source and the remote `Sftp(...)`/`Ftp(...)` source —
-*before* they enter the pipeline. The hook raises `ScanRejected` to reject content, which the connector
-then quarantines to `.error` and never emits. The seam is **off by default** (no-op) and format-agnostic
-(it sees raw bytes, so it works for HL7, X12, or any payload); it is the integration point for an
-in-process AV/ICAP/YARA scanner, complementing — not replacing — the gateway-fronting above.
+*before* they enter the pipeline. The seam is **off by default** (no-op) and format-agnostic (it sees raw
+bytes, so it works for HL7, X12, or any payload); it is the integration point for an in-process
+AV/ICAP/YARA scanner, complementing — not replacing — the gateway-fronting above.
+
+**Enforced precondition, fail-closed (ASVS 5.4.3, BACKLOG #204).** MessageFoundry does **not** ship an ICAP
+client (that stays an operator/plugin integration), but the *enforcement point* is built and mandatory:
+when a hook is installed it is a **precondition on ingest**, not an advisory pass, and unscanned content
+can never reach the pipeline on either failure axis. (1) A **content rejection** — the hook raises
+`ScanRejected` — quarantines the file to `.error` and never emits it. (2) A **scanner malfunction** — the
+hook raises **any other** exception (the AV/ICAP service is unreachable, a plugin bug) — is fail-closed
+too: the file is **not emitted** and is left in place to be re-scanned on the next poll once the scanner
+recovers (at-least-once), never passed through unscanned. This is the **operator's responsibility to
+uphold the contract**: MessageFoundry guarantees the hook runs and that neither a rejection nor a scanner
+outage can leak content past it; the operator supplies a scanner that actually inspects the bytes.
 
 ### REST — `Rest(...)`
 
@@ -479,22 +525,30 @@ outbound(
 
 ### Database — `Database(...)`
 
-An **outbound** SQL connector ([ADR 0003](adr/0003-non-hl7-transports-database-rest-soap.md)) — **SQL
-Server** today, via the `[sqlserver]` extra (`pip install 'messagefoundry[sqlserver]'`) + the Microsoft
-ODBC Driver 18, **lazily imported** (SQLite-only installs unaffected). **Status: production / supported**
-— the live aioodbc round-trip is exercised by the CI SQL Server service-container job. (The SQL Server
-*store* backend is a **separate** layer, also production; the connector doesn't depend on it.)
-The **inbound** direction is the DB poll source below (`DatabasePoll(...)`).
+An **outbound** SQL connector ([ADR 0003](adr/0003-non-hl7-transports-database-rest-soap.md)) over
+`aioodbc`, via the `[sqlserver]` extra (`pip install 'messagefoundry[sqlserver]'`), **lazily imported**
+(SQLite-only installs unaffected). It has **two dialects** (#66):
+
+- **`dialect="sqlserver"`** (default) — the **SQL Server preset** over the Microsoft ODBC Driver 18.
+  **Status: production / supported** — the live aioodbc round-trip is exercised by the CI SQL Server
+  service-container job.
+- **`dialect="generic"`** — a **generic ODBC path** for any other ODBC-reachable database (PostgreSQL,
+  Oracle, MySQL, …). No new Python dependency: you install the target's **ODBC driver at the OS level**
+  and name it in `odbc_driver`; see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql) below.
+
+(The SQL Server *store* backend is a **separate** layer, also production; the connector doesn't depend on
+it.) The **inbound** direction is the DB poll source below (`DatabasePoll(...)`).
 
 The Handler produces a **JSON-object** body; the connector binds its keys to the `:name` parameters in
 `statement` (translated to positional ODBC `?` — always parameterized, never string-built) and runs it.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `server` | — (required) | SQL Server host. Use `env()` for a DEV/PROD-specific host. |
-| `database` | — (required) | database name |
+| `server` | — (required) | DB host (the `[egress].allowed_db` allowlist key). Use `env()` for a DEV/PROD-specific host. |
+| `database` | — | database name — **required** for `dialect="sqlserver"`; optional for `"generic"` |
 | `statement` | — (required) | parameterized SQL / proc call with `:name` placeholders, e.g. `INSERT INTO obs (mrn, val) VALUES (:mrn, :val)` |
-| `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) |
+| `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql)) |
+| `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only** |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
 | `port` | `1433` | server port |
 | `encrypt` | `true` | TLS to the DB; `false` (dev only) needs `MEFOR_ALLOW_INSECURE_TLS` |
@@ -539,6 +593,56 @@ outbound(
 )
 ```
 
+#### Generic ODBC (PostgreSQL / Oracle / MySQL)
+
+`dialect="generic"` (#66) targets **any ODBC-reachable database** without a new Python dependency: the
+connector still rides the already-present `aioodbc` driver — you install the *target's* **ODBC driver at
+the OS level** (e.g. psqlODBC, Oracle Instant Client ODBC, MySQL Connector/ODBC) and name it in
+`odbc_driver`. The parameterized-`:name` binding, error classification, pooling and `[egress].allowed_db`
+gate are identical to the SQL Server preset.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver`, `Oracle in instantclient_21_13` |
+| `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are brace-quoted (injection-safe); keys must be valid ODBC keywords and may not re-set `DRIVER`/`SERVER`/`DATABASE`. |
+| `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`) |
+| `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`) |
+
+The DSN is built as `DRIVER={odbc_driver};SERVER=<server>;[DATABASE={database};][<user>={username};<pwd>={password};]<odbc_params…>`. `server` is emitted as the near-universal `SERVER` keyword (it is still the egress key); everything else driver-specific goes in `odbc_params`.
+
+> **TLS is the operator's responsibility on the generic path.** MessageFoundry reads SQL Server's
+> `Encrypt`/`TrustServerCertificate` to *refuse* a weakened DB hop, but it cannot introspect an arbitrary
+> driver's TLS posture — so the weakened-TLS refusal does **not** apply here. Configure **verifying** TLS
+> via the driver's own keyword in `odbc_params` (psqlODBC `SSLmode=verify-full`, MySQL
+> `SSLMODE=VERIFY_IDENTITY`, Oracle wallet). Never point PHI at an unverified generic hop. So the
+> delegation is never *silent*, a generic connection with **no** ssl/tls/encrypt keyword in `odbc_params`
+> logs a **WARNING** at construction (dropped to DEBUG once a TLS keyword is set); this exemption is
+> recorded in the [ADR 0092 amendment (2026-07-12)](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md).
+
+> **Scope / limitations.** Native async DB drivers (`asyncpg`-as-connector, `oracledb`, `mysqlclient`) are
+> **out of scope** (dep-heavy) — the generic path is ODBC-only. The `test_connection` reachability probe
+> runs `SELECT 1` (works on PostgreSQL / MySQL / SQL Server; Oracle needs `SELECT 1 FROM DUAL`, so its
+> probe reports an error even though delivery works). Read-only `db_lookup` (ADR 0010) stays SQL-Server-only.
+
+```python
+from messagefoundry import outbound, Database, env
+
+# PostgreSQL via psqlODBC (installed at the OS level), verifying TLS via the driver's own keyword.
+outbound(
+    "DB-OUT_ACME_PG",
+    Database(
+        dialect="generic",
+        odbc_driver="PostgreSQL Unicode",
+        server=env("acme_pg_host"),
+        database="results",
+        username=env("acme_pg_user"),
+        password=env("acme_pg_password"),
+        odbc_params={"PORT": 5432, "SSLmode": "verify-full"},
+        statement="INSERT INTO obs (mrn, value) VALUES (:mrn, :value)",
+    ),
+)
+```
+
 ### Database source — `DatabasePoll(...)`
 
 The **inbound** DB poll ([ADR 0003](adr/0003-non-hl7-transports-database-rest-soap.md) §3 + the
@@ -557,7 +661,8 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 | `body_column` | — | unset → the **whole row** as a JSON object `{column: value}` (pair with `content_type=json`); set → that **one column's value verbatim** (e.g. a column holding an HL7 message → `content_type=hl7v2`) |
 | `poll_seconds` | `5.0` | interval between polls |
 | `encoding` | `utf-8` | charset for the body bytes handed to the pipeline |
-| `auth` / `username` / `password` / `port` / `encrypt` / `trust_server_certificate` / `connect_timeout` / `app_name` / `odbc_driver` / `pool_max` | — | identical to the `Database(...)` destination above |
+| `dialect` / `odbc_driver` / `odbc_params` / `odbc_user_key` / `odbc_password_key` | `sqlserver` / … | same as `Database(...)` — `dialect="generic"` polls any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL); see [*Generic ODBC*](#generic-odbc-postgresql--oracle--mysql) |
+| `auth` / `username` / `password` / `port` / `encrypt` / `trust_server_certificate` / `connect_timeout` / `app_name` / `pool_max` | — | identical to the `Database(...)` destination above |
 
 **Mark mechanism — your choice via `mark_statement`.** A **status column** (lead pattern:
 `SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue** (`DELETE … WHERE

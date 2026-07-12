@@ -21,7 +21,7 @@ from messagefoundry.auth.tokens import hash_token
 
 from .. import pages
 from .._auth import (
-    COOKIE_NAME,
+    session_token,
     WEBAUTHN_EXTRA_MISSING_NOTICE,
     WEBAUTHN_RP_MISSING_NOTICE,
     assert_same_origin,
@@ -168,7 +168,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return _retry(str(exc.detail), exc.status_code)
         # Changed: the service revoked every session (incl. this cookie) — sign in again.
         resp = RedirectResponse("/ui/login?e=pwchanged", status_code=303)
-        clear_session_cookie(resp)
+        clear_session_cookie(resp, request)
         return resp
 
     @app.post("/ui/account/mfa/enroll")
@@ -212,7 +212,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         client = _client(request)
         if not service.allow_login_attempt(client):
             raise _rate_limited(request, "mfa-confirm")
-        token = request.cookies.get(COOKIE_NAME)
+        token = session_token(request)
         if not token:  # pragma: no cover - require_ui already authenticated this cookie
             return RedirectResponse("/ui/login", status_code=303)
         form = dict(await _form_pairs(request))
@@ -258,7 +258,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui()),
         m: str | None = Query(None, max_length=32),
     ) -> HTMLResponse:
-        current = hash_token(request.cookies.get(COOKIE_NAME) or "")
+        current = hash_token(session_token(request) or "")
         sessions = await service.list_sessions(identity.user_id)
         rows = [
             {
@@ -294,7 +294,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui()),
     ) -> Response:
         assert_same_origin(request)
-        current = hash_token(request.cookies.get(COOKIE_NAME) or "")
+        current = hash_token(session_token(request) or "")
         await service.revoke_other_sessions(identity, current, actor=identity.username)
         return RedirectResponse("/ui/account/sessions?m=signed_out_others", status_code=303)
 
@@ -325,7 +325,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 error=WEBAUTHN_RP_MISSING_NOTICE,
                 status_code=409,
             )
-        token = request.cookies.get(COOKIE_NAME)
+        token = session_token(request)
         if not token:  # pragma: no cover - require_ui_reauth_only authenticated this cookie
             return RedirectResponse("/ui/login", status_code=303)
         try:
@@ -355,7 +355,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         rp = webauthn_rp(request)
         if rp is None:
             return JSONResponse({"ok": False, "error": "rp_unavailable"}, status_code=409)
-        token = request.cookies.get(COOKIE_NAME)
+        token = session_token(request)
         if not token:  # pragma: no cover - require_ui_reauth_only authenticated this cookie
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
         try:

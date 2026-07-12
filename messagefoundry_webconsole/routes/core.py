@@ -5,17 +5,21 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qsl
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.models import (
     DeadLetterReplayRequest,
+    EditResendRequest,
     PendingApprovalResponse,
 )
 from messagefoundry.api.security import get_auth
@@ -26,7 +30,7 @@ from messagefoundry.parsing import HL7PeekError, parse_tree
 
 from .. import pages
 from .._auth import (
-    COOKIE_NAME,
+    session_token,
     WEBAUTHN_EXTRA_MISSING_NOTICE,
     WEBAUTHN_RP_CHANGED_NOTICE,
     WEBAUTHN_RP_MISSING_NOTICE,
@@ -34,11 +38,63 @@ from .._auth import (
     clear_session_cookie,
     is_unlock_action,
     lookup_ui_action,
+    register_ui_action,
     require_ui,
     require_ui_step_up,
     set_session_cookie,
     webauthn_rp,
 )
+
+_log = logging.getLogger(__name__)
+
+# Edit-and-resubmit (ADR 0090 §9, BACKLOG #153). The GET editor page is the step-up `unlock`
+# continuation (a GET form the re-auth flow can 303-GET-redirect back to); the body-carrying POST
+# `/edit-resend` is deliberately NOT a registered continuation — its `reauth_next` maps a stale-window
+# step-up to this /edit page, so the operator re-submits inside a fresh window (mirrors /ui/users).
+register_ui_action(
+    r"^/ui/messages/[^/?#]+/edit$", Permission.MESSAGES_EDIT, auto_retry=False, unlock=True
+)
+
+
+def _csp_report_summary(doc: object) -> str:
+    """A bounded, PHI-free one-line summary of a CSP violation report body, accepting BOTH delivery
+    shapes the wired /ui headers advertise: the legacy ``report-uri`` body
+    (``{"csp-report": {"document-uri": ..., "violated-directive": ..., "blocked-uri": ...}}``)
+    and the modern Reporting-API ``report-to`` batch (a top-level ARRAY whose entries carry a ``body``
+    dict keyed ``documentURL``/``effectiveDirective``/``blockedURL``, ``application/reports+json``).
+    Returns ``"empty"`` when nothing usable is present. Never raises on hostile input — the report is
+    attacker-influenceable DATA, never instructions."""
+    report: object
+    if isinstance(doc, list):
+        report = {}
+        for entry in doc:
+            if isinstance(entry, dict):
+                body = entry.get("body", entry)
+                if isinstance(body, dict):
+                    report = body
+                    break
+    elif isinstance(doc, dict):
+        inner = doc.get("csp-report", doc)
+        report = inner if isinstance(inner, dict) else {}
+    else:
+        return "non-object"
+    if not isinstance(report, dict):
+        return "empty"
+    # Accept both the hyphenated report-uri keys and the camelCase report-to keys, labelling the
+    # summary by the stable report-uri name in either case.
+    field_specs = (
+        ("document-uri", "documentURL"),
+        ("violated-directive", "effectiveDirective"),
+        ("blocked-uri", "blockedURL"),
+    )
+    fields: list[str] = []
+    for legacy_key, modern_key in field_specs:
+        value = report.get(legacy_key)
+        if value is None:
+            value = report.get(modern_key)
+        if value:
+            fields.append(f"{legacy_key}={str(value)[:256]}")
+    return "; ".join(fields) or "empty"
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -87,17 +143,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # /ui route would bounce it there anyway (require_ui).
         target = "/ui/account/password" if outcome.must_change_password else "/ui"
         resp = RedirectResponse(target, status_code=303)
-        set_session_cookie(resp, outcome.token, secure=deps.cookie_secure(request))
+        set_session_cookie(resp, outcome.token, request=request)
         return resp
 
     @app.post("/ui/logout")
     async def ui_logout(request: Request) -> Response:
         auth = get_auth(request)
-        token = request.cookies.get(COOKIE_NAME)
+        token = session_token(request)
         if auth is not None and token:
             await auth.logout(token)
         resp = RedirectResponse("/ui/login?e=loggedout", status_code=303)
-        clear_session_cookie(resp)
+        clear_session_cookie(resp, request)
         return resp
 
     @app.get("/ui", response_class=HTMLResponse)
@@ -327,6 +383,81 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         await core.replay_message(message_id, engine=engine, identity=identity)
         return RedirectResponse(f"/ui/messages/{message_id}", status_code=303)
 
+    # Edit-and-resubmit (ADR 0090 §9, BACKLOG #153). GET renders the editor (a COPY of the raw); the
+    # step-up gate opens it inside a fresh window (unlock continuation). The origin row is only READ
+    # here (the audited get_message path); nothing is written until the operator POSTs /edit-resend.
+    @app.get("/ui/messages/{message_id}/edit", response_class=HTMLResponse)
+    async def ui_message_edit(
+        message_id: str,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_EDIT)),
+    ) -> HTMLResponse:
+        detail = await core.get_message(message_id, request, engine=engine, identity=identity)
+        # A fresh per-open idempotency token: a double-submit of THIS rendered form is an idempotent
+        # no-op; re-opening the editor mints a new token (a genuine second resubmit).
+        return HTMLResponse(pages.message_edit(detail, uuid4().hex))
+
+    @app.post("/ui/messages/{message_id}/edit-resend")
+    async def ui_message_edit_resend(
+        message_id: str,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(
+            require_ui_step_up(
+                Permission.MESSAGES_EDIT,
+                # Stale-window step-up on this body-carrying POST → re-open the /edit form (fresh
+                # window), never the POST path (a re-POST would drop the edited body).
+                reauth_next=lambda r: r.url.path.removesuffix("/edit-resend") + "/edit",
+            )
+        ),
+    ) -> Response:
+        assert_same_origin(request)
+        form = dict(await request.form())
+        raw = str(form.get("raw", ""))
+        idem = str(form.get("idempotency_key", "")).strip()
+        mode = str(form.get("mode", "reroute"))
+        to = str(form.get("to", "")).strip()
+
+        async def _reject(msg: str) -> HTMLResponse:
+            # Re-render the editor preserving the operator's edits (raw_value) AND their destination
+            # choice (mode + to) — so a rejected direct send doesn't silently reset to re-route and drop
+            # the typed outbound (review #153-4). The audited get_message re-read is the same PHI path
+            # the GET used. NEVER echo the edited body in the error text.
+            detail = await core.get_message(message_id, request, engine=engine, identity=identity)
+            return HTMLResponse(
+                pages.message_edit(
+                    detail, idem or uuid4().hex, raw_value=raw, error=msg, mode=mode, to=to
+                ),
+                status_code=400,
+            )
+
+        if mode == "direct" and not to:
+            return await _reject(
+                "choose an outbound connection for a direct send, or re-route instead"
+            )
+        try:
+            body = EditResendRequest(
+                raw=raw,
+                idempotency_key=idem,
+                reroute=(mode != "direct"),
+                to=(to if mode == "direct" else None),
+            )
+        except ValidationError:
+            # PHI-safe: a bad edited body must never be echoed — a generic message only.
+            return await _reject("invalid input")
+        try:
+            result = await core.edit_resend_message(
+                message_id, body=body, engine=engine, identity=identity
+            )
+        except HTTPException as exc:
+            # str(exc.detail) carries ids only (the endpoint never interpolates the body).
+            return await _reject(str(exc.detail))
+        # Land on the NEW correlated child (re-route) so the operator sees the resubmit flow; the direct
+        # path lands back on the origin (which now carries the new outbound row). The ORIGINAL is intact.
+        target = result.new_message_id if (result.reroute and result.new_message_id) else message_id
+        return RedirectResponse(f"/ui/messages/{target}", status_code=303)
+
     async def _reauth_webauthn_state(
         request: Request,
         auth: AuthService,
@@ -368,7 +499,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if action is None:
             return RedirectResponse("/ui", status_code=303)
         auth = get_auth(request)
-        token = request.cookies.get(COOKIE_NAME)
+        token = session_token(request)
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or identity is None:
             return RedirectResponse("/ui/login", status_code=303)
@@ -403,7 +534,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_reauth(request: Request) -> Response:
         assert_same_origin(request)
         auth = get_auth(request)
-        token = request.cookies.get(COOKIE_NAME)
+        token = session_token(request)
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or not token or identity is None:
             return RedirectResponse("/ui/login", status_code=303)
@@ -506,7 +637,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_reauth_webauthn(request: Request) -> Response:
         assert_same_origin(request)
         auth = get_auth(request)
-        token = request.cookies.get(COOKIE_NAME)
+        token = session_token(request)
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or not token or identity is None:
             return JSONResponse({"ok": False, "error": "session expired"}, status_code=401)
@@ -599,3 +730,24 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         # Just the dead deliveries for this (channel, destination).
         return await _ui_dl_replay(request, channel_id, destination_name, engine, identity, gate)
+
+    @app.post("/ui/csp-report")
+    async def ui_csp_report(request: Request) -> Response:
+        # Browser-delivered CSP violation report (ASVS 3.7.5). UNAUTHENTICATED and non-mutating: a
+        # browser attaches no session credential to a report POST, and this only observes. The body is
+        # attacker-influenceable DATA (never instructions) — parse it defensively, log a BOUNDED,
+        # PHI-free summary at WARNING (the /ui surface carries no message bodies in its URLs), and 204.
+        # Never echo or act on the report. Both the legacy report-uri body and the modern report-to
+        # array (the wired Reporting-Endpoints header) are summarised by ``_csp_report_summary``.
+        raw = await request.body()
+        summary = "empty"
+        if raw:
+            try:
+                doc = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                summary = "malformed-json"
+            else:
+                summary = _csp_report_summary(doc)
+        client = request.client.host if request.client else "<unknown>"
+        _log.warning("CSP violation report from %s: %s", client, summary[:1024])
+        return Response(status_code=204)

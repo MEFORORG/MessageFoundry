@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.models import ContentType, ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed, check_source_allowed
@@ -93,7 +93,8 @@ class _FakeClient(_RemoteClient):
 
 
 def _install_client(monkeypatch: pytest.MonkeyPatch, client: _FakeClient) -> None:
-    monkeypatch.setattr(remotefile, "_make_client", lambda settings: client)
+    # _make_client gained a keyword-only trust_anchor_policy= (#190, ADR 0093); accept + ignore it.
+    monkeypatch.setattr(remotefile, "_make_client", lambda settings, **_: client)
 
 
 def _dest(
@@ -186,6 +187,23 @@ async def test_destination_permanent_error_is_negative_ack(
     with pytest.raises(NegativeAckError) as ei:
         await dest.send("x")
     assert ei.value.permanent is True
+    # #109 (ADR 0095): a CONTENT-permanent failure (no-such-dir) is NOT a credential fault.
+    assert ei.value.credential_fault is False
+
+
+async def test_destination_credential_fault_flag_threads_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #109 (ADR 0095): an auth-refusal _RemoteError(credential_fault=True) threads its marker onto the
+    # NegativeAckError so the delivery worker can STOP-and-retain instead of dead-lettering the backlog.
+    client = _FakeClient(
+        store_exc=_RemoteError("auth failed", permanent=True, credential_fault=True)
+    )
+    dest = _dest(monkeypatch, client, filename="msg.hl7")
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("x")
+    assert ei.value.permanent is True
+    assert ei.value.credential_fault is True
 
 
 async def test_destination_cleans_temp_on_failed_rename(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -406,6 +424,56 @@ async def test_source_quarantines_content_rejected_by_scan_hook(
     assert h.bodies == [b"MSH|clean"]  # only the clean file was delivered
     assert "/in/.error/bad.hl7" in client.files  # the flagged file was quarantined
     assert "/in/.processed/bad.hl7" not in client.files
+
+
+async def test_source_content_sniff_quarantines_non_hl7_when_hl7v2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ASVS 5.2.2: a remote drop declared content_type=hl7v2 gets the same MSH/FHS/BHS header sniff the
+    # local File source does — a binary/non-HL7 file that merely matches *.hl7 is quarantined to .error
+    # before its bytes reach the pipeline, never handed to the handler.
+    client = _FakeClient(
+        files={"/in/bad.hl7": b"\x00\x01not an hl7 message", "/in/ok.hl7": b"MSH|^~\\&|A|B"}
+    )
+    src = _src(monkeypatch, client)
+    src.content_type = ContentType.HL7V2  # runner injects this; set it directly here
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == [b"MSH|^~\\&|A|B"]  # only the real HL7 message was delivered
+    assert "/in/.error/bad.hl7" in client.files  # the non-HL7 file was quarantined
+    assert "/in/.processed/bad.hl7" not in client.files
+
+
+async def test_source_content_sniff_skipped_for_non_hl7_content_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The gate is content_type-specific: an X12/DICOM/binary drop (any non-hl7v2 type) must NOT be
+    # rejected for lacking an MSH header — that would wrongly quarantine a legitimate non-HL7 file.
+    x12_body = b"ISA*00*          *00*          *ZZ*SENDER"
+    client = _FakeClient(files={"/in/claim.hl7": x12_body})
+    src = _src(monkeypatch, client, pattern="*.hl7")
+    src.content_type = ContentType.X12  # non-HL7 → sniff disabled by design
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == [x12_body]  # delivered verbatim, not quarantined
+    assert "/in/.error/claim.hl7" not in client.files
+
+
+async def test_source_content_sniff_off_when_content_type_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # content_type=None (a direct caller/test that never had it injected) leaves the sniff OFF, so the
+    # poll path is byte-identical to before this control existed (a non-HL7 body is still delivered).
+    client = _FakeClient(files={"/in/a.hl7": b"not-hl7"})
+    src = _src(monkeypatch, client)
+    assert src.content_type is None  # default: unset
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == [b"not-hl7"]
+    assert "/in/.error/a.hl7" not in client.files
 
 
 def test_scan_hook_seam_defaults_to_noop_and_is_settable() -> None:

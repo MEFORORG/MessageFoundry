@@ -279,7 +279,7 @@ def test_router_and_handler_recover_bytes_via_raw_bytes() -> None:
     carried = RawMessage.from_bytes(ALL_BYTES, "binary").raw
     assert route_only(reg, ic, carried) == ["h"]
     assert seen == [RawMessage]
-    previews, _state = transform_one(reg, "h", carried, "binary")
+    previews, _state, _meta = transform_one(reg, "h", carried, "binary")
     assert len(previews) == 1 and previews[0].to == "OUT"
     assert previews[0].payload == str(len(ALL_BYTES))  # 1024 bytes recovered, never hand-rolled
 

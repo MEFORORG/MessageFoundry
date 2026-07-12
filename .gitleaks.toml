@@ -11,4 +11,7 @@ regexes = [
   '''Str0ng_P@ssw0rd!''',
   # Fake test-fixture passphrase (admin-reset rotation test, tests/test_api_auth.py, WP-L3-12).
   '''rotated-strong-passphrase-7''',
+  # Frozen keyless audit-chain byte-identity fixture (tests/test_audit_integrity.py, #190): the
+  # SHA-256 digest of a fixed SYNTHETIC audit row — a hash pinned to detect drift, not a secret.
+  '''f189c34ba475757a3d41c56861b6215de8c1d0ed68618e52a4ae2ae0b878981e''',
 ]

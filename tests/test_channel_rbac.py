@@ -37,7 +37,9 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _service(engine: Engine) -> AuthService:
-    service = AuthService(engine.store, AuthSettings())
+    # Channel-scope RBAC test, not an MFA test: pin require_mfa=False so the admin's step-up scope
+    # endpoint isn't blocked first by the BACKLOG #187 secure default (require_mfa now ON).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     return service
 

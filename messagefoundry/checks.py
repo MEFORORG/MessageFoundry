@@ -26,6 +26,9 @@ a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring
 config-dir Router/Handler modules that flags ``raise <Exc>(f"...{var}...")``, the exact pattern that can
 carry free-text PHI past the exception-path redaction (``redaction.py``); it only ever **prints** a
 heuristic reminder of the "never put PHI in an exception message" convention, never blocks the gate.
+So is ``accepts-candidate`` — an AST scan that flags a ``@handler`` opening with a guard-filter
+(``if <cond>: return []``), a filter that belongs in an ``accepts=`` router-stage predicate (ADR 0084)
+where it costs 0 transactions instead of 2; also advisory (prints, never blocks).
 Exit-code policy lives in the CLI (``__main__._check``): 0 iff no required check failed.
 """
 
@@ -114,7 +117,83 @@ def run_checks(
     # Appended AFTER the ruff/mypy advisory block so it only adds an advisory result and never blocks
     # the gate (required=False keeps __main__._check's "0 iff no required check failed" exit policy).
     results.append(_check_raise_fstring(config_dir))
+    results.append(_check_accepts_candidate(config_dir))
+    results.append(_check_dead_config(config_dir))
+    results.append(_check_send_target(config_dir))
     return CheckReport(results)
+
+
+def _check_dead_config(config_dir: str | Path) -> CheckResult:
+    """Advisory: list registered Handlers / outbound Connections / routers / lookup tables that no
+    object reachable from the inbound roots references — dead config an author can remove (#176).
+
+    Uses the reverse-reachability index (``config.reachability``), whose router->handler / handler->
+    ``Send()`` / ``code_set()`` edges are **heuristic string literals** from each function's
+    ``co_consts``: a dynamically-computed name is invisible (a false positive here) and a name used
+    only in a docstring reads as a live reference (a false negative). So the check is **advisory**
+    (prints, never blocks). A config dir that fails to load is left to ``validate`` (this check skips)."""
+    from messagefoundry.config.reachability import build_reference_index
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError):
+        # A broken config is reported (blocking) by validate; the advisory never crashes the gate.
+        return CheckResult(
+            "dead-config", ok=True, required=False, skipped=True, detail="config did not load"
+        )
+    dead = build_reference_index(registry).unreferenced(registry)
+    if not dead:
+        return CheckResult(
+            "dead-config", ok=True, required=False, skipped=True, detail="no dead config"
+        )
+    shown = ", ".join(f"{kind}:{name}" for kind, name in dead[:8])
+    more = "" if len(dead) <= 8 else f" (+{len(dead) - 8} more)"
+    return CheckResult(
+        "dead-config",
+        ok=False,
+        required=False,
+        detail=f"{len(dead)} unreferenced object(s): {shown}{more}",
+    )
+
+
+def _check_send_target(config_dir: str | Path) -> CheckResult:
+    """Advisory: flag a **literal** ``Send("...")`` target (or Router return) that names nothing
+    registered — a typo the runtime would only catch post-ACK as a dead-letter (ADR 0091 AC-2).
+
+    Uses the authoritative static wiring graph (``config.graph``): only AST-proven string literals
+    are judged, so a dynamically-computed name never trips it (those are surfaced as ``dynamic``
+    in ``graph --json``, not here). Advisory (prints, never blocks): the fail-closed runtime path
+    (``transform_one``) remains the authority, and a config dir that fails to load is left to
+    ``validate`` (this check skips)."""
+    from messagefoundry.config.graph import build_wiring_graph
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError):
+        return CheckResult(
+            "send-target", ok=True, required=False, skipped=True, detail="config did not load"
+        )
+    dangling = build_wiring_graph(registry).dangling
+    if not dangling:
+        return CheckResult(
+            "send-target",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail="no dangling literal targets",
+        )
+    shown = "; ".join(
+        f"{d.source_kind} {d.source!r} -> unknown {d.expected} {d.target!r}" for d in dangling[:5]
+    )
+    more = "" if len(dangling) <= 5 else f" (+{len(dangling) - 5} more)"
+    return CheckResult(
+        "send-target",
+        ok=False,
+        required=False,
+        detail=f"{len(dangling)} dangling literal target(s): {shown}{more}",
+    )
 
 
 def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
@@ -163,6 +242,135 @@ def _check_raise_fstring(config_dir: str | Path) -> CheckResult:
         f"identifiers out of exception messages): {shown}{more}"
     )
     return CheckResult("raise-fstring", ok=True, required=False, detail=detail)
+
+
+def _handler_decorator(node: ast.AST) -> ast.Call | None:
+    """The ``@handler(...)`` decorator Call on ``node`` (bare ``Name`` or dotted ``Attribute``), or None.
+
+    Only the decorator *shape* is matched — the loader is what actually registers a handler, so this
+    static heuristic deliberately does not resolve the import; a function that merely looks like a
+    handler at most trips an advisory print.
+    """
+    if not isinstance(node, ast.FunctionDef):
+        return None
+    for dec in node.decorator_list:
+        if not isinstance(dec, ast.Call):
+            continue
+        func = dec.func
+        if (isinstance(func, ast.Name) and func.id == "handler") or (
+            isinstance(func, ast.Attribute) and func.attr == "handler"
+        ):
+            return dec
+    return None
+
+
+def _is_handler_def(node: ast.AST) -> bool:
+    """A ``def`` decorated with ``@handler(...)``."""
+    return _handler_decorator(node) is not None
+
+
+def _already_declares_accepts(dec: ast.Call) -> bool:
+    """True when the ``@handler(...)`` call already carries an ``accepts=`` keyword — the handler has
+    adopted the seam, so a residual second-stage guard in its body is NOT an accepts-candidate to nag
+    about (the guard may be one that CANNOT move to the router, e.g. it reads run-scoped state)."""
+    return any(kw.arg == "accepts" for kw in dec.keywords)
+
+
+def _names_forbidden_router_accessor(body: list[ast.stmt]) -> bool:
+    """True when the guard-filter references ``state_get``/``response_get`` — a run-scoped read that
+    FAILS OPEN in the router phase (Registry.validate rejects it in an ``accepts=`` predicate). Such a
+    guard must NOT be recommended for migration: it belongs in the transform phase where the view is
+    active. Scans only the leading ``if`` guard (what the advisory would tell the author to move)."""
+    stmts = list(body)
+    if stmts and isinstance(stmts[0], ast.Expr) and isinstance(stmts[0].value, ast.Constant):
+        stmts = stmts[1:]
+    if not stmts or not isinstance(stmts[0], ast.If):
+        return False
+    for sub in ast.walk(stmts[0]):
+        if isinstance(sub, ast.Name) and sub.id in ("state_get", "response_get"):
+            return True
+    return False
+
+
+def _opens_with_guard_filter(body: list[ast.stmt]) -> bool:
+    """True when the def's first executable statement is a bare guard-filter ``if <cond>: return []``.
+
+    "Bare filter" = an ``if`` with no ``else``/``elif`` whose body is a single filter-return (``return``,
+    ``return None``, or ``return []`` — the empty list). A leading docstring is skipped. This is
+    deliberately conservative: a filter buried after real transform work is a genuine handler concern
+    (not an applicability rule) and is not flagged — the advisory only targets the leading guard that
+    belongs in ``accepts=``.
+    """
+    stmts = list(body)
+    # Skip a docstring first statement.
+    if stmts and isinstance(stmts[0], ast.Expr) and isinstance(stmts[0].value, ast.Constant):
+        stmts = stmts[1:]
+    if not stmts:
+        return False
+    first = stmts[0]
+    if not isinstance(first, ast.If) or first.orelse or len(first.body) != 1:
+        return False
+    inner = first.body[0]
+    if not isinstance(inner, ast.Return):
+        return False
+    val = inner.value
+    # bare ``return`` / ``return None`` / ``return []`` are all filter-drops.
+    if val is None:
+        return True
+    if isinstance(val, ast.Constant) and val.value is None:
+        return True
+    return isinstance(val, ast.List) and not val.elts
+
+
+def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:
+    """Advisory: flag a ``@handler`` that opens with a guard-filter (``if <cond>: return []``) — a
+    filter that belongs in an ``accepts=`` router-stage predicate (ADR 0084), where it costs 0
+    transactions instead of the 2 a materialized routed row charges (ADR 0051 ``txn/msg = 3 + 2H + 2N``).
+
+    A pure heuristic reminder, never a hard rule — the author still ports the guard by hand and the
+    dry-run / ``validate`` checks catch a bad port. Mirrors :func:`_check_raise_fstring` exactly in
+    shape: static ``ast`` only (never imports/executes the config module), scans every ``*.py`` under
+    ``config_dir`` (helpers included), skips a broken/unreadable file, and is **advisory** (prints,
+    never blocks — ``required=False`` keeps the gate's "0 iff no required check failed" exit policy).
+    """
+    base = Path(config_dir)
+    if not base.is_dir():
+        return CheckResult(
+            "accepts-candidate", ok=True, required=False, skipped=True, detail="not a config dir"
+        )
+    hits: list[str] = []
+    for path in sorted(base.glob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, OSError):
+            # A broken module is already caught by validate; never crash the advisory gate on it.
+            continue
+        for node in ast.walk(tree):
+            dec = _handler_decorator(node)
+            if dec is None:
+                continue
+            # narrowed by _handler_decorator; assert for the type checker.
+            assert isinstance(node, ast.FunctionDef)
+            # Skip a handler that already declares accepts= (it adopted the seam; a residual guard is a
+            # legitimate second-stage filter) and one whose guard reads fail-open router-phase state
+            # (state_get/response_get) — validate() would reject moving THAT guard, so don't recommend it.
+            if _already_declares_accepts(dec):
+                continue
+            if _opens_with_guard_filter(node.body) and not _names_forbidden_router_accessor(
+                node.body
+            ):
+                hits.append(f"{path.name}:{node.lineno} ({node.name})")
+    if not hits:
+        return CheckResult(
+            "accepts-candidate", ok=True, required=False, skipped=True, detail="no guard-filters"
+        )
+    shown = ", ".join(hits[:5])
+    more = f" (+{len(hits) - 5} more)" if len(hits) > 5 else ""
+    detail = (
+        f"{len(hits)} handler(s) open with a guard-filter (`if …: return []`) — consider declaring it "
+        f"as `accepts=` so it declines at routing time (0 transactions, not 2; ADR 0084): {shown}{more}"
+    )
+    return CheckResult("accepts-candidate", ok=True, required=False, detail=detail)
 
 
 def _check_validate(config_dir: str | Path) -> CheckResult:

@@ -141,7 +141,10 @@ def test_retired_keys_empty_by_default() -> None:
 # --- external providers: lazy + fail-closed (not built yet) ------------------
 
 
-@pytest.mark.parametrize("name", ["aws_kms", "azure_kv", "gcp_kms", "vault", "pkcs11"])
+# `vault` is intentionally omitted: its provider module (store/keyprovider_vault.py) now ships (BACKLOG
+# #196), so selecting it no longer fails closed as "not built yet" — its own fail-closed paths (missing
+# hvac / missing config / Transit failure) are covered in tests/test_keyprovider_vault.py.
+@pytest.mark.parametrize("name", ["aws_kms", "azure_kv", "gcp_kms", "pkcs11"])
 def test_external_provider_fails_closed_until_built(name: str) -> None:
     # Selecting an external provider before its module ships raises (never a silent degrade to the
     # identity cipher), and the message names the optional extra so the operator knows what to install.

@@ -174,14 +174,46 @@ export function run(args: string[], cwd?: string): Promise<CliResult> {
 }
 
 /**
- * Run a `--json` subcommand and parse stdout. The CLI prints valid JSON even on a non-zero exit
- * (e.g. `validate` returns 1 when there are diagnostics), so we parse stdout regardless of code.
+ * Run `python -m messagefoundry <args>` feeding `stdin` to the child, resolving with stdout/stderr/exit
+ * code (never rejects). Used by the Steps view's `lens rewrite - --edit …`, which reads the live
+ * editor buffer from stdin (never the on-disk file) so a rewrite operates on the current, possibly-dirty
+ * document. Same exec gate as {@link run}. stdin/stdout are UTF-8, so module source round-trips exactly.
  */
-export async function runJson<T>(args: string[], cwd?: string): Promise<T> {
-  const res = await run([...args, "--json"], cwd);
+export function runWithStdin(args: string[], stdin: string, cwd?: string): Promise<CliResult> {
+  if (isExecGated()) {
+    return Promise.resolve({
+      stdout: "",
+      stderr: "workspace not trusted — MessageFoundry CLI disabled until you trust this workspace",
+      code: 1,
+    });
+  }
+  return new Promise((resolve) => {
+    const child = execFile(
+      pythonPath(),
+      ["-m", "messagefoundry", ...args],
+      { cwd, maxBuffer: 64 * 1024 * 1024, encoding: "utf8" },
+      (err, stdout, stderr) => {
+        const code =
+          err && typeof (err as { code?: unknown }).code === "number"
+            ? (err as { code: number }).code
+            : err
+              ? 1
+              : 0;
+        resolve({ stdout: stdout ?? "", stderr: stderr ?? "", code });
+      },
+    );
+    // Swallow a stdin write error (e.g. EPIPE if the child exited before consuming input) — the exit
+    // code + stderr from the callback are the real signal; an unhandled stream 'error' would crash.
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(stdin, "utf8");
+  });
+}
+
+/** Parse a `--json` CLI result's stdout, surfacing an `{"error": …}` body as a thrown Error. */
+function parseJsonResult<T>(res: CliResult, label: string): T {
   const text = res.stdout.trim();
   if (!text) {
-    throw new Error(res.stderr.trim() || `messagefoundry ${args.join(" ")} produced no output`);
+    throw new Error(res.stderr.trim() || `messagefoundry ${label} produced no output`);
   }
   const parsed: unknown = JSON.parse(text);
   // The CLI prints {"error": "..."} (e.g. on a WiringError) instead of the expected array/object;
@@ -195,6 +227,23 @@ export async function runJson<T>(args: string[], cwd?: string): Promise<T> {
     throw new Error((parsed as { error: string }).error);
   }
   return parsed as T;
+}
+
+/**
+ * Run a `--json` subcommand and parse stdout. The CLI prints valid JSON even on a non-zero exit
+ * (e.g. `validate` returns 1 when there are diagnostics), so we parse stdout regardless of code.
+ */
+export async function runJson<T>(args: string[], cwd?: string): Promise<T> {
+  return parseJsonResult<T>(await run([...args, "--json"], cwd), args.join(" "));
+}
+
+/**
+ * Run a `--json` subcommand feeding `stdin` to the child, and parse stdout (see {@link runJson}). Used by
+ * the Steps view to re-project the LIVE buffer (`lens parse - --json`, source over stdin) after a
+ * structural edit shifts every row coordinate — reading the dirty buffer, never the on-disk file.
+ */
+export async function runJsonWithStdin<T>(args: string[], stdin: string, cwd?: string): Promise<T> {
+  return parseJsonResult<T>(await runWithStdin([...args, "--json"], stdin, cwd), args.join(" "));
 }
 
 // ---- Code-set (translation table) CLI bridge --------------------------------------------------

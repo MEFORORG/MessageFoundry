@@ -16,6 +16,7 @@ import io
 import json
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -112,16 +113,21 @@ def test_fhir_lookup_raises_with_no_active_runner() -> None:
 
 
 def test_fhir_lookup_delegates_to_active_runner() -> None:
-    calls: list[tuple[str, str]] = []
+    calls: list[tuple[str, str, Any]] = []
 
-    def runner(connection: str, query: str) -> dict[str, Any]:
-        calls.append((connection, query))
+    def runner(connection: str, query: str, params: Any = None) -> dict[str, Any]:
+        calls.append((connection, query, params))
         return {"resourceType": "Patient", "id": "123"}
 
     with activated(runner):
         res = fhir_lookup("epic", "Patient/123")
+        # The structured params= form threads through the accessor → runner unchanged (BACKLOG #204).
+        fhir_lookup("epic", "Patient", {"identifier": "MRN|123"})
     assert res == {"resourceType": "Patient", "id": "123"}
-    assert calls == [("epic", "Patient/123")]
+    assert calls == [
+        ("epic", "Patient/123", None),
+        ("epic", "Patient", {"identifier": "MRN|123"}),
+    ]
     # The runner is reset on exit — calling again raises.
     with pytest.raises(FhirLookupError):
         fhir_lookup("epic", "Patient/123")
@@ -203,6 +209,71 @@ async def test_read_rejects_bad_query_phi_safe() -> None:
         await ex.read("epic", "Patient/../secret")
     assert "epic" in str(ei.value)
     assert len(opener.requests) == 0  # never dialed out on an invalid path
+
+
+# --- structured params= search form: enforced per-value encoding (BACKLOG #204) --------------
+
+
+def test_resolve_read_url_params_percent_encodes_each_value() -> None:  # #204 (a)
+    # The safe structured form: each value is percent-encoded, structure (key=value) preserved.
+    url = _resolve_read_url(BASE, "Patient", {"identifier": "MRN|123"})
+    assert url == f"{BASE}/Patient?identifier=MRN%7C123"
+
+
+def test_resolve_read_url_params_multi_and_list() -> None:  # #204 (a)
+    # Multiple params keep order/structure; a list value expands to repeated params (doseq).
+    url = _resolve_read_url(BASE, "Patient", {"family": "O'Hara", "identifier": ["a|1", "b|2"]})
+    assert url == f"{BASE}/Patient?family=O%27Hara&identifier=a%7C1&identifier=b%7C2"
+
+
+def test_resolve_read_url_empty_params_is_bare_search() -> None:  # #204 (a)
+    # An empty params mapping = a search of the whole resource type (no trailing '?').
+    assert _resolve_read_url(BASE, "Patient", {}) == f"{BASE}/Patient"
+
+
+def test_resolve_read_url_rejects_params_with_query_string() -> None:  # #204
+    # Mixing the structured params= form with a flat '?'-query is ambiguous → refused.
+    with pytest.raises(ValueError, match="not both"):
+        _resolve_read_url(BASE, "Patient?active=true", {"identifier": "MRN|123"})
+
+
+async def test_read_params_injection_value_is_encoded() -> None:  # #204 (b)
+    ex, opener = _executor(body=SEARCHSET.encode())
+    # An attacker-influenced value that TRIES to inject a second FHIR search param via '&_count='.
+    await ex.read("epic", "Patient", {"identifier": "123&_count=99999"})
+    assert len(opener.requests) == 1
+    req = opener.requests[0]
+    # The '&' and '=' are percent-encoded → one 'identifier' param, no injected '_count' on the wire.
+    assert req.full_url == f"{BASE}/Patient?identifier=123%26_count%3D99999"
+    parsed = urllib.parse.parse_qs(urllib.parse.urlsplit(req.full_url).query)
+    assert parsed == {"identifier": ["123&_count=99999"]}  # a single intended search param
+    assert "_count" not in parsed  # the injected param never became a real param
+
+
+# --- flat-string defense-in-depth screen (rejects unambiguous injection shapes) --------------
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Patient?identifier=MRN|123#frag",  # a URL fragment ('#')
+        "Patient?identifier=MRN|123?evil=1",  # a second '?'
+        "Patient?identifier=%0d%0aX-Injected:1",  # percent-decoded control char (CRLF smuggling)
+        "Patient?identifier=%00null",  # percent-decoded NUL
+    ],
+)
+async def test_read_flat_search_screen_rejects_injection_shapes(query: str) -> None:  # #204 (c)
+    ex, opener = _executor(body=PATIENT.encode())
+    with pytest.raises(FhirLookupError):
+        await ex.read("epic", query)
+    assert len(opener.requests) == 0  # screened BEFORE any dial-out
+
+
+def test_flat_search_multi_param_still_verbatim() -> None:  # #204 (c) — no over-blocking
+    # A legitimate multi-param search (&/=/|) is NOT rejected — those are author-supplied FHIR
+    # separators; the flat form rides verbatim (per-value encoding is the author's duty).
+    url = _resolve_read_url(BASE, "Patient?given=Ann&family=Lee&identifier=MRN|9")
+    assert url == f"{BASE}/Patient?given=Ann&family=Lee&identifier=MRN|9"
 
 
 # --- error path is PHI- and secret-safe (AC-6) -------------------------------

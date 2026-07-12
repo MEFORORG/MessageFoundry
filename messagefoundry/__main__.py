@@ -31,7 +31,12 @@ from pathlib import (
 from typing import Any
 
 from messagefoundry import __version__
-from messagefoundry.logging_setup import LOG_LEVELS, SyslogForward, configure_logging
+from messagefoundry.logging_setup import (
+    LOG_LEVELS,
+    SyslogForward,
+    configure_logging,
+    query_sntp_offset,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -247,6 +252,37 @@ def main(argv: list[str] | None = None) -> int:
     )
     codeset.add_argument("--json", action="store_true", help="emit JSON")
 
+    impact = sub.add_parser(
+        "impact",
+        help="reverse-dependency pre-flight for a rename/delete (#152): report who references an "
+        "object, or plan/apply a rename that rewrites every referent (tokenize-safe; dry-run by default)",
+    )
+    impact.add_argument("--config", default="samples/config", help="config modules directory")
+    impact.add_argument(
+        "kind",
+        choices=sorted(_IMPACT_KINDS),
+        help="the object kind to analyze (router/handler/outbound/code_set/…)",
+    )
+    impact.add_argument("name", help="the object's current name")
+    impact.add_argument(
+        "--rename-to",
+        default=None,
+        metavar="NEW",
+        help="plan a rename to NEW: print the concrete literal edits that rewrite the object + its "
+        "referents (dry-run unless --apply)",
+    )
+    impact.add_argument(
+        "--delete",
+        action="store_true",
+        help="delete pre-flight: list the live referrers that would dangle if the object were removed",
+    )
+    impact.add_argument(
+        "--apply",
+        action="store_true",
+        help="with --rename-to: actually write the edits to disk (otherwise a dry-run that writes nothing)",
+    )
+    impact.add_argument("--json", action="store_true", help="emit JSON")
+
     alert = sub.add_parser(
         "alert",
         help="manage [[alerts.rules]] in the service-settings TOML — list / add / remove "
@@ -281,6 +317,65 @@ def main(argv: list[str] | None = None) -> int:
 
     schema = sub.add_parser("hl7schema", help="print HL7 v2.5.1 segment/field schema")
     schema.add_argument("--json", action="store_true", help="emit JSON")
+
+    lens = sub.add_parser(
+        "lens",
+        help="structured Steps view over Handlers (ADR 0076): statically parse a config module "
+        "into the per-@handler row contract (the VS Code Steps editor shells this)",
+    )
+    lens_sub = lens.add_subparsers(dest="lens_command", required=True)
+    lens_parse = lens_sub.add_parser(
+        "parse",
+        help="statically parse one config module into its @handler row contract (never imports or "
+        "executes the module; routers are out of v1 scope)",
+    )
+    lens_parse.add_argument(
+        "module",
+        help="config module .py file to parse, or '-' to read the source from stdin (the IDE re-projects "
+        "the live buffer this way after a structural edit)",
+    )
+    lens_parse.add_argument("--json", action="store_true", help="emit JSON")
+
+    lens_rewrite = lens_sub.add_parser(
+        "rewrite",
+        help="apply one row edit to a Handler and print the rewritten module source (ADR 0076 phase 3): "
+        "op is set_params (edit a param, incl. a literal arg of a multi-line call), delete_row, "
+        "insert_row, or move_row; every untouched byte is preserved and the result is re-parsed (invalid "
+        "Python is refused with zero change); never imports or executes the module",
+    )
+    lens_rewrite.add_argument(
+        "module",
+        help="config module .py file to rewrite, or '-' to read the source from stdin (the IDE passes "
+        "the live editor buffer this way)",
+    )
+    lens_rewrite.add_argument(
+        "--edit",
+        help="the edit spec as a JSON object; op defaults to set_params. Examples: "
+        '\'{"line_start":53,"line_end":53,"op":"set_params","params":{"to":"OB_NEW"}}\', '
+        '\'{"line_start":7,"line_end":7,"op":"delete_row"}\', '
+        '\'{"line_start":6,"line_end":6,"op":"insert_row","position":"after","action":"set_field",'
+        '"params":{"path":"MSH-3","value":"MEFOR"}}\', '
+        '\'{"line_start":7,"line_end":7,"op":"move_row","direction":"up"}\'; '
+        "omit to read the edit spec from stdin (only when 'module' is a file path, not '-')",
+    )
+
+    import_cmd = sub.add_parser(
+        "import",
+        help="deterministically import a legacy integration export into code-first config modules "
+        "(ADR 0086): parse the export -> emit @router/@handler modules calling the ADR 0076 vocabulary; "
+        "unmapped actions become in-place TODO stubs (never silently dropped)",
+    )
+    import_sub = import_cmd.add_subparsers(dest="import_format", required=True)
+    import_corepoint = import_sub.add_parser(
+        "corepoint",
+        help="import a Corepoint action-list export (SYNTHETIC-until-validated schema, ADR 0086) into "
+        "one config module per channel",
+    )
+    import_corepoint.add_argument("export", help="path to the Corepoint action-list export (JSON)")
+    import_corepoint.add_argument(
+        "--out", required=True, help="config directory to write the generated modules into"
+    )
+    import_corepoint.add_argument("--json", action="store_true", help="emit a JSON import summary")
 
     init = sub.add_parser(
         "init",
@@ -358,6 +453,18 @@ def main(argv: list[str] | None = None) -> int:
         help="service settings TOML (default: ./messagefoundry.toml if present)",
     )
     audit_verify.add_argument("--db", default=None, help="store path (overrides [store].path)")
+
+    rekey_audit = sub.add_parser(
+        "rekey-audit",
+        help="enable HMAC keying of an existing keyless audit chain (#190-D migration; non-silent, "
+        "re-verifies first, requires the store encryption key — run with the engine stopped)",
+    )
+    rekey_audit.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    rekey_audit.add_argument("--db", default=None, help="store path (overrides [store].path)")
 
     rotate_key = sub.add_parser(
         "rotate-key",
@@ -479,6 +586,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     verify.add_argument("--report-md", default=None, help="also write the Markdown report here")
     verify.add_argument("--report-json", default=None, help="also write the JSON report here")
+
+    service = sub.add_parser(
+        "service",
+        help="control the engine's Windows service (install|start|stop|status). Windows-only for "
+        "the actions (start/stop are elevated via UAC); status is a plain `sc query`. Elsewhere the "
+        "actions are no-ops and status reports 'unavailable'.",
+    )
+    service.add_argument("action", choices=["install", "start", "stop", "status"])
+    service.add_argument(
+        "--name",
+        default="MessageFoundry",
+        help="Windows service name to control (default: MessageFoundry)",
+    )
+    service.add_argument(
+        "--env",
+        default=None,
+        help="active environment the service runs as (required for `install`; passed to "
+        "install-service.ps1 as -Environment, i.e. serve --env)",
+    )
 
     args = parser.parse_args(argv)
     return _DISPATCH[args.command](args)
@@ -720,6 +846,10 @@ def _serve(args: argparse.Namespace) -> int:
     from messagefoundry.api import create_managed_app
     from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
     from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.config.tls_policy import (
+        in_process_tls_revocation_refused,
+        tls_revocation_attested,
+    )
 
     # Single project-root anchor (ADR 0050): --project-root (== [environments].base_dir) is the bundle
     # root; a relative --config / --service-config / [store].path resolves UNDER it, an absolute one is
@@ -813,6 +943,24 @@ def _serve(args: argparse.Namespace) -> int:
         return 2
     env_name = settings.ai.environment
 
+    # Delegated-identity precondition (#203, ASVS 13.2.1/13.3.2): when the operator declares
+    # [store].require_managed_identity, refuse (production) / warn (non-production) if the store
+    # authenticates with a static credential rather than a managed/delegated identity (Windows
+    # Integrated / Entra). Off by default → byte-identical. Admin device posture and AD/SMTP managed
+    # identity stay deployment-delegated (documented in docs/SECURITY.md), not engine-checked here.
+    mi_reason = settings.store.managed_identity_precondition()
+    if mi_reason is not None:
+        if production:
+            print(
+                f"error: [store].require_managed_identity is set but {mi_reason}; refusing to start.",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"warning: [store].require_managed_identity is set but {mi_reason}.",
+            file=sys.stderr,
+        )
+
     # PHI-at-rest posture (H3, OWASP *Fail Securely* / SDS §4.3 PW.9 secure-by-default): with no key
     # configured, a PHI-carrying instance — gated on data_class == phi, NOT the environment label, so a
     # custom-named dev/test box holding near-real PHI is covered the same as prod — REFUSES to start
@@ -865,6 +1013,14 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # PHI-at-rest invariant (#186b, ASVS 13.2.4): at-rest encryption is effective-by-default on ANY PHI
+    # instance (data_class==phi), not only a production one — the keyless gate ABOVE already fails
+    # closed in every environment unless an encryption key is configured or the audited
+    # [store].allow_unencrypted_phi opt-out is set, so by the time control reaches here a PHI instance
+    # necessarily has a key or the explicit opt-out. No further runtime check is added: an executable
+    # re-assertion here would be unreachable dead code. Synthetic instances carry no PHI and are exempt,
+    # so a dev/loopback synthetic start stays byte-identical.
+    #
     # Open-egress posture (Q5b): on a PHI-carrying instance, outbound egress that is fully
     # unrestricted — no [egress] allowlist AND deny_by_default off — lets a transform send PHI to any
     # destination. On a PRODUCTION instance this fails closed (refuse to start, the prod analogue of
@@ -899,6 +1055,47 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    # Egress deny-by-default effective flip (#186c, ASVS 13.2.4/13.2.5): a PRODUCTION PHI instance
+    # defaults to FAIL-CLOSED egress. Unless the operator explicitly set [egress].deny_by_default, turn
+    # it ON here so a transport whose per-type [egress].allowed_* list is EMPTY refuses every
+    # destination of that type — closing the gap the all-or-nothing open-egress gate above leaves (a
+    # partially-configured instance would otherwise allow-any the transports it did not list). The
+    # opt-out is EXPLICIT + audited: writing [egress].deny_by_default=false restores the per-list opt-in
+    # (empty = allow-any) posture. Gated on production PHI only — a synthetic/dev instance and a
+    # non-production (staging) PHI instance stay byte-identical, so existing dev/loopback configs load
+    # unchanged. Placed AFTER the open-egress gate so a fully-open production instance hits that gate's
+    # refusal first. settings.egress is the same object later passed to create_managed_app, so the
+    # in-place flip threads through to the wiring_runner egress enforcement (no forbidden-file edit).
+    if data_class is DataClass.PHI and production:
+        if "deny_by_default" not in settings.egress.model_fields_set:
+            settings.egress.deny_by_default = True
+            # configure_logging has not run yet (root lastResort drops < WARNING), so announce on stderr
+            # like the sibling posture gates rather than logging.info.
+            print(
+                f"info: [egress].deny_by_default defaulted ON for a production PHI instance "
+                f"({env_name!r}) — a transport with an empty [egress].allowed_* list now refuses every "
+                "destination of that type (secure-by-default). Declare the permitted destinations per "
+                "transport, or set [egress].deny_by_default=false to restore allow-any.",
+                file=sys.stderr,
+            )
+        elif not settings.egress.deny_by_default:
+            # Explicit, audited opt-out on a production PHI instance (mirrors allow_unencrypted_phi):
+            # the operator has chosen the allow-any (empty = unrestricted) egress posture. This audit
+            # line is WARNING-level so the root lastResort handler still surfaces it before
+            # configure_logging.
+            logging.getLogger(__name__).warning(
+                "AUDIT: [egress].deny_by_default=false on a production PHI instance (environment %r) — "
+                "outbound egress uses the allow-any posture (a transport with an empty allowlist may "
+                "send to ANY destination of that type); the secure-by-default deny is opted out.",
+                env_name,
+            )
+            print(
+                f"warning: [egress].deny_by_default=false on a production PHI instance ({env_name!r}) "
+                "— a transport with an empty [egress].allowed_* list may send PHI to ANY destination of "
+                "that type. Remove the override (or set it true) to fail closed.",
+                file=sys.stderr,
+            )
+
     # Gate #1: DEBUG logging can surface PHI (full message bodies / raw field values) into the general
     # log. Refuse it fail-closed on a production instance — real PHI flows there. A non-production
     # instance may use DEBUG for diagnostics.
@@ -921,6 +1118,10 @@ def _serve(args: argparse.Namespace) -> int:
             port=settings.logging.forward_port,
             protocol=settings.logging.forward_protocol.value,
             fmt=settings.logging.forward_format.value,
+            # Native TLS-syslog (ADR 0080): applied only when protocol == "tls"; unused otherwise.
+            tls_ca_file=settings.logging.forward_tls_ca_file,
+            tls_verify=settings.logging.forward_tls_verify,
+            tls_client_cert=settings.logging.forward_tls_client_cert,
         )
         if settings.logging.forward_enabled and settings.logging.forward_host
         else None
@@ -938,6 +1139,62 @@ def _serve(args: argparse.Namespace) -> int:
             log_forward.protocol,
             log_forward.fmt,
         )
+
+    # Startup clock-sync gate (ASVS 16.2.2; ADR 0080): cross-host log/audit correlation assumes the
+    # engine host's clock tracks a reference. Opt-in (require_time_sync + ntp_peer) because the engine
+    # can only verify skew against a configured peer — default is a NO-OP, byte-identical startup. The
+    # SNTP probe is fully bounded (query_sntp_offset carries its own socket timeout), so it can never
+    # hang serve(); it runs BEFORE listeners start so a fail-closed refusal never accepts a message
+    # under an unsynchronized clock. WARN loudly by default; refuse only under time_sync_fail_closed.
+    lg = settings.logging
+    if lg.require_time_sync and lg.ntp_peer:  # validator guarantees ntp_peer when require_time_sync
+        sync_log = logging.getLogger(__name__)
+        try:
+            offset = query_sntp_offset(lg.ntp_peer)
+        except OSError as exc:
+            # Unreachable / non-responsive peer: we cannot confirm sync. Fail closed if asked, else warn.
+            if lg.time_sync_fail_closed:
+                print(
+                    f"error: [logging].require_time_sync is set but the time reference "
+                    f"{lg.ntp_peer!r} could not be queried ({exc}); refusing to start "
+                    "([logging].time_sync_fail_closed). Restore NTP reachability, or unset "
+                    "time_sync_fail_closed to downgrade this to a warning.",
+                    file=sys.stderr,
+                )
+                return 2
+            sync_log.warning(
+                "clock-sync check: could not query time reference %r (%s); continuing — cross-host "
+                "log correlation may be unreliable (ASVS 16.2.2)",
+                lg.ntp_peer,
+                exc,
+            )
+        else:
+            skew = abs(offset)
+            if skew > lg.time_sync_max_skew_seconds:
+                if lg.time_sync_fail_closed:
+                    print(
+                        f"error: local clock skew {skew:.3f}s vs {lg.ntp_peer!r} exceeds "
+                        f"[logging].time_sync_max_skew_seconds={lg.time_sync_max_skew_seconds}; "
+                        "refusing to start ([logging].time_sync_fail_closed). Synchronize the host "
+                        "clock (w32tm/NTP), or unset time_sync_fail_closed to warn instead.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                sync_log.warning(
+                    "clock-sync check: local clock is %.3fs off time reference %r (threshold %.3fs) "
+                    "— cross-host log correlation may be unreliable (ASVS 16.2.2)",
+                    offset,
+                    lg.ntp_peer,
+                    lg.time_sync_max_skew_seconds,
+                )
+            else:
+                sync_log.info(
+                    "clock-sync check: local clock within %.3fs of %r (skew %.3fs)",
+                    lg.time_sync_max_skew_seconds,
+                    lg.ntp_peer,
+                    skew,
+                )
+
     # Anchor for the per-environment value dir: [environments].base_dir (or --project-root) when set,
     # else the working directory (unchanged default). Resolved once here so the startup log shows the
     # exact file env() values come from — the standalone-repo / NSSM footgun is a silently-wrong path.
@@ -975,13 +1232,26 @@ def _serve(args: argparse.Namespace) -> int:
                 settings.api.host,
                 settings.api.trusted_proxies,
             )
-        elif args.allow_insecure_bind:
+        elif args.allow_insecure_bind and not (data_class is DataClass.PHI and production):
             print(
                 f"warning: API bound to non-loopback host {settings.api.host!r} with "
                 "--allow-insecure-bind and NO TLS; bearer tokens and PHI cross the network in "
                 "cleartext — configure [api].tls_cert_file (+ tls_key_file) for real remote access.",
                 file=sys.stderr,
             )
+        elif args.allow_insecure_bind:
+            # #200 (ADR 0092, decision 2): --allow-insecure-bind is CLAMPED to a NON production-PHI
+            # instance — a production-PHI listener refuses cleartext even WITH the flag. Serving bearer
+            # tokens + PHI in the clear on production is never one "I accept the risk" away.
+            print(
+                "error: refusing to serve the API on non-loopback host "
+                f"{settings.api.host!r} without TLS on a PRODUCTION PHI instance ({env_name!r}) — "
+                "--allow-insecure-bind cannot relax a production-PHI cleartext bind (#200). Configure "
+                "[api].tls_cert_file for in-process TLS, or set [api].tls_terminated_upstream "
+                "(+ trusted_proxies) if a proxy terminates TLS.",
+                file=sys.stderr,
+            )
+            return 2
         else:
             print(
                 "error: refusing to serve the API on non-loopback host "
@@ -992,6 +1262,80 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+
+    # Gate: certificate REVOCATION posture (ASVS 12.1.4, ADR 0078 — the ENFORCED half of ADR 0002's
+    # documented delegation). WHEN the engine terminates TLS IN-PROCESS (uvicorn, [api].tls_cert_file)
+    # on a network-reachable host, a REVOKED-but-unexpired server (or mTLS client) certificate is still
+    # accepted: stdlib `ssl` performs no OCSP/CRL fetch and the engine deliberately attempts none (on-
+    # prem, offline-by-default; CLAUDE.md §2). Revocation must be PROVEN IN FRONT — a declared TLS-
+    # terminating reverse proxy (tls_terminated_upstream + trusted_proxies, WP-15, which does its own
+    # OCSP-must-staple / CRL revocation) OR an explicit operator attestation
+    # (MEFOR_TLS_REVOCATION_ATTESTED=1) that the terminator/PKI enforces revocation. Absent both, refuse
+    # fail-closed. Loopback and proxy-terminated deployments never reach this — they start byte-
+    # identically (the predicate short-circuits). Layered AFTER the §0 exposed-bind ladder above
+    # (extend-never-weaken), like the keyless-store / open-egress / MFA-at-exposure gates.
+    proxy_terminated = settings.api.tls_terminated_upstream and bool(settings.api.trusted_proxies)
+    if in_process_tls_revocation_refused(
+        tls_enabled=settings.api.tls_enabled,
+        is_loopback=settings.api.is_loopback,
+        proxy_terminated=proxy_terminated,
+        attested=tls_revocation_attested(),
+    ):
+        print(
+            "error: refusing to serve the API with in-process TLS on non-loopback host "
+            f"{settings.api.host!r}: the engine terminates TLS itself but performs NO certificate "
+            "revocation check (stdlib ssl has no OCSP/CRL fetch; the engine is offline-by-default), so "
+            "a revoked-but-unexpired certificate would still be accepted (ASVS 12.1.4). Terminate TLS "
+            "at a revocation-checking reverse proxy (set [api].tls_terminated_upstream + "
+            "[api].trusted_proxies; e.g. OCSP-must-staple at IIS/nginx/Caddy), or set "
+            "MEFOR_TLS_REVOCATION_ATTESTED=1 to attest that your TLS terminator/PKI enforces "
+            "revocation. See docs/adr/0078-certificate-revocation-posture.md.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # --- #200 Posture-B (upstream TLS termination) fail-closed gate (ASVS 4.2.1/4.4.1, 11.6.2) ------
+    # When a reverse proxy terminates TLS in front (settings.api.tls_terminated_upstream), the exposed-
+    # gate above ALLOWS the off-loopback bind unconditionally — but two properties are then UNVERIFIABLE
+    # by the engine: (a) the proxy→engine internal hop is a plaintext segment, so a rogue peer on that
+    # segment could impersonate the proxy unless the hop is authenticated; and (b) the engine terminates
+    # no browser TLS, so it cannot observe the proxy's negotiated version/KEX floor (11.6.2). The engine
+    # cannot inspect either, so it requires the operator to AFFIRMATIVELY DECLARE them (attestations made
+    # fail-closed) before a PHI-PRODUCTION Posture-B bind may start. Mirror the require_mfa / keyless-
+    # store posture EXACTLY: REFUSE on a production PHI instance, WARN on a non-production PHI instance,
+    # stay QUIET (byte-identical) on a synthetic/non-PHI instance. --allow-insecure-bind CANNOT reach
+    # here: it lives only in the no-TLS arm of the mutually-exclusive exposed-gate if/elif above, so a
+    # Posture-B (tls_terminated_upstream) bind never consults it — the refusal cannot be flag-bypassed.
+    if not settings.api.is_loopback and settings.api.tls_terminated_upstream:
+        posture_b_missing = []
+        if not settings.api.proxy_intra_service_declared:
+            posture_b_missing.append(
+                "[api].proxy_intra_service_auth (proxy→engine hop authentication)"
+            )
+        if not settings.api.proxy_tls_floor_declared:
+            posture_b_missing.append("[api].proxy_tls_min_version (attested proxy TLS/KEX floor)")
+        if posture_b_missing and data_class is DataClass.PHI:
+            missing_desc = "; ".join(posture_b_missing)
+            if production:
+                print(
+                    "error: refusing to serve on a production PHI instance "
+                    f"({env_name!r}) behind an upstream TLS terminator ([api].tls_terminated_upstream) "
+                    f"without: {missing_desc}. The engine cannot verify the proxy→engine internal hop "
+                    "or the proxy's negotiated TLS/KEX (it terminates no browser TLS here), so it "
+                    "requires these operator attestations before exposure. Declare "
+                    "[api].proxy_intra_service_auth (mtls/network/shared_secret) and "
+                    "[api].proxy_tls_min_version (1.2/1.3). See "
+                    "docs/security/OFF-LOOPBACK-DEPLOYMENT.md (ADR 0002).",
+                    file=sys.stderr,
+                )
+                return 2
+            print(
+                "warning: upstream TLS terminator ([api].tls_terminated_upstream) in a PHI-carrying "
+                f"environment ({env_name!r}) without: {missing_desc}. Declare "
+                "[api].proxy_intra_service_auth and [api].proxy_tls_min_version before exposure — the "
+                "engine cannot verify the internal hop or the proxy's TLS/KEX for itself (attestation).",
+                file=sys.stderr,
+            )
 
     # The browser ops console ([api].serve_ui, ADR 0065) is a SEPARATE optional wheel
     # (messagefoundry-webconsole) mounted same-origin in-process. Refuse serve_ui when it is absent with
@@ -1114,12 +1458,16 @@ def _serve(args: argparse.Namespace) -> int:
     # MFA-at-exposure posture (sec-mfa-on; WP-14, ASVS 6.3.3): an off-loopback bind serving local
     # accounts puts admin authentication on the network, where a single password factor is far weaker.
     # [auth].require_mfa adds the native TOTP second factor for the Administrator role; with it off the
-    # admin interface is single-factor over the wire. Mirror the keyless-store / open-egress posture:
-    # refuse on a production PHI instance (the prod fail-closed analogue), warn on a non-production PHI
-    # instance, stay quiet on a synthetic instance. Reached only for an otherwise-permitted exposed
-    # bind (the TLS gate above ran first); the loopback default never trips it. AD/Kerberos MFA is
-    # delegated to the directory, so require_mfa only gates LOCAL Administrator accounts (the bootstrap
-    # admin is one) — it is safe to enable even on an AD-only deployment.
+    # admin interface is single-factor over the wire. Since BACKLOG #187 require_mfa DEFAULTS ON (even
+    # on loopback), so this gate no longer catches the common "forgot to enable it" case — it now fires
+    # only when an operator has EXPLICITLY opted out ([auth].require_mfa=false) AND exposed the admin
+    # interface. That explicit opt-out at exposure is exactly the posture to refuse/warn on. Mirror the
+    # keyless-store / open-egress posture: refuse on a production PHI instance (the prod fail-closed
+    # analogue), warn on a non-production PHI instance, stay quiet on a synthetic instance. Reached only
+    # for an otherwise-permitted exposed bind (the TLS gate above ran first); the loopback default (now
+    # require_mfa on) never trips it. AD/Kerberos MFA is delegated to the directory, so require_mfa only
+    # gates LOCAL Administrator accounts (the bootstrap admin is one) — it is safe to leave on even on
+    # an AD-only deployment.
     #
     # L5b review fix (ADR 0068 §8): the gate keys on the same EXPOSURE signal as the ladder above,
     # not the bind host alone — the runbook's RECOMMENDED topology (loopback bind BEHIND a declared
@@ -1153,6 +1501,148 @@ def _serve(args: argparse.Namespace) -> int:
                 "before exposure.",
                 file=sys.stderr,
             )
+
+    # --- #189 dual-control-at-exposure posture (ASVS 2.3.5) -----------------------------------------
+    # High-value runtime actions (dead-letter replay, connection purge) complete on a SINGLE caller's
+    # authority unless [approvals].enabled turns on maker-checker (a distinct second user holding
+    # approvals:approve releases the request). On an off-box admin surface that concentration is the
+    # weakest link: one compromised/coerced admin session can replay full-PHI dead-letters or purge a
+    # connection with no second sign-off. Key on the SAME exposure signal as the MFA gate above
+    # (admin_exposed = off-loopback bind OR declared-proxy ui_exposed), so a loopback default is
+    # byte-identical (admin_exposed is False → this never trips) and a synthetic instance stays quiet
+    # (gated on data_class is PHI). This is WARN-ONLY by design (the reviewed default): dual-control is
+    # off-by-default precisely so a genuine single-operator hospital deployment is never wedged, so
+    # refusing to start on its absence would break a supported topology.
+    #
+    # OWNER FORK (TODO, ADR/PR body): whether a PRODUCTION PHI exposed instance should REFUSE (mirror
+    # the sec-mfa-on / retention / notifications prod-refuse ladder above, returning 2) instead of
+    # warning is an owner decision — kept WARN-only here until adjudicated; flip by adding the
+    # `if production: ... return 2` arm and an audited [approvals].allow_single_control override.
+    if admin_exposed and not settings.approvals.enabled and data_class is DataClass.PHI:
+        approvals_exposure_desc = (
+            f"API bound to non-loopback host {settings.api.host!r}"
+            if not settings.api.is_loopback
+            else "browser console exposed through a declared reverse proxy "
+            "([api].serve_ui + tls_terminated_upstream)"
+        )
+        print(
+            f"warning: {approvals_exposure_desc} in a PHI-carrying environment ({env_name!r}) with "
+            "[approvals].enabled off — high-value actions (dead_letter_replay, connection_purge) each "
+            "complete on a single caller's authority with no second sign-off (ASVS 2.3.5). Enable "
+            "dual-control with [approvals].enabled=true so a distinct approver (approvals:approve) must "
+            "release them before exposure.",
+            file=sys.stderr,
+        )
+
+    # --- #186(a) secure-by-default data retention (ASVS 14.2.4) --------------------------------------
+    # RetentionSettings defaults every window to 0 (keep-forever) and RetentionRunner then purges
+    # NOTHING, so a PHI instance accumulates PHI bodies indefinitely. Both PHI-body windows must be
+    # bounded: messages_days (inbound bodies) AND dead_letter_days (dead-lettered outbound bodies stay
+    # replayable, i.e. full PHI, until their own window purges them). Mirror the open-egress / MFA-at-
+    # exposure posture: a PRODUCTION PHI instance with EITHER window unbounded REFUSES to start; a
+    # non-production PHI instance (staging) WARNS; a synthetic/dev instance is byte-identical (starts
+    # with windows=0). The explicit, audited opt-out is [retention].allow_unbounded_phi=true, which
+    # downgrades the production refusal to a loud audited warning. Placed after the exposure gates so an
+    # exposed instance's cleartext/MFA refusals surface first.
+    if data_class is DataClass.PHI:
+        unbounded_windows = [
+            field
+            for field, days in (
+                ("messages_days", settings.retention.messages_days),
+                ("dead_letter_days", settings.retention.dead_letter_days),
+            )
+            if days <= 0
+        ]
+        if unbounded_windows:
+            windows_desc = ", ".join(f"[retention].{field}" for field in unbounded_windows)
+            if not settings.retention.allow_unbounded_phi:
+                if production:
+                    print(
+                        f"error: no data-retention window is configured for {windows_desc} on a "
+                        f"production PHI instance ({env_name!r}); refusing to start — PHI message "
+                        "bodies would be retained indefinitely (unbounded PHI at rest, ASVS 14.2.4). "
+                        "Set the window(s) to a positive number of days (e.g. 30) to bound PHI at "
+                        "rest; or, to deliberately retain forever, set "
+                        "[retention].allow_unbounded_phi=true (audited).",
+                        file=sys.stderr,
+                    )
+                    return 2
+                print(
+                    f"warning: no data-retention window is configured for {windows_desc} in a "
+                    f"PHI-carrying environment ({env_name!r}) — PHI message bodies accumulate without "
+                    "bound. Set the window(s) to bound PHI at rest (ASVS 14.2.4).",
+                    file=sys.stderr,
+                )
+            elif production:
+                # Explicit, audited override: unbounded PHI retention on a production instance.
+                logging.getLogger(__name__).warning(
+                    "AUDIT: starting a production PHI instance (environment %r) with unbounded data "
+                    "retention ([retention].allow_unbounded_phi=true; %s = 0) — PHI message bodies are "
+                    "retained INDEFINITELY (retention opt-out override).",
+                    env_name,
+                    windows_desc,
+                )
+                print(
+                    f"warning: [retention].allow_unbounded_phi=true — a production PHI instance "
+                    f"({env_name!r}) retains PHI message bodies indefinitely ({windows_desc} unset). "
+                    "Configure a window to bound PHI at rest.",
+                    file=sys.stderr,
+                )
+
+    # --- #188 out-of-band security notifications effective by default (ASVS 6.3.5/6.3.7) -------------
+    # The per-user security-event push (lockout, password/email/roles change, new-IP admin action)
+    # rides the [alerts] SMTP transport AND the [auth].notify_security_events kill-switch — api/app.py
+    # builds the notifier only when BOTH are on, so with either off it is silently absent (which the
+    # defaults and the off-loopback runbook never set). Mirror the retention posture: a PRODUCTION PHI
+    # instance with no effective channel REFUSES to start; a non-production PHI instance WARNS;
+    # synthetic/dev is byte-identical. The explicit, audited opt-out is
+    # [alerts].security_notifications_required=false (accept the pull-only /me/security-events feed in
+    # writing). "Effective channel" == notify_security_events on + SMTP host + sender (parity with the
+    # app.py notifier wiring). Skipped when auth is disabled (no accounts to notify — a non-loopback
+    # no-auth serve is already refused elsewhere).
+    if data_class is DataClass.PHI and settings.auth.enabled:
+        security_channel_ready = bool(
+            settings.auth.notify_security_events
+            and settings.alerts.email_smtp_host
+            and settings.alerts.email_from
+        )
+        if not security_channel_ready:
+            if settings.alerts.security_notifications_required:
+                if production:
+                    print(
+                        "error: no out-of-band security-notification channel is configured on a "
+                        f"production PHI instance ({env_name!r}); refusing to start — account-security "
+                        "events (lockout, password/roles change, new-IP admin action) would have no "
+                        "push channel, only the pull-only /me/security-events feed (ASVS 6.3.5/6.3.7). "
+                        "Configure the [alerts] SMTP transport (email_smtp_host + email_from) and keep "
+                        "[auth].notify_security_events on; or, to rely on the pull-only feed, set "
+                        "[alerts].security_notifications_required=false (audited).",
+                        file=sys.stderr,
+                    )
+                    return 2
+                print(
+                    "warning: no out-of-band security-notification channel is configured in a "
+                    f"PHI-carrying environment ({env_name!r}) — account-security events have no push "
+                    "channel, only the pull-only /me/security-events feed. Configure the [alerts] SMTP "
+                    "transport (email_smtp_host + email_from) with [auth].notify_security_events on "
+                    "(ASVS 6.3.5/6.3.7).",
+                    file=sys.stderr,
+                )
+            elif production:
+                logging.getLogger(__name__).warning(
+                    "AUDIT: starting a production PHI instance (environment %r) with no security-"
+                    "notification channel ([alerts].security_notifications_required=false) — "
+                    "account-security events are recorded only in the pull-only /me/security-events "
+                    "feed (out-of-band-notification opt-out override).",
+                    env_name,
+                )
+                print(
+                    "warning: [alerts].security_notifications_required=false — a production PHI "
+                    f"instance ({env_name!r}) has no out-of-band security-event push (only the "
+                    "pull-only /me/security-events feed). Configure [alerts] SMTP + "
+                    "[auth].notify_security_events to enable it.",
+                    file=sys.stderr,
+                )
 
     # This instance's environment values (env() lookups in the graph): environments/<env>.toml +
     # MEFOR_VALUE_* env, anchored at env_base (above). The active environment is the single selector
@@ -1255,17 +1745,22 @@ def _serve(args: argparse.Namespace) -> int:
         infra_fault_policy=settings.pipeline.infra_fault_policy,
         infra_fault_stop_after=settings.pipeline.infra_fault_stop_after,
         infra_fault_backoff_cap=settings.pipeline.infra_fault_backoff_cap,
+        credential_fault_policy=settings.pipeline.credential_fault_policy,
+        schedule_tick_seconds=settings.pipeline.schedule_tick_seconds,
         fuse_thread_hops=settings.pipeline.fuse_thread_hops,
         pooled_fusing_workers=settings.pipeline.pooled_fusing_workers,
         batch_handoff_statements=settings.pipeline.batch_handoff_statements,
+        sandbox_settings=settings.sandbox,
         connection_events=settings.diagnostics.connection_events,
         response_sent_default=settings.diagnostics.response_sent,
+        message_events=settings.diagnostics.message_events,
         env_values_provider=env_values,
         auth_settings=settings.auth,
         ai_settings=settings.ai,
         alerts_settings=settings.alerts,
         retention_settings=settings.retention,
         cert_monitor_settings=settings.cert_monitor,
+        secret_rotation_settings=settings.secret_rotation,
         update_check_settings=settings.update_check,
         backup_settings=settings.backup,
         dr_settings=settings.dr,
@@ -1275,6 +1770,9 @@ def _serve(args: argparse.Namespace) -> int:
         api_listener=(settings.api.host, settings.api.port),
         reference_settings=settings.reference,
         egress_settings=settings.egress,
+        # #190 (ADR 0093): the [tls] client trust-anchor policy — the internal-CA fallback the
+        # internal-outbound TLS context builders verify an internal hop against.
+        tls_settings=settings.tls,
         shadow_settings=settings.shadow,
         cluster_settings=settings.cluster,
         approvals_settings=settings.approvals,
@@ -1296,6 +1794,9 @@ def _serve(args: argparse.Namespace) -> int:
         # scheme tripwire (proxy not sending X-Forwarded-Proto / untrusted peer).
         exposure_protected=settings.api.exposure_protected,
         tls_terminated_upstream=settings.api.tls_terminated_upstream,
+        # #200 (ADR 0002): mTLS client-cert → principal allow-list, consumed by
+        # security.resolve_client_cert_identity (deny-by-default; empty = cert-identity off).
+        tls_client_cert_identities=settings.api.tls_client_cert_identities,
         log_dir=settings.logging.log_dir,  # GET /status app-log disk metering (#50)
     )
     # log_config=None: uvicorn's loggers propagate to the handler configure_logging installed,
@@ -1318,6 +1819,14 @@ def _serve(args: argparse.Namespace) -> int:
 
         ctx = build_api_ssl_context(settings.api)
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
+        # ADR 0083 activation: only when in-process mTLS (client CA) AND a cert-identity map are BOTH
+        # configured, swap in the scope-populating HTTP protocol so a verified peer cert reaches
+        # resolve_client_cert_identity. Gated on both so a mutual-auth-only bind (console mTLS, no map)
+        # and every non-mTLS bind keep the stock protocol — no behaviour change without a client CA + map.
+        if settings.api.tls_client_ca_file and settings.api.tls_client_cert_identities:
+            from messagefoundry.api.tls_client_cert import client_cert_http_protocol_class
+
+            run_kwargs["http"] = client_cert_http_protocol_class()
     from messagefoundry.last_resort import install_excepthook
     from messagefoundry.redaction import safe_exc
 
@@ -1406,6 +1915,7 @@ def _validate(args: argparse.Namespace) -> int:
 
 
 def _graph(args: argparse.Namespace) -> int:
+    from messagefoundry.config.graph import build_wiring_graph
     from messagefoundry.config.wiring import WiringError, display_settings, load_config
 
     resolved = _resolve_offline_anchor(args)
@@ -1416,7 +1926,28 @@ def _graph(args: argparse.Namespace) -> int:
         reg = load_config(config_dir)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
+    # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
+    # legacy string-constant scan as a fallback tier, provenance-tagged, plus reverse adjacency.
+    # v1 fields ("handlers"/"sends" name lists, per-element file/line) are preserved unchanged;
+    # v2 adds "edges"/"fed_by"/"receives_from"/"dynamic" and the top-level "version".
+    graph = build_wiring_graph(reg)
+
+    def edges_out(kind: str, name: str) -> list[dict[str, str]]:
+        return [
+            {"target": e.target, "target_kind": e.target_kind, "provenance": e.provenance}
+            for e in sorted(graph.targets(kind, name), key=lambda e: (e.target_kind, e.target))
+        ]
+
+    def out_names(kind: str, name: str, target_kind: str) -> list[str]:
+        return sorted({e.target for e in graph.targets(kind, name) if e.target_kind == target_kind})
+
+    def in_names(kind: str, name: str, source_kind: str) -> list[str]:
+        return sorted(
+            {e.source for e in graph.referrers(kind, name) if e.source_kind == source_kind}
+        )
+
     data = {
+        "version": 2,
         "inbound": [
             {
                 "name": name,
@@ -1427,6 +1958,8 @@ def _graph(args: argparse.Namespace) -> int:
                 "strict": c.validation.strict,
                 "file": c.source_file,
                 "line": c.source_line,
+                # Non-empty only for a pass-through (PT) inbound — the handlers that Send here.
+                "receives_from": in_names("inbound", name, "handler"),
             }
             for name, c in reg.inbound.items()
         ],
@@ -1437,18 +1970,30 @@ def _graph(args: argparse.Namespace) -> int:
                 "settings": display_settings(c.spec.settings),
                 "file": c.source_file,
                 "line": c.source_line,
+                "receives_from": in_names("outbound", name, "handler"),
             }
             for name, c in reg.outbound.items()
         ],
-        # router→handler and handler→outbound edges are decided in code, not declared, so they're
-        # extracted best-effort: a handler/outbound name that appears as a string literal in the
-        # function counts as a reference. Accurate for names written literally; misses computed names.
         "routers": [
-            {"name": n, **_fn_location(fn), "handlers": _referenced(fn, reg.handlers)}
+            {
+                "name": n,
+                **_fn_location(fn),
+                "handlers": out_names("router", n, "handler"),
+                "edges": edges_out("router", n),
+                "fed_by": in_names("router", n, "inbound"),
+                "dynamic": graph.is_dynamic("router", n),
+            }
             for n, fn in sorted(reg.routers.items())
         ],
         "handlers": [
-            {"name": n, **_fn_location(fn), "sends": _referenced(fn, reg.outbound)}
+            {
+                "name": n,
+                **_fn_location(fn),
+                "sends": out_names("handler", n, "outbound"),
+                "edges": edges_out("handler", n),
+                "fed_by": in_names("handler", n, "router"),
+                "dynamic": graph.is_dynamic("handler", n),
+            }
             for n, fn in sorted(reg.handlers.items())
         ],
     }
@@ -1462,31 +2007,6 @@ def _fn_location(fn: object) -> dict[str, Any]:
     if code is None:
         return {"file": None, "line": None}
     return {"file": code.co_filename, "line": code.co_firstlineno}
-
-
-def _referenced(fn: object, names: dict[str, Any]) -> list[str]:
-    """Best-effort: which of ``names`` appear as string literals in ``fn`` (router/handler wiring)."""
-    consts = _string_consts(fn)
-    return sorted(name for name in names if name in consts)
-
-
-def _string_consts(fn: object) -> set[str]:
-    """All string constants in a function, recursing into nested code objects (comprehensions, etc.)."""
-    import types
-
-    code = getattr(fn, "__code__", None)
-    if code is None:
-        return set()
-    found: set[str] = set()
-    stack = [code]
-    while stack:
-        current = stack.pop()
-        for const in current.co_consts:
-            if isinstance(const, str):
-                found.add(const)
-            elif isinstance(const, types.CodeType):
-                stack.append(const)
-    return found
 
 
 def _redact_body(body: str) -> str:
@@ -1587,6 +2107,127 @@ def _hl7schema(args: argparse.Namespace) -> int:
     return 0
 
 
+def _lens(args: argparse.Namespace) -> int:
+    """Statically parse or rewrite a config module's @handler rows (ADR 0076 §3 / §5).
+
+    The module is never imported/executed (static ``ast`` only), so a module whose top level would raise
+    still parses/rewrites. An unparseable file / refused edit is a clean ``{"error": …}`` + non-zero
+    exit, matching the IDE's degradation-to-text-editor behavior."""
+    if args.lens_command == "rewrite":
+        return _lens_rewrite(args)
+    return _lens_parse(args)
+
+
+def _lens_parse(args: argparse.Namespace) -> int:
+    """``lens parse`` — emit the per-@handler row contract (ADR 0076 §3).
+
+    Reads the source from the ``module`` file, or from stdin when it is ``-`` (the IDE re-projects the
+    live buffer this way after a structural edit shifts every row coordinate). Static-only either way."""
+    import sys
+
+    from messagefoundry.lens import LensParseError, parse_module, parse_source
+
+    try:
+        if args.module == "-":
+            # Raw UTF-8 (never the Windows locale codepage) so the buffer's non-ASCII round-trips exactly.
+            module_label = "<stdin>"
+            handlers = parse_source(sys.stdin.buffer.read().decode("utf-8"), module=module_label)
+        else:
+            module_label = args.module
+            handlers = parse_module(args.module)
+    except LensParseError as exc:
+        return _emit_error(str(exc), as_json=args.json)
+    _print_json({"module": module_label, "handlers": handlers}, compact=args.json)
+    return 0
+
+
+def _lens_rewrite(args: argparse.Namespace) -> int:
+    """``lens rewrite`` — apply one row param-edit and print the rewritten module source (ADR 0076 §5).
+
+    Reads the source from ``module`` (or stdin when it is ``-``) and the edit spec from ``--edit`` (or
+    stdin otherwise); prints the rewritten source (byte-identical outside the edited row) on success, or
+    ``{"error": …}`` + exit 1 on any refusal — never a partial/lossy write."""
+    import sys
+
+    from messagefoundry.lens import LensParseError, LensRewriteError, rewrite_module, rewrite_source
+
+    # Read stdin as raw UTF-8 (never the Windows locale codepage) so source bytes round-trip exactly —
+    # byte-stability (gate 2) would break if a non-ASCII char (the samples carry — and → in comments)
+    # were re-encoded through cp1252.
+    def _read_stdin() -> str:
+        return sys.stdin.buffer.read().decode("utf-8")
+
+    if args.edit is not None:
+        edit_text = args.edit
+    elif args.module != "-":
+        edit_text = _read_stdin()
+    else:
+        return _emit_error(
+            "provide the edit spec via --edit when the source is read from stdin ('-')",
+            as_json=True,
+        )
+    try:
+        edit = json.loads(edit_text)
+    except json.JSONDecodeError as exc:
+        return _emit_error(f"invalid --edit JSON: {exc}", as_json=True)
+    if not isinstance(edit, dict):
+        return _emit_error("the edit spec must be a JSON object", as_json=True)
+
+    try:
+        if args.module == "-":
+            rewritten = rewrite_source(_read_stdin(), edit, module="<stdin>")
+        else:
+            rewritten = rewrite_module(args.module, edit)
+    except (LensParseError, LensRewriteError) as exc:
+        return _emit_error(str(exc), as_json=True)
+    # The rewritten module source is file content, not a JSON report — write the exact UTF-8 bytes to
+    # stdout (not sys.stdout.write, which would re-encode through the console codepage and corrupt
+    # non-ASCII, defeating byte-stability).
+    sys.stdout.buffer.write(rewritten.encode("utf-8"))
+    sys.stdout.buffer.flush()
+    return 0
+
+
+def _import(args: argparse.Namespace) -> int:
+    """``import corepoint`` — translate a Corepoint action-list export into code-first config (ADR 0086).
+
+    Writes one ``@router``/``@handler`` module per channel into ``--out`` and reports the count-and-log
+    summary (mapped vs. unmapped actions). The export is untrusted data — a malformed export is a clean
+    error + exit 1, never a traceback."""
+    from messagefoundry.corepoint_import import CorepointImportError, import_corepoint
+
+    try:
+        result = import_corepoint(args.export, args.out)
+    except CorepointImportError as exc:
+        return _emit_error(str(exc), as_json=args.json)
+
+    if args.json:
+        _print_json(result.to_json(), compact=True)
+        return 0
+    print(
+        f"Imported {len(result.channels)} channel(s) into {args.out} "
+        f"({result.total_mapped} action(s) mapped, {result.total_unmapped} left as TODO stubs):"
+    )
+    for c in result.channels:
+        note = (
+            f" — {c.unmapped} unmapped: {', '.join(sorted(set(c.unmapped_classes)))}"
+            if c.unmapped
+            else ""
+        )
+        renamed = (
+            f" [renamed from {c.renamed_from} to avoid a filename collision]"
+            if c.renamed_from
+            else ""
+        )
+        print(f"  {c.filename} ({c.mapped} mapped){note}{renamed}")
+    if result.total_unmapped:
+        print(
+            "\nReview the `# TODO: Corepoint ...` markers in the generated modules and hand-finish them, "
+            "then run: messagefoundry check --config " + str(args.out)
+        )
+    return 0
+
+
 def _init(args: argparse.Namespace) -> int:
     """Scaffold a new config repo into ``args.dir`` (starter feed + environments + CI + a pinned engine)."""
     from pathlib import Path
@@ -1613,6 +2254,59 @@ def _init(args: argparse.Namespace) -> int:
     print("  pip install -r requirements.txt        # the pinned engine (a read-only dependency)")
     print("  messagefoundry check --config config --messages messages/sets")
     print("  messagefoundry serve --config config --env dev")
+    return 0
+
+
+def _service(args: argparse.Namespace) -> int:
+    """Control the engine's Windows service (ADR 0088). ``status`` queries state (no elevation);
+    ``start``/``stop`` elevate once via UAC; ``install`` runs scripts/service/install-service.ps1
+    elevated. The engine can't stop/start its *own* hosting service through the API, so this is a
+    local, out-of-band CLI over the Windows SCM. Off Windows the actions are no-ops (return 1) and
+    ``status`` prints ``unavailable``."""
+    from messagefoundry import service as svc
+
+    action = args.action
+    if action == "status":
+        print(svc.service_state(args.name))
+        return 0
+    if action == "install":
+        if args.env is None:
+            print(
+                "error: `service install` requires --env <name> (the active environment the service "
+                "runs as, passed to install-service.ps1)",
+                file=sys.stderr,
+            )
+            return 2
+        script = svc.install_script_path()
+        if script is None:
+            print(
+                "error: could not locate scripts/service/install-service.ps1 (is the engine "
+                "installed from a source checkout?)",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            started = svc.install_service(str(script), args.env)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if not started:
+            print("error: `service install` is Windows-only", file=sys.stderr)
+            return 1
+        print(f"launched the elevated installer for environment {args.env!r}")
+        return 0
+    # start / stop
+    try:
+        started = svc.control_service(action, args.name)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not started:
+        print(f"error: `service {action}` is Windows-only", file=sys.stderr)
+        return 1
+    print(
+        f"requested elevated `{action}` of service {args.name!r}; poll `service status` for state"
+    )
     return 0
 
 
@@ -1745,6 +2439,53 @@ def _audit_verify(args: argparse.Namespace) -> int:
             "warning: the audit log is empty — confirm this is the intended database.",
             file=sys.stderr,
         )
+    return 0 if ok else 1
+
+
+def _rekey_audit(args: argparse.Namespace) -> int:
+    """Enable HMAC keying of an EXISTING keyless audit chain (#190-D migration).
+
+    This is the owner-visible fork the spec asked for: fresh encrypted stores auto-key from row 1, but
+    an already-deployed keyless encrypted store only becomes keyed through this explicit, **non-silent**
+    step — never on ``open()``. It requires the store encryption key (``MEFOR_STORE_ENCRYPTION_KEY``),
+    FIRST re-verifies the existing keyless chain (refusing to bless a broken/forged one), then sets the
+    keying watermark to the next id without rewriting any existing ``row_hash``. Run with the engine
+    stopped so no concurrent append races the watermark move."""
+    import asyncio
+    from pathlib import Path
+
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import StoreBackend, load_settings
+    from messagefoundry.store.base import open_store
+
+    cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        cli.setdefault("store", {})["path"] = args.db
+    try:
+        settings = load_settings(config_path=args.service_config, cli=cli)
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    # Refuse to create-and-key a fresh empty SQLite DB from a typo'd path (mirrors _audit_verify M-31).
+    if settings.store.backend == StoreBackend.SQLITE and not Path(settings.store.path).exists():
+        print(
+            f"error: no audit database at {settings.store.path} — refusing to create one "
+            f"(check --db / [store].path)",
+            file=sys.stderr,
+        )
+        return 2
+
+    async def run() -> tuple[bool, str]:
+        store = await open_store(settings.store)
+        try:
+            return await store.rekey_audit_chain()
+        finally:
+            await store.close()
+
+    ok, message = asyncio.run(run())
+    print(("OK: " if ok else "FAIL: ") + message)
     return 0 if ok else 1
 
 
@@ -2098,7 +2839,7 @@ def _connection(args: argparse.Namespace) -> int:
         load_environment_values,
         resolve_values_base_dir,
     )
-    from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.settings import hop_posture_from_ai, load_settings
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
 
@@ -2141,6 +2882,13 @@ def _connection(args: argparse.Namespace) -> int:
             # Reserve the configured API listener so an edit that puts an inbound on the API's port is
             # rejected here, before it persists — same check the running engine applies.
             reserved_bindings=((API_LISTENER_LABEL, settings.api.host, settings.api.port),),
+            # #200 (ADR 0092): key the posture-keyed insecure-hop refusal on THIS instance's derived
+            # posture, so an edit adding a cleartext-egress hop is refused at edit time exactly as at
+            # reload — rather than defaulting wrong (strictest) and failing an otherwise-valid non-prod edit.
+            posture=hop_posture_from_ai(settings.ai),
+            # #190 (ADR 0093): resolve internal-outbound TLS hops against the [tls] internal-CA anchor at
+            # edit-time build-check exactly as at reload (None-safe: default system policy = no-op).
+            trust_anchor_policy=settings.tls.policy(),
         )
 
     try:
@@ -2226,6 +2974,87 @@ def _codeset(args: argparse.Namespace) -> int:
         return _emit_error(str(exc), as_json=args.json)
     _print_json(result, compact=args.json)
     return 0
+
+
+#: The object kinds `messagefoundry impact` accepts (mirrors config.impact.RENAMEABLE_KINDS; kept as a
+#: literal so building the argparse choices doesn't import the engine on every CLI invocation).
+_IMPACT_KINDS = frozenset(
+    {"inbound", "router", "handler", "outbound", "code_set", "reference", "lookup", "fhir_lookup"}
+)
+
+
+def _impact(args: argparse.Namespace) -> int:
+    """Reverse-dependency pre-flight (#152): report referrers, or plan/apply a rename that rewrites an
+    object AND every referent. Offline — loads the config graph, touches no network, starts no server.
+    A rename is a **dry-run** (prints the edits) unless ``--apply`` writes them; ``--delete`` lists the
+    live referrers that would dangle. Rename/delete are mutually exclusive."""
+    from messagefoundry.config.impact import apply_rename, delete_impact, plan_rename
+    from messagefoundry.config.reachability import build_reference_index
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    if args.rename_to is not None and args.delete:
+        return _emit_error("--rename-to and --delete are mutually exclusive", as_json=args.json)
+    if args.apply and args.rename_to is None:
+        return _emit_error("--apply is only valid with --rename-to", as_json=args.json)
+
+    try:
+        registry = load_config(args.config)
+    except (WiringError, FileNotFoundError, OSError) as exc:
+        return _emit_error(str(exc), as_json=args.json)
+
+    index = build_reference_index(registry)
+
+    if args.rename_to is not None:
+        try:
+            plan = plan_rename(registry, args.config, args.kind, args.name, args.rename_to)
+        except (WiringError, OSError) as exc:
+            return _emit_error(str(exc), as_json=args.json)
+        result = plan.as_dict()
+        if args.apply:
+            try:
+                applied = apply_rename(plan)
+            except OSError as exc:
+                return _emit_error(str(exc), as_json=args.json)
+            result["applied"] = len(applied)
+            result["dry_run"] = False
+        else:
+            result["dry_run"] = True
+        _print_json(result, compact=args.json)
+        return 0
+
+    if args.delete:
+        referrers = delete_impact(index, args.kind, args.name)
+        result = {
+            "op": "delete",
+            "kind": args.kind,
+            "name": args.name,
+            "referrers": [_reference_dict(r) for r in referrers],
+            "would_dangle": len(referrers),
+        }
+        _print_json(result, compact=args.json)
+        return 0
+
+    referrers = index.referrers(args.kind, args.name)
+    _print_json(
+        {
+            "kind": args.kind,
+            "name": args.name,
+            "referrers": [_reference_dict(r) for r in referrers],
+            "count": len(referrers),
+        },
+        compact=args.json,
+    )
+    return 0
+
+
+def _reference_dict(ref: Any) -> dict[str, str]:
+    """JSON view of a :class:`~messagefoundry.config.reachability.Reference` (referrer -> target edge)."""
+    return {
+        "referrer_kind": ref.referrer_kind,
+        "referrer": ref.referrer,
+        "target_kind": ref.target_kind,
+        "target": ref.target,
+    }
 
 
 def _verify(args: argparse.Namespace) -> int:
@@ -2383,6 +3212,7 @@ def _emit_error(message: str, *, as_json: bool) -> int:
 _DISPATCH = {
     "serve": _serve,
     "supervise": _supervise,
+    "import": _import,
     "init": _init,
     "validate": _validate,
     "graph": _graph,
@@ -2391,18 +3221,22 @@ _DISPATCH = {
     "adr-analyze": _adr_analyze,
     "connection": _connection,
     "codeset": _codeset,
+    "impact": _impact,
     "alert": _alert,
     "generate": _generate,
     "hl7schema": _hl7schema,
+    "lens": _lens,
     "gen-key": _gen_key,
     "protect-key": _protect_key,
     "audit-verify": _audit_verify,
+    "rekey-audit": _rekey_audit,
     "rotate-key": _rotate_key,
     "backup": _backup,
     "restore-verify": _restore_verify,
     "ai-policy": _ai_policy,
     "verify": _verify,
     "support-bundle": _support_bundle,
+    "service": _service,
 }
 
 

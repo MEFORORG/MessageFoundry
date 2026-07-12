@@ -37,7 +37,7 @@ Declare a connection with :func:`~messagefoundry.config.wiring.FhirLookup`; read
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -64,9 +64,12 @@ class FhirLookupError(RuntimeError):
 
 
 #: The runner the engine publishes for the duration of one off-loop transform: it takes
-#: ``(connection, query)`` (``query`` is ``"Patient/123"`` or ``"Patient?identifier=..."``) and returns
-#: the parsed read result as a plain dict (a resource, or a searchset ``Bundle``).
-FhirLookupRunner = Callable[[str, str], dict[str, Any]]
+#: ``(connection, query, params)`` (``query`` is ``"Patient/123"``, ``"Patient?identifier=..."``, or a
+#: path-only ``"Patient"`` paired with structured ``params``) and returns the parsed read result as a
+#: plain dict (a resource, or a searchset ``Bundle``). ``params`` (ADR 0043, BACKLOG #204) is the
+#: **safely-encoded** search form: each value is percent-encoded by the engine, so an attacker-influenced
+#: value can never inject an extra FHIR search parameter (CWE-88). ``None`` = the flat ``query`` form.
+FhirLookupRunner = Callable[[str, str, Mapping[str, str | list[str]] | None], dict[str, Any]]
 
 # Active runner as a ContextVar (mirrors db_lookup._active): the runner is published around the off-loop
 # transform run and copied into the worker thread by asyncio.to_thread, so a call-time fhir_lookup(...)
@@ -103,7 +106,11 @@ def activated(runner: FhirLookupRunner | None) -> Iterator[None]:
         _active.reset(token)
 
 
-def fhir_lookup(connection: str, query: str) -> dict[str, Any]:
+def fhir_lookup(
+    connection: str,
+    query: str,
+    params: Mapping[str, str | list[str]] | None = None,
+) -> dict[str, Any]:
     """Run a live, read-only FHIR ``query`` against the named ``FhirLookup`` ``connection`` and return the
     parsed result as a dict — a single resource for a read-by-id, or a searchset ``Bundle`` for a search.
 
@@ -111,6 +118,20 @@ def fhir_lookup(connection: str, query: str) -> dict[str, Any]:
 
     * a **read-by-id**: ``fhir_lookup("epic", "Patient/123")`` → ``GET {base}/Patient/123``;
     * a **search**: ``fhir_lookup("epic", "Patient?identifier=MRN|123")`` → ``GET {base}/Patient?...``.
+
+    **Encoding of search values (ASVS 1.2.2, BACKLOG #204).** Two ways to pass search parameters:
+
+    * the **flat string** form (above) — the query rides the URL as authored, so **you** must
+      percent-encode any attacker-influenceable value (e.g. an HL7 field). This is back-compat and stays
+      supported, but a value like ``f"Patient?identifier=MRN|{pid}"`` with ``pid="123&_count=99999"``
+      would inject an extra FHIR search param. The engine still screens the flat form for unambiguous
+      injection shapes (a ``#`` fragment, a second ``?``, or a percent-decoded control char) and rejects
+      those before dialing out — but it cannot re-encode a legitimate ``&``/``=``/``|`` separator for you.
+    * the **structured** ``params`` form (**preferred, safe**): pass the path in ``query`` and the search
+      fields in ``params`` — ``fhir_lookup("epic", "Patient", params={"identifier": f"MRN|{pid}"})``. The
+      engine percent-encodes **each value** (``urlencode(quote_via=quote, safe="")``), so a value can
+      **never** inject an extra parameter; a ``list[str]`` value expands to repeated params. Pass search
+      fields via ``params`` **or** a ``?``-query in ``query``, not both.
 
     The GET runs **off the event loop**. The result is read on demand by the Handler via the pure
     ``parsing/fhir/`` codec (``FhirPeek``/``FhirResource``) — never a typed object pushed through the
@@ -129,4 +150,4 @@ def fhir_lookup(connection: str, query: str) -> dict[str, Any]:
             "connection). It is intentionally unavailable on a Router and in dry-run / Test Bench, "
             "because its result is non-deterministic (re-run-divergent). See docs/adr/0043."
         )
-    return runner(connection, query)
+    return runner(connection, query, params)

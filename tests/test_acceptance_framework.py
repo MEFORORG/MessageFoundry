@@ -111,6 +111,23 @@ def test_reports_render(tmp_path: Path) -> None:
     assert "A1" in console and "exit" in console
 
 
+def test_render_csv_neutralizes_formula_injection() -> None:
+    # ASVS 1.2.10 / CWE-1236: a free-text cell (detail/evidence) beginning with a formula trigger is
+    # prefixed with a literal "'", so opening the report CSV in Excel/Sheets can't execute it.
+    results = [
+        RowResult(MATRIX[0], Status.FAIL, "=cmd|'/c calc'!A1", evidence="@SUM(1)"),
+    ]
+    csv_text = render_csv(results)
+    data_line = csv_text.splitlines()[1]
+    assert "'=cmd" in data_line  # detail neutralized
+    assert "'@SUM(1)" in data_line  # evidence neutralized
+    # No cell in the data row reaches the file starting with a bare formula trigger.
+    import csv as _csv
+
+    cells = next(_csv.reader([data_line]))
+    assert not any(cell[:1] in "=+-@\t\r\x00" for cell in cells)
+
+
 def test_exit_code() -> None:
     ok = [RowResult(MATRIX[0], Status.PASS, "ok"), RowResult(MATRIX[1], Status.MANUAL, "later")]
     assert exit_code(ok) == 0

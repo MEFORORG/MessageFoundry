@@ -11,6 +11,8 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.settings import (
+    AuthSettings,
+    DrSettings,
     ServiceSettings,
     SqlAuth,
     SqliteSync,
@@ -149,6 +151,30 @@ def test_egress_allowlist_loads_from_file_and_env(tmp_path: Path) -> None:
     assert s.egress.allowed_file_dirs == ["/data/out", "/data/archive"]  # from env (comma-split)
 
 
+def test_retention_secure_by_default_knob(tmp_path: Path) -> None:
+    # #186a: allow_unbounded_phi defaults to the SECURE posture (False = the serve gate bounds PHI
+    # retention). The [egress].deny_by_default MODEL default is left UNCHANGED (False) — the fail-closed
+    # flip is a serve-side effective mutation, not a model default change, so loopback stays byte-
+    # identical. Both parse from the file.
+    s = ServiceSettings()
+    assert s.retention.allow_unbounded_phi is False
+    assert s.egress.deny_by_default is False  # unchanged model default (byte-identical constructor)
+    cfg = _write(tmp_path / "messagefoundry.toml", "[retention]\nallow_unbounded_phi = true\n")
+    loaded = load_settings(config_path=cfg, environ={})
+    assert loaded.retention.allow_unbounded_phi is True
+
+
+def test_security_notifications_required_default(tmp_path: Path) -> None:
+    # #188: security_notifications_required defaults to the SECURE posture (True = the serve gate
+    # requires an out-of-band channel). Parses false (the audited opt-out) from the file.
+    assert ServiceSettings().alerts.security_notifications_required is True
+    cfg = _write(
+        tmp_path / "messagefoundry.toml", "[alerts]\nsecurity_notifications_required = false\n"
+    )
+    loaded = load_settings(config_path=cfg, environ={})
+    assert loaded.alerts.security_notifications_required is False
+
+
 def test_auth_password_policy_defaults_are_asvs_aligned() -> None:
     a = ServiceSettings().auth  # WP-3: length-first, no mandatory composition, breach screening on
     assert a.password_min_length == 15
@@ -229,6 +255,114 @@ def test_logging_invalid_format_rejected(tmp_path: Path) -> None:
     cfg = _write(tmp_path / "messagefoundry.toml", '[logging]\nformat = "xml"\n')
     with pytest.raises(ValidationError):
         load_settings(config_path=cfg, environ={})
+
+
+# --- ADR 0080: default-on-when-configured + native TLS-syslog + clock-sync gate ------
+
+
+def test_logging_forward_default_on_when_host_set(tmp_path: Path) -> None:
+    # Configuring a collector (forward_host) turns forwarding ON by default (forward_enabled unset →
+    # derived True), so an operator can't silently forget the enable flag.
+    cfg = _write(tmp_path / "messagefoundry.toml", '[logging]\nforward_host = "siem.local"\n')
+    log = load_settings(config_path=cfg, environ={}).logging
+    assert log.forward_enabled is True
+    assert log.forward_host == "siem.local"
+
+
+def test_logging_forward_explicit_disable_wins_over_host(tmp_path: Path) -> None:
+    # The documented opt-out: forward_enabled=false is honored even with a collector configured.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[logging]\nforward_enabled = false\nforward_host = "siem.local"\n',
+    )
+    log = load_settings(config_path=cfg, environ={}).logging
+    assert log.forward_enabled is False
+
+
+def test_logging_no_collector_leaves_forwarding_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No forward_host → forwarding OFF (byte-identical to the pre-0080 stdout-only default). The None
+    # default is resolved to a concrete False by the validator.
+    monkeypatch.chdir(tmp_path)
+    log = load_settings(environ={}).logging
+    assert log.forward_enabled is False
+
+
+def test_logging_tls_requires_ca_when_verifying(tmp_path: Path) -> None:
+    # protocol="tls" with verification on (the default) requires an explicit CA anchor.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[logging]\nforward_host = "siem.local"\nforward_protocol = "tls"\n',
+    )
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_logging_tls_with_ca_parses(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[logging]\nforward_host = "siem.local"\nforward_protocol = "tls"\n'
+        'forward_tls_ca_file = "/etc/mefor/siem-ca.pem"\nforward_tls_client_cert = "/etc/mefor/client.pem"\n',
+    )
+    log = load_settings(config_path=cfg, environ={}).logging
+    assert log.forward_protocol.value == "tls"
+    assert log.forward_tls_ca_file == "/etc/mefor/siem-ca.pem"
+    assert log.forward_tls_verify is True  # secure default
+    assert log.forward_tls_client_cert == "/etc/mefor/client.pem"
+
+
+def test_logging_tls_verify_false_needs_no_ca(tmp_path: Path) -> None:
+    # The insecure opt-out: forward_tls_verify=false accepts an unverified collector without a CA file.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[logging]\nforward_host = "siem.local"\nforward_protocol = "tls"\nforward_tls_verify = false\n',
+    )
+    log = load_settings(config_path=cfg, environ={}).logging
+    assert log.forward_protocol.value == "tls" and log.forward_tls_verify is False
+
+
+def test_logging_time_sync_requires_peer(tmp_path: Path) -> None:
+    cfg = _write(tmp_path / "messagefoundry.toml", "[logging]\nrequire_time_sync = true\n")
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_logging_time_sync_fail_closed_requires_require(tmp_path: Path) -> None:
+    # fail-closed without require_time_sync is incoherent (nothing to fail on).
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[logging]\ntime_sync_fail_closed = true\nntp_peer = "ntp.local"\n',
+    )
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_logging_time_sync_parsed(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[logging]\nrequire_time_sync = true\nntp_peer = "ntp.local"\n'
+        "time_sync_max_skew_seconds = 0.5\ntime_sync_fail_closed = true\n",
+    )
+    log = load_settings(config_path=cfg, environ={}).logging
+    assert log.require_time_sync is True and log.ntp_peer == "ntp.local"
+    assert log.time_sync_max_skew_seconds == 0.5 and log.time_sync_fail_closed is True
+
+
+def test_logging_time_sync_skew_threshold_must_be_positive(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[logging]\nrequire_time_sync = true\nntp_peer = "ntp.local"\ntime_sync_max_skew_seconds = 0\n',
+    )
+    with pytest.raises(ValidationError):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_logging_time_sync_default_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    log = load_settings(environ={}).logging
+    assert log.require_time_sync is False and log.ntp_peer is None
+    assert log.time_sync_fail_closed is False
 
 
 def test_invalid_backend_rejected(tmp_path: Path) -> None:
@@ -633,6 +767,79 @@ def test_cluster_heartbeat_must_be_below_fence(tmp_path: Path) -> None:
         load_settings(config_path=cfg, environ={})
 
 
+# --- [cluster] leader preference / non-promotable standby (ADR 0096) --------
+
+
+def test_cluster_leader_preference_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Default (no handicap, promotable) — byte-identical to before the knobs existed.
+    monkeypatch.chdir(tmp_path)
+    s = load_settings(environ={})
+    assert s.cluster.acquire_delay_seconds == 0.0
+    assert s.cluster.promotable is True
+
+
+def test_cluster_leader_preference_parses(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[cluster]\nenabled = true\nacquire_delay_seconds = 5.0\npromotable = false\n",
+    )
+    s = load_settings(config_path=cfg, environ={"MEFOR_CLUSTER_ACQUIRE_DELAY_SECONDS": "7.5"})
+    assert s.cluster.acquire_delay_seconds == 7.5  # env overrides file
+    assert s.cluster.promotable is False
+
+
+def test_cluster_acquire_delay_must_be_non_negative(tmp_path: Path) -> None:
+    # A negative delay would let a node claim BEFORE the lease expires (a two-leader window) — refused.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[cluster]\nenabled = true\nacquire_delay_seconds = -1\n",
+    )
+    with pytest.raises(ValidationError, match="acquire_delay_seconds"):
+        load_settings(config_path=cfg, environ={})
+
+
+# --- [dr].activate + [cluster] mutual-exclusion guard (ADR 0096 rider) ------
+
+
+def test_dr_activate_with_cluster_is_rejected(tmp_path: Path) -> None:
+    # A DR box coming up under the DR run-profile must not also contend for the cluster lease (it could
+    # win leadership and drive the primary store cross-WAN). Refused at config load.
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = true\n",
+    )
+    with pytest.raises(ValidationError, match="dr.*activate|activate.*cluster"):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_dr_enabled_but_not_activated_with_cluster_is_ok(tmp_path: Path) -> None:
+    # Only [dr].activate is guarded: a provisioned-but-passive DR box (enabled, activate=false) may still
+    # coexist with cluster membership (it binds no priority feeds until activated).
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[store]\nbackend = "postgres"\nserver = "pg"\ndatabase = "d"\nusername = "u"\n'
+        "[cluster]\nenabled = true\n[dr]\nenabled = true\nactivate = false\n",
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert s.cluster.enabled is True and s.dr.enabled is True and s.dr.activate is False
+
+
+def test_dr_activate_without_cluster_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The classic DR posture: activate the DR profile with [cluster] disabled — must load fine.
+    monkeypatch.chdir(tmp_path)
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        "[dr]\nenabled = true\nactivate = true\n",
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert s.dr.activate is True and s.cluster.enabled is False
+
+
 # --- [integrity] startup self-attestation (ADR 0041 D3) + dual-control config_reload (D2) ----
 
 
@@ -779,8 +986,38 @@ def test_invalid_priority_and_dr_settings_rejected(tmp_path: Path) -> None:
         "[dr]\ntakeover_hook = '   '\n",  # blank-but-present hook
         "[dr]\ntakeover_timeout_seconds = 0\n",  # non-positive timeout
         "[dr]\nseed_archive = 's3://bucket/seed.mfbak'\n",  # cloud seed source
+        "[dr]\nrestore_token = 'https://x/token.json'\n",  # BACKLOG #223: cloud restore-token source
     ]
     for i, body in enumerate(bad_configs):
         cfg = _write(tmp_path / f"bad_dr_{i}.toml", body)
         with pytest.raises((ValueError, ValidationError)):
             load_settings(config_path=cfg, environ={})
+
+
+def test_dr_restore_token_local_path_parses(tmp_path: Path) -> None:
+    # BACKLOG #223 / ADR 0102: a LOCAL restore-token path parses (default "" = OFF, byte-identical to
+    # #102); a cloud URL is the only rejected form (covered above).
+    assert DrSettings().restore_token == ""  # opt-in default OFF
+    cfg = _write(
+        tmp_path / "dr_token.toml",
+        "[dr]\nenabled = true\nrestore_token = 'D:/dr/restore.token'\n",
+    )
+    s = load_settings(config_path=cfg, environ={})
+    assert s.dr.restore_token == "D:/dr/restore.token"
+
+
+def test_auth_mfa_secure_defaults_and_totp_skew_validation() -> None:
+    # BACKLOG #187 secure-by-default posture: MFA required for the Administrator role, and a STRICT
+    # (current-step-only) TOTP verify window out of the box.
+    d = AuthSettings()
+    assert d.require_mfa is True
+    assert d.totp_skew_steps == 0
+    # Documented org opt-outs parse.
+    assert AuthSettings(require_mfa=False).require_mfa is False
+    assert AuthSettings(totp_skew_steps=1).totp_skew_steps == 1
+    assert AuthSettings(totp_skew_steps=2).totp_skew_steps == 2
+    # The window is bounded 0..2 — a negative or over-wide window is rejected (an over-wide window
+    # materially weakens replay resistance).
+    for bad in (-1, 3):
+        with pytest.raises(ValidationError):
+            AuthSettings(totp_skew_steps=bad)

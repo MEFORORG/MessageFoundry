@@ -42,6 +42,11 @@ class _FakeNotifier:
 async def _service(
     store: MessageStore, *, notifier: _FakeNotifier | None = None, **settings: object
 ) -> AuthService:
+    # These WebAuthn tests assume single-factor unless a test opts in (a few pass require_mfa=True
+    # explicitly). BACKLOG #187 flipped the require_mfa default ON, so default it back OFF here unless
+    # the caller set it — otherwise the bootstrap admin's mfa_status/last-factor-delete assertions,
+    # written for require_mfa off, would flip.
+    settings.setdefault("require_mfa", False)
     service = AuthService(store, AuthSettings(**settings), security_notifier=notifier)
     return service
 

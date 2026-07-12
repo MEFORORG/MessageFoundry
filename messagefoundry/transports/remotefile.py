@@ -45,11 +45,23 @@ import logging
 import posixpath
 import ssl
 import uuid
+from collections.abc import Mapping
 from typing import Any, Callable, TypeVar
 
-from messagefoundry.config.models import ConnectorType, Destination, Source
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
-from messagefoundry.config.tls_policy import harden_kex_groups, harden_verify_flags
+from messagefoundry.config.models import ContentType, ConnectorType, Destination, Source
+from messagefoundry.config.settings import (
+    INSECURE_TLS_ESCAPE_ENV,
+    insecure_tls_allowed,
+    weakened_tls_escape_permitted_here,
+)
+from messagefoundry.config.tls_policy import (
+    TrustAnchorPolicy,
+    build_verifying_client_context,
+    harden_kex_groups,
+    harden_verify_flags,
+    relax_verify_expiry,
+    resolve_trust_anchor,
+)
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
@@ -62,9 +74,11 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.file import (
     DEFAULT_MAX_FILE_BYTES,
     ScanRejected,
+    _looks_like_hl7,
     render_filename,
     scan_inbound_file,
 )
+from messagefoundry.transports.mllp import InsecureHopGuard
 
 __all__ = ["RemoteFileDestination", "RemoteFileSource"]
 
@@ -87,12 +101,20 @@ class _RemoteError(Exception):
     """A remote-file operation failed. ``permanent`` distinguishes a server refusal that a retry can't
     fix (auth failure, no-such-dir, a permanent FTP 5xx) from a transient connect/IO/timeout failure.
 
-    The connector maps a transient error to :class:`DeliveryError` (retry) and a permanent one to
-    :class:`NegativeAckError` (dead-letter), so the client layer stays transport-detail-only."""
+    ``credential_fault`` (BACKLOG #109, ADR 0095) narrows a permanent failure to specifically a
+    **bad credential / authentication rejection** (would lock out the partner account on a retry
+    storm), as distinct from a content/path permanent failure (no-such-dir, no-perm on one operation).
+    Only auth-refusal sites set it; it is threaded onto the :class:`NegativeAckError` so the delivery
+    worker can STOP-and-retain rather than dead-letter the backlog.
 
-    def __init__(self, message: str, *, permanent: bool) -> None:
+    The connector maps a transient error to :class:`DeliveryError` (retry) and a permanent one to
+    :class:`NegativeAckError` (dead-letter / credential-STOP), so the client layer stays
+    transport-detail-only."""
+
+    def __init__(self, message: str, *, permanent: bool, credential_fault: bool = False) -> None:
         super().__init__(message)
         self.permanent = permanent
+        self.credential_fault = credential_fault
 
 
 class _RemoteClient(abc.ABC):
@@ -125,7 +147,9 @@ class _RemoteClient(abc.ABC):
         """Best-effort create ``remote_dir`` (ignore "already exists")."""
 
 
-def _ftps_ssl_context(settings: dict[str, Any]) -> ssl.SSLContext:
+def _ftps_ssl_context(
+    settings: dict[str, Any], *, trust_anchor_policy: TrustAnchorPolicy | None = None
+) -> ssl.SSLContext:
     """Build a verifying TLS context for an FTPS control+data channel, mirroring the MLLP outbound arm
     (mllp.py ``_mllp_ssl_context``). Without this, ``ftplib.FTP_TLS()`` falls back to a no-verify stdlib
     context (``check_hostname=False`` / ``CERT_NONE``) — any certificate, including an attacker's, is
@@ -134,16 +158,34 @@ def _ftps_ssl_context(settings: dict[str, Any]) -> ssl.SSLContext:
 
     Fail-fast (build time): ``tls_verify=false`` without ``MEFOR_ALLOW_INSECURE_TLS`` raises, exactly
     like the MLLP path, so a misconfiguration is refused at construction rather than silently insecure.
-    Optional mTLS via ``tls_cert_file``/``tls_key_file`` (passphrase ``tls_key_password``)."""
+    Optional mTLS via ``tls_cert_file``/``tls_key_file`` (passphrase ``tls_key_password``).
+
+    ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback when
+    the connection names no ``tls_ca_file`` of its own (the verify path only; ``None`` = the historical
+    ``create_default_context(cafile=…)`` behaviour, byte-identical). It never disables verification, so
+    the internal CA never bypasses the ``tls_verify=false`` refusal above."""
+    # #200 (ADR 0092 decision 2): the escape is CLAMPED to non production-PHI, so tls_verify=false can no
+    # longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance (mirrors the MLLP verify-off
+    # arm). Byte-identical off the construction gate (posture unstamped → unclamped escape).
     verify = bool(settings.get("tls_verify", True))
-    if not verify and not insecure_tls_allowed():
+    if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(
             "REMOTEFILE ftps tls_verify=false disables server-certificate verification (MITM risk). "
             f"Use a trusted CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a "
-            "trusted-network bind."
+            "trusted-network bind (refused on a production-PHI instance even with the escape, #200)."
         )
     ca = settings.get("tls_ca_file")
-    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
+    if verify and trust_anchor_policy is not None:
+        # #190 (ADR 0093): the connection's own tls_ca_file wins verbatim, else the internal-CA anchor
+        # for an internal hop. Only the VERIFY path uses it; the CERT_NONE branch is refused above.
+        anchor = resolve_trust_anchor(
+            connection_ca_file=str(ca) if ca else None,
+            host=str(settings.get("host", "")),
+            policy=trust_anchor_policy,
+        )
+        ctx = build_verifying_client_context(anchor)
+    else:
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
         ctx.check_hostname = bool(settings.get("tls_check_hostname", True))
@@ -166,6 +208,10 @@ def _ftps_ssl_context(settings: dict[str, Any]) -> ssl.SSLContext:
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     if verify:  # nothing to strict-validate on the CERT_NONE path (ASVS 12.1.4)
         harden_verify_flags(ctx)
+        # #129 (ADR 0094): opt-in granular expiry-only relaxation — accept an expired server cert while
+        # STILL validating chain + hostname (verify path only; default off = byte-identical).
+        if settings.get("tls_allow_expired"):
+            relax_verify_expiry(ctx, host=str(settings.get("host", "")))
     return ctx
 
 
@@ -175,7 +221,13 @@ class _FtpClient(_RemoteClient):
     :class:`ssl.SSLContext` is built at construction (fail-fast) so the server certificate and hostname
     are validated — ftplib's default no-verify stdlib context is never used."""
 
-    def __init__(self, settings: dict[str, Any], *, tls: bool) -> None:
+    def __init__(
+        self,
+        settings: dict[str, Any],
+        *,
+        tls: bool,
+        trust_anchor_policy: TrustAnchorPolicy | None = None,
+    ) -> None:
         self._host = str(settings["host"])
         self._port = int(settings.get("port", 21))
         self._user = settings.get("username")
@@ -184,7 +236,10 @@ class _FtpClient(_RemoteClient):
         self._timeout = float(settings.get("connect_timeout", 30.0))
         # Build the verifying TLS context once, fail-fast (build_check) — mirrors the SFTP host-key
         # posture: a verify-disabled ftps without the escape is refused here, not silently insecure.
-        self._context: ssl.SSLContext | None = _ftps_ssl_context(settings) if tls else None
+        # #190 (ADR 0093): thread the instance [tls] internal-CA trust-anchor policy (verify path only).
+        self._context: ssl.SSLContext | None = (
+            _ftps_ssl_context(settings, trust_anchor_policy=trust_anchor_policy) if tls else None
+        )
 
     def _connect(self) -> ftplib.FTP:
         # B321: plain FTP only when explicitly selected; credentials over it are refused unless
@@ -260,7 +315,11 @@ class _FtpClient(_RemoteClient):
         except (
             ftplib.error_perm
         ) as exc:  # login refused — a permanent credential/permission problem
-            raise _RemoteError(f"FTP login refused: {exc}", permanent=True) from exc
+            # #109 (ADR 0095): login refusal is a CREDENTIAL fault (account-lockout risk on a retry
+            # storm) — distinct from an operation-level error_perm below (a content/path problem).
+            raise _RemoteError(
+                f"FTP login refused: {exc}", permanent=True, credential_fault=True
+            ) from exc
         except ftplib.all_errors as exc:  # connect/timeout/protocol/OSError — transient
             raise _RemoteError(f"FTP connect failed: {exc}", permanent=False) from exc
         try:
@@ -400,7 +459,11 @@ class _SftpClient(_RemoteClient):
         try:
             client = self._connect()
         except paramiko.AuthenticationException as exc:
-            raise _RemoteError(f"SFTP authentication failed: {exc}", permanent=True) from exc
+            # #109 (ADR 0095): auth rejection = a CREDENTIAL fault (account-lockout risk) — the delivery
+            # worker STOP-and-retains instead of dead-lettering + re-authing the whole backlog.
+            raise _RemoteError(
+                f"SFTP authentication failed: {exc}", permanent=True, credential_fault=True
+            ) from exc
         except paramiko.SSHException as exc:
             # SSHException covers an unknown/rejected host key (RejectPolicy) — a security stop the
             # operator must resolve, so it's permanent, not a retry.
@@ -423,17 +486,45 @@ class _SftpClient(_RemoteClient):
             client.close()
 
 
-def _make_client(settings: dict[str, Any]) -> _RemoteClient:
+def _make_client(
+    settings: dict[str, Any], *, trust_anchor_policy: TrustAnchorPolicy | None = None
+) -> _RemoteClient:
     """Build the protocol-appropriate client. Tests monkeypatch this (or the client classes) so no
-    real server/SSH is needed; both connectors call it per operation-batch."""
+    real server/SSH is needed; both connectors call it per operation-batch. ``trust_anchor_policy``
+    (#190, ADR 0093) is the outbound FTPS verify-path internal-CA fallback; the source passes ``None``
+    (byte-identical) and SFTP/plain-FTP ignore it (no server-cert verify)."""
     protocol = str(settings.get("protocol", "sftp")).lower()
     if protocol == "sftp":
         return _SftpClient(settings)
     if protocol == "ftp":
         return _FtpClient(settings, tls=False)
     if protocol == "ftps":
-        return _FtpClient(settings, tls=True)
+        return _FtpClient(settings, tls=True, trust_anchor_policy=trust_anchor_policy)
     raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
+
+
+def _anon_ftp_guard(s: dict[str, Any]) -> InsecureHopGuard | None:
+    """An :class:`~messagefoundry.transports.mllp.InsecureHopGuard` for an ANONYMOUS plain-``ftp`` hop
+    (protocol ``ftp`` with no credentials), or ``None`` for any other protocol / a credentialed ftp.
+
+    Credentialed plain-ftp is already refused by :func:`_validate_common` (it puts the credential itself
+    on the wire in the clear); ``ftps``/``sftp`` are encrypted. The remaining gap #200 closes is an
+    ANONYMOUS plain-ftp hop — no credential, but the message BODY is still PHI over a cleartext channel.
+    Keyed on the posture gradient off-loopback (refuse production-PHI, warn non-prod PHI, allow
+    synthetic / loopback / per-connection-attested)."""
+    if str(s.get("protocol", "sftp")).lower() != "ftp":
+        return None
+    if s.get("username") or s.get("password"):
+        return None  # credentialed ftp — covered by _validate_common's cleartext-credential refusal
+    reason = s.get("tls_hop_attested_reason")
+    return InsecureHopGuard.capture(
+        host=str(s["host"]),
+        port=int(s.get("port", 21)),
+        cell="REMOTEFILE ftp",
+        description="cleartext anonymous FTP egress",
+        attested=bool(s.get("tls_hop_attested", False)),
+        attested_reason=None if reason is None else str(reason),
+    )
 
 
 def _validate_common(s: dict[str, Any]) -> str:
@@ -446,17 +537,28 @@ def _validate_common(s: dict[str, Any]) -> str:
     if protocol not in _PROTOCOLS:
         raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
     if protocol == "ftp" and (s.get("username") or s.get("password")):
-        # Plain FTP sends the credential in cleartext (and the body is PHI). Refuse unless the
-        # explicit dev/trusted-network escape is set, mirroring refuse_cleartext_credentials.
-        if not insecure_tls_allowed():
+        # Plain FTP sends the credential in cleartext (and the body is PHI). Refuse unless the explicit
+        # dev/trusted-network escape is set, mirroring refuse_cleartext_credentials. #200 (ADR 0092
+        # decision 2): the escape is CLAMPED to non production-PHI — the credential-on-the-wire hop (the
+        # strictly-worse case) now gets the same clamp the sibling anonymous-ftp guard already applies, so
+        # MEFOR_ALLOW_INSECURE_TLS can no longer cross a prod-PHI credentialed-ftp hop.
+        if not weakened_tls_escape_permitted_here():
             raise ValueError(
                 "REMOTEFILE plain ftp transmits credentials in CLEARTEXT; refused unless "
-                f"{INSECURE_TLS_ESCAPE_ENV} is set — use ftps (tls=True) or sftp"
+                f"{INSECURE_TLS_ESCAPE_ENV} is set — use ftps (tls=True) or sftp (refused on a "
+                "production-PHI instance even with the escape, #200)"
             )
         logger.warning(
             "REMOTEFILE %s sends credentials over CLEARTEXT ftp (no TLS)",
             _redact(str(s["host"]), str(s.get("remote_dir", ""))),
         )
+    # #200 (ADR 0092): an ANONYMOUS plain-ftp hop carries no credential but still ships the PHI body over
+    # cleartext. Refuse a production-PHI hop off-loopback at the ENFORCED construction gate (the
+    # credentialed case above is the orthogonal credential-on-the-wire guard). No-op for ftps/sftp/
+    # credentialed-ftp, and byte-identical off the enforced gate (posture unstamped).
+    guard = _anon_ftp_guard(s)
+    if guard is not None:
+        guard.enforce_construction()
     return protocol
 
 
@@ -466,8 +568,13 @@ class RemoteFileDestination(DestinationConnector):
     def __init__(self, config: Destination) -> None:
         s = config.settings
         _validate_common(s)
+        # #200 send-time backstop for an anonymous plain-ftp hop (the enforced refusal already fired in
+        # _validate_common at the construction gate). None for ftps/sftp/credentialed-ftp.
+        self._hop_guard = _anon_ftp_guard(s)
         # Constructing the SFTP client validates the host-key escape posture fail-fast (build_check).
-        self._client = _make_client(s)
+        # #190 (ADR 0093): pass the instance [tls] internal-CA trust-anchor policy so an FTPS hop that
+        # names no tls_ca_file of its own verifies against the org internal CA.
+        self._client = _make_client(s, trust_anchor_policy=config.trust_anchor_policy)
         self._settings = s
         self._host = str(s["host"])
         self._remote_dir = str(s["remote_dir"])
@@ -475,12 +582,23 @@ class RemoteFileDestination(DestinationConnector):
         self._overwrite = bool(s.get("overwrite", False))
         self._encoding: str = s.get("encoding", "utf-8")
 
-    async def send(self, payload: str) -> None:
+    async def send(
+        self, payload: str, *, metadata: Mapping[str, str] | None = None
+    ) -> None:  # metadata (#68): unused — no per-message header knob here
+        if self._hop_guard is not None:
+            # Zero-I/O byte-crossing backstop (#200) before the upload (defense in depth against a reload
+            # routing PHI around the construction gate).
+            self._hop_guard.assert_send()
         try:
             await asyncio.to_thread(self._upload, payload)
         except _RemoteError as exc:
             if exc.permanent:
-                raise NegativeAckError(str(exc), code="remotefile", permanent=True) from exc
+                raise NegativeAckError(
+                    str(exc),
+                    code="remotefile",
+                    permanent=True,
+                    credential_fault=exc.credential_fault,
+                ) from exc
             raise DeliveryError(str(exc)) from exc
 
     def _upload(self, payload: str) -> None:
@@ -530,7 +648,12 @@ class RemoteFileDestination(DestinationConnector):
             await asyncio.to_thread(self._client.ensure_dir, self._remote_dir)
         except _RemoteError as exc:
             if exc.permanent:
-                raise NegativeAckError(str(exc), code="remotefile", permanent=True) from exc
+                raise NegativeAckError(
+                    str(exc),
+                    code="remotefile",
+                    permanent=True,
+                    credential_fault=exc.credential_fault,
+                ) from exc
             raise DeliveryError(str(exc)) from exc
 
     async def aclose(self) -> None:
@@ -589,7 +712,12 @@ class RemoteFileSource(SourceConnector):
             await asyncio.to_thread(self._client.list_dir, self._remote_dir)
         except _RemoteError as exc:
             if exc.permanent:
-                raise NegativeAckError(str(exc), code="remotefile", permanent=True) from exc
+                raise NegativeAckError(
+                    str(exc),
+                    code="remotefile",
+                    permanent=True,
+                    credential_fault=exc.credential_fault,
+                ) from exc
             raise DeliveryError(str(exc)) from exc
 
     async def _run(self) -> None:
@@ -668,6 +796,22 @@ class RemoteFileSource(SourceConnector):
                     "REMOTEFILE could not retrieve %s (will retry next poll): %s", name, exc
                 )
                 continue
+            # Content sniff (ASVS 5.2.2), gated to hl7v2 drops. The remote dir is a less-trusted source,
+            # so a binary/non-HL7 file that merely matches the *.hl7 pattern is quarantined before its
+            # bytes reach the pipeline — mirroring the local File source's _looks_like_hl7 guard. Unlike
+            # the local source (which sniffs unconditionally), this is gated on the inbound's declared
+            # content_type: a legitimate X12/DICOM/binary drop (any non-hl7v2 type) must NOT be rejected
+            # for lacking an MSH/FHS/BHS header. content_type is None only for a direct caller/test that
+            # never had it injected — treated as "unknown", so gating off leaves that path byte-identical.
+            if self.content_type is ContentType.HL7V2 and not _looks_like_hl7(raw):
+                # Like the oversize / scan-reject cases it never became a "received message", so there
+                # is no store disposition; preserve it in .error and log it (never a silent drop).
+                logger.warning(
+                    "REMOTEFILE file %s is not HL7 (no MSH/FHS/BHS header); routing to error dir",
+                    name,
+                )
+                await self._move(path, self._error_dir, name)
+                continue
             try:
                 await asyncio.to_thread(scan_inbound_file, raw, name)
             except ScanRejected as exc:
@@ -681,6 +825,19 @@ class RemoteFileSource(SourceConnector):
                     exc,
                 )
                 await self._move(path, self._error_dir, name)
+                continue
+            except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
+                # The scan hook MALFUNCTIONED (AV/ICAP unreachable, a plugin bug) — NOT a content
+                # rejection. Fail closed (ASVS 5.4.3): never emit unscanned content from a less-trusted
+                # remote source. Unlike a ScanRejected we don't quarantine a possibly-healthy file on a
+                # scanner outage — leave it in place so the next poll re-runs the scan once the scanner
+                # recovers (at-least-once, mirroring the transient-retrieve path). Logged, never a silent
+                # pass-through, and scoped to THIS file so a hiccup can't abort the poll's remaining files.
+                logger.warning(
+                    "REMOTEFILE file %s: pre-ingest scan hook errored (%s); leaving in place, will retry",
+                    name,
+                    exc,
+                )
                 continue
             try:
                 await self._handler(raw)

@@ -4,8 +4,10 @@
   [ADR 0007](0007-gui-manageable-connections-toml.md): the same "transport/wiring config is data, edited
   by a CLI the GUI shells" pattern, applied to **code sets** (reference lookup tables) instead of
   connections.
-- **Built:** Not yet — design record. The CLI + writer (`messagefoundry codeset`) and the VS Code grid
-  editor are the build; logic (Routers/Handlers) is untouched.
+- **Built:** The CLI + writer (`messagefoundry codeset`) and the VS Code grid editor. The
+  **unmapped-value policy + re-run-safe capture** (BACKLOG #162) is built per the *Amendment
+  (2026-07-11)* below (Python model/lookup/capture; the grid **shows** the policy — TS gated by ide CI).
+  Logic (Routers/Handlers) is untouched.
 - **Decision in one line:** add a **`messagefoundry codeset`** CLI (mirroring `connection` 1:1) that
   **owns validation + atomic write** of `codesets/<name>.csv` files, plus a **VS Code webview grid
   editor** that shells it — so an operator can create/edit/rename/delete a translation table from the
@@ -201,6 +203,113 @@ owned** — a reference set is synced from an external file/DB source on a caden
 a live external database — so editing it in this grid would be meaningless (the next sync / the next
 query overwrites it) and misleading. This editor governs only the bundle-shipped, operator-owned code
 sets. **TOML-in-grid editing** is a fast-follow, not v1.
+
+## Amendment (2026-07-11) — declared unmapped-value policy + re-run-safe capture (BACKLOG #162)
+
+This amendment extends ADR 0033 with a **declared per-code-set unmapped-value policy**, applied by the
+lookup itself on a **miss**, plus **re-run-safe capture** of unmapped inputs for operator reconciliation,
+plus the policy **shown in the editor grid**. It is additive and **backward-compatible**: a code set with
+no declared policy behaves exactly as before. No new ADR number is warranted — code sets are this ADR's
+subject, and the policy is a property of a code set, so it is recorded here.
+
+### Decision
+
+- **The policy is a property of the code set.** A new `unmapped_policy` on the model
+  (`config/code_sets.py`): `{kind: none | default | passthrough | flag, default_value?}` where
+  `default_value` is a string, **required iff** `kind = default` and forbidden otherwise (validated at
+  load, fail loud). The default is `kind = none` — *no policy declared* — so every shipped bundle keeps
+  today's behavior (`cs.get(key, default)` returns the caller's default; `cs[key]` raises `KeyError`).
+  The mapping accessors are **unchanged**; only the new `translate()` consults the policy.
+- **Declared as data in a sidecar.** Because the GUI-canonical format is CSV (which carries no metadata),
+  the policy is authored in a `codesets/<name>.policy.toml` sidecar next to the code-set file
+  (`kind = "default"` / `default_value = "UNKNOWN"`). The loader reads it alongside the code-set file
+  (`load_policy`) and **skips** `*.policy.toml` when enumerating code sets (it is metadata, not a set).
+  Absent sidecar ⇒ `none`. This keeps CSV authoring and the `codeset` writer untouched; sidecar
+  authoring is hand-edited for v1 and **shown read-only** in the grid — consistent with this ADR's
+  TOML-in-grid fast-follow framing. A grid **editor** for the policy is a fast-follow.
+- **Applied by the lookup on a miss.** `code_set(name).translate(key)` returns the mapped value on a hit;
+  on a miss it applies the policy: `default` → the configured `default_value`; `passthrough` → the
+  original `key`; `flag` → a `Flagged(code_set, key)` sentinel a Handler can test
+  (`isinstance(x, Flagged)`) and route to review; `none` → raise `CodeSetError` (fail loud — declare a
+  policy, or use `.get()`/`[]`). Handlers stop hand-coding `code_set(...).get(key, default)` per crosswalk.
+
+### The purity crux (why capture does not break at-least-once)
+
+CLAUDE.md §2/§8: routers/handlers must be **pure** (message in → message/Sends out, no external side
+effects), because at-least-once **re-runs** a transform on recovery and relies on it deriving the
+**identical** output. Two distinct concerns are kept strictly apart:
+
+1. **Applying the policy is pure.** `translate(key)`'s return value is a referentially-transparent
+   function of `(key, table, policy)` — no I/O, no mutation of the frozen code set, deterministic. Safe
+   under pure-re-run.
+2. **Capturing the unmapped inputs is a side effect — so it is decoupled from the pure return value.** A
+   bare capture write inside a transform would (a) make the transform impure and (b) **re-capture on
+   every crash-re-run**, duplicating or diverging — **forbidden**. Instead, on a miss the lookup records
+   into a **run-scoped, in-memory, deduplicated** accumulator (`UnmappedCapture`, keyed by
+   `(code_set, key)`) that: **(i)** never changes `translate`'s return value; **(ii)** performs **no
+   external I/O** during the transform; **(iii)** is a deterministic function of the message, so a
+   re-run re-derives a **byte-identical** buffer. The accumulator is published/torn-down by the runner
+   around each run (`capturing(message_id)`, wired as a run-scoped provider in `config/run_context.py`),
+   and the **single external effect** happens **once, at scope exit**, idempotently:
+   - **(a) Non-PHI counts** on the observability path — per-code-set *distinct-miss counts* at DEBUG.
+     Inherently re-run-tolerant (a rare re-run over-count is an accepted health-signal approximation),
+     and it carries **no values**.
+   - **(b) The values** (for reconciliation) via an optional installed `UnmappedSink`, which **must** key
+     each row by `(message_id, code_set, key)` so a re-run **upserts the same rows — a no-op**.
+
+   When **no capture scope is active** (import, dry-run, a bare call) `translate` is **strictly pure**
+   with zero side effects. This mirrors the accepted cost-counter observability precedent (ADR 0084):
+   in-band, deterministic, drained once at a controlled point.
+
+**`message_id` is supplied by the runner, not defaulted.** The `(message_id, …)` idempotency key is only
+real if the engine actually passes it. Every pipeline `RunContext` the runner builds around a
+router/transform run — router, inline fast-path, transform, and the fused route/transform executors
+(`pipeline/wiring_runner.py`) — populates `message_id=item.message_id`, so the capture scope keys by the
+message's durable id. The **dry-run/preview** path (`pipeline/dryrun.py`) has no persisted message and
+so leaves it `None` by design (and its default sink is `None` anyway) — a preview captures nothing at
+rest. A store-backed sink must therefore treat a `None` `message_id` as "not a persisted run" (skip),
+never as a shared bucket that would collapse distinct messages onto `(None, code_set, key)`.
+
+**The scope-exit drain must not block the event loop.** `capturing()`'s drain (`_drain_capture`) runs
+**synchronously where the `with` scope unwinds** — the **asyncio loop thread** on the non-fused
+router/transform path (only the router/transform *body* hops off-loop via `asyncio.to_thread`; the fused
+executor path unwinds off-loop). So the specified store-backed sink **must not** perform its DB write
+inline: it must **offload** persistence (enqueue to a writer task / run the write off the loop) and
+return promptly, or it would stall every listener, worker, and the API (CLAUDE.md §6 "never block the
+event loop"). The `UnmappedSink` type carries this contract in its docstring.
+
+### PHI handling (CLAUDE.md §9)
+
+A missing key may derive from a PHI field, so a captured `key` is treated as **PHI**:
+
+- **Never logged at INFO+.** The scope-exit drain logs only **non-PHI counts**, and only at **DEBUG**;
+  the values never reach the general log. A sink failure logs the exception **type only** (never its
+  message, which could echo a key).
+- **No PHI at rest in this increment.** The default sink is `None` — capture stays **in memory** for the
+  run's duration and is discarded on drain, so this PR introduces **no new PHI at rest**. A store-backed
+  sink is the specified integration: it **must** encrypt the `key` at rest (the store's field
+  encryption, as reference snapshots do), key by `(message_id, code_set, key)` for idempotency, and
+  **audit** operator access — the same posture as any raw-view/summary PHI read.
+
+### Editor grid
+
+`codeset show`/`list` now include a `policy` field (`{kind, default_value}`); the VS Code grid
+(`ide/src/codeSetEditor.ts`) **shows** it read-only under the name (mirroring the read-only TOML
+treatment). TypeScript is validated by the **ide CI leg**, not the Python gates.
+
+### Acceptance criteria (amendment)
+
+- **AC-7** — WHEN a code set declares `unmapped_policy` in `<name>.policy.toml`, THE SYSTEM SHALL apply
+  it on a `translate()` miss: `default`→`default_value`, `passthrough`→`key`, `flag`→`Flagged`.
+  → `tests/test_code_sets_policy.py::test_translate_applies_policy`
+- **AC-8** — WHEN no policy is declared, THE SYSTEM SHALL preserve today's behavior: `cs.get(miss)` is
+  `None`, `cs.get(miss, d)` is `d`, `cs[miss]` raises, and `translate(miss)` raises `CodeSetError`.
+  → `tests/test_code_sets_policy.py::test_backward_compatible_no_policy`
+- **AC-9** — WHEN the same message is (re-)run, THE SYSTEM SHALL capture each unmapped input **idempotently**
+  (deduped by `(code_set, key)`; a `(message_id, …)`-keyed sink upserts the same rows).
+  → `tests/test_code_sets_policy.py::test_capture_idempotent_under_rerun`
+- **AC-10** — WHEN unmapped inputs are captured, THE SYSTEM SHALL keep the values out of INFO+ logs.
+  → `tests/test_code_sets_policy.py::test_captured_values_not_logged_at_info`
 
 ## To resolve on acceptance
 

@@ -351,6 +351,24 @@ def test_build_coordinator_threads_store_schema_into_lock_key() -> None:
     assert coord._lock_key == "tenant_a:mefor_cluster_nodes"  # store schema threaded through
 
 
+def test_build_coordinator_threads_leader_preference_knobs() -> None:
+    # ADR 0096: the acquire_delay_seconds handicap + promotable flag reach the DbCoordinator.
+    coord = build_coordinator(
+        _PoolStore(), ClusterSettings(enabled=True, acquire_delay_seconds=5.0, promotable=False)
+    )
+    assert isinstance(coord, DbCoordinator)
+    assert coord._acquire_delay == 5.0
+    assert coord._promotable is False
+
+
+def test_build_coordinator_leader_preference_defaults() -> None:
+    # Default enabled cluster → no handicap, promotable (byte-identical to before the knobs existed).
+    coord = build_coordinator(_PoolStore(), ClusterSettings(enabled=True))
+    assert isinstance(coord, DbCoordinator)
+    assert coord._acquire_delay == 0.0
+    assert coord._promotable is True
+
+
 # --- Step 4b: the runner threads coordinator.is_leader into each source ------
 
 
@@ -1036,3 +1054,44 @@ def test_build_coordinator_postgres_still_gets_dbcoordinator() -> None:
         node_id = None
 
     assert isinstance(build_coordinator(_Store(), _Cluster()), DbCoordinator)
+
+
+# --- ADR 0096: SqlServerCoordinator leader preference (DB-free unit) ---------
+
+
+async def test_sqlserver_non_promotable_claim_touches_no_db() -> None:
+    # The promotable=False short-circuit is backend-agnostic: the SQL Server coordinator must return
+    # not-held BEFORE issuing any store query (the DbCoordinator path is proven in test_cluster_lease).
+    from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+
+    class _Settings:
+        db_schema = None
+
+    class _Store:
+        _settings = _Settings()
+
+        async def _fetchone(self, *a: object, **k: object) -> object:
+            raise AssertionError("non-promotable node must not query the store to claim")
+
+    coord = SqlServerCoordinator(_Store(), "N", promotable=False)
+    # Even if it were somehow already leader, the tick demotes it without a DB round-trip.
+    coord._is_leader = True
+    coord._last_renew_ok = 0.0
+    coord._leader_epoch = 1
+    assert await coord._claim_or_renew_lease() is False
+    await coord._maintain_leadership()
+    assert coord.is_leader() is False
+    assert coord.current_epoch() is None
+
+
+def test_sqlserver_coordinator_stores_leader_preference_knobs() -> None:
+    from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+
+    class _Settings:
+        db_schema = None
+
+    class _Store:
+        _settings = _Settings()
+
+    coord = SqlServerCoordinator(_Store(), "N", acquire_delay_seconds=5.0, promotable=False)
+    assert coord._acquire_delay == 5.0 and coord._promotable is False

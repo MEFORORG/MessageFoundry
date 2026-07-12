@@ -16,17 +16,21 @@ import time
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.models import ConnectorType, ContentType
 from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.wiring import (
+    META_MAX_BYTES,
+    META_MAX_KEYS,
+    HandlerAccepts,
     HandlerFn,
     InboundConnection,
     Registry,
     RouterFn,
     Send,
+    SetMeta,
     SetState,
     StateValue,
 )
@@ -40,11 +44,13 @@ from messagefoundry.parsing import (
     summarize,
     validate,
 )
+from messagefoundry.pipeline.sandbox import SandboxMode, SandboxSession, run_sandboxed
 from messagefoundry.store import MessageStatus
 
 __all__ = [
     "DeliveryPreview",
     "StateOpPreview",
+    "MetaOpPreview",
     "RouteOutcome",
     "DryRunResult",
     "TraceHook",
@@ -78,7 +84,11 @@ class TraceHook(Protocol):
 
     def trace_handler(
         self, fn: HandlerFn, name: str, payload: Message | RawMessage
-    ) -> Send | SetState | list[Send | SetState] | None: ...
+    ) -> Send | SetState | SetMeta | list[Send | SetState | SetMeta] | None: ...
+
+    def trace_accepts(
+        self, pred: HandlerAccepts, name: str, payload: Message | RawMessage
+    ) -> bool: ...
 
 
 def _handler_names(result: list[str] | str | None) -> list[str]:
@@ -88,18 +98,20 @@ def _handler_names(result: list[str] | str | None) -> list[str]:
 
 
 def _partition(
-    result: Send | SetState | list[Send | SetState] | None,
-) -> tuple[list[Send], list[SetState]]:
-    """Split a Handler's return into its (deliveries, state writes) — ADR 0005.
+    result: Send | SetState | SetMeta | list[Send | SetState | SetMeta] | None,
+) -> tuple[list[Send], list[SetState], list[SetMeta]]:
+    """Split a Handler's return into (deliveries, state writes, metadata writes) — ADR 0005 + ADR 0081.
 
-    A Handler may now return :class:`Send`\\ s and/or :class:`SetState`\\ s (a single value, a mixed
-    list, or ``None``). ``Send``-only returns yield ``([...], [])`` — backward compatible."""
+    A Handler may return :class:`Send`\\ s, :class:`SetState`\\ s and/or :class:`SetMeta`\\ s (a single
+    value, a mixed list, or ``None``). ``Send``-only returns yield ``([...], [], [])`` — backward
+    compatible."""
     if result is None:
-        return [], []
+        return [], [], []
     items = result if isinstance(result, list) else [result]
     sends = [it for it in items if isinstance(it, Send)]
     state_ops = [it for it in items if isinstance(it, SetState)]
-    return sends, state_ops
+    meta_ops = [it for it in items if isinstance(it, SetMeta)]
+    return sends, state_ops, meta_ops
 
 
 def _payload(raw: str | bytes, content_type: str) -> Message | RawMessage:
@@ -120,11 +132,14 @@ def _shareable_payload(raw: str | bytes, content_type: str) -> Message | RawMess
     """A single payload object safe to reuse across a router + every handler of *one* message, or
     ``None`` when no such object exists and each consumer must build its own.
 
-    A non-HL7 :class:`RawMessage` is immutable (read-only ``.raw``/``.text``/``.json()`` surface), so
-    one instance serves the whole fan-out — building it once avoids re-decoding/re-constructing it per
-    handler on a high-fan-out non-HL7 feed. An HL7 :class:`Message` is *mutable* (Handlers transform
-    it in place), so it cannot be shared: this returns ``None`` and each consumer re-parses (the
-    optimal isolation strategy — see :func:`_payload`)."""
+    A non-HL7 :class:`RawMessage` is treated as read-only *by convention* (a Router/Handler/predicate
+    reads ``.raw``/``.text``/``.json()`` and returns a fresh output string; ``.raw`` is a plain writable
+    attribute, so the contract is enforced by the no-mutation rule, not by the type), so one instance
+    serves the whole fan-out — building it once avoids re-decoding/re-constructing it per handler on a
+    high-fan-out non-HL7 feed. Because it IS shared, a consumer that broke the convention and mutated
+    ``.raw`` would be visible to later consumers of the same message. An HL7 :class:`Message` is *mutable*
+    (Handlers transform it in place), so it cannot be shared: this returns ``None`` and each consumer
+    re-parses (the optimal isolation strategy — see :func:`_payload`)."""
     if content_type == ContentType.HL7V2.value:
         return None
     return RawMessage(raw if isinstance(raw, str) else raw.decode("utf-8"), content_type)
@@ -158,12 +173,84 @@ class StateOpPreview:
 
 
 @dataclass(frozen=True)
+class MetaOpPreview:
+    """A per-message metadata write a Handler would declare (ADR 0081, BACKLOG #150) — captured for the
+    dry-run, applied nowhere. ``value`` may carry PHI, so the CLI gates it behind ``--show-phi`` exactly
+    like a delivery payload / state write."""
+
+    key: str
+    value: str
+
+
+def _accepted(
+    registry: Registry,
+    names: list[str],
+    payload: Message | RawMessage,
+    *,
+    tracer: TraceHook | None,
+    sandbox: SandboxSession | None,
+    run_context: RunContext | None,
+) -> list[str]:
+    """Drop the handlers whose ``accepts=`` predicate declines this message (ADR 0084).
+
+    A handler with no predicate is always kept, so this is identity on today's graphs. The predicates
+    of one message all see the **same** ``payload`` object the Router just ran on — the point of the
+    seam is to spend *zero* extra work at routing time, and a per-predicate re-parse would re-spend the
+    very transactions it exists to recover.
+
+    A predicate MUST NOT mutate the payload (the Router shares the object; mutation would make routing
+    order-dependent — :data:`~messagefoundry.config.wiring.HandlerAccepts` states the contract). For an
+    **HL7** feed a mutation additionally cannot LEAK downstream: :func:`route_message` shares nothing for
+    HL7 (``_shareable_payload`` returns ``None``), so ``route_handoff`` carries the ORIGINAL RAW string
+    and :func:`transform_one` re-parses each surviving handler a fresh :class:`Message`. For a **non-HL7**
+    feed that structural isolation does NOT hold: ``_shareable_payload`` returns ONE writable
+    :class:`RawMessage` shared across the router, every predicate, and every handler — a mutating
+    predicate WOULD reach a downstream handler in dry-run (this is the same pre-existing sharing hazard a
+    mutating Router has). So on non-HL7 the no-mutation contract is load-bearing, not merely advisory.
+
+    The predicate call sits **bare** — deliberately. Wrapping it in ``except Exception: continue`` would
+    turn a broken predicate into a silent decline: the handler quietly stops receiving messages with no
+    ``ERROR``, no dead-letter, and no operator-visible disposition — an accept-and-drop (CLAUDE.md §12).
+    A raise must propagate out of :func:`route_only` exactly as a Router raise does, into the caller's
+    router-stage CONTENT error boundary (dead-letter / ``ERROR``; AC-4).
+    """
+    kept: list[str] = []
+    for hname in names:
+        pred = registry.handler_accepts.get(hname)
+        if pred is None:
+            kept.append(hname)
+            continue
+        if sandbox is not None and sandbox.mode is SandboxMode.SUBPROCESS:
+            # ADR 0087 parity: the predicate is user code and must run under the SAME isolation as the
+            # Router/Handler it sits beside. Evaluating it here in the parent would let a predicate
+            # reach the imports and resources the sandbox exists to deny.
+            verdict = bool(
+                run_sandboxed(
+                    pred,
+                    payload,
+                    phase="accepts",
+                    name=hname,
+                    run_context=run_context,
+                    session=sandbox,
+                )
+            )
+        elif tracer is not None:
+            verdict = tracer.trace_accepts(pred, hname, payload)
+        else:
+            verdict = pred(payload)
+        if verdict:
+            kept.append(hname)
+    return kept
+
+
+@dataclass(frozen=True)
 class RouteOutcome:
     """The result of running a Router + its Handlers (without validation/disposition)."""
 
     handlers: list[str]  # handler names the Router selected ([] = routed nowhere)
     deliveries: list[DeliveryPreview]
     state_ops: list[StateOpPreview] = field(default_factory=list)  # declared writes (ADR 0005)
+    meta_ops: list[MetaOpPreview] = field(default_factory=list)  # metadata writes (ADR 0081)
 
     @property
     def routed(self) -> bool:
@@ -177,6 +264,8 @@ def route_only(
     *,
     payload: Message | RawMessage | None = None,
     tracer: TraceHook | None = None,
+    sandbox: SandboxSession | None = None,
+    run_context: RunContext | None = None,
 ) -> list[str]:
     """Run ``ic``'s Router and return the handler name(s) it selected (``[]`` = routed nowhere).
 
@@ -187,6 +276,10 @@ def route_only(
     dead-letters/NAK-equivalents it, and dry-run / ``messagefoundry check`` surface the bad name
     (review M-7). The live engine's router worker calls this; the combined :func:`route_message` does too.
 
+    A selected handler that declared an ``accepts=`` predicate (ADR 0084) is then given the chance to
+    **decline** the message — the returned list holds only the handlers that will actually take it, so
+    a decline never materializes a routed row (0 transactions, not 2). See :func:`_accepted`.
+
     ``payload`` is an optional pre-built Router input: when given it is used **as-is** instead of
     parsing ``raw`` (a caller that already built the read-only :class:`RawMessage` — see
     :func:`_shareable_payload` — passes it to skip a redundant construct). The caller is responsible
@@ -196,18 +289,48 @@ def route_only(
     ``tracer`` (ADR 0072) is an optional observer: when given, the Router is invoked **through**
     ``tracer.trace_router`` (which installs ``sys.settrace`` around the call) instead of called directly.
     The hook returns the Router's result unchanged, so the routing decision is byte-identical.
+
+    ``sandbox`` (ADR 0087) optionally isolates the Router in a subprocess: with ``None`` or
+    ``mode=off`` the Router runs in-process byte-identically (and the ``tracer`` composes); with
+    ``mode=subprocess`` the call is marshalled to the persistent worker (``run_context`` is marshalled
+    with it) and a forbidden op / resource-cap / crash raises :class:`SandboxError` — the fail-closed
+    handler-name validation below still runs **engine-side** on the returned result.
     """
     route = registry.routers[ic.router]
     if payload is None:
         payload = _payload(raw, ic.content_type.value)
-    raw_result = (
-        route(payload) if tracer is None else tracer.trace_router(route, ic.router, payload)
-    )
+    raw_result: list[str] | str | None
+    if sandbox is not None and sandbox.mode is SandboxMode.SUBPROCESS:
+        raw_result = cast(
+            "list[str] | str | None",
+            run_sandboxed(
+                route,
+                payload,
+                phase="router",
+                name=ic.router,
+                run_context=run_context,
+                session=sandbox,
+            ),
+        )
+    else:
+        raw_result = (
+            route(payload) if tracer is None else tracer.trace_router(route, ic.router, payload)
+        )
     names = _handler_names(raw_result)
     for hname in names:
         if hname not in registry.handlers:
             raise ValueError(f"router {ic.router!r} returned unknown handler {hname!r}")
-    return names
+    # ADR 0084: give each selected handler that declared an `accepts=` predicate the chance to decline
+    # BEFORE its routed row exists. Filtering HERE — in the shared routing core — rather than in the
+    # router worker is what makes the seam total: all four consumers of route_only (the async live
+    # router worker, the fused route twin, dry-run/`check`/Test Bench, and the traced dry-run) pick it
+    # up, along with each one's disposition line and CONTENT error boundary, with no change to any of
+    # them. A graph with no predicates early-outs on one dict truthiness check (AC-7: byte-identical).
+    if not registry.handler_accepts:
+        return names
+    return _accepted(
+        registry, names, payload, tracer=tracer, sandbox=sandbox, run_context=run_context
+    )
 
 
 def transform_one(
@@ -218,8 +341,10 @@ def transform_one(
     *,
     payload: Message | RawMessage | None = None,
     tracer: TraceHook | None = None,
-) -> tuple[list[DeliveryPreview], list[StateOpPreview]]:
-    """Run **one** Handler on its own freshly-built payload; return ``(deliveries, state_ops)``.
+    sandbox: SandboxSession | None = None,
+    run_context: RunContext | None = None,
+) -> tuple[list[DeliveryPreview], list[StateOpPreview], list[MetaOpPreview]]:
+    """Run **one** Handler on its own freshly-built payload; return ``(deliveries, state_ops, meta_ops)``.
 
     The **transform half** of the split routing core (ADR 0001 Step B): a single handler, its own
     payload (a :class:`Message`, or a :class:`RawMessage` when ``content_type`` is non-HL7 — so one
@@ -246,8 +371,35 @@ def transform_one(
     handle: HandlerFn = registry.handlers[hname]
     if payload is None:
         payload = _payload(raw, content_type)
-    raw_result = handle(payload) if tracer is None else tracer.trace_handler(handle, hname, payload)
-    sends, ops = _partition(raw_result)
+    raw_result: Send | SetState | SetMeta | list[Send | SetState | SetMeta] | None
+    if sandbox is not None and sandbox.mode is SandboxMode.SUBPROCESS:
+        raw_result = cast(
+            "Send | SetState | SetMeta | list[Send | SetState | SetMeta] | None",
+            run_sandboxed(
+                handle,
+                payload,
+                phase="transform",
+                name=hname,
+                run_context=run_context,
+                session=sandbox,
+            ),
+        )
+    else:
+        raw_result = (
+            handle(payload) if tracer is None else tracer.trace_handler(handle, hname, payload)
+        )
+    sends, ops, meta = _partition(raw_result)
+    # Cap the handler's metadata contribution (ADR 0081): a runaway bag would bloat the encrypted
+    # column. Over-cap is a transform-time code error → the transform worker dead-letters the row.
+    if len(meta) > META_MAX_KEYS:
+        raise ValueError(
+            f"handler {hname!r} returned {len(meta)} SetMeta ops (> {META_MAX_KEYS} per message)"
+        )
+    meta_bytes = sum(len(m.key.encode()) + len(m.value.encode()) for m in meta)
+    if meta_bytes > META_MAX_BYTES:
+        raise ValueError(
+            f"handler {hname!r} SetMeta payload is {meta_bytes} bytes (> {META_MAX_BYTES} per message)"
+        )
     deliveries: list[DeliveryPreview] = []
     for send in sends:
         # A Send.to names a known OUTBOUND (deliver there) OR a pass-through (PT) INBOUND (ADR 0013,
@@ -263,7 +415,8 @@ def transform_one(
         out_payload = send.message if isinstance(send.message, str) else send.message.encode()
         deliveries.append(DeliveryPreview(to=send.to, payload=out_payload, is_passthrough=is_pt))
     state_ops = [StateOpPreview(namespace=op.namespace, key=op.key, value=op.value) for op in ops]
-    return deliveries, state_ops
+    meta_ops = [MetaOpPreview(key=m.key, value=m.value) for m in meta]
+    return deliveries, state_ops, meta_ops
 
 
 def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
@@ -291,6 +444,7 @@ def route_message(
     *,
     ingest_time: float | None = None,
     tracer: TraceHook | None = None,
+    sandbox: SandboxSession | None = None,
 ) -> RouteOutcome:
     """Run ``ic``'s Router then the named Handlers; return what they selected and would send.
 
@@ -323,21 +477,22 @@ def route_message(
     sim_reference = _dry_run_reference_view(registry)
     deliveries: list[DeliveryPreview] = []
     state_ops: list[StateOpPreview] = []
+    meta_ops: list[MetaOpPreview] = []
     # Activate the same run-scoped providers the live engine uses (via the shared run_context registry),
     # so router + handlers resolve identically here and in the staged engine. Dry-run runs router and
     # transform in one block, so it uses the transform (superset) phase; it has no live environment, so
     # active_environment=None — current_environment() then returns None, exactly as when dry-run left the
     # environment unset. A provider that needs live infrastructure (db_lookup) refuses to run here.
-    with run_contexts(
-        RunContext(
-            code_sets=registry.code_sets,
-            reference_view=sim_reference,
-            state_view=sim_state,
-            active_environment=None,
-            ingest_time=ingest_time,
-        ),
-        phase="transform",
-    ):
+    rc = RunContext(
+        code_sets=registry.code_sets,
+        reference_view=sim_reference,
+        state_view=sim_state,
+        active_environment=None,
+        ingest_time=ingest_time,
+        # #162: a dry-run/preview has no persisted message, so message_id stays None — the
+        # unmapped-capture drain has no id to key by (and the default sink is None here anyway).
+    )
+    with run_contexts(rc, phase="transform"):
         ct = ic.content_type.value
         # Parse-once on the per-message fan-out: for a non-HL7 feed the payload is a read-only
         # RawMessage, so build it ONCE and reuse it for the router and every handler instead of
@@ -345,14 +500,28 @@ def route_message(
         # Message in place — see _shareable_payload — so each consumer re-parses its own, which is
         # also cheaper than parse-once-then-deep-copy). Value-identical either way.
         shared = _shareable_payload(raw, ct)
-        names = route_only(registry, ic, raw, payload=shared, tracer=tracer)
+        names = route_only(
+            registry, ic, raw, payload=shared, tracer=tracer, sandbox=sandbox, run_context=rc
+        )
         for hname in names:
-            ds, ops = transform_one(registry, hname, raw, ct, payload=shared, tracer=tracer)
+            ds, ops, meta = transform_one(
+                registry,
+                hname,
+                raw,
+                ct,
+                payload=shared,
+                tracer=tracer,
+                sandbox=sandbox,
+                run_context=rc,
+            )
             deliveries.extend(ds)
             for op in ops:
                 sim_state[(op.namespace, op.key)] = op.value  # visible to subsequent handlers
             state_ops.extend(ops)
-    return RouteOutcome(handlers=names, deliveries=deliveries, state_ops=state_ops)
+            meta_ops.extend(meta)
+    return RouteOutcome(
+        handlers=names, deliveries=deliveries, state_ops=state_ops, meta_ops=meta_ops
+    )
 
 
 def disposition_for(outcome: RouteOutcome) -> MessageStatus:
@@ -382,6 +551,7 @@ class DryRunResult:
     handlers: list[str] = field(default_factory=list)
     deliveries: list[DeliveryPreview] = field(default_factory=list)
     state_ops: list[StateOpPreview] = field(default_factory=list)  # declared writes (ADR 0005)
+    meta_ops: list[MetaOpPreview] = field(default_factory=list)  # metadata writes (ADR 0081)
     error: str | None = None
 
 

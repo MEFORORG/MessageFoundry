@@ -31,3 +31,7 @@ fhir_base_url = "https://fhir-prod.example.org/fhir"
 # (samples/config/IB_RADIOLOGY_SR.py — placeholder host; ADR 0025).
 powerscribe_host = "powerscribe-prod.example.org"
 powerscribe_port = 6665
+
+# Downstream results receiver for OB_DEMO_ORU (the per-feed "Hybrid" layout example — placeholder host).
+demo_oru_host = "results-prod.example.org"
+demo_oru_port = 6666

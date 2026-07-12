@@ -463,6 +463,22 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def secret_rotation_due(
+        self, name: str, *, secret: str, last_rotated: str, days_overdue: int
+    ) -> None:
+        # #195b (ADR 0019 §5): a tracked secret is overdue/near-due for rotation. The secret label stands
+        # in for "connection" so the realert throttle keys per secret; the payload carries the secret's
+        # config/env IDENTIFIER + rotation dates only (never a key value — no PHI).
+        self._emit(
+            {
+                "type": "secret_rotation",
+                "connection": name,
+                "secret": secret,
+                "last_rotated": last_rotated,
+                "days_overdue": days_overdue,
+            }
+        )
+
     def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
         # #54: startup attestation found in-place-tampered engine module(s). The label ("engine-
         # integrity") stands in for "connection" so the realert throttle + subject keying + rule

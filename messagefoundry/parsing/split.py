@@ -26,7 +26,7 @@ import re
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import normalize
 
-__all__ = ["split_batch", "split_by_obr"]
+__all__ = ["encode_batch", "split_batch", "split_by_obr"]
 
 # Split a normalized (``\r``-delimited) payload before each non-leading ``MSH`` segment. We match
 # ``\rMSH`` *without* the trailing field separator so a batch whose MSH-1 isn't ``|`` (e.g.
@@ -55,6 +55,53 @@ def split_batch(raw: str | bytes) -> list[str]:
     # isn't MSH-led after stripping (the batch header) is dropped.
     messages = [c.lstrip("\r") for c in chunks if c.strip() and c.lstrip("\r").startswith("MSH")]
     return messages or [text]
+
+
+def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: str) -> str:
+    """Frame N HL7 messages into one ``BHS``…``BTS`` batch envelope — the encode-side inverse of
+    :func:`split_batch` (BACKLOG #134 / ADR 0082).
+
+    Used by the outbound delivery stage to coalesce a claimed FIFO head-prefix of N rows into a single
+    partner send. It is **pure and deterministic**: it derives nothing from a clock — the caller passes
+    ``timestamp`` (the head row's re-run-stable ingest time, ADR 0009) and ``control_id`` (the head
+    row's sequence, ADR 0082 ratified decision #3), so a crash re-run that re-claims the same prefix
+    re-derives the **byte-identical** envelope (the at-least-once purity requirement).
+
+    The ``BHS`` header is built from the **head member's own** MSH-1 (field separator) and MSH-2
+    (encoding characters) — never hardcoded ``|^~\\&`` — so a custom-delimiter feed frames correctly:
+
+    * ``BHS-1`` = the field separator (the literal char after ``BHS``), ``BHS-2`` = the encoding chars,
+    * ``BHS-7`` = ``timestamp`` (batch creation date/time), ``BHS-11`` = ``control_id`` (batch control
+      id); ``BHS-3``…``BHS-6`` and ``BHS-8``…``BHS-10`` are empty placeholders so the two land at the
+      correct field indices,
+    * ``BTS-1`` = the framed message count ``N`` (HL7 validators reject a mismatch).
+
+    Member payloads are carried **verbatim** — only line endings are normalized to ``\\r`` (never
+    ``\\n``/``\\r\\n``) and one trailing ``\\r`` is kept per segment — so the transform's exact output
+    bytes are preserved (no re-parse/re-escape). ``\\r`` is the sole segment terminator. Members must be
+    HL7v2 (``str``/:class:`Message`); non-HL7 batching is out of scope (ADR 0082).
+    """
+    if not messages:
+        raise ValueError("encode_batch requires at least one message")
+    # Read the batch separators from the HEAD member's own MSH (never hardcode |^~\&). The head drives
+    # the whole envelope's framing; mixed-delimiter members in one batch are not a real feed shape.
+    head = messages[0] if isinstance(messages[0], Message) else Message.parse(messages[0])
+    field_sep, comp_sep, rep_sep, esc, sub_sep = head._encoding_chars()
+    enc = (
+        comp_sep + rep_sep + esc + sub_sep
+    )  # MSH-2 / BHS-2: component^repetition~escape\subcomponent
+    # BHS-3..BHS-11 field VALUES (BHS-1 is the separator literal, BHS-2 is `enc`, appended above).
+    bhs_tail = ["", "", "", "", timestamp, "", "", "", control_id]  # BHS-3, -4, -5, -6, -7, …, -11
+    bhs = "BHS" + field_sep + enc + field_sep + field_sep.join(bhs_tail)
+    bts = "BTS" + field_sep + str(len(messages))
+    parts = [bhs]
+    for m in messages:
+        text = m.encode() if isinstance(m, Message) else normalize(m)
+        parts.append(
+            text.strip("\r")
+        )  # the member's segments, no leading/trailing CR (kept verbatim otherwise)
+    parts.append(bts)
+    return "\r".join(parts) + "\r"
 
 
 def split_by_obr(message: Message | str | bytes) -> list[str]:

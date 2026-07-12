@@ -4,10 +4,19 @@
 
 The **destination** executes the operator-declared ``statement`` (an INSERT/UPDATE or a stored-procedure
 call) against an outbound database, binding the payload's fields to the statement's ``:name``
-parameters. The first backend is **SQL Server over ``aioodbc``** (ADR 0003) — the ``[sqlserver]`` extra
-(``pip install 'messagefoundry[sqlserver]'``) plus the Microsoft ODBC Driver 18, **lazily imported** so
-SQLite-only installs never touch it. **Status: production / supported** — SQL Server only, via that
-extra. The live aioodbc round-trip is exercised by the CI SQL Server service-container job
+parameters. The transport rides **``aioodbc``** (ADR 0003) — the ``[sqlserver]`` extra
+(``pip install 'messagefoundry[sqlserver]'``), **lazily imported** so SQLite-only installs never touch it.
+
+**Two dialects (#66).** ``dialect='sqlserver'`` (default) is the **SQL Server preset** — the Microsoft ODBC
+Driver 18, T-SQL-flavoured DSN with the ``Encrypt``/``TrustServerCertificate`` TLS posture and its
+weakened-TLS refusal (:func:`_build_dsn`); **production / supported**, exercised by the CI SQL Server
+job. ``dialect='generic'`` is a **generic ODBC path** decoupled from Driver-18/T-SQL: the operator names
+any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL) + supplies driver-specific keywords via
+``odbc_params`` (:func:`_build_odbc_dsn`), so no new Python DB-driver dependency is needed. On the generic
+path TLS is the operator's responsibility (configured through the driver's own keyword) — MessageFoundry
+cannot introspect an arbitrary driver's TLS posture, so the SQL-Server weakened-TLS refusal does not apply;
+construction instead logs the delegation as a fail-safe (a WARNING when no TLS keyword is set — see
+:func:`_warn_generic_tls_unenforced`). The live aioodbc round-trip is exercised by the CI SQL Server service-container job
 (``tests/test_database_connector_integration.py``); the connector logic is also unit-tested with a
 faked driver. The SQL Server *store* backend is a **separate** (also production) layer — this
 connector does not depend on it.
@@ -41,7 +50,12 @@ from typing import Any
 
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.models import ConnectorType, Destination, Source
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
+from messagefoundry.config.settings import (
+    INSECURE_TLS_ESCAPE_ENV,
+    hop_insecure_escape_downgrades,
+    insecure_tls_allowed,
+)
+from messagefoundry.config.tls_policy import InsecureHopRefused, current_hop_posture
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -75,12 +89,64 @@ def _odbc_brace(value: str) -> str:
     return "{" + value.replace("}", "}}") + "}"
 
 
-def _build_dsn(s: dict[str, Any], *, read_only: bool = False) -> str:
+def _weakened_tls_permitted(*, attested: bool) -> bool:
+    """Whether a weakened (verify-off) customer-DB TLS posture may be used, routed through the ONE
+    shared hop authority (#200, ADR 0092).
+
+    A per-connection ``tls_hop_attested`` ALLOWs it (the operator affirms the hop is secure by other
+    means — a proxy-terminated / trusted-segment DB link). Otherwise this stays a **STRICT verify-off
+    cell** (decision 5): refused for **both staging and prod PHI** unless the global
+    ``MEFOR_ALLOW_INSECURE_TLS`` escape applies, and that escape is **CLAMPED to non-production**
+    (decision 2 — :func:`hop_insecure_escape_downgrades`) so it can never relax a production hop.
+
+    Keyed on the construction-time posture (:func:`current_hop_posture`, stamped by
+    ``build_check_registry`` — the ENFORCED gate at ``messagefoundry check`` / dry-run / serve-start /
+    reload). When unstamped (``None`` — a runtime delivery build or a direct embedding outside that
+    gate) it falls back to the **unclamped** escape, so a legitimately-escaped non-production instance
+    is not refused at delivery time; the enforced gate already vetted the production case against the
+    real posture, so this fallback never loosens the clamp."""
+    if attested:
+        return True
+    posture = current_hop_posture()
+    if posture is None:
+        return insecure_tls_allowed()
+    return hop_insecure_escape_downgrades(production=posture.production)
+
+
+def _audit_attested_weakened_tls(cell: str) -> None:
+    """Loud-log a per-connection attestation that suppresses a would-be **production-PHI** weakened-TLS
+    refusal (#200 decision 3 — attestation is AUDITED when it crosses a prod-PHI hop). No-op on a
+    non-prod / non-PHI / unstamped posture (nothing was suppressed there)."""
+    posture = current_hop_posture()
+    if posture is not None and posture.is_phi and posture.production:
+        logger.warning(
+            "%s: weakened TLS permitted by per-connection tls_hop_attested on a production-PHI "
+            "instance (operator attests the hop is secure by other means)",
+            cell,
+        )
+
+
+def _assert_send_hop(*, weakened: bool, attested: bool) -> None:
+    """Zero-I/O byte-crossing re-assertion (#200 decision 4): before a payload crosses a weakened-TLS
+    DB hop, re-confirm the posture-keyed authority still permits it. Raises :class:`InsecureHopRefused`
+    (a ``ValueError``) otherwise — a fail-closed tripwire behind the construction-time gate. No-op for
+    a non-weakened (verifying-TLS) hop."""
+    if weakened and not _weakened_tls_permitted(attested=attested):
+        raise InsecureHopRefused(
+            "DATABASE destination: refusing to put a payload on a weakened-TLS DB hop "
+            "(posture-keyed refusal, #200)"
+        )
+
+
+def _build_dsn(s: dict[str, Any], *, read_only: bool = False, attested: bool = False) -> str:
     """Build the ODBC connection string for SQL Server from the connection settings.
 
     Free-text values are brace-quoted (injection guard) and the ``Encrypt``/``TrustServerCertificate``
     flags are emitted **last** (ODBC is last-wins, so nothing earlier can downgrade TLS). A weakened
-    TLS posture is **refused** unless the explicit dev escape is set, exactly like the store backend.
+    TLS posture is **refused** via the shared posture-keyed authority (:func:`_weakened_tls_permitted`,
+    #200) — a STRICT verify-off cell that stays refused for staging AND prod PHI, with the global escape
+    clamped so it can never relax a production hop; ``attested`` (the per-connection ``tls_hop_attested``)
+    is the surgical, audited per-hop opt-in.
 
     ``read_only`` (only the db_lookup pool sets it; destination/source omit it, keeping their DSN
     byte-identical) appends ``ApplicationIntent=ReadOnly`` so the connection advertises read-only intent
@@ -89,12 +155,16 @@ def _build_dsn(s: dict[str, Any], *, read_only: bool = False) -> str:
     replica, a no-op otherwise — the statement guard is the load-bearing control)."""
     encrypt = bool(s.get("encrypt", True))
     trust = bool(s.get("trust_server_certificate", False))
-    if (trust or not encrypt) and not insecure_tls_allowed():
+    if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
         raise ValueError(
-            "DATABASE destination TLS is weakened (trust_server_certificate=true or encrypt=false), "
-            f"which is MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 "
-            "to explicitly allow it for a trusted-network dev/test bind."
+            "DATABASE connection TLS is weakened (trust_server_certificate=true or encrypt=false), "
+            "which is MITM-able. Use a trusted server certificate, set tls_hop_attested=true on this "
+            "connection if the hop is secure by other means (a proxy-terminated / trusted segment), or "
+            f"set {INSECURE_TLS_ESCAPE_ENV}=1 on a NON-PRODUCTION instance to allow it for a trusted-"
+            "network dev/test bind (the escape can no longer relax a production-PHI hop)."
         )
+    if (trust or not encrypt) and attested:
+        _audit_attested_weakened_tls("DATABASE connection")
     auth = str(s.get("auth", "sql")).lower()
     if auth not in ("sql", "integrated", "entra"):
         raise ValueError(f"DATABASE destination auth must be sql|integrated|entra, got {auth!r}")
@@ -129,6 +199,131 @@ def _build_dsn(s: dict[str, Any], *, read_only: bool = False) -> str:
     parts.append(f"Encrypt={'yes' if encrypt else 'no'}")
     parts.append(f"TrustServerCertificate={'yes' if trust else 'no'}")
     return ";".join(parts) + ";"
+
+
+# A valid ODBC connection-string keyword: a letter then letters/digits/spaces/underscores. Rejecting the
+# metacharacters (`; { } =`) and newlines is the STORE-5 guard for the operator-supplied generic keys
+# (the VALUES are additionally brace-quoted), so message-influenced data can't smuggle extra keywords.
+_ODBC_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 _]*$")
+
+# odbc_params must not re-declare a keyword the connector emits from its own settings (driver/server/
+# database/the credential keys) — that would silently duplicate/conflict a keyword.
+_ODBC_RESERVED_KEYS = frozenset({"driver", "server", "database"})
+
+# A best-effort hint that the operator configured driver-level TLS via an odbc_params keyword (anything
+# ssl/tls/encrypt-ish — psqlODBC `SSLmode`, MySQL `SSLMODE`, some drivers' `Encrypt`). Used ONLY to tune
+# the severity of the generic-path construction-time TLS reminder (WARNING vs DEBUG) — never to gate or
+# alter the connection. It cannot prove the value *verifies* the cert, only that TLS was addressed.
+_ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
+
+
+def _odbc_keyword(key: str, *, what: str) -> str:
+    """Validate an ODBC keyword token (STORE-5) and return it, or raise a clear ValueError."""
+    if not _ODBC_KEY_RE.match(key):
+        raise ValueError(
+            f"DATABASE {what} {key!r} is not a valid ODBC keyword "
+            "(letters, digits, spaces, underscores; must start with a letter)"
+        )
+    return key
+
+
+def _build_odbc_dsn(s: dict[str, Any]) -> str:
+    """Build a GENERIC ODBC connection string (``dialect='generic'``, #66) — decoupled from the ODBC
+    Driver 18 / T-SQL preset so any ODBC-reachable DB (PostgreSQL / Oracle / MySQL via that DB's own ODBC
+    driver) works. The operator installs the target ODBC driver at the OS level and names it here.
+
+    The operator supplies the ODBC ``odbc_driver`` name + an ``odbc_params`` mapping of driver-specific
+    keywords (PORT, SSLmode, …). ``server`` (the ``[egress].allowed_db`` allowlist key) is emitted as the
+    near-universal ``SERVER`` keyword and ``database`` as ``DATABASE`` when set; credentials come from the
+    top-level ``username``/``password`` settings (``env()``-resolved + secret-redacted) under the
+    operator-chosen ``odbc_user_key``/``odbc_password_key`` keyword names (default ``UID``/``PWD``). Every
+    ``odbc_params`` value is brace-quoted (STORE-5 injection guard) and its key validated to a safe ODBC
+    keyword, so message-influenced data can never inject an extra connection keyword.
+
+    **TLS is the operator's responsibility on this path.** MessageFoundry cannot introspect an arbitrary
+    driver's TLS posture the way it reads SQL Server's ``Encrypt``/``TrustServerCertificate``, so the
+    weakened-TLS refusal (:func:`_build_dsn`) does not apply here — configure verifying TLS via the
+    driver's own keyword in ``odbc_params`` (e.g. psqlODBC ``SSLmode=verify-full``, MySQL
+    ``SSLMODE=VERIFY_IDENTITY``). Because that delegation is otherwise invisible, construction logs it
+    (:func:`_warn_generic_tls_unenforced`): a **WARNING** when no TLS keyword is present, DEBUG when one
+    is. See docs/CONNECTIONS.md."""
+    driver = str(s.get("odbc_driver") or "").strip()
+    if not driver:
+        raise ValueError("DATABASE generic dialect requires an 'odbc_driver' setting")
+    # SERVER is emitted UNBRACED (validated, not brace-quoted) so a driver that parses a ",port"/":port"
+    # suffix in SERVER can resolve the host — mirrors the SQL Server preset's rationale.
+    server = str(s["server"])
+    if any(ch in server for ch in ";{}=\r\n"):
+        raise ValueError(
+            "DATABASE server must not contain ';', '{', '}', '=', or newlines (ODBC injection risk)"
+        )
+    parts = [f"DRIVER={_odbc_brace(driver)}", f"SERVER={server}"]
+    if s.get("database"):
+        parts.append(f"DATABASE={_odbc_brace(str(s['database']))}")
+    username = s.get("username")
+    if username:
+        user_key = _odbc_keyword(str(s.get("odbc_user_key", "UID")), what="odbc_user_key")
+        parts.append(f"{user_key}={_odbc_brace(str(username))}")
+    password = s.get("password")
+    if password:
+        pwd_key = _odbc_keyword(str(s.get("odbc_password_key", "PWD")), what="odbc_password_key")
+        parts.append(f"{pwd_key}={_odbc_brace(str(password))}")
+    params = s.get("odbc_params") or {}
+    if not isinstance(params, Mapping):
+        raise ValueError("DATABASE odbc_params must be a mapping of ODBC keyword -> value")
+    for key, value in params.items():
+        k = _odbc_keyword(str(key), what="odbc_params key")
+        if k.lower() in _ODBC_RESERVED_KEYS:
+            raise ValueError(
+                f"DATABASE odbc_params must not set {k!r} — use the 'odbc_driver' / 'server' / "
+                "'database' settings instead"
+            )
+        parts.append(f"{k}={_odbc_brace(str(value))}")
+    _warn_generic_tls_unenforced(params)
+    return ";".join(parts) + ";"
+
+
+def _warn_generic_tls_unenforced(params: Mapping[str, Any]) -> None:
+    """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
+    path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
+    (#200 / ADR 0092) does not apply and :func:`_build_connection` reports the hop as non-weakened. That
+    is a deliberate operator-owned-TLS model — but it must not be *silent*, or a generic PHI connection
+    with no TLS keyword would cross in plaintext with no refusal and no trace.
+
+    So at construction we log the delegation loudly: a **WARNING** when no ssl/tls/encrypt-ish keyword is
+    present in ``odbc_params`` (plaintext-PHI is a real risk the operator should see), dropped to
+    **DEBUG** when one is (the operator has taken TLS ownership). This is advisory only — it never gates
+    or changes the connection; enforcement stays the operator's driver keyword (e.g.
+    ``SSLmode=verify-full``)."""
+    if any(_ODBC_TLS_HINT_RE.search(str(k)) for k in params):
+        logger.debug(
+            "DATABASE generic ODBC dialect: TLS is delegated to the driver (a TLS keyword is set in "
+            "odbc_params); MessageFoundry does not enforce or verify it on this path"
+        )
+    else:
+        logger.warning(
+            "DATABASE generic ODBC dialect: TLS verification is NOT enforced by MessageFoundry on this "
+            "path and no TLS keyword was found in odbc_params — configure verifying TLS via the "
+            "driver's own keyword (e.g. SSLmode=verify-full) so PHI is not sent in plaintext"
+        )
+
+
+def _build_connection(
+    s: dict[str, Any], *, attested: bool = False, read_only: bool = False
+) -> tuple[str, bool]:
+    """Dispatch on ``dialect`` and return ``(dsn, weakened_tls)`` (#66). ``dialect='sqlserver'`` (default)
+    runs the byte-identical SQL Server preset (:func:`_build_dsn`, weakened-TLS refusal + optional
+    read-only intent); ``dialect='generic'`` runs :func:`_build_odbc_dsn` (operator-owned TLS, so never
+    reported weakened — a construction-time WARNING flags the unenforced-TLS delegation instead)."""
+    dialect = str(s.get("dialect", "sqlserver")).lower()
+    if dialect == "sqlserver":
+        weakened = bool(s.get("trust_server_certificate", False)) or not bool(
+            s.get("encrypt", True)
+        )
+        return _build_dsn(s, read_only=read_only, attested=attested), weakened
+    if dialect == "generic":
+        return _build_odbc_dsn(s), False
+    raise ValueError(f"DATABASE dialect must be 'sqlserver' or 'generic', got {dialect!r}")
 
 
 # A leading SQL line comment (`-- ...` to end of line) or block comment (`/* ... */`). Stripped (with
@@ -335,10 +530,23 @@ class DatabaseDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
-        for req in ("server", "database", "statement"):
+        # `database` is required only for the SQL Server preset; the generic ODBC dialect (#66) may omit
+        # it (Oracle names a service, not a DATABASE keyword) and carries it via odbc_params if needed.
+        self._dialect = str(s.get("dialect", "sqlserver")).lower()
+        required = (
+            ("server", "statement")
+            if self._dialect == "generic"
+            else ("server", "database", "statement")
+        )
+        for req in required:
             if not s.get(req):
                 raise ValueError(f"DATABASE destination requires a {req!r} setting")
-        self._dsn = _build_dsn(s)  # fail fast on a weakened-TLS / bad-auth config
+        # Per-connection insecure-hop attestation (#200) — surfaced to _build_dsn and captured for the
+        # send-time byte-crossing re-assertion below.
+        self._hop_attested = config.tls_hop_attested
+        self._dsn, self._weakened_tls = _build_connection(
+            s, attested=self._hop_attested
+        )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
         self._sql, self._param_names = _parse_named_params(str(s["statement"]))
         self._pool_max = int(s.get("pool_max", 5))
         self._acquire_timeout = float(s.get("acquire_timeout", _DEFAULT_DB_ACQUIRE_TIMEOUT))
@@ -362,7 +570,15 @@ class DatabaseDestination(DestinationConnector):
                 self._pool = await _make_pool(self._dsn, self._pool_max, autocommit=False)
         return self._pool
 
-    async def send(self, payload: str) -> DeliveryResponse | None:
+    async def send(
+        self, payload: str, *, metadata: Mapping[str, str] | None = None
+    ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
+        # #200 decision 4: zero-I/O byte-crossing re-assertion of the posture-keyed hop decision, so a
+        # payload never crosses a weakened-TLS DB hop the shared authority would refuse. Defense-in-depth
+        # BEHIND the construction-time _build_dsn gate (which already refused a prod-PHI weakened hop),
+        # catching a reload / build that reached send() around it. Fixed DSN target → this only ever
+        # fires as a tripwire.
+        _assert_send_hop(weakened=self._weakened_tls, attested=self._hop_attested)
         params = _bind_params(payload, self._param_names)  # NegativeAckError(permanent) on bad data
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
@@ -462,10 +678,21 @@ class DatabaseSource(SourceConnector):
 
     def __init__(self, config: Source) -> None:
         s = config.settings
-        for req in ("server", "database", "poll_statement"):
+        # `database` is required only for the SQL Server preset; the generic ODBC dialect (#66) may omit it.
+        self._dialect = str(s.get("dialect", "sqlserver")).lower()
+        required = (
+            ("server", "poll_statement")
+            if self._dialect == "generic"
+            else ("server", "database", "poll_statement")
+        )
+        for req in required:
             if not s.get(req):
                 raise ValueError(f"DATABASE source requires a {req!r} setting")
-        self._dsn = _build_dsn(s)  # fail fast on a weakened-TLS / bad-auth config
+        # Per-connection insecure-hop attestation (#200): the customer-DB poll link rides the same
+        # posture-keyed verify-off refusal as the destination (a read still crosses the wire).
+        self._dsn, _ = _build_connection(
+            s, attested=config.tls_hop_attested
+        )  # fail fast on a weakened-TLS / bad-auth / bad-generic config
         self._poll_sql = str(s["poll_statement"])
         mark = s.get("mark_statement")
         # mark_statement is optional (a read-only/idempotent feed may omit it); its :name params bind

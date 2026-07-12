@@ -1,0 +1,37 @@
+{
+  "module": "samples/config/IB_RTE_ELIGIBILITY.py",
+  "handlers": [
+    {
+      "handler": "rte_query_handler",
+      "module": "samples/config/IB_RTE_ELIGIBILITY.py",
+      "def_line": 72,
+      "rows": [
+        {
+          "kind": "send",
+          "outbounds": [
+            "OB_PAYER_RTE"
+          ],
+          "line_start": 74,
+          "line_end": 74,
+          "nesting": 0
+        }
+      ]
+    },
+    {
+      "handler": "rte_result_handler",
+      "module": "samples/config/IB_RTE_ELIGIBILITY.py",
+      "def_line": 86,
+      "rows": [
+        {
+          "kind": "send",
+          "outbounds": [
+            "OB_RTE_RESULT"
+          ],
+          "line_start": 87,
+          "line_end": 87,
+          "nesting": 0
+        }
+      ]
+    }
+  ]
+}

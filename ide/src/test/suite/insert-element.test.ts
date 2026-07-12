@@ -90,7 +90,7 @@ suite("insert-element contributions", () => {
       "meforsend",
       "meforsplit",
       // Palette expansion (BACKLOG #48 Lane L1): Format/Transform/Decision/Date/Lookup/Send/Raw/
-      // Field/Router idioms mapping Corepoint's Action-List palette.
+      // Field/Router idioms mapping Corepoint's Steps palette.
       "meforupper",
       "meforlower",
       "meforstrip",

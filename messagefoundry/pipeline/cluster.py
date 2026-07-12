@@ -125,6 +125,11 @@ class ClusterMember:
     last_seen: float | None
     status: str
     is_leader: bool
+    # Leader-preference config (ADR 0096), surfaced for the observability API so an operator can SEE a
+    # node's handicap / promotability across the cluster. Defaulted so existing constructors (and the
+    # single-node self-entry) stay valid; the DB coordinators read the durable per-node columns.
+    acquire_delay_seconds: float = 0.0
+    promotable: bool = True
 
 
 @runtime_checkable
@@ -358,6 +363,8 @@ class DbCoordinator:
         node_timeout_seconds: float = 30.0,
         leader_lease_ttl_seconds: float = 30.0,
         leader_fence_timeout_seconds: float = 20.0,
+        acquire_delay_seconds: float = 0.0,
+        promotable: bool = True,
         db_schema: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -382,6 +389,11 @@ class DbCoordinator:
         # The fence watchdog polls this often; small relative to the fence timeout so a fence fires
         # promptly (well before the lease TTL). Pure in-memory check — no DB.
         self._fence_tick = max(0.05, min(1.0, leader_fence_timeout_seconds / 5.0))
+        # Leader-preference (ADR 0096). `acquire_delay` handicaps ONLY the take-over-of-an-EXPIRED-lease
+        # path (added to the lease-expiry time on the DB clock), never a renew; `promotable=False` makes
+        # this node never claim/hold the lease at all. Default (0.0, True) = byte-identical to before.
+        self._acquire_delay = acquire_delay_seconds
+        self._promotable = promotable
         # Monotonic clock for the fence (injectable for deterministic tests). Distinct from the DB clock
         # the lease uses: the fence measures a node-local elapsed duration (skew-free by construction),
         # the lease compares against the DB's own clock_timestamp() (so inter-node skew is irrelevant).
@@ -551,8 +563,8 @@ class DbCoordinator:
         One DB read, returned ordered by ``node_id`` for a stable listing; off the message hot path
         (operator-driven)."""
         rows = await self._pool.fetch(
-            "SELECT node_id, host, pid, started_at, last_seen, status, is_leader "
-            "FROM nodes ORDER BY node_id"
+            "SELECT node_id, host, pid, started_at, last_seen, status, is_leader, "
+            "acquire_delay_seconds, promotable FROM nodes ORDER BY node_id"
         )
         now = time.time()
         # First pass: which rows carry a *fresh* leader flag, and which of those is the freshest. The
@@ -579,6 +591,8 @@ class DbCoordinator:
                     # flag is filtered out (not fresh), and a not-yet-cleared ex-leader that overlaps a
                     # new leader loses to the new leader's more recent last_seen.
                     is_leader=(r["node_id"] == leader_node_id),
+                    acquire_delay_seconds=float(r["acquire_delay_seconds"]),
+                    promotable=bool(r["promotable"]),
                 )
             )
         return members
@@ -640,7 +654,10 @@ class DbCoordinator:
                     " started_at DOUBLE PRECISION,"
                     " last_seen  DOUBLE PRECISION,"
                     " status     TEXT,"
-                    " is_leader  BOOLEAN NOT NULL DEFAULT FALSE"  # Step 7: derived-leader observability
+                    " is_leader  BOOLEAN NOT NULL DEFAULT FALSE,"  # Step 7: derived-leader observability
+                    # ADR 0096 leader-preference config, mirrored per-node for the /cluster/nodes API.
+                    " acquire_delay_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,"
+                    " promotable BOOLEAN NOT NULL DEFAULT TRUE"
                     ")"
                 )
                 # Idempotent migration for a pre-Step-7 nodes table created without is_leader (a cluster
@@ -649,6 +666,16 @@ class DbCoordinator:
                 # fresh CREATE above and on any node that already migrated.
                 await conn.execute(
                     "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS is_leader BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+                # ADR 0096: additively migrate a pre-existing nodes table (cluster upgraded in place) to
+                # carry the leader-preference config columns. Same DDL advisory lock; ADD COLUMN IF NOT
+                # EXISTS is a no-op on the fresh CREATE above and on any already-migrated node.
+                await conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS acquire_delay_seconds "
+                    "DOUBLE PRECISION NOT NULL DEFAULT 0"
+                )
+                await conn.execute(
+                    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS promotable BOOLEAN NOT NULL DEFAULT TRUE"
                 )
                 # The self-fencing leadership lease (Workstream A2): a single row per cluster (keyed by
                 # the schema-namespaced lease_key) holding the current leader + its DB-clock expiry. The
@@ -679,18 +706,25 @@ class DbCoordinator:
         (re)registered node holds no leadership until it acquires the advisory lock on its first
         maintenance tick (the heartbeat then folds the true value in)."""
         now = time.time()
+        # acquire_delay_seconds / promotable are static per-node config (read once at construction), so
+        # they are written on register — including a restart's conflict-update, which re-applies any
+        # config change — and never touched by the heartbeat (ADR 0096).
         await self._pool.execute(
-            "INSERT INTO nodes (node_id, host, pid, started_at, last_seen, status, is_leader)"
-            " VALUES ($1,$2,$3,$4,$5,$6,FALSE)"
+            "INSERT INTO nodes (node_id, host, pid, started_at, last_seen, status, is_leader,"
+            " acquire_delay_seconds, promotable)"
+            " VALUES ($1,$2,$3,$4,$5,$6,FALSE,$7,$8)"
             " ON CONFLICT (node_id) DO UPDATE SET"
             " host=excluded.host, pid=excluded.pid, started_at=excluded.started_at,"
-            " last_seen=excluded.last_seen, status=excluded.status, is_leader=FALSE",
+            " last_seen=excluded.last_seen, status=excluded.status, is_leader=FALSE,"
+            " acquire_delay_seconds=excluded.acquire_delay_seconds, promotable=excluded.promotable",
             self.node_id,
             self._host,
             self._pid,
             now,
             now,
             "active",
+            self._acquire_delay,
+            self._promotable,
         )
 
     async def heartbeat_once(self) -> None:
@@ -811,7 +845,26 @@ class DbCoordinator:
         (``held >= leader_lease.leader_epoch``) then rejects the ex-leader. ``RETURNING leader_epoch``
         carries the held value back so :meth:`_maintain_leadership` can cache it. (Renew keeps it because
         ``owner = me`` can only be reached when no other node took over in between — a take-over would
-        have changed ``owner`` and routed us through the bump branch.)"""
+        have changed ``owner`` and routed us through the bump branch.)
+
+        **Leader preference (ADR 0096).** A ``promotable=False`` node short-circuits to not-held BEFORE
+        touching the DB, so it never inserts, takes over, or renews — it can neither become nor remain
+        leader (a node that somehow already holds the lease is demoted by :meth:`_maintain_leadership` on
+        this tick; the fence watchdog is the backstop). ``acquire_delay_seconds`` handicaps ONLY the
+        take-over-of-an-EXPIRED-lease predicate — the expiry is compared against ``clock_timestamp() -
+        delay`` (equivalently ``lease_expires_at + delay < now``) — so a delayed node must wait ``delay``
+        seconds PAST the un-handicapped expiry before it may claim, letting a preferred (delay=0) node win
+        the routine race. The delay is added to the *expiry* side only, so it is a STRICTLY stricter
+        predicate than the base one: it can only make this node claim LATER, never earlier, so it cannot
+        open a two-leader window (the split-brain guarantee is preserved). The renew branch
+        (``owner = me``) carries NO delay term, so the current leader always renews at ``now`` regardless
+        of its own configured delay."""
+        if not self._promotable:
+            # NON-PROMOTABLE: never acquire (insert / take-over) and never renew, so this node can never
+            # become or remain leader. Touch no DB row — returning not-held makes _maintain_leadership
+            # demote a node that was somehow already leader (a clean step-down), and the fence watchdog is
+            # the backstop. At least one promotable node must exist or the cluster elects no leader.
+            return False
         row = await self._pool.fetchrow(
             "INSERT INTO leader_lease (lease_key, owner, lease_expires_at, leader_epoch) "
             "VALUES ($1, $2, EXTRACT(EPOCH FROM clock_timestamp()) + $3, 1) "
@@ -820,11 +873,15 @@ class DbCoordinator:
             "leader_epoch = CASE WHEN leader_lease.owner = EXCLUDED.owner "
             "THEN leader_lease.leader_epoch ELSE leader_lease.leader_epoch + 1 END "
             "WHERE leader_lease.owner = $2 "
-            "OR leader_lease.lease_expires_at < EXTRACT(EPOCH FROM clock_timestamp()) "
+            # Take-over-of-EXPIRED is handicapped by acquire_delay ($4): add the delay to the expiry so a
+            # delayed node only claims once the lease has been expired for `delay` seconds (DB clock). The
+            # owner=me renew branch above is NOT delayed. delay=0 → byte-identical to `expires_at < now`.
+            "OR leader_lease.lease_expires_at + $4 < EXTRACT(EPOCH FROM clock_timestamp()) "
             "RETURNING owner, leader_epoch",
             self._lease_key,
             self.node_id,
             self._lease_ttl,
+            self._acquire_delay,
         )
         if row is None or row["owner"] != self.node_id:
             return False
@@ -947,6 +1004,8 @@ def build_coordinator(store: Any, cluster_settings: Any) -> ClusterCoordinator:
             leader_fence_timeout_seconds=getattr(
                 cluster_settings, "leader_fence_timeout_seconds", 20.0
             ),
+            acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
+            promotable=getattr(cluster_settings, "promotable", True),
         )
     return DbCoordinator(
         pool,
@@ -957,5 +1016,7 @@ def build_coordinator(store: Any, cluster_settings: Any) -> ClusterCoordinator:
         leader_fence_timeout_seconds=getattr(
             cluster_settings, "leader_fence_timeout_seconds", 20.0
         ),
+        acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
+        promotable=getattr(cluster_settings, "promotable", True),
         db_schema=db_schema,
     )

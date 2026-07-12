@@ -29,12 +29,14 @@ from typing import Any, Callable, TypeVar
 from messagefoundry.config.models import (
     AckAfter,
     AckMode,
+    BatchConfig,
     BuildupThreshold,
     ContentType,
     InternalErrorPolicy,
     OrderingMode,
     Priority,
     RetryPolicy,
+    Schedule,
     StallThreshold,
 )
 from messagefoundry.config.wiring import (
@@ -89,6 +91,7 @@ _INBOUND_KEYS = frozenset(
         "ack_after",
         "strict",
         "hl7_version",
+        "strict_timeout_s",
         "content_type",
         "metadata",
         "bind_address",
@@ -100,6 +103,7 @@ _INBOUND_KEYS = frozenset(
         "prune_documents_min_bytes",
         "priority",
         "shard",
+        "schedule",
     }
 )
 _OUTBOUND_KEYS = frozenset(
@@ -112,10 +116,12 @@ _OUTBOUND_KEYS = frozenset(
         "internal_error",
         "buildup",
         "stall",
+        "batch",
         "simulate",
         "dead_letter_days",
         "priority",
         "metadata",
+        "schedule",
     }
 )
 
@@ -166,6 +172,7 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         else None,
         strict=_require_bool(table, "strict", where),
         hl7_version=_optional_str(table, "hl7_version", where),
+        strict_timeout_s=_optional_float(table, "strict_timeout_s", where),
         content_type=_enum(ContentType, table["content_type"], "content_type", where)
         if "content_type" in table
         else ContentType.HL7V2,
@@ -181,6 +188,7 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         if table.get("priority") is not None
         else None,
         shard=_optional_str(table, "shard", where),
+        schedule=_policy(Schedule, table.get("schedule"), "schedule", where),
         source_file=source,
         source_line=None,
     )
@@ -203,12 +211,14 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
         else None,
         buildup=_policy(BuildupThreshold, table.get("buildup"), "buildup", where),
         stall=_policy(StallThreshold, table.get("stall"), "stall", where),
+        batch=_policy(BatchConfig, table.get("batch"), "batch", where),
         simulate=_require_bool(table, "simulate", where),
         dead_letter_days=_optional_int(table, "dead_letter_days", where),
         priority=_enum(Priority, table["priority"], "priority", where)
         if table.get("priority") is not None
         else None,
         metadata=_optional_table(table, "metadata", where),
+        schedule=_policy(Schedule, table.get("schedule"), "schedule", where),
         source_file=source,
         source_line=None,
     )
@@ -319,6 +329,22 @@ def _optional_int(table: dict[str, Any], key: str, where: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise WiringError(f"{where}: {key!r} must be an integer number of days (0 = keep forever)")
     return value
+
+
+def _optional_float(table: dict[str, Any], key: str, where: str) -> float | None:
+    """A tri-state float: absent/None → ``None`` (inherit the engine default), else the number. Used for
+    the per-connection ``strict_timeout_s`` strict-validation backstop (#89), where ``None`` means
+    "inherit ``_STRICT_VALIDATE_TIMEOUT_SECONDS``" and ``<= 0`` disables it. A ``bool`` is rejected
+    (TOML ``true``/``false`` is an int subclass but never a valid duration); an int is accepted and
+    widened to float (TOML ``5`` and ``5.0`` are equivalent seconds)."""
+    if key not in table or table[key] is None:
+        return None
+    value = table[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WiringError(
+            f"{where}: {key!r} must be a number of seconds (<= 0 disables the backstop)"
+        )
+    return float(value)
 
 
 def _enum(enum_cls: type[_E], value: Any, key: str, where: str) -> _E:

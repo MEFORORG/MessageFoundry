@@ -8,7 +8,13 @@ uvicorn's own loggers routed through the same handler. When the engine runs unde
 service, NSSM captures stdout/stderr to rotating files, so we deliberately do **not** add file handlers
 here. A copy of every record can also be **forwarded off-box** to a syslog/SIEM collector
 (``[logging].forward_*``; sec-offbox-log, ASVS 16.x) so log evidence survives a host compromise; PHI
-redaction + control-char scrubbing apply to the forwarded stream exactly as to stdout.
+redaction + control-char scrubbing apply to the forwarded stream exactly as to stdout. The off-box
+transport is UDP (RFC 5426), plaintext TCP (RFC 6587), or **native TLS** (RFC 5425 — an ``ssl``-wrapped
+TCP socket, ADR 0080), so evidence can be encrypted on the wire without a local forwarding agent.
+
+This module also exposes :func:`query_sntp_offset`, the bounded stdlib SNTP probe behind the opt-in
+startup clock-sync gate (``[logging].require_time_sync``; ASVS 16.2.2) — cross-host log correlation
+depends on synchronized clocks. The gate's *policy* (warn vs refuse) lives in ``__main__.serve``.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ import logging
 import logging.handlers
 import os
 import socket
+import ssl
 import sys
 import time
 from dataclasses import dataclass
@@ -32,6 +39,7 @@ __all__ = [
     "RedactionFilter",
     "JsonFormatter",
     "SyslogForward",
+    "query_sntp_offset",
     "LOG_LEVELS",
 ]
 
@@ -156,14 +164,21 @@ class JsonFormatter(logging.Formatter):
 class SyslogForward:
     """Off-box syslog forwarding target (sec-offbox-log). A primitive value object so this module stays
     free of a config import (``config.settings`` imports ``LOG_LEVELS`` from here — the dependency must
-    not go the other way). ``protocol`` is ``"udp"`` (RFC 5426; fire-and-forget) or ``"tcp"`` (RFC 6587;
-    a down collector is tolerated — see :func:`configure_logging`); ``fmt`` is ``"json"`` or ``"text"``
-    and is independent of the stdout format."""
+    not go the other way). ``protocol`` is ``"udp"`` (RFC 5426; fire-and-forget), ``"tcp"`` (RFC 6587),
+    or ``"tls"`` (RFC 5425; ssl-wrapped TCP — ADR 0080); a down collector is tolerated for the
+    connection-oriented protocols (see :func:`configure_logging`). ``fmt`` is ``"json"`` or ``"text"``
+    and is independent of the stdout format. The ``tls_*`` fields apply only when ``protocol == "tls"``:
+    ``tls_ca_file`` is the PEM trust anchor (only that CA is trusted; system roots are not loaded),
+    ``tls_verify`` toggles certificate + hostname verification (default on), and ``tls_client_cert`` is
+    an optional PEM cert+key chain for mutual TLS."""
 
     host: str
     port: int = 514
     protocol: str = "udp"
     fmt: str = "json"
+    tls_ca_file: str | None = None
+    tls_verify: bool = True
+    tls_client_cert: str | None = None
 
 
 #: Socket timeout (seconds) pinned on a **TCP** off-box forwarder. The engine logs synchronously from
@@ -194,6 +209,50 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
             sock.settimeout(self._sock_timeout)
 
 
+def _build_tls_context(forward: SyslogForward) -> ssl.SSLContext:
+    """Build the client :class:`ssl.SSLContext` for a ``protocol == "tls"`` forwarder (RFC 5425).
+
+    ``create_default_context(cafile=...)`` trusts **only** the supplied CA anchor when one is given
+    (system roots are NOT loaded) — an on-prem SIEM's private cert is anchored explicitly rather than
+    silently accepting the public CA bundle. ``forward.tls_verify=False`` is the documented insecure
+    opt-out (``CERT_NONE`` + no hostname check); ``tls_client_cert`` adds a client chain for mutual
+    TLS. The settings validator guarantees a CA file is present when verification is on, so the default
+    path is always CA-anchored + hostname-checked."""
+    ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH, cafile=forward.tls_ca_file)
+    if not forward.tls_verify:
+        # Insecure opt-out: check_hostname must be cleared before verify_mode (ssl rejects the reverse).
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    if forward.tls_client_cert is not None:
+        # Mutual TLS: a single PEM carrying both the client cert and its key (keyfile defaults to it).
+        ctx.load_cert_chain(certfile=forward.tls_client_cert)
+    return ctx
+
+
+class _TlsSysLogHandler(_TimeoutSysLogHandler):
+    """A TCP :class:`~logging.handlers.SysLogHandler` whose connected socket is wrapped in TLS (RFC
+    5425 syslog-over-TLS). The wrap happens in ``createSocket`` *after* the base handler has connected
+    and pinned the socket timeout, so the TLS handshake itself runs under ``_FORWARD_TCP_TIMEOUT`` — a
+    collector that completes the TCP connect but stalls the handshake can't block the calling thread
+    (the asyncio event loop) indefinitely. A handshake/verification failure raises ``ssl.SSLError``
+    (a subclass of ``OSError``), so :func:`configure_logging` treats a bad-cert collector at startup as
+    best-effort (skipped with a warning) exactly like an unreachable one."""
+
+    def __init__(
+        self, *args: Any, ssl_context: ssl.SSLContext, server_hostname: str, **kwargs: Any
+    ) -> None:
+        self._ssl_context = ssl_context
+        self._server_hostname = server_hostname
+        super().__init__(*args, **kwargs)
+
+    def createSocket(self) -> None:
+        super().createSocket()  # plain TCP connect + bounded timeout (inherited posture)
+        sock = getattr(self, "socket", None)
+        if sock is not None:
+            # server_hostname drives SNI + hostname verification; harmless when verification is off.
+            self.socket = self._ssl_context.wrap_socket(sock, server_hostname=self._server_hostname)
+
+
 def _make_formatter(fmt: str) -> logging.Formatter:
     """A JSON formatter for ``fmt == "json"``, else the human-readable text formatter (the default)."""
     if fmt == "json":
@@ -216,10 +275,20 @@ def _install_phi_filters(handler: logging.Handler) -> None:
 
 def _build_syslog_handler(forward: SyslogForward) -> logging.handlers.SysLogHandler:
     """A :class:`logging.handlers.SysLogHandler` for ``forward``. For UDP the socket is created but not
-    connected (never fails on a down collector, never blocks on send). For TCP the constructor connects
-    and may raise ``OSError`` if the collector is down at startup (:func:`configure_logging` treats that
-    as best-effort), and a runtime socket timeout (``_FORWARD_TCP_TIMEOUT``) is pinned so a stalled
-    collector can't block the calling thread (the event loop) indefinitely — emit drops the record."""
+    connected (never fails on a down collector, never blocks on send). For TCP/TLS the constructor
+    connects (and, for TLS, completes the handshake) and may raise ``OSError`` if the collector is down
+    or its certificate can't be verified at startup (:func:`configure_logging` treats that as best-
+    effort — ``ssl.SSLError`` is an ``OSError`` subclass), and a runtime socket timeout
+    (``_FORWARD_TCP_TIMEOUT``) is pinned so a stalled collector can't block the calling thread (the
+    event loop) indefinitely — emit drops the record."""
+    if forward.protocol == "tls":
+        return _TlsSysLogHandler(
+            address=(forward.host, forward.port),
+            socktype=socket.SOCK_STREAM,
+            timeout=_FORWARD_TCP_TIMEOUT,
+            ssl_context=_build_tls_context(forward),
+            server_hostname=forward.host,
+        )
     if forward.protocol == "tcp":
         return _TimeoutSysLogHandler(
             address=(forward.host, forward.port),
@@ -332,3 +401,35 @@ def silence_phi_prone_dependency_loggers() -> None:
         # hl7 names its loggers getLogger(__file__) → an absolute path inside the hl7 package dir.
         if os.path.normcase(name).startswith(pkg_dir):
             logging.getLogger(name).setLevel(logging.CRITICAL)
+
+
+#: Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01) — RFC 4330.
+_NTP_UNIX_EPOCH_DELTA = 2_208_988_800
+#: Default bound (seconds) on the startup SNTP probe so a silent/absent peer never blocks serve().
+_SNTP_TIMEOUT = 2.0
+
+
+def query_sntp_offset(peer: str, *, port: int = 123, timeout: float = _SNTP_TIMEOUT) -> float:
+    """Query an SNTP server (RFC 4330) and return the local-minus-server clock offset, in seconds.
+
+    A minimal stdlib UDP SNTP client (no new dependency): send a 48-byte client request, read the
+    server's *transmit* timestamp from the reply, and return how far the local clock leads (positive)
+    or lags (negative) the peer. **Bounded + best-effort:** the socket carries ``timeout`` so a silent
+    or absent peer raises ``socket.timeout`` (a subclass of ``OSError``) instead of blocking. This
+    powers the opt-in startup clock-sync gate (ASVS 16.2.2) only — it is never on the message path, and
+    SNTP is unauthenticated (a coarse drift check for a trusted management network, not NTS).
+
+    Raises ``OSError`` (incl. ``socket.timeout``/``socket.gaierror``) if the peer can't be reached or
+    returns a short/invalid reply."""
+    request = b"\x1b" + 47 * b"\x00"  # LI=0, VN=3, Mode=3 (client); remaining fields zero
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(timeout)
+        sock.sendto(request, (peer, port))
+        data, _ = sock.recvfrom(48)
+    if len(data) < 48:
+        raise OSError(f"short SNTP reply from {peer!r}: {len(data)} bytes")
+    # Transmit timestamp is bytes 40..47: 32-bit seconds (NTP epoch) + 32-bit fractional seconds.
+    seconds = int.from_bytes(data[40:44], "big")
+    fraction = int.from_bytes(data[44:48], "big") / 2**32
+    server_unix = (seconds - _NTP_UNIX_EPOCH_DELTA) + fraction
+    return time.time() - server_unix

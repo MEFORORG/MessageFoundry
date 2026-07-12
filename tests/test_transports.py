@@ -326,6 +326,53 @@ async def test_file_source_quarantines_content_rejected_by_scan_hook(tmp_path: P
     assert not (inbox / ".processed" / "msg1.hl7").exists()
 
 
+async def test_file_source_scan_hook_malfunction_fails_closed(tmp_path: Path) -> None:
+    # ASVS 5.4.3, BACKLOG #204: a scan hook that MALFUNCTIONS (raises a non-ScanRejected exception — the
+    # AV/ICAP service is unreachable, or a plugin bug) must fail CLOSED. The file is never emitted, and —
+    # unlike a content rejection — it is NOT quarantined but left in place to be re-scanned once the
+    # scanner recovers (at-least-once). It must never be passed through unscanned.
+    from messagefoundry.transports.file import set_scan_hook
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "msg1.hl7").write_bytes(ADT.encode("utf-8"))
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+        return None
+
+    def _scanner_down(raw: bytes, source: str) -> None:
+        raise ConnectionError(
+            "ICAP service unreachable"
+        )  # a transient scanner outage, not a rejection
+
+    set_scan_hook(_scanner_down)
+    try:
+        src = build_source(
+            Source(
+                type=ConnectorType.FILE,
+                settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
+            )
+        )
+        task = asyncio.create_task(src.start(handler))
+        try:
+            # Give the poller several ticks to (fail to) process the file.
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+                if received:
+                    break
+        finally:
+            await src.stop()
+            await task
+    finally:
+        set_scan_hook(None)  # restore the default no-op so the global doesn't leak between tests
+    assert received == []  # fail-closed: never emitted while the scanner is down
+    assert (inbox / "msg1.hl7").exists()  # left in place to retry (NOT quarantined, NOT processed)
+    assert not (inbox / ".error" / "msg1.hl7").exists()
+    assert not (inbox / ".processed" / "msg1.hl7").exists()
+
+
 # --- MLLP source <-> destination round trip ----------------------------------
 
 

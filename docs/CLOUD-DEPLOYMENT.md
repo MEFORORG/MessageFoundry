@@ -84,8 +84,8 @@ is verified against [`config/settings.py`](../messagefoundry/config/settings.py)
 
 `[store].encrypt` defaults **true** and `[store].trust_server_certificate` defaults **false**, so the DB
 connection is TLS-verified out of the box. Give the managed Postgres a **CA-trusted** server cert (the
-provider's default RDS/Cloud SQL/Azure CA chains to a public root, or pin a private CA via
-`[store].ssl_root_cert` — **Postgres only**, see [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5). **Do not
+provider's default RDS/Cloud SQL/Azure CA chains to a public root, or pin a private CA by file via
+`[store].ssl_root_cert` — a Postgres CA-bundle, see [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5). **Do not
 set `MEFOR_ALLOW_INSECURE_TLS`** in a real deployment — it disables TLS verification across every transport.
 
 ### 2.2 Lease timings vs. failover speed
@@ -107,9 +107,9 @@ mechanism against a SQL Server store with **Always On Availability Groups** for 
 - `MEFOR_STORE_BACKEND=sqlserver`, point `MEFOR_STORE_*` at the AG listener, `MEFOR_STORE_PORT=1433`.
 - Use the **`messagefoundry:sqlserver`** image (it adds the OS-level MS ODBC Driver 18); the slim default
   has no ODBC.
-- SQL Server (ODBC Driver 18) has **no** connection-string CA-file keyword — trust the DB CA via the host
-  **machine trust store**, not `ssl_root_cert` (which is rejected for `sqlserver`). See
-  [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5.
+- Trust the DB CA via the host **machine trust store** (the CA-chain path, recommended for rotation), or
+  pin the server cert by file with `[store].ssl_root_cert` (ODBC Driver **18.1+** `ServerCertificate`, a
+  leaf pin — rotate in lockstep). See [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §5.
 - Everything else (the leader lease, graph gating, the LB recipe below) is identical — both backends run
   the same active-passive coordinator.
 

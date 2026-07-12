@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import ipaddress
 import logging
 import os
@@ -53,6 +54,7 @@ from messagefoundry.config.code_sets import (
 from messagefoundry.config.models import (
     AckAfter,
     AckMode,
+    BatchConfig,
     BuildupThreshold,
     ConnectorType,
     ContentType,
@@ -60,6 +62,7 @@ from messagefoundry.config.models import (
     OrderingMode,
     Priority,
     RetryPolicy,
+    Schedule,
     StallThreshold,
     Validation,
 )
@@ -76,6 +79,7 @@ __all__ = [
     "Loopback",
     "PassThrough",
     "Rest",
+    "Direct",
     "FHIR",
     "DICOM",
     "DICOMweb",
@@ -86,6 +90,7 @@ __all__ = [
     "Ftp",
     "Send",
     "SetState",
+    "SetMeta",
     "EnvRef",
     "env",
     "CodeSet",
@@ -116,6 +121,7 @@ __all__ = [
     "parse_env_setting",
     "router",
     "handler",
+    "HandlerAccepts",
     "load_config",
     "validate_config",
 ]
@@ -658,6 +664,7 @@ def MLLP(
     max_connection_age_seconds: float
     | None = None,  # outbound: recycle by age (LB/firewall hygiene)
     encoding_characters: str | None = None,  # OUTBOUND: re-encode MSH-1/MSH-2 delimiters per dest
+    hl7_raw_separators: bool = False,  # OUTBOUND: emit reserved separators as RAW bytes, not \F\..\T\ escapes (BACKLOG #107)
     capture_response: bool = False,  # outbound: capture the application ACK (MSA/ERR) as a reply (ADR 0013)
     reingress_to: str
     | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
@@ -673,6 +680,7 @@ def MLLP(
     | None = None,  # trust anchor — inbound: verify client certs (mTLS); outbound: verify server
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able → needs MEFOR_ALLOW_INSECURE_TLS)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
+    tls_allow_expired: bool = False,  # OUTBOUND: honour an EXPIRED server cert (chain+hostname still verified; #129)
 ) -> ConnectionSpec:
     """An MLLP endpoint. Inbound uses port/max_connections/receive_timeout/max_frame_bytes (the
     bind interface comes from the service's ``[inbound].bind_host``, so ``host`` is rejected on an
@@ -705,6 +713,17 @@ def MLLP(
     five characters, all distinct); a non-HL7 payload that can't be parsed fails the delivery loud
     (``DeliveryError``) rather than being silently corrupted.
 
+    ``hl7_raw_separators`` (**outbound only**, BACKLOG #107) is a deliberate escape-hatch for a partner
+    that **cannot decode HL7 escape sequences**: when ``True`` the connector emits the four reserved
+    **structural** separators as RAW bytes (``\\F\\ \\S\\ \\R\\ \\T\\`` → the message's own
+    field/component/repetition/subcomponent character) instead of their escape sequences, reading the
+    reserved chars from the payload's own MSH and re-serializing via the parsed model (never string
+    slicing). ``False`` (the default) leaves the payload **byte-identical** — fully backward compatible.
+    Enabling it can produce **non-conformant** output (a formerly-escaped ``^`` now reads as a component
+    separator) — that is the point; use it only for such a broken partner. A non-HL7 payload that can't be
+    parsed fails the delivery loud (``DeliveryError``). It composes with ``encoding_characters`` (the
+    delimiter rewrite runs first, then the raw-separator emit).
+
     **TLS (WP-13b).** ``tls=True`` wraps the connection: inbound presents ``tls_cert_file``/``tls_key_file``
     (a server identity; ``tls_ca_file`` adds opt-in mTLS — require + verify a client cert); outbound
     verifies the server cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
@@ -713,7 +732,11 @@ def MLLP(
     listener's ``MEFOR_API_TLS_KEY_PASSWORD``); omit it for an unencrypted key. ``tls_verify=False``
     (outbound) is MITM-able and refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning) —
     exactly like LDAPS / SQL Server. TLS is TLS 1.2+ and composes with the ``[egress].allowed_mllp``
-    allowlist (both enforced)."""
+    allowlist (both enforced). ``tls_allow_expired=True`` (outbound, #129 / ADR 0094) is the **granular**
+    alternative to ``tls_verify=False`` for the narrow real-world case of a partner whose server
+    certificate has lapsed: it honours an **expired** cert while STILL verifying the chain and hostname
+    (a wrong-host / untrusted-chain cert is still rejected), logs a WARN, and — because verification stays
+    ON — is NOT an insecure hop the #200 posture gate refuses. Default ``False`` = byte-identical."""
     return ConnectionSpec(
         ConnectorType.MLLP,
         {
@@ -729,6 +752,7 @@ def MLLP(
             "idle_timeout_seconds": idle_timeout_seconds,
             "max_connection_age_seconds": max_connection_age_seconds,
             "encoding_characters": encoding_characters,
+            "hl7_raw_separators": hl7_raw_separators,
             "capture_response": capture_response,
             "reingress_to": reingress_to,
             "tls": tls,
@@ -738,6 +762,7 @@ def MLLP(
             "tls_ca_file": tls_ca_file,
             "tls_verify": tls_verify,
             "tls_check_hostname": tls_check_hostname,
+            "tls_allow_expired": tls_allow_expired,
         },
     )
 
@@ -1024,10 +1049,12 @@ def Rest(
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the HTTP response body as a reply (ADR 0013)
     reingress_to: str
     | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
+    dynamic_headers: bool = False,  # #68: apply a Handler's per-message http.header.* SetMeta as headers
 ) -> ConnectionSpec:
     """An HTTP(S) endpoint (**outbound only** today — there is no REST source yet, ADR 0003). The
     Handler produces the request body; this delivers it to ``url`` via ``method`` with ``content_type``
@@ -1047,9 +1074,11 @@ def Rest(
             "basic_password": basic_password,
             "timeout_seconds": timeout_seconds,
             "verify_tls": verify_tls,
+            "tls_allow_expired": tls_allow_expired,
             "encoding": encoding,
             "capture_response": capture_response,
             "reingress_to": reingress_to,
+            "dynamic_headers": dynamic_headers,
         },
     )
 
@@ -1071,10 +1100,12 @@ def FHIR(
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the server reply / OperationOutcome (ADR 0013)
     reingress_to: str
     | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
+    dynamic_headers: bool = False,  # #68: apply a Handler's per-message http.header.* SetMeta as headers
 ) -> ConnectionSpec:
     """A FHIR REST endpoint (**outbound destination only** — the inbound FHIR server facade is ADR 0023).
     The Handler produces a FHIR-JSON resource (or transaction/batch ``Bundle``) body; this delivers it to
@@ -1104,9 +1135,11 @@ def FHIR(
             "basic_password": basic_password,
             "timeout_seconds": timeout_seconds,
             "verify_tls": verify_tls,
+            "tls_allow_expired": tls_allow_expired,
             "encoding": encoding,
             "capture_response": capture_response,
             "reingress_to": reingress_to,
+            "dynamic_headers": dynamic_headers,
         },
     )
 
@@ -1156,6 +1189,57 @@ def Email(
 SMTP = Email
 
 
+def Direct(
+    *,
+    host: str | EnvRef,  # the SMTP/HISP relay host (required; may be env())
+    sender: str | EnvRef,  # the Direct From: address (required; may be env())
+    recipients: list[str] | str | EnvRef,  # Direct To: address(es) — a list or a single string
+    signing_cert: str | EnvRef,  # path to the sender's PEM/DER signing certificate (required)
+    signing_key: str | EnvRef,  # path to the sender's PEM/DER signing private key (required)
+    recipient_cert: str | EnvRef,  # path to the partner's PEM/DER encryption certificate (required)
+    trust_anchor: str
+    | EnvRef,  # path to the PEM/DER CA the recipient_cert must chain to (required)
+    signing_key_password: str | EnvRef | None = None,  # passphrase for signing_key (use env())
+    port: int | EnvRef = 587,  # 587 STARTTLS submission (default); 465 → implicit TLS (SMTP_SSL)
+    subject: str | EnvRef = "",  # static Subject
+    username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
+    password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
+    use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    timeout_seconds: float = 30.0,
+    encoding: str = "utf-8",
+) -> ConnectionSpec:
+    """A Direct-Project **S/MIME-over-SMTP** endpoint (**outbound destination only** — inbound Direct
+    mail, MDN, and DNS-CERT discovery are deferred, ADR 0085 PR1). The Handler produces the clinical
+    **body** (content-agnostic — an HL7 string, a CDA/XML document, plain text); this **signs** it with
+    ``signing_key``/``signing_cert``, **encrypts** the signed blob to the partner's ``recipient_cert``
+    (which must chain to ``trust_anchor``), and submits the S/MIME message to ``host:port`` over
+    STARTTLS. All cert/key material is loaded + validated at construction (fail loud). The egress host
+    is gated by ``[egress].allowed_direct``. Put secrets in ``env()`` (``signing_key_password``,
+    ``username``/``password``), never inline. Delivery is at-least-once, so a retry re-sends — a Direct
+    mailbox has no idempotency key, so a rare duplicate is possible and accepted (a duplicate beats a
+    drop). Crypto is core ``cryptography`` (``serialization.pkcs7``) — no new dependency. ADR 0085."""
+    return ConnectionSpec(
+        ConnectorType.DIRECT,
+        {
+            "host": host,
+            "sender": sender,
+            "recipients": recipients,
+            "signing_cert": signing_cert,
+            "signing_key": signing_key,
+            "signing_key_password": signing_key_password,
+            "recipient_cert": recipient_cert,
+            "trust_anchor": trust_anchor,
+            "port": port,
+            "subject": subject,
+            "username": username,
+            "password": password,
+            "use_tls": use_tls,
+            "timeout_seconds": timeout_seconds,
+            "encoding": encoding,
+        },
+    )
+
+
 def DICOM(
     *,
     ae_title: str
@@ -1180,6 +1264,7 @@ def DICOM(
     tls_ca_file: str
     | EnvRef
     | None = None,  # opt-in mTLS: require + verify a calling peer's client cert
+    tls_allow_expired: bool = False,  # OUTBOUND SCU: honour an EXPIRED PACS cert (chain+hostname still verified; #129)
     max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
     # failure BEFORE the durable commit (the X12 max_interchange_bytes analog; OOM/DoS guard, §9)
     max_associations: int = 10,  # cap concurrent associations (connection-flood guard)
@@ -1221,6 +1306,7 @@ def DICOM(
             "tls_key_file": tls_key_file,
             "tls_key_password": tls_key_password,
             "tls_ca_file": tls_ca_file,
+            "tls_allow_expired": tls_allow_expired,
             "max_object_bytes": max_object_bytes,
             "max_associations": max_associations,
             "max_pdu_size": max_pdu_size,
@@ -1281,20 +1367,43 @@ def DICOMweb(
     )
 
 
+def _reject_envref_odbc_params(odbc_params: Mapping[str, Any] | None) -> None:
+    """Refuse an ``env()`` ref inside ``odbc_params`` (#66). Nested settings are NOT env-resolved (only
+    top-level ones are — see :func:`resolve_env_settings`), so an ``EnvRef`` here would stringify to a
+    broken literal at connect. Fail loud at authoring, pointing to the top-level ``username``/``password``
+    fields (which ARE env-resolved + secret-redacted) for a per-environment/secret value."""
+    if not odbc_params:
+        return
+    offenders = sorted(k for k, v in odbc_params.items() if isinstance(v, EnvRef))
+    if offenders:
+        raise WiringError(
+            f"Database odbc_params may not use env() ({', '.join(offenders)}) — nested settings are "
+            "not env-resolved. Put a credential/password in the top-level username/password fields "
+            "(env-resolved + redacted); odbc_params carries only static driver keywords."
+        )
+
+
 def Database(
     *,
-    server: str | EnvRef,  # SQL Server host (may be env())
-    database: str | EnvRef,
+    server: str | EnvRef,  # DB host (may be env())
     statement: str,  # parameterized SQL / proc call with :name placeholders
-    auth: str = "sql",  # sql | integrated | entra
+    database: str
+    | EnvRef
+    | None = None,  # required for dialect='sqlserver'; optional for 'generic'
+    dialect: str = "sqlserver",  # 'sqlserver' preset (default) | 'generic' ODBC (#66)
+    auth: str = "sql",  # sql | integrated | entra (SQL Server preset only)
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
-    trust_server_certificate: bool = False,
+    encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = 15,
     app_name: str = "messagefoundry",
-    odbc_driver: str = "ODBC Driver 18 for SQL Server",
+    odbc_driver: str = "ODBC Driver 18 for SQL Server",  # name the OS-installed driver for 'generic'
+    odbc_params: dict[str, str | EnvRef]
+    | None = None,  # generic dialect: driver-specific ODBC keywords (PORT, SSLmode, …)
+    odbc_user_key: str = "UID",  # generic dialect: ODBC keyword the username is emitted under
+    odbc_password_key: str = "PWD",  # generic dialect: ODBC keyword the password is emitted under
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
     capture_response: bool = False,  # capture the statement's RETURNING/OUTPUT result-set (ADR 0013)
@@ -1302,18 +1411,28 @@ def Database(
     | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
     capture_max_rows: int = 100,  # cap captured rows (over-cap → outcome='unparseable', empty body)
 ) -> ConnectionSpec:
-    """A SQL database endpoint (**outbound only** today; SQL Server via the ``[sqlserver]`` extra + ODBC
-    Driver 18 — **production / supported**). The Handler produces a JSON-object body; the connector binds its keys
-    to the ``:name`` parameters in ``statement`` (translated to positional ``?`` — always parameterized,
-    never string-built) and runs it. A transient DB error retries; a constraint/data error (or a payload
-    that doesn't match) dead-letters. Put secrets (``password``) in ``env()``. TLS is on by default;
-    weakening it needs ``MEFOR_ALLOW_INSECURE_TLS``. The write **must be idempotent** (at-least-once)."""
+    """A SQL database endpoint (**outbound only** today; via the ``[sqlserver]`` extra's ``aioodbc``).
+
+    ``dialect='sqlserver'`` (default) is the **production / supported** SQL Server preset over ODBC Driver
+    18. ``dialect='generic'`` (#66) targets any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL): name
+    it in ``odbc_driver`` and pass driver-specific keywords (``PORT``, ``SSLmode``, …) via ``odbc_params``;
+    credentials stay in ``username``/``password`` (emitted under ``odbc_user_key``/``odbc_password_key`` —
+    default ``UID``/``PWD``). **On the generic path configure TLS via the driver's own keyword** (e.g.
+    ``odbc_params={"SSLmode": "verify-full"}``) — the SQL-Server weakened-TLS refusal does not apply there.
+
+    The Handler produces a JSON-object body; the connector binds its keys to the ``:name`` parameters in
+    ``statement`` (translated to positional ``?`` — always parameterized, never string-built) and runs it. A
+    transient DB error retries; a constraint/data error (or a payload that doesn't match) dead-letters. Put
+    secrets (``password``) in ``env()``; ``odbc_params`` values are literals (put per-env/secret values in
+    the top-level fields). The write **must be idempotent** (at-least-once)."""
+    _reject_envref_odbc_params(odbc_params)
     return ConnectionSpec(
         ConnectorType.DATABASE,
         {
             "server": server,
             "database": database,
             "statement": statement,
+            "dialect": dialect,
             "auth": auth,
             "username": username,
             "password": password,
@@ -1323,6 +1442,9 @@ def Database(
             "connect_timeout": connect_timeout,
             "app_name": app_name,
             "odbc_driver": odbc_driver,
+            "odbc_params": odbc_params,
+            "odbc_user_key": odbc_user_key,
+            "odbc_password_key": odbc_password_key,
             "pool_max": pool_max,
             "acquire_timeout": acquire_timeout,
             "capture_response": capture_response,
@@ -1334,22 +1456,29 @@ def Database(
 
 def DatabasePoll(
     *,
-    server: str | EnvRef,  # SQL Server host (may be env())
-    database: str | EnvRef,
+    server: str | EnvRef,  # DB host (may be env())
     poll_statement: str,  # SELECT of the next batch (e.g. WHERE status='NEW' ORDER BY id)
+    database: str
+    | EnvRef
+    | None = None,  # required for dialect='sqlserver'; optional for 'generic'
+    dialect: str = "sqlserver",  # 'sqlserver' preset (default) | 'generic' ODBC (#66)
     mark_statement: str
     | None = None,  # UPDATE/DELETE run per row after the handler succeeds (:name)
     body_column: str | None = None,  # None → whole row as JSON; set → that column's value verbatim
     poll_seconds: float = 5.0,
-    auth: str = "sql",  # sql | integrated | entra
+    auth: str = "sql",  # sql | integrated | entra (SQL Server preset only)
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
-    encrypt: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
-    trust_server_certificate: bool = False,
+    encrypt: bool = True,  # SQL Server preset: False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    trust_server_certificate: bool = False,  # SQL Server preset only
     connect_timeout: int = 15,
     app_name: str = "messagefoundry",
-    odbc_driver: str = "ODBC Driver 18 for SQL Server",
+    odbc_driver: str = "ODBC Driver 18 for SQL Server",  # name the OS-installed driver for 'generic'
+    odbc_params: dict[str, str | EnvRef]
+    | None = None,  # generic dialect: driver-specific ODBC keywords (PORT, SSLmode, …)
+    odbc_user_key: str = "UID",  # generic dialect: ODBC keyword the username is emitted under
+    odbc_password_key: str = "PWD",  # generic dialect: ODBC keyword the password is emitted under
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
     encoding: str = "utf-8",
@@ -1366,13 +1495,20 @@ def DatabasePoll(
     whole row as a JSON object (pair with ``content_type=json``); set → that one column's value verbatim
     (e.g. a column holding an HL7 message → ``content_type=hl7v2``). Put secrets (``password``) in
     ``env()``; TLS is on by default (weakening needs ``MEFOR_ALLOW_INSECURE_TLS``); the polled ``server``
-    is gated by ``[egress].allowed_db``."""
+    is gated by ``[egress].allowed_db``.
+
+    ``dialect='generic'`` (#66) polls any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL) — name it
+    in ``odbc_driver``, pass driver keywords via ``odbc_params``, and configure TLS through the driver's own
+    keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
+    ``username``/``password`` (under ``odbc_user_key``/``odbc_password_key``, default ``UID``/``PWD``)."""
+    _reject_envref_odbc_params(odbc_params)
     return ConnectionSpec(
         ConnectorType.DATABASE,
         {
             "server": server,
             "database": database,
             "poll_statement": poll_statement,
+            "dialect": dialect,
             "mark_statement": mark_statement,
             "body_column": body_column,
             "poll_seconds": poll_seconds,
@@ -1385,6 +1521,9 @@ def DatabasePoll(
             "connect_timeout": connect_timeout,
             "app_name": app_name,
             "odbc_driver": odbc_driver,
+            "odbc_params": odbc_params,
+            "odbc_user_key": odbc_user_key,
+            "odbc_password_key": odbc_password_key,
             "pool_max": pool_max,
             "acquire_timeout": acquire_timeout,
             "encoding": encoding,
@@ -1403,6 +1542,7 @@ def Soap(
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
     encoding: str = "utf-8",
     capture_response: bool = False,  # capture the SOAP response envelope as a reply (ADR 0013)
     reingress_to: str
@@ -1448,6 +1588,7 @@ def Soap(
             "basic_password": basic_password,
             "timeout_seconds": timeout_seconds,
             "verify_tls": verify_tls,
+            "tls_allow_expired": tls_allow_expired,
             "encoding": encoding,
             "capture_response": capture_response,
             "reingress_to": reingress_to,
@@ -1526,6 +1667,7 @@ def Ftp(
     host: str | EnvRef,  # the FTP server (may be env())
     port: int | EnvRef = 21,
     tls: bool = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
+    tls_allow_expired: bool = False,  # FTPS: honour an EXPIRED server cert (chain+hostname still verified; #129)
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     remote_dir: str | EnvRef,
@@ -1554,6 +1696,7 @@ def Ftp(
             "protocol": "ftps" if tls else "ftp",
             "host": host,
             "port": port,
+            "tls_allow_expired": tls_allow_expired,
             "username": username,
             "password": password,
             "remote_dir": remote_dir,
@@ -1619,13 +1762,102 @@ class SetState:
             ) from exc
 
 
+#: Per-message metadata cap (BACKLOG #150, ADR 0081): a handler's `SetMeta` contribution is bounded so
+#: the encrypted `messages.metadata` column stays small. Over-cap raises at transform time → dead-letter.
+META_MAX_KEYS = 32
+META_MAX_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class SetMeta:
+    """A Handler's instruction to attach a small key/value to *this* message (channelMap / userdata
+    parity, BACKLOG #150, ADR 0081).
+
+    Like :class:`SetState`, a Handler does not mutate imperatively — it returns ``SetMeta(key, value)``
+    alongside its :class:`Send`\\ s, and the engine merges it under the message's ``metadata.user``
+    sub-key **inside the routed→outbound handoff transaction**, so a crash before commit leaves nothing
+    and a re-run applies it exactly once (the staged-pipeline pure-re-run invariant). The bag is surfaced
+    **read-only** (PHI-redacted) on the message API; there is no pipeline read-back. ``value`` is a
+    ``str`` (Corepoint-faithful); last-writer-wins on a repeated key within a message."""
+
+    key: str
+    value: str
+
+    def __post_init__(self) -> None:
+        # Validate in the author's handler (clear message), not deep in a store UPDATE. Both are the
+        # public metadata surface, so both must be plain strings.
+        if not isinstance(self.key, str) or not self.key:
+            raise WiringError("SetMeta key must be a non-empty string")
+        if not isinstance(self.value, str):
+            raise WiringError(
+                f"SetMeta({self.key!r}, ...): value must be a str (got {type(self.value).__name__})"
+            )
+
+
 #: What a Router/Handler receives: a mutable HL7 :class:`Message`, or a :class:`RawMessage` for a
 #: non-HL7 inbound (ADR 0004). The author knows which — a Router/Handler is bound to one inbound.
 Payload = Message | RawMessage
 RouterFn = Callable[[Payload], "list[str] | str | None"]
-#: A Handler returns deliveries and/or state writes (ADR 0005): a single :class:`Send`/:class:`SetState`,
-#: a mixed list, or ``None`` (filtered). ``Send``-only returns are unchanged — backward compatible.
-HandlerFn = Callable[[Payload], "Send | SetState | list[Send | SetState] | None"]
+#: A Handler returns deliveries and/or writes (ADR 0005 state, ADR 0081 metadata): a single
+#: :class:`Send`/:class:`SetState`/:class:`SetMeta`, a mixed list, or ``None`` (filtered). ``Send``-only
+#: returns are unchanged — backward compatible.
+HandlerFn = Callable[
+    [Payload], "Send | SetState | SetMeta | list[Send | SetState | SetMeta] | None"
+]
+#: An optional **router-stage** applicability predicate a Handler may declare (``@handler(name,
+#: accepts=...)``; ADR 0084). It is evaluated while the Router's selection is still being computed —
+#: *before* any routed row is materialized — so a handler that declines costs **0** transactions
+#: instead of the 2 an in-handler filter pays (ADR 0051's ``2H`` term becomes ``2·H_accepted``).
+#:
+#: It MUST be a **pure peek** over the message (message in → bool out): at-least-once replay re-runs
+#: the router handoff, so which handlers were declined has to re-derive identically. It runs in the
+#: router phase, where ``db_lookup``/``fhir_lookup`` already **raise** (ADR 0010/0043). The two OTHER
+#: run-scoped inputs, ``state_get``/``response_get`` (ADR 0005/0013), are registered TRANSFORM-only and
+#: **fail OPEN** in the router phase (they return their ``default``, not raise) — so a predicate that
+#: read them would silently see an EMPTY view and could INVERT a suppression/dedup filter migrated from
+#: a Handler. That would deliver PHI a rule excluded, with no ERROR/dead-letter/disposition anomaly, so
+#: :meth:`Registry.validate` REJECTS an ``accepts=`` predicate that names ``state_get``/``response_get``
+#: (fail-closed at load/``check`` time — a Handler that needs run-scoped state keeps its filter). It
+#: must also **not mutate** the payload: the predicates of one message share the Router's payload object.
+HandlerAccepts = Callable[[Payload], bool]
+
+#: Run-scoped accessors that FAIL OPEN (return ``default``, never raise) when their view is inactive —
+#: the router phase, where an ``accepts=`` predicate runs, activates neither. A predicate that named one
+#: would silently read an empty view and could invert a filter, so it is refused at load time. (Unlike
+#: ``db_lookup``/``fhir_lookup``, which RAISE in the router phase and so need no static check.)
+_ACCEPTS_FORBIDDEN_ACCESSORS = frozenset({"state_get", "response_get"})
+
+
+def _check_accepts_predicate(hname: str, pred: object) -> None:
+    """Fail closed on an ``accepts=`` predicate that can't hold its contract (ADR 0084).
+
+    Two static checks, both at load/``check`` time so a broken predicate is a :class:`WiringError`
+    rather than a per-message routing-stage dead-letter storm:
+
+    * **Non-callable** — ``accepts=True`` (passing the intended default instead of a predicate, a
+      plausible typo) would pass the orphan check yet ``pred(msg)`` raises ``TypeError: 'bool' object is
+      not callable`` on the FIRST message, dead-lettering every message on that inbound.
+    * **Fail-open run-scoped read** — a predicate whose code names ``state_get``/``response_get`` (ADR
+      0005/0013) would see an EMPTY view in the router phase and silently invert (deliver what a
+      suppression rule excluded). Those accessors return ``default`` instead of raising, so nothing
+      catches it at runtime; refuse it here (a filter that needs run-scoped state stays in the Handler).
+    """
+    if not callable(pred):
+        raise WiringError(
+            f"accepts= predicate for handler {hname!r} is not callable ({pred!r}); it must be a "
+            "function (msg) -> bool"
+        )
+    code = getattr(inspect.unwrap(pred), "__code__", None)
+    if code is None:
+        return  # a callable with no analyzable code object (e.g. a callable instance) — can't inspect
+    named = _ACCEPTS_FORBIDDEN_ACCESSORS.intersection(code.co_names)
+    if named:
+        raise WiringError(
+            f"accepts= predicate for handler {hname!r} reads run-scoped state "
+            f"({', '.join(sorted(named))}), which is unavailable in the router phase where the predicate "
+            "runs — it would silently return its default and could invert the filter. Keep that guard in "
+            "the Handler body (it runs in the transform phase, where the state view is active)."
+        )
 
 
 @dataclass(frozen=True)
@@ -1644,6 +1876,18 @@ class InboundConnection:
     # transaction (7 -> 5 commits/msg). Default False = the split pipeline, byte-identical. Eligibility is
     # re-checked per message at runtime (RegistryRunner); anything not eligible falls back to the split path.
     inline: bool = False
+    # Per-connection auto-start (#115): True = the RegistryRunner binds this inbound's listener at engine
+    # start (the default — unchanged behaviour); False = it is NOT bound at boot and reports
+    # status:"stopped", but an operator can still start it at runtime (POST /connections/{name}/start).
+    # A persisted "declare this feed start-disabled across restarts" flag (e.g. a test endpoint) — the
+    # missing durable counterpart to the transient runtime start/stop. Code-first AND connections.toml.
+    auto_start: bool = True
+    # Per-connection active-window scheduler (#147, ADR 0095): None = always-on (no scheduler task,
+    # byte-identical). Set = the RegistryRunner runs a per-connection scheduler task that AUTO-STARTs
+    # this inbound's listener on entering an active window and cleanly STOPs it on leaving — distinct
+    # from auto_start (a one-time boot gate) and from a TIMER source (which emits a body but never gates
+    # a connection up/down). Code-first AND connections.toml.
+    schedule: Schedule | None = None
     # Operability (Tier 4): free-form operator metadata (owner/runbook/env labels — surfaced by the
     # API, never used for routing); a per-connection inbound bind interface that overrides the service
     # [inbound].bind_host; and an inbound peer-IP allowlist (MLLP/TCP listen sources only). All
@@ -1698,9 +1942,23 @@ class OutboundConnection:
     internal_error: InternalErrorPolicy | None = None
     buildup: BuildupThreshold | None = None
     stall: StallThreshold | None = None
+    # Opt-in HL7 batch aggregation (#134, ADR 0082): None = deliver one message per send (unchanged);
+    # set = coalesce up to batch.max_count lane rows into one BHS…BTS envelope per send (count-or-head-
+    # age trigger). MLLP-only, and rejected on a capturing/reingressing outbound (validated at build).
+    # Same override idiom as retry/buildup — code-first AND via connections.toml (ADR 0007).
+    batch: BatchConfig | None = None
     # Shadow / parallel-run egress suppression (#15). False = deliver normally; True = the delivery
     # worker suppresses the real egress + finalizes PROCESSED. [shadow].simulate_all_egress forces it on.
     simulate: bool = False
+    # Per-connection auto-start (#115): True = built at engine start (default, unchanged); False = NOT
+    # built at boot (reports status:"stopped"), but startable at runtime (POST /connections/{name}/start).
+    # Its delivery worker still spawns so any routed backlog self-heals, exactly like a DR-parked outbound.
+    auto_start: bool = True
+    # Per-connection active-window scheduler (#147, ADR 0095): None = always-on (byte-identical). Set =
+    # the RegistryRunner AUTO-RESUMEs delivery on entering an active window and cleanly PAUSEs it (queued
+    # rows RETAINED pending, never dropped) on leaving — reusing start_outbound/stop_outbound, the same
+    # path the API uses. Code-first AND connections.toml.
+    schedule: Schedule | None = None
     # Per-connection dead-letter retention override (#34, ADR 0027): None = inherit the global
     # [retention].dead_letter_days window; 0 = keep this outbound's dead-letter bodies forever; >0 = days.
     # Keyed on the outbound that dead-lettered the row (purge_dead_letters keys by queue.destination_name =
@@ -1896,6 +2154,13 @@ class Registry:
     outbound: dict[str, OutboundConnection] = field(default_factory=dict)
     routers: dict[str, RouterFn] = field(default_factory=dict)
     handlers: dict[str, HandlerFn] = field(default_factory=dict)
+    # Router-stage `accepts=` predicates (ADR 0084), keyed by handler name — a SPARSE table holding an
+    # entry only for a handler that declared one. Deliberately parallel to `handlers` rather than folded
+    # into it: `handlers` maps name -> the bare fn, and eight call sites introspect that fn directly
+    # (`fn.__code__`, `__module__`) — reachability/impact analysis, the CLI, the sandbox worker, the
+    # support bundle. A record type there would break every one of them; a parallel dict touches none.
+    # Empty on a graph with no predicates, which route_only early-outs on (zero hot-path cost).
+    handler_accepts: dict[str, HandlerAccepts] = field(default_factory=dict)
     # Reference lookup tables loaded from <config_dir>/codesets/ — attached so a runner can re-publish
     # this graph's code sets as the active set while its routers/handlers run (call-time resolution).
     code_sets: dict[str, CodeSet] = field(default_factory=dict)
@@ -1929,8 +2194,11 @@ class Registry:
     def add_router(self, name: str, fn: RouterFn) -> None:
         self._add(self.routers, name, fn, "router")
 
-    def add_handler(self, name: str, fn: HandlerFn) -> None:
+    def add_handler(self, name: str, fn: HandlerFn, accepts: HandlerAccepts | None = None) -> None:
         self._add(self.handlers, name, fn, "handler")
+        if accepts is not None:
+            # _add on `handlers` already rejected a duplicate name, so this can't collide.
+            self.handler_accepts[name] = accepts
 
     def add_reference(self, spec: ReferenceSpec) -> None:
         self._add(self.references, spec.name, spec, "reference set")
@@ -1954,6 +2222,14 @@ class Registry:
                 raise WiringError(
                     f"inbound connection {conn.name!r} references unknown router {conn.router!r}"
                 )
+        # An `accepts=` predicate keyed to no handler would silently never run (ADR 0084): the router
+        # filter looks the predicate up BY handler name, so an orphan is dead code that reads as an
+        # armed filter. Fail closed at load/`check` time. (add_handler cannot produce one; a registry
+        # assembled by hand — a rebuild that drops a handler, a test — can.)
+        for hname, pred in self.handler_accepts.items():
+            if hname not in self.handlers:
+                raise WiringError(f"accepts= predicate declared for unknown handler {hname!r}")
+            _check_accepts_predicate(hname, pred)
         collisions = self.port_collisions()
         if collisions:
             port, first, second = collisions[0]
@@ -2066,8 +2342,11 @@ def build_inbound_connection(
     ack_after: AckAfter | None = None,
     strict: bool = False,
     hl7_version: str | None = None,
+    strict_timeout_s: float | None = None,
     content_type: ContentType | str = ContentType.HL7V2,
     inline: bool = False,
+    auto_start: bool = True,
+    schedule: Schedule | None = None,
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
     source_ip_allowlist: list[str] | None = None,
@@ -2228,9 +2507,13 @@ def build_inbound_connection(
         router=router,
         ack_mode=ack_mode,
         ack_after=ack_after,
-        validation=Validation(strict=strict, hl7_version=hl7_version),
+        validation=Validation(
+            strict=strict, hl7_version=hl7_version, strict_timeout_s=strict_timeout_s
+        ),
         content_type=content_type,
         inline=inline,
+        auto_start=auto_start,
+        schedule=schedule,
         metadata=metadata,
         bind_address=bind_address,
         source_ip_allowlist=allowlist,
@@ -2255,8 +2538,11 @@ def inbound(
     ack_after: AckAfter | None = None,
     strict: bool = False,
     hl7_version: str | None = None,
+    strict_timeout_s: float | None = None,
     content_type: ContentType | str = ContentType.HL7V2,
     inline: bool = False,
+    auto_start: bool = True,
+    schedule: Schedule | None = None,
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
     source_ip_allowlist: list[str] | None = None,
@@ -2280,7 +2566,10 @@ def inbound(
     parsing and they receive a :class:`RawMessage` (``.raw``/``.text``/``.json()``). It may be a
     :class:`ContentType` member **or** its bare string value (``content_type="x12"``), coerced at load —
     an unrecognized string fails loud as a :class:`WiringError`. ``strict`` validation is HL7-only, so it
-    cannot combine with a non-HL7 ``content_type``.
+    cannot combine with a non-HL7 ``content_type``. ``strict_timeout_s`` (#89) bounds the wall-clock a
+    single strict hl7apy validate may run before the message dead-letters (a DoS backstop against a
+    pathological body): ``None`` (default) inherits the engine default, ``<= 0`` disables it. Also a
+    ``connections.toml`` key (ADR 0007), so it stays hand-/GUI-editable.
 
     Operability (Tier 4, all optional): ``metadata`` attaches free-form operator labels
     (owner/runbook/environment) surfaced by the API and never used for routing; ``bind_address``
@@ -2320,8 +2609,11 @@ def inbound(
             ack_after=ack_after,
             strict=strict,
             hl7_version=hl7_version,
+            strict_timeout_s=strict_timeout_s,
             content_type=content_type,
             inline=inline,
+            auto_start=auto_start,
+            schedule=schedule,
             metadata=metadata,
             bind_address=bind_address,
             source_ip_allowlist=source_ip_allowlist,
@@ -2347,7 +2639,10 @@ def build_outbound_connection(
     internal_error: InternalErrorPolicy | None = None,
     buildup: BuildupThreshold | None = None,
     stall: StallThreshold | None = None,
+    batch: BatchConfig | None = None,
     simulate: bool = False,
+    auto_start: bool = True,
+    schedule: Schedule | None = None,
     dead_letter_days: int | None = None,
     priority: Priority | None = None,
     metadata: Mapping[str, Any] | None = None,
@@ -2446,6 +2741,24 @@ def build_outbound_connection(
                 f"outbound connection {name!r}: SOAP ws_security/ws_addressing require "
                 "soap_version='1.2' (WS-Addressing/WS-Security are coherent only on SOAP 1.2) (ADR 0015)."
             )
+    # ADR 0082 (#134): opt-in HL7 batch aggregation. Gate at the wiring choke point so `check`/dry-run
+    # rejects an unsupportable config before any store is opened.
+    if batch is not None:
+        if spec.type is not ConnectorType.MLLP:
+            # BHS/BTS framing is HL7v2-specific; other transports have no batch-envelope analogue. The
+            # outbound has no content_type (inbound-only), so gate on the MLLP connector type itself.
+            raise WiringError(
+                f"outbound connection {name!r}: batch aggregation is MLLP (HL7v2) only, "
+                f"not {spec.type.value.upper()} (ADR 0082)."
+            )
+        if spec.settings.get("capture_response"):
+            # One batch-level ACK covers the whole envelope; there is no per-row reply to capture or
+            # re-ingress (ADR 0013). Reject the combination rather than silently drop N-1 captures.
+            reason = "reingress_to" if spec.settings.get("reingress_to") else "capture_response"
+            raise WiringError(
+                f"outbound connection {name!r}: batch aggregation is incompatible with {reason} "
+                "— one batch ACK cannot fan out to N per-message captured replies (ADR 0082/0013)."
+            )
     return OutboundConnection(
         name=name,
         spec=spec,
@@ -2454,7 +2767,10 @@ def build_outbound_connection(
         internal_error=internal_error,
         buildup=buildup,
         stall=stall,
+        batch=batch,
         simulate=simulate,
+        auto_start=auto_start,
+        schedule=schedule,
         dead_letter_days=dead_letter_days,
         priority=priority,
         metadata=metadata,
@@ -2472,7 +2788,10 @@ def outbound(
     internal_error: InternalErrorPolicy | None = None,
     buildup: BuildupThreshold | None = None,
     stall: StallThreshold | None = None,
+    batch: BatchConfig | None = None,
     simulate: bool = False,
+    auto_start: bool = True,
+    schedule: Schedule | None = None,
     dead_letter_days: int | None = None,
     priority: Priority | None = None,
     metadata: Mapping[str, Any] | None = None,
@@ -2506,7 +2825,10 @@ def outbound(
             internal_error=internal_error,
             buildup=buildup,
             stall=stall,
+            batch=batch,
             simulate=simulate,
+            auto_start=auto_start,
+            schedule=schedule,
             dead_letter_days=dead_letter_days,
             priority=priority,
             metadata=metadata,
@@ -2526,13 +2848,28 @@ def router(name: str) -> Callable[[RouterFn], RouterFn]:
     return decorate
 
 
-def handler(name: str) -> Callable[[HandlerFn], HandlerFn]:
-    """Register a Handler: ``def handle(msg) -> Send | SetState | list[Send | SetState] | None``
-    (``None`` => filtered; :class:`SetState` declares a state write applied exactly-once in the
-    handoff, ADR 0005)."""
+def handler(
+    name: str, *, accepts: HandlerAccepts | None = None
+) -> Callable[[HandlerFn], HandlerFn]:
+    """Register a Handler: ``def handle(msg) -> Send | SetState | SetMeta | list[...] | None``
+    (``None`` => filtered; :class:`SetState` declares a cross-message state write, ADR 0005;
+    :class:`SetMeta` attaches a per-message metadata key/value, ADR 0081 — both applied exactly-once in
+    the handoff).
+
+    ``accepts`` (ADR 0084) is an optional **pure** router-stage predicate — ``(msg) -> bool`` — that
+    lets this handler decline a message at *routing* time, before a routed row is materialized: a
+    decline then costs 0 transactions instead of the 2 an in-handler ``return []`` pays. Omitted (the
+    default) the handler behaves exactly as today. See :data:`HandlerAccepts` for the purity contract
+    (no live lookups — they raise in the router phase anyway; no ``state_get``/``response_get`` — they
+    fail OPEN there and are rejected at load time; no mutation of the payload).
+
+    **Disposition shift when migrating a filter.** Moving an in-handler ``return []`` to ``accepts=``
+    changes a message that EVERY handler declines from ``FILTERED`` ("handlers ran, delivered nothing")
+    to ``UNROUTED`` ("no handler took it") — the ratified ADR 0084 §4 semantic, since a declined handler
+    never ran. Re-key any dashboard/alert that distinguishes the two buckets before migrating."""
 
     def decorate(fn: HandlerFn) -> HandlerFn:
-        _active_registry().add_handler(name, fn)
+        _active_registry().add_handler(name, fn, accepts)
         return fn
 
     return decorate
@@ -3076,6 +3413,18 @@ def validate_config(directory: str | Path) -> list[Diagnostic]:
                     f"{conn.router!r}"
                 )
             )
+    # Mirror Registry.validate's `accepts=` checks as editor diagnostics (ADR 0084) — an orphan /
+    # non-callable / fail-open-state-reading predicate should surface in the IDE, not first at `serve`.
+    for hname, pred in registry.handler_accepts.items():
+        if hname not in registry.handlers:
+            diagnostics.append(
+                Diagnostic(message=f"accepts= predicate declared for unknown handler {hname!r}")
+            )
+            continue
+        try:
+            _check_accepts_predicate(hname, pred)
+        except WiringError as exc:
+            diagnostics.append(Diagnostic(message=str(exc)))
     for port, first, second in registry.port_collisions():  # low-13
         diagnostics.append(
             Diagnostic(

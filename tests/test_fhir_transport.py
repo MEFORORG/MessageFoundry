@@ -20,6 +20,7 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import FHIR, WiringError
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports import build_destination
@@ -92,6 +93,50 @@ def test_fhir_rejects_non_http_scheme() -> None:
         build_destination(
             Destination(name="OB", type=ConnectorType.FHIR, settings=FHIR(url="ftp://x/y").settings)
         )
+
+
+def test_fhir_cleartext_http_nonloopback_refused_without_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ASVS 12.2.1: the FHIR resource/Bundle body is PHI, so a cleartext http egress to a non-loopback
+    # host is refused even with NO credentials, unless the explicit escape is set.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with pytest.raises(ValueError, match="cleartext http to a non-loopback host"):
+        build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.FHIR,
+                settings=FHIR(url="http://fhir.example.org/fhir").settings,
+            )
+        )
+
+
+def test_fhir_cleartext_http_loopback_allowed() -> None:
+    # On-box loopback cleartext egress is not a network exposure → allowed (byte-identical posture).
+    dest = build_destination(
+        Destination(
+            name="OB",
+            type=ConnectorType.FHIR,
+            settings=FHIR(url="http://127.0.0.1:8080/fhir").settings,
+        )
+    )
+    assert isinstance(dest, FhirDestination)
+
+
+def test_fhir_cleartext_http_nonloopback_allowed_with_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    # #200 (ADR 0092): the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
+    with active_hop_posture(HopPosture(is_phi=True, production=False)):
+        dest = build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.FHIR,
+                settings=FHIR(url="http://fhir.example.org/fhir").settings,
+            )
+        )
+    assert isinstance(dest, FhirDestination)  # built (warns loudly), not refused
 
 
 def test_fhir_rejects_xml_format() -> None:
@@ -403,3 +448,58 @@ def test_fhir_egress_deny_by_default_refuses_when_unconfigured() -> None:
     dest = Destination(name="OB", type=ConnectorType.FHIR, settings=FHIR(url=BASE).settings)
     with pytest.raises(WiringError):
         check_egress_allowed(dest, EgressSettings(deny_by_default=True))
+
+
+# --- per-message dynamic HTTP headers (BACKLOG #68) -------------------------------------------------
+
+
+def test_fhir_dynamic_headers_flag_opt_in() -> None:
+    assert _dest().consumes_metadata is False
+    assert _dest(dynamic_headers=True).consumes_metadata is True
+
+
+async def test_fhir_per_message_header_appears_on_request() -> None:
+    dest = _dest(interaction="create")
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(PATIENT, metadata={"http.header.X-Trace-Id": "trace-9", "note": "skip"})
+    req = opener.requests[0]
+    assert req.get_header("X-trace-id") == "trace-9"
+    assert not req.has_header("Note")
+
+
+async def test_fhir_per_message_header_overrides_static() -> None:
+    dest = _dest(interaction="create", headers={"X-Trace": "static"})
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(PATIENT, metadata={"http.header.X-Trace": "dynamic"})
+    assert opener.requests[0].get_header("X-trace") == "dynamic"
+
+
+async def test_fhir_dynamic_header_cannot_override_if_match() -> None:
+    # The connector's interaction header (If-Match) is semantically required and must win over a
+    # message-derived header of the same name.
+    dest = _dest(interaction="update", conditional="if-match")
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(PATIENT_VERSIONED, metadata={"http.header.If-Match": 'W/"attacker"'})
+    assert opener.requests[0].get_header("If-match") == 'W/"3"'
+
+
+async def test_fhir_crlf_in_header_value_is_neutralized() -> None:
+    dest = _dest(interaction="create")
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(PATIENT, metadata={"http.header.X-Evil": "ok\r\nX-Injected: 1"})
+    req = opener.requests[0]
+    assert req.get_header("X-evil") == "okX-Injected: 1"
+    assert not req.has_header("X-injected")
+
+
+async def test_fhir_no_metadata_is_byte_identical() -> None:
+    dest = _dest(interaction="create")
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(PATIENT)  # no metadata → no dynamic headers, unchanged request
+    req = opener.requests[0]
+    assert req.get_header("Content-type") == "application/fhir+json"

@@ -28,7 +28,7 @@ from typing import Any
 #: (a CoreHandlers/AdminHandlers field, a rendered DTO field set, the app.state attributes the
 #: console reads, the ``api.security`` deps it imports directly, or the ``/ws`` push shape). The
 #: console declares ``SUPPORTED_ENGINE_SEAMS`` and refuses a skew at startup (``assert_engine_seam``).
-ENGINE_UI_SEAM: int = 1
+ENGINE_UI_SEAM: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +48,7 @@ class CoreHandlers:
     stop_connection: Callable[..., Awaitable[Any]]
     restart_connection: Callable[..., Awaitable[Any]]
     replay_message: Callable[..., Awaitable[Any]]
+    edit_resend_message: Callable[..., Awaitable[Any]]  # edit-and-resubmit (ADR 0090 §9, seam v2)
     replay_dead_letters: Callable[..., Awaitable[Any]]
     list_active_alerts: Callable[..., Awaitable[Any]]
     alerts_rules: Callable[..., Awaitable[Any]]

@@ -39,6 +39,7 @@ from typing import Any
 
 from messagefoundry.config.active_environment import activated as _environment_activated
 from messagefoundry.config.code_sets import activated as _code_sets_activated
+from messagefoundry.config.code_sets import capturing as _unmapped_capturing
 from messagefoundry.config.reference import activated as _reference_activated
 from messagefoundry.config.response import activated as _response_activated
 from messagefoundry.config.state import activated as _state_activated
@@ -76,6 +77,9 @@ class RunContext:
     active_environment: str | None = None
     ingest_time: float | None = (
         None  # the message's re-run-stable enqueue time (ingest-time provider)
+    )
+    message_id: str | None = (
+        None  # #162: the run's message id, so the unmapped-capture sink can key idempotently
     )
 
 
@@ -149,5 +153,15 @@ register_run_context("response", lambda c: _response_activated(c.response_view),
 register_run_context(
     "environment",
     lambda c: _environment_activated(c.active_environment),
+    phases={ROUTER, TRANSFORM},
+)
+# #162: the run-scoped unmapped-input capture buffer. Registered LAST (innermost) — a router/handler's
+# code_set(...).translate() miss is recorded regardless of nesting depth (the run body sits inside every
+# provider), so appending here keeps the built-in five in their asserted order while activating capture
+# for every router/transform run. On scope exit the buffer drains once (non-PHI counts + optional keyed
+# sink) — the controlled, re-run-idempotent point (see config.code_sets.capturing / ADR 0033).
+register_run_context(
+    "unmapped_capture",
+    lambda c: _unmapped_capturing(c.message_id),
     phases={ROUTER, TRANSFORM},
 )

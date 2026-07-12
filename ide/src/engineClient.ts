@@ -77,12 +77,26 @@ export function postJson<T>(
   });
 }
 
+/** Default GET timeout (ms). A hung engine (accepts the socket but never answers) must not leave the
+ *  caller pending forever — the status-bar probe would then stick on "checking…" and leak the socket. */
+export const GET_TIMEOUT_MS = 5000;
+
 /**
  * GET `<baseUrl><route>` and parse the JSON response. Mirrors {@link postJson} (same unreachable /
  * non-2xx handling and FastAPI `{"detail": ...}` extraction) but sends no body — used for read-only
- * engine endpoints such as `/ai/policy`.
+ * engine endpoints such as `/ai/policy` and the status-bar `/health` probe.
+ *
+ * A `timeoutMs` cap (default {@link GET_TIMEOUT_MS}) destroys a request that produces no response in
+ * time, rejecting with a plain (non-{@link HttpError}) Error — so a hung engine classifies as a
+ * transport failure (→ unreachable), exactly like a refused connection. `timeoutMs` is injectable so a
+ * test can force the path fast; production callers omit it.
  */
-export function getJson<T>(baseUrl: string, route: string, token?: string): Promise<T> {
+export function getJson<T>(
+  baseUrl: string,
+  route: string,
+  token?: string,
+  timeoutMs: number = GET_TIMEOUT_MS,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let url: URL;
     try {
@@ -112,6 +126,9 @@ export function getJson<T>(baseUrl: string, route: string, token?: string): Prom
         reject(new HttpError(status, httpErrorMessage(status, text)));
       });
     });
+    // Fail an unanswered request (hung engine) after the cap: destroy it → the 'error' handler below
+    // fires with our timeout Error (no ErrnoException.code), rejecting as a transport failure.
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`engine request timed out after ${timeoutMs}ms`)));
     req.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET" || err.code === "ENOTFOUND") {
         reject(new Error(`engine not reachable at ${baseUrl} — start it (Console or \`messagefoundry serve\`).`));

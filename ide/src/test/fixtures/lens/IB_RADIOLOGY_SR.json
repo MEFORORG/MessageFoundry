@@ -1,0 +1,63 @@
+{
+  "module": "samples/config/IB_RADIOLOGY_SR.py",
+  "handlers": [
+    {
+      "handler": "sr_to_oru",
+      "module": "samples/config/IB_RADIOLOGY_SR.py",
+      "def_line": 70,
+      "rows": [
+        {
+          "kind": "code",
+          "line_start": 74,
+          "line_end": 75,
+          "nesting": 0
+        },
+        {
+          "kind": "control",
+          "control": "if",
+          "test_src": "not measurements",
+          "recognized": true,
+          "line_start": 76,
+          "line_end": 76,
+          "nesting": 0
+        },
+        {
+          "kind": "code",
+          "line_start": 77,
+          "line_end": 77,
+          "nesting": 1
+        },
+        {
+          "kind": "code",
+          "line_start": 78,
+          "line_end": 84,
+          "nesting": 0
+        },
+        {
+          "kind": "control",
+          "control": "for",
+          "test_src": "set_id, measurement in enumerate(measurements, start=1)",
+          "recognized": false,
+          "line_start": 85,
+          "line_end": 85,
+          "nesting": 0
+        },
+        {
+          "kind": "code",
+          "line_start": 86,
+          "line_end": 86,
+          "nesting": 1
+        },
+        {
+          "kind": "send",
+          "outbounds": [
+            "OB_POWERSCRIBE"
+          ],
+          "line_start": 87,
+          "line_end": 87,
+          "nesting": 0
+        }
+      ]
+    }
+  ]
+}

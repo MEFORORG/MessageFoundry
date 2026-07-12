@@ -17,6 +17,7 @@ from messagefoundry.transports import (  # noqa: F401  (import = registration)
     database,
     dicom,
     dicomweb,
+    direct,
     email,
     fhir,
     file,

@@ -262,7 +262,9 @@ async def _login_token(c: httpx.AsyncClient, username: str = "boss") -> str:
 
 
 async def test_admin_route_from_new_ip_forces_step_up_then_clears(engine: Engine) -> None:
-    service = AuthService(engine.store, AuthSettings(admin_new_ip_step_up=True))
+    # New-client-IP step-up test (admin route), not an MFA test: pin require_mfa=False so the admin's
+    # step-up op isn't blocked first by the BACKLOG #187 secure default (require_mfa now ON).
+    service = AuthService(engine.store, AuthSettings(admin_new_ip_step_up=True, require_mfa=False))
     await service.initialize()
     await _add_admin(service, "boss")
     async with _client_at(engine, service, "10.0.0.1") as a:
@@ -284,7 +286,9 @@ async def test_admin_route_from_new_ip_forces_step_up_then_clears(engine: Engine
 
 
 async def test_known_ip_with_feature_on_is_unobtrusive(engine: Engine) -> None:
-    service = AuthService(engine.store, AuthSettings(admin_new_ip_step_up=True))
+    # New-client-IP step-up test (admin route), not an MFA test: pin require_mfa=False so the admin's
+    # step-up op isn't blocked first by the BACKLOG #187 secure default (require_mfa now ON).
+    service = AuthService(engine.store, AuthSettings(admin_new_ip_step_up=True, require_mfa=False))
     await service.initialize()
     await _add_admin(service, "boss")
     async with _client_at(engine, service, "10.0.0.1") as a:
@@ -294,7 +298,7 @@ async def test_known_ip_with_feature_on_is_unobtrusive(engine: Engine) -> None:
 
 
 async def test_disabled_by_default_new_ip_does_not_force_step_up(engine: Engine) -> None:
-    service = AuthService(engine.store, AuthSettings())  # default off
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))  # admin_new_ip default off
     await service.initialize()
     await _add_admin(service, "boss")
     async with _client_at(engine, service, "10.0.0.1") as a:
@@ -308,7 +312,9 @@ async def test_new_ip_never_overrides_rbac(engine: Engine) -> None:
     """A viewer lacking ``users:manage`` is denied for *permission* — RBAC runs before the step-up /
     IP logic, so the IP signal neither grants nor is even consulted (it never changes an authz
     decision)."""
-    service = AuthService(engine.store, AuthSettings(admin_new_ip_step_up=True))
+    # New-client-IP step-up test (admin route), not an MFA test: pin require_mfa=False so the admin's
+    # step-up op isn't blocked first by the BACKLOG #187 secure default (require_mfa now ON).
+    service = AuthService(engine.store, AuthSettings(admin_new_ip_step_up=True, require_mfa=False))
     await service.initialize()
     uid = await service.create_local_user(
         username="viewer1",

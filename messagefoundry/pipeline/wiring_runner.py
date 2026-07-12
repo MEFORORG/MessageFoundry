@@ -33,6 +33,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -40,6 +41,7 @@ from typing import Any, Protocol, cast
 from messagefoundry.config.models import (
     AckAfter,
     AckMode,
+    BatchConfig,
     BuildupThreshold,
     ConnectorType,
     ContentType,
@@ -49,6 +51,7 @@ from messagefoundry.config.models import (
     OutboundSigning,
     Priority,
     RetryPolicy,
+    Schedule,
     Source,
     StallThreshold,
 )
@@ -59,6 +62,11 @@ from messagefoundry.config.fhir_lookup import (
 )
 from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.settings import EgressSettings, StoreBackend
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    TrustAnchorPolicy,
+    active_hop_posture,
+)
 from messagefoundry.config.wiring import (
     InboundConnection,
     OutboundConnection,
@@ -70,13 +78,23 @@ from messagefoundry.config.wiring import (
     resolve_env_settings,
     resolve_listener_binding,
 )
-from messagefoundry.parsing import HL7PeekError, Peek, RawMessage, normalize, summarize, validate
+from messagefoundry.parsing import (
+    HL7PeekError,
+    Peek,
+    RawMessage,
+    encode_batch,
+    normalize,
+    summarize,
+    validate,
+)
+from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.sharding import owner_shard_of_destination
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.pipeline.dryrun import route_only, transform_one
+from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy, SandboxSession
 from messagefoundry.pipeline.phase_timing import (
     # Explicit re-exports (`as`): the pre-#842 import surface — tests and the harness node-log parser
     # import these names from wiring_runner, not from phase_timing.
@@ -93,6 +111,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
 )
 from messagefoundry.store import MessageStatus, OutboxItem, QueueStore, Stage
 from messagefoundry.store.base import pool_over_provisioned_warning
+from messagefoundry.store.metadata import user_metadata
 from messagefoundry.transports import (
     DeliveryError,
     DestinationConnector,
@@ -171,10 +190,38 @@ _PER_LANE_IDLE_BACKSTOP_SECONDS = 30.0
 # full backstop — worse than no wake).
 _RETRY_WAKE_SLACK_SECONDS = 0.05
 
+# #134 (ADR 0082): the batch delivery body's coalescing poll slice — how long it waits between
+# top-up claims while a partial batch is still filling (bounded by the head's max_wait_ms deadline).
+# Small so a graceful stop / a newly-arrived row is observed promptly; the deadline (not this) bounds
+# the total wait.
+_BATCH_POLL_SECONDS = 0.02
+
 # How long the handler's worker thread blocks on a single db_lookup() before giving up (ADR 0010).
 # A live lookup that exceeds this raises (→ the message's transform fails and dead-letters) rather than
 # pinning a worker thread forever; the orphaned query still completes on the loop and releases its conn.
 _LOOKUP_RESULT_TIMEOUT_SECONDS = 30.0
+
+# How long a single strict hl7apy validate may run before the message dead-letters (#89, DoS backstop).
+# Mirrors the _LOOKUP_RESULT_TIMEOUT_SECONDS rationale: a pathological body that makes hl7apy's
+# structure/cardinality parse spin can otherwise pin the listener's off-loop worker; the timeout frees
+# the listener and routes the message to ERROR/dead-letter. It CANNOT kill the to_thread worker (no
+# thread cancellation in CPython) — the orphaned validate leaks its thread until it returns, bounded by
+# the 16 MiB / segment caps enforce_size_limits fires BEFORE the slow parse (validate.py). Per-inbound
+# `validation.strict_timeout_s` overrides this; <= 0 there disables the backstop entirely. Owner-tunable.
+_STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
+
+
+def _strict_validate_timeout(ic: InboundConnection) -> float | None:
+    """The effective wall-clock (seconds) for this inbound's strict validate, or ``None`` if disabled.
+
+    Resolves the per-connection ``validation.strict_timeout_s`` against the engine default (#89):
+    ``None`` inherits ``_STRICT_VALIDATE_TIMEOUT_SECONDS``; ``<= 0`` disables the backstop (returns
+    ``None`` → the caller runs the validate un-timed, the pre-#89 behaviour). The value is trusted config,
+    not an HL7 field."""
+    configured = ic.validation.strict_timeout_s
+    effective = _STRICT_VALIDATE_TIMEOUT_SECONDS if configured is None else configured
+    return effective if effective > 0 else None
+
 
 # Engine-level ingress size ceiling for NON-HL7 content types (SEC-017, CWE-770). The HL7 path already
 # enforces this via Peek.parse → enforce_size_limits; the binary/text branches had only the per-transport
@@ -337,6 +384,7 @@ class _FusedHandoffStore(Protocol):
         deliveries: Sequence[tuple[str, str]],
         state_ops: Sequence[tuple[str, str, Any]] = (),
         pt_deliveries: Sequence[tuple[str, str]] = (),
+        meta_ops: Sequence[tuple[str, str]] = (),
         correlation_depth_cap: int = 8,
         now: float | None = None,
     ) -> tuple[bool, list[tuple[tuple[str, str], Any]]]: ...
@@ -405,6 +453,8 @@ class RegistryRunner:
         dr_threshold: Priority | None = None,
         alert_sink: AlertSink | None = None,
         egress: EgressSettings | None = None,
+        hop_posture: HopPosture | None = None,
+        trust_anchor_policy: TrustAnchorPolicy | None = None,
         simulate_all: bool = False,
         env_values: Mapping[str, Any] | None = None,
         active_environment: str | None = None,
@@ -422,12 +472,34 @@ class RegistryRunner:
         infra_fault_policy: str = "stop",
         infra_fault_stop_after: int = 10,
         infra_fault_backoff_cap: float = 60.0,
+        # #109 (ADR 0095): what an outbound does on a PERMANENT credential/auth fault — "stop" (default)
+        # halts the lane immediately + retains the queued rows un-errored (no re-auth storm that could
+        # lock out the partner account); "dead_letter" keeps the historical fail-fast dead-letter path.
+        credential_fault_policy: str = "stop",
+        # #147 (ADR 0095): the per-connection active-window scheduler's tick granularity (seconds) and an
+        # injectable UTC clock (mirrors dryrun's ingest_time seam) so tests drive schedule boundaries
+        # deterministically. None → wall clock (datetime.now(timezone.utc)).
+        schedule_tick: float = 30.0,
+        schedule_clock: Callable[[], datetime] | None = None,
         fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
         pooled_fusing_workers: int = 8,
         batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
+        sandbox_policy: SandboxPolicy
+        | None = None,  # ADR 0087 #197: opt-in subprocess isolation (default-OFF)
+        sandbox_config_source: tuple[str | None, str | None] | None = None,
     ) -> None:
         self.registry = registry
         self.store = store
+        # ADR 0087 (#197) opt-in Router/Handler subprocess isolation. None or mode=off → in-process,
+        # byte-identical, zero overhead (no session ever constructed). mode=subprocess → one PERSISTENT
+        # worker child per inbound, built lazily on first dispatch (off the loop, inside the worker
+        # thread) and closed at stop(). The (config_dir, env) source lets the child re-load the SAME
+        # message graph to look a Router/Handler up by name; None config_dir (embedding) can't isolate,
+        # so _sandbox_for degrades to in-process. Read ONCE at construction (a /config/reload does NOT
+        # re-read it — restart to change, exactly like claim_mode).
+        self._sandbox_policy = sandbox_policy
+        self._sandbox_config_source = sandbox_config_source
+        self._sandbox_sessions: dict[str, SandboxSession] = {}
         # ADR 0013 Increment 2: the loop-prevention cap for re-ingress. A re-ingressed message at this
         # correlation depth still routes; the next hop (depth+1) dead-letters its work-row and ERRORs the
         # origin. Coarse by design (bounds total work, not topology). From [pipeline] max_correlation_depth.
@@ -475,6 +547,16 @@ class RegistryRunner:
         # Fail-closed outbound destination allowlist (WP-11c); empty = unrestricted. Enforced at
         # build_check (config load/reload) and start, so a non-allowed destination is refused.
         self._egress = egress or EgressSettings()
+        # #200 (ADR 0092): the instance's derived security posture (PHI? production?), stamped as the
+        # active hop posture for the whole connector-construction block in build_check so each cell keys
+        # its posture-keyed insecure-hop refusal on this config's posture. None (a test/embedding that
+        # derives none) leaves it unstamped → a cell fail-closes (treats the hop as prod-PHI).
+        self._hop_posture = hop_posture
+        # #190 (ADR 0093): the instance-wide [tls] client trust-anchor policy, threaded onto every
+        # outbound Destination by _dest_config so the internal-outbound TLS context builders (MLLP/DICOM/
+        # FTPS) resolve the same org internal-CA anchor at build_check AND live construction. None → the
+        # default system/no-op policy (byte-identical — the OS trust store verifies the peer).
+        self._trust_anchor_policy = trust_anchor_policy or TrustAnchorPolicy()
         # Deployment-wide shadow override ([shadow].simulate_all_egress, #15): when True, EVERY outbound
         # runs egress-suppressed regardless of its own simulate= flag. Resolved per-connection into
         # self._simulate at reconcile (per-connection simulate OR this).
@@ -531,6 +613,10 @@ class RegistryRunner:
         self._internal_error: dict[str, InternalErrorPolicy] = {}
         self._buildup: dict[str, BuildupThreshold] = {}
         self._stall: dict[str, StallThreshold] = {}
+        # Opt-in HL7 batch aggregation (#134, ADR 0082): per-outbound BatchConfig (None = no batching,
+        # the unchanged one-message-per-send path). Read live per delivery so a reload can turn batching
+        # on/off under a running worker.
+        self._batch: dict[str, BatchConfig | None] = {}
         # Effective per-connection egress-suppression (#15): per-connection simulate= OR simulate_all.
         self._simulate: dict[str, bool] = {}
         # Per-outbound-lane health (#46), for the edge-triggered connection_lost/restored events. True
@@ -624,6 +710,20 @@ class RegistryRunner:
         self._infra_fault_policy = infra_fault_policy
         self._infra_fault_stop_after = infra_fault_stop_after
         self._infra_fault_backoff_cap = infra_fault_backoff_cap
+        # #109 (ADR 0095): credential-fault (partner account-lockout protection) policy. Validated here
+        # so a bad value fails loud at construction, mirroring the infra_fault_policy assert above.
+        assert credential_fault_policy in ("stop", "dead_letter")
+        self._credential_fault_policy = credential_fault_policy
+        # #147 (ADR 0095): per-connection active-window scheduler. `_schedule_clock` is injectable for
+        # deterministic tests (returns an AWARE UTC datetime); `_schedule_tick` is the reconcile
+        # granularity. `_schedule_workers` holds one cooperatively-cancellable task per SCHEDULED
+        # connection, spawned in start() and cancelled in _teardown_unsafe (empty = no scheduled
+        # connections = byte-identical always-on lifecycle).
+        self._schedule_tick = schedule_tick
+        self._schedule_clock: Callable[[], datetime] = schedule_clock or (
+            lambda: datetime.now(timezone.utc)
+        )
+        self._schedule_workers: dict[str, asyncio.Task[None]] = {}
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
         # (restart to change, exactly like claim_mode). ``_fusion_active`` is the EFFECTIVE decision,
         # resolved in _start_pooled_dispatchers AFTER trying to open the sync pools + build the per-stage
@@ -992,18 +1092,24 @@ class RegistryRunner:
             resolved[name] = settings
         return FhirLookupExecutor(resolved)
 
-    def _run_fhir_lookup(self, connection: str, query: str) -> dict[str, Any]:
+    def _run_fhir_lookup(
+        self,
+        connection: str,
+        query: str,
+        params: Mapping[str, str | list[str]] | None = None,
+    ) -> dict[str, Any]:
         """The FHIR-lookup runner published to Handlers (``fhir_lookup`` → this). Called FROM the handler's
         worker thread, it bridges the async GET onto the engine loop via ``run_coroutine_threadsafe`` and
         blocks the WORKER THREAD — never the loop — for the result (bounded by
-        ``_LOOKUP_RESULT_TIMEOUT_SECONDS``)."""
+        ``_LOOKUP_RESULT_TIMEOUT_SECONDS``). ``params`` (BACKLOG #204) carries the safely-encoded
+        structured search form; the executor percent-encodes each value before it reaches the URL."""
         executor = self._fhir_lookup_executor
         loop = self._loop
         if executor is None or loop is None:  # only published when both exist; guard defensively
             raise FhirLookupError(
                 "fhir_lookup is unavailable — no FhirLookup connections are configured"
             )
-        future = asyncio.run_coroutine_threadsafe(executor.read(connection, query), loop)
+        future = asyncio.run_coroutine_threadsafe(executor.read(connection, query, params), loop)
         return future.result(_LOOKUP_RESULT_TIMEOUT_SECONDS)
 
     # --- per-connection control (console operations) -------------------------
@@ -1155,7 +1261,7 @@ class RegistryRunner:
             return "in", build_source(source_cfg)
         oc = self.registry.outbound.get(name)
         if oc is not None:
-            dest_cfg = _dest_config(oc, self._env_values)
+            dest_cfg = _dest_config(oc, self._env_values, self._trust_anchor_policy)
             check_egress_allowed(dest_cfg, self._egress)
             return "out", build_destination(dest_cfg)
         raise KeyError(name)
@@ -1276,6 +1382,71 @@ class RegistryRunner:
             if worker is None or worker.done():
                 self._spawn_worker(name)
 
+    # --- per-connection active-window scheduler (#147, ADR 0095) --------------
+
+    def _start_schedulers(self) -> None:
+        """Spawn one active-window scheduler task per scheduled inbound/outbound connection. Called
+        once from :meth:`start` under the reload lock; idempotent per name (a live task is not
+        re-spawned). Byte-identical no-op when no connection declares a ``schedule``."""
+        for ic in self.registry.inbound.values():
+            if ic.schedule is not None:
+                self._spawn_scheduler(ic.name, "inbound", ic.schedule)
+        for oc in self.registry.outbound.values():
+            if oc.schedule is not None:
+                self._spawn_scheduler(oc.name, "outbound", oc.schedule)
+
+    def _spawn_scheduler(self, name: str, kind: str, schedule: Schedule) -> None:
+        existing = self._schedule_workers.get(name)
+        if existing is not None and not existing.done():
+            return
+        self._schedule_workers[name] = asyncio.create_task(
+            self._schedule_worker(name, kind, schedule)
+        )
+
+    async def _schedule_worker(self, name: str, kind: str, schedule: Schedule) -> None:
+        """Reconcile ``name``'s live listen/deliver state against its active-window ``schedule`` every
+        ``_schedule_tick`` seconds until the runner stops. Cooperatively cancellable (it sleeps via
+        :meth:`_stop_or_sleep`, which returns True on stop). A reconcile error is logged and swallowed —
+        a transient start/stop failure must never kill the scheduler and freeze the connection's
+        calendar (the next tick retries)."""
+        while not self._stop.is_set():
+            try:
+                await self._reconcile_schedule(name, kind, schedule)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("schedule worker %r: reconcile failed; will retry next tick", name)
+            if await self._stop_or_sleep(self._schedule_tick):
+                return
+
+    async def _reconcile_schedule(self, name: str, kind: str, schedule: Schedule) -> None:
+        """Bring ``name`` up or park it to match its schedule at the current (injectable) clock — one
+        idempotent step. Reuses the SAME per-connection lifecycle the API uses: an inbound is
+        started/stopped by binding/unbinding its listener (its router/transform workers keep draining
+        any in-flight backlog); an outbound is resumed/paused (a park RETAINS its queued rows pending,
+        never dropped). A schedule-park is a clean stop — in-flight messages follow normal stop
+        semantics. Distinct stop-reason logging keeps a schedule-park legible vs a credential-fault or
+        content STOP (#109)."""
+        # Sharding (ADR 0073): only the OWNING shard drives an outbound's delivery lifecycle — a
+        # non-owner's start_outbound/stop_outbound raises ShardLaneOwnershipError. Skip so the scheduler
+        # doesn't error every tick on a lane another shard owns (single-shard/unsharded owns everything).
+        if kind == "outbound" and not self._owns_destination(name):
+            return
+        active = schedule.is_active(self._schedule_clock())
+        running = self.inbound_running(name) if kind == "inbound" else self.outbound_running(name)
+        if active and not running:
+            log.info("schedule: connection %r entering active window — starting", name)
+            if kind == "inbound":
+                await self.start_inbound(name)
+            else:
+                await self.start_outbound(name)
+        elif not active and running:
+            log.info("schedule: connection %r leaving active window — parking (clean stop)", name)
+            if kind == "inbound":
+                await self.stop_inbound(name)
+            else:
+                await self.stop_outbound(name)
+
     def _guard_port_conflict(self, ic: InboundConnection) -> None:
         """Refuse to bind ``ic`` if its resolved ``(host, port)`` collides with a reserved service
         binding (the API listener) or an already-bound sibling source — raising :class:`PortConflictError`
@@ -1334,15 +1505,46 @@ class RegistryRunner:
         # Exposed-gate (ADR 0002 §0 / ADR 0025 §9): refuse a non-loopback MLLP or DICOM SCP listener
         # without TLS at start, and a non-loopback raw-TCP/X12 listener (plaintext-only — no TLS option)
         # at start (cleartext PHI on the wire). Each guard no-ops for the other's type.
-        check_mllp_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
-        check_dimse_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
-        check_tcp_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
-        check_http_tls_exposure(source_cfg, ic.name, allow_insecure_bind=self._allow_insecure_bind)
-        source = build_source(source_cfg)
+        # #200: thread the derived instance posture so --allow-insecure-bind is CLAMPED — a
+        # production-PHI listener refuses cleartext even with the flag (a per-connection
+        # tls_hop_attested is the surgical per-hop opt-in).
+        check_mllp_tls_exposure(
+            source_cfg,
+            ic.name,
+            allow_insecure_bind=self._allow_insecure_bind,
+            posture=self._hop_posture,
+        )
+        check_dimse_tls_exposure(
+            source_cfg,
+            ic.name,
+            allow_insecure_bind=self._allow_insecure_bind,
+            posture=self._hop_posture,
+        )
+        check_tcp_tls_exposure(
+            source_cfg,
+            ic.name,
+            allow_insecure_bind=self._allow_insecure_bind,
+            posture=self._hop_posture,
+        )
+        check_http_tls_exposure(
+            source_cfg,
+            ic.name,
+            allow_insecure_bind=self._allow_insecure_bind,
+            posture=self._hop_posture,
+        )
+        # #200 (ADR 0092): stamp the posture for the source build too (a DATABASE poll source keys its
+        # weakened-TLS refusal on it), matching the exposure-check posture threading above.
+        with active_hop_posture(self._hop_posture):
+            source = build_source(source_cfg)
         # Inject the connection-event sink (#46) BEFORE start so a listen source can emit accept/refuse/
         # close. None when capture is off (byte-identical). transports/ stays store-agnostic — the sink
         # is a runner-owned coroutine that only enqueues onto the off-hot-path drain queue.
         source.on_connection_event = self._make_connection_event_sink(ic)
+        # Inject the inbound's declared content format (ADR 0004) the same runtime way — the transport
+        # Source config carries no content_type (it lives on the wiring's InboundConnection). A content-
+        # sniffing poll source (RemoteFileSource) reads it to gate its HL7-header quarantine to hl7v2
+        # drops only, so a legitimate X12/DICOM/binary drop is not wrongly rejected.
+        source.content_type = ic.content_type
         # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
         # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/
         # free of any pipeline/cluster import. Only POLL sources act on it — they skip a scan when it
@@ -1440,7 +1642,19 @@ class RegistryRunner:
         self._internal_error[name] = oc.internal_error or self._internal_error_default
         self._buildup[name] = oc.buildup or self._buildup_default
         self._stall[name] = oc.stall or self._stall_default
+        # #134 (ADR 0082): per-outbound batch aggregation (None = the unchanged one-per-send path).
+        # No global [delivery] default — batching is strictly opt-in per outbound.
+        self._batch[name] = oc.batch
         self._simulate[name] = self._resolve_simulate(name, oc)
+        # Per-connection auto-start (#115): a start-disabled outbound is NOT built at engine start — it
+        # reports status:"stopped" and an operator can build it at runtime (POST /connections/{name}/start,
+        # which calls _start_outbound_unsafe and bypasses this gate). Its delivery worker still spawns, so
+        # a routed row queues + self-heals exactly like the DR-parked branch below. No-op (byte-identical)
+        # when auto_start is True — every normal connection. This is a boot-time gate only.
+        if not oc.auto_start:
+            self._destinations.pop(name, None)  # no live connector for a start-disabled lane
+            self._spawn_worker(name)
+            return
         # DR run-profile (#61, ADR 0048): a below-threshold outbound is NOT built — but its delivery
         # worker still spawns (the retry/ordering/etc. above are set regardless), so a row routed to it
         # sits in the outbound stage and backs off via the retry policy, self-healing on the next full
@@ -1456,9 +1670,17 @@ class RegistryRunner:
             name, None
         )  # at/above threshold this run — clear any prior parked marker
         try:
-            dest = _dest_config(oc, self._env_values)
+            dest = _dest_config(oc, self._env_values, self._trust_anchor_policy)
             check_egress_allowed(dest, self._egress)  # fail-closed egress allowlist (WP-11c)
-            connector = build_destination(dest)
+            # #200 (ADR 0092): stamp the derived instance posture for the connector build so each cell's
+            # posture-keyed insecure-hop refusal decides against THIS config's posture — NOT the unstamped
+            # fail-closed/no-op default. engine.start() never calls build_check (add_registry has already
+            # set the runner), so without this the raw/MLLP/DB guards no-op (a prod-PHI plaintext outbound
+            # would ship cleartext) and the HTTP guards fail-closed (a legit non-prod cleartext lane would
+            # wrongly refuse) on the primary serve path. Mirrors _start_inbound_unsafe threading posture
+            # into the exposure checks. No-op (None) in a test/embedding that derives no posture.
+            with active_hop_posture(self._hop_posture):
+                connector = build_destination(dest)
             # ADR 0013: a capturing outbound on a backend that can't persist captures must not deliver
             # — but (ADR 0031) degrade THIS lane, don't crash the engine. Rows routed here are retried,
             # not dropped, so the ADR 0013 "never silently drop replies" intent is preserved.
@@ -1520,6 +1742,13 @@ class RegistryRunner:
                 # known (P-lookup needs both to be None). Default-OFF unless an inbound opted in.
                 self._recompute_inline_ok()
                 for ic in self.registry.inbound.values():
+                    # Per-connection auto-start (#115): a start-disabled inbound listener is NOT bound at
+                    # engine start — it reports status:"stopped" and an operator can start it at runtime
+                    # (POST /connections/{name}/start). Its router + transform workers are still spawned
+                    # below (backlog drains), exactly like a DR-filtered listener. No-op (byte-identical)
+                    # when auto_start is True — every normal connection.
+                    if not ic.auto_start:
+                        continue
                     # DR run-profile (#61, ADR 0048): a below-threshold inbound LISTENER is NOT bound
                     # (no source.start) — but its router + transform workers are still spawned below, so
                     # any crash-recovered ingress/routed backlog carried in the (cold-restored) store
@@ -1564,6 +1793,12 @@ class RegistryRunner:
                 await self._teardown_unsafe()
                 raise
             self._running = True
+            # #147 (ADR 0095): spawn one active-window scheduler task per SCHEDULED connection. Each
+            # AUTO-STARTs/STOPs its connection through the same start_inbound/stop_inbound (or
+            # start_outbound/stop_outbound) path the API uses — a schedule-park is a clean stop, never a
+            # crash. Spawned AFTER _running is set so the first reconcile can (re)park an auto-started
+            # connection immediately. No-op (byte-identical) when no connection declares a schedule.
+            self._start_schedulers()
             if self._dr_threshold is not None:
                 # DR run-profile filter summary (#61, ADR 0048): log the curated critical set up front so
                 # an operator can audit which feeds are live and which are deliberately parked on EVERY
@@ -1605,6 +1840,28 @@ class RegistryRunner:
                 if _pool_warn is not None:
                     log.warning(_pool_warn)
 
+    def _sandbox_for(self, name: str) -> SandboxSession | None:
+        """The persistent sandbox worker for inbound ``name`` (ADR 0087), or ``None`` to run in-process.
+
+        Returns ``None`` — the byte-identical in-process path — unless ``[sandbox].mode=subprocess``
+        AND a config source is available (an embedded runner with no config dir can't re-load the
+        graph in a child, so it degrades to in-process). The :class:`SandboxSession` object is created
+        here (cheap; loop-safe) but the child subprocess is spawned lazily inside the worker thread on
+        first dispatch, so this never blocks the event loop. Sessions are reused per inbound and reaped
+        at :meth:`stop`."""
+        policy = self._sandbox_policy
+        if policy is None or policy.mode is SandboxMode.OFF:
+            return None
+        cfg_dir = self._sandbox_config_source[0] if self._sandbox_config_source else None
+        if cfg_dir is None:
+            return None
+        session = self._sandbox_sessions.get(name)
+        if session is None:
+            env = self._sandbox_config_source[1] if self._sandbox_config_source else None
+            session = SandboxSession(policy, config_dir=cfg_dir, env=env)
+            self._sandbox_sessions[name] = session
+        return session
+
     async def stop(self) -> None:
         async with self._reload_lock:  # serialize against an in-flight reload (no torn-down state)
             had_state = self._running or bool(self._sources or self._workers or self._destinations)
@@ -1617,6 +1874,15 @@ class RegistryRunner:
         _reload_lock) and idempotent — cleans up whatever is registered even if the runner never
         reached _running, so a half-started runner (review M-8) and a double stop() are both safe."""
         self._stop.set()
+        # #147 (ADR 0095): cancel the active-window scheduler tasks FIRST so no schedule tick calls
+        # start/stop_inbound/outbound while the rest of teardown runs (a task blocked awaiting the reload
+        # lock is interrupted by cancel). Empty in the always-on case, so this is a no-op there.
+        if self._schedule_workers:
+            _sched_tasks = list(self._schedule_workers.values())
+            self._schedule_workers.clear()
+            for _t in _sched_tasks:
+                _t.cancel()
+            await asyncio.gather(*_sched_tasks, return_exceptions=True)
         # B12 (ADR 0061): break every waiting worker out of its wait so cancel()+gather lands promptly.
         # OFF sets the four stage singletons (byte-identical); ON sets every registered lane Event. ADR
         # 0066 pooled: skip — the shared _stop.set() already breaks the dispatchers' loops, and _wake_all
@@ -1683,6 +1949,18 @@ class RegistryRunner:
             self._fuse_route_executor = None
             self._fuse_transform_executor = None
         self._fusion_active = False
+        # ADR 0087 (#197): stop the per-inbound sandbox worker children (kills + reaps each subprocess).
+        # Run OFF the loop (each close() waits on a process) so a draining child can't wedge the loop.
+        # No-op unless [sandbox].mode=subprocess actually spawned any.
+        if self._sandbox_sessions:
+            _sessions = list(self._sandbox_sessions.values())
+            self._sandbox_sessions.clear()
+
+            def _close_sandboxes() -> None:
+                for _s in _sessions:
+                    _s.close()
+
+            await asyncio.to_thread(_close_sandboxes)
         if self._lookup_executor is not None:
             await self._lookup_executor.aclose()
             self._lookup_executor = None
@@ -1694,6 +1972,7 @@ class RegistryRunner:
         self._retry.clear()
         self._internal_error.clear()
         self._buildup.clear()
+        self._batch.clear()
         self._simulate.clear()
         self._lane_healthy.clear()
         self._next_buildup_alert.clear()
@@ -2007,6 +2286,20 @@ class RegistryRunner:
         open runs OFF the loop (it opens real connections; must not block the loop at startup)."""
         if not self._fuse_thread_hops:
             return False
+        # ADR 0087 isolation is incompatible with ADR 0071 fusion: the fused route/transform twins
+        # (_run_fused_route / _run_fused_transform) call route_only/transform_one WITHOUT a `sandbox=`,
+        # so the Router, the Handler, AND the `accepts=` predicate (ADR 0084) would all run IN the engine
+        # process — silently OUTSIDE the forbidden-import guard and resource caps the operator turned on.
+        # Rather than run user config code unsandboxed under a config that asked for a sandbox, fail
+        # CLOSED to the async (sandboxed) path. An IPC round-trip inside a fused hop would negate the
+        # fusion anyway, so degrading is the right trade — never a silent isolation bypass.
+        if self._sandbox_policy is not None and self._sandbox_policy.mode is SandboxMode.SUBPROCESS:
+            log.warning(
+                "fuse_thread_hops is set but [sandbox].mode=subprocess: fusion runs Router/Handler/"
+                "accepts= code in-process (unsandboxed), so it is DISABLED — running the async sandboxed "
+                "pipeline path. Turn the sandbox off to use fusion, or leave fusion off to keep isolation."
+            )
+            return False
         backend = self.store.backend
         if backend is not StoreBackend.SQLSERVER:
             log.info(
@@ -2128,6 +2421,8 @@ class RegistryRunner:
             env_values=self._env_values,
             egress=self._egress,
             reserved_bindings=self._reserved_bindings,
+            posture=self._hop_posture,
+            trust_anchor_policy=self._trust_anchor_policy,
         )
         # PT-backend allow-list — folded in here (vs only at Engine.start) so EVERY reload + dry-run
         # path that build-checks the new registry also rejects a PT-on-non-SQLite graph before any
@@ -2180,7 +2475,14 @@ class RegistryRunner:
                 stale = self._destinations.pop(name, None)
                 if stale is not None:
                     await stale.aclose()
-                self._destinations[name] = build_destination(_dest_config(oc, self._env_values))
+                # #200 (ADR 0092): stamp the posture for the reload rebuild too. build_check above vetted
+                # the new registry against the real posture, but the HTTP cells fail-closed when unstamped
+                # — so an unstamped rebuild here would raise InsecureHopRefused on a legit non-prod cleartext
+                # lane AFTER intake is quiesced (the "connector builds here cannot fail" invariant).
+                with active_hop_posture(self._hop_posture):
+                    self._destinations[name] = build_destination(
+                        _dest_config(oc, self._env_values, self._trust_anchor_policy)
+                    )
                 self._failed.pop(name, None)
                 self._spawn_worker(name)
             elif failed or old.outbound.get(name) is None or old.outbound[name].spec != oc.spec:
@@ -2190,7 +2492,11 @@ class RegistryRunner:
                 # (build_check above already re-validated the whole new registry, so this build can't
                 # fail here — a still-broken connector would have raised before any quiesce).
                 old_conn = self._destinations.get(name)
-                self._destinations[name] = build_destination(_dest_config(oc, self._env_values))
+                # #200 (ADR 0092): stamp the posture for the in-place rebuild too (see the branch above).
+                with active_hop_posture(self._hop_posture):
+                    self._destinations[name] = build_destination(
+                        _dest_config(oc, self._env_values, self._trust_anchor_policy)
+                    )
                 self._failed.pop(name, None)
                 if old_conn is not None:
                     await old_conn.aclose()
@@ -2231,6 +2537,24 @@ class RegistryRunner:
             try:
                 # 2. Swap the registry and restart inbound listeners from it (intake back up first).
                 self.registry = new_registry
+                # ADR 0087 (#197): recycle the per-inbound sandbox worker children so the NEW graph
+                # reaches them. Each child holds the registry it load_config'd at spawn, so a stale child
+                # would keep routing/transforming/deciding accepts= against the OLD graph — and a reload
+                # that RETROFITS an `accepts=` predicate would make the parent dispatch phase='accepts' to
+                # a child that has no such predicate, which returns a denial → SandboxError → EVERY message
+                # dead-letters until restart. Dropping the sessions here makes the next dispatch respawn a
+                # child that re-loads the swapped config (its docstring's "Router/Handler changes take
+                # effect immediately" now also holds under mode=subprocess). Off-loop: close() waits on a
+                # process. No-op unless mode=subprocess actually spawned any.
+                if self._sandbox_sessions:
+                    _stale_sessions = list(self._sandbox_sessions.values())
+                    self._sandbox_sessions.clear()
+
+                    def _close_stale_sandboxes() -> None:
+                        for _s in _stale_sessions:
+                            _s.close()
+
+                    await asyncio.to_thread(_close_stale_sandboxes)
                 # Rebuild the live-lookup executor from the new graph, closing the old pools. build_check
                 # already validated the new specs, so this can't fail on a bad spec here.
                 old_lookup_executor = self._lookup_executor
@@ -2421,9 +2745,23 @@ class RegistryRunner:
             )
             return None
         if ic.validation.strict:
-            result = await asyncio.to_thread(
-                validate, text, expected_version=ic.validation.hl7_version
-            )
+            timeout = _strict_validate_timeout(ic)
+            try:
+                # wait_for frees THIS listener path but cannot kill the to_thread worker (no thread
+                # cancellation in CPython) — the orphaned hl7apy validate leaks its thread until it
+                # returns, accepted-by-design (mirrors _run_lookup), bounded by enforce_size_limits'
+                # 16 MiB / segment caps that fire before the slow parse (#89).
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(validate, text, expected_version=ic.validation.hl7_version),
+                    timeout,
+                )
+            except TimeoutError:
+                # DoS backstop (#89): a pathological body made hl7apy spin past the budget. Dead-letter
+                # it instead of pinning intake. The message string is PHI-safe/value-free (only the
+                # numeric timeout). HTTP owns its own 202/4xx response — no HL7 ACK here.
+                timed_out = f"strict-validation timed out after {timeout}s"
+                await self._record(ic, peek, text, MessageStatus.ERROR, error=timed_out)
+                return None
             if not result.ok:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
                 await self._record(ic, peek, text, MessageStatus.ERROR, error=persisted)
@@ -2567,9 +2905,35 @@ class RegistryRunner:
         if ic.validation.strict:
             # hl7apy validation is CPU-bound (full structure/cardinality parse) — run it off the event
             # loop so a strict feed can't stall every other listener, worker, and API call (review M-11).
-            result = await asyncio.to_thread(
-                validate, text, expected_version=ic.validation.hl7_version
-            )
+            timeout = _strict_validate_timeout(ic)
+            try:
+                # wait_for frees THIS listener but cannot kill the to_thread worker (no thread
+                # cancellation in CPython) — the orphaned hl7apy validate leaks its thread until it
+                # returns, accepted-by-design (mirrors _run_lookup), bounded by enforce_size_limits'
+                # 16 MiB / segment caps that fire before the slow parse (#89).
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(validate, text, expected_version=ic.validation.hl7_version),
+                    timeout,
+                )
+            except TimeoutError:
+                # DoS backstop (#89): a pathological body made hl7apy spin past the budget. Dead-letter
+                # + NAK AE instead of pinning the listener. The stored/ACK string is PHI-safe/value-free
+                # (only the numeric timeout) — unlike the validation-error path below it quotes no field.
+                timed_out = f"strict-validation timed out after {timeout}s"
+                mid = await self._record(ic, peek, text, MessageStatus.ERROR, error=timed_out)
+                ack = (
+                    build_ack(peek, code="AE", text=timed_out, ack_mode=ack_mode) if reply else None
+                )
+                if ack is not None and self._capture_ack_enabled(ic):
+                    await self._capture_ack(
+                        mid,
+                        ic.name,
+                        ack_code="AE",
+                        ack_phase="strict",
+                        ack_body=None,
+                        detail=timed_out,
+                    )
+                return ack
             if not result.ok:
                 joined = "; ".join(result.errors)
                 # Persist a PHI-scrubbed form: hl7apy error strings quote the offending field VALUE
@@ -2733,7 +3097,13 @@ class RegistryRunner:
                     woken = await self._wait_for_work(wait_ev)
                     continue
                 for item in items:
-                    outcome = await self._process_delivery_item(name, item)
+                    # #134 (ADR 0082): a batching outbound coalesces this claimed head + the lane's next
+                    # due rows into ONE BHS…BTS envelope; the plain path delivers one message per send.
+                    batch_cfg = self._batch.get(name)
+                    if batch_cfg is not None:
+                        outcome = await self._process_delivery_batch(name, item, batch_cfg)
+                    else:
+                        outcome = await self._process_delivery_item(name, item)
                     if outcome[0] is _ItemOutcome.STOPPED:
                         return
             except asyncio.CancelledError:
@@ -2747,6 +3117,25 @@ class RegistryRunner:
                 )
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
+
+    async def _user_metadata_for(self, message_id: str) -> dict[str, str] | None:
+        """The message's user-metadata bag as a flat ``{key: value}`` map for a ``dynamic_headers``
+        outbound (#68), or ``None`` when it has none. Reads the decrypted metadata column ONLY (never the
+        raw PHI body), strips the engine-internal correlation-lineage keys via
+        :func:`~messagefoundry.store.metadata.user_metadata`, and keeps only ``str`` values (the shape
+        :class:`~messagefoundry.config.wiring.SetMeta` writes). Pure w.r.t. the committed message row, so
+        an at-least-once re-run reads the same bag and re-derives identical headers."""
+        raw_meta = await self.store.message_metadata_json(message_id)
+        user_json = user_metadata(raw_meta)
+        if not user_json:
+            return None
+        try:
+            loaded = json.loads(user_json)
+        except ValueError:
+            return None
+        if not isinstance(loaded, dict):
+            return None
+        return {str(k): v for k, v in loaded.items() if isinstance(v, str)}
 
     async def _process_delivery_item(
         self, name: str, item: OutboxItem
@@ -2813,7 +3202,16 @@ class RegistryRunner:
                 # loopback can't reproduce. Timed only when the bench lever is on (else `_send_t0 = 0`,
                 # no perf_counter). See the DeliveryPhaseTiming note.
                 _send_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
-                response = await connector.send(item.payload)
+                if getattr(connector, "consumes_metadata", False):
+                    # #68: an opted-in outbound (REST/FHIR with dynamic_headers) gets this message's
+                    # user-metadata bag so it can project http.header.* entries onto the request. The
+                    # read touches only the small metadata column (never the raw body).
+                    metadata = await self._user_metadata_for(item.message_id)
+                    response = await connector.send(item.payload, metadata=metadata)
+                else:
+                    # Default: NO metadata read and the historical send(payload) call shape —
+                    # byte-identical for every non-consuming connector.
+                    response = await connector.send(item.payload)
                 if self._delivery_phase_timing:
                     self._delivery_phase_stats.record_send_ack(time.perf_counter_ns() - _send_t0)
         except NegativeAckError as exc:
@@ -2821,7 +3219,32 @@ class RegistryRunner:
             # accept this message, so dead-letter it now rather than block the FIFO lane
             # forever (still replayable from the DLQ). AE/CE (transient) → retry per
             # policy, like a transport failure.
-            if exc.permanent:
+            if exc.permanent and getattr(exc, "credential_fault", False):
+                # #109 (ADR 0095): a PERMANENT CREDENTIAL/AUTH fault (bad password / would lock out the
+                # partner account) — NOT a bad message. Under the "stop" policy (default) STOP the lane
+                # IMMEDIATELY (no dead-lettering the backlog, no re-auth storm that could trip the
+                # partner's account lockout) and RETAIN this claimed row UN-ERRORED (release it back to
+                # PENDING, undoing only the claim's attempts++ — no backoff, no last_error), so the
+                # queue is intact for an operator to resume after fixing the credential (reload/restart
+                # re-arms the STOPPED lane). The "dead_letter" policy opts back into the historical
+                # fail-fast dead-letter of just this row.
+                if self._credential_fault_policy == "stop":
+                    await self.store.release_claimed([item.id])
+                    log.error(
+                        "delivery worker %r: PERMANENT credential/auth fault (%s); STOPPING the lane "
+                        "and retaining %d queued row(s) un-errored to protect the partner account "
+                        "(operator must fix the credential + reload/restart to resume)",
+                        name,
+                        exc.code,
+                        1,
+                    )
+                    self._alert_sink.connection_stopped(
+                        name,
+                        detail=f"credential fault ({exc.code}); lane stopped, queue retained (#109)",
+                    )
+                    return _ItemOutcome.STOPPED, None
+                await self.store.dead_letter_now(item.id, safe_exc(exc))
+            elif exc.permanent:
                 await self.store.dead_letter_now(item.id, safe_exc(exc))
             else:
                 retry_until = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
@@ -2913,6 +3336,151 @@ class RegistryRunner:
             if self._delivery_phase_timing:
                 self._delivery_phase_stats.maybe_emit(stage="outbound")
         return _ItemOutcome.PROCESSED, retry_until
+
+    async def _process_delivery_batch(
+        self, name: str, head: OutboxItem, cfg: BatchConfig
+    ) -> tuple[_ItemOutcome, float | None]:
+        """Deliver a contiguous FIFO head-prefix as ONE ``BHS``…``BTS`` envelope (#134 / ADR 0082) —
+        the batch counterpart of :meth:`_process_delivery_item`, shared by the per_lane worker and the
+        pooled dispatcher (via :meth:`_dispatch_delivery`).
+
+        Starting from the already-claimed ``head``, coalesce the lane's next due rows (each via
+        ``claim_next_fifo`` — the same H2 skip-and-complete single claim) until **either** ``cfg.max_count``
+        rows are held **or** ``cfg.max_wait_ms`` has elapsed since the head's ingest time **or** a graceful
+        stop signals a flush (ADR 0082 decision #4) — whichever comes first — then frame + ``send`` **once**
+        + complete all N in one store transaction. Mirrors the single-row disposition ladder over the whole
+        batch: on success ``mark_batch_done`` all N; a transient/transport failure ``mark_batch_failed`` all
+        N (re-claimed as the identical prefix); a permanent reject ``dead_letter_batch`` all N (decision #1).
+
+        **Invariants.** Every member is INFLIGHT throughout the window, so a crash recovers the whole set in
+        ``seq`` order (``reset_stale_inflight``). The members are the lane's oldest contiguous rows in
+        ``seq`` order, so strict per-lane FIFO holds within and across batches. Framing is **deterministic
+        given a member set** — ``encode_batch`` derives nothing from a clock (BHS-7 from the head's re-run-
+        stable ``created_at``, BHS-11 from the head member's control id, members verbatim). A crash *before*
+        ``send`` re-runs cleanly (the first send is the re-run's). A crash *after* ``send`` but before
+        completion re-sends the batch, which may now coalesce newly-arrived contiguous rows into a **larger**
+        envelope — the ADR 0082 "whole batch re-sent on crash-after-send, partner idempotent" consequence:
+        at-least-once holds under **per-message** idempotency (the standard HL7-batch partner; dedup by
+        MSH-10, not BHS-11). Batching is MLLP-only and rejected on a capturing outbound at wiring (one batch
+        ACK), so the response is always one-way here.
+
+        The lane's processing slot is held for the coalescing window (bounded by ``max_wait_ms`` and by
+        ``max_count`` sequential claims) — a deliberate, opt-in trade of a held slot for envelope size."""
+        retry = self._retry.get(name) or RetryPolicy()
+        items: list[OutboxItem] = [head]
+        # Deadline measured from the head's ingest time (ADR 0009, re-run-stable). created_at is now
+        # projected by every outbound claim; fall back to now defensively (a slightly later window start).
+        base = head.created_at if head.created_at is not None else time.time()
+        deadline = base + cfg.max_wait_ms / 1000.0
+        while len(items) < cfg.max_count:
+            more = await self.store.claim_next_fifo(name)
+            if more is not None:
+                items.append(more)
+                continue  # drain everything instantly due first, regardless of stop (never a WAIT)
+            # Nothing more immediately due. A graceful stop flushes what's drained NOW (decision #4) —
+            # never waiting for stragglers; the head aging out flushes the partial; else wait a poll slice
+            # (interruptible by stop so shutdown lands promptly instead of waiting the whole deadline).
+            if self._stop.is_set():
+                break
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=min(_BATCH_POLL_SECONDS, remaining)
+                )
+            except asyncio.TimeoutError:
+                pass
+        ids = [it.id for it in items]
+        retry_until: float | None = None
+        connector = self._destinations.get(name)
+        if connector is None:
+            failure = self._failed.get(name)
+            detail = f"outbound failed to start: {failure}" if failure else "outbound reloading"
+            retry_until = await self._mark_batch_failed_and_arm(name, ids, detail, retry)
+            await self._maybe_alert_buildup(name)
+            await self._maybe_alert_stall(name)
+            return _ItemOutcome.PROCESSED, retry_until
+        if not self._coordinator.is_leader():
+            retry_until = await self._mark_batch_failed_and_arm(
+                name, ids, "leadership lost before send; re-queued for the new leader", retry
+            )
+            return _ItemOutcome.PROCESSED, retry_until
+        # Frame + send inside ONE try so a FRAMING error (an unparseable / non-HL7 head member — MLLP is
+        # payload-agnostic, ADR 0004, so a non-hl7v2 feed can reach here) routes to the internal-error
+        # policy below (dead-letter / STOP) instead of stranding every claimed row INFLIGHT forever with
+        # no send and no disposition. Members are carried VERBATIM (the head too — never re-encoded); only
+        # the head is PARSED, for the BHS separators + the BHS-11 control id.
+        try:
+            control_id = Message.parse(head.payload).control_id or head.id  # FIFO-aligned, stable
+            envelope = encode_batch(
+                [it.payload for it in items],
+                control_id=control_id,
+                timestamp=_hl7_batch_timestamp(head.created_at),
+            )
+            if self._simulate.get(name, False):
+                pass  # shadow / parallel-run: suppress the real egress; still complete all N below.
+            else:
+                await connector.send(envelope)
+        except NegativeAckError as exc:
+            if exc.permanent:
+                await self.store.dead_letter_batch(ids, safe_exc(exc))
+            else:
+                retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
+                await self._maybe_alert_buildup(name)
+                await self._maybe_alert_stall(name)
+        except DeliveryError as exc:
+            retry_until = await self._mark_batch_failed_and_arm(name, ids, safe_exc(exc), retry)
+            await self._maybe_alert_buildup(name)
+            await self._maybe_alert_stall(name)
+            self._note_lane_unhealthy(name, head.id, exc)
+        except Exception as exc:
+            # A framing error (unparseable/non-HL7 head) or an internal/code error — NOT the partner's
+            # fault. The per-connection policy decides: STOP halts the lane (preserve the batch, alert);
+            # CONTINUE (default) dead-letters all N (bad data can never frame/deliver — replayable from
+            # the DLQ) so a code bug or a mis-typed feed can't wedge the lane forever.
+            if (
+                self._internal_error.get(name, self._internal_error_default)
+                is InternalErrorPolicy.STOP
+            ):
+                log.error(
+                    "delivery worker %r: framing/internal error delivering a batch of %d (%s); STOPPING "
+                    "connection (operator must fix + reload/restart to resume)",
+                    name,
+                    len(ids),
+                    type(exc).__name__,
+                )
+                await self.store.mark_batch_failed(
+                    ids, f"internal error (connection stopped): {safe_exc(exc)}", retry
+                )
+                self._alert_sink.connection_stopped(
+                    name, detail=f"{type(exc).__name__} delivering a batch of {len(ids)}"
+                )
+                return _ItemOutcome.STOPPED, None
+            log.warning(
+                "delivery worker %r: framing/internal error delivering a batch of %d (%s); dead-lettering",
+                name,
+                len(ids),
+                type(exc).__name__,
+            )
+            await self.store.dead_letter_batch(ids, f"internal error: {safe_exc(exc)}")
+        else:
+            self._note_lane_healthy(name)
+            await self.store.mark_batch_done(ids)
+        return _ItemOutcome.PROCESSED, retry_until
+
+    async def _mark_batch_failed_and_arm(
+        self, lane: str, ids: Sequence[str], error: str, retry: RetryPolicy
+    ) -> float | None:
+        """``mark_batch_failed`` + (per_lane wake ON) arm a one-shot retry wake at the shared deadline —
+        the batch counterpart of :meth:`_mark_failed_and_arm`. All N re-pend to the same
+        ``next_attempt_at``, so one timer re-claims the identical prefix. Pooled skips the arming (the
+        dispatcher parks off the returned deadline); per_lane arming is byte-identical to the single row."""
+        next_at = await self.store.mark_batch_failed(list(ids), error, retry)
+        if self._claim_mode != "pooled" and self._per_lane_wake and next_at is not None:
+            delay = max(0.0, next_at - time.time()) + _RETRY_WAKE_SLACK_SECONDS
+            asyncio.get_running_loop().call_later(delay, self._wake_lane, Stage.OUTBOUND, lane)
+        return next_at
 
     async def _router_worker(self, name: str) -> None:
         """Drain the **ingress** stage for one inbound — the router half of the split pipeline (ADR
@@ -3110,15 +3678,14 @@ class RegistryRunner:
             # reload's swapped tables apply to the next routed row; run_contexts restores
             # cleanly after each run (no leak). The set of providers is the run_context
             # registry (router phase) — features add one provider there, never edit this call.
-            with run_contexts(
-                RunContext(
-                    code_sets=self.registry.code_sets,
-                    reference_view=self.store.reference_view(),
-                    active_environment=self._active_environment,
-                    ingest_time=item.created_at,
-                ),
-                phase="router",
-            ):
+            router_rc = RunContext(
+                code_sets=self.registry.code_sets,
+                reference_view=self.store.reference_view(),
+                active_environment=self._active_environment,
+                ingest_time=item.created_at,
+                message_id=item.message_id,  # #162: key the unmapped-capture drain per message
+            )
+            with run_contexts(router_rc, phase="router"):
                 # Run the Router OFF the event loop (SEC-013, CWE-1322). A Router is arbitrary
                 # synchronous Python whose CPU cost can scale with attacker-influenced content
                 # (ReDoS over a field, O(n^2) build); running it inline would let one message
@@ -3126,7 +3693,17 @@ class RegistryRunner:
                 # asyncio.to_thread copies THIS context (the run_contexts views) into the
                 # worker thread, so a call-time code_set()/reference()/current_environment()
                 # still resolves. db_lookup raises on a Router by design, so no lookup runner.
-                names = await asyncio.to_thread(route_only, self.registry, ic, item.payload)
+                # ADR 0087 (#197): when [sandbox].mode=subprocess, route_only marshals the Router
+                # to the per-inbound worker child (router_rc travels with it) instead of running it
+                # in this thread; sandbox=None (the default) is the byte-identical in-process path.
+                names = await asyncio.to_thread(
+                    route_only,
+                    self.registry,
+                    ic,
+                    item.payload,
+                    sandbox=self._sandbox_for(name),
+                    run_context=router_rc,
+                )
             # ADR 0057 inline Step-A fast-path (G1: this whole block is INSIDE the inner try,
             # so a raise from transform_one OR handoff routes to the internal_error policy
             # below — NOT the outer retry-forever except). Eligible iff the inbound opted in
@@ -3139,35 +3716,39 @@ class RegistryRunner:
                 # db_lookup()/fhir_lookup() inside the handler raises (fail-closed) — no hang.
                 hname = names[0]
                 content_type = ic.content_type.value
-                with run_contexts(
-                    RunContext(
-                        code_sets=self.registry.code_sets,
-                        reference_view=self.store.reference_view(),
-                        state_view=self.store.state_view(),
-                        response_view=None,
-                        active_environment=self._active_environment,
-                        ingest_time=item.created_at,
-                    ),
-                    phase="transform",
-                ):
-                    deliveries_preview, state_preview = await asyncio.to_thread(
+                inline_rc = RunContext(
+                    code_sets=self.registry.code_sets,
+                    reference_view=self.store.reference_view(),
+                    state_view=self.store.state_view(),
+                    response_view=None,
+                    active_environment=self._active_environment,
+                    ingest_time=item.created_at,
+                    message_id=item.message_id,  # #162: key the unmapped-capture drain per message
+                )
+                with run_contexts(inline_rc, phase="transform"):
+                    # ADR 0087 (#197): sandbox=subprocess marshals the Handler to the per-inbound
+                    # worker (inline_rc travels with it); sandbox=None is the byte-identical path.
+                    deliveries_preview, state_preview, meta_preview = await asyncio.to_thread(
                         transform_one,
                         self.registry,
                         hname,
                         item.payload,
                         content_type,
+                        sandbox=self._sandbox_for(name),
+                        run_context=inline_rc,
                     )
                 # Split deliveries / pass-through / state exactly as the transform worker does.
                 deliveries = [(d.to, d.payload) for d in deliveries_preview if not d.is_passthrough]
                 pt_deliveries = [d for d in deliveries_preview if d.is_passthrough]
                 state_ops = list(state_preview)
                 # M-deliver gate: only the pure all-deliver case is fused. A zero-delivery
-                # (filtering) handler, any state-op, or any pass-through Send FALLS BACK to the
+                # (filtering) handler, any state-op, any pass-through Send, or any SetMeta write
+                # (ADR 0081, #150 — the fused handoff carries no metadata-merge) FALLS BACK to the
                 # split path — handoff lacks _maybe_finalize (G2: a zero-delivery fused message
-                # would strand non-terminal) and the state-MERGE / PT-child machinery
+                # would strand non-terminal) and the state-MERGE / PT-child / metadata machinery
                 # transform_handoff carries. The split path finalizes those correctly (FILTERED
-                # via transform_handoff's _maybe_finalize; state/PT via its dedicated handling).
-                if deliveries and not state_ops and not pt_deliveries:
+                # via transform_handoff's _maybe_finalize; state/PT/meta via its dedicated handling).
+                if deliveries and not state_ops and not pt_deliveries and not meta_preview:
                     # CF — the fused single commit: consume the ingress row, insert one
                     # outbound row per delivery, set ROUTED. G5: no DB connection/txn is held
                     # across the to_thread calls above — C2 committed + released before this
@@ -3418,17 +3999,16 @@ class RegistryRunner:
             # (ADR 0005) so state_get(...) resolves against committed writes. Providers come
             # from the run_context registry (transform phase) — features add one provider,
             # never edit this call site.
-            with run_contexts(
-                RunContext(
-                    code_sets=self.registry.code_sets,
-                    reference_view=self.store.reference_view(),
-                    state_view=self.store.state_view(),
-                    response_view=response_view,
-                    active_environment=self._active_environment,
-                    ingest_time=item.created_at,
-                ),
-                phase="transform",
-            ):
+            transform_rc = RunContext(
+                code_sets=self.registry.code_sets,
+                reference_view=self.store.reference_view(),
+                state_view=self.store.state_view(),
+                response_view=response_view,
+                active_environment=self._active_environment,
+                ingest_time=item.created_at,
+                message_id=item.message_id,  # #162: key the unmapped-capture drain per message
+            )
+            with run_contexts(transform_rc, phase="transform"):
                 # Run the Handler's transform OFF the event loop UNCONDITIONALLY (SEC-013,
                 # CWE-1322). A Handler is arbitrary synchronous Python whose CPU cost can scale
                 # with attacker-influenced content (ReDoS, O(n^2) build, large fan-out); the
@@ -3450,12 +4030,18 @@ class RegistryRunner:
                         lookup_stack.enter_context(db_lookup_activated(self._run_lookup))
                     if self._fhir_lookup_executor is not None:
                         lookup_stack.enter_context(fhir_lookup_activated(self._run_fhir_lookup))
-                    deliveries_preview, state_preview = await asyncio.to_thread(
+                    # ADR 0087 (#197): sandbox=subprocess marshals the Handler to the per-inbound
+                    # worker (transform_rc travels with it); a db_lookup/fhir_lookup inside a
+                    # sandboxed Handler fails closed there (they can't bridge across the process
+                    # boundary in this PR). sandbox=None is the byte-identical in-process path.
+                    deliveries_preview, state_preview, meta_preview = await asyncio.to_thread(
                         transform_one,
                         self.registry,
                         hname,
                         item.payload,
                         content_type,
+                        sandbox=self._sandbox_for(name),
+                        run_context=transform_rc,
                     )
         except Exception as exc:
             # Handler/transform code error (incl. an unknown outbound name). Post-ACK, so no
@@ -3471,6 +4057,7 @@ class RegistryRunner:
         deliveries = [(d.to, d.payload) for d in deliveries_preview if not d.is_passthrough]
         pt_deliveries = [(d.to, d.payload) for d in deliveries_preview if d.is_passthrough]
         state_ops = [(s.namespace, s.key, s.value) for s in state_preview]
+        meta_ops = [(m.key, m.value) for m in meta_preview]
         await self.store.transform_handoff(
             routed_id=item.id,
             message_id=item.message_id,
@@ -3478,6 +4065,7 @@ class RegistryRunner:
             deliveries=deliveries,
             state_ops=state_ops,
             pt_deliveries=pt_deliveries,
+            meta_ops=meta_ops,
             correlation_depth_cap=self._max_correlation_depth,
         )
         if deliveries:
@@ -3526,6 +4114,7 @@ class RegistryRunner:
             reference_view=self.store.reference_view(),
             active_environment=self._active_environment,
             ingest_time=item.created_at,
+            message_id=item.message_id,  # #162: key the unmapped-capture drain per message
         )
         return await loop.run_in_executor(
             self._fuse_route_executor, self._run_fused_route, name, ic, item, rc, now
@@ -3624,6 +4213,7 @@ class RegistryRunner:
             response_view=response_view,
             active_environment=self._active_environment,
             ingest_time=item.created_at,
+            message_id=item.message_id,  # #162: key the unmapped-capture drain per message
         )
         content_type = ic.content_type.value
         return await loop.run_in_executor(
@@ -3659,7 +4249,7 @@ class RegistryRunner:
                     lookup_stack.enter_context(db_lookup_activated(self._run_lookup))
                 if self._fhir_lookup_executor is not None:
                     lookup_stack.enter_context(fhir_lookup_activated(self._run_fhir_lookup))
-                deliveries_preview, state_preview = transform_one(
+                deliveries_preview, state_preview, meta_preview = transform_one(
                     self.registry, hname, item.payload, content_type
                 )
         except (
@@ -3677,6 +4267,7 @@ class RegistryRunner:
         deliveries = [(d.to, d.payload) for d in deliveries_preview if not d.is_passthrough]
         pt_deliveries = [(d.to, d.payload) for d in deliveries_preview if d.is_passthrough]
         state_ops = [(s.namespace, s.key, s.value) for s in state_preview]
+        meta_ops = [(m.key, m.value) for m in meta_preview]
         store = cast(_FusedHandoffStore, self.store)
         try:
             with store.sync_handoff_pool(Stage.OUTBOUND.value).acquire() as conn:
@@ -3688,6 +4279,7 @@ class RegistryRunner:
                     deliveries=deliveries,
                     state_ops=state_ops,
                     pt_deliveries=pt_deliveries,
+                    meta_ops=meta_ops,
                     correlation_depth_cap=self._max_correlation_depth,
                     now=now,
                 )
@@ -3840,6 +4432,13 @@ class RegistryRunner:
         return result
 
     async def _dispatch_delivery(self, lane: str, item: OutboxItem) -> LaneItemResult:
+        # #134 (ADR 0082): batch inside the pooled claim (decision #5) — the dispatcher claims one head
+        # per lane as always; a batching lane's delivery body coalesces its own tail (claim_next_fifo)
+        # into one BHS…BTS envelope, so per_lane and pooled share the exact batch body with NO change to
+        # the StageDispatcher state machine (the held slot spans the bounded max_wait_ms window).
+        batch_cfg = self._batch.get(lane)
+        if batch_cfg is not None:
+            return _to_lane_result(await self._process_delivery_batch(lane, item, batch_cfg))
         return _to_lane_result(await self._process_delivery_item(lane, item))
 
     async def _dispatch_response(self, lane: str, item: OutboxItem) -> LaneItemResult:
@@ -3914,6 +4513,16 @@ class RegistryRunner:
             return False
 
 
+def _hl7_batch_timestamp(created_at: float | None) -> str:
+    """Format an outbound row's re-run-stable ingest time (epoch seconds) as a deterministic HL7 BHS-7
+    batch-creation DTM (``YYYYMMDDHHMMSS``, **UTC** — TZ-independent, so a re-run on any host re-derives
+    the byte-identical envelope; #134 / ADR 0082). Empty string when ``created_at`` is absent (defensive:
+    every outbound claim now projects it) — still deterministic."""
+    if created_at is None:
+        return ""
+    return time.strftime("%Y%m%d%H%M%S", time.gmtime(created_at))
+
+
 def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[str, Any]) -> Source:
     # Resolve any env() references first (a missing value raises WiringError here, before bind).
     settings = resolve_env_settings(ic.spec.settings, env_values)
@@ -3932,10 +4541,29 @@ def _source_config(ic: InboundConnection, bind_host: str, env_values: Mapping[st
         settings["host"] = ic.bind_address or bind_host
         if ic.source_ip_allowlist:
             settings["source_ip_allowlist"] = list(ic.source_ip_allowlist)
-    return Source(type=ic.spec.type, settings=settings, ack_mode=ic.ack_mode)
+    return Source(
+        type=ic.spec.type,
+        settings=settings,
+        ack_mode=ic.ack_mode,
+        # #200 (ADR 0092): surface the per-connection insecure-hop attestation as a typed field so the
+        # cell (built inside build_check_registry's active_hop_posture scope) can ALLOW a legitimately-
+        # secure hop. Default False → keyed purely on posture; a bad attested/reason pair fails loud here.
+        tls_hop_attested=bool(settings.get("tls_hop_attested", False)),
+        tls_hop_attested_reason=_hop_attested_reason(settings),
+    )
 
 
-def _dest_config(oc: OutboundConnection, env_values: Mapping[str, Any]) -> Destination:
+def _hop_attested_reason(settings: Mapping[str, Any]) -> str | None:
+    """The env-resolved ``tls_hop_attested_reason`` connector setting as ``str | None`` (#200)."""
+    reason = settings.get("tls_hop_attested_reason")
+    return None if reason is None else str(reason)
+
+
+def _dest_config(
+    oc: OutboundConnection,
+    env_values: Mapping[str, Any],
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
+) -> Destination:
     # Resolve env() first so any signing key/password ref is materialized here, then assemble the
     # typed signing config (ASVS 4.1.5, ADR 0018) from the resolved sign_* settings. None = signing
     # off (every existing outbound unchanged). The connector loads the key + mints the signature; this
@@ -3947,6 +4575,19 @@ def _dest_config(oc: OutboundConnection, env_values: Mapping[str, Any]) -> Desti
         settings=settings,
         retry=oc.retry or RetryPolicy(),
         sign=OutboundSigning.from_settings(settings),
+        # BACKLOG #107: surface the per-outbound raw-separator escape-hatch as a typed field. Default
+        # False → byte-identical; only an explicit `hl7_raw_separators=True` (MLLP() factory or a
+        # connections.toml setting) flips it. The MLLP connector reads config.hl7_raw_separators.
+        hl7_raw_separators=bool(settings.get("hl7_raw_separators", False)),
+        # #200 (ADR 0092): the per-outbound insecure-hop attestation, typed here so the cell can ALLOW a
+        # legitimately-secure egress hop even on production-PHI. Default False → keyed purely on posture.
+        tls_hop_attested=bool(settings.get("tls_hop_attested", False)),
+        tls_hop_attested_reason=_hop_attested_reason(settings),
+        # #190 (ADR 0093): thread the instance-wide [tls] client trust-anchor policy onto the outbound
+        # (the SINGLE choke point feeding build_check AND live construction, so the internal-outbound TLS
+        # context builders resolve the same anchor both places). None → the default system/no-op policy,
+        # byte-identical to before this seam.
+        trust_anchor_policy=trust_anchor_policy or TrustAnchorPolicy(),
     )
 
 
@@ -3957,12 +4598,25 @@ def build_check_registry(
     env_values: Mapping[str, Any],
     egress: EgressSettings,
     reserved_bindings: Sequence[tuple[str, str, int]] = (),
+    posture: HopPosture | None = None,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> None:
     """Construct (and discard) every connector in ``registry`` + run the fail-closed connect/egress
     allowlists, so a bad connector spec or a non-allowlisted host fails as a :class:`WiringError`
     BEFORE anything is applied. The standalone core of :meth:`RegistryRunner.build_check`, callable
     offline — e.g. the ``connection`` CLI validating an edit before it persists (ADR 0007). Builds
-    nothing live (no socket bind / file I/O — binding happens later in ``start_inbound``)."""
+    nothing live (no socket bind / file I/O — binding happens later in ``start_inbound``).
+
+    ``posture`` (#200, ADR 0092) is the instance's derived security posture (PHI? production?), stamped
+    as the active hop posture for the whole connector-construction block so each cell keys its
+    posture-keyed insecure-hop refusal on the LOADED config's posture rather than guessing — the ENFORCED
+    construction-time gate that fires at ``messagefoundry check`` / dry-run / reload. ``None`` (an
+    embedding/test that doesn't derive a posture) leaves the posture unstamped: a cell then fail-closes
+    (treats each hop as prod-PHI). Every ``serve``/``reload`` caller passes the config's real posture.
+
+    ``trust_anchor_policy`` (#190, ADR 0093) is the instance ``[tls]`` client trust-anchor policy the
+    internal-outbound TLS context builders resolve their org internal-CA fallback against. ``None`` → the
+    default system/no-op policy (byte-identical — the OS trust store verifies the peer)."""
     # Port-conflict pre-flight (env-resolved + reserved-port aware): a listener stealing a sibling's or
     # the API's (host, port) fails the whole reload here, before quiescing, naming both ends — rather
     # than half-applying and surfacing as a bare bind OSError. PortConflictError is a WiringError → 422.
@@ -3975,57 +4629,77 @@ def build_check_registry(
     if conflicts:
         raise PortConflictError("; ".join(conflicts))
     try:
-        for ic in registry.inbound.values():
-            source_cfg = _source_config(ic, inbound_bind_host, env_values)
-            check_source_allowed(source_cfg, ic.name, egress)
-            build_source(source_cfg)
-        reingress_targets: set[str] = set()
-        for oc in registry.outbound.values():
-            dest = _dest_config(oc, env_values)
-            check_egress_allowed(dest, egress)  # fail-closed egress allowlist (WP-11c)
-            build_destination(dest)
-            # ADR 0013 Increment 2: reingress_to must name an existing Loopback() inbound. This is a
-            # CROSS-registry fact (build_outbound_connection is registry-blind), enforced here so it
-            # fails at `check`/dry-run with no store, like every other connector validation.
-            target = oc.spec.settings.get("reingress_to")
-            if target is not None:
-                tic = registry.inbound.get(str(target))
-                if tic is None or tic.spec.type is not ConnectorType.LOOPBACK:
-                    raise WiringError(
-                        f"outbound connection {oc.name!r}: reingress_to names unknown/non-loopback "
-                        f"inbound {target!r} — declare it as inbound(..., Loopback(), ...) (ADR 0013)."
-                    )
-                reingress_targets.add(str(target))
-        # A loopback inbound with no capturing outbound pointing at it is legal but inert (never fed) —
-        # surface it (it may be a staging artifact), but don't error.
-        for iname, ic in registry.inbound.items():
-            if ic.spec.type is ConnectorType.LOOPBACK and iname not in reingress_targets:
-                log.warning(
-                    "loopback inbound %r has no reingress_to source; it will never receive a message",
-                    iname,
-                )
-        resolved_lookups: dict[str, dict[str, Any]] = {}
-        for lname, lspec in registry.lookups.items():
-            lsettings = resolve_env_settings(lspec.settings, env_values)
-            check_lookup_allowed(lname, lsettings, egress)  # fail-closed connect allowlist
-            resolved_lookups[lname] = lsettings
-        if resolved_lookups:
-            # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
-            DatabaseLookupExecutor(resolved_lookups)
-        resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
-        for fname, fspec in registry.fhir_lookups.items():
-            fsettings = resolve_env_settings(fspec.settings, env_values)
-            check_fhir_lookup_allowed(
-                fname, fsettings, egress
-            )  # fail-closed egress allowlist (ADR 0043)
-            resolved_fhir_lookups[fname] = fsettings
-        if resolved_fhir_lookups:
-            # Construct (and discard): validates each FHIR URL/TLS/SMART-auth without issuing a read.
-            FhirLookupExecutor(resolved_fhir_lookups)
+        # Stamp the derived posture for the whole build so a cell's posture-keyed hop-refusal (ADR 0092)
+        # decides against THIS config's posture. The port-conflict pre-flight above builds no connector,
+        # so it need not run inside the scope.
+        with active_hop_posture(posture):
+            _build_check_connectors(
+                registry, inbound_bind_host, env_values, egress, trust_anchor_policy
+            )
     except WiringError:
         raise
     except Exception as exc:
         raise WiringError(f"connector build failed: {exc}") from exc
+
+
+def _build_check_connectors(
+    registry: Registry,
+    inbound_bind_host: str,
+    env_values: Mapping[str, Any],
+    egress: EgressSettings,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
+) -> None:
+    """Construct-and-discard every connector + run the connect/egress allowlists (the body of
+    :func:`build_check_registry`, split out so the whole block runs inside the ``active_hop_posture``
+    scope with a single ``try`` in the caller). Raises the raw connector error; the caller wraps a
+    non-:class:`WiringError` as one."""
+    for ic in registry.inbound.values():
+        source_cfg = _source_config(ic, inbound_bind_host, env_values)
+        check_source_allowed(source_cfg, ic.name, egress)
+        build_source(source_cfg)
+    reingress_targets: set[str] = set()
+    for oc in registry.outbound.values():
+        dest = _dest_config(oc, env_values, trust_anchor_policy)
+        check_egress_allowed(dest, egress)  # fail-closed egress allowlist (WP-11c)
+        build_destination(dest)
+        # ADR 0013 Increment 2: reingress_to must name an existing Loopback() inbound. This is a
+        # CROSS-registry fact (build_outbound_connection is registry-blind), enforced here so it
+        # fails at `check`/dry-run with no store, like every other connector validation.
+        target = oc.spec.settings.get("reingress_to")
+        if target is not None:
+            tic = registry.inbound.get(str(target))
+            if tic is None or tic.spec.type is not ConnectorType.LOOPBACK:
+                raise WiringError(
+                    f"outbound connection {oc.name!r}: reingress_to names unknown/non-loopback "
+                    f"inbound {target!r} — declare it as inbound(..., Loopback(), ...) (ADR 0013)."
+                )
+            reingress_targets.add(str(target))
+    # A loopback inbound with no capturing outbound pointing at it is legal but inert (never fed) —
+    # surface it (it may be a staging artifact), but don't error.
+    for iname, ic in registry.inbound.items():
+        if ic.spec.type is ConnectorType.LOOPBACK and iname not in reingress_targets:
+            log.warning(
+                "loopback inbound %r has no reingress_to source; it will never receive a message",
+                iname,
+            )
+    resolved_lookups: dict[str, dict[str, Any]] = {}
+    for lname, lspec in registry.lookups.items():
+        lsettings = resolve_env_settings(lspec.settings, env_values)
+        check_lookup_allowed(lname, lsettings, egress)  # fail-closed connect allowlist
+        resolved_lookups[lname] = lsettings
+    if resolved_lookups:
+        # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
+        DatabaseLookupExecutor(resolved_lookups)
+    resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
+    for fname, fspec in registry.fhir_lookups.items():
+        fsettings = resolve_env_settings(fspec.settings, env_values)
+        check_fhir_lookup_allowed(
+            fname, fsettings, egress
+        )  # fail-closed egress allowlist (ADR 0043)
+        resolved_fhir_lookups[fname] = fsettings
+    if resolved_fhir_lookups:
+        # Construct (and discard): validates each FHIR URL/TLS/SMART-auth without issuing a read.
+        FhirLookupExecutor(resolved_fhir_lookups)
 
 
 def check_pt_backend_supported(registry: Registry, store: QueueStore) -> None:
@@ -4085,6 +4759,8 @@ def _allowlist_for(conn_type: ConnectorType, egress: EgressSettings) -> list[str
         return egress.allowed_remote
     if conn_type is ConnectorType.EMAIL:
         return egress.allowed_smtp  # SMTP destination (ADR 0029)
+    if conn_type is ConnectorType.DIRECT:
+        return egress.allowed_direct  # Direct S/MIME-over-SMTP HISP relay (ADR 0085)
     return []
 
 
@@ -4220,7 +4896,36 @@ def check_fhir_lookup_allowed(
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
 
 
-def check_mllp_tls_exposure(source: Source, name: str, *, allow_insecure_bind: bool) -> None:
+def _inbound_insecure_bind_permitted(
+    *, allow_insecure_bind: bool, attested: bool, posture: HopPosture | None
+) -> bool:
+    """Whether an off-loopback, cleartext inbound listener may bind (warn-and-cross) rather than being
+    REFUSED (#200, ADR 0092). Consumed by the four exposed-gate checks past their loopback / TLS-on
+    early returns.
+
+    STRICT by default (decision 5 — the shipped exposed-gate refuses every off-loopback cleartext bind
+    regardless of environment): a bind is permitted only by a per-connection ``tls_hop_attested`` (the
+    segment is secure by other means), or by ``--allow-insecure-bind`` — and that flag is **CLAMPED to
+    a non production-PHI instance** (decision 2), exactly mirroring the global TLS escape. So a
+    production-PHI listener **refuses cleartext even WITH** ``--allow-insecure-bind``.
+
+    An **unstamped** posture (``None``) means the check ran outside the ENFORCED gate — the serve /
+    reload path that stamps the derived posture always passes a real one, so ``None`` is a direct /
+    embedding call, where the shipped exposed-gate warn is preserved (the flag is honored). The clamp is
+    an ADD at the enforced surface, never a new refusal for an un-postured call. Adds coverage (the
+    prod-PHI clamp + the attestation opt-in); never loosens the shipped no-flag refusal."""
+    if attested:
+        return True
+    if not allow_insecure_bind:
+        return False
+    if posture is None:
+        return True  # un-postured (direct/embedding) call: preserve the shipped warn (see above)
+    return not (posture.production and posture.is_phi)
+
+
+def check_mllp_tls_exposure(
+    source: Source, name: str, *, allow_insecure_bind: bool, posture: HopPosture | None = None
+) -> None:
     """Exposed-gate (ADR 0002 §0, MLLP side): refuse a **non-loopback MLLP listener without TLS** — it
     would put HL7 bodies on the wire in cleartext. Set ``tls=true`` (+ cert) on the connection, or pass
     ``serve --allow-insecure-bind`` to accept the risk on a trusted segment (then warn). Loopback binds
@@ -4230,10 +4935,13 @@ def check_mllp_tls_exposure(source: Source, name: str, *, allow_insecure_bind: b
     host = str(source.settings.get("host", "127.0.0.1"))
     if host in _LOOPBACK_HOSTS or source.settings.get("tls"):
         return
-    if allow_insecure_bind:
+    if _inbound_insecure_bind_permitted(
+        allow_insecure_bind=allow_insecure_bind, attested=source.tls_hop_attested, posture=posture
+    ):
         log.warning(
-            "inbound %r binds non-loopback host %r without TLS (--allow-insecure-bind); HL7 bodies "
-            "cross the network in cleartext — set tls=true (+ tls_cert_file/tls_key_file) on it.",
+            "inbound %r binds non-loopback host %r without TLS "
+            "(--allow-insecure-bind / tls_hop_attested); HL7 bodies cross the network in cleartext — "
+            "set tls=true (+ tls_cert_file/tls_key_file) on it.",
             name,
             host,
         )
@@ -4242,27 +4950,34 @@ def check_mllp_tls_exposure(source: Source, name: str, *, allow_insecure_bind: b
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; HL7 bodies would "
         "cross the network in cleartext. Set tls=true (+ tls_cert_file/tls_key_file) on the MLLP "
         "connection, or pass `serve --allow-insecure-bind` to accept the cleartext risk on a trusted, "
-        "firewalled network."
+        "firewalled network (refused even with the flag on a production-PHI instance — set "
+        "tls_hop_attested=true if the segment is secured by other means)."
     )
 
 
-def check_http_tls_exposure(source: Source, name: str, *, allow_insecure_bind: bool) -> None:
+def check_http_tls_exposure(
+    source: Source, name: str, *, allow_insecure_bind: bool, posture: HopPosture | None = None
+) -> None:
     """Exposed-gate (ADR 0002 §0 / ADR 0023 §D4, HTTP side): refuse a **non-loopback inbound HTTP
     listener without TLS** — it would put POSTed bodies (frequently PHI: HL7-over-HTTP, FHIR, X12) on the
     wire in cleartext. The HTTP sibling of :func:`check_mllp_tls_exposure`. Like MLLP/DICOM the HTTP
     source *does* support TLS, so the escape hatch is ``tls=true`` (+ cert) on the ``Http(...)``
     connection; otherwise bind loopback or pass ``serve --allow-insecure-bind`` to accept the risk on a
-    trusted segment (then warn). Loopback binds and TLS-on binds pass unconditionally."""
+    trusted segment (then warn). ``--allow-insecure-bind`` is CLAMPED (#200): a production-PHI listener
+    refuses cleartext even with it (``posture``-keyed via :func:`_inbound_insecure_bind_permitted`).
+    Loopback binds and TLS-on binds pass unconditionally."""
     if source.type is not ConnectorType.HTTP:
         return
     host = str(source.settings.get("host", "127.0.0.1"))
     if host in _LOOPBACK_HOSTS or source.settings.get("tls"):
         return
-    if allow_insecure_bind:
+    if _inbound_insecure_bind_permitted(
+        allow_insecure_bind=allow_insecure_bind, attested=source.tls_hop_attested, posture=posture
+    ):
         log.warning(
             "inbound %r binds non-loopback host %r for an HTTP listener without TLS "
-            "(--allow-insecure-bind); POSTed bodies (frequently PHI) cross the network in cleartext — "
-            "set tls=true (+ tls_cert_file/tls_key_file) on the Http connection.",
+            "(--allow-insecure-bind / tls_hop_attested); POSTed bodies (frequently PHI) cross the "
+            "network in cleartext — set tls=true (+ tls_cert_file/tls_key_file) on the Http connection.",
             name,
             host,
         )
@@ -4271,27 +4986,33 @@ def check_http_tls_exposure(source: Source, name: str, *, allow_insecure_bind: b
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; POSTed bodies "
         "(frequently PHI) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the Http connection, or pass `serve --allow-insecure-bind` to accept the "
-        "cleartext risk on a trusted, firewalled network."
+        "cleartext risk on a trusted, firewalled network (refused even with the flag on a "
+        "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
     )
 
 
-def check_dimse_tls_exposure(source: Source, name: str, *, allow_insecure_bind: bool) -> None:
+def check_dimse_tls_exposure(
+    source: Source, name: str, *, allow_insecure_bind: bool, posture: HopPosture | None = None
+) -> None:
     """Exposed-gate (ADR 0025 §9, DIMSE side): refuse a **non-loopback DICOM C-STORE SCP without TLS** —
     it would put DICOM header + pixel-data PHI on the wire in cleartext. The DIMSE sibling of
     :func:`check_mllp_tls_exposure` (the shipped guard is MLLP-only; TCP/X12/DIMSE listeners were not
     covered, so this is **net-new** security work, not a fold-in). Set ``tls=true`` (+ cert) on the
     ``DICOM(...)`` connection, or pass ``serve --allow-insecure-bind`` to accept the risk on a trusted
-    segment (then warn). Loopback binds and TLS-on binds pass unconditionally."""
+    segment (then warn). ``--allow-insecure-bind`` is CLAMPED (#200): a production-PHI listener refuses
+    cleartext even with it (``posture``-keyed). Loopback binds and TLS-on binds pass unconditionally."""
     if source.type is not ConnectorType.DIMSE:
         return
     host = str(source.settings.get("host", "127.0.0.1"))
     if host in _LOOPBACK_HOSTS or source.settings.get("tls"):
         return
-    if allow_insecure_bind:
+    if _inbound_insecure_bind_permitted(
+        allow_insecure_bind=allow_insecure_bind, attested=source.tls_hop_attested, posture=posture
+    ):
         log.warning(
-            "inbound %r binds non-loopback host %r without DICOM-over-TLS (--allow-insecure-bind); "
-            "DICOM PHI (header + pixel data) crosses the network in cleartext — set tls=true "
-            "(+ tls_cert_file/tls_key_file) on the DICOM connection.",
+            "inbound %r binds non-loopback host %r without DICOM-over-TLS "
+            "(--allow-insecure-bind / tls_hop_attested); DICOM PHI (header + pixel data) crosses the "
+            "network in cleartext — set tls=true (+ tls_cert_file/tls_key_file) on the DICOM connection.",
             name,
             host,
         )
@@ -4300,11 +5021,14 @@ def check_dimse_tls_exposure(source: Source, name: str, *, allow_insecure_bind: 
         f"inbound connection {name!r} binds non-loopback host {host!r} without TLS; DICOM PHI (header "
         "+ pixel data) would cross the network in cleartext. Set tls=true (+ tls_cert_file/"
         "tls_key_file) on the DICOM connection, or pass `serve --allow-insecure-bind` to accept the "
-        "cleartext risk on a trusted, firewalled network."
+        "cleartext risk on a trusted, firewalled network (refused even with the flag on a "
+        "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
     )
 
 
-def check_tcp_tls_exposure(source: Source, name: str, *, allow_insecure_bind: bool) -> None:
+def check_tcp_tls_exposure(
+    source: Source, name: str, *, allow_insecure_bind: bool, posture: HopPosture | None = None
+) -> None:
     """Exposed-gate (ADR 0002 §0, raw-TCP/X12 side): refuse a **non-loopback raw-TCP or X12 listener**
     on a cleartext bind — it would put raw-TCP/X12 payloads (frequently PHI: X12 270/271 eligibility,
     raw/FHIR bodies) on the wire in plaintext. The TCP/X12 sibling of :func:`check_mllp_tls_exposure`
@@ -4312,18 +5036,21 @@ def check_tcp_tls_exposure(source: Source, name: str, *, allow_insecure_bind: bo
     LISTEN types. Unlike MLLP/DICOM these connectors are **plaintext-only** — they have **no** ``tls=``
     option (``asyncio.start_server`` is called with no ``ssl=`` arg), so there is no TLS escape hatch:
     the only ways forward are a loopback bind, OS-level firewall/segmentation, or
-    ``serve --allow-insecure-bind`` to accept the cleartext risk (then warn). Loopback binds pass
-    unconditionally; the guard no-ops for any non-TCP/X12 type."""
+    ``serve --allow-insecure-bind`` to accept the cleartext risk (then warn). ``--allow-insecure-bind``
+    is CLAMPED (#200): a production-PHI listener refuses cleartext even with it (``posture``-keyed).
+    Loopback binds pass unconditionally; the guard no-ops for any non-TCP/X12 type."""
     if source.type not in (ConnectorType.TCP, ConnectorType.X12):
         return
     host = str(source.settings.get("host", "127.0.0.1"))
     if host in _LOOPBACK_HOSTS:
         return
-    if allow_insecure_bind:
+    if _inbound_insecure_bind_permitted(
+        allow_insecure_bind=allow_insecure_bind, attested=source.tls_hop_attested, posture=posture
+    ):
         log.warning(
             "inbound %r binds non-loopback host %r for a plaintext-only %s listener "
-            "(--allow-insecure-bind); X12/raw-TCP payloads (frequently PHI) cross the network in "
-            "cleartext — these listeners have no TLS, so firewall/segment them.",
+            "(--allow-insecure-bind / tls_hop_attested); X12/raw-TCP payloads (frequently PHI) cross "
+            "the network in cleartext — these listeners have no TLS, so firewall/segment them.",
             name,
             host,
             source.type.value.upper(),
@@ -4334,7 +5061,8 @@ def check_tcp_tls_exposure(source: Source, name: str, *, allow_insecure_bind: bo
         f"{source.type.value.upper()} listener; raw-TCP/X12 payloads (frequently PHI) would cross the "
         "network in cleartext. TCP/X12 listeners are plaintext-only (no TLS option) — bind loopback, "
         "firewall/segment the port at the OS level, or pass `serve --allow-insecure-bind` to accept "
-        "the cleartext risk on a trusted, firewalled network."
+        "the cleartext risk on a trusted, firewalled network (refused even with the flag on a "
+        "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
     )
 
 
@@ -4498,6 +5226,22 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
             raise WiringError(
                 f"outbound {dest.name!r}: EMAIL host {host!r} is not in the "
                 "[egress].allowed_smtp allowlist"
+            )
+    elif dest.type is ConnectorType.DIRECT and egress.allowed_direct:
+        # Direct S/MIME-over-SMTP (ADR 0085): the HISP relay host is gated with the same host[:port]
+        # matching as EMAIL/MLLP, but against its own [egress].allowed_direct list so a Direct relay is
+        # permitted independently of generic SMTP egress.
+        host = str(dest.settings.get("host", ""))
+        port = dest.settings.get("port", 587)
+        if not _mllp_egress_allowed(host, port, egress.allowed_direct):  # same host[:port] matching
+            log.warning(
+                "egress denied: outbound %r DIRECT host %r not in [egress].allowed_direct",
+                dest.name,
+                host,
+            )
+            raise WiringError(
+                f"outbound {dest.name!r}: DIRECT host {host!r} is not in the "
+                "[egress].allowed_direct allowlist"
             )
 
 

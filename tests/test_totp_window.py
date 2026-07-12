@@ -1,13 +1,24 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Regression for SEC-014 (CWE-287): the TOTP verify window tolerates a near-boundary fast-clock
-authenticator without letting the single-use high-water mark advance past the current step.
+"""TOTP clock-skew window semantics ([auth].totp_skew_steps, BACKLOG #187; ASVS 6.5.5) + the SEC-014
+(CWE-287) fast-clock clamp.
 
-``verify_totp_step`` accepts the forward half of the skew window (so a user whose authenticator clock
-runs ~25-30 s fast can still log in) but **clamps the returned step to the current step**. Otherwise
-consuming the future step ``counter+1`` would reject the user's own genuine current-step code (a
-non-greater step) for up to ~30 s — a self-inflicted lockout. The clamp only lowers the recorded step,
-so single-use is preserved."""
+The verify window is an operator knob: ``AuthService`` threads ``[auth].totp_skew_steps`` into
+:func:`~messagefoundry.auth.totp.verify_totp_step`.
+
+- Default ``totp_skew_steps = 0`` is STRICT: only the CURRENT 30 s step verifies, so the prior AND the
+  next step are rejected and a captured code is replayable for at most the remainder of its own step
+  (ASVS 6.5.5 prefers the tightest window).
+- The documented opt-out ``totp_skew_steps = 1`` restores RFC-6238 ±1 tolerance. There the SEC-014
+  accommodation applies: the forward half of the window is *accepted* (a near-boundary fast-clock
+  authenticator can still log in) but the returned step is **clamped to the current step**, so consuming
+  a tolerated future code never advances the single-use high-water mark past ``now`` — otherwise the
+  user's own genuine current-step code (a non-greater step) would be rejected for up to ~30 s, a
+  self-inflicted lockout, not a bypass. The clamp only lowers the recorded step, so single-use holds.
+
+These call ``verify_totp_step`` directly with an EXPLICIT ``window`` so both the strict default and the
+opt-out are pinned regardless of the module-level ``DEFAULT_WINDOW`` (which stays 1 for callers that
+don't pass one)."""
 
 from __future__ import annotations
 
@@ -22,54 +33,74 @@ def _step(now: float) -> int:
     return int(now // PERIOD)
 
 
-def test_fast_clock_future_code_is_clamped_to_current_step() -> None:
-    # The engine clock is one step BEHIND the user's fast authenticator: the user submits the code for
-    # step floor(T/30) while the engine's "now" is T-30 (current step floor((T-30)/30)).
+# --- strict default: totp_skew_steps = 0 (current step only, ASVS 6.5.5) -----
+
+
+def test_strict_window_accepts_only_the_current_step() -> None:
     t = 5_000 * PERIOD + 5.0  # comfortably mid-step
-    engine_now = t - PERIOD
-    user_future_code = totp.totp(SECRET, now=t)  # code for the user's (fast) current step
-
-    matched = totp.verify_totp_step(SECRET, user_future_code, now=engine_now)
-    # Accepted (forward window) but reported as the ENGINE's current step, not the future step.
-    assert matched == _step(engine_now)
-    assert matched != _step(t)
+    current = totp.totp(SECRET, now=t)
+    assert totp.verify_totp_step(SECRET, current, now=t, window=0) == _step(t)
 
 
-def test_genuine_current_code_after_future_code_is_strictly_greater() -> None:
-    # No self-lockout: after the clamped future code is consumed at the engine's current step, the
-    # user's genuine code for the engine's NEXT step still resolves to a strictly greater step.
+def test_strict_window_rejects_the_prior_step() -> None:
+    t = 5_000 * PERIOD + 5.0
+    prior = totp.totp(SECRET, now=t - PERIOD)
+    # Even one step back is outside the strict window → no match (tighter than the historical ±1).
+    assert totp.verify_totp_step(SECRET, prior, now=t, window=0) is None
+
+
+def test_strict_window_rejects_the_next_step() -> None:
+    t = 5_000 * PERIOD + 5.0
+    future = totp.totp(SECRET, now=t + PERIOD)
+    # A fast-clock (future) code is NOT tolerated at window=0 — the tightest replay posture (6.5.5).
+    assert totp.verify_totp_step(SECRET, future, now=t, window=0) is None
+
+
+# --- opt-out: totp_skew_steps = 1 restores ±1 (with the SEC-014 clamp) --------
+
+
+def test_optout_window_accepts_prior_and_current_and_clamps_the_future() -> None:
+    t = 5_000 * PERIOD + 5.0
+    prior = totp.totp(SECRET, now=t - PERIOD)
+    current = totp.totp(SECRET, now=t)
+    future = totp.totp(SECRET, now=t + PERIOD)
+    # Prior step is accepted and reported as its own (strictly-less) step.
+    assert totp.verify_totp_step(SECRET, prior, now=t, window=1) == _step(t - PERIOD)
+    # Current step accepted as current.
+    assert totp.verify_totp_step(SECRET, current, now=t, window=1) == _step(t)
+    # The forward step is ACCEPTED but its reported step is clamped down to the current step (SEC-014),
+    # so burning it can't advance the single-use high-water mark past now.
+    assert totp.verify_totp_step(SECRET, future, now=t, window=1) == _step(t)
+
+
+def test_optout_two_steps_into_the_future_is_still_rejected() -> None:
+    t = 5_000 * PERIOD + 5.0
+    two_future = totp.totp(SECRET, now=t + 2 * PERIOD)
+    assert totp.verify_totp_step(SECRET, two_future, now=t, window=1) is None
+
+
+def test_optout_fast_clock_future_code_causes_no_self_lockout() -> None:
+    # SEC-014: the engine clock is one step BEHIND the user's fast authenticator. The user submits the
+    # code for step floor(T/30) while the engine's "now" is T-PERIOD. It is accepted (forward window)
+    # but recorded at the engine's CURRENT step, not the future step.
     t = 5_000 * PERIOD + 5.0
     engine_now = t - PERIOD
     future_code = totp.totp(SECRET, now=t)
-    consumed = totp.verify_totp_step(SECRET, future_code, now=engine_now)
-    assert consumed is not None
+    consumed = totp.verify_totp_step(SECRET, future_code, now=engine_now, window=1)
+    assert consumed == _step(engine_now)
+    assert consumed != _step(t)
+    # When the engine clock catches up, the user's genuine current code resolves to a STRICTLY GREATER
+    # step, so a single-use store rejecting a non-greater step still lets it through (no lockout).
+    genuine = totp.verify_totp_step(SECRET, totp.totp(SECRET, now=t), now=t, window=1)
+    assert genuine is not None and genuine > consumed
 
-    # The engine's clock catches up to the user's step; the genuine current code now verifies.
-    genuine_code = totp.totp(SECRET, now=t)
-    genuine_step = totp.verify_totp_step(SECRET, genuine_code, now=t)
-    assert genuine_step is not None
-    assert genuine_step > consumed  # strictly greater → single-use guard lets it through
 
-
-def test_single_use_preserved_same_code_same_now() -> None:
-    # The same code at the same now resolves to the same step both times; a single-use store rejecting
-    # a non-greater step would reject the replay. (We assert the returned step is identical/stable.)
+def test_single_use_step_is_stable_for_the_same_code_and_now() -> None:
+    # The same code at the same now resolves to the same step both times (a single-use store rejecting a
+    # non-greater step then rejects the replay). Holds under both the strict and the opt-out window.
     t = 5_000 * PERIOD + 5.0
-    code = totp.totp(SECRET, now=t)
-    first = totp.verify_totp_step(SECRET, code, now=t)
-    second = totp.verify_totp_step(SECRET, code, now=t)
-    assert first == second == _step(t)
-
-
-def test_prior_and_current_in_window_but_two_steps_future_rejected() -> None:
-    t = 5_000 * PERIOD + 5.0
-    prior_code = totp.totp(SECRET, now=t - PERIOD)
-    current_code = totp.totp(SECRET, now=t)
-    two_steps_future = totp.totp(SECRET, now=t + 2 * PERIOD)
-
-    # Prior step is accepted (and is its own step — strictly less than current).
-    assert totp.verify_totp_step(SECRET, prior_code, now=t) == _step(t - PERIOD)
-    # Current step accepted as current.
-    assert totp.verify_totp_step(SECRET, current_code, now=t) == _step(t)
-    # Two steps into the future is outside the ±1 window → no match.
-    assert totp.verify_totp_step(SECRET, two_steps_future, now=t) is None
+    for window in (0, 1):
+        code = totp.totp(SECRET, now=t)
+        first = totp.verify_totp_step(SECRET, code, now=t, window=window)
+        second = totp.verify_totp_step(SECRET, code, now=t, window=window)
+        assert first == second == _step(t)

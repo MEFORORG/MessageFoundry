@@ -40,8 +40,13 @@ def test_cipher_round_trip_and_hides_plaintext() -> None:
     cipher = make_cipher(generate_key())
     token = cipher.encrypt(ADT)
     assert token.startswith(PREFIX)
-    assert "DOE" not in token and "MSH" not in token  # PHI not visible in the ciphertext
+    # PHI-hidden, asserted deterministically: the whole plaintext can never appear in the token
+    # (it contains non-base64 bytes like '|' and '\r'), and the round-trip proves real encryption.
+    # NEVER assert short-substring absence ("MSH"/"DOE") — a random base64 body contains any given
+    # 3-char run with probability ~len/64^3, and that assertion HAS flaked in CI.
+    assert ADT not in token
     assert cipher.decrypt(token) == ADT
+    assert cipher.encrypt(ADT) != token  # fresh nonce per encryption — tokens never repeat
 
 
 def test_identity_cipher_is_passthrough() -> None:
@@ -483,8 +488,11 @@ def test_v2_round_trip_marker_and_decrypt() -> None:
     # mfenc:v2:<alg>:<key_id>:<b64> — alg id present, PHI hidden.
     assert token.startswith("mfenc:v2:a256gcm:")
     assert token.startswith(MARKER_PREFIX) and cipher.is_encrypted(token)
-    assert "DOE" not in token and "MSH" not in token
+    # Deterministic PHI-hidden assertions (see test_cipher_round_trip_and_hides_plaintext —
+    # the short-substring "MSH"/"DOE" check flaked in CI on a chance base64 collision).
+    assert ADT not in token
     assert cipher.decrypt(token) == ADT
+    assert cipher.encrypt(ADT) != token  # fresh nonce per encryption — tokens never repeat
 
 
 def test_v2_active_decrypts_v1_without_rotation() -> None:
@@ -591,3 +599,86 @@ async def test_store_reads_mixed_v1_and_v2_rows(tmp_path: Path) -> None:
         assert rec2 is not None and rec2["raw"] == other  # v2 row decrypts
     finally:
         await store.close()
+
+
+# --- SECMEM (#198): in-use memory hygiene (ASVS 13.3.3 / 11.7.2) --------------
+#
+# Best-effort lock + zeroize on the DEK and the transient plaintext buffers. The wipe is the only HARD
+# assertion (memset is deterministic); locking is verified only to the extent that its *absence* never
+# breaks the round trip (VirtualLock/mlock legitimately fail without privilege, so a real success can't
+# be asserted portably). The v1 byte-identity gate lives in test_v1_frozen_fixture_decrypts above and
+# must remain UNCHANGED.
+
+
+def test_secure_zero_clears_bytearray() -> None:
+    from messagefoundry.store.crypto import _secure_zero
+
+    buf = bytearray(b"\x01" * 32)
+    _secure_zero(buf)
+    assert buf == bytearray(32)  # every byte scrubbed to 0x00
+    assert len(buf) == 32  # length preserved, only the contents wiped
+
+
+def test_secure_zero_empty_and_immutable_never_raise() -> None:
+    from messagefoundry.store.crypto import _secure_zero
+
+    _secure_zero(bytearray())  # empty buffer is a no-op, never raises
+    # An immutable bytes handed in (defensive: the DEK path is bytearray) must be swallowed, not crash.
+    _secure_zero(b"\x02" * 16)  # type: ignore[arg-type]
+
+
+def test_round_trip_after_key_zeroization() -> None:
+    # __init__ wipes the DEK bytearray after AESGCM copies the key; the cipher must still work.
+    cipher = make_cipher(generate_key())
+    token = cipher.encrypt(ADT)
+    assert cipher.decrypt(token) == ADT
+
+
+def test_lock_and_zero_run_on_the_dek_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Spy that the DEK (32 bytes) is offered to _lock_memory AND actually zeroized during construction.
+    import messagefoundry.store.crypto as crypto
+
+    locked_lens: list[int] = []
+    zeroed_lens: list[int] = []
+    real_zero = crypto._secure_zero
+
+    def spy_lock(buf: bytearray) -> bool:
+        locked_lens.append(len(buf))
+        return False  # force the no-lock path (see the forced-failure round-trip test too)
+
+    def spy_zero(buf: bytearray) -> None:
+        zeroed_lens.append(len(buf))
+        real_zero(buf)  # still perform the real wipe so behaviour is unchanged
+
+    monkeypatch.setattr(crypto, "_lock_memory", spy_lock)
+    monkeypatch.setattr(crypto, "_secure_zero", spy_zero)
+
+    make_cipher(generate_key())  # constructing the keyring installs + wipes the DEK
+    assert 32 in locked_lens  # the 32-byte DEK buffer was offered to _lock_memory
+    assert 32 in zeroed_lens  # and was zeroized
+
+
+def test_round_trip_when_lock_memory_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Locking is best-effort: with _lock_memory forced to always fail (as it does unprivileged), the
+    # cipher must still encrypt + decrypt correctly and _unlock_memory must not be invoked.
+    import messagefoundry.store.crypto as crypto
+
+    monkeypatch.setattr(crypto, "_lock_memory", lambda buf: False)
+
+    def fail_unlock(buf: bytearray) -> None:
+        raise AssertionError("_unlock_memory must not run when the lock was not taken")
+
+    monkeypatch.setattr(crypto, "_unlock_memory", fail_unlock)
+
+    cipher = make_cipher(generate_key())
+    token = cipher.encrypt(ADT)
+    assert cipher.decrypt(token) == ADT
+
+
+def test_cipher_does_not_retain_raw_key_bytearray() -> None:
+    # The raw DEK bytearray is not kept as an attribute — only the fingerprint + the AESGCM survive.
+    from messagefoundry.store.crypto import AesGcmCipher
+
+    cipher = make_cipher(generate_key())
+    assert isinstance(cipher, AesGcmCipher)
+    assert not any(isinstance(v, bytearray) for v in vars(cipher).values())

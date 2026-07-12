@@ -24,6 +24,7 @@ __all__ = [
     "dead_letter_pending",
     "dead_letters",
     "message_detail",
+    "message_edit",
     "message_search",
     "messages",
     "parse_tree_page",
@@ -241,10 +242,19 @@ def message_detail(detail: MessageDetail) -> Markup:
         action=f"/ui/messages/{detail.id}/replay",
         class_="ctl",
     )
+    # Edit-and-resubmit (ADR 0090 §9, BACKLOG #153): a LINK (GET) to the editor page — the editable copy
+    # opens there so the ORIGINAL shown here is never altered. GET, not a POST, so it is the step-up
+    # `unlock` continuation the re-auth flow can hand back to (a body-carrying POST can't be auto-retried).
+    edit = el(
+        "a",
+        "Edit & resubmit →",
+        href=f"/ui/messages/{detail.id}/edit",
+        class_="btn-link",
+    )
     return page(
         "Message",
         el("p", el("a", "← Messages", href="/ui/messages")),
-        el("div", el("h1", "Message detail"), replay, class_="detail-head"),
+        el("div", el("h1", "Message detail"), replay, edit, class_="detail-head"),
         meta,
         el(
             "div",
@@ -257,6 +267,131 @@ def message_detail(detail: MessageDetail) -> Markup:
         outbox,
         el("h2", "Events"),
         events,
+        active="messages",
+    )
+
+
+def message_edit(
+    detail: MessageDetail,
+    idempotency_key: str,
+    *,
+    raw_value: str | None = None,
+    error: str = "",
+    mode: str = "reroute",
+    to: str = "",
+) -> Markup:
+    """The edit-and-resubmit editor (ADR 0090 §9, BACKLOG #153): a COPY of the message's raw body opened
+    in an editable ``<textarea>``, a "Modified" badge that app.js reveals as soon as the copy changes, a
+    Revert button that restores the original copy, and a Resubmit button that POSTs the edited body. The
+    ORIGINAL log entry is untouched — this is a copy — which the banner states explicitly. ``raw_value``
+    (a rejected prior attempt echoed back) overrides the pristine copy so a validation error keeps the
+    operator's edits; the ``data-original`` attribute always carries the PRISTINE copy for Revert.
+
+    The edited body is attacker-influenced HL7 rendered as escaped ``<textarea>`` text (never markup);
+    ``idempotency_key`` is a fresh per-open token so a double-submit of this form is an idempotent no-op.
+    """
+    original = detail.raw
+    shown = original if raw_value is None else raw_value
+    is_direct = mode == "direct"
+    err = el("p", text(error), class_="banner") if error else Markup("")
+    # data-original carries the PRISTINE copy for the client-side Revert; the badge/Revert/Resubmit
+    # wiring lives in app.js (no inline script — the /ui CSP forbids it).
+    editor = el(
+        "textarea",
+        text(shown),
+        name="raw",
+        id="edit-raw",
+        class_="edit-raw",
+        rows="18",
+        spellcheck="false",
+        data_original=original,
+    )
+    modified_badge = el(
+        "span", "Modified", id="edit-modified", class_="badge-modified", hidden=True
+    )
+    # reroute (default) vs a direct alternate outbound. app.js shows/hides the `to` field on toggle;
+    # server-side, an empty `to` means re-route (the endpoint's default). On a rejected retry the
+    # selected mode + typed outbound are echoed back (via `mode`/`to`) so the operator's destination
+    # choice survives alongside their edits — not silently reset to re-route (review #153-4).
+    dest = el(
+        "div",
+        el(
+            "label",
+            el(
+                "input",
+                type="radio",
+                name="mode",
+                value="reroute",
+                checked=not is_direct,
+                class_="edit-mode",
+            ),
+            " Re-route on the original channel (re-parse + route normally)",
+        ),
+        el(
+            "label",
+            el(
+                "input",
+                type="radio",
+                name="mode",
+                value="direct",
+                checked=is_direct,
+                class_="edit-mode",
+            ),
+            " Send directly to an outbound connection",
+        ),
+        el(
+            "div",
+            el("label", "Outbound connection", for_="edit-to"),
+            el(
+                "input",
+                type="text",
+                name="to",
+                id="edit-to",
+                value=to,
+                maxlength="256",
+                autocomplete="off",
+            ),
+            id="edit-to-row",
+            class_="edit-to-row",
+            hidden=not is_direct,
+        ),
+        class_="edit-mode-row",
+    )
+    form = el(
+        "form",
+        el("input", type="hidden", name="idempotency_key", value=idempotency_key),
+        dest,
+        editor,
+        el(
+            "div",
+            el("button", "Resubmit", type="submit", id="edit-resubmit", class_="primary"),
+            el("button", "Revert", type="button", id="edit-revert", disabled=True),
+            modified_badge,
+            class_="ctls edit-ctls",
+        ),
+        method="post",
+        action=f"/ui/messages/{detail.id}/edit-resend",
+        class_="edit-form",
+        id="edit-form",
+        data_mf_edit=True,
+    )
+    return page(
+        "Edit & resubmit",
+        el("p", el("a", "← Message", href=f"/ui/messages/{detail.id}")),
+        el("h1", "Edit & resubmit"),
+        el(
+            "p",
+            "You are editing a COPY. The original message in the log stays unchanged; Resubmit"
+            " creates a new, correlated message.",
+            class_="muted",
+        ),
+        err,
+        rows_table(
+            ["Field", "Value"],
+            [["Original ID", detail.id], ["Channel", detail.channel_id], ["Status", detail.status]],
+            adjustable=False,
+        ),
+        form,
         active="messages",
     )
 

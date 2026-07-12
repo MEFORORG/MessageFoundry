@@ -22,25 +22,37 @@ UNCHANGED. It adds four things the manual flow lacked:
    offered / delivered / drained / verdict), the pinned ceiling in BOTH ingress-msg/s and
    outbound-deliveries/s, the soak slope, and the per-shard ``send_ack``/``mark_done`` phase-timing split.
 
-**Judged ONLY by the reliable authorities** — the DRIVE sink socket-truth (``S == A*dests ∧ A>0 ∧ S>0 ∧
-Σinversions==0 ∧ Σrepeats==0 ∧ lanes≥2``) and the ENGINE store-truth (``drained ∧ stranded==0 ∧
+**Judged ONLY by the reliable authorities** — the DRIVE sink socket-truth (``S == A*delivering ∧ A>0 ∧
+S>0 ∧ Σinversions==0 ∧ Σrepeats==0 ∧ lanes≥2``) and the ENGINE store-truth (``drained ∧ stranded==0 ∧
 dead_total==0``). The remote ``/stats`` poller stays advisory (unreliable on a unified store — #841) and is
 never gated on. **This bench REPORTS numbers; it does NOT flip ``SYSTEM-REQUIREMENTS.md §8`` or grade its
 own fix** (the two-box governance rule). Counts + synthetic topology only — never message bodies /
 control-ids (PHI rule).
 
 The **target** is the 45M-messages/day figure = 45_000_000 / 86_400 ≈ **520.83 TOTAL message events/s**
-(:data:`TARGET_EVENTS_PER_S`) — inbound *and* outbound, per the owner ruling. Because every accepted
-message fans out to ``dests`` destinations, one ingress message produces ``1 + dests`` total events
-(``delivered = ingress * dests``). So the sustainable ingress that saturates the budget is
-``TARGET_EVENTS_PER_S / (1 + dests)``, and the report states BOTH figures.
+(:data:`TARGET_EVENTS_PER_S`) — inbound *and* outbound, per the owner ruling. An accepted message DELIVERS
+to ``delivering`` (D) destinations, so it produces ``1 + D`` total events (``delivered = ingress * D``) and
+the sustainable ingress that saturates the budget is ``TARGET_EVENTS_PER_S / (1 + D)``. The report states
+BOTH figures.
 
 .. warning::
-   Until 2026-07-10 this constant was named ``TARGET_INGRESS_PER_S`` and the gate compared it against a
-   pure **ingress** rate — a units defect (harness defect **B10**) that made the gate ``(1 + dests)``x too
-   strict, i.e. **9x** at the bench default ``dests=8``. Every "52x short" figure published before that
-   date carries that inflation. The JSON keys were renamed in ``schema_version`` 3 so that a stale
-   consumer fails loudly with a ``KeyError`` rather than silently reading a boolean whose meaning flipped.
+   **The fan-out is ``delivering`` (D), never ``dests``** (BACKLOG #209). ``dests`` is the count of shared
+   outbound destination CONNECTIONS — the sink port-band width, TOPOLOGY. ``handlers`` (H) is how many the
+   router SELECTS (it feeds the reported ``txn/msg = 3 + 2H + 2D`` and NEVER any delivery arithmetic). They
+   all default to each other (``H = D = dests = 8``), which is what the graph did before the split, so no
+   published run changes. But modelling the reference ``H=20, D=4`` ADT hub by simply raising ``dests`` to
+   20 would build 20 connections, deliver 20 copies, and report ``sustained_events_per_s = p*21`` against a
+   truth of ``p*5`` — a **4.2x overstatement of the headline number the §8 decision keys off**. That is
+   harness defect **B10** again, in the permissive direction. Keep D out of ``dests`` and dests out of the
+   arithmetic.
+
+.. warning::
+   Until 2026-07-10 :data:`TARGET_EVENTS_PER_S` was named ``TARGET_INGRESS_PER_S`` and the gate compared it
+   against a pure **ingress** rate — a units defect (harness defect **B10**) that made the gate
+   ``(1 + dests)``x too strict, i.e. **9x** at the bench default ``dests=8``. Every "52x short" figure
+   published before that date carries that inflation. The JSON keys were renamed in ``schema_version`` 3 so
+   that a stale consumer fails loudly with a ``KeyError`` rather than silently reading a boolean whose
+   meaning flipped; ``schema_version`` 4 adds ``handlers``/``delivering`` for the same reason.
 """
 
 from __future__ import annotations
@@ -73,8 +85,8 @@ from harness.load.shardcert import (
 )
 
 #: 45M messages/day as the sustained TOTAL message-event rate (inbound + outbound) the ladder pins
-#: against. NOT an ingress rate: one ingress message with ``dests`` destinations produces ``1 + dests``
-#: events, so the ingress that saturates this budget is ``TARGET_EVENTS_PER_S / (1 + dests)``.
+#: against. NOT an ingress rate: one ingress message DELIVERED to ``delivering`` (D) destinations produces
+#: ``1 + D`` events, so the ingress that saturates this budget is ``TARGET_EVENTS_PER_S / (1 + D)``.
 TARGET_EVENTS_PER_S = 45_000_000 / 86_400  # ≈ 520.833…
 
 #: A slope (in_pipeline rows per second over the soak hold) at or below this magnitude reads as
@@ -386,7 +398,7 @@ def slope_is_draining(slope: float | None, *, tol: float = _SLOPE_FLAT_TOL) -> b
 class LadderRung:
     """One rung of the ladder. ``ingress_rate`` is the whole-fleet offered INGRESS msg/s (the
     ``aggregate_rate`` the drive splits across its K sender-workers); the OUTBOUND delivery rate is
-    ``ingress_rate * dests``."""
+    ``ingress_rate * delivering`` — the FAN-OUT, not the destination-connection count."""
 
     index: int
     ingress_rate: float
@@ -398,8 +410,10 @@ class LadderRung:
     def run_suffix(self) -> str:
         return "soak" if self.is_soak else f"r{self.index}"
 
-    def outbound_rate(self, dests: int) -> float:
-        return self.ingress_rate * dests
+    def outbound_rate(self, delivering: int) -> float:
+        """Deliveries/s at this rung. Keyed on ``delivering`` (D), NEVER ``dests`` (BACKLOG #209): a
+        destination CONNECTION that no handler sends to carries no deliveries."""
+        return self.ingress_rate * delivering
 
 
 def plan_climb_rungs(
@@ -429,11 +443,17 @@ class RungVerdict(enum.Enum):
       tally came up short with NO ordering/dup break. The shortfall is a teardown-frozen / latency tail, NOT
       collapse — inconclusive (re-run with a longer drain), and NOT counted as the ceiling. With the drain
       gate ON this is rare; it is the diagnostic for a degraded/absent gate.
-    * :attr:`INCONCLUSIVE` — the engine store-truth could NOT be confirmed at all (neither the ENGINE_DRAINED
-      drain gate nor the ENGINE_RUNG_REPORT arrived). This is a coordination glitch, NOT proof the fleet
-      failed to sustain — so it must NOT be scored as a real COLLAPSED (that would fabricate a false
-      bracketed ceiling below the true one). It halts the climb (store-truth is required to certify) but is
-      EXCLUDED from the collapse bracket, leaving the pinned rate an honest FLOOR.
+    * :attr:`INCONCLUSIVE` — the rung's outcome could NOT be trusted, so it must NOT be scored as a real
+      SUSTAINED/COLLAPSED (that would fabricate a plausible ceiling — the B-class defect). Two disjoint
+      causes, both "nothing certified":
+        1. **Store-truth unconfirmed** — neither the ENGINE_DRAINED drain gate nor the ENGINE_RUNG_REPORT
+           arrived, so there is no reliable store-truth at all (a coordination glitch).
+        2. **Cross-observer inconsistency** (A4b) — the two INDEPENDENT observers of the rung (the ENGINE
+           store-truth tally and the DRIVE sink socket count) are mutually contradictory beyond tolerance,
+           OR a required collector read zero on a non-zero-volume run (see :func:`observers_inconclusive`).
+           Trusting either observer to break the tie is exactly the silent-fabrication the ladder refuses.
+      Either way it halts the climb (the rung cannot certify the next one) and is EXCLUDED from the collapse
+      bracket, leaving the pinned rate an honest FLOOR — never a false bracketed ceiling below the true one.
     * :attr:`CORRECTNESS_FAIL` — a per-lane FIFO inversion or a duplicate delivery. A hard correctness break
       that FAILs the whole ladder verdict, independent of throughput.
     """
@@ -445,6 +465,163 @@ class RungVerdict(enum.Enum):
     CORRECTNESS_FAIL = "correctness_fail"
 
 
+#: Cross-observer agreement tolerance (A4b), as a fraction of the expected deliveries ``A×delivering``. The
+#: two INDEPENDENT observers of a rung — the ENGINE store-truth tally and the DRIVE sink socket count — may
+#: differ by up to ``tol × A×delivering`` deliveries (a benign teardown/latency tail, lane-boundary rounding)
+#: before the harness treats the difference as a genuine CONTRADICTION rather than measurement noise. Kept
+#: small so the guard fires only on a MATERIAL inter-observer inconsistency, never on a few-delivery tail.
+_OBSERVER_DISAGREE_TOL = 0.01
+
+
+def observers_inconclusive(
+    *,
+    engine_ok: bool,
+    acked: int,
+    sink_received: int,
+    delivering: int,
+    engine_stranded: int,
+    engine_dead_total: int,
+    handlers: int = 0,
+    tol: float = _OBSERVER_DISAGREE_TOL,
+) -> bool:
+    """Whether the two INDEPENDENT observers of a rung — the ENGINE store-truth tally and the DRIVE sink
+    socket count — are mutually INCONSISTENT, so neither's sustained-vs-collapsed read can be trusted and the
+    rung must downgrade to INCONCLUSIVE instead of fabricating a plausible SUSTAINED/COLLAPSED (A4b, the
+    harness sibling of the merged ``test_harness_invariants`` guard; BACKLOG #219).
+
+    Returns False (**guard inert**) when the raw observer counts were not supplied (``acked < 0`` or
+    ``sink_received < 0``): the boolean ``no_loss`` alone cannot convey the MAGNITUDE a tolerance needs, so
+    the pure truth-table callers (no counts) keep their verdict; the integration path
+    (:func:`build_rung_outcome`) always passes the real tallies.
+
+    **BACKLOG #209 — this guard keys on ``delivering`` (D), the FAN-OUT, never ``dests``.** It is the
+    silent one: at ``D < dests`` an over-expected ``A×dests`` inflates BOTH ``expected`` and ``permit``, so
+    trigger (a) — ``sink_received > permit + slack`` — can never fire. The A4b cross-observer guard would be
+    DISARMED with no error, no note, and no failing test (every pre-#209 run had ``D == dests``, so the two
+    coincided). A disarmed guard does not fail loudly; it just quietly stops catching fabrications.
+
+    **BACKLOG #209 — the permit also accounts for the non-delivering-handler strand budget at ``H > D``.**
+    ``expected`` is a DELIVERY count (``A×D``) but ``engine_stranded`` / ``engine_dead_total`` are ROW counts
+    across ALL pipeline stages (ingress + routed + outbound). At the ADT-hub shape the router SELECTS ``H``
+    handlers but only ``D`` DELIVER — the other ``H − D`` per message self-filter (their transform returns
+    ``None``). A stranded/dead routed row of one of those NON-delivering handlers blocks ZERO deliveries: it
+    was never going to produce one. So the old "each unclear row blocks at least one delivery" premise is
+    FALSE at ``H > D`` — it holds only at ``H == D`` (the pre-#209 graph). Subtracting every such row from a
+    DELIVERY permit under-counts the permit; at a genuine ``H > D`` collapse the routed strand count scales
+    with ``H`` (``~A×H``) while deliveries scale with ``D`` (``~A×D``), so the permit goes strongly NEGATIVE
+    and ``S > permit + slack`` fires on ANY nonzero sink — a real COLLAPSE mislabeled INCONCLUSIVE, a
+    fabricated verdict in the very guard whose job is to prevent fabricated verdicts.
+
+    The fix has TWO parts, and the ORDER between them is load-bearing::
+
+        unclear = max(0, engine_stranded) + max(0, engine_dead_total)
+        # (a′) a FULLY-lossless sink can NOT coexist with any unclear row — fire BEFORE `free`:
+        if sink_received ≥ expected and unclear > 0:  return True
+        # (a) below the lossless line the sink UNDER-counts; only THEN credit the H>D budget:
+        free    = acked × max(0, handlers − delivering)   # non-delivering-handler routed rows
+        blocked = max(0, unclear − free)
+        permit  = expected − blocked
+
+    **Why the lossless-sink clause precedes ``free`` (the fix for the stage-blind over-forgiveness).** ``free``
+    was originally applied to the WHOLE opaque ``unclear`` tally, stage-blind. But ``engine_stranded`` is
+    ``status NOT IN ('done','dead')`` across ALL stages, and a self-filtering handler's routed row is finalized
+    TERMINAL (``FILTERED``/``UNROUTED``; its routed row is DELETEd in the same transform-handoff transaction —
+    see :meth:`store.handoff` / :meth:`transform_handoff`). A row that self-filters therefore NEVER enters the
+    ``stranded`` tally, so ``free`` had no legitimate population to absorb: every ``unclear`` row is a genuinely
+    stuck/dead **delivery-bearing** row. A FULLY-lossless sink (``S ≥ A×D``) asserts every accepted message
+    delivered all D copies — impossible if ANY such row is still non-terminal or dead. Charging that
+    contradiction to ``free`` would forgive an INGRESS strand (blocks D copies) or a delivering-path strand
+    (blocks ≥1) as if it blocked ZERO — a stage-blind over-forgiveness that let a fully-lossless sink coincident
+    with strands fabricate a bracketed COLLAPSED (the exact B-class defect this guard exists to prevent). So the
+    lossless-sink clause fires first, unconditionally on ``unclear > 0``, and ``free`` is consulted ONLY on the
+    UNDER-counting branch, where the sink honestly reports loss and the two observers can genuinely AGREE.
+
+    ``free`` (on the under-counting branch) absorbs stranded AND dead jointly because a DEAD-lettered row and a
+    stranded row are treated identically by the permit; it lets a GENUINE H>D collapse — routed strands scaling
+    with H, deliveries with D, and the sink honestly SHORT — read as the honest COLLAPSED the observers agree
+    on rather than a fabricated INCONCLUSIVE.
+
+    **RESIDUAL (BACKLOG #229): ``free`` is still applied STAGE-BLIND on the under-counting branch.** ``stranded``
+    is an opaque all-stage total, so an INGRESS strand (blocks D copies) or a delivering-path strand (blocks ≥1)
+    within the ``free`` window is credited as blocking 0 — a partial over-count (sink > the store's *real*
+    capacity, yet < A×D) is MISSED at H>D. It fails CONSERVATIVE (a missed downgrade to INCONCLUSIVE, never a
+    fabricated definite verdict) and cannot touch H==D (``free==0``). The sound fix threads the per-stage strand
+    counts ``_queue_breakdown`` (``shardcert.py``) already reads — needed **before any H>D ladder result is
+    trusted**, not before the seam merges.
+
+    **``H == D`` identity (matches the pre-fix formula wherever the two observers can disagree, so no published
+    run regresses).** At ``H == D`` (and for any caller that does not pass ``handlers`` — it defaults to ``0``
+    with ``max(0, 0 − D) == 0``), ``free == 0``, so the UNDER-counting branch is ``permit == expected −
+    max(0, stranded) − max(0, dead)`` — EXACTLY the old expression. (Reaching that branch already guarantees
+    ``stranded ≥ 0`` and ``dead ≥ 0``: the ``< 0`` sentinel path below returns first when ``not engine_ok``,
+    and when ``engine_ok`` the store-truth pass bar forces both to ``0``, so ``max(0, s) + max(0, d)`` equals
+    ``max(0, s + d)`` and the terms fold identically.) The lossless-sink clause (a′) is the ONE point where the
+    fixed guard is STRICTER than the raw pre-fix arithmetic even at ``H == D``: the old formula absorbed up to
+    ``slack`` genuinely-stuck rows as delivery noise, so a lossless sink with ``0 < unclear ≤ slack`` slipped
+    through; (a′) now fires on it, because a stranded row is an EXACT store count, not a noisy delivery tail,
+    and cannot be reconciled with a lossless sink. Every published ``H == D`` run had ``stranded == 0`` on a
+    lossless rung (a run that stranded rows was not lossless), so this stricter edge changes no real verdict —
+    it only removes a corner where the noise slack wrongly forgave a real contradiction.
+
+    Two triggers, each a hard inter-observer contradiction rather than a mere shortfall:
+
+    (a) **The sink counted MORE deliveries than the engine's own store-truth permits.** Split in two by the
+        lossless line. When the sink is FULLY lossless (``S ≥ A×D``) and the engine reports ANY unclear row,
+        the two are irreconcilable outright — a lossless sink means every copy landed, which leaves no stuck or
+        dead row — so it fires without consulting ``free`` (clause a′ above). When the sink UNDER-counts, the
+        engine's ``unclear`` rows are reconciled against a permit ``A×D − max(0, unclear − free)`` that credits
+        up to ``free`` of them to the self-filtering handlers; a sink beyond that permit + a ``tol × A×D`` slack
+        over-counts against the reliable store-truth. Either way the tie was silently broken in the engine's
+        favour and stamped COLLAPSED, fabricating a bracketed ceiling from a contradiction. This CANNOT
+        false-positive on a genuine collapse, where the sink UNDER-counts and ``S ≤ permit`` holds.
+
+    (b) **A required collector read ZERO on a run that processed a non-zero volume.** The sink tally is the
+        drive box's ONLY reliable delivery observer. If the fleet accept-ACK'd a non-zero intake (``A > 0``)
+        and the engine store-truth says it delivered that intake CLEAN (``engine_ok``), a sink count of ZERO
+        is a blind/absent collector, not a measured zero — it cannot certify SUSTAINED nor a benign
+        FROZEN_TAIL. (A genuine total collapse also reads ``S == 0``, but then the engine CONFIRMS it —
+        ``engine_ok`` is False — and the run is honestly COLLAPSED, not caught here.)
+    """
+    if acked < 0 or sink_received < 0:
+        return False  # observer counts not supplied ⇒ guard inert (see docstring)
+    if acked == 0 or delivering <= 0:
+        return False  # no non-zero volume to reconcile across the two observers
+    expected = acked * delivering
+    slack = tol * expected
+    # (b) blind required collector: the engine says all-clean-delivered, the sink saw nothing.
+    if sink_received == 0 and engine_ok:
+        return True
+    # (a) the sink over-counts vs the engine store-truth's permitted deliveries. When the engine claims a
+    # collapse we need the strand/dead tally to compute the permit; an unknown tally (a sentinel <0) can't
+    # detect (a), so we leave such a rung to the COLLAPSED branch rather than guess.
+    if not engine_ok and (engine_stranded < 0 or engine_dead_total < 0):
+        return False
+    unclear = max(0, engine_stranded) + max(0, engine_dead_total)
+    # (a′) A FULLY-lossless sink (``S ≥ A×D``) coincident with ANY unclear row is a HARD contradiction that
+    # NO handler budget can explain, so it is charged BEFORE ``free`` is consulted. ``S ≥ A×D`` asserts every
+    # one of the A accepted messages delivered all D copies — which leaves ZERO non-terminal or dead rows: a
+    # self-filtering handler's routed row is finalized TERMINAL (``FILTERED``/``UNROUTED``, its routed row
+    # DELETEd in the transform-handoff txn — see ``store.handoff``/``transform_handoff``), so it never enters
+    # the ``stranded`` (``status NOT IN ('done','dead')``) tally in the first place. Every row that DOES count
+    # as unclear is therefore a genuinely stuck/dead delivery-bearing row, and it cannot coexist with a
+    # lossless sink. Crediting such a row to the non-delivering-handler ``free`` budget would forgive an
+    # INGRESS strand (blocks D copies) or a delivering-path strand (blocks ≥1) as if it blocked nothing — the
+    # exact stage-blind over-forgiveness that would let this contradiction fabricate a bracketed COLLAPSED.
+    if sink_received >= expected and unclear > 0:
+        return True
+    # Below here the sink UNDER-counts (``S < A×D``) — a real shortfall, not a lossless-vs-stranded
+    # contradiction. The non-delivering-handler budget A×(H−D) lets a GENUINE H>D collapse (where the routed
+    # strand count scales with H while deliveries scale with D, and the sink honestly under-counts) read as
+    # the honest COLLAPSED the observers AGREE on, rather than a fabricated INCONCLUSIVE. It absorbs
+    # stranded+dead TOGETHER before any unclear row is charged against the DELIVERY permit. At H==D (or
+    # handlers unset) free==0 ⇒ this reduces to `expected - max(0, stranded) - max(0, dead)`, byte-identical
+    # to the pre-fix formula (see docstring).
+    free = acked * max(0, handlers - delivering)
+    blocked = max(0, unclear - free)
+    permit = expected - blocked
+    return sink_received > permit + slack
+
+
 def classify_rung(
     *,
     engine_reported: bool,
@@ -452,20 +629,47 @@ def classify_rung(
     no_loss: bool,
     lane_inversions: int,
     lane_repeats: int,
+    acked: int = -1,
+    sink_received: int = -1,
+    delivering: int = 1,
+    handlers: int = 0,
+    engine_stranded: int = 0,
+    engine_dead_total: int = 0,
+    observer_tol: float = _OBSERVER_DISAGREE_TOL,
 ) -> RungVerdict:
     """Classify one rung from the two RELIABLE authorities only. ``engine_reported`` is whether the ENGINE
     store-truth was confirmed at all (from the ENGINE_DRAINED drain gate or the ENGINE_RUNG_REPORT);
     ``engine_ok`` is the store-truth pass bar (``drained ∧ stranded==0 ∧ dead_total==0``); ``no_loss`` is the
-    DRIVE sink socket-truth (``S == A*dests ∧ A>0 ∧ S>0``). The remote poller is NEVER an input.
+    DRIVE sink socket-truth (``S == A*delivering ∧ A>0 ∧ S>0``). The remote poller is NEVER an input.
+
+    The ``acked``/``sink_received``/``delivering``/``handlers``/``engine_stranded``/``engine_dead_total``
+    counts feed the A4b cross-observer guard (:func:`observers_inconclusive`); they default to a sentinel that
+    leaves the guard INERT, so a caller passing only the booleans keeps the historical truth-table. The
+    integration path (:func:`build_rung_outcome`) always supplies them — with ``delivering``, the FAN-OUT,
+    never ``dests``, and ``handlers`` (H) so the permit can credit the non-delivering-handler strand budget at
+    ``H > D`` (``handlers`` defaults to ``0`` ⇒ that budget is empty ⇒ the pre-#209 ``H == D`` behaviour).
 
     Order matters: (1) a correctness break (from the always-present sink-truth) outranks everything; (2) an
     UNCONFIRMED engine store-truth is INCONCLUSIVE — a coord glitch, distinct from a proven collapse, so it
-    never fabricates a bracketed ceiling; (3) a CONFIRMED non-drained engine is a true COLLAPSE; (4) the
-    engine having drained clean, a lossless run is SUSTAINED and a short sink tally is a (benign) frozen
-    tail, never collapse."""
+    never fabricates a bracketed ceiling; (3) A4b: two CONFIRMED-but-CONTRADICTORY observers (or a blind
+    required collector) are also INCONCLUSIVE — trusting one to break the tie is the exact silent fabrication
+    this ladder refuses; (4) a CONFIRMED non-drained engine that the sink does NOT contradict is a true
+    COLLAPSE; (5) the engine having drained clean, a lossless run is SUSTAINED and a short sink tally is a
+    (benign) frozen tail, never collapse."""
     if lane_inversions > 0 or lane_repeats > 0:
         return RungVerdict.CORRECTNESS_FAIL
     if not engine_reported:
+        return RungVerdict.INCONCLUSIVE
+    if observers_inconclusive(
+        engine_ok=engine_ok,
+        acked=acked,
+        sink_received=sink_received,
+        delivering=delivering,
+        handlers=handlers,
+        engine_stranded=engine_stranded,
+        engine_dead_total=engine_dead_total,
+        tol=observer_tol,
+    ):
         return RungVerdict.INCONCLUSIVE
     if not engine_ok:
         return RungVerdict.COLLAPSED
@@ -498,7 +702,12 @@ class RungOutcome:
     index: int
     is_soak: bool
     ingress_rate: float
+    # TOPOLOGY: shared outbound CONNECTIONS. NOT the fan-out — see `delivering` (BACKLOG #209).
     dests: int
+    # H: handlers the router SELECTED. Feeds `txn_per_message`; never delivery arithmetic.
+    handlers: int
+    # D: destinations an accepted message actually delivered to. *** THE FAN-OUT ***
+    delivering: int
     hold_seconds: float
     offered: int  # round(ingress_rate * hold_seconds) — the ingress offer
     acked: int  # A (accept-ACK'd intake)
@@ -542,15 +751,26 @@ class RungOutcome:
         )
 
     def outbound_rate(self) -> float:
-        return self.ingress_rate * self.dests
+        """Deliveries/s — keyed on the FAN-OUT (D), never on the destination-connection count."""
+        return self.ingress_rate * self.delivering
 
     def outbound_delivered_expected(self) -> int:
-        return self.acked * self.dests
+        """The sink's expected socket count: ``A × D``. This IS the no-loss identity — key it on ``dests``
+        and every healthy ``H != D`` rung reads LOSS (BACKLOG #209)."""
+        return self.acked * self.delivering
+
+    @property
+    def txn_per_message(self) -> int:
+        """The ADR 0051 durable-write cost of one ingress message on the shape this rung SERVED:
+        ``3 + 2H + 2D``. The ``2H`` term is charged before any handler runs, so a self-filtering handler
+        still costs its 2 — which is precisely the waste the ``accepts=`` seam (ADR 0084) removes and this
+        rung's ``handlers``/``delivering`` split exists to make visible. Reported, never gated on."""
+        return 3 + 2 * self.handlers + 2 * self.delivering
 
     @property
     def sustainable_ingress_rate(self) -> float | None:
         """The HONEST sustainable INGRESS rate this rung actually proves (D1). A SUSTAINED rung only shows
-        the engine DELIVERED all ``offered × dests`` messages within ``hold + drain`` — NOT that it kept up
+        the engine DELIVERED all ``offered × D`` messages within ``hold + drain`` — NOT that it kept up
         at the offered ``ingress_rate`` in real time. The honest rate spreads the offer over the REAL span it
         took to clear: ``ingress_rate × hold / (hold + drain)`` using the RELIABLE measured drain
         (:attr:`rate_drain_seconds` — the engine-side store-truth drain preferred over the advisory drive
@@ -603,7 +823,7 @@ class RungOutcome:
         return (
             f"{tag:5} ingress={self.ingress_rate:g}/s outbound={self.outbound_rate():g}/s{sustain} "
             f"offered={self.offered} A={self.acked} S={self.sink_received} "
-            f"(expect A*dests={self.outbound_delivered_expected()}) | {eng} | "
+            f"(expect A*delivering={self.outbound_delivered_expected()}) | {eng} | "
             f"inv={self.lane_inversions} rep={self.lane_repeats} lanes={self.lanes_observed}{slope} "
             f"=> {self.verdict.value.upper()}"
         )
@@ -622,12 +842,17 @@ class RungOutcome:
                 if self.sustainable_ingress_rate is None
                 else round(self.sustainable_ingress_rate, 3)
             ),
+            # BACKLOG #209: `dests` is the destination-CONNECTION count (topology); `delivering` is the
+            # FAN-OUT every delivery figure here keys off; `handlers` is what the router selected (cost only).
             "dests": self.dests,
+            "handlers": self.handlers,
+            "delivering": self.delivering,
+            "txn_per_message": self.txn_per_message,  # 3 + 2H + 2D (ADR 0051) — reported, not gated
             "hold_seconds": self.hold_seconds,
             "offered_ingress": self.offered,
             "acked": self.acked,
             "sink_received": self.sink_received,
-            "outbound_expected": self.outbound_delivered_expected(),
+            "outbound_expected": self.outbound_delivered_expected(),  # A * delivering, NOT A * dests
             "no_loss": self.no_loss,
             "lane_inversions": self.lane_inversions,
             "lane_repeats": self.lane_repeats,
@@ -719,12 +944,36 @@ def build_rung_outcome(
         no_loss=drive.no_loss,
         lane_inversions=drive.lane_inversions,
         lane_repeats=drive.lane_repeats,
+        # A4b cross-observer guard: reconcile the ENGINE store-truth tally against the DRIVE sink count so a
+        # contradiction (or a blind collector) downgrades to INCONCLUSIVE instead of a fabricated verdict.
+        # It keys on `delivering` — the FAN-OUT. On `dests` the permit inflates at D < dests and trigger (a)
+        # can never fire: the guard would be silently DISARMED (BACKLOG #209/#219). It also needs `handlers`
+        # (H): at H > D the permit credits the non-delivering-handler strand budget A×(H−D) so a GENUINE
+        # collapse (strands scale with H, deliveries with D) is not fabricated INCONCLUSIVE (BACKLOG #209).
+        acked=drive.acked,
+        sink_received=drive.sink_received,
+        delivering=drive.delivering,
+        handlers=drive.handlers,
+        engine_stranded=engine_stranded,
+        engine_dead_total=engine_dead_total,
     )
+    # A4b: distinguish this INCONCLUSIVE from the store-truth-unconfirmed one (which already noted itself
+    # above) so an operator sees WHY a confirmed rung would not certify — the two observers disagreed.
+    if verdict is RungVerdict.INCONCLUSIVE and engine_reported:
+        notes.append(
+            "cross-observer INCONCLUSIVE: the ENGINE store-truth and the DRIVE sink count are "
+            f"inconsistent (acked={drive.acked} delivering={drive.delivering} "
+            f"sink_received={drive.sink_received} engine_ok={engine_ok} stranded={engine_stranded} "
+            f"dead={engine_dead_total}) — neither observer is trusted to break the tie (excluded from "
+            "the ceiling bracket)"
+        )
     return RungOutcome(
         index=rung.index,
         is_soak=rung.is_soak,
         ingress_rate=rung.ingress_rate,
         dests=drive.dests,
+        handlers=drive.handlers,
+        delivering=drive.delivering,
         hold_seconds=rung.hold_seconds,
         offered=drive.offered,
         acked=drive.acked,
@@ -757,9 +1006,9 @@ def pick_soak_rate(records: Sequence[RungOutcome], override: float | None = None
     nothing sustained (⇒ the ladder skips the soak and says so).
 
     B8: this used to select the rung's raw OFFERED ``ingress_rate``, which is not a sustainable rate. A climb
-    rung is a VOLUME test — a SUSTAINED rung proves only that the fleet DELIVERED ``offered × dests`` within
-    ``hold + drain``, never that it kept up at ``ingress_rate`` in real time. The offered rate overstates the
-    honest one by ``(hold + drain) / hold`` (see :attr:`sustainable_ingress_rate`).
+    rung is a VOLUME test — a SUSTAINED rung proves only that the fleet DELIVERED ``offered × delivering``
+    within ``hold + drain``, never that it kept up at ``ingress_rate`` in real time. The offered rate
+    overstates the honest one by ``(hold + drain) / hold`` (see :attr:`sustainable_ingress_rate`).
 
     Worse, ``max()`` over OFFERED rates selects the HIGHEST sustained rung — which is the rung with the
     LONGEST drain, i.e. the MOST overstated estimator on the whole ladder. The soak then offers a rate the
@@ -789,7 +1038,9 @@ class ConsolidatedLadderReport:
     the pinned ceiling (in BOTH ingress and outbound terms) + the soak + the phase split."""
 
     shards: tuple[str, ...]
-    dests: int
+    dests: int  # TOPOLOGY: shared outbound CONNECTIONS = sink port-band width. NOT the fan-out.
+    handlers: int  # H: handlers the router SELECTED per (shard, lane). Cost model only.
+    delivering: int  # D: destinations an accepted message delivered to. *** THE FAN-OUT ***
     driver_count: int
     sink_count: int
     climb: list[RungOutcome] = field(default_factory=list)
@@ -812,6 +1063,15 @@ class ConsolidatedLadderReport:
         return [*self.climb, *([self.soak] if self.soak is not None else [])]
 
     @property
+    def txn_per_message(self) -> int:
+        """The ADR 0051 durable-write cost of one ingress message on the SHAPE this ladder served:
+        ``3 + 2H + 2D`` (mirrors :attr:`RungOutcome.txn_per_message` / :attr:`ShardCertShape`). The bench
+        SELF-REPORTS this in ``render`` AND ``to_json_dict``; deriving both from one property keeps the
+        rendered header and the JSON from drifting apart (a published figure disagreeing with its own JSON
+        is the B1-B10 shape) when the #213 model — where ``2H`` becomes ``2·H_accepted`` — is folded in."""
+        return 3 + 2 * self.handlers + 2 * self.delivering
+
+    @property
     def pinned_ingress_rate(self) -> float | None:
         """The pinned HONEST sustainable-ingress ceiling (D1): the highest per-rung
         ``sustainable_ingress_rate`` (offered spread over hold + MEASURED drain) over the SUSTAINED climb
@@ -828,8 +1088,10 @@ class ConsolidatedLadderReport:
 
     @property
     def pinned_outbound_rate(self) -> float | None:
+        """The pinned ceiling in DELIVERIES/s. Keyed on the fan-out ``delivering``, never on ``dests``
+        (BACKLOG #209) — a destination CONNECTION no handler sends to carries no deliveries."""
         p = self.pinned_ingress_rate
-        return None if p is None else p * self.dests
+        return None if p is None else p * self.delivering
 
     @property
     def pinned_rung(self) -> RungOutcome | None:
@@ -874,9 +1136,14 @@ class ConsolidatedLadderReport:
     @property
     def sustained_events_per_s(self) -> float | None:
         """The pinned SUSTAINED rate expressed in TOTAL message events/s — the currency the 45M/day budget
-        is denominated in. One ingress message yields itself plus one event per destination."""
+        is denominated in. One ingress message yields itself plus one event per DELIVERED copy: ``1 + D``.
+
+        **This is the headline number the SYSTEM-REQUIREMENTS §8 decision keys off, so the multiplier has to
+        be the fan-out.** ``1 + dests`` would overstate it by ``(1 + dests) / (1 + D)`` — 4.2x at the
+        reference ADT hub (``dests=20, D=4``: 21 vs 5). That is harness defect B10 in the permissive
+        direction, and it is why ``dests`` no longer means fan-out anywhere (BACKLOG #209)."""
         p = self.pinned_ingress_rate
-        return None if p is None else p * (1 + self.dests)
+        return None if p is None else p * (1 + self.delivering)
 
     @property
     def clears_target_events(self) -> bool:
@@ -884,7 +1151,8 @@ class ConsolidatedLadderReport:
         number the §8 N-active decision keys off — but the bench only REPORTS it; the owner decides.
 
         B10: this used to compare a pure ingress rate against the total-events budget, making the gate
-        ``(1 + dests)``x too strict (9x at the bench default ``dests=8``)."""
+        ``(1 + dests)``x too strict (9x at the bench default ``dests=8``). It now keys off
+        :attr:`sustained_events_per_s`, i.e. ``ingress × (1 + delivering)``."""
         e = self.sustained_events_per_s
         return e is not None and e >= TARGET_EVENTS_PER_S
 
@@ -917,10 +1185,13 @@ class ConsolidatedLadderReport:
 
     @property
     def store_truth_unconfirmed(self) -> bool:
-        """A CLIMB rung's ENGINE store-truth never arrived (INCONCLUSIVE — neither the ENGINE_DRAINED gate
-        nor the ENGINE_RUNG_REPORT). Like a rendezvous abort, this is a coord/infra DEGRADATION, not a clean
+        """A CLIMB rung was INCONCLUSIVE — either its ENGINE store-truth never arrived (neither the
+        ENGINE_DRAINED gate nor the ENGINE_RUNG_REPORT) OR the two independent observers were mutually
+        inconsistent (A4b — the store-truth and the DRIVE sink count contradicted, or a required collector
+        read zero on a non-zero-volume run). Like a rendezvous abort, either is a DEGRADATION, not a clean
         bench result — nothing was certified — so it must NOT read as a PASS. (A soak-only inconclusive is
-        supplementary and does not trip this — the climb still pinned the ceiling.)"""
+        supplementary and does not trip this — the climb still pinned the ceiling.) The JSON key name is kept
+        for schema_version 3 back-compat even though it now also covers the cross-observer cause."""
         return any(r.verdict is RungVerdict.INCONCLUSIVE for r in self.climb)
 
     @property
@@ -1016,9 +1287,11 @@ class ConsolidatedLadderReport:
         lines = [
             "ShardCert two-box SIZING ladder — pin the post-#842 delivered ceiling vs the 521/s "
             "TOTAL-EVENTS target (45M/day, inbound + outbound)",
-            f"  topology: shards={'/'.join(self.shards)} dests={self.dests} "
-            f"K={self.driver_count} senders x M={self.sink_count} sinks   "
-            f"(delivered = ingress x dests; total events = ingress x (1 + dests))",
+            f"  topology: shards={'/'.join(self.shards)} dests={self.dests} conns  "
+            f"H={self.handlers} selected, D={self.delivering} delivering  "
+            f"K={self.driver_count} senders x M={self.sink_count} sinks",
+            f"    (delivered = ingress x D; total events = ingress x (1 + D); "
+            f"txn/msg = 3 + 2H + 2D = {self.txn_per_message})",
             "",
             "  climb (ascending ingress rate; stops at the first collapse):",
         ]
@@ -1054,13 +1327,13 @@ class ConsolidatedLadderReport:
             fc = self.first_collapse_ingress_rate
             if fc is not None:
                 lines.append(
-                    f"    first collapse at: {fc:g} ingress/s = {fc * self.dests:g} outbound/s"
+                    f"    first collapse at: {fc:g} ingress/s = {fc * self.delivering:g} outbound/s"
                 )
             ev = self.sustained_events_per_s
             lines.append(
                 f"    clears {TARGET_EVENTS_PER_S:.1f}/s TOTAL-EVENTS target? "
                 f"{'YES' if self.clears_target_events else 'NO'} "
-                f"({pin:g} ingress/s x (1 + {self.dests} dests) = {ev:g} events/s "
+                f"({pin:g} ingress/s x (1 + {self.delivering} delivering) = {ev:g} events/s "
                 f"vs {TARGET_EVENTS_PER_S:.1f} events/s)"
             )
         lines.append("")
@@ -1109,7 +1382,10 @@ class ConsolidatedLadderReport:
             elif self.soak_aborted:
                 reason = "two-box rendezvous/timeout broke during the soak — soak not measured"
             else:
-                reason = "engine store-truth never confirmed (INCONCLUSIVE) — nothing certified"
+                reason = (
+                    "a climb rung was INCONCLUSIVE (engine store-truth never confirmed, or the two "
+                    "observers were inconsistent) — nothing certified"
+                )
             lines.append(
                 f"RESULT: SETUP-DEGRADED ({reason} — NOT a bench result) -> exit {self.exit_code}"
             )
@@ -1146,7 +1422,14 @@ class ConsolidatedLadderReport:
             # boolean whose meaning silently flipped is exactly this harness's signature defect, so a stale
             # consumer must KeyError rather than branch on a wrong-but-plausible value. Replacements:
             # `target_events_per_s`, `ceiling.sustained_events_per_s`, `ceiling.clears_target_events`.
-            "schema_version": 3,
+            #
+            # v4 (BACKLOG #209): `topology.dests` STOPPED meaning the fan-out — it is now the count of shared
+            # outbound destination CONNECTIONS. The fan-out is `topology.delivering` (D) and the router's
+            # selection width is `topology.handlers` (H). Every delivery figure below (pinned_outbound_rate,
+            # sustained_events_per_s, each rung's outbound_expected) keys off D. A pre-v4 consumer that reads
+            # `dests` and multiplies by it will OVERSTATE deliveries on any H != D run — hence the bump: the
+            # version is the only thing that tells it the multiplier moved.
+            "schema_version": 4,
             "kind": "shardcert_ladder_two_box",
             "result": self.result_label,
             "exit_code": self.exit_code,
@@ -1157,14 +1440,18 @@ class ConsolidatedLadderReport:
             "store_truth_unconfirmed": self.store_truth_unconfirmed,
             "topology": {
                 "shards": list(self.shards),
-                "dests": self.dests,
+                "dests": self.dests,  # destination CONNECTIONS (port-band width) — NOT the fan-out
+                "handlers": self.handlers,  # H: router selection width (cost model only)
+                "delivering": self.delivering,  # D: THE fan-out — every delivery figure keys off this
+                "txn_per_message": self.txn_per_message,  # ADR 0051 (3 + 2H + 2D)
+                "events_per_message": 1 + self.delivering,
                 "driver_count": self.driver_count,
                 "sink_count": self.sink_count,
             },
             "target_events_per_s": round(TARGET_EVENTS_PER_S, 3),
             "ceiling": {
                 # D1: honest sustainable rate (offered spread over hold + MEASURED drain), not the inflated
-                # raw offered ingress_rate. clears_target_events keys off pinned_ingress_rate x (1 + dests).
+                # raw offered ingress_rate. clears_target_events keys off pinned_ingress_rate x (1 + D).
                 "pinned_ingress_rate": (
                     None if self.pinned_ingress_rate is None else round(self.pinned_ingress_rate, 3)
                 ),
@@ -1182,7 +1469,8 @@ class ConsolidatedLadderReport:
                 ),
                 "first_collapse_ingress_rate": self.first_collapse_ingress_rate,
                 "bracketed": self.ceiling_bracketed,
-                # B10: total events = ingress x (1 + dests). Gate on events, never on ingress alone.
+                # B10: total events = ingress x (1 + delivering). Gate on events, never on ingress alone —
+                # and never on (1 + dests), which is a 4.2x overstatement at the reference hub (#209).
                 "sustained_events_per_s": (
                     None
                     if self.sustained_events_per_s is None
@@ -1201,6 +1489,8 @@ def build_consolidated_report(
     *,
     shards: Sequence[str],
     dests: int,
+    handlers: int,
+    delivering: int,
     driver_count: int,
     sink_count: int,
     climb: Sequence[RungOutcome],
@@ -1210,10 +1500,17 @@ def build_consolidated_report(
     soak_aborted: bool = False,
 ) -> ConsolidatedLadderReport:
     """Assemble the consolidated report from the driven rung outcomes — a thin, PURE constructor so the
-    report shape can be unit-tested from synthetic outcomes without a live fleet."""
+    report shape can be unit-tested from synthetic outcomes without a live fleet.
+
+    ``handlers``/``delivering`` are REQUIRED, deliberately not defaulted to ``dests`` (BACKLOG #209):
+    ``delivering`` is the multiplier under ``sustained_events_per_s``, the headline the §8 decision keys
+    off. A default here is a stale constant waiting to be forgotten by a future caller — and it would
+    fabricate a plausible number rather than fail."""
     return ConsolidatedLadderReport(
         shards=tuple(shards),
         dests=dests,
+        handlers=handlers,
+        delivering=delivering,
         driver_count=driver_count,
         sink_count=sink_count,
         climb=list(climb),
@@ -1298,6 +1595,8 @@ async def run_engine_ladder(
     *,
     rates: Sequence[float],
     dests: int,
+    handlers: int | None = None,
+    delivering: int | None = None,
     hold_seconds: float,
     drain_timeout: float,
     sink_port: int,
@@ -1328,7 +1627,11 @@ async def run_engine_ladder(
     BOUNDED ``stop_poll_grace`` poll of LADDER_STOP before arming each rung after the first: the drive posts
     STOP right after it reads our prior ENGINE_RUNG_REPORT, so a few seconds' grace catches it and avoids
     wasting a full ``climb_drive_start_timeout`` on a rung the drive will never drive. Lost signal → the
-    bounded plan still finishes (the CoordTimeout branch below re-checks STOP)."""
+    bounded plan still finishes (the CoordTimeout branch below re-checks STOP).
+
+    ``handlers`` (H) / ``delivering`` (D) are the BACKLOG #209 shape split (both default to ``dests``). The
+    ENGINE box owns the shape for the whole ladder; the DRIVE box has NO shape flag and learns H/D/dests per
+    rung from SHARDS_READY, so the two halves cannot drift."""
     result = EngineLadderResult()
     climb = plan_climb_rungs(rates, hold_seconds=hold_seconds, drain_timeout=drain_timeout)
     keep_logs_base.mkdir(parents=True, exist_ok=True)
@@ -1357,6 +1660,8 @@ async def run_engine_ladder(
         try:
             report = await run_shardcert_engine(
                 dests=dests,
+                handlers=handlers,
+                delivering=delivering,
                 hold_seconds=rung.hold_seconds,
                 kill=False,
                 drain_timeout=rung.drain_timeout,
@@ -1426,6 +1731,8 @@ async def run_engine_ladder(
     try:
         report = await run_shardcert_engine(
             dests=dests,
+            handlers=handlers,
+            delivering=delivering,
             hold_seconds=soak_rung.hold_seconds,
             kill=False,
             drain_timeout=soak_rung.drain_timeout,
@@ -1460,7 +1767,7 @@ async def run_drive_ladder(
     hold_seconds: float,
     drain_timeout: float,
     driver_count: int,
-    sink_count: int,
+    sink_count: int | None,
     sink_host: str,
     base_coord: FileDropCoord,
     allow_insecure: bool = False,
@@ -1475,7 +1782,12 @@ async def run_drive_ladder(
     """The LOAD-GEN-box ladder loop + the consolidated report. Iterates the SAME climb plan the engine
     arms, driving each rung with the merged multi-process :func:`run_shardcert_drive` (K senders + M sinks)
     under the drain gate, classifies each rung, and — at the first COLLAPSE — posts LADDER_STOP and stops
-    climbing. Then picks the soak rate, posts LADDER_SOAK, drives the soak, and builds the report."""
+    climbing. Then picks the soak rate, posts LADDER_SOAK, drives the soak, and builds the report.
+
+    It takes NO shape argument (BACKLOG #209): ``dests``/``handlers``/``delivering`` are learned from the
+    engine's SHARDS_READY (via :attr:`ShardCertDriveReport`), so the shape has ONE source of truth across the
+    box boundary. A shape flag on both CLIs would be a two-place constant that drifts invisibly — and the
+    drift would surface as a fabricated ceiling, not an error."""
     climb = plan_climb_rungs(rates, hold_seconds=hold_seconds, drain_timeout=drain_timeout)
     # Clear cross-rung signals so a re-run under the same base run_id doesn't read a stale STOP/SOAK.
     base_coord.clear_messages(LADDER_STOP, LADDER_SOAK)
@@ -1483,7 +1795,17 @@ async def run_drive_ladder(
     outcomes: list[RungOutcome] = []
     notes: list[str] = []
     shards: tuple[str, ...] = ()
+    # The shape the ENGINE served, learned per rung from its SHARDS_READY. 0 until the first rung reports —
+    # an aborted-before-any-rung climb legitimately has no shape to name (and pins no ceiling either).
     dests = 0
+    handlers = 0
+    delivering = 0
+    # The EFFECTIVE sink_count. `sink_count=None` means "derive from the engine's advertised band width"
+    # (BACKLOG #209 back-compat: --dests below the old literal 8 narrows the band). run_shardcert_drive
+    # resolves it per rung and echoes it on ShardCertDriveReport.sink_count, so the consolidated report
+    # names the count actually run, not None. Seed with a caller-supplied value; overwritten from the
+    # first drive report either way.
+    resolved_sink_count = sink_count if sink_count is not None else 0
 
     stopped = False
     climb_aborted = False
@@ -1524,7 +1846,10 @@ async def run_drive_ladder(
             stopped = True
             break
         shards = drive.shards
-        dests = drive.dests
+        dests, handlers, delivering = drive.dests, drive.handlers, drive.delivering
+        resolved_sink_count = (
+            drive.sink_count
+        )  # the count actually run (derived when caller passed None)
         # Store-truth for the classifier comes from the RELIABLE drain gate (ENGINE_DRAINED — the drive
         # awaited it before tallying, so it is already on disk); the later, more fragile ENGINE_RUNG_REPORT
         # only ADDS the phase timing + soak slope, so a late/lost report can no longer fabricate a collapse.
@@ -1581,7 +1906,11 @@ async def run_drive_ladder(
                 engine_drained_timeout=engine_drained_timeout,
             )
             if not shards:
-                shards, dests = drive.shards, drive.dests
+                # A soak-only run (every climb rung aborted before reporting) still has to name the shape it
+                # served — otherwise the report's delivery arithmetic would key off a zero fan-out.
+                shards = drive.shards
+                dests, handlers, delivering = drive.dests, drive.handlers, drive.delivering
+                resolved_sink_count = drive.sink_count
             gate = soak_coord.read(ENGINE_DRAINED)
             report_msg = await _read_engine_report(
                 soak_coord, timeout_seen=engine_rung_report_timeout
@@ -1604,8 +1933,10 @@ async def run_drive_ladder(
     return build_consolidated_report(
         shards=shards,
         dests=dests,
+        handlers=handlers,
+        delivering=delivering,
         driver_count=driver_count,
-        sink_count=sink_count,
+        sink_count=resolved_sink_count,
         climb=outcomes,
         soak=soak_outcome,
         notes=notes,

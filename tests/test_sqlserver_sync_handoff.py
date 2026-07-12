@@ -246,6 +246,39 @@ async def test_transform_handoff_sync_byte_identical_to_async(store: Any) -> Non
     )
 
 
+# --- #150 / ADR 0081: the fused sync path merges SetMeta under metadata.user ----------------------
+
+
+async def test_transform_handoff_sync_merges_setmeta(store: Any) -> None:
+    """The fused B5 sync path (``transform_handoff_sync`` — the one SQL Server uses in production)
+    merges SetMeta ops under ``metadata.user`` inside the SAME committed handoff txn as the outbound
+    rows + routed-row DELETE, without clobbering ADR-0013 lineage."""
+    mid, ing = await _ingress_and_claim(store, "IB", RAW, now=100.0)
+    await store.route_handoff(
+        ingress_id=ing.id,
+        message_id=mid,
+        channel_id="IB",
+        handlers=[("H", RAW)],
+        disposition=MessageStatus.ROUTED,
+        now=100.0,
+    )
+    rtd = await store.claim_next_fifo("IB", stage=Stage.ROUTED.value, now=100.0)
+    pool = store.open_sync_handoff_pool("outbound", 1)
+    with pool.acquire(timeout=5) as conn:
+        ok, applied = store.transform_handoff_sync(
+            conn,
+            routed_id=rtd.id,
+            message_id=mid,
+            channel_id="IB",
+            deliveries=[("OB1", "body")],
+            meta_ops=[("mrn_source", "ACME"), ("priority", "stat")],
+            now=100.0,
+        )
+    assert ok is True and applied == []
+    meta = json.loads((await store.get_message(mid))["metadata"])
+    assert meta["user"] == {"mrn_source": "ACME", "priority": "stat"}
+
+
 # --- DELETE-guard idempotency (False / (False, []) on a re-run) ------------------------------------
 
 

@@ -1,0 +1,21 @@
+{
+  "module": "samples/config/IB_ACME_ADT.py",
+  "handlers": [
+    {
+      "handler": "acme_adt_handler",
+      "module": "samples/config/IB_ACME_ADT.py",
+      "def_line": 27,
+      "rows": [
+        {
+          "kind": "send",
+          "outbounds": [
+            "OB_ACME_ADT"
+          ],
+          "line_start": 29,
+          "line_end": 29,
+          "nesting": 0
+        }
+      ]
+    }
+  ]
+}

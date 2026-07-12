@@ -231,3 +231,30 @@ table.grid th:has(> [data-mf-conns-all]), table.grid td:has(> .rowcb) {
 ul.tree { list-style: none; margin: 0; padding-left: 1rem; border-left: 1px solid var(--line); }
 ul.tree .tlabel { color: var(--muted); }
 ul.tree .tval { color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+
+/* Edit-and-resubmit editor (ADR 0090 §9, BACKLOG #153). The editable COPY, the "Modified" badge that
+   app.js reveals on the first change, and the mode/outbound controls. */
+.btn-link { color: var(--accent); text-decoration: none; font-size: 0.85rem; }
+.btn-link:hover { text-decoration: underline; }
+.edit-form { max-width: 900px; }
+.edit-raw {
+  width: 100%; box-sizing: border-box; background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px; padding: 0.5rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85rem;
+  white-space: pre; overflow-wrap: normal; overflow-x: auto; tab-size: 2;
+}
+.edit-mode-row { display: flex; flex-direction: column; gap: 0.3rem; margin: 0.5rem 0; }
+.edit-mode-row label { color: var(--ink); }
+.edit-to-row { flex-direction: row; align-items: center; gap: 0.5rem; }
+.edit-to-row input { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: 0.35rem 0.5rem; }
+.edit-ctls { align-items: center; margin-top: 0.6rem; }
+.edit-ctls button.primary {
+  background: var(--accent); color: #04122b; border: 0; border-radius: 6px;
+  padding: 0.35rem 0.9rem; cursor: pointer; font-weight: 600;
+}
+.edit-ctls button[disabled] { opacity: 0.5; cursor: default; }
+.badge-modified {
+  color: var(--warn); border: 1px solid var(--warn); border-radius: 999px;
+  padding: 0.05rem 0.55rem; font-size: 0.75rem; font-weight: 600;
+}

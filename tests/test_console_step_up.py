@@ -109,6 +109,63 @@ def test_reauth_wrong_password_raises_403() -> None:
     assert ei.value.status == 403
 
 
+def test_action_step_up_binds_purpose_into_reauth() -> None:
+    # ADR 0077: a per-action step-up 403 names the action in X-Step-Up-Action; the client stashes it and
+    # the reauth() the handler calls carries it as `purpose`, so the engine mints a grant bound to it.
+    reauth_seen: dict[str, object] = {}
+    n = {"req": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/me/reauth":
+            reauth_seen["body"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"detail": "re-verified"})
+        n["req"] += 1
+        if n["req"] == 1:
+            return httpx.Response(
+                403,
+                headers={"X-Step-Up-Required": "1", "X-Step-Up-Action": "mfa_enroll"},
+                json={"detail": "step-up required"},
+            )
+        return httpx.Response(200, json={"secret": "S"})
+
+    c = _mock_client(handler)
+    c.set_step_up_handler(lambda: (c.reauth("pw"), True)[1])  # the real handler flow: prompt→reauth
+    resp = c._request("POST", "/me/mfa/enroll")
+    assert resp.status_code == 200  # original 403 → reauth → retry succeeds
+    assert reauth_seen["body"] == {"password": "pw", "purpose": "mfa_enroll"}  # bound to the action
+
+
+def test_plain_step_up_reauth_carries_no_purpose_after_action() -> None:
+    # A per-action step-up is single-use on the client too: the stashed action is cleared once consumed,
+    # so a later PLAIN session-window step-up (no header) reauths with just the password.
+    bodies: list[dict[str, object]] = []
+    n = {"req": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/me/reauth":
+            bodies.append(json.loads(request.content.decode()))
+            return httpx.Response(200, json={"detail": "re-verified"})
+        n["req"] += 1
+        # First call names an action; the third (a different endpoint) is a plain step-up (no action).
+        if n["req"] == 1:
+            return httpx.Response(
+                403,
+                headers={"X-Step-Up-Required": "1", "X-Step-Up-Action": "mfa_enroll"},
+                json={"detail": "x"},
+            )
+        if n["req"] == 2:
+            return httpx.Response(200, json={"ok": True})  # retry of the action route
+        if n["req"] == 3:
+            return httpx.Response(403, headers={"X-Step-Up-Required": "1"}, json={"detail": "x"})
+        return httpx.Response(200, json={"ok": True})  # retry of the plain route
+
+    c = _mock_client(handler)
+    c.set_step_up_handler(lambda: (c.reauth("pw"), True)[1])
+    assert c._request("POST", "/me/mfa/enroll").status_code == 200
+    assert c._request("POST", "/dead-letters/replay").status_code == 200
+    assert bodies == [{"password": "pw", "purpose": "mfa_enroll"}, {"password": "pw"}]
+
+
 # --- ReauthDialog (Qt offscreen) -------------------------------------------------------------
 @pytest.fixture(scope="module")
 def qapp():

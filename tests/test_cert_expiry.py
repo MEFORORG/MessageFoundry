@@ -64,6 +64,11 @@ class _RecordingSink:
     def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
         self.cert_calls.append((name, path, not_after, days_remaining))
 
+    def secret_rotation_due(
+        self, name: str, *, secret: str, last_rotated: str, days_overdue: int
+    ) -> None:
+        pass
+
 
 def _runner(
     certs: list[MonitoredCert], sink: _RecordingSink, warn_days: int = 30

@@ -34,7 +34,10 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _service(engine: Engine, settings: AuthSettings | None = None) -> AuthService:
-    service = AuthService(engine.store, settings or AuthSettings())
+    # Step-up-recency tests, not MFA tests: pin require_mfa=False so the admin's step-up path isn't
+    # first blocked by the BACKLOG #187 secure default (require_mfa now ON for the Administrator role).
+    # Tests that DO exercise require_mfa pass it explicitly.
+    service = AuthService(engine.store, settings or AuthSettings(require_mfa=False))
     await service.initialize()
     return service
 
@@ -172,7 +175,9 @@ async def test_ad_user_reauth_uses_a_live_rebind(engine: Engine) -> None:
 
 # --- service / store unit ----------------------------------------------------
 async def test_has_recent_step_up_tracks_the_window(engine: Engine) -> None:
-    service = await _service(engine, AuthSettings(step_up_max_age_seconds=300))
+    # require_mfa=False: this test pins the step-up RECENCY window, not the MFA gate (BACKLOG #187
+    # secure default now ON — an explicit AuthSettings bypasses the helper's opt-out, so set it here).
+    service = await _service(engine, AuthSettings(step_up_max_age_seconds=300, require_mfa=False))
     await _add_admin(service, "boss")
     async with _client(engine, service) as c:
         token = await _login(c, "boss")
@@ -184,6 +189,169 @@ async def test_has_recent_step_up_tracks_the_window(engine: Engine) -> None:
     assert await service.has_recent_step_up(token) is False
     await service.store.mark_session_reauthed(th)  # now
     assert await service.has_recent_step_up(token) is True
+
+
+# --- ADR 0077: action-bound step-up for the durable-takeover routes ----------
+async def _reauth(
+    c: httpx.AsyncClient, token: str, *, purpose: str | None = None, password: str = PW
+) -> httpx.Response:
+    body: dict[str, str] = {"password": password}
+    if purpose is not None:
+        body["purpose"] = purpose
+    return await c.post("/me/reauth", headers=_auth(token), json=body)
+
+
+async def test_login_window_does_not_unlock_factor_binding(engine: Engine) -> None:
+    """AC-1: a session INSIDE the login-seeded window is 403'd on the factor-binding routes until a
+    fresh per-action reauth — login seeds the session window but NOT a per-action grant (ADR 0077)."""
+    service = await _service(engine)
+    await _add_admin(service, "boss")
+    async with _client(engine, service) as c:
+        token = await _login(c, "boss")
+        # Fresh login: the session window is fresh (a broad admin op would pass), but the factor-binding
+        # routes now demand a proof bound to THEIR action, which login never mints.
+        assert (await c.post("/users", headers=_auth(token), json=NEW_USER)).status_code == 201
+        for path, body, action in [
+            ("/me/mfa/enroll", None, "mfa_enroll"),
+            ("/me/mfa/confirm", {"code": "000000"}, "mfa_confirm"),
+        ]:
+            r = await c.post(path, headers=_auth(token), json=body)
+            assert r.status_code == 403, (path, r.text)
+            assert r.headers.get("X-Step-Up-Required") == "1"
+            assert r.headers.get("X-Step-Up-Action") == action  # the 403 names the action to reauth
+        # A per-action reauth for enroll unlocks exactly enroll (the staged secret is returned).
+        assert (await _reauth(c, token, purpose="mfa_enroll")).status_code == 200
+        enrolled = await c.post("/me/mfa/enroll", headers=_auth(token))
+        assert enrolled.status_code == 200 and enrolled.json()["secret"]
+
+
+async def test_action_grant_is_single_use_and_bound(engine: Engine) -> None:
+    """AC-2: a fresh reauth grants EXACTLY the bound action, once. A second sensitive action re-prompts,
+    and a grant for one action never unlocks another."""
+    service = await _service(engine)
+    await _add_admin(service, "boss")
+    async with _client(engine, service) as c:
+        token = await _login(c, "boss")
+        # One reauth → one enroll.
+        assert (await _reauth(c, token, purpose="mfa_enroll")).status_code == 200
+        assert (await c.post("/me/mfa/enroll", headers=_auth(token))).status_code == 200
+        # Single-use: the grant was consumed, so a second enroll re-prompts.
+        again = await c.post("/me/mfa/enroll", headers=_auth(token))
+        assert again.status_code == 403 and again.headers.get("X-Step-Up-Action") == "mfa_enroll"
+        # Bound: an enroll grant does NOT unlock confirm (a different action).
+        assert (await _reauth(c, token, purpose="mfa_enroll")).status_code == 200
+        confirm = await c.post("/me/mfa/confirm", headers=_auth(token), json={"code": "000000"})
+        assert (
+            confirm.status_code == 403 and confirm.headers.get("X-Step-Up-Action") == "mfa_confirm"
+        )
+
+
+async def test_login_and_verify_mfa_never_grant_an_action(engine: Engine) -> None:
+    """AC-3: neither login nor verify_mfa mints a per-action grant — only reauth(purpose=…) does."""
+    from messagefoundry.auth import totp
+
+    service = await _service(engine)
+    await _add_admin(service, "boss")
+    async with _client(engine, service) as c:
+        token = await _login(c, "boss")
+        identity = await service.identity_for_token(token)
+        assert identity is not None
+        # Login stamped the session window but no action grant.
+        assert await service.has_recent_step_up(token) is True
+        assert await service.has_action_step_up(token, "mfa_enroll") is False
+        # Enroll + confirm TOTP (drives the service directly, past the HTTP step-up).
+        enroll = await service.begin_mfa_enrollment(identity)
+        await service.confirm_mfa_enrollment(identity, totp.totp(enroll.secret), token=token)
+        # A fresh MFA-required login, then verify_mfa: it seeds the session window but NOT an action grant.
+        token2 = (await service.login("boss", PW)).token
+        assert token2 is not None
+        assert await service.verify_mfa(token2, totp.totp(enroll.secret)) is True
+        assert await service.has_recent_step_up(token2) is True  # verify_mfa re-anchored the window
+        assert await service.has_action_step_up(token2, "mfa_disable") is False  # but no grant
+        # Only reauth(purpose=…) mints one — and it is single-use.
+        assert await service.reauth(identity, PW, token=token2, purpose="mfa_disable") is True
+        assert await service.has_action_step_up(token2, "mfa_disable") is True  # consumes it
+        assert await service.has_action_step_up(token2, "mfa_disable") is False  # gone
+
+
+async def test_opt_out_restores_session_window(engine: Engine) -> None:
+    """AC-4: with [auth].require_action_step_up=False the legacy session-window step-up returns, so a
+    fresh login can enroll without a per-action reauth."""
+    # require_mfa=False: this test pins the session-window step-up opt-out, not the MFA gate (an
+    # explicit AuthSettings bypasses the helper's BACKLOG #187 opt-out, so set it here too).
+    service = await _service(engine, AuthSettings(require_action_step_up=False, require_mfa=False))
+    await _add_admin(service, "boss")
+    async with _client(engine, service) as c:
+        token = await _login(c, "boss")
+        # Legacy behaviour: the login-seeded window satisfies the enroll step-up (no per-action reauth).
+        enrolled = await c.post("/me/mfa/enroll", headers=_auth(token))
+        assert enrolled.status_code == 200, enrolled.text
+        # And a stale window still blocks it (the session-window gate is intact), unlocked by a plain
+        # reauth carrying no purpose.
+        await _make_stale(service, token)
+        assert (await c.post("/me/mfa/enroll", headers=_auth(token))).status_code == 403
+        assert (await _reauth(c, token)).status_code == 200
+        assert (await c.post("/me/mfa/enroll", headers=_auth(token))).status_code == 200
+
+
+async def test_mfa_pending_and_ad_do_not_deadlock(engine: Engine) -> None:
+    """AC-5: an MFA-pending session (required-but-unenrolled admin) can still reach enrollment — the
+    factor-binding routes are password-only (no MFA gate), so a per-action reauth unlocks them without
+    a second factor the session can't yet produce."""
+    service = await _service(engine, AuthSettings(require_mfa=True))
+    # A require_mfa admin who has not enrolled: login leaves the session MFA-pending.
+    await _add_admin(service, "boss")
+    async with _client(engine, service) as c:
+        token = await _login(c, "boss")
+        # Enroll is gated on the per-action step-up, NOT the MFA gate — so the 403 asks for a step-up,
+        # never an (unsatisfiable) MFA code.
+        blocked = await c.post("/me/mfa/enroll", headers=_auth(token))
+        assert blocked.status_code == 403
+        assert blocked.headers.get("X-Step-Up-Required") == "1"
+        assert blocked.headers.get("X-MFA-Required") is None  # no MFA deadlock
+        # The password-only per-action reauth unlocks enrollment for the MFA-pending session.
+        assert (await _reauth(c, token, purpose="mfa_enroll")).status_code == 200
+        assert (await c.post("/me/mfa/enroll", headers=_auth(token))).status_code == 200
+
+
+async def test_ad_reauth_mints_action_grant_via_live_rebind(engine: Engine) -> None:
+    """AC-5 (AD arm): an AD account's per-action reauth rides the live directory re-bind and still mints
+    the single-use grant (no deadlock, no password-hash path)."""
+    principal = AdPrincipal(
+        username="jdoe",
+        display_name="J Doe",
+        email=None,
+        dn="CN=jdoe,DC=x",
+        groups=frozenset({"cn=mf-admins,dc=x"}),
+    )
+
+    class _FakeLdap:
+        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            return principal if (username == "jdoe" and password == "ad-pw") else None
+
+        def resolve_principal(self, username: str) -> AdPrincipal | None:
+            return principal if username == "jdoe" else None
+
+    settings = AuthSettings(
+        ad_enabled=True,
+        ad_server="ldaps://x",
+        ad_user_search_base="DC=x",
+        ad_bind_dn="CN=svc,DC=x",
+        ad_bind_password="x",
+    )
+    service = AuthService(engine.store, settings, ldap=_FakeLdap())  # type: ignore[arg-type]
+    await service.initialize()
+    await service.set_ad_group_map([("CN=MF-Admins,DC=x", Role.ADMINISTRATOR.value)], actor="admin")
+    async with _client(engine, service) as c:
+        token = await _login(c, "jdoe", "ad-pw", provider="ad")
+        identity = await service.identity_for_token(token)
+        assert identity is not None
+        # Wrong AD password: the live re-bind fails and mints nothing.
+        assert await service.reauth(identity, "wrong", token=token, purpose="mfa_disable") is False
+        assert await service.has_action_step_up(token, "mfa_disable") is False
+        # Correct AD password: the re-bind succeeds and the single-use grant is minted.
+        assert await service.reauth(identity, "ad-pw", token=token, purpose="mfa_disable") is True
+        assert await service.has_action_step_up(token, "mfa_disable") is True
 
 
 async def test_create_session_stamps_reauth_at(engine: Engine) -> None:

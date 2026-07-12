@@ -10,6 +10,7 @@ import json
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from urllib.parse import quote, urlencode
 from pathlib import Path
 
@@ -45,7 +46,12 @@ XSS_RAW = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|X1|P|2.5.1\rPID|1||1||<script>al
 
 
 async def _service(engine: Engine) -> AuthService:
-    service = AuthService(engine.store, AuthSettings())
+    # BACKLOG #187 flipped [auth].require_mfa to default-ON (secure-by-default). This /ui suite
+    # exercises routing / RBAC / user-management, not MFA enrollment, and its fixtures never enroll
+    # an authenticator — so under the new default every unenrolled session diverts to
+    # /ui/account?m=enroll_first. Pin require_mfa=False here (the pre-#187 assumption); the handful
+    # of tests that DO exercise the require_mfa gate construct their own AuthSettings(require_mfa=True).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     return service
 
@@ -445,14 +451,23 @@ async def test_reauth_accepts_dead_letter_replay_next(engine: Engine) -> None:
 
 
 class _FakeWS:
-    """Minimal duck-typed WebSocket for unit-testing authorize_ui_ws (headers/cookies/app.state)."""
+    """Minimal duck-typed WebSocket for unit-testing authorize_ui_ws (headers/cookies/app.state/url)."""
 
     def __init__(
         self, origin: str | None, host: str | None, cookie: str | None, app: object
     ) -> None:
         self.headers = {k: v for k, v in (("origin", origin), ("host", host)) if v is not None}
-        self.cookies = {"mf_session": cookie} if cookie is not None else {}
         self.app = app
+        # A real Starlette WebSocket carries ``.url``; the #192 cookie-name resolver
+        # (session_cookie_name → effective_https) reads ``.url.scheme`` to key the cookie name off the
+        # effective scheme. Model the handshake scheme from the page origin — a cleartext http page
+        # opens ws://, an https page wss:// — and store the session token under the SAME name a real
+        # browser on that origin would hold: plain ``mf_session`` over cleartext (byte-identity), the
+        # ``__Host-mf_session`` prefix over https (#192, ASVS 3.4.3), so the resolver reads it back.
+        scheme = "wss" if (origin or "").startswith("https") else "ws"
+        self.url = SimpleNamespace(scheme=scheme)
+        cookie_name = "__Host-mf_session" if scheme == "wss" else "mf_session"
+        self.cookies = {cookie_name: cookie} if cookie is not None else {}
 
 
 async def _token(engine: Engine, service: AuthService, user: str) -> tuple[object, str]:

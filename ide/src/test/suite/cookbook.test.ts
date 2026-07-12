@@ -60,11 +60,11 @@ suite("cookbook recipe catalog", () => {
     }
   });
 
-  test("no recipe spells the forbidden space-form 'action-list(s)' phrase (leak-gate)", () => {
+  test("no recipe spells the forbidden space-form 'Steps(s)' phrase (leak-gate)", () => {
     for (const r of RECIPES) {
       assert.ok(
         !/\baction\s+lists?\b/i.test(`${r.title} ${r.summary} ${r.code}`),
-        `${r.id} must not spell the space form of "action-list(s)"`,
+        `${r.id} must not spell the space form of "Steps(s)"`,
       );
     }
   });

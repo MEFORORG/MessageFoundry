@@ -635,7 +635,7 @@ async def _await_inbound_rows_all(
 
 
 def _inbound_rows_per_node(nodes: list[EngineNode]) -> list[int]:
-    from messagefoundry.console.client import ApiError, EngineClient
+    from messagefoundry.apiclient import ApiError, EngineClient
 
     counts: list[int] = []
     for node in nodes:
@@ -671,7 +671,7 @@ async def _attribute_engines(
 def _attribute_engines_sync(
     nodes: list[EngineNode], engine_index_base: int = 0
 ) -> list[EngineAttribution]:
-    from messagefoundry.console.client import ApiError, EngineClient
+    from messagefoundry.apiclient import ApiError, EngineClient
 
     out: list[EngineAttribution] = []
     for k, node in enumerate(nodes):

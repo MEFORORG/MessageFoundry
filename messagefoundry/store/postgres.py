@@ -59,14 +59,16 @@ from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     StoreBackend,
     StoreSettings,
-    insecure_tls_allowed,
+    weakened_tls_escape_permitted,
 )
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import Row, warm_pool_connections, warm_pool_target
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.document_strip import StripResult, cutoff_for
+from messagefoundry.store.metadata import merge_user_metadata
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram, PoolStatus
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
@@ -93,6 +95,14 @@ from messagefoundry.store.store import (
     OutboxItem,
     OutboxStatus,
     OwnedLanes,
+    ReingressOriginMissing,
+    ReingressOutcome,
+    REINGRESS_TARGET_PREFIX,
+    ResendKeyConflict,
+    ResendOutcome,
+    ResendSourceAmbiguous,
+    ResendSourceEmpty,
+    ResendSourceNotFound,
     SessionRecord,
     Stage,
     UserRecord,
@@ -100,6 +110,7 @@ from messagefoundry.store.store import (
     audit_row_hash,
     delivery_key,
     owned_lane_scope,
+    should_record_event,
 )
 from messagefoundry.store.store import _finite_cutoff  # backlog #106: keep-forever cutoff clamp
 
@@ -121,9 +132,18 @@ _RELEASE_CHUNK = 500
 _LOCK_CLASS_AUDIT = 1
 _LOCK_CLASS_SCHEMA = 2
 _LOCK_CLASS_FINALIZE = 3
+# ADR 0090 strict-FIFO writer-funnel: a per-(outbound-lane) advisory lock keyed by destination_name.
+# Taken by EVERY writer of a lane's outbound rows (the handoff producers + resend_to), from before seq
+# assignment through commit, so commit-order == BIGSERIAL-seq-order for a lane. Postgres' claim uses
+# FOR UPDATE SKIP LOCKED under MVCC, which would let a resend (a second writer) be claimed ahead of an
+# older producer row still uncommitted-and-invisible — this lock closes that window. Acquired BEFORE the
+# per-message finalize lock (lane < finalize is a total order; methods that take only finalize never take
+# a lane lock, so no cycle). Multi-destination writers lock in SORTED order (deadlock-free).
+_LOCK_CLASS_OUTBOUND_LANE = 4
 _AUDIT_LOCK = "mefor_audit_chain"
 _SCHEMA_LOCK = "mefor_schema_init"
 _FINALIZE_LOCK_PREFIX = "mefor_finalize:"
+_OUTBOUND_LANE_LOCK_PREFIX = "mefor_outlane:"
 
 # Schema (PostgreSQL). All DDL is `IF NOT EXISTS`, run once under the schema advisory lock so
 # concurrent opens don't race on CREATE. Epoch timestamps are DOUBLE PRECISION; ids TEXT (uuid4 hex);
@@ -265,6 +285,19 @@ _SCHEMA: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS ix_delivered_outbox ON delivered_keys(outbox_id)",
     "CREATE INDEX IF NOT EXISTS ix_delivered_message ON delivered_keys(message_id, destination_name)",
+    # Resend idempotency ledger (ADR 0090, BACKLOG #123) — one row per accepted resend-to-alternate,
+    # keyed on the caller idempotency_key. IDS ONLY, no body/PHI (not part of the cipher seam). resend_to
+    # INSERTs here FIRST (ON CONFLICT DO NOTHING) and creates the outbound row only when the insert made a
+    # row (RETURNING non-empty), so racing API nodes with the same key never double-send (ADR 0090 §4).
+    """CREATE TABLE IF NOT EXISTS resend_log (
+        resend_key       TEXT PRIMARY KEY,
+        message_id       TEXT NOT NULL,
+        to_destination   TEXT NOT NULL,
+        from_destination TEXT NOT NULL,
+        outbox_id        TEXT,
+        created_at       DOUBLE PRECISION NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_resend_message ON resend_log(message_id)",
     # Connection/transport event log (Corepoint-style #46) — METADATA-ONLY: inbound lifecycle +
     # pre-ingress failures + outbound lane transitions. id-keyed (NOT a queue stage → invisible to the
     # finalizer's `FROM queue` scan); message_id is NULLABLE with NO FK (correlation hint only) so a
@@ -314,6 +347,12 @@ _SCHEMA: list[str] = [
         row_hash   TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts)",
+    # Audit-chain keying watermark (#190) — single row (id=1). keyed_from_id = the first audit_log.id
+    # hashed with the HMAC key; NULL/no row = the whole chain is keyless (byte-identical to pre-#190).
+    """CREATE TABLE IF NOT EXISTS audit_chain_meta (
+        id             INTEGER PRIMARY KEY CHECK (id = 1),
+        keyed_from_id  BIGINT
+    )""",
     """CREATE TABLE IF NOT EXISTS pending_approvals (
         id           TEXT PRIMARY KEY,
         operation    TEXT NOT NULL,
@@ -448,7 +487,7 @@ def _schema_hash() -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _build_ssl(settings: StoreSettings) -> Any:
+def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) -> Any:
     """Build the asyncpg ``ssl`` arg from the store settings, mirroring the SQL Server backend's
     refuse-weakened-TLS logic (ASVS 12.3.2).
 
@@ -457,8 +496,16 @@ def _build_ssl(settings: StoreSettings) -> Any:
     silently turned on in production. Returns the ``ssl`` value to pass to ``asyncpg.create_pool``:
     ``False`` (no TLS) only under the escape with ``encrypt=false``; an SSLContext that skips cert
     verification under the escape with ``trust_server_certificate=true``; otherwise a default
-    verifying SSLContext (``True``)."""
-    if (settings.trust_server_certificate or not settings.encrypt) and not insecure_tls_allowed():
+    verifying SSLContext (``True``).
+
+    #200 (ADR 0092 decision 2): the engine<->store hop routes the escape through the ONE clamp
+    (:func:`~messagefoundry.config.settings.weakened_tls_escape_permitted`) so ``MEFOR_ALLOW_INSECURE_TLS``
+    can NEVER relax a **production-PHI** store hop (the SQL Server twin above is keyed identically). It
+    stays a STRICT verify-off cell (no gradient) and keeps NO second escape. ``posture`` (threaded from
+    ``open_store``) ``None`` leaves the escape unclamped — byte-identical to pre-#200."""
+    if (
+        settings.trust_server_certificate or not settings.encrypt
+    ) and not weakened_tls_escape_permitted(posture):
         raise ValueError(
             "Postgres TLS is weakened (trust_server_certificate=true or encrypt=false), which is "
             f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 to "
@@ -535,10 +582,30 @@ class PostgresStore:
         # always empty), so it needs no rotation pass here until the dedup insert is wired (CI-verified).
     )
 
-    def __init__(self, pool: Any, settings: StoreSettings, *, cipher: Cipher | None = None) -> None:
+    def __init__(
+        self,
+        pool: Any,
+        settings: StoreSettings,
+        *,
+        cipher: Cipher | None = None,
+        audit_mac_key: bytes | None = None,
+        message_events: str = "all",
+    ) -> None:
         self._pool = pool
         self._settings = settings
         self._cipher: Cipher = cipher or IdentityCipher()
+        # A1 live cost counters (QueueStore protocol / `/stats` uniformity). Exposed at 0 on this backend:
+        # counting is fully wired on SQLite + SQL Server, whose explicit ``conn.commit()`` / body-insert
+        # sites funnel through single helpers; Postgres commits implicitly via ``async with
+        # conn.transaction()`` blocks scattered across the module, so live wiring is a separate pass. The
+        # ``/stats`` consumer reads these with ``getattr(store, name, 0)``, so 0 here degrades gracefully.
+        self.committed_txns = 0
+        self.body_copies = 0
+        # #190 audit-chain HMAC key (HKDF-derived; None → keyless chain) + keying watermark.
+        self._audit_mac_key = audit_mac_key
+        self._audit_keyed_from: int | None = None
+        # #63 message_events verbosity gate ("all"/"errors"/"off"); floor always retained.
+        self._message_events = message_events
         self.path = f"{settings.server}/{settings.database}"  # descriptor for db_status
         # B11 connection-scale observability: a perf_counter-measured histogram of how long each
         # pooled-connection acquire() WAITS — the PRIMARY pool-wait wall signal (it grows monotonically
@@ -580,7 +647,13 @@ class PostgresStore:
 
     @classmethod
     async def open(
-        cls, settings: StoreSettings, *, cipher: Cipher | None = None
+        cls,
+        settings: StoreSettings,
+        *,
+        cipher: Cipher | None = None,
+        audit_mac_key: bytes | None = None,
+        message_events: str = "all",
+        posture: HopPosture | None = None,
     ) -> "PostgresStore":
         try:
             import asyncpg
@@ -599,7 +672,7 @@ class PostgresStore:
             database=settings.database,
             user=settings.username,
             password=settings.password,
-            ssl=_build_ssl(settings),
+            ssl=_build_ssl(settings, posture=posture),
             min_size=1,
             max_size=max(1, settings.pool_size),
             timeout=settings.connect_timeout,  # connection-acquire/connect timeout (seconds)
@@ -608,10 +681,17 @@ class PostgresStore:
             command_timeout=(settings.command_timeout or None),
             server_settings=server_settings,
         )
-        store = cls(pool, settings, cipher=cipher)
+        store = cls(
+            pool,
+            settings,
+            cipher=cipher,
+            audit_mac_key=audit_mac_key,
+            message_events=message_events,
+        )
         await store._ensure_schema()
         await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
         await store._backfill_audit_chain()  # chain any pre-existing (unhashed) audit rows
+        await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
         await (
             store._load_state_cache()
         )  # populate the in-memory state read-through cache (ADR 0005)
@@ -866,6 +946,18 @@ class PostgresStore:
             "SELECT pg_advisory_xact_lock($1, hashtext($2))", classid, self._lock_key(key)
         )
 
+    async def _lock_outbound_lanes(self, conn: Any, destinations: Iterable[str]) -> None:
+        """ADR 0090 strict-FIFO writer-funnel: take the per-lane advisory lock for each distinct
+        ``destination_name`` this txn will insert an outbound row into, in **sorted** order (so any two
+        writers acquire a shared subset in the same order — deadlock-free), before ``seq`` assignment and
+        held until commit. Serializes all writers of a lane's outbound rows so commit-order ==
+        BIGSERIAL-seq-order, closing the SKIP-LOCKED/MVCC inversion a second writer (resend) would open.
+        Acquired BEFORE any per-message finalize lock (lane < finalize total order)."""
+        for dest in sorted({d for d in destinations if d}):
+            await self._advisory_lock(
+                conn, _LOCK_CLASS_OUTBOUND_LANE, f"{_OUTBOUND_LANE_LOCK_PREFIX}{dest}"
+            )
+
     async def _lock_finalize_batch(self, conn: Any, message_ids: Iterable[str]) -> None:
         """Acquire the per-message finalize advisory lock for every id in a **canonical (sorted)**
         order, up front, before any finalize work. A multi-message finalizer (cancel_queued, the
@@ -1080,6 +1172,65 @@ class PostgresStore:
                         "UPDATE audit_log SET row_hash=$1 WHERE id=$2", row_hash, rid
                     )
 
+    async def _load_audit_chain_meta(self) -> None:
+        """Load the #190 audit-chain keying watermark; auto-enable keying from row 1 for a FRESH
+        encrypted store (nothing to re-bless). An existing keyless chain stays keyless until the
+        explicit :meth:`rekey_audit_chain` migration — never silent (see the SQLite twin)."""
+        async with self._timed_acquire() as conn:
+            row = await conn.fetchrow("SELECT keyed_from_id FROM audit_chain_meta WHERE id=1")
+            if row is not None and row["keyed_from_id"] is not None:
+                self._audit_keyed_from = int(row["keyed_from_id"])
+                return
+            if self._audit_mac_key is None:
+                return
+            cnt = await conn.fetchrow("SELECT COUNT(*) AS n FROM audit_log")
+            if cnt is not None and int(cnt["n"]) == 0:
+                await conn.execute(
+                    "INSERT INTO audit_chain_meta (id, keyed_from_id) VALUES (1, 1) "
+                    "ON CONFLICT (id) DO UPDATE SET keyed_from_id = EXCLUDED.keyed_from_id"
+                )
+                self._audit_keyed_from = 1
+
+    def _audit_append_key(self) -> bytes | None:
+        """The key a NEW ``audit_log`` row is hashed with (#190): keyed once the watermark is set.
+
+        Fail-closed when keyed but the DEK is absent — appending a keyless row above the watermark would
+        read as tampered under a later keyed verify, a FALSE break (review major-1; see SQLite twin)."""
+        if self._audit_keyed_from is None:
+            return None
+        if self._audit_mac_key is None:
+            raise RuntimeError(
+                f"audit chain is keyed (from id={self._audit_keyed_from}) but no store encryption key "
+                "is configured; refusing to append a keyless audit row above the keying watermark"
+            )
+        return self._audit_mac_key
+
+    async def rekey_audit_chain(
+        self, *, expected_anchor: tuple[int, str] | None = None
+    ) -> tuple[bool, str]:
+        """Non-silent #190-D migration — enable HMAC keying on an existing keyless chain. Refuses
+        without a DEK, no-op if already keyed, verifies the existing chain first (refusing on any break),
+        then sets the watermark to the next id (never rewrites existing hashes). See the SQLite twin."""
+        if self._audit_mac_key is None:
+            return False, "no store encryption key configured; cannot key the audit chain"
+        if self._audit_keyed_from is not None:
+            return True, f"audit chain already keyed from id={self._audit_keyed_from}"
+        ok, msg = await self.verify_audit_chain(expected_anchor=expected_anchor)
+        if not ok:
+            return False, f"refusing to key a broken audit chain: {msg}"
+        async with self._timed_acquire() as conn:
+            async with conn.transaction():
+                await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
+                row = await conn.fetchrow("SELECT COALESCE(MAX(id), 0) AS m FROM audit_log")
+                watermark = (int(row["m"]) if row is not None else 0) + 1
+                await conn.execute(
+                    "INSERT INTO audit_chain_meta (id, keyed_from_id) VALUES (1, $1) "
+                    "ON CONFLICT (id) DO UPDATE SET keyed_from_id = EXCLUDED.keyed_from_id",
+                    watermark,
+                )
+        self._audit_keyed_from = watermark
+        return True, f"audit chain keyed from id={watermark}"
+
     async def _encrypt_existing_rows(self) -> None:
         """Encrypt legacy plaintext values in the cipher-covered columns in place when encryption is
         enabled (STORE-1 / WP-5). Idempotent + batched: skips rows already carrying the ciphertext
@@ -1269,6 +1420,8 @@ class PostgresStore:
         """Append a ``message_events`` row, encrypting ``detail`` here so the cipher boundary lives in
         ONE place (mirrors MessageStore._event; ``detail`` is a declared cipher column). Callers pass
         plaintext — never pre-wrap with ``_enc``."""
+        if not should_record_event(event, self._message_events):
+            return  # #63 verbosity gate — floor events always pass; routine ones thinnable
         detail = safe_text(detail) if detail else detail  # PHI chokepoint (#120)
         await conn.execute(
             "INSERT INTO message_events (message_id, ts, event, destination, detail)"
@@ -1366,16 +1519,19 @@ class PostgresStore:
 
     async def _insert_outbound_row(
         self, conn: Any, mid: str, channel_id: str, dest_name: str, payload: str, now: float
-    ) -> None:
-        """Insert one ``stage='outbound'`` queue row (one message→destination delivery)."""
+    ) -> str:
+        """Insert one ``stage='outbound'`` queue row (one message→destination delivery). Returns the
+        generated queue-row id (ADR 0090 resend records it in ``resend_log``; the handoff loop ignores
+        it). Callers must have taken the lane lock (:meth:`_lock_outbound_lanes`) for ``dest_name``."""
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
         created_at = now
+        row_id = uuid4().hex
         await conn.execute(
             "INSERT INTO queue"
             " (id, message_id, stage, channel_id, destination_name, payload,"
             "  status, attempts, next_attempt_at, created_at, updated_at)"
             " VALUES ($1,$2,$3,$4,$5,$6,$7,0,$8,$9,$10)",
-            uuid4().hex,
+            row_id,
             mid,
             Stage.OUTBOUND.value,
             channel_id,
@@ -1386,6 +1542,7 @@ class PostgresStore:
             created_at,
             now,
         )
+        return row_id
 
     async def _insert_routed_row(
         self, conn: Any, mid: str, channel_id: str, handler_name: str, payload: str, now: float
@@ -1589,6 +1746,8 @@ class PostgresStore:
         status = MessageStatus.ROUTED.value if deliveries else MessageStatus.UNROUTED.value
         async with self._timed_acquire() as conn:
             async with conn.transaction():
+                # ADR 0090 writer-funnel (same as the handoff paths).
+                await self._lock_outbound_lanes(conn, (d for d, _ in deliveries))
                 await self._insert_message(
                     conn,
                     mid,
@@ -1720,6 +1879,9 @@ class PostgresStore:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn:
             async with conn.transaction():
+                # ADR 0090 writer-funnel: lock every destination lane this txn writes (sorted, before seq
+                # assignment) so commit-order == seq-order and a concurrent resend can't be claimed ahead.
+                await self._lock_outbound_lanes(conn, (d for d, _ in deliveries))
                 deleted = await conn.fetchval(
                     "DELETE FROM queue WHERE id=$1 AND stage=$2 AND status=$3 RETURNING id",
                     ingress_id,
@@ -1796,6 +1958,7 @@ class PostgresStore:
         deliveries: Sequence[tuple[str, str]],
         state_ops: Sequence[tuple[str, str, Any]] = (),
         pt_deliveries: Sequence[tuple[str, str]] = (),
+        meta_ops: Sequence[tuple[str, str]] = (),
         correlation_depth_cap: int = 8,
         now: float | None = None,
     ) -> bool:
@@ -1819,6 +1982,9 @@ class PostgresStore:
         applied: list[tuple[tuple[str, str], Any]] = []
         async with self._timed_acquire() as conn:
             async with conn.transaction():
+                # ADR 0090 writer-funnel: lock the outbound lanes this txn writes (sorted, before seq
+                # assignment, before the later finalize lock) so commit-order == seq-order per lane.
+                await self._lock_outbound_lanes(conn, (d for d, _ in deliveries))
                 deleted = await conn.fetchval(
                     "DELETE FROM queue WHERE id=$1 AND stage=$2 AND status=$3 RETURNING id",
                     routed_id,
@@ -1835,12 +2001,15 @@ class PostgresStore:
                 # terminal marker IN THIS same transaction as the routed-row DELETE, so the handoff is
                 # atomic and re-run-idempotent. Read the parent's correlation lineage once (absent →
                 # depth 0).
-                if pt_deliveries:
+                # Read the message's current metadata ONCE if either PT re-ingress or SetMeta needs it.
+                pmeta_json: str | None = None
+                if pt_deliveries or meta_ops:
                     prow = await conn.fetchrow(
                         "SELECT metadata FROM messages WHERE id=$1", message_id
                     )
-                    parent_meta: dict[str, Any] = {}
                     pmeta_json = self._dec(prow["metadata"]) if prow else None
+                if pt_deliveries:
+                    parent_meta: dict[str, Any] = {}
                     if pmeta_json:
                         loaded = json.loads(pmeta_json)
                         if isinstance(loaded, dict):
@@ -1863,6 +2032,13 @@ class PostgresStore:
                     value_json = json.dumps(value)
                     await self._apply_state_op(conn, namespace, key, value_json, message_id, now)
                     applied.append(((namespace, key), value))
+                # SetMeta (ADR 0081, #150): merge the user bag under messages.metadata."user" in THIS
+                # same transaction — crash before commit leaves no metadata; a re-run re-derives it.
+                if meta_ops:
+                    merged = merge_user_metadata(pmeta_json, meta_ops)
+                    await conn.execute(
+                        "UPDATE messages SET metadata=$1 WHERE id=$2", self._enc(merged), message_id
+                    )
                 # Track B Step 6b: bump each DISTINCT namespace's version IN THE SAME txn as its writes —
                 # atomic, so a follower that sees the new version is guaranteed the rows are committed.
                 # Gated on clustered (single-node never writes state_version → byte-identical). Idempotent
@@ -2588,6 +2764,46 @@ class PostgresStore:
                 )
                 await self._maybe_finalize_message(conn, row["message_id"], now)
 
+    async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
+        """Complete N delivered outbound rows in ONE transaction — the batch counterpart of
+        :meth:`mark_done` (ADR 0082). All N flip ``DONE`` together; each writes its H2 ledger row +
+        ``delivered`` event, and the finalizer runs once per distinct ``message_id``. A vanished member
+        is skipped; a crash before commit rolls all N back to ``INFLIGHT``."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn:
+            async with conn.transaction():
+                finalize: dict[str, None] = {}
+                for outbox_id in outbox_ids:
+                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                    if row is None:
+                        continue  # vanished member — idempotent no-op
+                    await conn.execute(
+                        "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
+                        " owner=NULL, lease_expires_at=NULL WHERE id=$3",
+                        OutboxStatus.DONE.value,
+                        now,
+                        outbox_id,
+                    )
+                    await self._record_delivered_key(
+                        conn,
+                        outbox_id=outbox_id,
+                        message_id=row["message_id"],
+                        destination_name=row["destination_name"],
+                        handler_name=row["handler_name"],
+                        now=now,
+                    )
+                    await self._event(
+                        conn,
+                        row["message_id"],
+                        "delivered",
+                        row["destination_name"],
+                        f"attempt {row['attempts']}",
+                        now,
+                    )
+                    finalize[row["message_id"]] = None
+                for message_id in finalize:
+                    await self._maybe_finalize_message(conn, message_id, now)
+
     async def complete_with_response(
         self,
         outbox_id: str,
@@ -3206,6 +3422,92 @@ class PostgresStore:
                     return None
                 return next_at
 
+    async def mark_batch_failed(
+        self,
+        outbox_ids: Sequence[str],
+        error: str,
+        retry: RetryPolicy,
+        now: float | None = None,
+    ) -> float | None:
+        """Re-pend (or dead-letter) N outbound rows that failed **as a unit** — the batch counterpart of
+        :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
+        applied identically to all N (same ``next_attempt_at`` → re-claimed as the identical prefix, or
+        all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter."""
+        error = safe_text(error)  # PHI chokepoint (#120)
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn:
+            async with conn.transaction():
+                present = []
+                for outbox_id in outbox_ids:
+                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                    if row is not None:
+                        present.append((outbox_id, row))
+                if not present:
+                    return None
+                head_attempts = present[0][1]["attempts"]
+                if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
+                    status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
+                else:
+                    backoff = min(
+                        retry.max_backoff_seconds,
+                        retry.backoff_seconds * (retry.backoff_multiplier ** (head_attempts - 1)),
+                    )
+                    status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
+                finalize: dict[str, None] = {}
+                for outbox_id, row in present:
+                    await conn.execute(
+                        "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                        " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                        status,
+                        next_at,
+                        self._enc(error),
+                        now,
+                        outbox_id,
+                    )
+                    await self._event(
+                        conn,
+                        row["message_id"],
+                        event,
+                        row["destination_name"],
+                        f"attempt {row['attempts']}: {error}",
+                        now,
+                    )
+                    if status == OutboxStatus.DEAD.value:
+                        finalize[row["message_id"]] = None
+                for message_id in finalize:
+                    await self._maybe_finalize_message(conn, message_id, now)
+                return None if status == OutboxStatus.DEAD.value else next_at
+
+    async def dead_letter_batch(
+        self, outbox_ids: Sequence[str], error: str, now: float | None = None
+    ) -> None:
+        """Force N outbound rows terminal (``DEAD``) in one transaction — the batch counterpart of
+        :meth:`dead_letter_now` (ADR 0082 decision #1: a permanent envelope reject dead-letters all N)."""
+        error = safe_text(error)  # PHI chokepoint (#120)
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn:
+            async with conn.transaction():
+                finalize: dict[str, None] = {}
+                for outbox_id in outbox_ids:
+                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                    if row is None:
+                        continue
+                    await conn.execute(
+                        "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                        " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                        OutboxStatus.DEAD.value,
+                        now,
+                        self._enc(error),
+                        now,
+                        outbox_id,
+                    )
+                    await self._event(
+                        conn, row["message_id"], "dead", row["destination_name"], error, now
+                    )
+                    finalize[row["message_id"]] = None
+                for message_id in finalize:
+                    await self._maybe_finalize_message(conn, message_id, now)
+
     async def pending_depth(
         self, name: str, *, stage: str = Stage.OUTBOUND.value
     ) -> tuple[int, float | None]:
@@ -3494,6 +3796,323 @@ class PostgresStore:
                     await self._event(conn, message_id, "replayed", None, f"{count} row(s)", now)
         return count
 
+    async def resend_to(
+        self,
+        *,
+        message_id: str,
+        to: str,
+        idempotency_key: str,
+        from_: str | None = None,
+        body_override: str | None = None,
+        now: float | None = None,
+    ) -> ResendOutcome:
+        """Resend a message's stored transformed body to an ALTERNATE outbound ``to`` (ADR 0090).
+        Mirrors :meth:`MessageStore.resend_to`. Strict-FIFO writer-funnel: takes the per-lane advisory
+        lock for ``to`` (:meth:`_lock_outbound_lanes`) so the resend commits in seq-order for the lane
+        and can't be claimed ahead of an older producer row still uncommitted-and-invisible under
+        SKIP-LOCKED/MVCC. Idempotency: the ``resend_log`` INSERT (ON CONFLICT DO NOTHING) runs FIRST and
+        the outbound row is created only when it returned a row (ADR 0090 §4)."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn:
+            async with conn.transaction():
+                await self._lock_outbound_lanes(conn, (to,))
+                # Idempotency gate FIRST: claim the key; proceed only if we created the row.
+                claimed = await conn.fetchval(
+                    "INSERT INTO resend_log"
+                    " (resend_key, message_id, to_destination, from_destination, outbox_id, created_at)"
+                    " VALUES ($1,$2,$3,$4,NULL,$5) ON CONFLICT (resend_key) DO NOTHING"
+                    " RETURNING resend_key",
+                    idempotency_key,
+                    message_id,
+                    to,
+                    from_ or "",
+                    now,
+                )
+                if claimed is None:
+                    # Bind the key to its (message_id, to) request — a key reused for a DIFFERENT
+                    # message/target is a conflict (raise -> 409), never a silent no-op (ADR 0090 §4,
+                    # review #123-4).
+                    prior = await conn.fetchrow(
+                        "SELECT message_id, to_destination, from_destination, outbox_id FROM resend_log"
+                        " WHERE resend_key=$1",
+                        idempotency_key,
+                    )
+                    if prior is not None and (
+                        prior["message_id"] != message_id or prior["to_destination"] != to
+                    ):
+                        raise ResendKeyConflict(
+                            f"idempotency key {idempotency_key!r} was already used to resend message"
+                            f" {prior['message_id']!r} to {prior['to_destination']!r}; it cannot be"
+                            f" reused for message {message_id!r} to {to!r}"
+                        )
+                    return ResendOutcome(
+                        status="duplicate",
+                        message_id=message_id,
+                        to_destination=prior["to_destination"] if prior else to,
+                        from_destination=prior["from_destination"] if prior else (from_ or ""),
+                        outbox_id=prior["outbox_id"] if prior else None,
+                    )
+                if body_override is not None:
+                    # Edit-and-resend DIRECT power-path (ADR 0090 §9.1.3, BACKLOG #153): ship the
+                    # operator's EDITED body to `to` as a NEW, correlated CHILD delivery. The ORIGIN row
+                    # is only READ (channel/type + correlation metadata) and NEVER written, so its
+                    # count-and-log disposition + error stay byte-identical (#153 "the original must NOT
+                    # change"; review #153-1/#153-2). The outbound row hangs off the CHILD, so the
+                    # finalizer recomputes the CHILD's disposition, never the origin's.
+                    orow = await conn.fetchrow(
+                        "SELECT channel_id, source_type, message_type, metadata"
+                        " FROM messages WHERE id=$1",
+                        message_id,
+                    )
+                    if orow is None:
+                        raise ReingressOriginMissing(
+                            f"message {message_id} no longer exists -- cannot edit-and-resend"
+                        )
+                    src_channel = str(orow["channel_id"])
+                    src_dest = from_ or ""
+                    body = body_override
+                    if not body:
+                        raise ResendSourceEmpty(
+                            f"message {message_id} edited body is empty -- cannot resend"
+                        )
+                    # Correlate the child to the origin (mirrors `reingress`).
+                    raw_meta = self._dec(orow["metadata"])
+                    try:
+                        parent_meta = json.loads(raw_meta) if raw_meta else {}
+                    except (ValueError, TypeError):
+                        parent_meta = {}
+                    if not isinstance(parent_meta, dict):
+                        parent_meta = {}
+                    child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
+                    root = parent_meta.get("correlation_root_id") or message_id
+                    child_meta = json.dumps(
+                        {
+                            "correlation_id": message_id,
+                            "correlation_root_id": root,
+                            "correlation_depth": child_depth,
+                            "edited_from": message_id,
+                        }
+                    )
+                    # ROUTED child with its single outbound delivery already in flight (skips router/
+                    # transform); the finalizer drives it to PROCESSED/ERROR. Idempotency is the
+                    # resend_log gate above (single txn), so a uuid4 child id is safe.
+                    child_mid = uuid4().hex
+                    await self._insert_message(
+                        conn,
+                        child_mid,
+                        channel_id=src_channel,
+                        raw=body,
+                        status=MessageStatus.ROUTED.value,
+                        control_id=None,
+                        message_type=orow["message_type"],
+                        source_type=orow["source_type"],
+                        summary=None,
+                        metadata=child_meta,
+                        error=None,
+                        now=now,
+                    )
+                    await self._event(
+                        conn, child_mid, "received", None, f"edit-resend from {message_id}", now
+                    )
+                    await self._event(conn, message_id, "edit_resend", to, f"-> {child_mid}", now)
+                    outbox_id = await self._insert_outbound_row(
+                        conn, child_mid, src_channel, to, body, now
+                    )
+                else:
+                    # Resolve the source + its stored body (deref a shared body via COALESCE). ANY retained
+                    # stage='outbound' row is an eligible source (done/cancelled/dead/pending) — the
+                    # transform already produced its body; diverting a permanently-failed (dead) delivery
+                    # to a standby is a marquee use case (ADR 0090 §1). `from_destination` names the source
+                    # LANE, not a delivery claim (review #123-3).
+                    src_where = "message_id=$1 AND stage=$2"
+                    src_args: list[Any] = [message_id, Stage.OUTBOUND.value]
+                    if from_ is not None:
+                        src_where += " AND destination_name=$3"
+                        src_args.append(from_)
+                    src_rows = await conn.fetch(
+                        "SELECT q.destination_name, q.channel_id,"
+                        " COALESCE(sb.body, q.payload) AS _body_ciphertext"
+                        " FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
+                        f" WHERE {src_where} ORDER BY q.destination_name",
+                        *src_args,
+                    )
+                    if not src_rows:
+                        raise ResendSourceNotFound(
+                            f"message {message_id} has no delivered body"
+                            + (f" for source {from_!r}" if from_ is not None else "")
+                            + " to resend"
+                        )
+                    if from_ is None and len({r["destination_name"] for r in src_rows}) > 1:
+                        raise ResendSourceAmbiguous(
+                            f"message {message_id} was delivered to multiple destinations --"
+                            " specify the source destination (from) to resend"
+                        )
+                    src = src_rows[0]
+                    src_channel = str(src["channel_id"])
+                    src_dest = str(src["destination_name"])
+                    decoded = self._dec(src["_body_ciphertext"])
+                    if not decoded:
+                        raise ResendSourceEmpty(
+                            f"message {message_id} source body was purged by retention -- cannot resend"
+                        )
+                    body = decoded
+                    # #123 stored-body path: another delivery of the SAME logged message — outbound row
+                    # on the ORIGIN message_id + flip the ORIGIN to ROUTED (finalizer recomputes).
+                    outbox_id = await self._insert_outbound_row(
+                        conn, message_id, src_channel, to, body, now
+                    )
+                    await conn.execute(
+                        "UPDATE messages SET status=$1, error=NULL WHERE id=$2",
+                        MessageStatus.ROUTED.value,
+                        message_id,
+                    )
+                    await self._event(
+                        conn, message_id, "resent", to, f"resend {src_dest or '?'}->{to}", now
+                    )
+                await conn.execute(
+                    "UPDATE resend_log SET outbox_id=$1 WHERE resend_key=$2",
+                    outbox_id,
+                    idempotency_key,
+                )
+                return ResendOutcome(
+                    status="resent",
+                    message_id=message_id,
+                    to_destination=to,
+                    from_destination=src_dest,
+                    outbox_id=outbox_id,
+                )
+
+    async def reingress(
+        self,
+        *,
+        origin_message_id: str,
+        raw: str,
+        idempotency_key: str,
+        now: float | None = None,
+    ) -> ReingressOutcome:
+        """Edit-and-resubmit RE-ROUTE (ADR 0090 §9). Mirrors :meth:`MessageStore.reingress`: injects a
+        fresh, correlated ``RECEIVED`` child message at the origin channel's ingress stage; the origin
+        row is READ (channel + correlation metadata), never written. Idempotency: ``resend_log`` INSERT
+        (ON CONFLICT DO NOTHING) runs FIRST, keyed to ``(origin, "@reingress:<channel>")``; the child is
+        created only when it claimed the key. Deterministic child id (content-address of key+channel+body)
+        is the defense-in-depth against a partial-rollback double-inject. Like a pass-through child
+        (ADR 0013) the fresh INGRESS row lands at the channel's ingress tail — a new logged receipt, not
+        re-inserted into any historical outbound-lane position, so no outbound writer-funnel applies."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn:
+            async with conn.transaction():
+                orow = await conn.fetchrow(
+                    "SELECT channel_id, source_type, message_type, metadata FROM messages WHERE id=$1",
+                    origin_message_id,
+                )
+                if orow is None:
+                    raise ReingressOriginMissing(
+                        f"message {origin_message_id} no longer exists -- cannot edit-and-resubmit"
+                    )
+                channel_id = str(orow["channel_id"])
+                target = f"{REINGRESS_TARGET_PREFIX}{channel_id}"
+                claimed = await conn.fetchval(
+                    "INSERT INTO resend_log"
+                    " (resend_key, message_id, to_destination, from_destination, outbox_id, created_at)"
+                    " VALUES ($1,$2,$3,'',NULL,$4) ON CONFLICT (resend_key) DO NOTHING"
+                    " RETURNING resend_key",
+                    idempotency_key,
+                    origin_message_id,
+                    target,
+                    now,
+                )
+                if claimed is None:
+                    prior = await conn.fetchrow(
+                        "SELECT message_id, to_destination, outbox_id FROM resend_log WHERE resend_key=$1",
+                        idempotency_key,
+                    )
+                    if prior is not None and (
+                        prior["message_id"] != origin_message_id
+                        or prior["to_destination"] != target
+                    ):
+                        raise ResendKeyConflict(
+                            f"idempotency key {idempotency_key!r} was already used for a different"
+                            f" resubmit ({prior['message_id']!r} -> {prior['to_destination']!r}); it"
+                            f" cannot be reused for message {origin_message_id!r}"
+                        )
+                    return ReingressOutcome(
+                        status="duplicate",
+                        message_id=origin_message_id,
+                        new_message_id=(prior["outbox_id"] if prior else "") or "",
+                        channel_id=channel_id,
+                    )
+                raw_meta = self._dec(orow["metadata"])
+                try:
+                    parent_meta = json.loads(raw_meta) if raw_meta else {}
+                except (ValueError, TypeError):
+                    parent_meta = {}
+                if not isinstance(parent_meta, dict):
+                    parent_meta = {}
+                child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
+                root = parent_meta.get("correlation_root_id") or origin_message_id
+                child_meta = json.dumps(
+                    {
+                        "correlation_id": origin_message_id,
+                        "correlation_root_id": root,
+                        "correlation_depth": child_depth,
+                        "edited_from": origin_message_id,
+                    }
+                )
+                new_mid = MessageStore._edit_resubmit_message_id(idempotency_key, channel_id, raw)
+                exists = await conn.fetchval("SELECT 1 FROM messages WHERE id=$1", new_mid)
+                if exists is None:
+                    await self._insert_message(
+                        conn,
+                        new_mid,
+                        channel_id=channel_id,
+                        raw=raw,
+                        status=MessageStatus.RECEIVED.value,
+                        control_id=None,
+                        message_type=orow["message_type"],
+                        source_type=orow["source_type"],
+                        summary=None,
+                        metadata=child_meta,
+                        error=None,
+                        now=now,
+                    )
+                    await conn.execute(
+                        "INSERT INTO queue"
+                        " (id, message_id, stage, channel_id, destination_name, payload,"
+                        "  status, attempts, next_attempt_at, created_at, updated_at)"
+                        " VALUES ($1,$2,$3,$4,NULL,$5,$6,0,$7,$8,$9)",
+                        uuid4().hex,
+                        new_mid,
+                        Stage.INGRESS.value,
+                        channel_id,
+                        self._cipher.encrypt(raw),
+                        OutboxStatus.PENDING.value,
+                        now,
+                        now,
+                        now,
+                    )
+                    await self._event(
+                        conn,
+                        new_mid,
+                        "received",
+                        None,
+                        f"edit-resubmit from {origin_message_id}",
+                        now,
+                    )
+                    await self._event(
+                        conn, origin_message_id, "edit_resubmit", None, f"-> {new_mid}", now
+                    )
+                await conn.execute(
+                    "UPDATE resend_log SET outbox_id=$1 WHERE resend_key=$2",
+                    new_mid,
+                    idempotency_key,
+                )
+                return ReingressOutcome(
+                    status="resubmitted",
+                    message_id=origin_message_id,
+                    new_message_id=new_mid,
+                    channel_id=channel_id,
+                )
+
     async def replay_dead(
         self,
         *,
@@ -3606,6 +4225,14 @@ class PostgresStore:
         d["summary"] = self._dec(d["summary"])  # EF-3: MRN/name PHI, ciphered at rest
         d["metadata"] = self._dec(d["metadata"])  # EF-3
         return d
+
+    async def message_metadata_json(self, message_id: str) -> str | None:
+        # #68: decrypt ONLY the metadata column (never the raw PHI body) for the delivery worker's
+        # per-message dynamic headers. Off the perf-critical claim path; read only for opted-in outbounds.
+        record = await self._fetchone("SELECT metadata FROM messages WHERE id=$1", message_id)
+        if record is None:
+            return None
+        return self._dec(record["metadata"])
 
     async def list_messages(
         self,
@@ -3891,7 +4518,13 @@ class PostgresStore:
                 )
                 prev = last["row_hash"] if last and last["row_hash"] else ""
                 row_hash = audit_row_hash(
-                    prev, ts=now, actor=actor, action=action, channel_id=channel_id, detail=detail
+                    prev,
+                    ts=now,
+                    actor=actor,
+                    action=action,
+                    channel_id=channel_id,
+                    detail=detail,
+                    key=self._audit_append_key(),  # keyed once the #190 watermark is set, else keyless
                 )
                 await conn.execute(
                     "INSERT INTO audit_log (ts, actor, action, channel_id, detail, row_hash)"
@@ -3907,9 +4540,37 @@ class PostgresStore:
         # truly persisted; never hold the advisory lock / a pooled connection across a syslog send).
         emit_audit_tee(action=action, actor=actor, channel_id=channel_id, detail=detail, ts=now)
 
-    async def list_audit(self, *, limit: int = 50) -> Sequence[Row]:
-        """Most-recent-first audit entries (for review tooling / tests)."""
-        return await self._fetchall("SELECT * FROM audit_log ORDER BY id DESC LIMIT $1", limit)
+    async def list_audit(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> Sequence[Row]:
+        """Most-recent-first audit entries, optionally filtered (BACKLOG #170).
+
+        Filters are ANDed as bound ``$N`` parameters — only the fixed column/operator template is
+        formatted into the SQL, never a value — so a filter value cannot inject."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if actor is not None:
+            params.append(actor)
+            clauses.append(f"actor = ${len(params)}")
+        if action is not None:
+            params.append(action)
+            clauses.append(f"action = ${len(params)}")
+        if since is not None:
+            params.append(since)
+            clauses.append(f"ts >= ${len(params)}")
+        if until is not None:
+            params.append(until)
+            clauses.append(f"ts <= ${len(params)}")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        sql = f"SELECT * FROM audit_log{where} ORDER BY id DESC LIMIT ${len(params)}"
+        return await self._fetchall(sql, *params)
 
     async def security_events_for_user(self, username: str, *, limit: int = 100) -> Sequence[Row]:
         """A user's own security events (``auth.*``), most-recent-first — for ``GET
@@ -3990,17 +4651,34 @@ class PostgresStore:
             return 0, ""
         return int(row["n"]), (row["head"] or "")
 
+    async def has_prior_backup_history(self) -> bool:
+        """See :meth:`AuditStore.has_prior_backup_history` — ≥1 ``dr_backup`` audit row (the #102 server-DB
+        DR-seed restored-not-bootstrapped signal). Read-only existence check."""
+        row = await self._fetchone("SELECT 1 FROM audit_log WHERE action = 'dr_backup' LIMIT 1")
+        return row is not None
+
     async def verify_audit_chain(
         self, *, expected_anchor: tuple[int, str] | None = None
     ) -> tuple[bool, str | None]:
         """Recompute the audit hash-chain in order; returns ``(ok, message)``. Pass ``expected_anchor``
         from :meth:`audit_anchor` (held out-of-band) to also detect tail-truncation."""
+        if self._audit_keyed_from is not None and self._audit_mac_key is None:
+            return (
+                False,
+                "audit chain is keyed (from id="
+                f"{self._audit_keyed_from}) but no store encryption key is configured to verify it",
+            )
         rows = await self._fetchall(
             "SELECT id, ts, actor, action, channel_id, detail, row_hash FROM audit_log ORDER BY id"
         )
         prev = ""
         count = 0
         for r in rows:
+            key = (
+                self._audit_mac_key
+                if self._audit_keyed_from is not None and int(r["id"]) >= self._audit_keyed_from
+                else None
+            )
             expected = audit_row_hash(
                 prev,
                 ts=r["ts"],
@@ -4008,6 +4686,7 @@ class PostgresStore:
                 action=r["action"],
                 channel_id=r["channel_id"],
                 detail=r["detail"],
+                key=key,
             )
             if r["row_hash"] != expected:
                 return False, f"audit chain broken at row id={r['id']}"

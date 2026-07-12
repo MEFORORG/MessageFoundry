@@ -471,6 +471,7 @@ def _node_env(
     base_port: int,
     transform: str,
     sink_host: str,
+    inbound_bind_host: str = "127.0.0.1",
     sink_port: int,
     sink_ports: int,
     install_executor_shim: bool,
@@ -499,6 +500,11 @@ def _node_env(
     env["MEFOR_CONNSCALE_BASE_PORT"] = str(base_port)
     env["MEFOR_CONNSCALE_TRANSFORM"] = transform
     env["MEFOR_CONNSCALE_SINK_HOST"] = sink_host
+    # Inbound listener interface: loopback for a co-located single-box run (unchanged); a two-box batch
+    # drive sets 0.0.0.0 so the off-box ConnScaleDriver can reach base_port + i on the engine box. The
+    # engine honors MEFOR_INBOUND_BIND_HOST for its inbound bind (the same env the two-box shardcert
+    # rig uses), so this is additive and behavior-preserving for the default.
+    env["MEFOR_INBOUND_BIND_HOST"] = inbound_bind_host
     env["MEFOR_CONNSCALE_SINK_PORT"] = str(sink_port)
     env["MEFOR_CONNSCALE_SINK_PORTS"] = str(sink_ports)
     # Per-engine connection-name tag: empty (the single-engine connscale default) leaves the historical

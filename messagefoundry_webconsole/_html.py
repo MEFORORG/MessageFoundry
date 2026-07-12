@@ -15,10 +15,49 @@ contained.
 
 from __future__ import annotations
 
+import contextvars
 from collections.abc import Iterable
 from html import escape
 
-__all__ = ["Markup", "attr", "el", "page", "register_nav", "rows_table", "text"]
+__all__ = [
+    "Markup",
+    "attr",
+    "current_csp_nonce",
+    "el",
+    "page",
+    "register_nav",
+    "reset_csp_nonce",
+    "rows_table",
+    "set_csp_nonce",
+    "text",
+]
+
+#: Per-response CSP nonce (ADR 0065 §hardening / BACKLOG #192, ASVS 3.4.7/3.4.8). The /ui security
+#: middleware mints one per effective-https response and binds it here BEFORE the route renders;
+#: :func:`page` reads it to stamp the ``<script>`` tag so it matches that response's
+#: ``script-src 'nonce-…'`` header. A ContextVar (not a module global) so concurrent requests never
+#: share a nonce; ``None`` over cleartext loopback means no nonce is emitted (byte-identity with the
+#: pre-#192 tag).
+_CSP_NONCE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mf_ui_csp_nonce", default=None
+)
+
+
+def set_csp_nonce(nonce: str | None) -> contextvars.Token[str | None]:
+    """Bind ``nonce`` for the current context (the /ui security middleware, per effective-https
+    response). Returns the reset token the middleware restores in its ``finally``."""
+    return _CSP_NONCE.set(nonce)
+
+
+def reset_csp_nonce(token: contextvars.Token[str | None]) -> None:
+    """Undo a :func:`set_csp_nonce` binding (middleware teardown)."""
+    _CSP_NONCE.reset(token)
+
+
+def current_csp_nonce() -> str | None:
+    """The CSP nonce bound for this response, or ``None`` (cleartext loopback → no nonce emitted)."""
+    return _CSP_NONCE.get()
+
 
 # HTML void elements never get a closing tag or children.
 _VOID = frozenset(
@@ -97,8 +136,12 @@ def page(title: str, *body: object, nav: object = None, active: str = "") -> Mar
                 el("meta", name="referrer", content="no-referrer"),
                 el("title", f"{title} — MessageFoundry"),
                 el("link", rel="stylesheet", href="/ui/static/app.css"),
-                # First-party live-poll script (no third-party JS). CSP: script-src 'self'.
-                el("script", src="/ui/static/app.js", defer=True),
+                # First-party live-poll script (no third-party JS). Over an effective-https response the
+                # /ui security middleware binds a per-response CSP nonce that stamps this tag + the
+                # matching ``script-src 'nonce-…' 'strict-dynamic'`` header (ADR 0065 §hardening / #192);
+                # over cleartext loopback the nonce is None and the tag is byte-identical to before
+                # (CSP: script-src 'self').
+                el("script", src="/ui/static/app.js", defer=True, nonce=current_csp_nonce()),
             ]
         )
     )

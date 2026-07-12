@@ -6,8 +6,9 @@ The two-box drive of PR-B is ONE sender proc + ONE sink proc, both below the ~45
 a plateau there can't be told apart from the engine/store ceiling. PR-C over-provisions the CLIENT tier
 into K sender processes + M sink processes on the load-gen box, and — because the coord channel is
 metadata-only, so senders and sinks in different processes can't correlate acked↔delivered per-message —
-reconciles no-loss by COUNT-BALANCE + engine store-truth (``S == A*dests`` + engine REMOTE done/dead),
-not per-message.
+reconciles no-loss by COUNT-BALANCE + engine store-truth (``S == A*delivering`` + engine REMOTE
+done/dead), not per-message. (BACKLOG #209: the fan-out is ``delivering``, learned from SHARDS_READY —
+``dests`` is the destination-CONNECTION count and appears in no arithmetic.)
 
 These tests prove the process-split primitives WIRE + PARTITION + RECONCILE correctly OFFLINE on one PC
 over a temp coord dir: the exact contiguous sink-port partition (+ fail-loud), the exact band-slice
@@ -289,6 +290,8 @@ async def test_worker_owns_slice_arms_waits_go_and_drives(
             "inbound_base": 3600,
             "lanes": 2,
             "dests": 3,
+            "handlers": 3,
+            "delivering": 3,
             "api_ports": [9001, 9002],
             "sink_base": 3700,
             "sink_ports": 3,
@@ -334,7 +337,15 @@ async def test_worker_fails_loud_on_empty_slice(
     # G = 1 shard x 5 lanes = 5 bands; driver_count 4 ⇒ worker 3 owns an empty slice.
     coord.post(
         SHARDS_READY,
-        {"shards": ["a"], "inbound_base": 3600, "lanes": 5, "dests": 2, "api_ports": [9001]},
+        {
+            "shards": ["a"],
+            "inbound_base": 3600,
+            "lanes": 5,
+            "dests": 2,
+            "handlers": 2,
+            "delivering": 2,
+            "api_ports": [9001],
+        },
     )
     with pytest.raises(ValueError, match="EMPTY band slice"):
         await sc.run_shardcert_driver_worker(
@@ -359,6 +370,10 @@ def _drive_report(**over: Any) -> sc.ShardCertDriveReport:
     base: dict[str, Any] = dict(
         shards=("a", "b"),
         dests=2,
+        # #209: H = D = dests reproduces the pre-split report exactly (routed == delivered). The fan-out is
+        # `delivering`; `dests` is now the destination-CONNECTION count and appears in no arithmetic.
+        handlers=2,
+        delivering=2,
         driver_count=2,
         sink_count=2,
         aggregate_rate=40.0,
@@ -479,7 +494,10 @@ def test_reconcile_r1_real_loss_ceiling_regardless_of_poller() -> None:
 def test_drive_report_renders_and_serializes() -> None:
     r = _drive_report()
     text = r.render()
-    assert "verdict=PASS" in text and "fanout(dests)=2" in text
+    # #209: the render names the FAN-OUT as `delivering`, distinct from the destination-CONNECTION count.
+    # It used to read `fanout(dests)`, which was only ever right because the graph hardwired H = D = dests.
+    assert "verdict=PASS" in text and "fanout(delivering)=2 of dests=2 conns" in text
+    assert "fanout(dests)" not in text  # the conflated label is gone
     # The poller cross-check is rendered but clearly labeled advisory / NOT gated.
     assert "advisory" in text and "NOT gated" in text
     js = r.to_json_dict()
@@ -621,6 +639,8 @@ async def test_coordinator_round_trip_aggregates_sum_of_fakes(
             "inbound_base": 3600,
             "lanes": 1,
             "dests": 2,
+            "handlers": 2,
+            "delivering": 2,
             "api_ports": [9001, 9002],
             "sink_base": 3700,
             "sink_ports": 2,
@@ -670,6 +690,43 @@ async def test_coordinator_round_trip_aggregates_sum_of_fakes(
     assert sum(n.startswith("[sink-") or n.startswith("[worker-") for n in report.notes) == 4
 
 
+@pytest.mark.parametrize("missing", ["handlers", "delivering"])
+async def test_coordinator_fails_loud_on_shards_ready_without_the_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, missing: str
+) -> None:
+    """BACKLOG #209: ``handlers``/``delivering`` are REQUIRED SHARDS_READY keys — a missing one is a
+    KeyError, never a silent default to ``dests``.
+
+    SHARDS_READY is the ONLY channel by which the drive box learns the FAN-OUT, and ``delivering`` is the
+    multiplier under ``no_loss`` (``S == A*D``) and under the ladder's ``sustained_events_per_s`` — the
+    headline the 45M/day decision keys off. If an engine box that predates the split (or a hand-written
+    payload) omits them, defaulting to ``dests`` would quietly reinstate the ``H = D = dests`` assumption
+    and produce a plausible, wrong number. Failing loud says what is actually true: the two boxes are
+    running different code.
+    """
+    _install_coordinator_fakes(monkeypatch, sink_tally={}, worker_tally={}, engine_final=None)
+    ready: dict[str, Any] = {
+        "shards": ["a"],
+        "inbound_base": 3600,
+        "lanes": 1,
+        "dests": 2,
+        "handlers": 2,
+        "delivering": 2,
+        "api_ports": [9001],
+        "sink_base": 3700,
+        "sink_ports": 2,
+        "sink_port": 3700,
+    }
+    ready.pop(missing)  # a pre-#209 engine box
+    coord = FileDropCoord(tmp_path, run_id=f"no-{missing}")
+    coord.post(SHARDS_READY, ready)
+
+    with pytest.raises(KeyError, match=missing):
+        await sc.run_shardcert_drive(
+            engine_host="10.0.0.5", driver_count=1, sink_count=1, coord=coord
+        )
+
+
 async def test_coordinator_threads_derived_drive_complete_timeout_to_sinks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -710,6 +767,8 @@ async def test_coordinator_threads_derived_drive_complete_timeout_to_sinks(
             "inbound_base": 3600,
             "lanes": 1,
             "dests": 1,
+            "handlers": 1,
+            "delivering": 1,
             "api_ports": [9001],
             "sink_base": 3700,
             "sink_ports": 1,
@@ -770,6 +829,8 @@ async def test_coordinator_threads_allow_insecure_to_remote_poller(
         "inbound_base": 3600,
         "lanes": 1,
         "dests": 1,
+        "handlers": 1,
+        "delivering": 1,
         "api_ports": [9001],
         "sink_base": 3700,
         "sink_ports": 1,
@@ -816,6 +877,8 @@ async def test_coordinator_fails_loud_on_oversized_sink_count(
             "inbound_base": 3600,
             "lanes": 1,
             "dests": 2,
+            "handlers": 2,
+            "delivering": 2,
             "api_ports": [9001, 9002],
             "sink_base": 3700,
             "sink_ports": 2,
@@ -847,6 +910,8 @@ async def test_coordinator_fails_loud_on_oversized_driver_count(
             "inbound_base": 3600,
             "lanes": 1,
             "dests": 2,
+            "handlers": 2,
+            "delivering": 2,
             "api_ports": [9001],
             "sink_base": 3700,
             "sink_ports": 2,

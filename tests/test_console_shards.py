@@ -28,9 +28,12 @@ from tests.test_console_widgets import StubClient  # noqa: E402
 
 @pytest.fixture
 def settings() -> QSettings:
-    # An in-memory QSettings: round-trips like the real registry/INI backends but touches no disk
-    # or the developer's actual MessageFoundry/Console settings.
-    s = QSettings(QSettings.Format.IniFormat, QSettings.Scope.UserScope, "MEFOR-Test", "ShardTest")
+    # NOT in-memory, despite what this comment used to claim. QSettings(IniFormat, UserScope, ...) writes
+    # a REAL file — %APPDATA%\<org>\ShardTest.ini — and this fixture .clear()s it. With a fixed org, two
+    # concurrent pytest runs wiped each other's settings mid-test. The org is therefore per-PROCESS
+    # (tests/conftest.py claims a slot); it still never touches the developer's real Console settings.
+    org = os.environ.get("MEFOR_TEST_QSETTINGS_ORG", "MEFOR-Test")
+    s = QSettings(QSettings.Format.IniFormat, QSettings.Scope.UserScope, org, "ShardTest")
     s.clear()
     return s
 

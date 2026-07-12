@@ -40,7 +40,7 @@ ADT_A01 = (
 )
 
 
-def _registry(route, handlers, *, strict: bool = False) -> Registry:  # type: ignore[no-untyped-def]
+def _registry(route, handlers, *, strict: bool = False, accepts=None) -> Registry:  # type: ignore[no-untyped-def]
     reg = Registry()
     reg.add_inbound(
         InboundConnection(
@@ -54,8 +54,9 @@ def _registry(route, handlers, *, strict: bool = False) -> Registry:  # type: ig
         OutboundConnection("out", ConnectionSpec(ConnectorType.FILE, {"directory": "./out"}))
     )
     reg.add_router("r", route)
+    acc = accepts or {}  # ADR 0084 `accepts=` predicates, keyed by handler name (sparse)
     for name, fn in handlers.items():
-        reg.add_handler(name, fn)
+        reg.add_handler(name, fn, acc.get(name))
     return reg
 
 
@@ -349,3 +350,68 @@ def test_cli_trace_show_phi(tmp_path: Path, capsys) -> None:  # type: ignore[no-
     handler_inv = next(inv for inv in out[0]["invocations"] if inv["kind"] == "handler")
     writes = [w for ev in handler_inv["events"] for w in ev.get("writes", [])]
     assert any(w["path"] == "MSH-3" and w["value"] == "FOUNDRY" for w in writes)
+
+
+# --- ADR 0084: an `accepts=` decline is surfaced in the trace ----------------------------------
+
+
+def route_to_both(msg: Message) -> list[str]:
+    picked = ["h", "h_declines"]
+    return picked
+
+
+def accepts_adt(msg: Message) -> bool:
+    mtype = msg["MSH-9.1"]  # a pure peek — the sanctioned shape of a predicate
+    return mtype == "ADT"
+
+
+def accepts_never(msg: Message) -> bool:
+    verdict = False
+    return verdict
+
+
+def test_trace_marks_accepts_declined() -> None:
+    """A handler declined at the router stage never runs, so it vanishes from `handlers` — with no
+    trace of WHY. `accepts_declined` names it (and the predicate's own lines are traced as an
+    "accepts" invocation), which is the #92 live-debug question: *why didn't my handler fire?*"""
+    reg = _registry(
+        route_to_both,
+        {"h": handle_transform, "h_declines": handle_transform},
+        accepts={"h": accepts_adt, "h_declines": accepts_never},
+    )
+    plain = dry_run(reg, ADT_A01)
+    traced = trace_dry_run(reg, ADT_A01)
+
+    # Byte-identical to the untraced run (the tracer stays a pure observer of the verdict).
+    assert traced["handlers"] == plain.handlers == ["h"]
+    assert traced["disposition"] == plain.disposition.value == MessageStatus.RECEIVED.value
+    # …and the declined handler is named, not silently absent.
+    assert traced["accepts_declined"] == ["h_declines"]
+
+    # Both predicates were traced; the accepting one is NOT reported as declined.
+    accepts_invs = [inv for inv in traced["invocations"] if inv["kind"] == "accepts"]
+    assert [inv["name"] for inv in accepts_invs] == ["h", "h_declines"]
+    assert all(inv["events"] for inv in accepts_invs)  # real lines captured, not an empty shell
+    # The declining predicate's own local is visible (redacted without --show-phi).
+    declined_locals = _all_assigned(accepts_invs[1])
+    assert "verdict" in declined_locals
+
+
+def test_trace_all_declined_is_unrouted() -> None:
+    reg = _registry(
+        route_to_both,
+        {"h": handle_transform, "h_declines": handle_transform},
+        accepts={"h": accepts_never, "h_declines": accepts_never},
+    )
+    traced = trace_dry_run(reg, ADT_A01)
+    assert traced["handlers"] == []
+    assert traced["accepts_declined"] == ["h", "h_declines"]
+    # The ratified §4 semantic: no handler took it ⇒ UNROUTED (never FILTERED).
+    assert traced["disposition"] == MessageStatus.UNROUTED.value
+
+
+def test_trace_accepts_declined_is_empty_without_predicates() -> None:
+    # AC-7 in the trace surface: a graph with no `accepts=` emits an empty list, never a missing key.
+    traced = trace_dry_run(_registry(route_to_h, {"h": handle_transform}), ADT_A01)
+    assert traced["accepts_declined"] == []
+    assert not [inv for inv in traced["invocations"] if inv["kind"] == "accepts"]

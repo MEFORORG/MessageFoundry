@@ -245,6 +245,60 @@ def test_token_http_error_is_secret_safe(rsa_pem: str) -> None:
     assert "400" in str(ei.value)
 
 
+def test_asvs_191_smart_oauth_controls_exercised(rsa_pem: str) -> None:
+    """BACKLOG #191 — drive the built SMART Backend Services outbound so the five ASVS L3 OAuth/JWS
+    controls are demonstrably *effective*, not merely present: 9.1.2 (alg allowlist, no 'None'),
+    9.2.4 (audience binding), 10.1.1 (token never leaked), 10.2.3 (only required scopes), 10.4.10
+    (private_key_jwt backchannel, no shared secret). Evidence for the Partial→Pass flip in
+    docs/security/ASVS-L3-ASSESSMENT-2026-07-09.md."""
+    # 9.1.2 — the signing-algorithm allowlist has no 'None'/'none' and rejects it at the enum boundary.
+    algs = {m.value for m in SignatureAlgorithm}
+    assert "none" not in {a.lower() for a in algs}
+    for bad in ("none", "None"):
+        with pytest.raises(ValueError):
+            SignatureAlgorithm(bad)
+
+    provider = _provider(rsa_pem)
+    opener = _token_opener()
+    provider._opener = opener  # type: ignore[assignment]
+    provider.access_token()
+    form = urllib.parse.parse_qs(opener.requests[0].data.decode())  # type: ignore[union-attr]
+    # …and the minted assertion's JOSE header carries an asymmetric alg, never 'none'.
+    header = json.loads(_b64u_decode(form["client_assertion"][0].split(".")[0]))
+    assert header["alg"] in {"RS384", "ES384"} and header["alg"].lower() != "none"
+
+    # 10.4.10 — the confidential client authenticates the token backchannel with private_key_jwt and
+    # carries NO shared secret in any form.
+    assert form["grant_type"] == ["client_credentials"]
+    assert form["client_assertion_type"] == [_CLIENT_ASSERTION_TYPE]
+    assert len(form["client_assertion"][0].split(".")) == 3  # a compact JWS (header.claims.sig)
+    assert not ({"client_secret", "client_secret_post", "client_secret_basic"} & form.keys())
+
+    # 10.2.3 — request exactly the configured scope, and OMIT the field entirely when unset (the gap the
+    # suite otherwise missed: it asserted scope PRESENCE when set, never its ABSENCE when unset).
+    assert form["scope"] == ["system/*.rs"]
+    unscoped = _provider(rsa_pem, scope=None)
+    un_op = _token_opener()
+    unscoped._opener = un_op  # type: ignore[assignment]
+    unscoped.access_token()
+    assert "scope" not in urllib.parse.parse_qs(un_op.requests[0].data.decode())  # type: ignore[union-attr]
+
+    # 9.2.4 — every assertion carries an aud bound to the pinned token endpoint (anti-replay); a missing
+    # endpoint is refused so aud can never be left unbound.
+    claims = json.loads(_b64u_decode(form["client_assertion"][0].split(".")[1]))
+    assert claims["aud"] == TOKEN_URL
+    with pytest.raises(SmartAuthError):
+        _provider(rsa_pem, token_url="")
+
+    # 10.1.1 — the credential is sent only to the token endpoint and never leaked: a token-endpoint
+    # failure surfaces no bearer/assertion bytes.
+    leaky = _provider(rsa_pem)
+    leaky._opener = _FakeOpener(exc=_http_error(401, b'{"access_token":"LEAK-TOK"}'))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        leaky.access_token()
+    assert "LEAK-TOK" not in str(ei.value)
+
+
 def test_token_unparseable_response_is_secret_safe(rsa_pem: str) -> None:
     provider = _provider(rsa_pem)
     provider._opener = _FakeOpener(body=b"<html>SECRET-BODY</html>")  # type: ignore[assignment]

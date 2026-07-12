@@ -375,6 +375,12 @@ class Message:
             raise ValueError(f"segment must begin with a 3-char segment id, got {segment_id!r}")
         if segment_id == "MSH":
             raise ValueError("refusing to add a second MSH segment")
+        # A bare segment id (no field separator -> a single token) grafts a segment with no data
+        # field: the backend counts it, but the write path can't address it, so a later set()/field
+        # write raises "cannot set absent segment" even though count_segments() sees it. Normalize a
+        # bare id to a settable empty segment (id + one empty field) — identical to add_segment("TXA|").
+        if len(tokens) == 1:
+            tokens.append("")
         if self._builtin:
             seg_count = len(_builtin_hl7.segment_ids(self._m))
             if index is not None and (index < 1 or index > seg_count):
@@ -458,6 +464,24 @@ class Message:
         if self._builtin:
             return _builtin_hl7.encode(self._m)
         return str(self._m)
+
+    def encode_raw_separators(self) -> str:
+        """Serialize like :meth:`encode`, but emit the four reserved HL7 **structural** separators as RAW
+        bytes instead of their ``\\F\\ \\S\\ \\R\\ \\T\\`` escape sequences (BACKLOG #107).
+
+        The default serialize path (:meth:`encode`) always escapes structural delimiters; this is the
+        opt-in escape-hatch a per-outbound ``hl7_raw_separators`` override uses to feed a partner that
+        cannot decode HL7 escapes. Reserved chars are read from this message's own MSH (never hardcoded)
+        and the transform runs over the parsed model, not by string-slicing the raw. When the body carries
+        no structural escapes the output is byte-identical to :meth:`encode`; when it does, the output is
+        deliberately **non-conformant** (that is the point). See
+        :func:`messagefoundry.parsing._builtin_hl7.encode_raw_separators`."""
+        if self._builtin:
+            return _builtin_hl7.encode_raw_separators(self._m)
+        # python-hl7 fallback backend (a rare parser-bug fallback): route through the single built-ins
+        # codec by re-parsing this message's own (clean, well-formed) re-encoded form — the built-ins
+        # parse is byte-parity with python-hl7, so the round-trip is faithful.
+        return _builtin_hl7.encode_raw_separators(_builtin_hl7.parse(normalize(str(self._m))))
 
     def __str__(self) -> str:
         return self.encode()
@@ -572,6 +596,19 @@ class Message:
         out = out.replace(rep_sep, f"{esc}R{esc}")
         out = out.replace(sub_sep, f"{esc}T{esc}")
         return out
+
+
+def emit_raw_separators(payload: str) -> str:
+    """Re-serialize an HL7 v2 ``payload`` with the four reserved **structural** separators emitted as RAW
+    bytes instead of ``\\F\\ \\S\\ \\R\\ \\T\\`` escape sequences (BACKLOG #107).
+
+    The deliberate per-outbound escape-hatch for a partner that cannot decode HL7 escapes. ``payload`` is
+    parsed with its OWN separators (read from MSH-1/MSH-2, never assumed ``|^~\\&``) and re-joined via the
+    parsed model — never by string-slicing the raw. A body with no structural escapes round-trips
+    **byte-identically** to a normal encode. Raises :class:`hl7.ParseException` if ``payload`` has no
+    leading ``MSH``/``BHS``/``FHS`` (not parseable HL7), so a caller can fail the delivery loud rather than
+    ship a corrupted frame."""
+    return Message.parse(payload).encode_raw_separators()
 
 
 class RawMessage:

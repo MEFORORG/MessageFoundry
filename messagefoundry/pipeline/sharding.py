@@ -172,6 +172,10 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
         outbound=registry.outbound,
         routers=registry.routers,
         handlers=registry.handlers,
+        # Carry the `accepts=` predicates (ADR 0084) with the handlers they gate. Dropping them here
+        # would leave each shard routing every selected handler — a silent cost + disposition
+        # regression (the shard would materialize routed rows the unsharded engine declines).
+        handler_accepts=registry.handler_accepts,
         code_sets=registry.code_sets,
         references=registry.references,
         lookups=registry.lookups,

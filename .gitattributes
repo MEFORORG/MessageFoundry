@@ -3,3 +3,6 @@
 uv.lock text eol=lf
 requirements.lock text eol=lf
 .mefor-hooks/** text eol=lf
+# Shell scripts are executed on the Linux CI runners; force LF so a contributor's
+# core.autocrlf=true can never commit CRLF (which breaks `#!/usr/bin/env bash\r`).
+*.sh text eol=lf

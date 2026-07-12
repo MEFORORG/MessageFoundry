@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.redaction import safe_exc
@@ -46,6 +46,7 @@ from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_FRAME_BYTES,
     DEFAULT_RECEIVE_TIMEOUT,
+    InsecureHopGuard,
     _peer_host,
 )
 
@@ -115,12 +116,29 @@ class TcpDestination(DestinationConnector):
         # reply is already a retryable DeliveryError (peer-close in _read_reply) and stays one — enabling
         # capture does NOT change delivery semantics, it only returns the frame that was already read.
         self.capture_response: bool = bool(s.get("capture_response", False))
+        # #200 (ADR 0092): raw TCP has NO TLS option, so every off-loopback egress is a cleartext PHI hop.
+        # Refuse a production-PHI hop at the enforced construction gate; allow loopback / synthetic /
+        # per-connection-attested hops (tls_hop_attested for a trusted-segment / proxy-terminated hop).
+        self._hop_guard = InsecureHopGuard.capture(
+            host=self.host,
+            port=self.port,
+            cell="TCP outbound",
+            description="cleartext raw-TCP egress",
+            attested=config.tls_hop_attested,
+            attested_reason=config.tls_hop_attested_reason,
+        )
+        self._hop_guard.enforce_construction()
 
     async def test_connection(self) -> None:
         # Reachability only: open + close a connection (no frame sent) so a test never delivers.
         await probe_tcp_reachable(self.host, self.port, self.connect_timeout, "TCP")
 
-    async def send(self, payload: str) -> DeliveryResponse | None:
+    async def send(
+        self, payload: str, *, metadata: Mapping[str, str] | None = None
+    ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
+        # Zero-I/O byte-crossing backstop (#200) before the first byte (defense in depth against a reload
+        # routing PHI around the construction gate).
+        self._hop_guard.assert_send()
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port), self.connect_timeout

@@ -1,0 +1,21 @@
+{
+  "module": "samples/config/IB_PARTNER_X12.py",
+  "handlers": [
+    {
+      "handler": "partner_x12_handler",
+      "module": "samples/config/IB_PARTNER_X12.py",
+      "def_line": 44,
+      "rows": [
+        {
+          "kind": "send",
+          "outbounds": [
+            "OB_PAYER_X12"
+          ],
+          "line_start": 47,
+          "line_end": 47,
+          "nesting": 0
+        }
+      ]
+    }
+  ]
+}

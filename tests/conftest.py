@@ -14,14 +14,109 @@ asyncio_default_fixture_loop_scope = "session"), which removes the per-test even
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
+import subprocess
 import sys
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
 from messagefoundry.config.settings import INSECURE_CONFIG_SOURCE_ESCAPE_ENV
+
+# ---------------------------------------------------------------------------------------------------
+# Per-PROCESS test slot.
+#
+# A few tests reach machine-GLOBAL resources, so two pytest runs at once trample each other. That used to
+# be an edge case; now that every session works in its own worktree, concurrent runs are the NORMAL case.
+# Both of these were reproduced, not theorised:
+#
+#   * tests/test_multishard_smoke.py::_free_window scanned for a free port window from a FIXED floor of
+#     20000. Probing alone is a TOCTOU race -- each process probes, each sees the window free, each takes
+#     it. Measured: three concurrent processes ALL chose base=20000, and FOUR concurrent runs of that
+#     suite produced THREE failures with WinError 10048 (address already in use). With this slot, the
+#     same four runs all pass.
+#   * tests/test_console_shards.py used a QSettings org of "MEFOR-Test", whose comment claimed it was
+#     "in-memory" and touched "no disk". It is not: it writes %APPDATA%\MEFOR-Test\ShardTest.ini, and the
+#     fixture .clear()s it -- so a sibling run's settings vanish mid-test.
+#
+# The colliding actor is the pytest PROCESS, not the worktree (two runs in one checkout collide just as
+# hard, and you running the suite while an agent runs it is routine), so the slot is keyed on the process.
+# Claiming is an exclusive-create: atomic, and free of the read-modify-write race a shared counter file
+# would reintroduce.
+#
+# It never fails a run. If every slot is taken it falls back to the shared defaults -- the old behaviour,
+# no worse.
+# ---------------------------------------------------------------------------------------------------
+
+_MAX_SLOTS = 32
+_PORTS_PER_SLOT = 1000
+
+
+def _pid_alive(pid: int) -> bool:
+    if sys.platform != "win32":  # pragma: no cover - the CI Linux legs
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+    out = subprocess.run(
+        ["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, check=False
+    ).stdout
+    return str(pid) in out
+
+
+def _slot_root() -> Path | None:
+    """Machine-global, shared by every worktree of this repo -- the same scope as the collisions."""
+    common = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if not common:
+        return None
+    root = Path(common) / "mefor-coord" / "test-slots"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return root
+
+
+def _claim_test_slot() -> int:
+    root = _slot_root()
+    if root is None:
+        return 0
+    # Two passes: the first claims, the second retries slots the first pass reaped from dead owners.
+    for _ in (0, 1):
+        for n in range(_MAX_SLOTS):
+            lock = root / f"{n}.lock"
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:  # a crashed run must not hold a slot forever
+                    owner = int(lock.read_text().strip() or "0")
+                    if owner and not _pid_alive(owner):
+                        lock.unlink(missing_ok=True)
+                except (OSError, ValueError):
+                    pass
+                continue
+            except OSError:
+                return 0
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            atexit.register(lock.unlink, missing_ok=True)
+            return n
+    return 0  # saturated: fall back to the shared defaults rather than failing the run
+
+
+_SLOT = _claim_test_slot()
+os.environ.setdefault("MEFOR_TEST_SLOT", str(_SLOT))
+os.environ.setdefault("MEFOR_TEST_PORT_BASE", str(20000 + _PORTS_PER_SLOT * _SLOT))
+os.environ.setdefault("MEFOR_TEST_QSETTINGS_ORG", f"MEFOR-Test-{_SLOT}")
 
 
 @pytest.fixture(scope="session", autouse=True)

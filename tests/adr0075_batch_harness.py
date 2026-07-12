@@ -161,6 +161,14 @@ def bare_store(*, batch: bool = False, command_timeout: int = 30) -> SqlServerSt
     store._state_cache = {}
     store._sync_pools = {}
     store._batch_handoff_statements = batch
+    # #63/#190 attrs normally set by __init__ (bypassed here); defaults keep the batch harness identical.
+    store._message_events = "all"
+    store._audit_mac_key = None
+    store._audit_keyed_from = None
+    # A1 live cost counters — normally set by __init__ (bypassed here); the store's commit/insert helpers
+    # increment these, so a bare store must carry them at 0 for the offline handoffs to run.
+    store.committed_txns = 0
+    store.body_copies = 0
     return store
 
 

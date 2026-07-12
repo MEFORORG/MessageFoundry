@@ -61,8 +61,17 @@ def test_git_commit_sha_is_str_or_none() -> None:
 
 
 def _empty_report():
+    # #209: handlers/delivering are REQUIRED (never defaulted to dests — see build_consolidated_report).
+    # 8/8/8 is the bench default shape, so this stays the pre-#209 report exactly.
     return build_consolidated_report(
-        shards=("a", "b", "c", "d"), dests=8, driver_count=4, sink_count=8, climb=[], soak=None
+        shards=("a", "b", "c", "d"),
+        dests=8,
+        handlers=8,
+        delivering=8,
+        driver_count=4,
+        sink_count=8,
+        climb=[],
+        soak=None,
     )
 
 

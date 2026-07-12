@@ -235,6 +235,16 @@ def _bare_store(command_timeout: int = 30) -> SqlServerStore:
     store._cipher = IdentityCipher()
     store._state_cache = {}
     store._sync_pools = {}
+    # #63/#190 attributes normally set by __init__ (bypassed here); defaults keep the statement/RT
+    # inventory byte-identical ("all" records every event; keyless audit chain).
+    store._message_events = "all"
+    store._audit_mac_key = None
+    store._audit_keyed_from = None
+    # A1 live cost counters (normally set by __init__): the instrumented handoff bodies increment
+    # these, so the bare store must carry them or the recording harness AttributeErrors on the first
+    # body copy. Starting at 0 keeps the statement/RT inventory itself byte-identical.
+    store.committed_txns = 0
+    store.body_copies = 0
     return store
 
 

@@ -43,6 +43,8 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from messagefoundry import __version__
@@ -71,6 +73,7 @@ from messagefoundry.api.models import (
     DeadLetterReplayResult,
     DeadLetterRow,
     DrActionResult,
+    DrActivateRequest,
     DrStatus,
     EngineInfo,
     EventInfo,
@@ -84,6 +87,8 @@ from messagefoundry.api.models import (
     MessageSummary,
     OutboundPayloadInfo,
     OutboundPayloads,
+    EditResendRequest,
+    EditResendResult,
     OutboxInfo,
     PendingApprovalInfo,
     PendingApprovalResponse,
@@ -93,6 +98,8 @@ from messagefoundry.api.models import (
     ReloadRequest,
     ReloadResult,
     ReplayResult,
+    ResendRequest,
+    ResendResult,
     SecurityPosture,
     StatsResetRequest,
     StatsResetResult,
@@ -110,6 +117,7 @@ from messagefoundry.api.security import (
     optional_identity,
     require,
     require_phi_read,
+    require_service_cert,
     require_step_up,
     ws_token,
 )
@@ -144,11 +152,15 @@ from messagefoundry.config.settings import (
     IntegritySettings,
     ReferenceSettings,
     RetentionSettings,
+    SandboxSettings,
+    SecretRotationSettings,
     ServiceStatusSettings,
     ShadowSettings,
     StoreBackend,
     StoreSettings,
+    TlsSettings,
     UpdateCheckSettings,
+    hop_posture_from_ai,
 )
 from messagefoundry.config.fingerprint import config_fingerprint_detail
 from messagefoundry.config.wiring import (
@@ -175,6 +187,7 @@ from messagefoundry.transports.base import (
     TestNotSupportedError,
 )
 from messagefoundry.store import Row, open_store, sqlite_settings
+from messagefoundry.store.base import ResendError
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
 )
@@ -188,6 +201,7 @@ from messagefoundry.store.content_search import (
     make_spec,
 )
 from messagefoundry.store.base import Store
+from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.store import _secure_file
 
 __all__ = ["create_app", "create_managed_app"]
@@ -405,7 +419,9 @@ def _summary(row: Row) -> MessageSummary:
         error=d.get("error"),
         event=d.get("last_event"),
         summary=d.get("summary"),
-        metadata=d.get("metadata"),
+        # Surface ONLY the operator/handler user bag (ADR 0081, #150) — user_metadata strips the
+        # engine-internal ADR-0013 correlation-lineage keys so they never leak to the API.
+        metadata=user_metadata(d.get("metadata")),
     )
 
 
@@ -633,6 +649,7 @@ def create_app(
     webauthn_rp_from_request: bool = True,
     exposure_protected: bool = False,
     tls_terminated_upstream: bool = False,
+    tls_client_cert_identities: Mapping[str, str] | None = None,
     log_dir: str | None = None,
 ) -> FastAPI:
     # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
@@ -689,6 +706,10 @@ def create_app(
     # tls_terminated_upstream additionally arms the one-shot /ui cleartext-scheme tripwire.
     app.state.exposure_protected = exposure_protected
     app.state.tls_terminated_upstream = tls_terminated_upstream
+    # mTLS client-cert → principal allow-list (#200, ADR 0002). Read by security.resolve_client_cert_
+    # identity to map a VERIFIED peer cert's subject/SAN to an Identity (deny-by-default). Empty (the
+    # default) disables cert-identity — byte-identical to the pre-#200 mTLS-for-transport-only path.
+    app.state.tls_client_cert_identities = dict(tls_client_cert_identities or {})
     app.state.summary_auditor = _SummaryAuditCoalescer()  # coalesced PHI-summary access audit (M-5)
     # add_auth_routes registers the auth/user-admin JSON routes and RETURNS an AdminHandlers bundle of
     # its nested handlers; the /ui admin pages that reuse them now live in messagefoundry_webconsole and
@@ -706,6 +727,23 @@ def create_app(
             "unhandled error on %s %s: %s", request.method, request.url.path, type(exc).__name__
         )
         return JSONResponse({"detail": "internal error"}, status_code=500)
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # PHI-safe 422 (ADR 0090 §9 / BACKLOG #153, ASVS 16.5.1). FastAPI's default validation handler
+        # echoes each error's ``input`` (the offending value) and ``ctx``. For a body-carrying PHI route
+        # — the edit-and-resubmit ``raw`` — that would surface the edited message body verbatim in the
+        # 4xx response AND in any client/proxy access log. Strip ``input``/``ctx`` so only the location,
+        # message, and type remain (enough to fix a bad request, never the PHI). The offending value is
+        # NOT logged either (the "never log bodies" rule) — we log the field locations only.
+        safe = [{k: v for k, v in err.items() if k not in ("input", "ctx")} for err in exc.errors()]
+        _log.info(
+            "request validation failed on %s %s: %d field error(s)",
+            request.method,
+            request.url.path,
+            len(safe),
+        )
+        return JSONResponse({"detail": jsonable_encoder(safe)}, status_code=422)
 
     # One-shot XFP-omission tripwire state (L5b, ADR 0068 §8): fires at most once per process.
     xfp_tripwire_fired = False
@@ -2117,6 +2155,191 @@ def create_app(
         )
         return ReplayResult(message_id=message_id, requeued=requeued)
 
+    @app.post("/messages/{message_id}/resend", response_model=ResendResult)
+    async def resend_message(
+        message_id: str,
+        body: ResendRequest,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.MESSAGES_RESEND)),
+    ) -> ResendResult:
+        """Resend a stored message's transformed body to an ALTERNATE outbound connection (ADR 0090,
+        BACKLOG #123). Ships exactly what we sent (the retained transformed body) — never a re-run
+        transform. Requires ``MESSAGES_RESEND`` step-up **and** per-channel access to BOTH the origin's
+        channel AND the alternate outbound's channel, so PHI can't be diverted to a partner the caller
+        otherwise can't reach. The alternate outbound must be a registered, owned-by-this-shard, running
+        connection. Audited (``message.resend``, actor + from→to) — never the body."""
+        row = await engine.store.get_message(message_id)
+        # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
+        # channel (mirrors replay/get_message).
+        if row is None or not identity.can_access_channel(row["channel_id"]):
+            if row is not None:
+                await _audit_channel_denied(engine, identity, row["channel_id"])
+            raise HTTPException(404, f"no such message: {message_id}")
+        # Cross-channel authorization: the caller must ALSO be scoped to the alternate outbound (its name
+        # is treated as a channel for per-channel RBAC), so a channel-scoped operator cannot push PHI to
+        # an outbound they can't reach. 403 (not 404) — the message IS visible; the target is denied.
+        if not identity.can_access_channel(body.to):
+            await _audit_channel_denied(engine, identity, body.to)
+            raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
+        # Target validation (must-fix #7): registered + owned-by-this-shard + running, else the row would
+        # sit permanently pending (a silent drop).
+        rr = engine.registry_runner
+        if rr is None or body.to not in rr.registry.outbound:
+            raise HTTPException(404, f"no such outbound connection: {body.to}")
+        owner = rr.destination_owner(body.to)
+        if owner is not None and owner != rr.registry.shard_id:
+            raise HTTPException(
+                409,
+                f"outbound {body.to!r} is owned by engine shard {owner!r} — resend on that shard's API",
+            )
+        try:
+            if not rr.outbound_running(body.to):
+                raise HTTPException(
+                    409, f"outbound {body.to!r} is not running — start it before resending"
+                )
+        except KeyError:  # neither declared nor draining (mirrors the control handlers)
+            raise HTTPException(404, f"no such outbound connection: {body.to}") from None
+        try:
+            outcome = await engine.resend(
+                message_id, to=body.to, idempotency_key=body.idempotency_key, source=body.source
+            )
+        except ResendError as exc:
+            # No delivered source body / retention-nulled body / ambiguous source / idempotency-key
+            # reused for a different message-or-target → 409 (ADR 0090 §4/§5/§7).
+            raise HTTPException(409, str(exc)) from None
+        # An actual re-transmission of PHI to a new partner: attribute it (from→to), NEVER the body.
+        if outcome.status == "resent":
+            await engine.store.record_audit(
+                "message_resend",
+                actor=identity.username,
+                channel_id=row["channel_id"],
+                detail=json.dumps(
+                    {
+                        "message_id": message_id,
+                        "from": outcome.from_destination,
+                        "to": outcome.to_destination,
+                        "outbox_id": outcome.outbox_id,
+                    }
+                ),
+            )
+        return ResendResult(
+            message_id=message_id,
+            status=outcome.status,
+            to=outcome.to_destination,
+            source=outcome.from_destination,
+            outbox_id=outcome.outbox_id,
+        )
+
+    @app.post("/messages/{message_id}/edit-resend", response_model=EditResendResult)
+    async def edit_resend_message(
+        message_id: str,
+        body: EditResendRequest,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.MESSAGES_EDIT)),
+    ) -> EditResendResult:
+        """Edit a stored message and resubmit the EDITED body (ADR 0090 §9, BACKLOG #153). The edit is
+        client-side + ephemeral (no server draft); this endpoint receives the final edited ``raw``. By
+        default (``reroute``, no ``to``) it re-ingresses the edited body as a fresh, correlated
+        ``RECEIVED`` message on the ORIGIN channel — the normal router→transform→outbound pipeline. With
+        ``to`` set it delivers the edited body DIRECTLY to that alternate outbound (reusing #123's resend
+        seam). The ORIGINAL message stays byte-identical (count-and-log) — the resubmit is a new,
+        correlated message. Requires ``MESSAGES_EDIT`` step-up (implies ``MESSAGES_VIEW_RAW``); the direct
+        path additionally requires access to the alternate outbound's channel. Audited
+        (``message.edit_resend``, actor + original→new correlation) — NEVER the edited body."""
+        row = await engine.store.get_message(message_id)
+        # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
+        if row is None or not identity.can_access_channel(row["channel_id"]):
+            if row is not None:
+                await _audit_channel_denied(engine, identity, row["channel_id"])
+            raise HTTPException(404, f"no such message: {message_id}")
+
+        if body.to is not None:
+            # DIRECT power-path: deliver the edited body straight to an alternate outbound. Same cross-
+            # channel authorization + target validation as #123's resend (registered/owned/running).
+            if not identity.can_access_channel(body.to):
+                await _audit_channel_denied(engine, identity, body.to)
+                raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
+            rr = engine.registry_runner
+            if rr is None or body.to not in rr.registry.outbound:
+                raise HTTPException(404, f"no such outbound connection: {body.to}")
+            owner = rr.destination_owner(body.to)
+            if owner is not None and owner != rr.registry.shard_id:
+                raise HTTPException(
+                    409,
+                    f"outbound {body.to!r} is owned by engine shard {owner!r} —"
+                    " resend on that shard's API",
+                )
+            try:
+                if not rr.outbound_running(body.to):
+                    raise HTTPException(
+                        409, f"outbound {body.to!r} is not running — start it before resending"
+                    )
+            except KeyError:
+                raise HTTPException(404, f"no such outbound connection: {body.to}") from None
+            try:
+                direct = await engine.edit_resend_direct(
+                    message_id, to=body.to, raw=body.raw, idempotency_key=body.idempotency_key
+                )
+            except ResendError as exc:
+                # Empty edited body / idempotency-key reused for a different target → 409. str(exc)
+                # carries ids only (never the body — the messages don't interpolate ``raw``).
+                raise HTTPException(409, str(exc)) from None
+            if direct.status == "resent":
+                await engine.store.record_audit(
+                    "message_edit_resend",
+                    actor=identity.username,
+                    channel_id=row["channel_id"],
+                    detail=json.dumps(
+                        {
+                            "message_id": message_id,
+                            "mode": "direct",
+                            "to": direct.to_destination,
+                            "outbox_id": direct.outbox_id,
+                        }
+                    ),
+                )
+            return EditResendResult(
+                message_id=message_id,
+                status=direct.status,
+                reroute=False,
+                to=direct.to_destination,
+                outbox_id=direct.outbox_id,
+            )
+
+        # RE-ROUTE (default): re-ingress the edited body on the origin channel. `reroute` must be set
+        # (guards against a request that supplied neither a target nor an explicit reroute intent).
+        if not body.reroute:
+            raise HTTPException(
+                400,
+                "set reroute=true to re-ingress on the origin channel, or provide a target 'to'",
+            )
+        try:
+            outcome = await engine.edit_resend_reroute(
+                message_id, raw=body.raw, idempotency_key=body.idempotency_key
+            )
+        except ResendError as exc:
+            raise HTTPException(409, str(exc)) from None
+        if outcome.status == "resubmitted":
+            await engine.store.record_audit(
+                "message_edit_resend",
+                actor=identity.username,
+                channel_id=row["channel_id"],
+                detail=json.dumps(
+                    {
+                        "message_id": message_id,
+                        "mode": "reroute",
+                        "new_message_id": outcome.new_message_id,
+                        "channel_id": outcome.channel_id,
+                    }
+                ),
+            )
+        return EditResendResult(
+            message_id=message_id,
+            status=outcome.status,
+            reroute=True,
+            new_message_id=outcome.new_message_id,
+        )
+
     # --- stats ---------------------------------------------------------------
 
     @app.get("/stats", response_model=StatsResponse)
@@ -2139,6 +2362,10 @@ def create_app(
             empty_claims_wake_fanout=ec.wake_fanout if ec is not None else 0,
             executor_queue_depth=exec_depth,
             executor_busy=exec_busy,
+            # A1 live cost counters (read-only, additive). getattr-with-default so a backend without them
+            # (or a future one) reports 0 rather than 500ing the stats read.
+            committed_txns=getattr(engine.store, "committed_txns", 0),
+            body_copies=getattr(engine.store, "body_copies", 0),
         )
 
     @app.get("/metrics")
@@ -2303,6 +2530,26 @@ def create_app(
             pool=pool,
         )
 
+    # --- attested service-to-service identity (ADR 0083, #200 activation) ----
+    # The ONLY route authenticated by a verified mTLS client cert instead of a bearer token: it lets a
+    # peer service confirm the principal its certificate maps to (a service-mesh "whoami"). It is
+    # deliberately non-PHI and non-step-up — require_service_cert admits the cert-identity plane, which
+    # carries no second factor and must never reach the interactive / PHI surface. Under stock uvicorn (no
+    # mTLS + no cert-identity map) no cert ever surfaces, so this 401s: byte-identical to before.
+
+    @app.get("/service/identity")
+    async def service_identity(
+        identity: Identity = Depends(require_service_cert(Permission.MONITORING_READ)),
+    ) -> dict[str, object]:
+        """Echo the MessageFoundry principal that this request's verified client certificate maps to
+        (username + granted roles). Non-PHI, read-only; used by a peer service to confirm its cert-identity
+        wiring end-to-end. Returns 401 when no mapped/verified client cert is presented (deny-by-default)."""
+        return {
+            "username": identity.username,
+            "roles": sorted(role.value for role in identity.roles),
+            "auth": "mtls-client-cert",
+        }
+
     # --- cluster observability (Track B Step 7) ------------------------------
 
     @app.get("/cluster/status", response_model=ClusterStatus)
@@ -2346,6 +2593,8 @@ def create_app(
                 started_at=m.started_at,
                 last_seen=m.last_seen,
                 is_leader=m.is_leader,
+                acquire_delay_seconds=m.acquire_delay_seconds,
+                promotable=m.promotable,
             )
             for m in members
         ]
@@ -2398,7 +2647,7 @@ def create_app(
     async def dr_activate(
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.DR_OPERATE)),
-        body: Mapping[str, Any] | None = Body(default=None),
+        body: DrActivateRequest | None = Body(default=None),
     ) -> DrActionResult:
         """**Manually promote** this DR standby (#61, ADR 0048). Gated by the dedicated ``dr:operate``
         permission (held by ADMINISTRATOR — NOT a reuse of ``connections:control``) and audited (every
@@ -2406,18 +2655,22 @@ def create_app(
         cold-seed restore-verify (**fail-closed** if the KeyProvider/DEK is unavailable at the DR site) →
         a new audit-chain segment → acquire-VIP-or-abort → serve under the DR run-profile. An optional
         ``{"archive": "<path>"}`` body overrides ``[dr].seed_archive`` (the runbook may pass the chosen
-        #60 backup). Aborts return a 4xx/5xx with the failing phase; the box stays passive."""
+        #60 backup); ``{"dba_attests_restored": true}`` is the operator's per-activation attestation that
+        the DBA restored the server-DB ``mefor`` database (REQUIRED on postgres/sqlserver, ignored on
+        SQLite — BACKLOG #102). Aborts return a 4xx/5xx with the failing phase; the box stays passive."""
         coord = engine.dr_coordinator
         if coord is None:
             raise HTTPException(503, "this deployment is not a DR standby ([dr].enabled is false)")
-        archive = None
-        if isinstance(body, Mapping):
-            raw = body.get("archive")
-            if raw is not None and not isinstance(raw, str):
-                raise HTTPException(422, "archive must be a string path")
-            archive = raw
+        # BACKLOG #102: dba_attests_restored is the operator's explicit, per-activation attestation that
+        # the server-DB 'mefor' database was restored (required on postgres/sqlserver, ignored on SQLite).
+        archive = body.archive if body is not None else None
+        dba_attests_restored = body.dba_attests_restored if body is not None else False
         try:
-            result = await coord.activate(archive=archive, actor=identity.username)
+            result = await coord.activate(
+                archive=archive,
+                dba_attests_restored=dba_attests_restored,
+                actor=identity.username,
+            )
         except DrActivationError as exc:
             # The coordinator already recorded a dr_activation_aborted audit row. Map the failing phase
             # to an HTTP status: a missing/unverified seed or a not-this-box state is the client's input
@@ -2606,6 +2859,7 @@ def create_app(
                 stop_connection=stop_connection,
                 restart_connection=restart_connection,
                 replay_message=replay_message,
+                edit_resend_message=edit_resend_message,
                 replay_dead_letters=replay_dead_letters,
                 list_active_alerts=list_active_alerts,
                 alerts_rules=alerts_rules,
@@ -2716,11 +2970,14 @@ def create_managed_app(
     infra_fault_policy: str = "stop",  # ADR 0070: "stop" (default) | "retry_forever"
     infra_fault_stop_after: int = 10,
     infra_fault_backoff_cap: float = 60.0,
+    credential_fault_policy: str = "stop",  # #109 (ADR 0095): "stop" (default) | "dead_letter"
+    schedule_tick_seconds: float = 30.0,  # #147 (ADR 0095): active-window scheduler tick
     fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
     pooled_fusing_workers: int = 8,
     batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
     connection_events: bool = True,
     response_sent_default: bool = True,
+    message_events: str = "all",  # #63 [diagnostics].message_events verbosity → open_store
     env_values: Mapping[str, Any] | None = None,
     env_values_provider: Callable[[], Mapping[str, Any]] | None = None,
     auth_settings: AuthSettings | None = None,
@@ -2729,6 +2986,7 @@ def create_managed_app(
     priority_default: Priority | None = None,
     retention_settings: RetentionSettings | None = None,
     cert_monitor_settings: CertMonitorSettings | None = None,
+    secret_rotation_settings: SecretRotationSettings | None = None,
     update_check_settings: UpdateCheckSettings | None = None,
     backup_settings: BackupSettings | None = None,
     dr_settings: DrSettings | None = None,
@@ -2736,7 +2994,9 @@ def create_managed_app(
     api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
     egress_settings: EgressSettings | None = None,
+    tls_settings: TlsSettings | None = None,
     shadow_settings: ShadowSettings | None = None,
+    sandbox_settings: SandboxSettings | None = None,
     cluster_settings: ClusterSettings | None = None,
     approvals_settings: ApprovalsSettings | None = None,
     integrity_settings: IntegritySettings | None = None,
@@ -2748,6 +3008,7 @@ def create_managed_app(
     webauthn_rp_from_request: bool = True,
     exposure_protected: bool = False,
     tls_terminated_upstream: bool = False,
+    tls_client_cert_identities: Mapping[str, str] | None = None,
     registry_filter: Callable[[Registry], Registry] | None = None,
     log_dir: str | None = None,
 ) -> FastAPI:
@@ -2782,7 +3043,14 @@ def create_managed_app(
         # WITHOUT changing capacity. A no-op returning None in production / every other test, so the
         # engine is byte-identical when the gate is unset. Stashed for /stats + shut down in finally.
         app.state.connscale_executor = maybe_install_executor_shim(asyncio.get_running_loop())
-        store = await open_store(resolved)
+        # #200 (ADR 0092 decision 2): thread the derived instance posture so the engine<->store weakened-
+        # TLS refusal (connection_string / _build_ssl) clamps MEFOR_ALLOW_INSECURE_TLS — the escape can
+        # never relax a production-PHI store hop. None when no [ai] (SQLite/test) → unclamped, unchanged.
+        store = await open_store(
+            resolved,
+            message_events=message_events,
+            posture=hop_posture_from_ai(ai_settings) if ai_settings else None,
+        )
         # Operational alert notifier (webhook/email). None when no transport is configured → the
         # engine falls back to the logging sink. Its background dispatch task is owned by this
         # lifespan: started here, drained + stopped after the engine in the finally below.
@@ -2833,11 +3101,14 @@ def create_managed_app(
             infra_fault_policy=infra_fault_policy,
             infra_fault_stop_after=infra_fault_stop_after,
             infra_fault_backoff_cap=infra_fault_backoff_cap,
+            credential_fault_policy=credential_fault_policy,
+            schedule_tick_seconds=schedule_tick_seconds,
             fuse_thread_hops=fuse_thread_hops,
             pooled_fusing_workers=pooled_fusing_workers,
             batch_handoff_statements=batch_handoff_statements,
             connection_events=connection_events,
             response_sent_default=response_sent_default,
+            audit_verify_on_start=integ.audit_verify_on_start,
             config_dir=config_dir,
             config_reload_roots=config_reload_roots,
             inbound_bind_host=inbound_bind_host,
@@ -2851,7 +3122,10 @@ def create_managed_app(
             priority_default=priority_default,
             alert_sink=notifier,
             retention_settings=retention_settings,
+            # [logging].log_dir for application-log-file retention (#120) in the RetentionRunner.
+            log_dir=log_dir,
             cert_monitor_settings=cert_monitor_settings,
+            secret_rotation_settings=secret_rotation_settings,
             update_check_settings=update_check_settings,
             backup_settings=backup_settings,
             # [dr] third-tier DR standby run-profile + cold-seed (#61, ADR 0048). When dr.enabled AND
@@ -2865,7 +3139,16 @@ def create_managed_app(
             api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
+            # #200 (ADR 0092): the derived (PHI? production?) posture the connector-construction gate keys
+            # its posture-keyed insecure-hop refusal on. Derived from [ai] here (the one place ai_settings
+            # is in scope) so every runner this engine builds refuses/warns identically. None when the
+            # instance declares no [ai] (test/embedding) — a cell then fail-closes.
+            hop_posture=hop_posture_from_ai(ai_settings) if ai_settings else None,
+            # #190 (ADR 0093): the [tls] client trust-anchor policy (internal-CA fallback for internal
+            # outbound hops). None ([tls] unset) → the default system/no-op policy (byte-identical).
+            trust_anchor_policy=tls_settings.policy() if tls_settings else None,
             shadow_settings=shadow_settings,
+            sandbox_settings=sandbox_settings,
             active_environment=ai_settings.environment if ai_settings else None,
             env_values=env_values,
             env_values_provider=env_values_provider,
@@ -2892,10 +3175,16 @@ def create_managed_app(
         reaper: asyncio.Task[None] | None = None
         security_notifier = None
         if auth_settings is not None and auth_settings.enabled:
-            # Out-of-band security-event email (ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP transport,
-            # sent to each affected user's own address. None when disabled or no SMTP configured; the
-            # /me/security-events feed still records events. Its background task is owned by this
-            # lifespan (started here, drained + closed after the engine in the finally below).
+            # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
+            # transport, sent to each affected user's own address. The notifier is wired only when the
+            # [auth].notify_security_events kill-switch is on AND a transport can be built (SMTP
+            # configured): security_notifier_from_settings returns None when SMTP is unset, so we never
+            # fabricate a transport — then only the audited /me/security-events pull feed records events.
+            # The effective-by-default guarantee (an exposed PHI instance MUST have a real push channel,
+            # or opt out in writing via [alerts].security_notifications_required) is enforced fail-closed
+            # at startup by the serve gate (messagefoundry/__main__.py), which checks these SAME two
+            # conditions — not here. This task is owned by the lifespan (started here, drained + closed
+            # after the engine in the finally below).
             if auth_settings.notify_security_events and alerts_settings is not None:
                 security_notifier = security_notifier_from_settings(alerts_settings)
                 if security_notifier is not None:
@@ -2973,4 +3262,5 @@ def create_managed_app(
         webauthn_rp_from_request=webauthn_rp_from_request,
         exposure_protected=exposure_protected,
         tls_terminated_upstream=tls_terminated_upstream,
+        tls_client_cert_identities=tls_client_cert_identities,
     )

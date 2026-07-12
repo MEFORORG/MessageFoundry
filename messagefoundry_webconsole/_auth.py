@@ -11,6 +11,7 @@ a JSON-API credential and SameSite is never the sole CSRF defense for the JSON A
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -22,12 +23,16 @@ from messagefoundry.api.security import get_auth
 from messagefoundry.auth import Identity, Permission
 
 __all__ = [
+    "BROWSER_HARDENING_OPT_OUT_ENV",
     "COOKIE_NAME",
+    "HOST_COOKIE_NAME",
     "UI_CSP",
     "UiWriteAction",
     "assert_same_origin",
     "authorize_ui_ws",
+    "browser_hardening_enabled",
     "clear_session_cookie",
+    "effective_https",
     "is_safe_ui_action",
     "is_unlock_action",
     "lookup_ui_action",
@@ -35,10 +40,66 @@ __all__ = [
     "require_ui",
     "require_ui_reauth_only",
     "require_ui_step_up",
+    "session_cookie_name",
+    "session_token",
     "set_session_cookie",
 ]
 
 COOKIE_NAME = "mf_session"
+
+#: The ``__Host-`` prefixed session cookie name, used ONLY in an effective-https context (ADR 0065
+#: §hardening / BACKLOG #192, ASVS 3.4.3). A browser REJECTS a ``__Host-`` cookie unless it is Secure +
+#: Path=/ + carries no Domain — all three hold here — so the prefix is a browser-enforced binding of the
+#: session to THIS exact host over TLS. Over cleartext loopback the plain :data:`COOKIE_NAME` is kept
+#: (byte-identity): ``__Host-`` can never be set without Secure, which cleartext cannot carry.
+HOST_COOKIE_NAME = "__Host-mf_session"
+
+#: Org opt-out for the #192 /ui browser hardening. DEFAULT is hardening ON (secure-by-default); set this
+#: env truthy to REVERT the /ui surface to the pre-#192 posture — plain :data:`COOKIE_NAME` (still Secure
+#: over https, so transport security is never downgraded) + the engine's static self-CSP, and no
+#: per-response nonce / COOP / CSP-reporting. The escape hatch for a legacy proxy/browser that cannot
+#: tolerate ``__Host-``/nonce-CSP, per the secure-by-default-with-explicit-opt-out rule.
+BROWSER_HARDENING_OPT_OUT_ENV = "MEFOR_WEBCONSOLE_DISABLE_BROWSER_HARDENING"
+
+
+def browser_hardening_enabled() -> bool:
+    """Whether the #192 /ui browser hardening is active (default ``True``). Disabled only by an explicit
+    truthy :data:`BROWSER_HARDENING_OPT_OUT_ENV`."""
+    return os.environ.get(BROWSER_HARDENING_OPT_OUT_ENV, "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def effective_https(app_state: object, scheme: str) -> bool:
+    """Whether this connection is an EFFECTIVE-https context — the single signal the cookie name +
+    Secure flag + the /ui security-header hardening all key on (ADR 0065 §hardening / #192).
+
+    Mirrors the engine's ``api.app._cookie_secure`` decision READ-ONLY: the per-request/handshake scheme
+    is https/wss, OR the operator declared the browser-facing scheme https via
+    ``app.state.exposure_protected`` (set once in ``create_app`` — the proxy-TLS case where a request
+    that omits ``X-Forwarded-Proto`` would otherwise read as cleartext). Reads only the public
+    ``app.state`` attribute the engine already exposes; imports no engine module.
+    """
+    return scheme in ("https", "wss") or bool(getattr(app_state, "exposure_protected", False))
+
+
+def session_cookie_name(conn: Request | WebSocket) -> str:
+    """The session cookie name for this connection: ``__Host-mf_session`` in an effective-https context
+    (unless the org opt-out is set), else the plain ``mf_session`` (unchanged over cleartext loopback —
+    byte-identity). The ONE resolver every set/clear/read site threads through, so the name a response
+    writes and the name a later request reads always agree."""
+    if effective_https(conn.app.state, conn.url.scheme) and browser_hardening_enabled():
+        return HOST_COOKIE_NAME
+    return COOKIE_NAME
+
+
+def session_token(conn: Request | WebSocket) -> str | None:
+    """Read the session token from whichever cookie name applies to this connection's scheme."""
+    return conn.cookies.get(session_cookie_name(conn))
+
 
 # Strict, self-only CSP for the /ui surface — no 'unsafe-eval'/'unsafe-inline' (ADR 0065 §5). The only
 # script is the first-party /ui/static/app.js (no inline script, no on* handlers), so 'self' suffices.
@@ -82,7 +143,7 @@ def require_ui(
         if auth is None or not auth.enabled:
             # The browser UI always needs a real session — no allow_no_auth shortcut here.
             raise _login_redirect()
-        identity = await auth.identity_for_token(request.cookies.get(COOKIE_NAME))
+        identity = await auth.identity_for_token(session_token(request))
         if identity is None:
             raise _login_redirect()
         if identity.must_change_password and not allow_must_change:
@@ -313,7 +374,7 @@ def require_ui_step_up(
         auth = get_auth(request)
         if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
             raise _login_redirect()
-        token = request.cookies.get(COOKIE_NAME)
+        token = session_token(request)
         nxt = reauth_next(request) if reauth_next is not None else None
         # Second factor first (mirrors require_step_up): an MFA-required session must have verified TOTP.
         if not await auth.mfa_satisfied(token):
@@ -349,7 +410,7 @@ def require_ui_reauth_only(
         auth = get_auth(request)
         if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
             raise _login_redirect()
-        token = request.cookies.get(COOKIE_NAME)
+        token = session_token(request)
         client = request.client.host if request.client else None
         new_ip = await auth.flag_new_client_ip(token, client, path=request.url.path)
         if new_ip or not await auth.has_recent_step_up(token):
@@ -381,7 +442,7 @@ async def authorize_ui_ws(
         return None, None  # native client (no Origin) — the header path handles it
     if not _origin_matches(websocket.app.state, origin, websocket.headers.get("host")):
         return None, None  # cross-origin browser handshake (CSWSH) — reject
-    token = websocket.cookies.get(COOKIE_NAME)
+    token = session_token(websocket)
     if not token:
         return None, None
     auth = getattr(websocket.app.state, "auth", None)
@@ -396,14 +457,19 @@ async def authorize_ui_ws(
     return identity, token
 
 
-def set_session_cookie(response: Response, token: str, *, secure: bool) -> None:
-    """Set the confined session cookie: HttpOnly + SameSite=Strict (+ Secure over https), Path=/.
-
-    Path=/ (not /ui) so a future same-origin WebSocket handshake at the root can carry it (M2); the
-    cookie is only ever *read* by ``require_ui`` on /ui routes, never by the JSON API deps.
+def set_session_cookie(response: Response, token: str, *, request: Request) -> None:
+    """Set the confined session cookie: HttpOnly + SameSite=Strict, Path=/, and — in an effective-https
+    context (and unless the org opt-out is set) — the ``__Host-`` prefixed name (ADR 0065 §hardening /
+    #192, ASVS 3.4.3). Secure is ALWAYS set when the effective scheme is https, even under the opt-out
+    (transport security is never downgraded). Over cleartext loopback this is byte-identical to the
+    pre-#192 cookie (``mf_session``, no Secure). Path=/ (not /ui) so a future same-origin WebSocket
+    handshake at the root can carry it (M2); the cookie is only ever *read* by ``require_ui`` on /ui
+    routes, never by the JSON API deps.
     """
+    secure = effective_https(request.app.state, request.url.scheme)
+    name = HOST_COOKIE_NAME if (secure and browser_hardening_enabled()) else COOKIE_NAME
     response.set_cookie(
-        COOKIE_NAME,
+        name,
         token,
         httponly=True,
         samesite="strict",
@@ -412,9 +478,18 @@ def set_session_cookie(response: Response, token: str, *, secure: bool) -> None:
     )
 
 
-def clear_session_cookie(response: Response) -> None:
-    """Delete the session cookie (logout). Pairs with a server-side ``AuthService.logout`` revoke."""
-    response.delete_cookie(COOKIE_NAME, path="/")
+def clear_session_cookie(response: Response, request: Request) -> None:
+    """Delete the session cookie (logout). Pairs with a server-side ``AuthService.logout`` revoke.
+
+    Deletes whichever name this scheme uses (:func:`session_cookie_name`). Over cleartext loopback this
+    stays byte-identical to the pre-#192 clear (``delete_cookie(COOKIE_NAME, path="/")``); the
+    ``__Host-`` deletion additionally carries Secure so the browser accepts the expiry (a ``__Host-``
+    cookie is only writable — expiry included — over a Secure connection)."""
+    name = session_cookie_name(request)
+    if name == COOKIE_NAME:
+        response.delete_cookie(COOKIE_NAME, path="/")
+    else:
+        response.delete_cookie(name, path="/", secure=True, httponly=True, samesite="strict")
 
 
 # --- L5a: WebAuthn RP identity (ADR 0068 §7) --------------------------------------

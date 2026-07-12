@@ -9,8 +9,9 @@
 >
 > 1. **The climb is a volume test, not a rate test.** `offered = ingress_rate × hold_seconds`, and the
 >    rung then gets a fixed `hold + drain` budget to drain it. A rung passes iff
->    `offered × dests ≤ D × (hold + drain)`. The raw **offered** `ingress_rate` therefore overstates the
->    true sustainable ingress by exactly `(hold + drain) / hold`.
+>    `offered × delivering ≤ drain_capacity × (hold + drain)` (the produced deliveries key on the
+>    **`delivering`** fan-out, not `dests` — BACKLOG #209). The raw **offered** `ingress_rate` therefore
+>    overstates the true sustainable ingress by exactly `(hold + drain) / hold`.
 >    > **✅ FIXED — do not re-apply the 3.5× discount.** `ceiling.pinned_ingress_rate` is now the **D1
 >    > drain-discounted honest rate** (`RungOutcome.sustainable_ingress_rate` = `ingress × hold /
 >    > (hold + drain)`, using the *measured* engine drain, never the drain *timeout*), and
@@ -94,7 +95,11 @@ reuse the already-merged C1 primitives (`shardcert-engine` / `shardcert-drive`) 
 
 ## Verdict authorities (the only two gated on)
 
-- **Drive sink socket-truth:** `S == A*dests ∧ A>0 ∧ S>0 ∧ Σinversions==0 ∧ Σrepeats==0 ∧ lanes_observed≥2`.
+- **Drive sink socket-truth:** `S == A*delivering ∧ A>0 ∧ S>0 ∧ Σinversions==0 ∧ Σrepeats==0 ∧ lanes_observed≥2`.
+  The fan-out is `delivering` (D), **not** `dests` (BACKLOG #209): `dests` is now the count of destination
+  CONNECTIONS (the sink port-band width), while `delivering` is how many an accepted message delivers to.
+  They coincide at the default `H = D = dests`; at `H != D` keying this on `dests` reads LOSS on every
+  healthy rung.
 - **Engine store-truth (direct store read):** `drained ∧ stranded==0 ∧ dead_total==0`.
 
 The remote `/stats` poller stays **advisory** (unreliable on a unified store — 4× shard-API overcount /
@@ -109,12 +114,15 @@ zeroes under load, #841) and is **never** an input to any gate. Per-rung classif
 
 ## Target framing (read this before quoting a number)
 
-45M messages/day = `45_000_000 / 86_400 ≈ 520.83 msg/s` of **INGRESS**. Every accepted message fans out to
-`dests` destinations, so `delivered = ingress × dests`. The report states **both** figures and is explicit
-that 521/s is measured against **ingress**, not the outbound delivery rate. At `dests=8` a modest ingress
-rate is a large outbound (sink-tier) load — watch the runbook's sink-tier-wall caveat and lower `dests` to a
-realistic fan-out (1–few) if the sink tier saturates first; do not publish a sink-tier ceiling as an engine
-ceiling.
+45M messages/day = `45_000_000 / 86_400 ≈ 520.83 msg/s` of **INGRESS**. An accepted message DELIVERS to
+`delivering` (D) destinations, so `delivered = ingress × delivering` — **never `× dests`** (BACKLOG #209:
+`dests` is the count of destination CONNECTIONS, `delivering` is the fan-out; a connection no handler sends
+to carries no deliveries). The report states **both** figures and is explicit that 521/s is measured against
+**ingress**, not the outbound delivery rate. If the sink tier saturates first, lower **`--delivering`** (the
+fan-out) — **not** `--dests`: the sink port-band width is derived from `--dests`, so lowering `--dests`
+narrows the band and can make the drive fail to tile its sinks. Do not publish a sink-tier ceiling as an
+engine ceiling. To model the reference `H=20, D=4` ADT hub, pass `--handlers 20 --delivering 4` (never raise
+`--dests` to 20 — that builds 20 connections and 20 delivered copies, a 4.2× overstatement of the headline).
 
 ## Running it (two-box rig)
 
@@ -125,17 +133,20 @@ Restart + store rebuild first (`RESTART-AND-SIZING-runbook.md` STEP 1–2), and 
 ```pwsh
 # ENGINE box (MEFOR_STORE_* + the escapes per the restart runbook; phase timing on):
 $env:MEFOR_DELIVERY_PHASE_TIMING = "1"
-python -m harness shardcert-engine-ladder --shards a,b,c,d --dests 8 --sink-ports 8 `
+# --dests is TOPOLOGY (destination CONNECTIONS = sink port-band width). --sink-ports defaults to --dests.
+# To model an H!=D hub add --handlers 20 --delivering 4 (both default to --dests ⇒ the H=D=dests graph).
+python -m harness shardcert-engine-ladder --shards a,b,c,d --dests 8 `
   --sink-host <LOADGEN_IP> --sink-port 3700 --inbound-bind-host 0.0.0.0 `
   --lanes-per-shard 4 --persistent --claim-mode pooled `
   --rate-ladder 20:64:4 --hold-seconds 60 --drain-timeout 150 `
   --soak-hold-seconds 300 --keep-logs-dir C:\srv\mefor\nodelogs `
   --coord-dir <SHARED> --run-id ladder1
 
-# LOAD-GEN box (K | shards*lanes, M | dests, --insecure for the http engine):
+# LOAD-GEN box (the drive learns the shape from SHARDS_READY — it has NO --dests/--handlers/--delivering).
+# --sink-count defaults to the engine's advertised band width (min(8, sink_ports)); pass it only to override.
 python -m harness shardcert-drive-ladder --engine-host <ENGINE_IP> `
   --rate-ladder 20:64:4 --hold-seconds 60 --drain-timeout 150 `
-  --soak-hold-seconds 300 --driver-count 4 --sink-count 8 --sink-host 0.0.0.0 --insecure `
+  --soak-hold-seconds 300 --driver-count 4 --sink-host 0.0.0.0 --insecure `
   --coord-dir <SHARED> --run-id ladder1 --report-json ladder1.json
 ```
 
@@ -151,7 +162,8 @@ Then **stop the instances** (a stopped instance loses the ephemeral store on res
 - `ceiling.pinned_ingress_rate` / `pinned_outbound_rate` — the highest sustained rung (a **floor** if the
   climb never collapsed → raise the ladder); `first_collapse_ingress_rate` brackets it from above.
 - `ceiling.sustained_events_per_s` — the pinned rate in **total message events/s**
-  (`pinned_ingress_rate × (1 + dests)`), the currency the 45M/day budget is denominated in.
+  (`pinned_ingress_rate × (1 + delivering)`, **not** `× (1 + dests)` — BACKLOG #209), the currency the
+  45M/day budget is denominated in.
 - `ceiling.clears_target_events` — whether that **total-events** rate clears ~521/s. This is the number
   the §8 decision keys off, but the bench only reports it.
   > **B10 (schema_version 3, 2026-07-10).** This was `clears_target_ingress`, and it compared a pure
@@ -160,6 +172,9 @@ Then **stop the instances** (a stopped instance loses the ephemeral store on res
   > date carries the inflation; the honest pooled gap is **5.79×**. The old keys `clears_target_ingress`
   > and `target_ingress_per_s` were **removed rather than redefined**, so a stale consumer raises
   > `KeyError` instead of silently branching on a boolean whose meaning flipped.
+  > **schema_version 4 (BACKLOG #209)** adds `topology.handlers`/`topology.delivering` (the report now
+  > emits `schema_version: 4`); every delivery figure — `sustained_events_per_s`, each rung's
+  > `outbound_expected` — keys off `delivering`, not `dests`.
 - `soak_ok` — the soak held: its verdict is **SUSTAINED**, and that alone. B5 removed the `in_pipeline`
   slope from this gate (the de-inflated slope proved sign-unstable across rates); the slope is still
   *printed* as advisory context. Saturation is caught by SUSTAINED requiring the backlog to drain inside

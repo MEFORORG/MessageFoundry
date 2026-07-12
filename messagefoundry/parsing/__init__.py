@@ -24,7 +24,7 @@ from messagefoundry.parsing.binary import (
 from messagefoundry.parsing.groups import SegmentGroup
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize, parse_path
-from messagefoundry.parsing.split import split_batch, split_by_obr
+from messagefoundry.parsing.split import encode_batch, split_batch, split_by_obr
 from messagefoundry.parsing.summary import summarize
 from messagefoundry.parsing.tree import TreeNode, parse_tree
 from messagefoundry.parsing.validate import ValidationResult, validate
@@ -71,6 +71,7 @@ __all__ = [
     "validate",
     "ValidationResult",
     "summarize",
+    "encode_batch",
     "split_batch",
     "split_by_obr",
     # X12 EDI codec (ADR 0012) — full surface under messagefoundry.parsing.x12.

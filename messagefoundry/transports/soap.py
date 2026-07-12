@@ -54,7 +54,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import xml.sax  # nosec B406 — hardened, non-resolving, no-DTD well-formedness gate only (ADR 0015 §2a)
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 from xml.sax.handler import (  # nosec B406 — see _assert_well_formed_fragment (external entities OFF)
     ContentHandler,
@@ -65,7 +65,7 @@ from xml.sax.saxutils import escape as _xml_escape  # nosec B406 — pure string
 from xml.sax.xmlreader import InputSource  # nosec B406 — fed only the hardened, no-DTD parser
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
+from messagefoundry.config.tls_policy import relax_verify_expiry
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -78,10 +78,15 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     _NoRedirectHandler,
+    _expiry_relaxed_opener,
     _insecure_opener,
     _redact_url,
+    InsecureHopGuard,
     enforce_outbound_length_limits,
+    refuse_cleartext_credential_hop,
     refuse_cleartext_credentials,
+    refuse_cleartext_egress,
+    refuse_verify_off,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
@@ -162,17 +167,30 @@ def _classify_soap(status: int, body: str) -> DeliveryError | None:
 
 
 def _client_cert_opener(
-    certfile: str, keyfile: str, password: str | None
+    certfile: str,
+    keyfile: str,
+    password: str | None,
+    *,
+    allow_expired: bool = False,
+    host: str = "",
 ) -> urllib.request.OpenerDirector:
     """A no-redirect opener that presents a **client certificate** for mutual TLS (ADR 0015 §3).
 
     Server verification stays on (``create_default_context`` verifies the peer + hostname); a client
     cert against an unverified peer is incoherent and rejected at construction, so this never combines
     with ``verify_tls=False``. TLS 1.2+ floor (ADR 0002), as in ``mllp.py``/``api/tls.py``. Per
-    connection — REST's shared module-level openers are left untouched."""
+    connection — REST's shared module-level openers are left untouched.
+
+    ``allow_expired`` (#129, ADR 0094) relaxes ONLY the peer cert's validity-period check (chain +
+    hostname stay enforced) — the granular expiry tolerance, composable with mTLS. Default off =
+    byte-identical."""
     ctx = ssl.create_default_context()
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(certfile, keyfile, password)
+    if allow_expired:
+        relax_verify_expiry(
+            ctx, host=host
+        )  # server chain + hostname still verified; expiry relaxed
     return urllib.request.build_opener(_NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx))
 
 
@@ -273,11 +291,18 @@ class SoapDestination(DestinationConnector):
         self._uuid_fn: Callable[[], str] = _default_message_id
         self._nonce_fn: Callable[[], bytes] = _default_nonce
 
-        self._validate_ws(scheme, s)
+        # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
+        attested = config.tls_hop_attested
+        # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
+        self._hop_guard: InsecureHopGuard | None = None
+        self._validate_ws(scheme, s, attested=attested)
 
         self._headers = self._build_headers(s)
         enforce_outbound_length_limits(self.url, self._headers)
-        refuse_cleartext_credentials(scheme, self._headers, self.url)
+        refuse_cleartext_credentials(scheme, self._headers, self.url, attested=attested)
+        # ASVS 12.2.1: the SOAP envelope body is PHI, so a cleartext http egress to a non-loopback
+        # host is refused even without credentials (loopback stays byte-identical). See rest.py.
+        self._hop_guard = refuse_cleartext_egress(scheme, self.url, attested=attested)
         # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing of the outbound envelope. None = off
         # (byte-identical). Built here so a bad key/algorithm fails loud at connector construction; the
         # signature is minted in _post over the FINAL wire bytes (the WS-* wrapped envelope, ADR 0015).
@@ -285,23 +310,35 @@ class SoapDestination(DestinationConnector):
 
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
-                self.client_cert_file, self.client_key_file, self.client_key_password
+                self.client_cert_file,
+                self.client_key_file,
+                self.client_key_password,
+                allow_expired=bool(s.get("tls_allow_expired", False)),  # #129 (ADR 0094)
+                host=urllib.parse.urlsplit(self.url).hostname or "",
             )
         elif bool(s.get("verify_tls", True)):
-            self._opener = _NO_REDIRECT_OPENER
-        else:
-            if scheme == "https" and not insecure_tls_allowed():
-                raise ValueError(
-                    "SOAP destination verify_tls=false disables TLS certificate verification; "
-                    f"refused unless {INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only)"
+            # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
+            # expired peer cert (opt-in; default off = the shared verifying opener, byte-identical).
+            if bool(s.get("tls_allow_expired", False)):
+                self._opener = _expiry_relaxed_opener(
+                    urllib.parse.urlsplit(self.url).hostname or ""
                 )
+            else:
+                self._opener = _NO_REDIRECT_OPENER
+        else:
+            # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
+            guard = refuse_verify_off(
+                scheme, self.url, connector="SOAP destination", attested=attested
+            )
+            if guard is not None:
+                self._hop_guard = guard
             logger.warning(
                 "SOAP destination %s has TLS verification DISABLED (verify_tls=false)",
                 _redact_url(self.url),
             )
             self._opener = _insecure_opener()
 
-    def _validate_ws(self, scheme: str, s: dict[str, Any]) -> None:
+    def _validate_ws(self, scheme: str, s: dict[str, Any], *, attested: bool = False) -> None:
         """Runtime validation of the WS-* / mTLS settings (also enforced at wiring time by
         ``build_outbound_connection`` so ``check``/dry-run catches it without a store; the url-scheme
         checks need the resolved url and live here). ADR 0015 §6."""
@@ -322,11 +359,14 @@ class SoapDestination(DestinationConnector):
         if self._ws_mode and self.version != "1.2":
             raise ValueError("SOAP ws_addressing/ws_security require soap_version='1.2' (ADR 0015)")
         # A UsernameToken password over cleartext http is a credential on the wire — refuse like the
-        # Authorization-header path (ADR 0015 §6), unless the dev escape is set.
-        if self.ws_username and scheme == "http" and not insecure_tls_allowed():
-            raise ValueError(
-                "SOAP ws_username sends a UsernameToken credential over cleartext http; refused "
-                f"unless {INSECURE_TLS_ESCAPE_ENV} is set — use https (ADR 0015)"
+        # Authorization-header path, now posture-keyed (#200): a production-PHI hop REFUSES (escape
+        # inert), a non-prod PHI hop refuses unless the clamped escape / a per-hop attestation permits.
+        if self.ws_username:
+            refuse_cleartext_credential_hop(
+                scheme,
+                self.url,
+                credential="WS-Security UsernameToken credential",
+                attested=attested,
             )
 
     def _build_headers(self, s: dict[str, Any]) -> dict[str, str]:
@@ -421,7 +461,9 @@ class SoapDestination(DestinationConnector):
             + "</soap:Envelope>"
         )
 
-    async def send(self, payload: str) -> DeliveryResponse | None:
+    async def send(
+        self, payload: str, *, metadata: Mapping[str, str] | None = None
+    ) -> DeliveryResponse | None:  # metadata (#68): SOAP has no per-message header knob; unused
         # WS-* mode: the Handler returned only the <Body> fragment; wrap + stamp here (post-queue
         # boundary), so the per-call MessageID/Timestamp/Nonce never live in a pure transform.
         if self._ws_mode:
@@ -469,6 +511,12 @@ class SoapDestination(DestinationConnector):
             raise DeliveryError(f"SOAP {_redact_url(self.url)} failed: {exc}") from exc
 
     def _post(self, payload: str) -> tuple[str, int]:
+        # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
+        # a byte crosses (a None guard — secure/loopback — is byte-identical).
+        if self._hop_guard is not None:
+            self._hop_guard.assert_send(
+                urllib.parse.urlsplit(self.url).hostname or "", _redact_url(self.url)
+            )
         # payload is the FINAL wire body (in WS-* mode send() already wrapped + stamped the envelope),
         # so signing over these bytes covers exactly what the partner receives.
         data = payload.encode(self.encoding)

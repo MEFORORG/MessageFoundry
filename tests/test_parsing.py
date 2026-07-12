@@ -200,3 +200,54 @@ def test_validate_rejects_too_many_segments() -> None:
     result = validate(msg, max_segments=10)
     assert not result.ok
     assert any("max segments" in e for e in result.errors)
+
+
+# --- adversarial fuzz corpus (DoS backstop, #89) -----------------------------
+#
+# A hand-built corpus of pathological-but-bounded HL7 bodies (deep nesting, dense repetition /
+# component counts within the 16 MiB byte cap, truncated segments, bad MSH-12, non-numeric encoding
+# separators, empty / oversized) driven straight through the strict validator. The contract under
+# test is the DoS backstop's precondition (#89): validate() must **never raise** on hostile input —
+# it always routes the failure into ``ok=False`` (or is rejected up front by the size/segment caps),
+# so the timeout wrap in the runner never has to catch a leaked exception, only a genuine hang. The
+# pytest ``--timeout=60 --timeout-method=thread`` config self-guards a truly-hanging input. NO
+# hypothesis dependency — the corpus is explicit and deterministic (styled on
+# ``test_builtin_hl7_hardening``).
+
+_MSH_251 = "MSH|^~\\&|SEND|FAC|RECV|FAC|20260101000000||ADT^A01|MSG00001|P|2.5.1"
+
+# Dense but byte-capped shapes: a few thousand repetitions/components parse fast enough for the
+# 60s self-guard yet exercise hl7apy's structure builder on an attacker-shaped field.
+_DENSE_REPS = "~".join(f"ID{i}" for i in range(4000))
+_DENSE_COMPONENTS = "^".join(f"C{i}" for i in range(4000))
+_DEEP_SUBCOMPONENTS = "&".join(f"S{i}" for i in range(4000))
+# Oversized: a single field past the 16 MiB default byte cap — rejected by enforce_size_limits
+# BEFORE the slow parse (built once, module scope, to keep the parametrize cheap).
+_OVERSIZED = "MSH|^~\\&|" + "A" * (17 * 1024 * 1024)
+
+_FUZZ_CORPUS: list[tuple[str, str]] = [
+    ("empty", ""),
+    ("whitespace_only", "   \r\n  "),
+    ("truncated_msh", "MSH|^~\\"),
+    ("msh_no_body", _MSH_251),
+    ("truncated_segment", _MSH_251 + "\rPID|1||"),
+    ("bad_msh12_version", _MSH_251.replace("2.5.1", "99.9.9")),
+    ("nonnumeric_separators", "MSH|abcde|SEND|FAC|RECV|FAC|20260101||ADT^A01|1|P|2.5.1\rPID|1"),
+    ("empty_encoding_chars", "MSH||SEND|FAC|RECV|FAC|20260101||ADT^A01|1|P|2.5.1"),
+    ("deep_repetition", _MSH_251 + f"\rPID|1||{_DENSE_REPS}"),
+    ("deep_components", _MSH_251 + f"\rPID|1||{_DENSE_COMPONENTS}"),
+    ("deep_subcomponents", _MSH_251 + f"\rPID|1||{_DEEP_SUBCOMPONENTS}"),
+    ("null_bytes_in_field", _MSH_251 + "\rPID|1||A\x00B\x00C"),
+    ("control_chars", _MSH_251 + "\rPID|1||\x01\x02\x03\x04"),
+    ("only_field_separators", "MSH|^~\\&|" + "|" * 5000),
+    ("oversized_body", _OVERSIZED),
+]
+
+
+@pytest.mark.parametrize("name,message", _FUZZ_CORPUS, ids=[c[0] for c in _FUZZ_CORPUS])
+def test_validate_never_raises_on_adversarial_input(name: str, message: str) -> None:
+    # The whole point of the corpus: no input, however hostile, escapes as an exception. A conformant
+    # message would be ok=True, but none of these are — each must be a clean, non-raising ok=False.
+    result = validate(message)
+    assert result.ok is False
+    assert result.errors  # a rejection always carries at least one diagnostic (never a silent drop)

@@ -17,6 +17,7 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Soap, WiringError
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports import build_destination
@@ -192,6 +193,50 @@ def test_soap_credentials_over_cleartext_http_refused(monkeypatch: pytest.Monkey
                 settings=Soap(url="http://api.example.com/svc", bearer_token="tok").settings,
             )
         )
+
+
+def test_soap_cleartext_http_nonloopback_refused_without_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ASVS 12.2.1: the SOAP envelope is PHI, so a cleartext http egress to a non-loopback host is
+    # refused even with NO credentials, unless the explicit escape is set.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with pytest.raises(ValueError, match="cleartext http to a non-loopback host"):
+        build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.SOAP,
+                settings=Soap(url="http://api.example.com/svc").settings,
+            )
+        )
+
+
+def test_soap_cleartext_http_loopback_allowed() -> None:
+    # On-box loopback cleartext egress is not a network exposure → allowed (byte-identical posture).
+    dest = build_destination(
+        Destination(
+            name="OB",
+            type=ConnectorType.SOAP,
+            settings=Soap(url="http://127.0.0.1:8080/svc").settings,
+        )
+    )
+    assert isinstance(dest, SoapDestination)
+
+
+def test_soap_cleartext_http_nonloopback_allowed_with_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    # #200 (ADR 0092): the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
+    with active_hop_posture(HopPosture(is_phi=True, production=False)):
+        dest = build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.SOAP,
+                settings=Soap(url="http://api.example.com/svc").settings,
+            )
+        )
+    assert isinstance(dest, SoapDestination)  # built (warns loudly), not refused
 
 
 def test_egress_shares_allowed_http() -> None:

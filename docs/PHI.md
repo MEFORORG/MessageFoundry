@@ -271,7 +271,7 @@ memory and swap an attacker cannot reach without already owning the host.
 | File connector | Plaintext `.hl7` on disk/share | Rely on volume/share encryption; SFTP later |
 | Engine API ↔ console | Loopback HTTP by default; off-loopback requires TLS — **in-process** (`[api].tls_cert_file`, WP-13a) **or upstream** at a trusted reverse proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15) `[BUILT]`. HSTS engages on `https`; forwarded headers are trusted only from `trusted_proxies`. | — |
 | AD / LDAP auth | **LDAPS** with cert verification (`ad_tls_verify`) `[BUILT]` | — |
-| PostgreSQL / SQL Server backend | TLS-to-DB on by default (`[store].encrypt`), server cert **validated** (`trust_server_certificate=false`) `[BUILT]`. Trust a private/internal DB CA without disabling validation: Postgres `[store].ssl_root_cert` file-pin **or** a Windows machine-store (`LocalMachine\Root`) CA import; SQL Server (ODBC 18) machine store only. | — |
+| PostgreSQL / SQL Server backend | TLS-to-DB on by default (`[store].encrypt`), server cert **validated** (`trust_server_certificate=false`) `[BUILT]`. Trust a private/internal DB CA without disabling validation via `[store].ssl_root_cert` file-pin (Postgres CA-bundle, SQL Server ODBC 18.1+ `ServerCertificate` leaf-pin) **or** a Windows machine-store (`LocalMachine\Root`) CA import. | — |
 
 **Hard rule:** never bind the API to `0.0.0.0` (or any non-loopback interface) without TLS in front
 of it. Bearer tokens and PHI would otherwise cross the network in cleartext.

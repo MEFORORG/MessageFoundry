@@ -131,6 +131,63 @@ class ReplayResult(BaseModel):
     requeued: int
 
 
+class ResendRequest(BaseModel):
+    """Resend a stored message's transformed body to an ALTERNATE outbound (ADR 0090, BACKLOG #123).
+
+    ``to`` is the alternate outbound connection; ``source`` (optional) names which delivered
+    destination's stored body to copy when the origin fanned out to several (omit when there was one).
+    ``idempotency_key`` makes a retry a no-op — a *new* key is a genuine second resend. Values are
+    bounded so an over-long name can't reach a store query (ASVS 1.3.3)."""
+
+    to: str = Field(min_length=1, max_length=256)  # the alternate outbound connection
+    idempotency_key: str = Field(min_length=1, max_length=256)
+    source: str | None = Field(None, max_length=256)  # source delivery to copy the body from
+
+
+class ResendResult(BaseModel):
+    """The outcome of a resend. ``status`` is ``"resent"`` (a new delivery was queued to ``to`` at the
+    lane tail) or ``"duplicate"`` (the ``idempotency_key`` was already used — no new delivery). Carries
+    ids only, never a body."""
+
+    message_id: str
+    status: str  # "resent" | "duplicate"
+    to: str
+    source: str
+    outbox_id: str | None = None
+
+
+class EditResendRequest(BaseModel):
+    """Edit a stored message and resubmit the edited body (ADR 0090 §9, BACKLOG #153).
+
+    The edit is CLIENT-SIDE + EPHEMERAL: the console holds the editable copy until this POST — nothing
+    edited is stored as a server-side draft. ``raw`` is the operator's edited body (PHI — bounded, and
+    NEVER echoed in a 4xx: a validation failure is stripped by the ``RequestValidationError`` handler).
+    ``reroute`` (default) re-ingresses ``raw`` as a fresh correlated ``RECEIVED`` message on the ORIGIN
+    channel — the normal router→transform→outbound pipeline. ``to`` (optional power-path) instead
+    delivers the edited body DIRECTLY to that alternate outbound (reusing #123's resend seam); when set
+    it overrides ``reroute``. ``idempotency_key`` makes a retry a no-op — a *new* key is a genuine second
+    resubmit. The ORIGINAL message stays byte-identical either way."""
+
+    raw: str = Field(min_length=1, max_length=16_000_000)  # the edited body (PHI — never echoed)
+    idempotency_key: str = Field(min_length=1, max_length=256)
+    reroute: bool = True
+    to: str | None = Field(None, max_length=256)  # optional direct alternate outbound (power-path)
+
+
+class EditResendResult(BaseModel):
+    """The outcome of an edit-and-resubmit (ADR 0090 §9). ``status`` is ``"resubmitted"`` (re-route:
+    a new correlated child was ingressed) / ``"resent"`` (direct: a new outbound row) / ``"duplicate"``
+    (the ``idempotency_key`` was already used — no new work). ``new_message_id`` is the correlated child
+    (re-route) and ``outbox_id``/``to`` the direct delivery. Carries ids only, never a body."""
+
+    message_id: str  # the ORIGIN (unchanged)
+    status: str  # "resubmitted" | "resent" | "duplicate"
+    reroute: bool
+    new_message_id: str | None = None  # the re-ingressed correlated child (re-route path)
+    to: str | None = None  # the alternate outbound (direct path)
+    outbox_id: str | None = None  # the direct delivery's queue row
+
+
 class PurgeResult(BaseModel):
     cancelled: int
 
@@ -367,6 +424,13 @@ class StatsResponse(BaseModel):
     # that shared pool, so queue_depth > 0 means the pool is saturated (the wall).
     executor_queue_depth: int | None = None
     executor_busy: int | None = None
+    # A1 live cost counters (read-only, additive): cumulative physical transactions committed
+    # (``committed_txns`` — the 3+2H+2N-per-message cost-model currency, ADR 0051) and raw/payload body
+    # strings durably written (``body_copies`` — the 2+H+N-per-message amplification) since store open.
+    # Both default 0 so a client reading an older engine (no field) degrades gracefully; the Postgres
+    # backend reports 0 (counting is wired on SQLite + SQL Server).
+    committed_txns: int = 0
+    body_copies: int = 0
 
 
 class Health(BaseModel):
@@ -499,6 +563,11 @@ class ClusterNode(BaseModel):
     started_at: float | None
     last_seen: float | None
     is_leader: bool
+    # Leader-preference config (ADR 0096). ``acquire_delay_seconds`` = this node's take-over-of-expired
+    # handicap (0.0 = none); ``promotable`` = whether it may ever become leader (False = a non-promotable
+    # standby). Defaulted so single-node / older clients stay valid.
+    acquire_delay_seconds: float = 0.0
+    promotable: bool = True
 
 
 class ClusterNodeList(BaseModel):
@@ -553,6 +622,24 @@ class DrActionResult(BaseModel):
     verify_status: str | None = None
     seed_segment: str | None = None
     vip_hook_ran: bool = False
+
+
+class DrActivateRequest(BaseModel):
+    """Request body for ``POST /dr/activate`` (#61 / BACKLOG #102, ADR 0048). Both fields are optional so
+    an empty body still reaches the fail-closed cold-seed step (a missing seed then aborts as before).
+
+    ``archive`` overrides ``[dr].seed_archive`` (the runbook may pass the chosen #60 backup).
+    ``dba_attests_restored`` is the operator's explicit, per-activation attestation that a DBA has restored
+    the server-DB ``mefor`` database for THIS failover — REQUIRED on a Postgres/SQL Server store (the
+    config-only cold-seed archive cannot restore/verify a DBA-managed DB), IGNORED on SQLite (the archive
+    verifies the whole store). It is deliberately a per-request field, not a static ``[dr]`` setting: a
+    permanent config attestation would be no attestation at all. NOTE: even when ``true`` the engine's live
+    restore-provenance probe still fails closed against a fresh/unrestored DB (defense in depth); the
+    attestation does NOT prove the restore's vintage or completeness — that rests on the DBA runbook
+    (BACKLOG #102)."""
+
+    archive: str | None = None
+    dba_attests_restored: bool = False
 
 
 class AiPolicy(BaseModel):

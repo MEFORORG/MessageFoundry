@@ -114,7 +114,9 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def test_ad_group_scope_map_admin_endpoint(engine: Engine) -> None:
-    service = AuthService(engine.store, AuthSettings())
+    # Step-up admin endpoint test, not an MFA test: pin require_mfa=False so the admin's PUT isn't
+    # blocked first by the BACKLOG #187 secure default (require_mfa now ON).
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     boss_id = await service.create_local_user(
         username="boss",

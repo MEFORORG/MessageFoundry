@@ -93,6 +93,33 @@ def test_empty_phases_rejected() -> None:
         register_run_context("empty", lambda _c: nullcontext(), phases=set())
 
 
+def test_unmapped_capture_provider_keys_by_message_id() -> None:
+    """#162: the built-in ``unmapped_capture`` provider must thread ``RunContext.message_id`` to the
+    capture scope, so the drained sink is keyed per message. Guards the pipeline wiring (every runner
+    RunContext sets message_id=item.message_id) against silently collapsing to None."""
+    from messagefoundry.config.code_sets import (
+        CodeSet,
+        UnmappedKind,
+        UnmappedMiss,
+        UnmappedPolicy,
+        set_unmapped_sink,
+    )
+
+    cs = CodeSet("diet", {}, UnmappedPolicy(UnmappedKind.PASSTHROUGH))
+    seen: list[tuple[str | None, str, str]] = []
+
+    def sink(misses: list[UnmappedMiss], message_id: str | None) -> None:
+        seen.extend((message_id, m.code_set, m.key) for m in misses)
+
+    set_unmapped_sink(sink)
+    try:
+        with run_contexts(RunContext(message_id="msg-42"), phase=TRANSFORM):
+            cs.translate("ZZ")
+    finally:
+        set_unmapped_sink(None)
+    assert seen == [("msg-42", "diet", "ZZ")]
+
+
 def test_providers_unwind_on_exception() -> None:
     log: list[str] = []
     register_run_context("probe", _order_probe("p", log), phases={TRANSFORM})

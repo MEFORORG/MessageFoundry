@@ -2,7 +2,7 @@
   "name": "messagefoundry",
   "displayName": "MessageFoundry",
   "description": "Author, test, and monitor MessageFoundry HL7 v2 interfaces in VS Code.",
-  "version": "0.0.1",
+  "version": "0.0.20",
   "publisher": "messagefoundry",
   "icon": "media/icon.png",
   "license": "SEE LICENSE IN LICENSE",
@@ -11,7 +11,7 @@
     "url": "https://github.com/MEFORORG/MessageFoundry"
   },
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.95.0"
   },
   "categories": [
     "Programming Languages",
@@ -34,12 +34,12 @@
       {
         "command": "messagefoundry.validate",
         "title": "MessageFoundry: Validate Config",
-        "icon": "$(check)"
+        "icon": "media/check-amber.svg"
       },
       {
         "command": "messagefoundry.openTestBench",
         "title": "MessageFoundry: Open Test Bench",
-        "icon": "$(beaker)"
+        "icon": "media/beaker-amber.svg"
       },
       {
         "command": "messagefoundry.refreshGraph",
@@ -57,6 +57,11 @@
         "icon": "$(list-tree)"
       },
       {
+        "command": "messagefoundry.toggleGraphPerspective",
+        "title": "MessageFoundry: Toggle Element / Flow View",
+        "icon": "$(arrow-swap)"
+      },
+      {
         "command": "messagefoundry.openConnectionSettings",
         "title": "MessageFoundry: Open Connection Settings",
         "icon": "$(gear)"
@@ -68,6 +73,10 @@
       {
         "command": "messagefoundry.editConnection",
         "title": "MessageFoundry: Edit Connection"
+      },
+      {
+        "command": "messagefoundry.cloneConnection",
+        "title": "MessageFoundry: Clone Connection"
       },
       {
         "command": "messagefoundry.newCodeSet",
@@ -139,6 +148,11 @@
         "title": "MessageFoundry: Show AI Policy"
       },
       {
+        "command": "messagefoundry.showVersion",
+        "title": "MessageFoundry: About / Version",
+        "icon": "$(info)"
+      },
+      {
         "command": "messagefoundry.toggleLiveDebug",
         "title": "MessageFoundry: Toggle Live Debug",
         "icon": "$(pulse)"
@@ -147,6 +161,42 @@
         "command": "messagefoundry.toggleRevealValues",
         "title": "MessageFoundry: Reveal Values (Live Debug)",
         "icon": "$(eye)"
+      },
+      {
+        "command": "messagefoundry.newConnectionQuickInput",
+        "title": "MessageFoundry: New Connection (Keyboard Wizard)"
+      },
+      {
+        "command": "messagefoundry.openEngineSettings",
+        "title": "MessageFoundry: Configure Engine Target"
+      },
+      {
+        "command": "messagefoundry.openSettings",
+        "title": "MessageFoundry: Settings",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "messagefoundry.openConfigDir",
+        "title": "MessageFoundry: Open Config Folder"
+      },
+      {
+        "command": "messagefoundry.openSteps",
+        "title": "MessageFoundry: View as Steps",
+        "icon": "media/list-tree-amber.svg"
+      },
+      {
+        "command": "messagefoundry.engineStatusClicked",
+        "title": "MessageFoundry: Engine Status Actions"
+      },
+      {
+        "command": "messagefoundry.openWiringMap",
+        "title": "MessageFoundry: Open Wiring Map",
+        "icon": "media/type-hierarchy-amber.svg"
+      },
+      {
+        "command": "messagefoundry.showInWiringMap",
+        "title": "Show in Wiring Map",
+        "icon": "media/type-hierarchy-amber.svg"
       }
     ],
     "viewsContainers": {
@@ -185,9 +235,24 @@
     "menus": {
       "editor/title": [
         {
+          "command": "messagefoundry.openSteps",
+          "when": "messagefoundry.isConfigFile && activeCustomEditorId != messagefoundry.stepsEditor",
+          "group": "navigation@1"
+        },
+        {
+          "command": "messagefoundry.openTestBench",
+          "when": "messagefoundry.isConfigFile && activeCustomEditorId != messagefoundry.stepsEditor",
+          "group": "navigation@2"
+        },
+        {
+          "command": "messagefoundry.validate",
+          "when": "messagefoundry.isConfigFile && activeCustomEditorId != messagefoundry.stepsEditor",
+          "group": "navigation@3"
+        },
+        {
           "submenu": "messagefoundry.editorMenu",
           "when": "messagefoundry.isConfigFile",
-          "group": "navigation@1"
+          "group": "navigation@4"
         }
       ],
       "messagefoundry.editorMenu": [
@@ -218,6 +283,10 @@
         {
           "command": "messagefoundry.openCookbook",
           "group": "2_scaffold@4"
+        },
+        {
+          "command": "messagefoundry.openSteps",
+          "group": "3_view@1"
         }
       ],
       "view/title": [
@@ -232,14 +301,24 @@
           "group": "navigation@2"
         },
         {
-          "command": "messagefoundry.openTestBench",
+          "command": "messagefoundry.toggleGraphPerspective",
           "when": "view == messagefoundry.graph",
           "group": "navigation@3"
         },
         {
-          "command": "messagefoundry.refreshGraph",
+          "command": "messagefoundry.openTestBench",
           "when": "view == messagefoundry.graph",
           "group": "navigation@4"
+        },
+        {
+          "command": "messagefoundry.refreshGraph",
+          "when": "view == messagefoundry.graph",
+          "group": "navigation@5"
+        },
+        {
+          "command": "messagefoundry.openWiringMap",
+          "when": "view == messagefoundry.graph",
+          "group": "navigation@6"
         },
         {
           "command": "messagefoundry.newCodeSet",
@@ -256,12 +335,37 @@
         {
           "command": "messagefoundry.openConnectionSettings",
           "when": "view == messagefoundry.graph && viewItem == meforConnection",
-          "group": "inline"
+          "group": "inline@1"
+        },
+        {
+          "command": "messagefoundry.showInWiringMap",
+          "when": "view == messagefoundry.graph && viewItem == meforConnection",
+          "group": "inline@2"
         },
         {
           "command": "messagefoundry.editConnection",
           "when": "view == messagefoundry.graph && viewItem == meforConnection",
           "group": "1_edit"
+        },
+        {
+          "command": "messagefoundry.cloneConnection",
+          "when": "view == messagefoundry.graph && viewItem == meforConnection",
+          "group": "1_edit"
+        },
+        {
+          "command": "messagefoundry.showInWiringMap",
+          "when": "view == messagefoundry.graph && viewItem == meforConnection",
+          "group": "2_view"
+        },
+        {
+          "command": "messagefoundry.showInWiringMap",
+          "when": "view == messagefoundry.graph && viewItem == meforElement",
+          "group": "inline"
+        },
+        {
+          "command": "messagefoundry.showInWiringMap",
+          "when": "view == messagefoundry.graph && viewItem == meforElement",
+          "group": "2_view"
         },
         {
           "command": "messagefoundry.editCodeSet",
@@ -286,7 +390,19 @@
       ],
       "commandPalette": [
         {
+          "command": "messagefoundry.engineStatusClicked",
+          "when": "false"
+        },
+        {
+          "command": "messagefoundry.showInWiringMap",
+          "when": "false"
+        },
+        {
           "command": "messagefoundry.editConnection",
+          "when": "false"
+        },
+        {
+          "command": "messagefoundry.cloneConnection",
           "when": "false"
         },
         {
@@ -315,6 +431,54 @@
       {
         "language": "python",
         "path": "./snippets/messagefoundry.code-snippets"
+      }
+    ],
+    "languages": [
+      {
+        "id": "toml",
+        "aliases": [
+          "TOML"
+        ],
+        "extensions": [
+          ".toml"
+        ],
+        "filenames": [
+          "connections.toml",
+          "messagefoundry.toml"
+        ],
+        "configuration": "./language-configuration.toml.json"
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "messagefoundry.connectionsEditor",
+        "displayName": "MessageFoundry Connections",
+        "selector": [
+          {
+            "filenamePattern": "**/connections.toml"
+          }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "messagefoundry.codeSetEditor",
+        "displayName": "MessageFoundry Translation Table",
+        "selector": [
+          {
+            "filenamePattern": "**/codesets/*.csv"
+          }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "messagefoundry.stepsEditor",
+        "displayName": "MessageFoundry Steps",
+        "selector": [
+          {
+            "filenamePattern": "**/*.py"
+          }
+        ],
+        "priority": "option"
       }
     ],
     "chatParticipants": [
@@ -358,6 +522,28 @@
         "title": "Get Started with MessageFoundry",
         "description": "Wire your first Connection, Route, and Handler — then test it, without touching a real engine.",
         "steps": [
+          {
+            "id": "pointAtEngine",
+            "title": "Point at the engine",
+            "description": "Tell the IDE which running engine you'll promote to, and watch the status bar for reachability.\n[Configure Engine Target](command:messagefoundry.openEngineSettings)",
+            "media": {
+              "markdown": "media/walkthrough/point-at-engine.md"
+            },
+            "completionEvents": [
+              "onCommand:messagefoundry.openEngineSettings"
+            ]
+          },
+          {
+            "id": "openConfigDir",
+            "title": "Open the config dir",
+            "description": "Your Connections, Routers, and Handlers live as Python under the config dir — open it to browse them.\n[Open Config Folder](command:messagefoundry.openConfigDir)",
+            "media": {
+              "markdown": "media/walkthrough/open-config-dir.md"
+            },
+            "completionEvents": [
+              "onCommand:messagefoundry.openConfigDir"
+            ]
+          },
           {
             "id": "newConnection",
             "title": "Create a Connection",
@@ -403,6 +589,17 @@
             ]
           },
           {
+            "id": "liveDebug",
+            "title": "Watch it run live",
+            "description": "Toggle Live Debug: every save re-runs a dry-run over a synthetic sample and annotates your code — redacted by default.\n[Toggle Live Debug](command:messagefoundry.toggleLiveDebug)",
+            "media": {
+              "markdown": "media/walkthrough/live-debug.md"
+            },
+            "completionEvents": [
+              "onCommand:messagefoundry.toggleLiveDebug"
+            ]
+          },
+          {
             "id": "cookbook",
             "title": "Browse the Cookbook",
             "description": "Search solved problems — crosswalks, batch splits, enrichment, fan-out — and insert the editable Python.\n[Open Cookbook](command:messagefoundry.openCookbook)",
@@ -411,6 +608,17 @@
             },
             "completionEvents": [
               "onCommand:messagefoundry.openCookbook"
+            ]
+          },
+          {
+            "id": "promote",
+            "title": "Stage → Promote",
+            "description": "Ship the validated graph to a running engine — staged, pre-flighted against the target's env() values, then an atomic swap.\n[Stage → Promote](command:messagefoundry.promote)",
+            "media": {
+              "markdown": "media/walkthrough/promote.md"
+            },
+            "completionEvents": [
+              "onCommand:messagefoundry.promote"
             ]
           }
         ]
@@ -506,6 +714,22 @@
           "default": 400,
           "minimum": 0,
           "markdownDescription": "Debounce (milliseconds) before Live Debug re-runs `dryrun` after a config file is saved. A save-storm coalesces to a single run of the newest content. Only used when Live Debug is toggled on."
+        },
+        "messagefoundry.liveStatus.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Decorate Inbound/Outbound rows in the CONNECTIONS view with live runtime status and message counts polled from the engine's monitoring API (`GET /connections`). Reuses the session Stage → Promote signed in with — the poll itself never prompts; without a session (on an auth-required engine) rows simply stay undecorated. Shows status words and counts only — never message content."
+        },
+        "messagefoundry.liveStatus.intervalSeconds": {
+          "type": "integer",
+          "default": 10,
+          "minimum": 5,
+          "markdownDescription": "How often (seconds) to poll the engine for live status when `#messagefoundry.liveStatus.enabled#` is on. Values below 5 are clamped to 5."
+        },
+        "messagefoundry.revealViewOnStartup": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "When this workspace opens, reveal the MessageFoundry sidebar (Home / Connections / Translation Tables) instead of the default Explorer. Best set per-workspace in `.vscode/settings.json` so only your MessageFoundry config repos open to it."
         }
       }
     }
@@ -522,8 +746,8 @@
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
-    "@types/node": "^20.11.0",
-    "@types/vscode": "^1.90.0",
+    "@types/node": "^20.19.43",
+    "@types/vscode": "~1.95.0",
     "@vscode/test-electron": "^3.0.0",
     "@vscode/vsce": "^3.0.0",
     "esbuild": "^0.28.1",

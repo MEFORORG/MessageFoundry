@@ -20,7 +20,7 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
 
@@ -112,7 +112,9 @@ class FileDestination(DestinationConnector):
         self._overwrite: bool = bool(s.get("overwrite", False))
         self.encoding: str = s.get("encoding", "utf-8")
 
-    async def send(self, payload: str) -> None:
+    async def send(
+        self, payload: str, *, metadata: Mapping[str, str] | None = None
+    ) -> None:  # metadata (#68): unused — no per-message header knob here
         try:
             await asyncio.to_thread(self._write, payload)
         except OSError as exc:
@@ -298,6 +300,19 @@ class FileSource(SourceConnector):
                 )
                 await asyncio.to_thread(self._move, path, self.error_dir)
                 continue
+            except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
+                # The scan hook MALFUNCTIONED (AV/ICAP unreachable, a plugin bug) — NOT a content
+                # rejection. Fail closed (ASVS 5.4.3): never emit unscanned content. Unlike a
+                # ScanRejected we don't quarantine a possibly-healthy file on a scanner outage — leave
+                # it in place so the next scan re-runs the scan once the scanner recovers (at-least-once,
+                # mirroring the transient-read path). Logged, never a silent pass-through, and scoped to
+                # THIS file so a scanner hiccup can't abort the whole tick's remaining candidates.
+                logger.warning(
+                    "file %s: pre-ingest scan hook errored (%s); leaving in place, will retry next scan",
+                    path.name,
+                    exc,
+                )
+                continue
             try:
                 await self._emit(raw)
             except Exception as exc:
@@ -480,9 +495,21 @@ def set_scan_hook(hook: ScanHook | None) -> None:
     directory, and a less-trusted or remote source should be fronted by an AV/ICAP gateway (see
     docs/CONNECTIONS.md). This seam lets an operator/plugin install an in-process scanner that runs over
     the raw bytes of every inbound file — both the local FILE source and the remote SFTP/FTP(S) source —
-    *before* they enter the pipeline; it must raise :class:`ScanRejected` to reject content, which the
-    connector then quarantines to its error dir (never emitted). Format-agnostic (it sees raw bytes), so
-    it works for HL7, X12, or any payload."""
+    *before* they enter the pipeline. Format-agnostic (it sees raw bytes), so it works for HL7, X12, or
+    any payload.
+
+    **Enforced precondition, fail-closed (ASVS 5.4.3, BACKLOG #204).** When a hook is installed it is a
+    *precondition on ingest*, not an advisory pass: the connector runs it on **every** file and unscanned
+    content can never reach the pipeline on either failure axis —
+
+    * a **content rejection** (the hook raises :class:`ScanRejected`) quarantines the file to the
+      connector's error dir and never emits it;
+    * a **scanner malfunction** (the hook raises **any other** exception — AV/ICAP unreachable, a plugin
+      bug) is fail-closed too: the file is **not emitted** and is left in place to be re-scanned on the
+      next poll once the scanner recovers (at-least-once), never passed through unscanned.
+
+    The seam stays **off by default** (:func:`_no_scan` no-op); with no hook installed the drop directory
+    itself is the trust boundary and an operator-fronted AV/ICAP gateway is the supported control."""
     global _scan_hook
     _scan_hook = hook or _no_scan
 

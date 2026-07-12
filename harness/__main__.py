@@ -113,6 +113,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run_shardcert_engine_ladder(raw[1:])
     if raw and raw[0] == "shardcert-drive-ladder":
         return _run_shardcert_drive_ladder(raw[1:])
+    if raw and raw[0] == "connscale-remote":
+        return _run_connscale_remote(raw[1:])
+    if raw and raw[0] == "batch-engine":
+        return _run_batch_engine(raw[1:])
+    if raw and raw[0] == "batch-driver":
+        return _run_batch_driver(raw[1:])
 
     parser = argparse.ArgumentParser(prog="harness", description="MessageFoundry test harness")
     parser.add_argument(
@@ -230,7 +236,7 @@ def _list_scenarios() -> int:
 
 
 def _run_scenario(name: str, engine_url: str, token: str | None, timeout: float) -> int:
-    from messagefoundry.console.client import ApiError, EngineClient
+    from messagefoundry.apiclient import ApiError, EngineClient
     from harness.scenarios import SCENARIOS, run_scenario
 
     scenario = SCENARIOS.get(name)
@@ -264,7 +270,7 @@ def _run_load(args: argparse.Namespace) -> int:
     import time
     from pathlib import Path
 
-    from messagefoundry.console.client import ApiError
+    from messagefoundry.apiclient import ApiError
 
     from harness.load.profile import LoadProfileError, get_profile
     from harness.load.report import compare_to_baseline
@@ -596,6 +602,36 @@ def _run_multishard(argv: list[str]) -> int:
     return report.exit_code
 
 
+def _add_shape_args(parser: argparse.ArgumentParser) -> None:
+    """The BACKLOG #209 shardcert shape split, on the ENGINE-side CLIs only.
+
+    ``--dests`` (declared by each caller, since its help text differs) is TOPOLOGY: the shared outbound
+    destination CONNECTIONS = the sink port-band width. These two split the two jobs it used to also do:
+
+    * ``--handlers`` (H) — handlers the router SELECTS per (shard, lane). Feeds the reported
+      ``txn/msg = 3 + 2H + 2D`` (ADR 0051); NEVER appears in delivery arithmetic.
+    * ``--delivering`` (D) — destinations each accepted message actually DELIVERS to: **the fan-out**.
+
+    Both default to ``--dests`` ⇒ ``H = D = dests``, the pre-#209 graph, byte-identical. ``H > D`` makes the
+    surplus handlers SELF-FILTER (routed, then deliver nothing) — the real ``H=20, D=4`` ADT hub, where 16
+    handlers each burn 2 transactions for no delivered message. Deliberately NOT offered on the drive-side
+    CLIs: the drive box learns the shape from the engine's SHARDS_READY, so it has one source of truth."""
+    parser.add_argument(
+        "--handlers",
+        type=int,
+        default=None,
+        help="H: handlers the router SELECTS per (shard, lane) (default: = --dests). H > --delivering "
+        "makes the surplus handlers SELF-FILTER, costing 2 txn each for no delivery (the ADT-hub shape)",
+    )
+    parser.add_argument(
+        "--delivering",
+        type=int,
+        default=None,
+        help="D: destinations each accepted message actually delivers to — THE FAN-OUT (default: = "
+        "--dests). Must satisfy 1 <= D <= --dests and D <= --handlers, else the graph fails loud",
+    )
+
+
 def _run_shardcert(argv: list[str]) -> int:
     import asyncio
     import json
@@ -612,8 +648,13 @@ def _run_shardcert(argv: list[str]) -> int:
         "--shards", default="a,b,c,d", help="comma list of shard ids (default 4: a,b,c,d)"
     )
     parser.add_argument(
-        "--dests", type=int, default=8, help="shared outbound destinations every shard sends to"
+        "--dests",
+        type=int,
+        default=8,
+        help="TOPOLOGY: shared outbound destination CONNECTIONS (= the sink port-band width). NOT the "
+        "fan-out (that is --delivering) and NOT the router's selection width (--handlers)",
     )
+    _add_shape_args(parser)
     parser.add_argument(
         "--lanes-per-shard",
         type=int,
@@ -689,6 +730,8 @@ def _run_shardcert(argv: list[str]) -> int:
                 run_shardcert_ladder(
                     rates=rates,
                     dests=args.dests,
+                    handlers=args.handlers,
+                    delivering=args.delivering,
                     hold_seconds=args.hold_seconds,
                     drain_timeout=args.drain_timeout,
                     sink_host=args.sink_host,
@@ -706,6 +749,8 @@ def _run_shardcert(argv: list[str]) -> int:
         single = asyncio.run(
             run_shardcert(
                 dests=args.dests,
+                handlers=args.handlers,
+                delivering=args.delivering,
                 aggregate_rate=args.rate,
                 hold_seconds=args.hold_seconds,
                 drain_timeout=args.drain_timeout,
@@ -827,8 +872,10 @@ def _run_shardcert_engine(argv: list[str]) -> int:
         "--dests",
         type=int,
         default=8,
-        help="shared overlapping outbound destinations every shard sends to",
+        help="TOPOLOGY: shared overlapping outbound destination CONNECTIONS every shard declares (= the "
+        "sink port-band width). NOT the fan-out (--delivering) and NOT the selection width (--handlers)",
     )
+    _add_shape_args(parser)
     parser.add_argument(
         "--lanes-per-shard",
         type=int,
@@ -902,8 +949,11 @@ def _run_shardcert_engine(argv: list[str]) -> int:
         print("--lanes-per-shard must be >= 1", file=sys.stderr)
         return 2
 
-    # Wire the graph-shape env knobs BEFORE run_shardcert_engine's config discovery + the serve
-    # subprocesses read them (mirrors the single-box `_run_shardcert`).
+    # Wire the AMBIENT graph-shape env knobs BEFORE run_shardcert_engine's config discovery + the serve
+    # subprocesses read them (mirrors the single-box `_run_shardcert`). --dests/--handlers/--delivering are
+    # deliberately NOT set here: they are threaded as arguments through _discover() AND _shape_env(), which
+    # pins them for BOTH the discovery load and the served fleet from one value. Setting them ambiently as
+    # well would be a second source for the same constant — the drift this split exists to prevent.
     os.environ["MEFOR_SHARDCERT_SHARDS"] = args.shards
     os.environ["MEFOR_SHARDCERT_LANES_PER_SHARD"] = str(args.lanes_per_shard)
     os.environ["MEFOR_SHARDCERT_PERSISTENT"] = "1" if args.persistent else "0"
@@ -929,6 +979,8 @@ def _run_shardcert_engine(argv: list[str]) -> int:
         report = asyncio.run(
             run_shardcert_engine(
                 dests=args.dests,
+                handlers=args.handlers,
+                delivering=args.delivering,
                 hold_seconds=args.hold_seconds,
                 kill=args.kill,
                 kill_shard=args.kill_shard,
@@ -995,7 +1047,7 @@ def _run_shardcert_driver(argv: list[str]) -> int:
     import json
     from pathlib import Path
 
-    from messagefoundry.console.client import ApiError
+    from messagefoundry.apiclient import ApiError
 
     from harness.load.coord import CoordTimeout, FileDropCoord
     from harness.load.shardcert import run_shardcert_driver
@@ -1269,7 +1321,7 @@ def _run_shardcert_drive(argv: list[str]) -> int:
     parser.add_argument("--report-json", help="write the JSON report to this path")
     args = parser.parse_args(argv)
 
-    from messagefoundry.console.client import ApiError
+    from messagefoundry.apiclient import ApiError
 
     from harness.load.coord import CoordTimeout, FileDropCoord
     from harness.load.shardcert import run_shardcert_drive
@@ -1340,8 +1392,12 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
         "--shards", default="a,b,c,d", help="comma list of shard ids (default a,b,c,d)"
     )
     parser.add_argument(
-        "--dests", type=int, default=8, help="shared overlapping outbound destinations"
+        "--dests",
+        type=int,
+        default=8,
+        help="TOPOLOGY: shared overlapping outbound destination CONNECTIONS (= the sink port-band width)",
     )
+    _add_shape_args(parser)
     parser.add_argument(
         "--lanes-per-shard", type=int, default=1, help="inbound->router->handler chains per shard"
     )
@@ -1352,7 +1408,8 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
         "--rate-ladder",
         required=True,
         help="ascending INGRESS msg/s ladder — a comma list (24,28,32) or start:stop:step (24:64:4). "
-        "Outbound = ingress*dests; must match the drive box's --rate-ladder exactly",
+        "Outbound = ingress * --delivering (the FAN-OUT, not --dests); must match the drive box's "
+        "--rate-ladder exactly",
     )
     parser.add_argument(
         "--hold-seconds", type=float, default=60.0, help="per-climb-rung steady-state hold"
@@ -1376,7 +1433,12 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
         "--sink-port", type=int, required=True, help="BASE sink port the driver binds"
     )
     parser.add_argument(
-        "--sink-ports", type=int, default=8, help="sink port band width (== --dests)"
+        "--sink-ports",
+        type=int,
+        default=None,
+        help="sink port band width. Defaults to --dests (each destination CONNECTION binds its own port). "
+        "It used to be a hardcoded 8 sitting next to a --dests that could be anything else — a stale "
+        "constant beside a parameter is this harness's B1-B10 defect class, so it is now derived",
     )
     parser.add_argument(
         "--sink-host", default="127.0.0.1", help="the LOAD-GEN box IP the shards deliver to"
@@ -1457,6 +1519,9 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
     soak_drain_timeout = (
         args.drain_timeout if args.soak_drain_timeout is None else args.soak_drain_timeout
     )
+    # The band must cover every destination CONNECTION (topology), so it is DERIVED from --dests rather than
+    # left as a literal that only happened to equal the default. Byte-identical at the default --dests 8.
+    sink_ports = args.dests if args.sink_ports is None else args.sink_ports
 
     coord = _coord_from_args(args)
     assert isinstance(coord, FileDropCoord)
@@ -1465,10 +1530,12 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
             run_engine_ladder(
                 rates=rates,
                 dests=args.dests,
+                handlers=args.handlers,
+                delivering=args.delivering,
                 hold_seconds=args.hold_seconds,
                 drain_timeout=args.drain_timeout,
                 sink_port=args.sink_port,
-                sink_ports=args.sink_ports,
+                sink_ports=sink_ports,
                 sink_host=args.sink_host,
                 inbound_bind_host=args.inbound_bind_host,
                 claim_mode=args.claim_mode,
@@ -1540,7 +1607,12 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         help="K sender-worker child processes (K | shards*lanes)",
     )
     parser.add_argument(
-        "--sink-count", type=int, default=8, help="M sink child processes (M | dests)"
+        "--sink-count",
+        type=int,
+        default=None,
+        help="M sink child processes. Default: derived from the engine's advertised sink-port band "
+        "(min(8, sink_ports)). The engine's band width now follows its --dests (BACKLOG #209), so a "
+        "fixed default here would fail (sink_count > sink_ports) on any --dests < 8 run — it is derived",
     )
     parser.add_argument(
         "--sink-host",
@@ -1573,7 +1645,7 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
     parser.add_argument("--report-json", help="write the consolidated JSON report to this path")
     args = parser.parse_args(argv)
 
-    from messagefoundry.console.client import ApiError
+    from messagefoundry.apiclient import ApiError
 
     from harness.load.coord import CoordTimeout, FileDropCoord
     from harness.load.shardcert import parse_rate_ladder
@@ -1646,6 +1718,315 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         }
         # D5 P1: parent-mkdir + never raise on a bad path (a completed run's exit_code must still return).
         _write_json_report(args.report_json, payload, label="shardcert-drive-ladder")
+    return report.exit_code
+
+
+def _int_list(raw: str, *, flag: str) -> list[int]:
+    """Parse a comma-separated list of ints (e.g. ``--inbound-base 20000,21000``)."""
+    try:
+        values = [int(x) for x in str(raw).split(",") if x.strip()]
+    except ValueError as exc:
+        raise SystemExit(f"{flag} must be comma-separated integers, got {raw!r}: {exc}") from exc
+    if not values:
+        raise SystemExit(f"{flag} must list at least one integer")
+    return values
+
+
+def _run_connscale_remote(argv: list[str]) -> int:
+    import asyncio
+    import json
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(
+        prog="harness connscale-remote",
+        description="DRIVER-ONLY connscale (WS-C): drive already-running engines off-box + bind the "
+        "correlation sink locally. Never spawns an engine.",
+    )
+    parser.add_argument(
+        "--engine-url",
+        action="append",
+        required=True,
+        metavar="URL",
+        help="a running engine's API base URL for /stats + drain (repeatable; one per --inbound-base band)",
+    )
+    parser.add_argument(
+        "--engine-host",
+        default="127.0.0.1",
+        help="the engine box's inbound IP the senders dial (base_port + i). Default loopback (co-located)",
+    )
+    parser.add_argument(
+        "--inbound-base",
+        required=True,
+        help="comma-separated inbound MLLP base port(s), one per engine band (e.g. 20000,21000); band "
+        "k's senders dial engine_host:inbound_base[k]+i",
+    )
+    parser.add_argument(
+        "--sink-host",
+        default="127.0.0.1",
+        help="interface the correlation sink binds LOCALLY (0.0.0.0 on the load-gen box for a two-box "
+        "drive; loopback co-located). The engines deliver their outbound fan-out here",
+    )
+    parser.add_argument(
+        "--sink-base",
+        required=True,
+        help="comma-separated sink base port(s), one per engine band (e.g. 40000,41000); band k binds "
+        "sink_base[k]..+sink_ports-1 locally",
+    )
+    parser.add_argument(
+        "--sink-ports",
+        type=int,
+        default=1,
+        help="contiguous sink LISTENERS per band. For the attribution gate run >= 5-6 sink PROCESSES "
+        "total (launch several connscale-remote processes with disjoint bands via --engine-index-base)",
+    )
+    parser.add_argument(
+        "--count", type=int, required=True, help="inbound connections per engine band"
+    )
+    parser.add_argument(
+        "--per-conn-rate", type=float, default=0.35, help="target msg/s per connection"
+    )
+    parser.add_argument("--hold-seconds", type=float, default=60.0, help="steady-state hold")
+    parser.add_argument(
+        "--drain-timeout", type=float, default=300.0, help="post-hold drain timeout"
+    )
+    parser.add_argument(
+        "--engine-index-base",
+        type=int,
+        default=0,
+        help="offset for THIS process's control-id prefix so a SECOND concurrent connscale-remote "
+        "process (its own disjoint bands) can't collide — the multishard split that yields >= 5-6 sink "
+        "PROCESSES",
+    )
+    parser.add_argument("--report-json", help="write the JSON report to this path")
+    args = parser.parse_args(argv)
+
+    from harness.load.connscale.remote import run_connscale_remote
+    from harness.load.connscale.runner import ConnScaleError
+
+    inbound_bases = _int_list(args.inbound_base, flag="--inbound-base")
+    sink_bases = _int_list(args.sink_base, flag="--sink-base")
+    try:
+        report = asyncio.run(
+            run_connscale_remote(
+                engine_urls=list(args.engine_url),
+                engine_host=args.engine_host,
+                inbound_bases=inbound_bases,
+                sink_host=args.sink_host,
+                sink_bases=sink_bases,
+                sink_ports=args.sink_ports,
+                count=args.count,
+                per_conn_rate=args.per_conn_rate,
+                hold_seconds=args.hold_seconds,
+                drain_timeout=args.drain_timeout,
+                engine_index_base=args.engine_index_base,
+            )
+        )
+    except ConnScaleError as exc:
+        print(f"connscale-remote setup failed: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render_console())
+    if args.report_json:
+        Path(args.report_json).write_text(
+            json.dumps(report.to_json_dict(), indent=2), encoding="utf-8"
+        )
+    return report.exit_code
+
+
+def _run_batch_engine(argv: list[str]) -> int:
+    import asyncio
+    import json
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(
+        prog="harness batch-engine",
+        description="ENGINE-box half of the batch_ab statement-batching A/B (ADR 0075 Bench B): walk the "
+        "batch_ab matrix, per cell launch ONE connscale engine with the batch flag per arm, handshake with "
+        "the driver, tear down. Does NOT drive load.",
+    )
+    parser.add_argument(
+        "--profile",
+        default="batch_ab",
+        help="the connscale profile to sweep (built-in name or path)",
+    )
+    parser.add_argument(
+        "--claim-mode",
+        default="pooled",
+        choices=("pooled", "per_lane"),
+        help="pipeline claim mode set on every connscale engine (MEFOR_PIPELINE_CLAIM_MODE); batching "
+        "rides the pooled per-hop handoff (default pooled)",
+    )
+    parser.add_argument(
+        "--inbound-bind-host",
+        default="0.0.0.0",
+        help="interface the engine's inbound MLLP listeners bind (0.0.0.0 so the off-box driver reaches them)",
+    )
+    parser.add_argument(
+        "--sink-host",
+        default="127.0.0.1",
+        help="the LOAD-GEN box IP the engine delivers its outbound fan-out to (the driver binds the sink there)",
+    )
+    parser.add_argument(
+        "--inbound-base",
+        type=int,
+        default=None,
+        help="base inbound MLLP port on the engine box (default: the profile's base_port)",
+    )
+    parser.add_argument(
+        "--api-base", type=int, default=9000, help="base engine API port (base + cell step)"
+    )
+    parser.add_argument(
+        "--sink-base",
+        type=int,
+        default=40000,
+        help="base of the agreed sink band the driver's sink PROCESSES bind; the engine delivers "
+        "round-robin across sink_base..sink_base+procs-1",
+    )
+    parser.add_argument(
+        "--sink-procs",
+        type=int,
+        default=6,
+        help="the >= 5-6 sink-PROCESS count the driver runs; the engine delivers across this many "
+        "contiguous sink ports (default 6)",
+    )
+    parser.add_argument(
+        "--cell-timeout",
+        type=float,
+        default=1800.0,
+        help="per-cell wait for the driver's BATCH_CELL_DONE (connect + hold + drain + margin)",
+    )
+    _add_coord_args(parser, default_run_id="batch_ab")
+    parser.add_argument("--report-json", help="write the engine-side per-cell PID map to this path")
+    args = parser.parse_args(argv)
+
+    from harness.load.connscale.batchbox import run_batch_engine
+    from harness.load.connscale.profile import ConnScaleProfileError, get_connscale_profile
+    from harness.load.coord import FileDropCoord
+
+    try:
+        profile = get_connscale_profile(args.profile)
+    except ConnScaleProfileError as exc:
+        print(f"bad connscale profile: {exc}", file=sys.stderr)
+        return 2
+
+    coord = _coord_from_args(args)
+    assert isinstance(coord, FileDropCoord)
+    try:
+        report = asyncio.run(
+            run_batch_engine(
+                profile=profile,
+                claim_mode=args.claim_mode,
+                coord=coord,
+                store_env=_store_env_from_os(),
+                inbound_bind_host=args.inbound_bind_host,
+                sink_host=args.sink_host,
+                inbound_base=args.inbound_base,
+                api_base=args.api_base,
+                sink_base=args.sink_base,
+                sink_procs=args.sink_procs,
+                cell_timeout=args.cell_timeout,
+            )
+        )
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render())
+    if args.report_json:
+        Path(args.report_json).write_text(
+            json.dumps(report.to_json_dict(), indent=2), encoding="utf-8"
+        )
+    return 0 if report.ok else 1
+
+
+def _run_batch_driver(argv: list[str]) -> int:
+    import asyncio
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(
+        prog="harness batch-driver",
+        description="LOAD-GEN-box half of the batch_ab A/B: per cell wait for BATCH_CELL_READY, run the "
+        ">= 6 sink-PROCESS connscale-remote fleet, aggregate the per-proc JSON into one cell record, post "
+        "BATCH_CELL_DONE; after the matrix compute the B0/B1 verdict. Does NOT spawn engines.",
+    )
+    parser.add_argument(
+        "--profile", default="batch_ab", help="the SAME connscale profile the engine half walks"
+    )
+    parser.add_argument(
+        "--claim-mode",
+        default="pooled",
+        choices=("pooled", "per_lane"),
+        help="MUST match the engine half's --claim-mode (both derive the identical cell list)",
+    )
+    parser.add_argument(
+        "--engine-host",
+        required=True,
+        help="the ENGINE box's IP the senders dial + the /stats poller reads",
+    )
+    parser.add_argument(
+        "--sink-host",
+        default="0.0.0.0",
+        help="interface every connscale-remote sink PROCESS binds LOCALLY (0.0.0.0 on the load-gen box)",
+    )
+    parser.add_argument(
+        "--cell-timeout",
+        type=float,
+        default=900.0,
+        help="per-cell wait for the engine's BATCH_CELL_READY (engine startup for a large N can be slow)",
+    )
+    _add_coord_args(parser, default_run_id="batch_ab")
+    parser.add_argument(
+        "--report-json", help="write the aggregated ConnScaleReport JSON to this path"
+    )
+    parser.add_argument(
+        "--report-compare", help="write the B0/B1 batch A/B verdict table to this path"
+    )
+    args = parser.parse_args(argv)
+
+    from harness.load.connscale.batchbox import run_batch_driver
+    from harness.load.connscale.profile import ConnScaleProfileError, get_connscale_profile
+    from harness.load.coord import FileDropCoord
+
+    try:
+        profile = get_connscale_profile(args.profile)
+    except ConnScaleProfileError as exc:
+        print(f"bad connscale profile: {exc}", file=sys.stderr)
+        return 2
+
+    coord = _coord_from_args(args)
+    assert isinstance(coord, FileDropCoord)
+    try:
+        report = asyncio.run(
+            run_batch_driver(
+                profile=profile,
+                claim_mode=args.claim_mode,
+                engine_host=args.engine_host,
+                coord=coord,
+                sink_host=args.sink_host,
+                cell_timeout=args.cell_timeout,
+            )
+        )
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render_console())
+    if args.report_json:
+        Path(args.report_json).write_text(report.to_json(), encoding="utf-8")
+    if args.report_compare:
+        if report.batch_comparison is not None:
+            Path(args.report_compare).write_text(
+                report.batch_comparison.render_table() + "\n", encoding="utf-8"
+            )
+        else:
+            print(
+                "--report-compare: this profile has a single batch mode (no B0/B1 A/B to write); use "
+                "batch_modes = [false, true] (e.g. batch_ab)",
+                file=sys.stderr,
+            )
     return report.exit_code
 
 

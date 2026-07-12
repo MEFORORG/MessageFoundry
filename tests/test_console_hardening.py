@@ -51,7 +51,9 @@ def test_client_presents_configured_client_cert(monkeypatch: pytest.MonkeyPatch)
     # — the client cert now rides the `verify` SSLContext — so this checks that delegation: EngineClient
     # forwards (cacert, client_cert, client_key) to the context builder and hands httpx the result as
     # verify=, with no cert= kwarg. (The actual load_cert_chain is unit-tested in test_console_client.)
-    import messagefoundry.console.client as client_module
+    # The client body lives in messagefoundry.apiclient.client (ADR 0088); monkeypatch it there so
+    # the name resolution inside EngineClient.__init__ actually sees the spy (console.client is a shim).
+    import messagefoundry.apiclient.client as client_module
 
     seen: list[tuple[str | None, str | None, str | None]] = []
     sentinel = object()

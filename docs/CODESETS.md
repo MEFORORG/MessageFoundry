@@ -24,6 +24,32 @@ code sets); the directory is created on the first `upsert`.
 Both editors — a hand edit and a GUI save — write the same `codesets/<name>.csv`, so they are
 interchangeable.
 
+## Unmapped-value policy (on a lookup miss) — #162
+
+A code set may declare **how a lookup miss resolves**, so a Handler stops hand-coding
+`code_set(...).get(key, default)` per crosswalk. Declare it in a **sidecar** next to the code-set file,
+`codesets/<name>.policy.toml`:
+
+```toml
+# codesets/epic_diets.policy.toml
+kind = "default"          # none | default | passthrough | flag
+default_value = "UNKNOWN"  # required iff kind = "default"
+```
+
+A Handler then calls **`code_set("epic_diets").translate(key)`**: a hit returns the mapped value; a miss
+applies the policy — `default` → `default_value`, `passthrough` → the original `key`, `flag` → a
+`Flagged(code_set, key)` sentinel the Handler can test (`isinstance(x, Flagged)`) and route to review.
+**No sidecar (or `kind = "none"`)** is the backward-compatible default: `translate()` raises on a miss,
+and `.get(key, default)` / `[key]` behave exactly as before. The sidecar is **shown read-only** in the
+grid editor (authoring it in the grid is a fast-follow).
+
+**Unmapped inputs are captured** for operator reconciliation, **re-run-safely**: the miss lookup stays a
+pure function, and the values are gathered into a run-scoped, deduplicated buffer the engine drains once
+after each run — as non-PHI per-set *counts* on the observability path, and (via an optional store sink)
+the values keyed by `(message_id, code_set, key)` so a crash-re-run is a no-op. Captured values are
+treated as **PHI** (never logged at INFO+; encrypted at rest + audited when persisted). See
+[ADR 0033 → Amendment](adr/0033-gui-manageable-code-sets.md#amendment-2026-07-11--declared-unmapped-value-policy--re-run-safe-capture-backlog-162).
+
 ## The grid editor (VS Code)
 
 The extension opens a **grid** (rows × columns of strings; the first column is the lookup key) to

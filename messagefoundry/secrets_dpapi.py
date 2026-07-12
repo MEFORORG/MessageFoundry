@@ -13,7 +13,7 @@ DPAPI is **Windows-only**. Every entry point raises :class:`DpapiUnavailable` el
 degrade gracefully to the env-var key — this module never imports anything Windows-specific at module
 load, so it imports cleanly on Linux/macOS (CI lint leg) too. The ``ctypes.windll`` calls live behind
 ``sys.platform != "win32"`` guards; mypy treats the code after the guard as unreachable off Windows
-(mirrors :mod:`messagefoundry.console.service_control`), so it type-checks on the Linux CI leg.
+(mirrors :mod:`messagefoundry.service`), so it type-checks on the Linux CI leg.
 """
 
 from __future__ import annotations

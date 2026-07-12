@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""N-active engine-shard CERTIFICATION bench (ADR 0073).
+r"""N-active engine-shard CERTIFICATION bench (ADR 0073).
 
 Drives N **real** ``serve --shard`` engine processes against ONE unified server store, with the
 ``harness/config/shardcert`` graph whose shards deliver to OVERLAPPING outbound destinations, and
@@ -294,6 +294,14 @@ class ShardCertReport:
     ack_p99_ms: float = 0.0
     recovery_seconds: float | None = None
     notes: list[str] = field(default_factory=list)
+    # BACKLOG #209 topology: the shape this run SERVED. `dests` is the destination-CONNECTION count
+    # (topology), `handlers` (H) is the router's selection width, `delivering` (D) is the fan-out. Default
+    # sentinels (-1) so a caller that doesn't supply them is byte-identical; the CLI always does. The
+    # verdict here is a per-message-id set difference (`acked_not_delivered`), so it is fan-out-agnostic —
+    # these are RECORDED so a reader can tell an H!=D run from a default-shape one (schema_version 2).
+    dests: int = -1
+    handlers: int = -1
+    delivering: int = -1
 
     @property
     def ok(self) -> bool:
@@ -338,12 +346,20 @@ class ShardCertReport:
     def to_json_dict(self) -> dict[str, object]:
         """Metrics + metadata only (never message bodies or control-id lists — PHI rule)."""
         return {
-            "schema_version": 1,
+            # v2 (BACKLOG #209): adds the `topology` block. The `--handlers`/`--delivering` CLI knobs let
+            # this report describe an H!=D run, so a reader can no longer assume H = D = dests; the shape
+            # is now RECORDED. (The PASS/FAIL verdict itself is a fan-out-agnostic set difference, unchanged.)
+            "schema_version": 2,
             "kind": "shardcert",
             "verdict": "PASS" if self.ok else "FAIL",
             "shards": list(self.shards),
             "killed_shard": self.killed_shard,
             "owned": {s: list(self.owned[s]) for s in self.shards},
+            "topology": {
+                "dests": self.dests,  # destination CONNECTIONS (port-band width) — NOT the fan-out
+                "handlers": self.handlers,  # H: router selection width (cost model only)
+                "delivering": self.delivering,  # D: the FAN-OUT (deliveries/message)
+            },
             "traffic": {
                 "sent": self.sent,
                 "acked": self.acked,
@@ -580,9 +596,21 @@ async def _sample_in_pipeline_trace(
         await poller.close()
 
 
+def _resolve_shape(dests: int, handlers: int | None, delivering: int | None) -> tuple[int, int]:
+    """Resolve ``(H, D)`` from the ``dests`` topology + the optional overrides (BACKLOG #209).
+
+    BOTH default to ``dests``, which reproduces the pre-#209 graph exactly (``H = D = dests`` ⇒
+    ``routed == delivered``), so every existing caller and every published run is byte-identical. The
+    graph's :func:`load_shape` is the authority that VALIDATES the pair (``1 <= D <= dests``, ``D <= H``)
+    and raises — this only resolves the defaults, so there is ONE place the invariants live."""
+    return (dests if handlers is None else handlers), (dests if delivering is None else delivering)
+
+
 async def run_shardcert(
     *,
     dests: int = 8,
+    handlers: int | None = None,
+    delivering: int | None = None,
     aggregate_rate: float = 40.0,
     hold_seconds: float = 20.0,
     kill: bool = False,
@@ -604,14 +632,27 @@ async def run_shardcert(
     aggregate in-pipeline gauge during the hold and reports ``in_pipeline_peak`` — the sizing bench
     turns it on; **off by default so the correctness/kill path drives byte-identically** (no extra
     poller during the hold, ``in_pipeline_peak`` stays ``-1``).
+
+    ``handlers`` (H) / ``delivering`` (D) are the BACKLOG #209 shape split; both default to ``dests``
+    (⇒ the pre-#209 ``H = D = dests`` graph). ``dests`` remains TOPOLOGY only. This single-box path's
+    verdict is a per-message-id set difference (``acked_not_delivered``), so it is fan-out-agnostic by
+    construction and needs no D-keyed arithmetic — it only has to SERVE the requested shape.
     """
     import os
 
     cwd = cwd or Path.cwd()
     store_env = dict(store_env or {})
+    handlers, delivering = _resolve_shape(dests, handlers, delivering)
 
-    # Discover the shard set + ownership from the graph (with `dests` applied) BEFORE serving.
-    with _env_scope({"MEFOR_SHARDCERT_DESTS": str(dests)}):
+    # Discover the shard set + ownership from the graph (with the FULL shape applied) BEFORE serving. The
+    # scope must carry H/D too, not just dests: discovery and the served fleet have to build the SAME graph.
+    with _env_scope(
+        {
+            "MEFOR_SHARDCERT_DESTS": str(dests),
+            "MEFOR_SHARDCERT_HANDLERS": str(handlers),
+            "MEFOR_SHARDCERT_DELIVERING": str(delivering),
+        }
+    ):
         reg = load_config(_CONFIG_DIR)
     ids_list = shard_ids(reg)
     owned = {s: sorted(owned_destination_set(reg, s, ids_list)) for s in ids_list}
@@ -633,6 +674,8 @@ async def run_shardcert(
         "MEFOR_SHARDCERT_SHARDS": ",".join(ids_list),
         "MEFOR_SHARDCERT_INBOUND_BASE": str(inbound_base),
         "MEFOR_SHARDCERT_DESTS": str(dests),
+        "MEFOR_SHARDCERT_HANDLERS": str(handlers),
+        "MEFOR_SHARDCERT_DELIVERING": str(delivering),
         "MEFOR_SHARDCERT_SINK_HOST": sink_host,
         "MEFOR_SHARDCERT_SINK_PORT": str(sink_port),
         "MEFOR_SHARDCERT_TRANSFORM": "edit",
@@ -825,6 +868,9 @@ async def run_shardcert(
         ack_p99_ms=ack.p99_ms,
         recovery_seconds=recovery_seconds,
         notes=report_notes,
+        dests=dests,
+        handlers=handlers,
+        delivering=delivering,
     )
 
 
@@ -989,6 +1035,8 @@ async def _run_ladder_step(
     *,
     rate: float,
     dests: int,
+    handlers: int | None,
+    delivering: int | None,
     hold_seconds: float,
     drain_timeout: float,
     store_env: Mapping[str, str] | None,
@@ -1001,6 +1049,8 @@ async def _run_ladder_step(
     substitute a synthetic step and exercise the climb/stop logic without a live SQL Server."""
     report = await run_shardcert(
         dests=dests,
+        handlers=handlers,
+        delivering=delivering,
         aggregate_rate=rate,
         hold_seconds=hold_seconds,
         kill=False,
@@ -1018,6 +1068,8 @@ async def run_shardcert_ladder(
     *,
     rates: Sequence[float],
     dests: int = 8,
+    handlers: int | None = None,
+    delivering: int | None = None,
     hold_seconds: float = 60.0,
     drain_timeout: float = 120.0,
     store_env: Mapping[str, str] | None = None,
@@ -1039,6 +1091,8 @@ async def run_shardcert_ladder(
         rec = await _run_ladder_step(
             rate=rate,
             dests=dests,
+            handlers=handlers,
+            delivering=delivering,
             hold_seconds=hold_seconds,
             drain_timeout=drain_timeout,
             store_env=store_env,
@@ -1096,13 +1150,25 @@ class _env_scope:
 # --- shared setup helpers (used by the split engine/driver halves) ---------------------------------
 
 
-def _discover(dests: int) -> tuple[list[str], dict[str, list[str]], int, int]:
+def _discover(
+    dests: int, handlers: int, delivering: int
+) -> tuple[list[str], dict[str, list[str]], int, int]:
     """Discover the shard set, per-shard owned destination lanes, shard count ``n``, and lanes-per-shard
-    from the ``shardcert`` graph (with ``dests`` applied + the ambient ``MEFOR_SHARDCERT_LANES_PER_SHARD``)
-    BEFORE serving. ``lanes`` is derived from the built graph (``len(reg.inbound) // n``) — the SAME
-    derivation the single-box :func:`run_shardcert` uses — so the driver and the served graph stay in
-    lock-step. Pure read of the config; no engine/store side effects."""
-    with _env_scope({"MEFOR_SHARDCERT_DESTS": str(dests)}):
+    from the ``shardcert`` graph (with the FULL ``dests``/``handlers``/``delivering`` shape applied + the
+    ambient ``MEFOR_SHARDCERT_LANES_PER_SHARD``) BEFORE serving. ``lanes`` is derived from the built graph
+    (``len(reg.inbound) // n``) — the SAME derivation the single-box :func:`run_shardcert` uses — so the
+    driver and the served graph stay in lock-step. Pure read of the config; no engine/store side effects.
+
+    H/D are scoped here, not left ambient: discovery and :func:`_shape_env` (which shapes the SERVED fleet)
+    must build the same graph, and this is also where ``load_shape``'s invariant check (``D <= dests``,
+    ``D <= H``) fires — BEFORE any process is spawned."""
+    with _env_scope(
+        {
+            "MEFOR_SHARDCERT_DESTS": str(dests),
+            "MEFOR_SHARDCERT_HANDLERS": str(handlers),
+            "MEFOR_SHARDCERT_DELIVERING": str(delivering),
+        }
+    ):
         reg = load_config(_CONFIG_DIR)
     ids_list = shard_ids(reg)
     owned = {s: sorted(owned_destination_set(reg, s, ids_list)) for s in ids_list}
@@ -1115,6 +1181,8 @@ def _shape_env(
     ids_list: list[str],
     inbound_base: int,
     dests: int,
+    handlers: int,
+    delivering: int,
     sink_host: str,
     sink_port: int,
     sink_ports: int = 1,
@@ -1124,11 +1192,17 @@ def _shape_env(
     co-located); ``sink_port``/``sink_ports`` are the base + width of the sink port band the driver binds
     (a SINGLE sink for the correctness cert — the fan-out width is exercised in a later PR). The
     lanes-per-shard + persistent knobs ride ambiently on ``os.environ`` (the CLI/caller sets them before
-    config load), so the discovered graph and the served graph agree."""
+    config load), so the discovered graph and the served graph agree.
+
+    This is what SHAPES THE SERVED FLEET, so ``handlers``/``delivering`` (BACKLOG #209) must be pinned here
+    explicitly — the same values :func:`_discover` scoped. Leaving them to ride ambiently would let a caller
+    discover one graph and serve another, and the mismatch would surface only as a fabricated ``S != A*D``."""
     return {
         "MEFOR_SHARDCERT_SHARDS": ",".join(ids_list),
         "MEFOR_SHARDCERT_INBOUND_BASE": str(inbound_base),
         "MEFOR_SHARDCERT_DESTS": str(dests),
+        "MEFOR_SHARDCERT_HANDLERS": str(handlers),
+        "MEFOR_SHARDCERT_DELIVERING": str(delivering),
         "MEFOR_SHARDCERT_SINK_HOST": sink_host,
         "MEFOR_SHARDCERT_SINK_PORT": str(sink_port),
         "MEFOR_SHARDCERT_SINK_PORTS": str(sink_ports),
@@ -1399,6 +1473,8 @@ class ShardCertDriverReport:
 async def run_shardcert_engine(
     *,
     dests: int = 8,
+    handlers: int | None = None,
+    delivering: int | None = None,
     hold_seconds: float = 20.0,
     kill: bool = False,
     kill_shard: str | None = None,
@@ -1446,17 +1522,24 @@ async def run_shardcert_engine(
     reliable drain gate the PR-C2 ladder's DRIVE half waits on before tallying its sinks, so a
     teardown-frozen in-flight tail is absorbed BEFORE the tally rather than mis-read as loss. It is posted
     with the store-truth (``drained``/``stranded``/``dead_total``/``in_pipeline_final``), never the remote
-    poller's gauges."""
+    poller's gauges.
+
+    ``handlers`` (H) / ``delivering`` (D) are the BACKLOG #209 shape split (both default to ``dests`` ⇒ the
+    pre-#209 graph). This box OWNS the shape — the DRIVE box has no shape flag and learns H/D/dests from the
+    :data:`SHARDS_READY` post below, so there is exactly ONE source of truth across the box boundary."""
     import os
 
     cwd = cwd or Path.cwd()
     store_env = dict(store_env or {})
-    ids_list, owned, n, lanes = _discover(dests)
+    handlers, delivering = _resolve_shape(dests, handlers, delivering)
+    ids_list, owned, n, lanes = _discover(dests, handlers, delivering)
     # Ports: N*lanes contiguous inbound (lane l of shard i on base + i*lanes + l), N API. The DRIVER binds
     # the sink — the ENGINE only advertises the port band.
     inbound_base = _free_contiguous(n * lanes)
     api_ports = _reserve_ports(n)
-    shape_env = _shape_env(ids_list, inbound_base, dests, sink_host, sink_port, sink_ports)
+    shape_env = _shape_env(
+        ids_list, inbound_base, dests, handlers, delivering, sink_host, sink_port, sink_ports
+    )
     escapes = _escapes(inbound_bind_host)
     store_env.setdefault("MEFOR_STORE_POOL_SIZE", "8")
     node_env = {**os.environ, **store_env, **shape_env, **escapes}
@@ -1495,10 +1578,15 @@ async def run_shardcert_engine(
         # reading to a shard/node identity. Advertised in SHARDS_READY AND returned in the report.
         node_pids = {s: (nodes[s].node_id, getattr(nodes[s], "pid", None)) for s in ids_list}
         # Message 1: advertise the topology the driver needs — the inbound base + lanes-per-shard (so the
-        # driver opens N*lanes connections at base + i*lanes + l), the destination count, the sink port
-        # BAND to bind (base + width), the API ports to poll, the shard set, which shard gets killed — plus
-        # the per-shard subprocess identity (PID + node id + role) for external per-PID CPU attribution.
-        # Metadata only — no PHI.
+        # driver opens N*lanes connections at base + i*lanes + l), the destination-CONNECTION count, the
+        # sink port BAND to bind (base + width), the API ports to poll, the shard set, which shard gets
+        # killed — plus the per-shard subprocess identity (PID + node id + role) for external per-PID CPU
+        # attribution. Metadata only — no PHI.
+        #
+        # BACKLOG #209: `handlers` (H) and `delivering` (D) ride here too, and this post is the ONLY channel
+        # by which the drive box learns the FAN-OUT. The drive has no shape flag on purpose — a flag on both
+        # CLIs is a two-place constant that WILL drift invisibly, and a drive that assumed `dests` was the
+        # fan-out would compute `S == A*dests` and read every healthy H!=D rung as LOSS.
         coord.post(
             SHARDS_READY,
             {
@@ -1506,6 +1594,8 @@ async def run_shardcert_engine(
                 "inbound_base": inbound_base,
                 "lanes": lanes,
                 "dests": dests,
+                "handlers": handlers,
+                "delivering": delivering,
                 "api_ports": list(api_ports),
                 "sink_port": sink_port,
                 "sink_base": sink_port,
@@ -1855,12 +1945,15 @@ def _partition_band(base: int, width: int, count: int) -> list[list[int]]:
 class ShardCertSinkReport:
     """One SINK process's outcome — the delivered/order tally over ITS owned destination-port chunk.
 
-    Every accepted message fans to ALL ``dests`` outbound destinations, so a given (shard, lane, dest)
-    FIFO lane always maps to exactly one sink (the one owning that dest's port) — per-lane ordering is
-    sink-local-sound. And because every lane fans to every dest, EVERY sink observes EVERY lane, so
-    ``lanes_observed`` is already the full lane count per sink (the coordinator asserts agreement / takes
-    the max across sinks — it never SUMS, which would multiply-count the shared lanes). Counts + the
-    bound port numbers (synthetic topology) only — never control-ids / bodies (PHI rule)."""
+    Every accepted message fans to the ``delivering`` (D) destinations ``0..D-1``, so a given
+    (shard, lane, dest) FIFO lane always maps to exactly one sink (the one owning that dest's port) —
+    per-lane ordering is sink-local-sound. Every lane fans to every DELIVERED dest, so a sink owning a
+    port in ``[0, D)`` observes EVERY lane and ``lanes_observed`` is already the full lane count for it
+    (the coordinator asserts agreement / takes the max across sinks — it never SUMS, which would
+    multiply-count the shared lanes). At the default ``D == dests`` that is every sink; with ``D < dests``
+    the sinks owning the non-delivering tail of the band legitimately see nothing, which is exactly why the
+    coordinator takes the MAX. Counts + the bound port numbers (synthetic topology) only — never
+    control-ids / bodies (PHI rule)."""
 
     sink_index: int
     sink_count: int
@@ -1911,7 +2004,8 @@ async def run_shardcert_sink(
 ) -> ShardCertSinkReport:
     """One SINK-tier process of the multi-process drive. Binds a :class:`CorrelationSink` (its OWN
     ``Correlator`` + ``FailoverTracker`` + ``LiveMetrics``) over its CONTIGUOUS chunk of the
-    ``[sink_base, sink_base+sink_ports)`` (== ``dests``) destination-port band — chunk ``sink_index`` of
+    ``[sink_base, sink_base+sink_ports)`` (== ``dests``, the destination-CONNECTION count — the band is
+    sized by TOPOLOGY, not by the fan-out ``delivering``) destination-port band — chunk ``sink_index`` of
     the ``sink_count`` partition — posts :data:`SINK_BOUND`.``<sink_index>`` once bound, absorbs the
     engine's outbound fan-out until it observes the coordinator's :data:`DRIVE_COMPLETE` (or a bounded
     ``drive_complete_timeout``), then records its final tally and posts :data:`SINK_DONE`.``<sink_index>``.
@@ -2227,7 +2321,13 @@ class ShardCertDriveReport:
     labels only — never control-ids / message bodies (PHI rule)."""
 
     shards: tuple[str, ...]
-    dests: int  # fan-out factor: every accepted message fans to all `dests` outbound destinations
+    # TOPOLOGY: shared outbound destination CONNECTIONS = the sink port-band width. NOT the fan-out —
+    # `delivering` is (BACKLOG #209). Never put this in delivery arithmetic.
+    dests: int
+    # H: handlers the router SELECTS per (shard, lane). Cost model only — never delivery arithmetic.
+    handlers: int
+    # D: destinations an accepted message actually delivers to. *** THE FAN-OUT ***
+    delivering: int
     driver_count: int
     sink_count: int
     aggregate_rate: float
@@ -2253,10 +2353,28 @@ class ShardCertDriveReport:
     notes: list[str] = field(default_factory=list)
 
     @property
+    def txn_per_message(self) -> int:
+        """The ADR 0051 durable-write cost of one ingress message on the shape that was SERVED:
+        ``3 + 2H + 2D``. Reported, never gated on — the bench's own self-report of what it charged the
+        store, welded to the store-measured model in ``tests/test_txn_per_message_cost_model.py``."""
+        return 3 + 2 * self.handlers + 2 * self.delivering
+
+    @property
+    def events_per_message(self) -> int:
+        """Counted message events per ingress message (the 45M/day currency): ``1 + D``. NEVER
+        ``1 + dests`` — a destination CONNECTION no handler sends to produces no event."""
+        return 1 + self.delivering
+
+    @property
     def no_loss(self) -> bool:
         """Count-balance on SINK SOCKET-TRUTH ONLY (NO-KILL, strict): the sinks' socket-observed
-        deliveries (``S``) equal the accept-ACK'd intake fanned out (``A * dests``), with both sides
+        deliveries (``S``) equal the accept-ACK'd intake fanned out (``A * delivering``), with both sides
         non-vacuous (``A > 0``, ``S > 0``).
+
+        BACKLOG #209 — the fan-out is ``delivering`` (D), **NOT** ``dests``. ``dests`` is the count of
+        destination CONNECTIONS (the port-band width); at ``H != D`` the self-filtering handlers deliver
+        nothing, so ``A * dests`` would over-expect and this would read LOSS on every healthy rung —
+        nothing would ever sustain.
 
         Deliberately does NOT gate on the poller terms (``drained``, ``engine_dead``, ``engine_done``):
         they are read from the engine ``/stats`` REMOTELY and are UNRELIABLE on a unified store — the
@@ -2265,7 +2383,7 @@ class ShardCertDriveReport:
         on). The strand / dead-at-any-stage authority is the ENGINE half's report, which reads the store
         DIRECTLY (store-truth) and owns that verdict; the sinks are the DRIVE box's only reliable truth.
         The poller terms remain as ADVISORY cross-check fields (see ``render``/``to_json_dict``)."""
-        fanout = self.acked * self.dests
+        fanout = self.acked * self.delivering
         return self.sink_received == fanout and self.acked > 0 and self.sink_received > 0
 
     @property
@@ -2306,11 +2424,13 @@ class ShardCertDriveReport:
         a = self.acked
         lines = [
             f"ShardCert DRIVE {'/'.join(self.shards)}  verdict={'PASS' if self.ok else 'FAIL'}  "
-            f"K={self.driver_count}sender x M={self.sink_count}sink  fanout(dests)={self.dests}",
+            f"K={self.driver_count}sender x M={self.sink_count}sink  "
+            f"fanout(delivering)={self.delivering} of dests={self.dests} conns  "
+            f"H={self.handlers} (txn/msg={self.txn_per_message}, events/msg={self.events_per_message})",
             f"  rate={self.aggregate_rate:g}/s hold={self.hold_seconds:g}s offered={self.offered} "
             f"sent={self.sent} acked(A)={a} sink_received(S)={self.sink_received}",
             f"  no-loss (SINK truth): sink_received(S)={self.sink_received} "
-            f"(expect A*dests={a * self.dests}) -> {'OK' if self.no_loss else 'LOSS'}",
+            f"(expect A*delivering={a * self.delivering}) -> {'OK' if self.no_loss else 'LOSS'}",
             f"  FIFO: lane_inversions={self.lane_inversions} lanes_observed={self.lanes_observed} "
             f"lane_repeats(dups)={self.lane_repeats}",
             f"  ack p50/p99(max over senders)={self.ack_p50_ms:.1f}/{self.ack_p99_ms:.1f}ms "
@@ -2328,12 +2448,20 @@ class ShardCertDriveReport:
     def to_json_dict(self) -> dict[str, object]:
         """Metrics + metadata only (never message bodies or control-id lists — PHI rule)."""
         return {
-            "schema_version": 1,
+            # v2 (BACKLOG #209): `dests` no longer means the fan-out — it is the destination-CONNECTION
+            # count (topology) only. `topology.handlers` (H) and `topology.delivering` (D, THE fan-out) are
+            # new and REQUIRED reading: `no_loss` is now S == A*delivering, and a consumer that kept
+            # multiplying by `dests` would over-expect deliveries on any H != D run.
+            "schema_version": 2,
             "kind": "shardcert_drive",
             "verdict": "PASS" if self.ok else "FAIL",
             "shards": list(self.shards),
             "topology": {
                 "dests": self.dests,
+                "handlers": self.handlers,
+                "delivering": self.delivering,
+                "txn_per_message": self.txn_per_message,
+                "events_per_message": self.events_per_message,
                 "driver_count": self.driver_count,
                 "sink_count": self.sink_count,
             },
@@ -2379,7 +2507,7 @@ async def run_shardcert_drive(
     aggregate_rate: float = 40.0,
     hold_seconds: float = 20.0,
     driver_count: int = 1,
-    sink_count: int = 1,
+    sink_count: int | None = None,
     sink_host: str = "127.0.0.1",
     coord: FileDropCoord,
     shards_ready_timeout: float = 300.0,
@@ -2418,10 +2546,25 @@ async def run_shardcert_drive(
     ready = await coord.await_message(SHARDS_READY, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     dests = int(ready["dests"])
+    # BACKLOG #209: REQUIRED keys, never `.get(..., dests)`. These are GATE INPUTS — `delivering` is the
+    # multiplier in `no_loss` (S == A*D) and in the ladder's `sustained_events_per_s` (the number the
+    # 45M/day decision keys off). Defaulting them to `dests` against an engine box that did not send them
+    # would silently reinstate the H = D = dests assumption and fabricate a plausible headline. A KeyError
+    # here says "the two boxes are running different code" — which is exactly true, and must be loud.
+    handlers = int(ready["handlers"])
+    delivering = int(ready["delivering"])
     sink_base = int(ready.get("sink_base", ready["sink_port"]))
     sink_ports = int(ready.get("sink_ports", 1))
     api_ports = [int(p) for p in ready["api_ports"]]
     lanes = int(ready.get("lanes", 1))
+
+    # BACKLOG #209 back-compat: the engine's `--sink-ports` is now DERIVED from `--dests`, so a `--dests`
+    # below the old literal-8 default advertises a band narrower than 8. Default `sink_count` to the
+    # LEARNED band width (clamped at 8), never a fixed 8 sitting beside a `--dests` that can be anything —
+    # a stale constant beside a parameter is this harness's B1-B10 defect class. An explicit caller value
+    # is honored (and still validated by _partition_band below). One sink per port, up to 8.
+    if sink_count is None:
+        sink_count = min(8, sink_ports)
 
     if driver_count < 1 or sink_count < 1:
         raise ValueError("driver_count and sink_count must both be >= 1")
@@ -2605,6 +2748,8 @@ async def run_shardcert_drive(
     return ShardCertDriveReport(
         shards=tuple(ids_list),
         dests=dests,
+        handlers=handlers,
+        delivering=delivering,
         driver_count=driver_count,
         sink_count=sink_count,
         aggregate_rate=aggregate_rate,

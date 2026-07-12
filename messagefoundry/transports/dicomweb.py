@@ -41,10 +41,10 @@ import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -61,8 +61,11 @@ from messagefoundry.transports.rest import (
     _RETRYABLE_4XX,
     _insecure_opener,
     _redact_url,
+    InsecureHopGuard,
     enforce_outbound_length_limits,
     refuse_cleartext_credentials,
+    refuse_cleartext_egress,
+    refuse_verify_off,
 )
 
 __all__ = ["DicomWebDestination"]
@@ -148,19 +151,27 @@ class DicomWebDestination(DestinationConnector):
         self.encoding: str = s.get("encoding", "utf-8")
         # ADR 0013: capture the STOW-RS dicom+json response. Default False → returns None, byte-identical.
         self.capture_response: bool = bool(s.get("capture_response", False))
+        # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
+        attested = config.tls_hop_attested
+        # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
+        self._hop_guard: InsecureHopGuard | None = None
         self._headers = self._build_headers(s)
         # The multipart Content-Type (with the generated boundary) is set per-request in _post — it is not
         # operator-supplied, so it is excluded from the length check (which guards URL + supplied headers).
         enforce_outbound_length_limits(self.base_url, self._headers)
-        refuse_cleartext_credentials(scheme, self._headers, self.base_url)
+        refuse_cleartext_credentials(scheme, self._headers, self.base_url, attested=attested)
+        # ASVS 12.2.1: the STOW-RS multipart body carries the DICOM object (PHI), so a cleartext http
+        # egress to a non-loopback host is refused even without credentials (loopback byte-identical).
+        self._hop_guard = refuse_cleartext_egress(scheme, self.base_url, attested=attested)
         if bool(s.get("verify_tls", True)):
             self._opener: urllib.request.OpenerDirector = _NO_REDIRECT_OPENER
         else:
-            if scheme == "https" and not insecure_tls_allowed():
-                raise ValueError(
-                    "DICOMweb destination verify_tls=false disables TLS certificate verification; "
-                    f"refused unless {INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only)"
-                )
+            # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
+            guard = refuse_verify_off(
+                scheme, self.base_url, connector="DICOMweb destination", attested=attested
+            )
+            if guard is not None:
+                self._hop_guard = guard
             logger.warning(
                 "DICOMweb destination %s has TLS verification DISABLED (verify_tls=false)",
                 _redact_url(self.base_url),
@@ -223,7 +234,9 @@ class DicomWebDestination(DestinationConnector):
         )
         return body, boundary
 
-    async def send(self, payload: str) -> DeliveryResponse | None:
+    async def send(
+        self, payload: str, *, metadata: Mapping[str, str] | None = None
+    ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
         dicom_bytes = recover_dicom_object_bytes(payload, label="DICOMweb STOW-RS")
         # urllib is blocking — keep it off the event loop (the delivery worker awaits this).
         body, status = await asyncio.to_thread(self._post, dicom_bytes)
@@ -269,6 +282,12 @@ class DicomWebDestination(DestinationConnector):
             raise DeliveryError(f"DICOMweb {_redact_url(self.base_url)} failed: {exc}") from exc
 
     def _post(self, dicom_bytes: bytes) -> tuple[str, int]:
+        # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
+        # a byte crosses (a None guard — secure/loopback — is byte-identical).
+        if self._hop_guard is not None:
+            self._hop_guard.assert_send(
+                urllib.parse.urlsplit(self.base_url).hostname or "", _redact_url(self.base_url)
+            )
         data, boundary = self._multipart_body(dicom_bytes)
         headers = {
             **self._headers,

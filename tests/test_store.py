@@ -608,6 +608,62 @@ async def test_record_audit_writes_audit_log(store: MessageStore) -> None:
     assert entries[0]["channel_id"] == "c1"
 
 
+async def _seed_audit(store: MessageStore) -> None:
+    """Three distinct (actor, action, ts) rows for the #170 filter tests."""
+    await store.record_audit("message_view", actor="alice", detail="{}", now=100.0)
+    await store.record_audit("message_view", actor="bob", detail="{}", now=200.0)
+    await store.record_audit("config_reload", actor="alice", detail="{}", now=300.0)
+
+
+async def test_list_audit_filter_by_actor(store: MessageStore) -> None:
+    await _seed_audit(store)
+    rows = await store.list_audit(actor="alice")
+    assert {r["action"] for r in rows} == {"message_view", "config_reload"}
+    assert all(r["actor"] == "alice" for r in rows)
+
+
+async def test_list_audit_filter_by_action(store: MessageStore) -> None:
+    await _seed_audit(store)
+    rows = await store.list_audit(action="message_view")
+    assert {r["actor"] for r in rows} == {"alice", "bob"}
+    assert all(r["action"] == "message_view" for r in rows)
+
+
+async def test_list_audit_filter_by_time_range(store: MessageStore) -> None:
+    await _seed_audit(store)
+    # inclusive window [150, 300] captures the bob (200) and config_reload (300) rows
+    rows = await store.list_audit(since=150.0, until=300.0)
+    assert sorted(r["ts"] for r in rows) == [200.0, 300.0]
+
+
+async def test_list_audit_filter_combination(store: MessageStore) -> None:
+    await _seed_audit(store)
+    rows = await store.list_audit(actor="alice", action="message_view", since=50.0, until=150.0)
+    assert len(rows) == 1
+    assert rows[0]["ts"] == 100.0 and rows[0]["action"] == "message_view"
+
+
+async def test_list_audit_ordering_and_limit_preserved(store: MessageStore) -> None:
+    await _seed_audit(store)
+    rows = await store.list_audit(action="message_view", limit=1)
+    # most-recent-first ordering under a filter: bob's row (ts=200) precedes alice's (ts=100)
+    assert len(rows) == 1 and rows[0]["actor"] == "bob"
+
+
+async def test_list_audit_filter_is_parameterized_against_injection(store: MessageStore) -> None:
+    await _seed_audit(store)
+    # A classic injection payload must be treated as a literal actor value (matching nothing),
+    # never executed — the rows survive intact.
+    payload = "alice' OR '1'='1"
+    rows = await store.list_audit(actor=payload)
+    assert rows == []
+    # The audit_log table is untouched (no DROP / mutation happened).
+    assert len(await store.list_audit()) == 3
+    # A DROP-TABLE attempt in the action filter is likewise inert.
+    assert await store.list_audit(action="x'; DROP TABLE audit_log; --") == []
+    assert len(await store.list_audit()) == 3
+
+
 async def test_connection_metrics_respects_since_window(store: MessageStore) -> None:
     await store.enqueue_message(channel_id="c1", raw="x", deliveries=[("d1", "p1")], now=10.0)
     item = (await store.claim_ready(now=10.0))[0]

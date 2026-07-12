@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Console Windows service-control helpers: state parsing + a real missing-service query."""
+"""Windows service-control helpers: state parsing + a real missing-service query.
+
+The body moved to :mod:`messagefoundry.service` (ADR 0088); this exercises it there so the
+``sys``/``subprocess`` monkeypatches land where ``service_state`` resolves them (the
+``messagefoundry.console.service_control`` shim just re-exports these)."""
 
 from __future__ import annotations
 
-import messagefoundry.console.service_control as service_control
-from messagefoundry.console.service_control import (
+import messagefoundry.service as service_control
+from messagefoundry.service import (
     install_script_path,
     parse_service_state,
     service_state,

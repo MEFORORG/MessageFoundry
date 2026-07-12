@@ -11,7 +11,7 @@ backlog, and drain. See ``docs/LOAD-TESTING.md``.
 Like :mod:`harness.scenarios`, this package imports no PySide6 and never imports the engine's
 ``pipeline``/``store``/``config`` internals — only the **pure** surfaces the harness is allowed to
 use: the MLLP framing primitives (:mod:`messagefoundry.transports.mllp`), the parsing library, the
-generators, and the HTTP :class:`~messagefoundry.console.client.EngineClient`.
+generators, and the HTTP :class:`~messagefoundry.apiclient.EngineClient`.
 """
 
 from __future__ import annotations

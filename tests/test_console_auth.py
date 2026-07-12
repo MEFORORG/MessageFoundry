@@ -24,6 +24,17 @@ from messagefoundry.store.store import MessageStore
 PW = "Sup3rSecret!!"
 
 
+def _auto_reauth(client: EngineClient):
+    """A step-up handler that transparently reauths (ADR 0077: EngineClient.reauth carries the action
+    named in X-Step-Up-Action as `purpose`, minting the bound single-use grant)."""
+
+    def handler() -> bool:
+        client.reauth(PW)
+        return True
+
+    return handler
+
+
 def _free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -115,13 +126,16 @@ def test_console_mfa_enroll_confirm_and_disable(auth_server: str) -> None:
     # WP-14: the console client drives the full TOTP lifecycle against a real server.
     with EngineClient(auth_server) as client:
         client.login("root", PW)
+        # ADR 0077: enroll/confirm/disable each need a fresh per-action step-up; the console's step-up
+        # handler reauths transparently, binding the proof to the action the 403 named.
+        client.set_step_up_handler(_auto_reauth(client))
         assert client.mfa_status().enabled is False
-        enroll = client.enroll_mfa()  # root just logged in → step-up window is fresh
-        codes = client.confirm_mfa(totp.totp(enroll.secret))
+        enroll = client.enroll_mfa()  # 403 mfa_enroll → handler reauths(purpose) → retry succeeds
+        codes = client.confirm_mfa(totp.totp(enroll.secret))  # 403 mfa_confirm → reauth → retry
         assert len(codes) == 10
         st = client.mfa_status()
         assert st.enabled is True and st.recovery_codes_remaining == 10
-        client.disable_mfa()
+        client.disable_mfa()  # 403 mfa_disable (MFA satisfied) → reauth → retry
         assert client.mfa_status().enabled is False
 
 
@@ -129,6 +143,7 @@ def test_console_mfa_handler_auto_verifies_on_step_up(auth_server: str) -> None:
     # The X-MFA-Required handler transparently prompts-and-retries a sensitive op (mirrors step-up).
     with EngineClient(auth_server) as client:
         client.login("root", PW)
+        client.set_step_up_handler(_auto_reauth(client))  # ADR 0077: unlock enroll/confirm
         enroll = client.enroll_mfa()
         client.confirm_mfa(totp.totp(enroll.secret))
 

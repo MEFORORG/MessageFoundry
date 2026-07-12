@@ -434,6 +434,23 @@ duplicated delivery in this window is tolerated by idempotent outbounds, but **m
 reconciliation across the two stores is an operator responsibility, not an engine guarantee** — the cold path
 carries a real RPO and this reconciliation burden by design (the explicit cost of the owner-chosen cheap, cold DR).
 
+**Server-DB restore is DBA-owned — the attestation is a deliberate correctness assertion (BACKLOG #102/#223,
+[ADR 0102](0102-server-db-dr-restore-vintage-completeness-attestation-residual.md)).** On a Postgres/SQL Server
+store the #60 backup is **config-only** (the DB is DBA-restored out of band, #52), so `POST /dr/activate`
+requires an explicit **`dba_attests_restored=true`** and a live provenance probe (`has_prior_backup_history` — the
+restored `mefor` DB must carry ≥ 1 `dr_backup` audit row, which a fresh bootstrap lacks), refusing closed even
+when falsely attested. **The engine does NOT verify the restore's *vintage* or *completeness*** — a stale-but-real
+restore, or a partial restore that carried `audit_log` but not the message tables, passes those checks. Proving
+the native restore is the **intended vintage and complete** is a **DBA runbook responsibility**, formally accepted
+as a residual risk in [`ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`](../security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md). The
+DBA/operator must, before attesting: (i) restore from the **intended** native backup (confirm its point-in-time
+against the change record, not just "a" backup); (ii) verify the restore completed (all tables present, not a
+truncated/aborted restore); and (iii) **optionally** set `[dr].restore_token` to a local JSON token
+(`{"expected_backup_archive": "<the most-recent engine dr_backup archive name the restored DB should carry,
+sourced from the PRIMARY's `dr_backup` record — NOT read back from the restored DB>"}`) so the gate enforces a
+**vintage floor** (a mismatching/stale restore is then refused closed). The full engine-driven server-DB seed that
+would make vintage engine-verifiable is deferred (ADR 0102 option (a), an owner decision).
+
 ## Acceptance Criteria
 
 > EARS — testable, each linked to a test/fixture. (Paths below are the intended homes; created with the build.

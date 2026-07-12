@@ -59,7 +59,24 @@ reclaim_interval_seconds = 30.0
 #   heartbeat_seconds < leader_fence_timeout_seconds < leader_lease_ttl_seconds
 leader_lease_ttl_seconds      = 30.0  # a standby acquires leadership only once the lease has expired
 leader_fence_timeout_seconds  = 20.0  # a leader that can't renew within this self-fences (split-brain guard)
+# --- Leader preference (ADR 0096) — per-node; default (0.0, true) = unweighted first-lease-wins ------
+# acquire_delay_seconds: seconds this node waits PAST the lease-expiry time before it may take over an
+#   EXPIRED lease (handicap). A preferred site keeps 0.0; a warm remote-DR node sets a positive value so
+#   a preferred node wins the routine take-over race. NEVER delays a renewal by the current leader, and
+#   only ever makes a node claim LATER — so it can't open a two-leader window. Governs take-over of an
+#   EXPIRED lease only; the very first election on an empty table is a plain race.
+acquire_delay_seconds = 0.0
+# promotable: false = this node may NEVER become leader (never inserts/takes-over/renews the lease); a
+#   node that somehow already leads steps down cleanly on its next tick. Use it for a warm, passive DR
+#   engine. At least ONE promotable node MUST exist, or no node ever acquires the lease and the graph
+#   never drains (an all-non-promotable cluster is a misconfiguration).
+promotable = true
 ```
+
+> **Warm DR:** run a remote DR-site engine as a **non-promotable cluster member**
+> (`promotable = false`) — NOT as a `[dr].activate` box. Combining `[dr].activate` with `[cluster]` is
+> refused at config load (the DR run-profile gates which connections start, not lease acquisition, so a
+> lease-contending DR box could win leadership and drive the primary store cross-WAN).
 
 Start the same `serve` command on each host/process — e.g.:
 
@@ -175,9 +192,11 @@ Two-node cluster:
 {
   "nodes": [
     { "node_id": "node-a:4812:1f9c2a7b", "host": "node-a", "pid": 4812,
-      "status": "active", "started_at": 1750000000.0, "last_seen": 1750000123.4, "is_leader": true },
+      "status": "active", "started_at": 1750000000.0, "last_seen": 1750000123.4, "is_leader": true,
+      "acquire_delay_seconds": 0.0, "promotable": true },
     { "node_id": "node-b:5210:7c3e9d10", "host": "node-b", "pid": 5210,
-      "status": "active", "started_at": 1750000005.0, "last_seen": 1750000124.1, "is_leader": false }
+      "status": "active", "started_at": 1750000005.0, "last_seen": 1750000124.1, "is_leader": false,
+      "acquire_delay_seconds": 15.0, "promotable": false }
   ],
   "leader_node_id": "node-a:4812:1f9c2a7b",
   "lease_owner": "node-a:4812:1f9c2a7b",
@@ -189,14 +208,18 @@ Two-node cluster:
 `leader_lease` row: who holds the self-fencing lease and the DB-clock epoch at which it expires (the
 instant a standby could acquire if the leader stops renewing). `lease_owner` normally equals
 `leader_node_id` (the heartbeat-flag-derived leader); a brief divergence during failover is expected —
-the lease is the source of truth for who may process. Single node (synthetic self-entry — no heartbeat
+the lease is the source of truth for who may process. Each node also reports its **leader-preference
+config** (ADR 0096): `acquire_delay_seconds` (its take-over-of-expired handicap; `0.0` = none) and
+`promotable` (`false` = a non-promotable standby that can never become leader) — so an operator can SEE
+which nodes are handicapped or passive across the cluster. Single node (synthetic self-entry — no heartbeat
 history, so `started_at`/`last_seen` are `null`; permanently leader, so `lease_expires_at` is `null`):
 
 ```json
 {
   "nodes": [
     { "node_id": "host:1234:ab12cd34", "host": "host", "pid": 1234,
-      "status": "active", "started_at": null, "last_seen": null, "is_leader": true }
+      "status": "active", "started_at": null, "last_seen": null, "is_leader": true,
+      "acquire_delay_seconds": 0.0, "promotable": true }
   ],
   "leader_node_id": "host:1234:ab12cd34",
   "lease_owner": "host:1234:ab12cd34",

@@ -10,7 +10,7 @@ outbound (verified by polling ``/dead-letters``). The built-in :data:`SCENARIOS`
 ``harness/config`` graph; serve it first, then ``python -m harness --scenario <name>``.
 
 This module deliberately imports no PySide6 — it uses plain sockets and the synchronous
-:class:`~messagefoundry.console.client.EngineClient`, so it works on a headless runner.
+:class:`~messagefoundry.apiclient.EngineClient`, so it works on a headless runner.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import socket
 import time
 from dataclasses import dataclass
 
-from messagefoundry.console.client import ApiError, EngineClient
+from messagefoundry.apiclient import ApiError, EngineClient
 from messagefoundry.generators import _core
 from messagefoundry.generators import all_types  # noqa: F401  (registers the built-in message types)
 from messagefoundry.transports.mllp import MLLPDecoder, frame

@@ -32,14 +32,78 @@ Configure `[store]` in the service settings (full reference: [`CONFIGURATION.md`
 - The connection target (host/port/database/auth) — supply secrets via `MEFOR_*` env, never the file.
 - `[store].encrypt` (default **true**) + `[store].trust_server_certificate` (default **false**) —
   encrypt the DB connection; only weaken with `MEFOR_ALLOW_INSECURE_TLS` on a trusted lab segment.
-- `[store].ssl_root_cert` (**Postgres only**) — pin a private / self-signed DB CA by PEM path so the
-  server cert verifies **without** installing the CA box-globally into the OS trust store. **SQL Server
-  (ODBC Driver 18) has no connection-string CA-file option** — it validates against the OS trust store,
-  so install the DB's CA into the Windows machine trust store instead (setting `ssl_root_cert` for the
-  `sqlserver` backend is rejected at load, not silently ignored).
+- `[store].ssl_root_cert` — pin the DB server certificate by **file** so it verifies **without**
+  installing anything box-globally into the OS trust store, on the secure posture only (`encrypt = true`,
+  `trust_server_certificate = false`). **Postgres:** a **CA-bundle** PEM (chain + hostname still checked) —
+  the make-before-break-friendly path. **SQL Server:** the ODBC Driver **18.1+** `ServerCertificate`
+  keyword, which pins the **leaf** cert (an exact-cert match — see the leaf-pin rotation caveat in §5.3);
+  for CA-chain rotation the machine-store import (§5.2) stays the lighter-touch SQL Server option. Rejected
+  for SQLite; a missing file fails loud at load.
 - `[store].pool_size` — see *Pool sizing* below.
 
 > _Filled by staging:_ a minimal `[store]` block for each backend (Postgres DSN; SQL Server ODBC).
+
+### 1.1 Integrated (gMSA) authentication — SQL Server worked example (#99)
+
+The turnkey Windows/AD posture: the engine service runs under a **group Managed Service Account (gMSA)**
+and authenticates to SQL Server with **that Windows identity** (no SQL password anywhere) — set
+`[store].auth = "integrated"`, which connects with `Trusted_Connection=yes`. This is also what
+`[security].require_managed_identity = true` demands (it refuses a static `auth = "sql"` login on
+production PHI). End to end:
+
+**1. Provision the gMSA + let the engine host retrieve its password** (domain admin, once):
+
+```powershell
+New-ADServiceAccount -Name mefor-svc -DNSHostName mefor01.corp.example.com `
+  -PrincipalsAllowedToRetrieveManagedPassword "MEFOR-Hosts"   # a group the engine host is in
+# On the engine host (elevated), install + verify the account:
+Install-ADServiceAccount -Identity mefor-svc
+Test-ADServiceAccount   -Identity mefor-svc      # must return True (the installer runs this too)
+```
+
+**2. Install the service under the gMSA** — `install-service.ps1` runs the gMSA preflight and grants
+"Log on as a service" automatically; NSSM's `ObjectName` is the gMSA with a trailing `$` and **no
+password**:
+
+```powershell
+.\scripts\service\install-service.ps1 -Environment prod `
+  -ServiceAccount "CORP\mefor-svc$"          # gMSA — passwordless; preflight + SeServiceLogonRight auto
+```
+
+**3. Grant the gMSA a SQL login** (DBA, on the SQL Server) — the Windows account, mapped to a
+least-privilege database user; the engine bootstraps its own schema on first open (§2), so the user
+needs table create/CRUD on the MessageFoundry database only:
+
+```sql
+CREATE LOGIN [CORP\mefor-svc$] FROM WINDOWS;               -- the gMSA's Windows identity ($ suffix)
+USE [MessageFoundry];
+CREATE USER [CORP\mefor-svc$] FOR LOGIN [CORP\mefor-svc$];
+-- Least privilege: schema bootstrap (§2) + row CRUD; NOT sysadmin/db_owner.
+ALTER ROLE db_datareader  ADD MEMBER [CORP\mefor-svc$];
+ALTER ROLE db_datawriter  ADD MEMBER [CORP\mefor-svc$];
+ALTER ROLE db_ddladmin    ADD MEMBER [CORP\mefor-svc$];    -- create tables/indexes on first open
+```
+
+**4. The engine `[store]` block** — integrated auth, encrypted, verifying the DB cert against the
+Windows machine trust store (§5); **no secret in the file or env**:
+
+```toml
+[store]
+type = "sqlserver"
+host = "sql01.corp.example.com"
+database = "MessageFoundry"
+auth = "integrated"                # Trusted_Connection=yes — the gMSA's identity authenticates
+encrypt = true                     # default; TLS to the DB
+trust_server_certificate = false   # default; verify the DB cert (import its CA into LocalMachine\Root, §5.2)
+
+[security]
+require_managed_identity = true    # refuse a static SQL login on production PHI (ASVS 13.2.1)
+```
+
+> **Why the `$`:** a gMSA authenticates as a *computer-class* principal, so its SQL login name carries the
+> trailing `$` (`CORP\mefor-svc$`) — the same name NSSM's `ObjectName` uses. `db_ddladmin` is needed only
+> for the first-open schema bootstrap (§2); drop it to `db_datareader`/`db_datawriter` afterward, or
+> pre-create the schema and never grant it.
 
 ---
 
@@ -139,7 +203,7 @@ validation to succeed, the database's certificate must chain to a CA the host al
 | Backend | How the DB CA is trusted | Disable validation? |
 |---|---|---|
 | **PostgreSQL** | **Either** pin the CA by file with `[store].ssl_root_cert = <ca.pem>` (no machine-wide install — see §1), **or** import it into the Windows machine trust store (§5.2). The file pin is the lighter-touch path. | Never. |
-| **SQL Server (ODBC Driver 18)** | **Machine trust store only.** ODBC 18 has **no connection-string CA-file keyword**, so it validates against the Windows **LocalMachine\Root** store. There is **no `[store].ssl_root_cert` for the `sqlserver` backend** (it is rejected at load) — import the CA into the machine store (§5.2). | Never. |
+| **SQL Server (ODBC Driver 18)** | **Machine trust store** (`LocalMachine\Root`, §5.2) is the CA-chain path — recommended for make-before-break rotation. **Or** pin the server's cert by file with `[store].ssl_root_cert = <cert>` (ODBC Driver **18.1+** `ServerCertificate`), a **leaf** pin that must be rotated in lockstep with the server cert (§5.3 caveat). | Never. |
 
 ### 5.2 Import a private / internal CA into the machine store (`LocalMachine\Root`)
 

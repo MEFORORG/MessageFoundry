@@ -1,6 +1,7 @@
 # ADR 0019 — Pluggable KeyProvider seam (HSM/KMS/Vault envelope decryption) for store-key material (ASVS 13.3.3)
 
-- **Status:** **Accepted (2026-06-17); Amended 2026-06-18 — core seam BUILT.** Designs the pluggable
+- **Status:** **Accepted (2026-06-17); Amended 2026-06-18 — core seam BUILT; Amended 2026-07-10 — `vault`
+  provider (BACKLOG #196) + secret-rotation reminder (§5.1, BACKLOG #195b) BUILT.** Designs the pluggable
   **KeyProvider** seam (work package **WP-BL3-04**) that lets the store's at-rest data-encryption key be
   sourced from an external HSM / cloud KMS / Vault via **envelope decryption**. **As of the 2026-06-18
   amendment the core seam is built** ([store/keyprovider.py](../../messagefoundry/store/keyprovider.py)):
@@ -256,6 +257,43 @@ seam is designed to **generalize** to a `SecretProvider`. This is recorded as a 
 "SecretProvider" half of WP-BL3-04) — **not** part of the core store-key seam and **not** built here. The
 store key continues to flow through its own `MEFOR_STORE_ENCRYPTION_KEY` chokepoint, distinct from
 `MEFOR_VALUE_*`.
+
+### 5.1 Secret-rotation reminder (BUILT — BACKLOG #195b, amended 2026-07-10)
+
+A KeyProvider (or any of the built-in env/DPAPI sources) tells the engine **how** to source a secret,
+but nothing tells an operator **when** a long-lived secret is *overdue for rotation*. A TLS cert carries
+its own `notAfter`, so `[cert_monitor]` ([cert_expiry.py](../../messagefoundry/pipeline/cert_expiry.py))
+can alarm ahead of expiry; the store DEK and connector credentials have **no intrinsic expiry**, so a
+stale key can sit unrotated indefinitely with no in-engine signal. This amendment adds the **secret-side
+twin** of the cert monitor:
+
+- **`[secret_rotation]`** ([config/settings.py](../../messagefoundry/config/settings.py)
+  `SecretRotationSettings`) — the operator records, per tracked secret, a **last-rotated date** + a
+  **max age** (plus a `warn_days` look-ahead and a scan `check_interval_seconds`), mirroring
+  `[cert_monitor]`. `warn_days = 0` disables it.
+- **`SecretRotationRunner`** ([pipeline/secret_rotation.py](../../messagefoundry/pipeline/secret_rotation.py))
+  — a small engine-owned background task modelled **verbatim** on `CertExpiryRunner` (injected clock, a
+  recomputed-each-pass secret **source callable**, a pure `run_once`, an `enabled` gate, `start`/`stop`).
+  Each pass it compares each tracked secret's age to its max age and emits the new
+  **`secret_rotation_due`** AlertSink event when the secret is overdue or within `warn_days` of due.
+- **PHI-free / never the value.** The reminder reads **only** the operator-configured rotation *dates* +
+  a static label + the secret's config/env **identifier** (e.g. `MEFOR_STORE_ENCRYPTION_KEY`). It never
+  reads, loads, decrypts, or logs any secret value — a reminder needs the *when*, not the *what*. The
+  event carries only label + identifier + dates (no PHI), keyed per-secret for the realert throttle.
+- **Deny-by-default scope.** Today the runner tracks exactly one secret — the **store DEK** — and only
+  once the operator sets `store_key_last_rotated` (an unset date → not tracked → the runner is a no-op).
+
+This is a **reminder**, not enforcement: it never rotates a key or blocks startup. Actual rotation stays
+the operator running `rotate-key` (store DEK) / re-provisioning a credential; §4's fail-closed resolution
+is unchanged.
+
+**Still design-only (the connector `SecretProvider`).** Generalizing the KeyProvider seam to resolve
+**connector** secrets (AD/SQL/SMTP passwords off the `MEFOR_VALUE_*` path) from the *same* external
+provider — the "SecretProvider half" named above — remains a **follow-on, not built**. #195b builds the
+rotation *reminder* only; it does **not** add a `SecretProvider`, does not touch the `MEFOR_VALUE_*`
+chokepoint, and leaves the two secret paths distinct. When the connector `SecretProvider` lands, the
+reminder's secret source generalizes to enumerate those secrets too (the `MonitoredSecret` source callable
+is already the seam for it).
 
 ## ASVS 13.3.3 mapping — Pass-with-documented-residual (amended 2026-06-18)
 

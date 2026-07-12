@@ -79,6 +79,20 @@ The startup guard ([__main__.py](../../messagefoundry/__main__.py)) is extended 
 
 This keeps "the loopback assumption" a single, enforced invariant rather than scattered checks.
 
+**§0 extension — Posture-B fail-closed for production PHI (BACKLOG #200, ASVS 4.2.1/4.4.1, 11.6.2).**
+The original §0 gate *allows* a declared-upstream-terminator (Posture-B) bind unconditionally once
+`trusted_proxies` is set. That leaves two properties the engine cannot verify for itself on a Posture-B
+bind — the authentication of the cleartext **proxy→engine internal hop**, and the proxy's negotiated
+**TLS/KEX floor** (the engine terminates no browser TLS there, so 11.6.2 runtime inspection is
+impossible). So the gate is tightened: a **production-PHI** Posture-B bind now **refuses to start**
+(`return 2`) unless the operator **affirmatively declares** both `[api].proxy_intra_service_auth`
+(≠ `"none"`) and `[api].proxy_tls_min_version` — **attestations made fail-closed**, mirroring the
+require_mfa PHI-prod ladder (refuse prod PHI / warn non-prod PHI / quiet synthetic) and
+`MEFOR_TLS_REVOCATION_ATTESTED` (ADR 0078). `--allow-insecure-bind` **cannot** bypass it (that override
+lives only in the no-TLS arm of the mutually-exclusive exposed-gate, which a Posture-B bind never
+reaches). This is an **extension, never a weakening** — loopback and synthetic instances start
+byte-identically. See [OFF-LOOPBACK-DEPLOYMENT.md](../security/OFF-LOOPBACK-DEPLOYMENT.md) row 1b.
+
 ### 1. WP-13a — Engine API + WebSocket TLS (primary termination path)
 
 Terminate TLS **in-process** via uvicorn, the self-contained default. Add to `ApiSettings`
@@ -182,6 +196,31 @@ enterprise healthcare — the engine stays `http` on a restricted interface **be
 - Document the proxy↔uvicorn framing agreement (4.2.1) and explicit duplicate-query-parameter handling
   (HPP, 15.3.7).
 
+**§4 extension — Posture-B attestations + mTLS-as-Identity (BACKLOG #200).**
+
+- **Proxy→engine hop + TLS/KEX floor attestations.** New `[api].proxy_intra_service_auth`
+  (`none`|`mtls`|`network`|`shared_secret`) and `[api].proxy_tls_min_version` (+ optional
+  `proxy_tls_ciphers`, validated forward-secret via `validate_proxy_tls_posture` in
+  [config/tls_policy.py](../../messagefoundry/config/tls_policy.py)) gate a production-PHI Posture-B bind
+  (§0 extension above). These are **operator attestations, not runtime inspection**: the engine cannot
+  observe the proxy's negotiated KEX in Posture-B, so it validates only the *coherence* of the
+  declaration at config load and asserts its *presence* fail-closed at start. We deliberately do **not**
+  over-claim runtime 11.6.2 enforcement on this path.
+- **mTLS client certificate → Identity (attested model).** With in-process mTLS (`tls_client_ca_file`,
+  `CERT_REQUIRED`), a verified peer cert's subject/SAN maps to a MessageFoundry principal via the
+  allow-list `[api].tls_client_cert_identities` (`"CN:…"` / `"SAN:type:value"` → username), resolved
+  **deny-by-default** by `resolve_client_cert_identity` beside `require()` in
+  [api/security.py](../../messagefoundry/api/security.py); a new additive
+  `AuthService.identity_for_username` turns the mapped username into an `Identity`. **Verified limitation
+  (not over-claimed):** stock uvicorn does **not** surface the peer certificate to the ASGI scope, so the
+  resolver is **inert under the shipped server** (it activates only when a TLS-extension-capable
+  server/shim populates `scope['transport']`). It ships as a **ready, deny-by-default, documented model**
+  — *not* a live authorization path, and it does **not** alter the bearer-token path. **Owner decision
+  (resolved 2026-07-10):** the mTLS-identity model is now **formalized in
+  [ADR 0083](0083-mtls-client-certificate-identity.md)** (owner-ratified), which owns the resolver design, its
+  verified inert-under-stock-uvicorn limitation, and the deferred activation (a scope-populating server shim +
+  guarded wiring that must not bypass step-up/MFA). This §4 records only the Posture-B attestations.
+
 ### Certificate revocation (12.1.4)
 
 TLS certificate **revocation** is delegated to the deploying organization's PKI rather than
@@ -204,12 +243,21 @@ side-channel that fights the on-prem, offline-by-default posture (see *Context*)
   trustworthy. This is **strict path validation, not revocation checking**, and it is deliberately
   *skipped* on the opt-in `tls_verify=false` (`CERT_NONE`) MLLP path, where nothing is being validated.
 
-**Residual (accepted, documented).** The in-process (uvicorn) API-TLS and direct MLLP-over-TLS
-termination paths do **not** perform live, in-engine revocation — a revoked-but-unexpired cert is not
-rejected by the engine itself on those paths. Operators who require enforced revocation terminate at
-the WP-15 proxy with OCSP-must-staple, and/or pair short-lived (e.g. ACME-rotated) certs with the
-cert-expiry alerting flagged under *Consequences*. This is the honest 12.1.4 posture —
-**Pass-with-documented-residual**, not a claim of in-engine OCSP.
+**Residual — now ENFORCED, not merely documented ([ADR 0078](0078-certificate-revocation-posture.md)).**
+The in-process (uvicorn) API-TLS and direct MLLP-over-TLS termination paths still perform **no** live,
+in-engine revocation — a revoked-but-unexpired cert is not rejected by the engine itself on those paths
+(stdlib `ssl` has no OCSP/CRL fetch and the on-prem, offline-by-default posture forbids a hand-rolled
+outbound responder side-channel). ADR 0078 turns that delegation into an **enforced start-time control**:
+`serve` **refuses to start** an in-process, off-loopback `[api]` TLS bind unless revocation is *proven
+in front* — a declared WP-15 TLS-terminating proxy (`tls_terminated_upstream` + `trusted_proxies`, which
+does its own OCSP-must-staple / CRL revocation) **or** an explicit operator attestation
+(`MEFOR_TLS_REVOCATION_ATTESTED=1`) that the terminator/PKI enforces revocation. The loopback default
+and the proxy-terminated path start byte-identically (the gate never fires). Operators who terminate
+in-process are steered to pair short-lived (e.g. ACME-rotated) certs with the cert-expiry alerting
+flagged under *Consequences*. This is the honest 12.1.4 posture — **Pass with an enforced-delegation
+control** (fail-closed by default + a documented opt-out), not a claim of in-engine OCSP. The
+MLLP-over-TLS per-connection enforced gate and the Postgres/REST/SOAP client paths are scope-adjacent
+residuals tracked in ADR 0078.
 
 ## Options considered
 

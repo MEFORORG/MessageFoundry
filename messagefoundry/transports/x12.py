@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.parsing.x12.delimiters import DEFAULT_MAX_INTERCHANGE_BYTES
@@ -43,7 +43,11 @@ from messagefoundry.transports.base import (
     register_destination,
     register_source,
 )
-from messagefoundry.transports.mllp import DEFAULT_MAX_CONNECTIONS, DEFAULT_RECEIVE_TIMEOUT
+from messagefoundry.transports.mllp import (
+    DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_RECEIVE_TIMEOUT,
+    InsecureHopGuard,
+)
 
 __all__ = ["X12Source", "X12Destination"]
 
@@ -85,8 +89,25 @@ class X12Destination(DestinationConnector):
         self.ta1_required: bool = bool(s.get("ta1_required", False))
         mib = s.get("max_interchange_bytes", DEFAULT_MAX_INTERCHANGE_BYTES)
         self.max_interchange_bytes: int | None = int(mib) if mib else None
+        # #200 (ADR 0092): X12-over-TCP has NO TLS at all, so every off-loopback egress is a cleartext PHI
+        # hop. Refuse a production-PHI hop at the enforced construction gate; allow loopback / synthetic /
+        # per-connection-attested hops (tls_hop_attested for a trusted-segment / proxy-terminated hop).
+        self._hop_guard = InsecureHopGuard.capture(
+            host=self.host,
+            port=self.port,
+            cell="X12 outbound",
+            description="cleartext X12-over-TCP egress",
+            attested=config.tls_hop_attested,
+            attested_reason=config.tls_hop_attested_reason,
+        )
+        self._hop_guard.enforce_construction()
 
-    async def send(self, payload: str) -> DeliveryResponse | None:
+    async def send(
+        self, payload: str, *, metadata: Mapping[str, str] | None = None
+    ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
+        # Zero-I/O byte-crossing backstop (#200) before the first byte (defense in depth against a reload
+        # routing PHI around the construction gate).
+        self._hop_guard.assert_send()
         # Read the returned interchange when capturing it, when a TA1 is contractually required, or for
         # the legacy expect_reply confirmation. Fire-and-forget (none set) is byte-identical to before.
         need_reply = self.expect_reply or self.capture_response or self.ta1_required

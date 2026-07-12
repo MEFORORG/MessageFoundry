@@ -88,8 +88,15 @@ _AUTH_SERVICE_METHODS: tuple[str, ...] = (
 )
 
 # app.state attributes the console SETS in mount_ui (ui_*) and READS via get_auth / _auth.py.
+# ``exposure_protected`` is a READ-ONLY, backward-compatible SOFT dependency: the console reads it
+# via ``getattr(app.state, "exposure_protected", False)`` in ``_auth.effective_https`` (proxy-TLS
+# cookie-name + /ui hardening keying), so an engine lacking it degrades gracefully rather than
+# breaking. It is curated here so a future engine RENAME becomes a reviewed seam change — but it
+# does NOT bump ``ENGINE_UI_SEAM``: a graceful-default read stays compatible with every seam, and a
+# bump would make a newer engine REFUSE an older console wheel (``SUPPORTED_ENGINE_SEAMS == {1}``).
 _APP_STATE_ATTRS: tuple[str, ...] = (
     "auth",
+    "exposure_protected",
     "public_origin",
     "ui_connections_render",
     "ui_csp",

@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from messagefoundry.console.client import ApiError, EngineClient
+from messagefoundry.apiclient import ApiError, EngineClient
 
 _WINDOWS = sys.platform == "win32"
 # Bound every shell-out so a hung child (a stuck WMI/Get-Process or lsof) can't wedge a poll tick.

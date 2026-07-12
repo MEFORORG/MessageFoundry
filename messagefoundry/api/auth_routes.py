@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import csv
+import io
 import json
 import logging
+from collections.abc import Iterator
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 
 # The /ui admin pages moved to the messagefoundry_webconsole package (Option B, ADR 0065); this module
 # no longer imports the console at all. It returns an engine-side AdminHandlers bundle (leaf type in
@@ -50,6 +54,7 @@ from messagefoundry.api.auth_models import (
     SessionList,
     SimpleMessage,
     UserCreateRequest,
+    UserPermissions,
     UserSummary,
     UserUpdateRequest,
 )
@@ -57,8 +62,9 @@ from messagefoundry.api.security import (
     bearer_token,
     get_auth,
     require,
-    require_reauth_only,
+    require_reauth_only_action,
     require_step_up,
+    require_step_up_action,
 )
 from messagefoundry.auth import (
     BUILTIN_ROLE_PERMISSIONS,
@@ -69,13 +75,39 @@ from messagefoundry.auth import (
     Role,
 )
 from messagefoundry.auth.permissions import CustomRoleError
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_MFA_CONFIRM,
+    STEP_UP_ACTION_MFA_DISABLE,
+    STEP_UP_ACTION_MFA_ENROLL,
+    AuthService,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.store.store import SessionRecord, UserRecord
 
 _VALID_ROLE_IDS = {role.value for role in Role}
 
 _log = logging.getLogger(__name__)
+
+
+# Leading characters that make a spreadsheet treat a CSV cell as a formula (=, +, -, @) or that can
+# smuggle one past a leading-whitespace trim (TAB/CR/LF). See OWASP "CSV Injection" / CWE-1236.
+_CSV_FORMULA_TRIGGERS = frozenset("=+-@\t\r\n")
+
+
+def _csv_safe(value: object) -> object:
+    """Neutralize spreadsheet formula injection (CWE-1236) in a CSV cell.
+
+    A compliance officer opening ``audit-export.csv`` in Excel/Sheets would otherwise let a
+    user-influenced field (actor/detail/…) starting with ``= + - @`` — or a leading TAB/CR/LF ahead of
+    one — execute as a formula/DDE payload. If the (whitespace-stripped) string begins with such a
+    trigger, prefix a single apostrophe so the spreadsheet renders it as literal text. Non-strings and
+    benign strings pass through unchanged."""
+    if not isinstance(value, str) or not value:
+        return value
+    # A raw leading TAB/CR/LF is itself a trigger; ``=+-@`` count even behind ordinary leading spaces.
+    if value[0] in _CSV_FORMULA_TRIGGERS or value.lstrip()[:1] in _CSV_FORMULA_TRIGGERS:
+        return "'" + value
+    return value
 
 
 def _session_info(session: SessionRecord, current_token_hash: str) -> SessionInfo:
@@ -284,7 +316,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise _rate_limited(request, "reauth")
         token = bearer_token(request)
         if token is None or not await service.reauth(
-            identity, body.password, token=token, client=_client(request)
+            identity,
+            body.password,
+            token=token,
+            client=_client(request),
+            # ADR 0077: bind the fresh proof to the action the caller named (the value the 403 handed
+            # back in X-Step-Up-Action). None => refresh only the session window, as before.
+            purpose=body.purpose,
         ):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "re-verification failed")
         return SimpleMessage(detail="re-verified")
@@ -326,11 +364,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.post("/me/mfa/enroll", response_model=MfaEnrollResponse)
     async def enroll_mfa(
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_reauth_only()),
+        identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_MFA_ENROLL)),
     ) -> MfaEnrollResponse:
         """Begin TOTP enrollment: stage a secret and return it + the ``otpauth://`` URI for the QR.
-        Gated by a recent **password** step-up (not MFA — you may have none yet); not active until
-        confirmed via ``/me/mfa/confirm``."""
+        Gated by a fresh **password** step-up BOUND to this enroll action (ADR 0077 — not MFA, you may
+        have none yet; and not the shared login window, so a hijacked session can't bind a factor); not
+        active until confirmed via ``/me/mfa/confirm``."""
         if identity.auth_provider is AuthProvider.AD:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD accounts use directory MFA, not an engine TOTP"
@@ -346,10 +385,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         body: MfaConfirmRequest,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_reauth_only()),
+        identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_MFA_CONFIRM)),
     ) -> MfaConfirmResponse:
         """Confirm a staged enrollment by proving a live TOTP code; activates MFA and returns the
-        single-use recovery codes (shown **once** — save them). A wrong code is a 400."""
+        single-use recovery codes (shown **once** — save them). A wrong code is a 400. Gated by a fresh
+        password step-up BOUND to this confirm action (ADR 0077), independent of the enroll grant."""
         if not service.allow_login_attempt(_client(request)):
             raise _rate_limited(request, "mfa-confirm")
         token = bearer_token(request)
@@ -369,10 +409,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def disable_my_mfa(
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_step_up()),
+        identity: Identity = Depends(require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)),
     ) -> SimpleMessage:
         """Self-service: turn off the caller's TOTP MFA. Step-up gated — you prove your current factor
-        (a TOTP or recovery code via ``/auth/mfa-verify``) and a recent password."""
+        (a TOTP or recovery code via ``/auth/mfa-verify``) and a fresh password BOUND to this disable
+        action (ADR 0077): a hijacked session inside the login window can't silently strip MFA."""
         await service.disable_mfa(identity, client=_client(request))
         return SimpleMessage(detail="MFA disabled")
 
@@ -540,6 +581,30 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             role_ids = await service.store.get_user_role_ids(user.id)
             summaries.append(_user_summary(user, role_ids))
         return summaries
+
+    @app.get("/users/{user_id}/permissions", response_model=UserPermissions)
+    async def get_user_permissions(
+        user_id: str,
+        service: AuthService = Depends(_service),
+        _: Identity = Depends(require(Permission.USERS_READ)),
+    ) -> UserPermissions:
+        """Effective-permission inspector (BACKLOG #177): resolve the FLATTENED effective permission
+        set — built-in-role ∪ custom-role ∪ extras — for an arbitrary user id, for RBAC
+        troubleshooting. Reuses the same ``Identity.build`` flattening path ``/auth/me`` uses for the
+        caller (via :meth:`AuthService.identity_for_user_id`) rather than re-deriving the union.
+        Gated like ``/users`` (``USERS_READ``, deny-by-default); a non-existent user id 404s."""
+        resolved = await service.identity_for_user_id(user_id)
+        if resolved is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
+        # The flattened Identity carries only built-in Roles; list the actual held role ids (built-in +
+        # custom:) so an operator can see WHERE a grant came from, mirroring _user_summary.
+        role_ids = await service.store.get_user_role_ids(user_id)
+        return UserPermissions(
+            user_id=resolved.user_id,
+            username=resolved.username,
+            roles=sorted(role_ids),
+            permissions=sorted(p.value for p in resolved.permissions),
+        )
 
     @app.post("/users", response_model=UserSummary, status_code=status.HTTP_201_CREATED)
     async def create_user(
@@ -772,13 +837,21 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     # --- audit ---------------------------------------------------------------
 
-    @app.get("/audit", response_model=AuditList)
-    async def list_audit(
-        service: AuthService = Depends(_service),
-        _: Identity = Depends(require(Permission.AUDIT_READ)),
-        limit: int = Query(100, ge=1, le=1000),
+    async def _audit_list(
+        service: AuthService,
+        *,
+        limit: int = 100,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
     ) -> AuditList:
-        rows = await service.store.list_audit(limit=limit)
+        # Plain-default core shared by the HTTP route below and the webconsole seam wrapper. Every value
+        # is passed as a keyword to the store, which binds it as a SQL parameter across all three backends
+        # (BACKLOG #170) — filters are never string-interpolated into the query.
+        rows = await service.store.list_audit(
+            limit=limit, actor=actor, action=action, since=since, until=until
+        )
         return AuditList(
             entries=[
                 AuditEntry(
@@ -790,6 +863,101 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 )
                 for r in rows
             ]
+        )
+
+    @app.get("/audit", response_model=AuditList)
+    async def list_audit(
+        service: AuthService = Depends(_service),
+        _: Identity = Depends(require(Permission.AUDIT_READ)),
+        limit: int = Query(100, ge=1, le=1000),
+        actor: str | None = Query(None, max_length=256),
+        action: str | None = Query(None, max_length=128),
+        since: float | None = Query(
+            None, description="inclusive lower bound on the epoch-float ts"
+        ),
+        until: float | None = Query(
+            None, description="inclusive upper bound on the epoch-float ts"
+        ),
+    ) -> AuditList:
+        return await _audit_list(
+            service, limit=limit, actor=actor, action=action, since=since, until=until
+        )
+
+    async def _audit_ui_list(*, service: AuthService, _: Identity, limit: int = 100) -> AuditList:
+        # The webconsole /ui/audit page invokes this seam callable DIRECTLY (not through FastAPI), so its
+        # defaults MUST be plain values — a route Query(...) sentinel must never reach the store bind
+        # (BACKLOG #170 regression guard: 'type Query is not supported'). The UI shows the full trail;
+        # filter + CSV export are the JSON GET /audit surface. AUDIT_READ is enforced by the webconsole
+        # route's own require_ui dependency, so this wrapper carries no auth dependency of its own.
+        return await _audit_list(service, limit=limit)
+
+    @app.get("/audit/export")
+    async def export_audit(
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(require(Permission.AUDIT_EXPORT)),
+        format: str = Query("csv", pattern="^csv$"),
+        limit: int = Query(10000, ge=1, le=1_000_000),
+        actor: str | None = Query(None, max_length=256),
+        action: str | None = Query(None, max_length=128),
+        since: float | None = Query(
+            None, description="inclusive lower bound on the epoch-float ts"
+        ),
+        until: float | None = Query(
+            None, description="inclusive upper bound on the epoch-float ts"
+        ),
+    ) -> StreamingResponse:
+        """Stream the filtered audit trail as a downloadable CSV report (BACKLOG #170), so a compliance
+        officer can produce a scoped, offline audit report without a downstream SIEM.
+
+        Same filters and the same parameterized store query as ``GET /audit``, gated by the dedicated
+        ``audit:export`` permission. Only PHI-safe audit metadata is emitted — ``ts, actor, action,
+        channel_id, detail`` — the exact columns ``GET /audit`` already returns; the audit writers store
+        only filter shapes / counts / ids in ``detail`` (never a raw message body), so no PHI leaves on
+        this path. The export itself is recorded as an ``audit.export`` event (who, which filter, how
+        many rows)."""
+        rows = await service.store.list_audit(
+            limit=limit, actor=actor, action=action, since=since, until=until
+        )
+        # Record the export as its own audit event BEFORE streaming — the detail is metadata only (the
+        # applied filter + row count), never a message body.
+        await service.store.record_audit(
+            "audit.export",
+            actor=identity.username,
+            detail=json.dumps(
+                {
+                    "format": "csv",
+                    "count": len(rows),
+                    "filter": {
+                        "actor": actor,
+                        "action": action,
+                        "since": since,
+                        "until": until,
+                        "limit": limit,
+                    },
+                }
+            ),
+        )
+
+        def _iter_csv() -> Iterator[str]:
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(["ts", "actor", "action", "channel_id", "detail"])
+            yield buf.getvalue()
+            for r in rows:
+                buf.seek(0)
+                buf.truncate(0)
+                # Neutralize spreadsheet formula injection (CWE-1236) in every string cell before it
+                # reaches the CSV a compliance officer may open in Excel/Sheets.
+                writer.writerow(
+                    _csv_safe(c)
+                    for c in (r["ts"], r["actor"], r["action"], r["channel_id"], r["detail"])
+                )
+                yield buf.getvalue()
+
+        return StreamingResponse(
+            _iter_csv(),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="audit-export.csv"'},
         )
 
     # The /ui admin/account/audit pages moved to messagefoundry_webconsole (Option B, ADR 0065). Return
@@ -818,7 +986,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         change_password=change_password,
         enroll_mfa=enroll_mfa,
         disable_my_mfa=disable_my_mfa,
-        list_audit=list_audit,
+        list_audit=_audit_ui_list,
         my_security_events=my_security_events,
         user_summary=_user_summary,
         current_user=_current_user,

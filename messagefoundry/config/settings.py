@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import tomllib
+from datetime import date
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Mapping
@@ -40,7 +41,14 @@ from messagefoundry.config.models import (
     RetryPolicy,
     StallThreshold,
 )
-from messagefoundry.config.tls_policy import validate_tls_ciphers
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    TrustAnchorMode,
+    TrustAnchorPolicy,
+    current_hop_posture,
+    validate_proxy_tls_posture,
+    validate_tls_ciphers,
+)
 from messagefoundry.logging_setup import LOG_LEVELS
 from messagefoundry.service_status import is_safe_service_name
 
@@ -50,9 +58,11 @@ __all__ = [
     "SqlAuth",
     "StoreSettings",
     "ApiSettings",
+    "TlsSettings",
     "InboundSettings",
     "DeliverySettings",
     "PipelineSettings",
+    "SandboxSettings",
     "DiagnosticsSettings",
     "EnvironmentsSettings",
     "LoggingSettings",
@@ -82,6 +92,7 @@ __all__ = [
 _SECTIONS = (
     "store",
     "api",
+    "tls",
     "inbound",
     "delivery",
     "environments",
@@ -155,6 +166,49 @@ def insecure_tls_allowed() -> bool:
     ``MEFOR_ALLOW_INSECURE_TLS`` is truthy. This means a production deployment can't silently disable
     server-cert validation; an operator must opt in loudly for a trusted-network dev/test bind."""
     return os.environ.get(INSECURE_TLS_ESCAPE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def hop_insecure_escape_downgrades(*, production: bool) -> bool:
+    """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may downgrade an insecure-hop REFUSE→WARN here (#200).
+
+    The **clamp** on the blunt global escape for the posture-keyed hop refusal (ADR 0092, decision 2):
+    the escape may only relax a hop REFUSE to WARN on a **non-production** instance. On production it is
+    **inert** for hop refusal — it can NEVER satisfy a production-PHI hop (a deliberate behaviour change
+    from the pre-#200 global escape, which silenced the refusal in every environment). Cells pass the
+    result as :func:`~messagefoundry.config.tls_policy.insecure_hop_disposition`'s ``audited_opt_out``
+    argument, so on production that argument is always ``False`` and the ``production`` REFUSE arm wins.
+    Attestation (per-connection ``tls_hop_attested``) is the only way to cross a prod-PHI hop."""
+    return insecure_tls_allowed() and not production
+
+
+def weakened_tls_escape_permitted(posture: HopPosture | None = None) -> bool:
+    """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may permit a weakened / verify-off TLS hop under ``posture``,
+    CLAMPED so a production-PHI hop is NEVER relaxed (#200, ADR 0092 decision 2).
+
+    The is_phi-blind **strict verify-off** cells — the engine<->store TLS gate
+    (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
+    and FTPS ``tls_verify=false`` contexts, and the credentialed plain-``ftp`` guard — route their global-
+    escape check through here so the blunt escape can no longer silence a **production-PHI** refusal
+    (matching the ``--allow-insecure-bind`` API-bind clamp). Pass the construction-time
+    :func:`~messagefoundry.config.tls_policy.current_hop_posture` (transport cells) or the store's threaded
+    posture. Semantics: the escape must be set at all, AND the hop must not be production-PHI. ``None``
+    (a backup utility / embedding / test outside the construction gate) falls back to the **unclamped**
+    escape — byte-identical to pre-#200 — since the enforced serve/reload gate already vetted the real
+    production posture, so this fallback never loosens the clamp."""
+    if not insecure_tls_allowed():
+        return False
+    if posture is None:
+        return True
+    return not (posture.production and posture.is_phi)
+
+
+def weakened_tls_escape_permitted_here() -> bool:
+    """:func:`weakened_tls_escape_permitted` keyed on the ACTIVE construction posture (#200).
+
+    Convenience for a transport cell built inside the ``active_hop_posture`` construction scope: reads
+    :func:`~messagefoundry.config.tls_policy.current_hop_posture` itself so the call site stays a drop-in
+    replacement for the old bare ``insecure_tls_allowed()`` check."""
+    return weakened_tls_escape_permitted(current_hop_posture())
 
 
 #: Env var that explicitly permits loading config from a source a low-privileged principal can write
@@ -277,14 +331,27 @@ class StoreSettings(_Section):
     auth: SqlAuth = SqlAuth.SQL
     username: str | None = None
     password: str | None = None  # secret — supply via MEFOR_STORE_PASSWORD, never the file
+    # Delegated-identity precondition (#203, ASVS 13.2.1/13.3.2). Off by default. When true, `serve`
+    # asserts the store authenticates via a MANAGED / DELEGATED identity (Windows Integrated or Entra),
+    # NOT a static username+password: a production instance refuses to start and a non-production one
+    # warns if the store uses a static credential. It makes the operator's least-privilege identity
+    # posture a CHECKED precondition rather than a silent assumption. SQLite (a local file, no network
+    # credential) is exempt; Postgres has no managed-identity auth mode, so it cannot satisfy it. Admin
+    # device posture + AD/SMTP managed identity stay deployment-delegated (see docs/SECURITY.md).
+    require_managed_identity: bool = False
     encrypt: bool = True
     trust_server_certificate: bool = False
-    # Optional PEM CA bundle to verify the DB server certificate against a PRIVATE / self-signed CA (the
-    # common hospital-estate posture) WITHOUT installing it box-globally into the OS trust store. POSTGRES
-    # ONLY: asyncpg takes an SSLContext, so this loads ssl.create_default_context(cafile=...). SQL Server
-    # (ODBC Driver 18) has NO connection-string CA-file keyword — it validates against the OS trust store —
-    # so it is REJECTED for the sqlserver backend (install the CA into the Windows machine trust store
-    # instead). A path, not a secret. Empty = use the system trust store (the secure default).
+    # Optional certificate file to verify the DB server certificate against a PRIVATE / self-signed CA (the
+    # common hospital-estate posture) WITHOUT installing it box-globally into the OS trust store. Honored by
+    # BOTH server-DB backends (#45), on the SECURE posture only (encrypt=true, trust_server_certificate=false)
+    # — it NEVER disables verification:
+    #   * POSTGRES — asyncpg takes an SSLContext, so this loads ssl.create_default_context(cafile=...), a
+    #     CA-bundle pin (chain + hostname still verified).
+    #   * SQL SERVER — the ODBC Driver 18.1+ `ServerCertificate` keyword pins the server's certificate by
+    #     file (a leaf/exact-cert match, brace-quoted STORE-5-safe); requires ODBC Driver 18.1 or newer.
+    # REJECTED for SQLite (no TLS at all). A path, not a secret — it may live in the config file /
+    # connections.toml. Empty = use the system trust store (the secure default). Existence is checked at load
+    # (a missing file fails loud here, not confusingly at connect).
     ssl_root_cert: str | None = None
     # SQL SERVER ONLY: emit the ODBC `MultiSubnetFailover=Yes` keyword so a client connecting to an
     # Always On Availability Group *listener* reaches the current PRIMARY promptly across subnets,
@@ -328,6 +395,28 @@ class StoreSettings(_Section):
     # slots; an explicit value is clamped to pool_size-1. A pool of 1 is never warmed. At the default
     # pool_size=40 this resolves to min(39, 20) = 20 pre-opened connections per server-DB engine at startup.
     warm_pool_target: int | None = None
+
+    def managed_identity_precondition(self) -> str | None:
+        """When ``require_managed_identity`` is set, the reason the store VIOLATES the delegated-
+        identity precondition (#203, ASVS 13.2.1/13.3.2), or ``None`` when it is satisfied / the flag
+        is off. SQLite (a local file) is exempt; SQL Server must use Integrated/Entra auth; Postgres
+        has no managed-identity mode. The caller (``serve``) refuses on production, warns otherwise."""
+        if not self.require_managed_identity:
+            return None
+        if self.backend is StoreBackend.SQLITE:
+            return None  # a local file has no network credential to delegate
+        if self.backend is StoreBackend.SQLSERVER:
+            if self.auth in (SqlAuth.INTEGRATED, SqlAuth.ENTRA):
+                return None
+            return (
+                "the SQL Server store uses a static SQL login ([store].auth='sql'); "
+                "set [store].auth to 'integrated' (gMSA) or 'entra'"
+            )
+        return (
+            "the Postgres store authenticates with a static username+password (no managed-identity "
+            "mode); use a SQL Server store with [store].auth='integrated'/'entra', or clear "
+            "[store].require_managed_identity"
+        )
 
     @field_validator("lease_ttl_seconds")
     @classmethod
@@ -406,18 +495,27 @@ class StoreSettings(_Section):
                 raise ValueError(f"{label} backend requires: " + ", ".join(missing))
         return self
 
-    @model_validator(mode="after")
-    def _ssl_root_cert_postgres_only(self) -> "StoreSettings":
-        """``ssl_root_cert`` pins a private CA for server-cert verification, but only the Postgres backend
-        can honor it (asyncpg accepts an SSLContext). SQL Server's ODBC Driver 18 has no connection-string
-        CA-file keyword (it validates against the OS trust store) and SQLite uses no TLS, so setting it
-        there is a silent no-op — fail loud instead of leaving the operator thinking a private CA is pinned."""
-        if self.ssl_root_cert and self.backend is not StoreBackend.POSTGRES:
+    @field_validator("ssl_root_cert")
+    @classmethod
+    def _ssl_root_cert_exists(cls, value: str | None) -> str | None:
+        """Fail loud at load if the pinned cert path is missing, rather than surfacing a confusing
+        error only at connect (#45). A path, not a secret — cheap to stat here. Empty/unset = no-op."""
+        if value and not Path(value).is_file():
             raise ValueError(
-                "[store].ssl_root_cert is supported only by the postgres backend (asyncpg accepts an "
-                f"SSLContext); backend={self.backend.value!r}. For SQL Server, install the DB's CA into "
-                "the OS trust store (ODBC Driver 18 has no connection-string CA-file option); SQLite "
-                "uses no TLS."
+                f"[store].ssl_root_cert path does not exist or is not a file: {value!r}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _ssl_root_cert_backend(self) -> "StoreSettings":
+        """``ssl_root_cert`` pins the DB server certificate for verification (#45). Both server-DB
+        backends honor it — Postgres as an asyncpg SSLContext CA-bundle, SQL Server via the ODBC Driver
+        18.1+ ``ServerCertificate`` keyword — but SQLite uses no TLS, so setting it there is a silent
+        no-op: fail loud instead of leaving the operator thinking a private CA is pinned."""
+        if self.ssl_root_cert and self.backend is StoreBackend.SQLITE:
+            raise ValueError(
+                "[store].ssl_root_cert requires a server-DB backend (postgres or sqlserver); "
+                "SQLite uses no TLS, so pinning a certificate has no effect."
             )
         return self
 
@@ -461,6 +559,17 @@ class ApiSettings(_Section):
     tls_ciphers: str | None = None
     # Optional CA bundle to verify CLIENT certs (mTLS for the console; opt-in, future).
     tls_client_ca_file: str | None = None
+    # mTLS client-cert → MessageFoundry principal map (#200, ADR 0002). Meaningful only with in-process
+    # mTLS (tls_client_ca_file set, so uvicorn CERT_REQUIRED-verifies the client). A VERIFIED peer cert's
+    # subject CN / SAN is resolved to an existing username via this ALLOW-LIST, and that principal's RBAC
+    # authorizes the request (a service-to-service identity that carries no bearer token). Keys are the
+    # QUALIFIED cert name "CN:<commonName>" or "SAN:<type>:<value>" (e.g. "SAN:DNS:svc.internal"); values
+    # are existing usernames. DENY-BY-DEFAULT: an unmapped verified cert — or any spoofed CN not present
+    # here — resolves to no identity and is denied. Structured map → TOML-only (no env-string form). An
+    # empty map (default) disables cert-identity, byte-identical to the pre-#200 mTLS-for-transport-only
+    # behavior. NOTE (honest): stock uvicorn does NOT surface the peer cert to the ASGI scope, so this
+    # resolver is inert until a TLS-extension-capable server/shim populates it — see api/security.py.
+    tls_client_cert_identities: dict[str, str] = {}
 
     # --- Reverse-proxy / upstream TLS termination (WP-15, ADR 0002) --------
     # Proxy IPs whose X-Forwarded-For/-Proto headers are trusted (uvicorn forwarded_allow_ips). Empty =
@@ -471,6 +580,29 @@ class ApiSettings(_Section):
     # non-loopback bind satisfy the exposed-gate WITHOUT in-process TLS — but only when trusted_proxies
     # is set (so the engine knows a terminator is really in front).
     tls_terminated_upstream: bool = False
+
+    # --- Posture-B (upstream TLS termination) attestations (#200, ADR 0002) --------
+    # In Posture-B the proxy terminates browser TLS and the proxy→engine hop is a plaintext segment on
+    # the internal network. The ENGINE cannot observe the proxy's negotiated TLS/KEX or authenticate the
+    # internal hop for itself, so a PHI-PRODUCTION Posture-B bind must not start on trust alone. These are
+    # operator ATTESTATIONS made FAIL-CLOSED (mirroring MEFOR_TLS_REVOCATION_ATTESTED): the serve gate
+    # REFUSES a production-PHI Posture-B bind unless both are affirmatively declared (warns on non-prod
+    # PHI, quiet on synthetic — byte-identical). They are NOT runtime enforcement (see the honest docs).
+    #
+    # proxy_intra_service_auth — HOW the proxy→engine hop is authenticated so a rogue peer on the internal
+    #   segment cannot impersonate the proxy. "none" (default) is undeclared → refuse on prod-PHI. Declare
+    #   "mtls" (the proxy presents a client cert), "network" (an isolated proxy↔engine segment / host
+    #   firewall allow-list), or "shared_secret" (a pre-shared header the proxy injects). Attestation only.
+    proxy_intra_service_auth: Literal["none", "mtls", "network", "shared_secret"] = "none"
+    # proxy_tls_min_version — the operator-DECLARED TLS version floor the reverse proxy negotiates with
+    # browsers ("1.2"/"1.3"). None (default) = undeclared → refuse on prod-PHI Posture-B. The engine
+    # terminates no browser TLS here, so it cannot inspect the proxy's version (11.6.2) — this is the
+    # attested floor, validated only for coherence at load.
+    proxy_tls_min_version: str | None = None
+    # proxy_tls_ciphers — an OPTIONAL declared OpenSSL cipher list for that proxy floor. When set it must
+    # resolve to forward-secret (EC)DHE suites (ASVS 11.6.2), reusing the in-process cipher validator, so
+    # a declared floor can't itself name a non-forward-secret key exchange. None = no cipher declaration.
+    proxy_tls_ciphers: str | None = None
 
     @property
     def tls_enabled(self) -> bool:
@@ -489,6 +621,18 @@ class ApiSettings(_Section):
         TLS gate and the MFA-at-exposure advisory (``serve``) don't apply. Treats ``127.0.0.1``,
         ``localhost`` and ``::1`` as loopback (a dual-stack box never spuriously counts as exposed)."""
         return self.host in ("127.0.0.1", "localhost", "::1")
+
+    @property
+    def proxy_intra_service_declared(self) -> bool:
+        """Whether the Posture-B proxy→engine intra-service-auth posture is affirmatively declared
+        (#200). ``"none"`` (the default) is undeclared → a prod-PHI Posture-B bind refuses."""
+        return self.proxy_intra_service_auth != "none"
+
+    @property
+    def proxy_tls_floor_declared(self) -> bool:
+        """Whether the Posture-B proxy TLS/KEX floor is declared (#200): a ``proxy_tls_min_version`` is
+        set. Undeclared → a prod-PHI Posture-B bind refuses (the engine cannot observe the proxy's TLS)."""
+        return self.proxy_tls_min_version is not None
 
     @field_validator("public_origin", mode="after")
     @classmethod
@@ -547,11 +691,70 @@ class ApiSettings(_Section):
             raise ValueError(
                 "tls_key_file / tls_key_password / tls_client_ca_file require [api].tls_cert_file"
             )
+        # A cert-identity ALLOW-LIST only means anything when the engine actually verifies client certs
+        # (in-process mTLS): without tls_client_ca_file no peer cert is validated, so a mapping would be
+        # a false sense of a service identity. Fail loud at load, not silently ignore it (#200).
+        if self.tls_client_cert_identities and not self.tls_client_ca_file:
+            raise ValueError(
+                "[api].tls_client_cert_identities requires [api].tls_client_ca_file (in-process mTLS "
+                "verifies the client cert before its subject is resolved to a principal)"
+            )
         # An upstream TLS terminator only satisfies the exposed-gate when the engine knows (and trusts)
         # the proxy in front — otherwise it's an unverifiable claim that XFF could spoof.
         if self.tls_terminated_upstream and not self.trusted_proxies:
             raise ValueError("[api].tls_terminated_upstream requires [api].trusted_proxies")
+        # Validate the DECLARED Posture-B proxy TLS floor for internal coherence (#200, ASVS 11.6.2) —
+        # an attestation, but a *coherent* one (a NIST version floor; forward-secret ciphers if named).
+        validate_proxy_tls_posture(self.proxy_tls_min_version, self.proxy_tls_ciphers)
         return self
+
+
+class TlsSettings(_Section):
+    """``[tls]`` — the instance-wide client **trust-anchor** policy (#190, ADR 0093).
+
+    A small, shared fallback for outbound connectors that verify a downstream *server* certificate
+    (MLLP/DICOM/FTPS today). By default the OS trust store roots verify the peer; a hospital estate
+    whose internal endpoints present a PRIVATE / internal-CA cert can pin that CA here once instead of
+    installing it box-globally or repeating a per-connection ``tls_ca_file``. This is a CLIENT trust
+    anchor — it selects WHICH roots verify the peer, it NEVER disables verification — so it composes
+    with (never weakens) the connectors' fail-closed no-CA / ``tls_verify=false`` / cleartext-hop
+    refusals. A connection that names its **own** ``tls_ca_file`` always wins verbatim; a loopback hop
+    is exempt. Default (``internal_ca_file`` unset, ``trust_anchor_mode="system"``) = no-op, so a config
+    with no ``[tls]`` block builds a byte-identical SSL context."""
+
+    # PEM path to the org's internal CA (NOT a secret — a path, like tls_cert_file / forward_tls_ca_file).
+    # Empty (default) = no internal anchor; every hop uses the OS trust store (byte-identical).
+    internal_ca_file: str | None = None
+    # How internal_ca_file composes with the OS default roots for a non-loopback internal hop:
+    #   "system"  (default) — OS trust store only; internal_ca_file is ignored (byte-identical to today).
+    #   "augment" — OS roots AND the internal CA (a mixed public + private estate).
+    #   "pinned"  — ONLY the internal CA, not the public bundle (a fully-private estate; strictest,
+    #               the forward_tls_ca_file template).
+    trust_anchor_mode: TrustAnchorMode = "system"
+
+    @model_validator(mode="after")
+    def _check_pinned_requires_internal_ca(self) -> "TlsSettings":
+        # "pinned" is the exclude-public-CAs posture — trust ONLY the internal CA. With no
+        # internal_ca_file there is nothing to pin, so resolve_trust_anchor falls back to the full OS
+        # trust store: the operator asked to EXCLUDE public roots but silently got all of them (a
+        # fail-open misconfig). Refuse it at load (like [api]'s half-configured-TLS guards) so the
+        # intent can't collapse to a wider trust store. ("augment" without a CA is harmless — it equals
+        # "system" — and "system" ignores the field, so only "pinned" needs the anchor.)
+        if self.trust_anchor_mode == "pinned" and not self.internal_ca_file:
+            raise ValueError(
+                "[tls].trust_anchor_mode = 'pinned' requires [tls].internal_ca_file (pinned trusts "
+                "ONLY the internal CA; with no CA it would silently fall back to the full OS trust "
+                "store, defeating the exclusion of public CAs)"
+            )
+        return self
+
+    def policy(self) -> TrustAnchorPolicy:
+        """The resolved :class:`~messagefoundry.config.tls_policy.TrustAnchorPolicy` threaded onto each
+        outbound so a connector's client-verify context resolves the same anchor at build_check and
+        live construction (the internal-outbound context builders call ``resolve_trust_anchor``)."""
+        return TrustAnchorPolicy(
+            internal_ca_file=self.internal_ca_file, mode=self.trust_anchor_mode
+        )
 
 
 class InboundSettings(_Section):
@@ -692,6 +895,22 @@ class PipelineSettings(_Section):
     # back up within ~1 min while still collapsing the spin.
     infra_fault_backoff_cap: float = Field(default=60.0, gt=0)
 
+    # #109 (ADR 0095) partner-account-lockout protection. What an outbound File/FTP/SFTP sender does on
+    # a PERMANENT credential/auth fault (bad password, key rejected). "stop" (default) halts the lane
+    # IMMEDIATELY (not after a streak) and RETAINS the queued rows UN-ERRORED (they stay pending/
+    # claimable, never dead-lettered), so a backlog cannot repeatedly re-authenticate and lock out the
+    # partner account — reusing the STOP muscle (connection_stopped alert + reload/restart re-arm).
+    # "dead_letter" keeps the historical fail-fast behaviour (dead-letter just the offending row and
+    # advance). A content-permanent reject (AR/CR, no-such-dir) is UNAFFECTED — it still dead-letters.
+    credential_fault_policy: Literal["stop", "dead_letter"] = Field(default="stop")
+
+    # #147 (ADR 0095) per-connection active-window scheduler tick granularity (seconds). The runner
+    # reconciles each SCHEDULED connection's up/down state against its window calendar every tick; a
+    # window boundary is honoured within one tick. Only affects connections that declare a schedule
+    # (byte-identical always-on otherwise). Small enough for prompt boundaries, large enough to not busy-
+    # poll; injectable clock (tests) makes the boundary itself deterministic regardless of this value.
+    schedule_tick_seconds: float = Field(default=30.0, gt=0)
+
     # ADR 0071 B5 thread-hop fusion. DEFAULT-OFF and SQL-Server-scoped: when True AND the store backend
     # is SQL Server AND claim_mode="pooled", each fused stage (INGRESS/ROUTED) runs its off-loop CPU
     # stage (route_only/transform_one) together with its store handoff on a SINGLE dedicated-executor
@@ -731,6 +950,36 @@ class PipelineSettings(_Section):
     batch_handoff_statements: bool = Field(default=True)
 
 
+class SandboxSettings(_Section):
+    """``[sandbox]`` — opt-in subprocess isolation for Routers/Handlers (ADR 0087, BACKLOG #197).
+
+    Routers/Handlers are admin-authored pure Python the engine runs in its own address space (the
+    DEK, audit chain, and live sockets live there). ASVS 15.2.5 wants a hard isolation boundary; this
+    section turns one on. ``mode="off"`` (the default) runs them in-process, **byte-identically and
+    with zero overhead** — the isolation seam is invisible. ``mode="subprocess"`` runs each inbound's
+    Router/Handler in a **persistent per-inbound worker child** (never a per-message fork), enforcing
+    a forbidden-import guard (socket/store/crypto), the resource caps below, and a fail-closed refusal
+    of the live ``db_lookup``/``fhir_lookup`` bridges (they re-enter the event loop — a subprocess
+    boundary breaks that; a Handler needing live enrichment runs with ``mode=off``). An isolation
+    denial routes the message to ``ERROR``/dead-letter **post-ACK** (no NAK), never dropping it.
+
+    Reliability-core + read ONCE at engine construction (a ``/config/reload`` does NOT re-read it —
+    restart to change, exactly like ``claim_mode``)."""
+
+    # off (default, byte-identical, no subprocess) | subprocess (persistent per-inbound worker child).
+    mode: Literal["off", "subprocess"] = Field(default="off")
+    # Authoritative wall-clock cap (seconds) per Router/Handler call on EVERY platform: the parent
+    # kills a worker that overruns it, so a pathological busy-loop can never wedge intake. Floor > 0.
+    wall_seconds: float = Field(default=5.0, gt=0)
+    # POSIX-only RLIMIT_CPU backstop (seconds) inside the child (a no-op on Windows, where wall_seconds
+    # governs). Kept <= wall_seconds in spirit; the OS reaps a CPU-bound child sooner where supported.
+    cpu_seconds: float = Field(default=2.0, gt=0)
+    # POSIX-only RLIMIT_AS address-space cap (MiB) inside the child (no-op on Windows). None disables it.
+    mem_mb: int | None = Field(default=512, ge=1)
+    # Bound (seconds) on the one-time child bootstrap (config load + guard install) before start fails.
+    startup_seconds: float = Field(default=30.0, gt=0)
+
+
 class DiagnosticsSettings(_Section):
     """``[diagnostics]`` — the Corepoint-style event log (#46). Both switches are **on by default** and
     safe to be: ``connection_events`` writes only metadata (connection name, peer IP, a scrubbed
@@ -747,6 +996,15 @@ class DiagnosticsSettings(_Section):
     # captures the disposition metadata (ack_code/phase/outcome); the AA body is stored only on an
     # encrypted store, and every NAK body is NULL (the offending field value is never persisted).
     response_sent: bool = True
+    # Verbosity of the per-message `message_events` disposition log (#63). This governs how many rows
+    # the store writes to the `message_events` table — it does NOT touch the messages/queue disposition
+    # rows (count-and-log is separate) or the tamper-evident `audit_log` chain.
+    #   "all"    — record every event (the default; unchanged behavior).
+    #   "errors" — drop routine success events (received/delivered/replayed); keep the compliance floor.
+    #   "off"    — keep ONLY the compliance floor.
+    # COMPLIANCE FLOOR (retained at EVERY level, even "off"): `viewed` (a PHI-access record — the HIPAA
+    # message-view trail must never be dropped) and the terminal failure events `dead`/`error`/`failed`.
+    message_events: Literal["all", "errors", "off"] = "all"
 
 
 class EnvironmentsSettings(_Section):
@@ -775,11 +1033,16 @@ class LogFormat(str, Enum):
 
 
 class SyslogProtocol(str, Enum):
-    UDP = "udp"  # RFC 5426; fire-and-forget, never blocks the engine (the default)
-    TCP = (
-        "tcp"  # RFC 6587; connection-oriented (down-at-startup skipped; runtime stall bounded by a
-    )
-    #              socket timeout so a wedged collector can't block the event loop — synchronous send)
+    # RFC 5426; fire-and-forget, never blocks the engine (the default).
+    UDP = "udp"
+    # RFC 6587; connection-oriented (down-at-startup skipped; runtime stall bounded by a socket
+    # timeout so a wedged collector can't block the event loop — synchronous send).
+    TCP = "tcp"
+    # RFC 5425; syslog over an ssl-wrapped TCP socket (native, no local agent needed — ADR 0080). Same
+    # down-at-startup-skipped + bounded-timeout posture as tcp; the handshake is also bounded so a
+    # collector that stalls TLS can't block the event loop. Requires a CA trust anchor unless
+    # verification is explicitly disabled (see LoggingSettings.forward_tls_*).
+    TLS = "tls"
 
 
 class LoggingSettings(_Section):
@@ -800,22 +1063,51 @@ class LoggingSettings(_Section):
     # metering. Metadata only — the contents are never read.
     log_dir: str | None = None
 
-    # --- Off-box forwarding to a syslog/SIEM collector (ASVS 16.x) ----------
+    # --- Off-box forwarding to a syslog/SIEM collector (ASVS 16.x; ADR 0080) ----------
     # Ship a copy of every log record to a remote syslog collector so log evidence survives a host
-    # compromise (the local audit_log is tamper-evident, but lives on the same host). Off by default.
-    # PHI redaction applies to the forwarded stream exactly as to stdout, but the syslog transport
-    # itself is plaintext — terminate it at a local TLS-forwarding agent or keep it on a trusted
-    # management network (see docs/SECURITY.md / docs/PHI.md). The forwarder never blocks the engine
-    # indefinitely: UDP is fire-and-forget; a TCP collector unreachable at startup is skipped (warns),
-    # and a runtime stall is bounded by a socket timeout (record dropped). Synchronous send — for a
-    # high-volume feed prefer UDP or a local agent.
-    forward_enabled: bool = False
+    # compromise (the local audit_log is tamper-evident, but lives on the same host). PHI redaction
+    # applies to the forwarded stream exactly as to stdout. The forwarder never blocks the engine
+    # indefinitely: UDP is fire-and-forget; a TCP/TLS collector unreachable at startup is skipped
+    # (warns), and a runtime stall is bounded by a socket timeout (record dropped). Synchronous send —
+    # for a high-volume feed prefer UDP or a local agent.
+    #
+    # Default-on-when-configured (ADR 0080): None (the default) is DERIVED by the model validator to
+    # (forward_host is not None) — so pointing forward_host at a collector turns forwarding ON by
+    # default, forward_enabled=false is the explicit opt-out, and NO collector leaves it OFF (byte-
+    # identical to the pre-0080 stdout-only default). A literal True default is impossible: it would
+    # trip the forward_enabled-requires-host rule on an unconfigured engine.
+    forward_enabled: bool | None = None
     forward_host: str | None = None
     forward_port: int = 514
     forward_protocol: SyslogProtocol = SyslogProtocol.UDP
     # Wire format sent off-box, independent of the stdout `format`. JSON is the SIEM-friendly default and
     # guarantees one record per line; "text" framing is best-effort (a multi-line traceback spans lines).
     forward_format: LogFormat = LogFormat.JSON
+    # --- Native TLS-syslog (forward_protocol="tls"; RFC 5425, ADR 0080) ----------
+    # PEM trust anchor for the collector's certificate. With protocol="tls" and verification on this is
+    # REQUIRED (the validator enforces it): only this CA is trusted (system roots are NOT loaded), so an
+    # on-prem SIEM's private/self-signed cert is anchored explicitly instead of silently trusting the
+    # public CA bundle (which any public-CA cert could exploit to impersonate the collector).
+    forward_tls_ca_file: str | None = None
+    # Verify + hostname-check the collector's certificate (secure default). forward_tls_verify=false is
+    # the documented INSECURE opt-out (CERT_NONE, no CA file needed) — a lab / pinned-network only.
+    forward_tls_verify: bool = True
+    # Optional client cert (PEM cert+key chain) for mutual TLS to the collector. None = no client auth.
+    forward_tls_client_cert: str | None = None
+    # --- Startup clock-sync gate (ASVS 16.2.2; ADR 0080) ----------
+    # Cross-host log/audit correlation assumes the engine host's clock tracks a reference. This gate is
+    # OPT-IN because the engine cannot verify sync without an operator-chosen peer (default = a NO-OP,
+    # byte-identical startup). With require_time_sync + ntp_peer set, serve() runs a bounded SNTP probe
+    # before listeners start and WARNS loudly on skew (or an unreachable peer); with time_sync_fail_closed
+    # it REFUSES to start instead. See __main__.serve + logging_setup.query_sntp_offset.
+    require_time_sync: bool = False
+    ntp_peer: str | None = (
+        None  # NTP/SNTP host to compare the local clock against (required if the above)
+    )
+    time_sync_max_skew_seconds: float = 2.0  # |local - peer| above this is "skewed"
+    time_sync_fail_closed: bool = (
+        False  # refuse to start on skew / unreachable peer (further opt-in)
+    )
 
     @field_validator("level")
     @classmethod
@@ -834,12 +1126,43 @@ class LoggingSettings(_Section):
             raise ValueError("[logging].forward_port must be between 1 and 65535")
         return value
 
+    @field_validator("time_sync_max_skew_seconds")
+    @classmethod
+    def _check_skew_threshold(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("[logging].time_sync_max_skew_seconds must be > 0")
+        return value
+
     @model_validator(mode="after")
-    def _forward_needs_host(self) -> "LoggingSettings":
+    def _resolve_forwarding(self) -> "LoggingSettings":
+        # Default-on-when-configured: an unset forward_enabled follows whether a collector is named.
+        if self.forward_enabled is None:
+            self.forward_enabled = self.forward_host is not None
         if self.forward_enabled and not self.forward_host:
             raise ValueError(
                 "[logging].forward_enabled requires [logging].forward_host (the syslog/SIEM collector)"
             )
+        # Native TLS-syslog: verifying the collector needs an explicit CA anchor (see forward_tls_ca_file
+        # above). Only enforced when forwarding is actually on and verification is not opted out.
+        if (
+            self.forward_enabled
+            and self.forward_protocol is SyslogProtocol.TLS
+            and self.forward_tls_verify
+            and not self.forward_tls_ca_file
+        ):
+            raise ValueError(
+                "[logging].forward_protocol='tls' with certificate verification requires "
+                "[logging].forward_tls_ca_file (a PEM trust anchor for the collector); set "
+                "[logging].forward_tls_verify=false to accept an unverified server (insecure)"
+            )
+        # Clock-sync gate config coherence (the gate itself runs in serve()).
+        if self.require_time_sync and not self.ntp_peer:
+            raise ValueError(
+                "[logging].require_time_sync needs [logging].ntp_peer (an NTP/SNTP host to compare "
+                "the local clock against)"
+            )
+        if self.time_sync_fail_closed and not self.require_time_sync:
+            raise ValueError("[logging].time_sync_fail_closed requires [logging].require_time_sync")
         return self
 
 
@@ -900,6 +1223,12 @@ class RetentionSettings(_Section):
     # be high-volume (a connect-per-message sender, a probe storm), so it has its own short window in
     # HOURS (not days). 0 = inherit the message-body window (messages_days), the ADR 0021 §7.5 default.
     connection_event_retention_hours: int = 0
+    # Past N days, DELETE application LOG FILES (``.log``/``.txt``, one level) from the configured
+    # ``[logging].log_dir`` (#120). The supervisor (NSSM ``AppRotateBytes``) rotates the engine's daily
+    # logs by SIZE but never deletes them by AGE, so the log directory grows unbounded; this bounds it.
+    # 0 = keep forever (the default). Metadata only — file content is never read (no PHI). A no-op
+    # unless ``[logging].log_dir`` is set.
+    app_log_days: int = 0
     # Audit-log retention. RESERVED / not enforced: the audit_log is a tamper-evident hash chain and
     # HIPAA expects ~6-year retention, so audit is keep-forever by design here; archive-first pruning
     # is a tracked follow-up. Accepted (not rejected) so a forward-looking file still loads.
@@ -917,6 +1246,14 @@ class RetentionSettings(_Section):
     # "" = off. A daily off-peak time, not a cron expression, to avoid a new dependency — VACUUM holds
     # a write lock on the whole DB while it runs, so it is off by default and meant for a quiet window.
     vacuum_at: str = ""
+    # Secure-by-default opt-out (#186a, ASVS 14.2.4): on a PHI instance `serve` refuses to start (prod)
+    # / warns (non-prod) unless BOTH PHI-body retention windows are bounded — the inbound-body window
+    # (`messages_days`) and the dead-letter-body window (`dead_letter_days`), each of which keeps FULL
+    # raw PHI until purged — so PHI bodies do not accumulate without bound. Setting this true is the
+    # explicit, audited override that lets a PHI instance run with unbounded (keep-forever) retention.
+    # Off by default; ignored on a synthetic/non-PHI instance (exempt from the gate). See
+    # messagefoundry/__main__.py.
+    allow_unbounded_phi: bool = False
 
     @field_validator(
         "messages_days",
@@ -925,6 +1262,7 @@ class RetentionSettings(_Section):
         "max_db_mb",
         "state_max_age_days",
         "connection_event_retention_hours",
+        "app_log_days",
     )
     @classmethod
     def _non_negative_days(cls, value: int) -> int:
@@ -983,21 +1321,49 @@ class AuthSettings(_Section):
     # re-verified its credential — at login or via POST /me/reauth — within this many seconds. The
     # initial login counts as the first verification (sudo-timestamp model). Default 5 minutes.
     step_up_max_age_seconds: int = 300
+    # Action-bound step-up (ADR 0077; ASVS 7.5.1/8.2.4). When on (default), the durable-takeover
+    # JSON routes — TOTP enroll/confirm, disable-MFA — require a fresh proof BOUND to
+    # that specific action (POST /me/reauth with a matching `purpose`), single-use, instead of riding
+    # the session-wide step-up window. This closes the most-exploitable default: a session hijacked
+    # inside the 300s login-seeded window could otherwise bind an attacker's authenticator with no
+    # fresh proof. It changes ONLY those factor-binding routes; the broad admin/replay/config/purge
+    # routes keep the session-window step-up (7.5.3). Default True is secure-by-default and does not
+    # touch the loopback bind, TLS, or any collector path. Set False to revert to the legacy
+    # session-window behaviour (0.2.x semantics) — the documented org opt-out.
+    require_action_step_up: bool = True
 
     # Multi-factor authentication (WP-14, ADR 0002 §3; ASVS 6.3.3) — a native RFC 6238 TOTP second
     # factor for LOCAL accounts. AD/Kerberos MFA is delegated to the directory (Entra Conditional
     # Access / an MFA proxy), so a directory login is never prompted for an engine TOTP. When
     # require_mfa is on, a user holding the Administrator role MUST enroll TOTP and satisfy it before
-    # any step-up (sensitive) operation; non-admins may opt in voluntarily. Default OFF preserves
-    # today's loopback behavior byte-for-byte (on the 127.0.0.1 bind 6.3.3 is deferred-by-design with
-    # the single-trusted-host compensating control). An off-loopback bind that serves local accounts
-    # SHOULD turn this on; ``serve`` now makes that posture explicit (sec-mfa-on) — on an exposed
-    # (non-loopback) PHI bind with this off it **refuses to start** on a production instance and
-    # **warns** on a non-production one, mirroring the keyless-store / open-egress startup gates (see
-    # __main__._serve), so MFA can't be silently skipped at exposure. Scope: it gates **step-up
-    # (sensitive) operations** for the Administrator role — it is NOT a gate on every authenticated PHI
-    # read (those stay behind RBAC + the PHI-read throttle).
-    require_mfa: bool = False
+    # any step-up (sensitive) operation; non-admins may opt in voluntarily.
+    #
+    # Default ON (BACKLOG #187, secure-by-default + org opt-out): best practice is that an
+    # Administrator authenticates with a second factor, so the engine ships MFA required for the
+    # Administrator role out of the box, INCLUDING the default 127.0.0.1 loopback bind. This is an
+    # intentional break from the pre-#187 byte-identical-loopback posture — the owner chose the
+    # secure default over back-compat. It cannot lock a fresh admin out: a required-but-unenrolled
+    # Administrator can still reach the factor-enrollment routes (they are gated by a fresh PASSWORD
+    # step-up bound to the enroll/confirm action, never by the MFA gate — see
+    # api/security.py:require_reauth_only_action), so the bootstrap admin enrolls TOTP then satisfies
+    # it. Set ``require_mfa = false`` (the documented opt-out) to revert to the single-factor default.
+    # An off-loopback bind that serves local accounts MUST keep this on; ``serve`` makes that posture
+    # explicit (sec-mfa-on) — on an exposed (non-loopback) PHI bind with this **explicitly opted out**
+    # it **refuses to start** on a production instance and **warns** on a non-production one, mirroring
+    # the keyless-store / open-egress startup gates (see __main__._serve), so MFA can't be silently
+    # skipped at exposure. Scope: it gates **step-up (sensitive) operations** for the Administrator
+    # role — it is NOT a gate on every authenticated PHI read (those stay behind RBAC + the PHI-read
+    # throttle).
+    require_mfa: bool = True
+    # TOTP clock-skew tolerance, in 30-second time steps, applied when verifying a submitted code
+    # (BACKLOG #187; ASVS 6.5.5). Default 0 = STRICT: only the current 30 s step is accepted, so a
+    # captured code is replayable for at most the remainder of its own step (ASVS 6.5.5 prefers the
+    # tightest window). Set 1 (or 2) to restore RFC-6238 network-delay/clock-drift tolerance — the
+    # documented opt-out: 1 also accepts the immediately-prior and (fast-clock-clamped) next step, i.e.
+    # the historical ±1 behaviour. The forward half of the window is still clamped to the current step
+    # so tolerating a fast-clock code can't advance the single-use high-water mark (SEC-014); values
+    # above 2 are rejected (an over-wide window weakens replay resistance).
+    totp_skew_steps: int = 0
     # How many single-use recovery codes are minted at enrollment (the lost-authenticator escape
     # hatch). 0 disables recovery codes (an admin reset is then the only recovery path).
     mfa_recovery_code_count: int = 10
@@ -1070,6 +1436,19 @@ class AuthSettings(_Section):
     phi_read_rate_limit_global: int = 0  # max PHI reads across all users per window (0 = off)
     phi_read_rate_limit_window_seconds: float = 60.0
 
+    # Anti-automation on the state-changing admin surface (BACKLOG #193, ASVS 2.4.2): a per-actor
+    # sliding window folded into the step-up gate (require_step_up) for every NON-GET sensitive op —
+    # purge, replay, config deploy/reload. It paces scripted admin-write abuse on top of RBAC + step-up
+    # re-verification; the sole step-up GET (/messages/search) is exempt. The floor is set an order of
+    # magnitude above human console interaction AND above the worst-case 403 → /me/reauth → retry burst
+    # (that burst is only two writes), so an operator is never throttled while a machine-speed loop trips
+    # immediately. In-process only (front a proxy/WAF when exposed). enabled=False disables it.
+    admin_write_rate_limit_enabled: bool = True
+    admin_write_rate_limit_per_actor: int = (
+        12  # max state-changing admin writes per actor per window
+    )
+    admin_write_rate_limit_window_seconds: float = 1.0
+
     # Out-of-band user notification of security events (ASVS 6.3.5/6.3.7): email the affected user on
     # lockout / first-success-after-failures / password/email/role/disable changes. Email requires the
     # [alerts] SMTP transport to be configured (no SMTP → email is skipped); the audited
@@ -1081,6 +1460,18 @@ class AuthSettings(_Section):
     def _check_recovery_count(cls, value: int) -> int:
         if not 0 <= value <= 50:
             raise ValueError("mfa_recovery_code_count must be between 0 and 50 (0 = disabled)")
+        return value
+
+    @field_validator("totp_skew_steps")
+    @classmethod
+    def _check_totp_skew(cls, value: int) -> int:
+        # 0 = strict (current step only, ASVS 6.5.5); 1/2 = the documented network-delay opt-out. A
+        # negative window is meaningless and a wider-than-2 window materially weakens replay resistance.
+        if not 0 <= value <= 2:
+            raise ValueError(
+                "totp_skew_steps must be 0, 1, or 2 (0 = strict current-step only; "
+                "1/2 = RFC-6238 clock-skew tolerance)"
+            )
         return value
 
     @model_validator(mode="after")
@@ -1195,6 +1586,33 @@ class AiSettings(_Section):
         return dc, prod
 
 
+def hop_posture_from_ai(ai: AiSettings) -> HopPosture:
+    """The instance's :class:`~messagefoundry.config.tls_policy.HopPosture` for the #200 hop-refusal gate.
+
+    Maps the AI section's *derived* posture (built-in dev/staging/prod derivation applied) onto the
+    ``(is_phi, production)`` the transport cells decide on. ``is_phi`` keys on ``data_class == phi`` being
+    *explicitly* declared — an **undeclared** ``data_class`` is **not** PHI, exactly as the keyless-refusal
+    (§3), ``[egress]`` and #906 Posture-B gates all key on ``data_class == phi`` being set: a bare/default
+    on-prem config carries no PHI assertion, so its hops stay byte-identical (never newly refused). Only the
+    ``production`` dimension fails closed (``None`` → ``True``) — which matters solely once the instance
+    *has* declared PHI, splitting a declared-PHI hop between prod-REFUSE and staging-WARN. The construction
+    gate stamps the result via ``tls_policy.active_hop_posture`` (ADR 0092)."""
+    data_class, production = ai.derived_posture()
+    if data_class is not None:
+        # Resolved (a known env or an explicit data_class): PHI only if it is *phi*.
+        is_phi: bool | None = data_class is DataClass.PHI
+    elif ai.environment is None:
+        # Bare/default config — no environment AND no data_class declared. This carries no PHI
+        # assertion, so it is NOT PHI: its hops stay byte-identical (never newly refused), exactly
+        # as the keyless-refusal / [egress] / #906 gates all key on data_class == phi being set.
+        is_phi = False
+    else:
+        # A *custom* env is declared but leaves data_class unresolved — the operator asserted a
+        # non-standard deployment without a posture; fail closed (serve refuses such a start anyway).
+        is_phi = None
+    return HopPosture.fail_closed(is_phi=is_phi, production=production)
+
+
 class EgressSettings(_Section):
     """``[egress]`` — fail-closed outbound destination allowlist (WP-11c; ASVS 13.2.4/13.2.5/14.2.3).
 
@@ -1224,6 +1642,10 @@ class EgressSettings(_Section):
     allowed_remote: list[str] = []
     # Allowed EMAIL (SMTP) outbound hosts: each entry is "host" (any port) or "host:port" (ADR 0029).
     allowed_smtp: list[str] = []
+    # Allowed DIRECT (S/MIME-over-SMTP HISP relay) outbound hosts: each entry is "host" (any port) or
+    # "host:port" (ADR 0085). Kept SEPARATE from allowed_smtp so an operator can permit a Direct HISP
+    # relay without opening generic email egress (a distinct trust relationship carrying encrypted PHI).
+    allowed_direct: list[str] = []
 
     # Opt-in deny-by-default (Q5b): when true, a transport with an EMPTY allowlist refuses every
     # destination of that type instead of allowing any. A global on-ramp to fail-closed egress without
@@ -1239,6 +1661,7 @@ class EgressSettings(_Section):
         "allowed_db",
         "allowed_remote",
         "allowed_smtp",
+        "allowed_direct",
         mode="before",
     )
     @classmethod
@@ -1279,6 +1702,7 @@ _ALERT_EVENT_TYPES = frozenset(
         "queue_buildup",
         "storage_threshold",
         "cert_expiry",
+        "secret_rotation",  # #195b (ADR 0019 §5): a tracked secret is overdue/near-due for rotation
         "connection_error",  # #46: an outbound lane went down (connection_lost), throttled per lane
         "message_stall",  # #50: an outbound lane's oldest undelivered message aged past the threshold
         "integrity_drift",  # #54: startup attestation found in-place-tampered engine module(s)
@@ -1299,7 +1723,7 @@ class AlertRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # --- match (all conditions must hold) ---
-    event_type: str = "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry | connection_error | message_stall | integrity_drift | update_available | backup_failed
+    event_type: str = "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry | secret_rotation | connection_error | message_stall | integrity_drift | update_available | backup_failed
     connection: str = "*"  # fnmatch glob over the connection name; "*" = all
     min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
     min_oldest_seconds: float | None = Field(
@@ -1367,6 +1791,16 @@ class AlertsSettings(_Section):
     # flapping lane can't spam the channel.
     realert_seconds: float = 300.0
 
+    # Secure-by-default (#188, ASVS 6.3.5/6.3.7): out-of-band security-event notifications are required
+    # by default. On a PHI instance `serve` refuses to start (prod) / warns (non-prod) when no effective
+    # security-notification channel exists — SMTP transport (the settings above) configured AND the
+    # [auth].notify_security_events kill-switch on (both are what api/app.py needs to wire the notifier)
+    # — so account-security events (lockout, password/roles change, new-IP admin action) always have a
+    # push channel, not just the pull-only /me/security-events feed. Set false to accept the pull-only
+    # feed in writing (the explicit, audited opt-out). Ignored on a synthetic/non-PHI instance. See
+    # messagefoundry/__main__.py.
+    security_notifications_required: bool = True
+
     # Operator alert rules (ADR 0014): refine severity / which transports fire / cooldown / suppression
     # per event + connection. Empty = today's behaviour (every event → every transport, global throttle).
     # Authored as ``[[alerts.rules]]`` tables in the config file. First match wins.
@@ -1432,6 +1866,26 @@ class ClusterSettings(_Section):
     # MUST be < leader_lease_ttl_seconds so the old leader stops BEFORE the lease can expire and a standby
     # acquire — the split-brain guard. MUST be > heartbeat_seconds so a single missed renew doesn't fence.
     leader_fence_timeout_seconds: float = 20.0
+    # Leader-PREFERENCE handicap (ADR 0096). Seconds this node waits — MEASURED AGAINST THE LEASE-EXPIRY
+    # TIME on the DB clock — before it may claim an EXPIRED leadership lease. 0.0 (default) = no handicap
+    # (byte-identical to before this knob existed). A preferred site keeps its nodes at 0.0 and a warm
+    # remote-DR node at a positive value, so on a ROUTINE leadership transition (leader restart / patch /
+    # DB blip) the preferred node — which may claim the instant the lease expires — wins the take-over race
+    # and the DR node only becomes leader if no preferred node claims within the delay. It NEVER delays a
+    # RENEWAL by the current leader (only the take-over-of-expired path) and only ever makes a node WAIT
+    # LONGER than the un-handicapped expiry, so it can never open a two-leader window (the split-brain
+    # guarantee is preserved). It governs take-over of an EXPIRED lease (the routine-transition path); the
+    # very first election on an empty lease table is a plain race — use ``promotable`` / operator ordering
+    # to control cold bring-up. Must be >= 0.
+    acquire_delay_seconds: float = 0.0
+    # NON-PROMOTABLE standby flag (ADR 0096). True (default) = a normal HA node. False = this node may
+    # NEVER become leader: it never inserts a fresh lease, never takes over an expired one, and does not
+    # renew, so it can neither acquire nor retain leadership — a node that somehow already holds the lease
+    # steps down cleanly on its next maintenance tick (the fence watchdog is the backstop). Use it for a
+    # warm DR-site engine that must stay passive/read-only until an operator promotes it out-of-band. At
+    # least ONE promotable node MUST exist in the cluster, or no node ever acquires the lease and the graph
+    # never drains — an all-non-promotable cluster is a misconfiguration (documented, not guarded here).
+    promotable: bool = True
 
     @field_validator(
         "heartbeat_seconds",
@@ -1444,6 +1898,17 @@ class ClusterSettings(_Section):
     def _positive(cls, value: float) -> float:
         if value <= 0:
             raise ValueError("must be > 0")
+        return value
+
+    @field_validator("acquire_delay_seconds")
+    @classmethod
+    def _nonneg_acquire_delay(cls, value: float) -> float:
+        # 0.0 (the default) = no handicap; a negative delay would let a node claim BEFORE the lease
+        # expires (a two-leader window), so it is rejected at config load.
+        if value < 0:
+            raise ValueError(
+                "acquire_delay_seconds must be >= 0 (0 disables the leader-preference handicap)"
+            )
         return value
 
     @model_validator(mode="after")
@@ -1505,6 +1970,69 @@ class CertMonitorSettings(_Section):
     def _check_interval(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("cert_monitor.check_interval_seconds must be > 0")
+        return v
+
+
+class SecretRotationSettings(_Section):
+    """Periodic **secret-rotation reminder** (``[secret_rotation]``, ADR 0019 §5, BACKLOG #195b). Long-
+    lived secrets (the store data-encryption key today; connector credentials in a future
+    ``SecretProvider`` follow-on) have no natural expiry the way a TLS cert does, so nothing tells an
+    operator when one is overdue for rotation. This is the secret-side twin of ``[cert_monitor]``: the
+    engine periodically compares each tracked secret's **operator-configured last-rotated date** against
+    its **max age** and raises a ``secret_rotation_due`` alert when it is overdue or within ``warn_days``
+    of due. It reads **only** the rotation *dates* an operator supplied here — never any secret value
+    (PHI-free). Set ``warn_days`` to 0 to disable the reminder.
+
+    The store DEK is tracked **deny-by-default**: it is watched only once an operator sets
+    ``store_key_last_rotated`` (an ISO ``YYYY-MM-DD`` date). The connector-credential
+    ``SecretProvider`` generalization (AD/SQL/SMTP secrets off env) is a **design-only follow-on** (ADR
+    0019 §5) and is intentionally NOT tracked here yet."""
+
+    warn_days: int = (
+        14  # alert this many days before a secret is due for rotation (0 = reminder off)
+    )
+    check_interval_seconds: float = (
+        86_400.0  # rescan cadence (rotation is a slow signal; daily is ample)
+    )
+    # Store DEK tracking (deny-by-default): the operator records when the store encryption key was last
+    # rotated (ISO YYYY-MM-DD) + how long it may live. Unset last-rotated → the DEK is not tracked. These
+    # are DATES, not the key — never a secret value.
+    store_key_last_rotated: str | None = None
+    store_key_max_age_days: int = 365  # rotate the store DEK within this many days of last_rotated
+
+    @field_validator("warn_days")
+    @classmethod
+    def _check_warn_days(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("secret_rotation.warn_days must be >= 0 (0 disables the reminder)")
+        return v
+
+    @field_validator("check_interval_seconds")
+    @classmethod
+    def _check_interval(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("secret_rotation.check_interval_seconds must be > 0")
+        return v
+
+    @field_validator("store_key_max_age_days")
+    @classmethod
+    def _check_max_age(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("secret_rotation.store_key_max_age_days must be > 0")
+        return v
+
+    @field_validator("store_key_last_rotated")
+    @classmethod
+    def _check_last_rotated(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        try:
+            date.fromisoformat(v)
+        except ValueError as exc:
+            raise ValueError(
+                "secret_rotation.store_key_last_rotated must be an ISO date (YYYY-MM-DD); "
+                f"got {v!r}"
+            ) from exc
         return v
 
 
@@ -1587,6 +2115,11 @@ class IntegritySettings(_Section):
     # RECORD mismatch, so fail-closed-by-default would brick a legitimate patch. Opt in for hard
     # enforcement on a locked-down instance.
     fail_closed_on_drift: bool = False
+    # When true, the engine re-walks the tamper-evident audit hash-chain once at startup (#190). This is
+    # ALERT-ONLY: a broken chain logs a WARNING + fires the AlertSink but NEVER crashes startup (a
+    # refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS). Default false — opt in;
+    # on a very large audit_log the full re-walk adds startup latency, so it is not on by default.
+    audit_verify_on_start: bool = False
 
 
 class ApprovalsSettings(_Section):
@@ -1792,6 +2325,15 @@ class DrSettings(_Section):
     # supplies the archive path in the POST /dr/activate request body instead (the runbook path). A
     # cloud URL is rejected (the seed is local/UNC only, like the backup destination — no new egress).
     seed_archive: str = ""
+    # OPT-IN server-DB DR restore-token (BACKLOG #223, ADR 0102 — option b). A LOCAL/UNC path to a small
+    # JSON token the DBA/operator places on the DR box recording the EXPECTED source-backup anchor of a
+    # native (postgres/sqlserver) restore: {"expected_backup_archive": "<the most-recent engine dr_backup
+    # archive name the restored 'mefor' DB should carry, sourced OUT-of-band from the PRIMARY>"}. When set,
+    # the #102 server-DB seed gate cross-checks it against the restored DB's OWN latest successful dr_backup
+    # archive — a VINTAGE FLOOR a bare boolean attestation cannot give (a stale/wrong native restore's
+    # latest anchor differs → activation refuses closed). "" (the default) = OFF: the #102 gate is
+    # byte-unchanged and SQLite is a no-op. A cloud URL is rejected (local/UNC only, like seed_archive).
+    restore_token: str = ""
 
     @field_validator("takeover_hook", "release_hook")
     @classmethod
@@ -1819,6 +2361,19 @@ class DrSettings(_Section):
             raise ValueError(
                 f"[dr].seed_archive must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
                 "the DR cold seed has no cloud source (ADR 0048 — no new egress)"
+            )
+        return value
+
+    @field_validator("restore_token")
+    @classmethod
+    def _no_cloud_restore_token(cls, value: str) -> str:
+        # The restore-token is a DBA-placed local artifact on the DR box (BACKLOG #223, ADR 0102); like
+        # seed_archive it is LOCAL/UNC only — a cloud URL would imply new egress, which DR forbids.
+        low = value.strip().lower()
+        if low and any(low.startswith(scheme) for scheme in _CLOUD_DEST_SCHEMES):
+            raise ValueError(
+                f"[dr].restore_token must be a LOCAL or UNC path, not a cloud URL ({value!r}); "
+                "the DR restore-token is a local artifact on the DR box (ADR 0102 — no new egress)"
             )
         return value
 
@@ -1860,9 +2415,11 @@ class ServiceSettings(BaseModel):
 
     store: StoreSettings = Field(default_factory=StoreSettings)
     api: ApiSettings = Field(default_factory=ApiSettings)
+    tls: TlsSettings = Field(default_factory=TlsSettings)
     inbound: InboundSettings = Field(default_factory=InboundSettings)
     delivery: DeliverySettings = Field(default_factory=DeliverySettings)
     pipeline: PipelineSettings = Field(default_factory=PipelineSettings)
+    sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     diagnostics: DiagnosticsSettings = Field(default_factory=DiagnosticsSettings)
     environments: EnvironmentsSettings = Field(default_factory=EnvironmentsSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
@@ -1874,6 +2431,7 @@ class ServiceSettings(BaseModel):
     shadow: ShadowSettings = Field(default_factory=ShadowSettings)
     alerts: AlertsSettings = Field(default_factory=AlertsSettings)
     cert_monitor: CertMonitorSettings = Field(default_factory=CertMonitorSettings)
+    secret_rotation: SecretRotationSettings = Field(default_factory=SecretRotationSettings)
     update_check: UpdateCheckSettings = Field(default_factory=UpdateCheckSettings)
     cluster: ClusterSettings = Field(default_factory=ClusterSettings)
     approvals: ApprovalsSettings = Field(default_factory=ApprovalsSettings)
@@ -1910,6 +2468,27 @@ class ServiceSettings(BaseModel):
                     "workers) against the pool, so a pool of 1 would serialize everything — prefer "
                     "pool_size >= 3 for a clustered node (Postgres or SQL Server)"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _dr_activate_not_clustered(self) -> "ServiceSettings":
+        """A DR box coming up under the DR run-profile must not also be a ``[cluster]`` member (ADR 0096
+        rider). The two govern DIFFERENT things — ``[dr].activate`` gates which *connections* start (the
+        priority-threshold run-profile, ADR 0048), while ``[cluster].enabled`` makes the node contend for
+        *leadership* of a shared store — and combining them is a topology error: a warm DR-site engine
+        should be a NON-PROMOTABLE cluster member (``[cluster].promotable = false``) OR a cold/manually
+        promoted DR box, never a lease-contending DR box that could drive the primary store cross-WAN the
+        moment it activates. Refuse the combination at config load rather than let it silently co-elect.
+        Spans two sections, so it lives here (not on either section, which can't see the other)."""
+        if self.dr.activate and self.cluster.enabled:
+            raise ValueError(
+                "[dr].activate cannot be combined with [cluster].enabled: the DR run-profile gates which "
+                "connections start, not leadership acquisition, so a DR box that also contends for the "
+                "cluster lease could win leadership and drive the primary store cross-WAN. Run the DR "
+                "engine cold (or manually promoted) with [cluster] disabled, or make the warm DR node a "
+                "NON-PROMOTABLE cluster member ([cluster].enabled=true, [cluster].promotable=false) "
+                "instead of a [dr] box."
+            )
         return self
 
     @model_validator(mode="after")

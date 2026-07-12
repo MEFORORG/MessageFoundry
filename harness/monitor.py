@@ -3,7 +3,7 @@
 """Monitor tab: connect to a running engine and observe what it actually did with traffic.
 
 The harness's other tabs only see the transport edge (an ACK, a file). This tab closes the loop
-by reading the engine's own API ([`EngineClient`][messagefoundry.console.client.EngineClient]):
+by reading the engine's own API ([`EngineClient`][messagefoundry.apiclient.EngineClient]):
 live queue/connection stats, the message store with per-message disposition + delivery trail, and
 the dead-letter queue (with replay). It also drives a `config/reload`.
 
@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from messagefoundry.api.models import ConnectionRow, DeadLetterRow
-from messagefoundry.console.client import ApiError, EngineClient
+from messagefoundry.apiclient import ApiError, EngineClient
 from messagefoundry.console.login import LoginDialog
 from messagefoundry.console.widgets import (
     ConfigurableTable,

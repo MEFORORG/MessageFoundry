@@ -279,11 +279,27 @@ endpoint. **SMART App Launch** / human-user flows stay out (ADR 0024) — read a
 
 - [ ] **Confirm the ADR number is 0043** and add the `Proposed` row to [docs/adr/README.md](README.md) (coordinator
   owns the registry; it flips to `Accepted` on the owner's go).
-- [ ] **Confirm the accessor name `fhir_lookup(connection, query)`** and the `FhirLookup(...)` declaration name, plus
+- [x] **Confirm the accessor name `fhir_lookup(connection, query)`** and the `FhirLookup(...)` declaration name, plus
   the `query` shape: a string (`"Patient/123"` / `"Patient?identifier=MRN|123"`) only, or also a structured
   `(resource_type, id)` / `(resource_type, search_params)` form. (A string mirrors `db_lookup`'s `statement`; a
   structured form lets the executor grammar-gate the path segments like `FhirDestination._validate_path_token` does —
   decide whether read paths need the same CWE-918 path-token gate before they hit the URL.)
+  - **Resolved (BACKLOG #204, ASVS 1.2.2).** **Both** shapes, string-first + additive structured search:
+    - The **flat string** `fhir_lookup(connection, query)` is retained and **byte-identical** — the path
+      segments are grammar-gated (CWE-918, already built) and the search string after `?` rides the URL as
+      **authored** (the author percent-encodes any attacker-influenceable value). Per-value encoding of the
+      flat form stays the **author's** duty (`&`/`=`/`|` are legitimate FHIR search separators, so the engine
+      can't re-encode them without breaking multi-param searches).
+    - A **defense-in-depth screen** now rejects the flat-form shapes the engine *can* flag unambiguously —
+      a `#` fragment, a **second** `?`, or a control char raw **or** percent-decoded (`%0d%0a…`) — before any
+      dial-out, on top of the existing raw-control-char gate.
+    - An **additive, safely-encoded structured form** `fhir_lookup(connection, path, params={...})` percent-
+      encodes **each** value (`urllib.parse.urlencode(..., quote_via=urllib.parse.quote, safe="")`, `doseq`
+      for repeated params), so an attacker-influenced value **cannot** inject an extra FHIR search parameter
+      (CWE-88). `params=` is the **preferred, opt-in-safe** path; the string form is the back-compat opt-out.
+      Mixing `params=` with a `?`-query in the path is ambiguous and refused. The `params` argument threads
+      through the accessor, the `FhirLookupRunner` type, `_run_fhir_lookup`, `FhirLookupExecutor.read`, and
+      `_resolve_read_url` (`config/fhir_lookup.py`, `pipeline/wiring_runner.py`, `transports/fhir.py`).
 - [ ] **Confirm the egress gate reuses `[egress].allowed_http`** (not a new list) via a `check_fhir_lookup_allowed`
   modelled on `check_lookup_allowed`, and that `deny_by_default` + empty `allowed_http` refuses a `FhirLookup`.
 - [ ] **Confirm the SMART seam** — that `with_smart_backend(...)` accepts a `FhirLookup` spec (extend its REST/FHIR

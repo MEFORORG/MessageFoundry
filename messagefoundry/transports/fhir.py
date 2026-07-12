@@ -46,7 +46,6 @@ from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
 from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -61,10 +60,15 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     _RETRYABLE_4XX,
+    _expiry_relaxed_opener,
     _insecure_opener,
     _redact_url,
+    InsecureHopGuard,
     enforce_outbound_length_limits,
+    outbound_headers_from_metadata,
     refuse_cleartext_credentials,
+    refuse_cleartext_egress,
+    refuse_verify_off,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
 
@@ -234,10 +238,21 @@ class FhirDestination(DestinationConnector):
         # ADR 0013: capture the FHIR server reply (assigned resource / ETag / OperationOutcome). Default
         # False → returns None, byte-identical.
         self.capture_response: bool = bool(s.get("capture_response", False))
+        # #68: opt in to per-message HTTP headers a Handler stamps into the ADR 0081 metadata bag
+        # (http.header.* entries). Default False → the delivery worker skips the metadata read and send
+        # is byte-identical. When True, consumes_metadata tells the worker to pass this message's bag.
+        self.consumes_metadata: bool = bool(s.get("dynamic_headers", False))
+        # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
+        attested = config.tls_hop_attested
+        # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
+        self._hop_guard: InsecureHopGuard | None = None
 
         self._headers = self._build_headers(s)
         enforce_outbound_length_limits(self.base_url, self._headers)
-        refuse_cleartext_credentials(scheme, self._headers, self.base_url)
+        refuse_cleartext_credentials(scheme, self._headers, self.base_url, attested=attested)
+        # ASVS 12.2.1: the FHIR resource/Bundle body is PHI, so a cleartext http egress to a
+        # non-loopback host is refused even without credentials (loopback stays byte-identical).
+        self._hop_guard = refuse_cleartext_egress(scheme, self.base_url, attested=attested)
         # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing; None = off (byte-identical). Built here so
         # a bad key fails loud at construction; the signature is minted in _post over the body bytes.
         self._signer: MessageSigner | None = signer_from_destination(config)
@@ -252,17 +267,28 @@ class FhirDestination(DestinationConnector):
             # above can't see it. Re-run the check treating the connection as credential-bearing, so a
             # SMART access token never ships over cleartext http.
             refuse_cleartext_credentials(
-                scheme, {**self._headers, "Authorization": "Bearer"}, self.base_url
+                scheme,
+                {**self._headers, "Authorization": "Bearer"},
+                self.base_url,
+                attested=attested,
             )
 
         if bool(s.get("verify_tls", True)):
-            self._opener: urllib.request.OpenerDirector = _NO_REDIRECT_OPENER
-        else:
-            if scheme == "https" and not insecure_tls_allowed():
-                raise ValueError(
-                    "FHIR destination verify_tls=false disables TLS certificate verification; "
-                    f"refused unless {INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only)"
+            # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
+            # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
+            if bool(s.get("tls_allow_expired", False)):
+                self._opener: urllib.request.OpenerDirector = _expiry_relaxed_opener(
+                    urllib.parse.urlsplit(self.base_url).hostname or ""
                 )
+            else:
+                self._opener = _NO_REDIRECT_OPENER
+        else:
+            # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
+            guard = refuse_verify_off(
+                scheme, self.base_url, connector="FHIR destination", attested=attested
+            )
+            if guard is not None:
+                self._hop_guard = guard
             logger.warning(
                 "FHIR destination %s has TLS verification DISABLED (verify_tls=false)",
                 _redact_url(self.base_url),
@@ -364,8 +390,14 @@ class FhirDestination(DestinationConnector):
                 return version_id
         return None
 
-    async def send(self, payload: str) -> DeliveryResponse | None:
+    async def send(
+        self, payload: str, *, metadata: Mapping[str, str] | None = None
+    ) -> DeliveryResponse | None:
         method, url, extra_headers = self._resolve_request(payload)
+        # #68: fold this message's dynamic http.header.* entries into the per-request headers, MERGED
+        # OVER the static ones but UNDER the connector's interaction headers (If-Match/If-None-Exist),
+        # which are semantically required and must win. Pure; None → {} → byte-identical.
+        extra_headers = {**outbound_headers_from_metadata(metadata), **extra_headers}
         # urllib is blocking — keep it off the event loop (the delivery worker awaits this).
         body, status = await asyncio.to_thread(self._post, payload, method, url, extra_headers)
         # A non-2xx already raised inside _post (transient retry / permanent dead-letter). Here status is
@@ -413,6 +445,13 @@ class FhirDestination(DestinationConnector):
     def _post(
         self, payload: str, method: str, url: str, extra_headers: dict[str, str]
     ) -> tuple[str, int]:
+        # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
+        # a byte crosses. ``url`` is a per-message write path but its host is always the base_url host, so
+        # a None guard (secure/loopback base) is byte-identical.
+        if self._hop_guard is not None:
+            self._hop_guard.assert_send(
+                urllib.parse.urlsplit(self.base_url).hostname or "", _redact_url(self.base_url)
+            )
         data = payload.encode(self.encoding)
         headers = {**self._headers, **extra_headers}
         if self._token_provider is not None:
@@ -480,16 +519,48 @@ register_destination(ConnectorType.FHIR, FhirDestination)
 # body), so a Handler cannot mutate the FHIR server through it (FHIR writes stay on FhirDestination).
 
 
-def _resolve_read_url(base: str, query: str) -> str:
+def _has_control_char(text: str) -> bool:
+    """True if ``text`` holds a C0 control (< 0x20) or DEL (0x7F) — a CRLF/NUL/etc. that must never ride a
+    URL (header/request smuggling)."""
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text)
+
+
+def _encode_search_params(params: Mapping[str, str | list[str]]) -> str:
+    """Percent-encode a structured search into a URL query string, so a **value** can never inject an
+    extra FHIR search parameter (CWE-88 argument injection, ASVS 1.2.2). ``urlencode(quote_via=quote,
+    safe="")`` encodes **every** reserved char in each key/value — an ``&``/``=``/``|``/``#`` in a value
+    becomes ``%26``/``%3D``/``%7C``/``%23`` and stays a literal, never a separator. ``doseq=True`` expands
+    a ``list[str]`` value into repeated params (``identifier=a&identifier=b``); a ``str`` value stays a
+    single param. Returns ``""`` for empty ``params`` (a search of the whole resource type)."""
+    return urllib.parse.urlencode(params, doseq=True, quote_via=urllib.parse.quote, safe="")
+
+
+def _resolve_read_url(
+    base: str,
+    query: str,
+    params: Mapping[str, str | list[str]] | None = None,
+) -> str:
     """Build a read-only ``GET`` URL from a ``FhirLookup`` ``query``: a read-by-id (``"Patient/123"``) or a
-    search (``"Patient?identifier=MRN|123"``).
+    search (``"Patient?identifier=MRN|123"``, or a path-only ``"Patient"`` plus structured ``params``).
 
     Grammar-gates the resource-type and id **path segments** to the FHIR token/id grammars (the same gate
     ``FhirDestination`` applies to a write path, CWE-918): a crafted query can't smuggle ``/``, ``..``,
     ``#``, ``@`` (or a leading ``/`` / absolute URL) into the path and redirect the read to another
-    resource/operation — or off the allow-listed host. The optional search string (after ``?``) rides the
-    URL query verbatim after a control-char check (it never adds a path segment). Raises a PHI-safe
-    ``ValueError`` (it names only the offending shape/segment, never the query's parameter values)."""
+    resource/operation — or off the allow-listed host.
+
+    Search values are handled two ways (ASVS 1.2.2, BACKLOG #204):
+
+    * ``params`` given (**safe**): each value is percent-encoded via :func:`_encode_search_params`, so a
+      value can never inject an extra search parameter. Mixing ``params`` with a ``?`` in ``query`` is
+      ambiguous and refused.
+    * the flat ``?``-query (back-compat, **author-encoded**): it rides the URL as authored after a
+      defense-in-depth screen — it rejects a control char (raw **or** percent-decoded), a URL fragment
+      ``#``, or a second ``?`` (unambiguous injection shapes), but it deliberately does **not** re-encode a
+      legitimate author-supplied ``&``/``=``/``|`` separator (per-value encoding of the flat form is the
+      author's duty; ``params`` is the safe path).
+
+    Raises a PHI-safe ``ValueError`` (it names only the offending shape/segment, never the query's
+    parameter values)."""
     raw = query.strip()
     if not raw:
         raise ValueError("FHIR read query is empty")
@@ -509,9 +580,27 @@ def _resolve_read_url(base: str, query: str) -> str:
             raise ValueError("FHIR read id is not a valid FHIR id")
         path = f"{type_seg}/{urllib.parse.quote(resource_id, safe='')}"
     url = f"{base.rstrip('/')}/{path}"
-    if sep:  # a search query string — control-char gate (it never adds a path segment)
-        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in search_part):
+    if params is not None:
+        # Structured, safely-encoded search form: refuse the ambiguous "both forms at once" shape so the
+        # engine never has to reconcile a flat ?-query with per-value-encoded params.
+        if sep:
+            raise ValueError(
+                "FHIR read: pass search parameters via params= OR a '?'-query in the path, not both"
+            )
+        encoded = _encode_search_params(params)
+        return f"{url}?{encoded}" if encoded else url
+    if sep:  # flat search query string — control-char gate + defense-in-depth injection screen
+        if _has_control_char(search_part):
             raise ValueError("FHIR read search query contains an illegal control character")
+        # Defense-in-depth (ASVS 1.2.2): reject the shapes the engine can flag unambiguously without
+        # breaking legitimate multi-param (&/=/|) searches. '#' would start a URL fragment; a second '?'
+        # is a malformed/injected query; a percent-decoded control char is a smuggled CRLF/NUL.
+        if "#" in search_part:
+            raise ValueError("FHIR read search query contains a URL fragment ('#')")
+        if "?" in search_part:
+            raise ValueError("FHIR read search query contains a second '?'")
+        if _has_control_char(urllib.parse.unquote(search_part)):
+            raise ValueError("FHIR read search query decodes to an illegal control character")
         url = f"{url}?{search_part}"
     return url
 
@@ -541,6 +630,8 @@ class FhirLookupExecutor:
         self._encoding: dict[str, str] = {}
         self._opener: dict[str, urllib.request.OpenerDirector] = {}
         self._token: dict[str, Any] = {}  # name -> SmartBackendTokenProvider | None
+        # #200 (ADR 0092): per-connection send-time guard, re-asserted (zero I/O) in _get (decision 4).
+        self._hop_guard: dict[str, InsecureHopGuard | None] = {}
         for cname, raw in connections.items():
             s = dict(raw)
             url = s.get("url")
@@ -556,21 +647,27 @@ class FhirLookupExecutor:
             self._base[cname] = url
             self._timeout[cname] = float(s.get("timeout_seconds", 30.0))
             self._encoding[cname] = str(s.get("encoding", "utf-8"))
+            # #200 (ADR 0092): the per-connection insecure-hop attestation keys the posture-keyed refusal.
+            attested = bool(s.get("tls_hop_attested", False))
             headers = self._build_headers(s)
             # The read sends Authorization (static or SMART) — refuse it over cleartext http.
             token = token_provider_from_settings(s)
             check_headers = {**headers, "Authorization": "Bearer"} if token is not None else headers
-            refuse_cleartext_credentials(scheme, check_headers, url)
+            refuse_cleartext_credentials(scheme, check_headers, url, attested=attested)
+            # ASVS 12.2.1: a cleartext read pulls the PHI resource/searchset back over the wire, so a
+            # cleartext http read to a non-loopback host is refused too (loopback stays byte-identical).
+            self._hop_guard[cname] = refuse_cleartext_egress(scheme, url, attested=attested)
             self._headers[cname] = headers
             self._token[cname] = token
             if bool(s.get("verify_tls", True)):
                 self._opener[cname] = _NO_REDIRECT_OPENER
             else:
-                if scheme == "https" and not insecure_tls_allowed():
-                    raise ValueError(
-                        f"FhirLookup {cname!r} verify_tls=false disables TLS certificate verification; "
-                        f"refused unless {INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only)"
-                    )
+                # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
+                guard = refuse_verify_off(
+                    scheme, url, connector=f"FhirLookup {cname!r}", attested=attested
+                )
+                if guard is not None:
+                    self._hop_guard[cname] = guard
                 logger.warning(
                     "FhirLookup %s has TLS verification DISABLED (verify_tls=false)",
                     _redact_url(url),
@@ -600,11 +697,19 @@ class FhirLookupExecutor:
         """The declared lookup connection names."""
         return frozenset(self._base)
 
-    async def read(self, connection: str, query: str) -> dict[str, Any]:
+    async def read(
+        self,
+        connection: str,
+        query: str,
+        params: Mapping[str, str | list[str]] | None = None,
+    ) -> dict[str, Any]:
         """Issue a read-only ``GET`` for ``query`` against ``connection`` and return the parsed result.
 
-        Runs the blocking GET **off the event loop** (the engine loop awaits this; ``fhir_lookup`` bridges
-        in from the handler's worker thread via ``run_coroutine_threadsafe``). Raises
+        When ``params`` is given (the safe structured search form, BACKLOG #204), each value is
+        percent-encoded into the URL query so a value can never inject an extra FHIR search parameter;
+        otherwise the flat ``query`` string is used (author-encoded, defense-in-depth-screened). Runs the
+        blocking GET **off the event loop** (the engine loop awaits this; ``fhir_lookup`` bridges in from
+        the handler's worker thread via ``run_coroutine_threadsafe``). Raises
         :class:`~messagefoundry.config.fhir_lookup.FhirLookupError` (PHI/secret-safe) on an unknown
         connection, an invalid query path, a non-2xx, an unparseable body, or a network/timeout error."""
         # Lazy import keeps transports/ from importing config at module load (config imports transports).
@@ -616,7 +721,7 @@ class FhirLookupExecutor:
                 f"fhir_lookup: no FhirLookup connection named {connection!r} (declared: {known})"
             )
         try:
-            url = _resolve_read_url(self._base[connection], query)
+            url = _resolve_read_url(self._base[connection], query, params)
         except ValueError as exc:
             # PHI-safe: _resolve_read_url names only the offending shape/segment, never the query values.
             raise FhirLookupError(f"fhir_lookup on {connection!r}: {exc}") from exc
@@ -630,6 +735,11 @@ class FhirLookupExecutor:
         from messagefoundry.config.fhir_lookup import FhirLookupError
 
         base = self._base[connection]
+        # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure read hop
+        # before a byte crosses (a None guard — secure/loopback — is byte-identical).
+        guard = self._hop_guard.get(connection)
+        if guard is not None:
+            guard.assert_send(urllib.parse.urlsplit(base).hostname or "", _redact_url(base))
         encoding = self._encoding[connection]
         headers = dict(self._headers[connection])
         token = self._token[connection]

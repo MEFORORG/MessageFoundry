@@ -56,6 +56,19 @@ class UserSummary(BaseModel):
     channel_scope: list[str] | None = None  # per-channel RBAC: allowed connections; None = all
 
 
+class UserPermissions(BaseModel):
+    """The FLATTENED effective permission set for an arbitrary user (BACKLOG #177 inspector).
+
+    ``permissions`` is the union built-in-role ∪ custom-role ∪ extras — the same set every
+    authorization check consults. ``roles`` lists the role ids the user actually holds (built-in +
+    ``custom:``-prefixed) for troubleshooting *where* a grant came from. Both are sorted."""
+
+    user_id: str
+    username: str
+    roles: list[str]
+    permissions: list[str]
+
+
 class ChannelScope(BaseModel):
     """A user's per-channel RBAC scope. ``None`` = all channels; a list = exactly those connections."""
 
@@ -90,6 +103,11 @@ class ReauthRequest(BaseModel):
     the session's step-up window before a highly sensitive operation."""
 
     password: str = Field(max_length=_PASSWORD_MAX)
+    # ADR 0077: optionally BIND this fresh proof to a single durable-takeover action (the value the
+    # 403 handed back in `X-Step-Up-Action`), minting a single-use per-action grant instead of only
+    # refreshing the session window. Bounded length — it is an opaque action tag, never reflected;
+    # an unknown tag simply fails closed (nothing consumes it, so the action re-prompts).
+    purpose: str | None = Field(default=None, max_length=64)
 
 
 class PasswordResetResponse(BaseModel):

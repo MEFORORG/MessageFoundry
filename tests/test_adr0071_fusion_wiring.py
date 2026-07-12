@@ -104,6 +104,13 @@ def _bare_ss(command_timeout: int = 30) -> SqlServerStore:
     s._cipher = IdentityCipher()
     s._state_cache = {}
     s._sync_pools = {}
+    # #63/#190 attrs normally set by __init__ (bypassed here); defaults keep behavior identical.
+    s._message_events = "all"
+    s._audit_mac_key = None
+    s._audit_keyed_from = None
+    # A1 live cost counters — normally set by __init__ (bypassed here).
+    s.committed_txns = 0
+    s.body_copies = 0
     return s
 
 

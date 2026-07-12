@@ -50,9 +50,10 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import NoReturn
 
-from messagefoundry.config.settings import DrSettings
+from messagefoundry.config.settings import DrSettings, StoreBackend
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import VerifyResult, run_restore_verify
 from messagefoundry.redaction import safe_exc
@@ -150,16 +151,25 @@ class DrCoordinator:
 
     # --- activate ------------------------------------------------------------
 
-    async def activate(self, *, archive: str | None = None, actor: str = "system") -> DrResult:
+    async def activate(
+        self,
+        *,
+        archive: str | None = None,
+        dba_attests_restored: bool = False,
+        actor: str = "system",
+    ) -> DrResult:
         """Promote this DR box (ADR 0048 fixed ordering: cold-seed restore-verify → new audit segment →
         acquire-VIP-or-abort → serve under the DR run-profile). MANUAL only — there is no auto-probe in
         this slice; the caller (``POST /dr/activate``) is RBAC-gated by ``dr:operate`` and supplies the
         operator ``actor`` for the audit rows.
 
         ``archive`` overrides ``[dr].seed_archive`` (the runbook may pass the chosen #60 backup in the
-        request body). Raises :class:`DrActivationError` and records a ``dr_activation_aborted`` audit row
-        on any abort; never leaves the VIP held against a store that will not open (the restore-verify
-        fail-closes BEFORE the VIP step)."""
+        request body). ``dba_attests_restored`` is the operator's explicit, per-activation attestation that
+        a DBA has restored the server-DB ``mefor`` database for THIS failover — REQUIRED on a
+        Postgres/SQL Server store (the config-only cold-seed archive cannot restore or verify a
+        DBA-managed DB) and IGNORED on SQLite (BACKLOG #102). Raises :class:`DrActivationError` and records
+        a ``dr_activation_aborted`` audit row on any abort; never leaves the VIP held against a store that
+        will not open (the restore-verify fail-closes BEFORE the VIP step)."""
         if self._settings.enabled is False:
             # Not a DR box at all — activation is meaningless. Fail loud rather than silently no-op.
             raise DrActivationError(
@@ -189,6 +199,14 @@ class DrCoordinator:
                     now,
                 )
             verify = await self._verify_seed(seed, actor, now)
+
+            # (1b) SERVER-DB LIVE SEED GATE (BACKLOG #102, fail-closed, BEFORE any store mutation or VIP
+            # step). A config-only cold-seed archive (server-DB store) verifies only that the tar/config
+            # decrypt — it NEVER restores or inspects the DBA-managed live ``mefor`` DB, so step (1) alone
+            # could bless promotion against a fresh/unrestored server store (non-empty only because engine
+            # bootstrap + operator login wrote to audit_log). Require an explicit DBA attestation AND a
+            # restore-provenance probe here. No-op on SQLite (the archive verified the whole store already).
+            await self._verify_live_server_seed(dba_attests_restored, actor, now)
 
             # (2) Recover the cold-restored store (every stage, AC-15) + open a NEW audit-chain segment
             # (the seed-marker genesis; do NOT blindly extend the restored chain — ADR 0049/0041).
@@ -366,6 +384,172 @@ class DrCoordinator:
             )
         return verify
 
+    async def _verify_live_server_seed(
+        self, dba_attests_restored: bool, actor: str, now: float
+    ) -> None:
+        """SERVER-DB live seed gate (BACKLOG #102) — the O3 data-loss fix. On a Postgres/SQL Server store
+        the #60 backup is ``config_only`` (``snapshot_to`` is DBA-delegated), so :func:`run_restore_verify`
+        returns ``PASS`` on the manifest WITHOUT restoring or inspecting the DBA-managed live ``mefor`` DB.
+        That would let activation promote priority feeds against a FRESH/UNRESTORED server store —
+        non-empty only because engine startup bootstrap + operator login wrote to ``audit_log``. This gate
+        closes that. It is a **no-op on SQLite** (the archive already carried + verified the whole store —
+        the byte-identical path).
+
+        Two independent conditions, either failing aborts closed (records ``dr_activation_aborted`` +
+        raises :class:`DrActivationError` via :meth:`_record_aborted`):
+
+        1. an **explicit DBA attestation** (``dba_attests_restored`` — the engine cannot itself restore a
+           DBA-managed DB, so activation must be a deliberate act); absent → abort; and
+        2. a **live restore-provenance probe** (:meth:`Store.has_prior_backup_history`): the restored DB
+           must carry ≥1 ``dr_backup`` audit row — present on any DB restored from an operating primary
+           (the primary writes one on every leader-gated backup, the run that produced the seed) and ABSENT
+           on a fresh DR-box bootstrap (a passive standby is never the leader). An unreachable DB / missing
+           ``audit_log`` raises → abort; a fresh/unrestored DB (no ``dr_backup`` row) → abort **even when
+           attested** (defense in depth: a mistaken attestation must still fail closed). The probe runs off
+           the event loop via the async store API (a pooled read-only round-trip; no mutation).
+
+        RESIDUAL (BACKLOG #102 → #223, ADR 0102): the (a)+(b) checks prove prior backup history, NOT the
+        vintage or completeness of a DBA-managed restore. A stale-but-real restore, or a partial restore
+        that carried ``audit_log`` but not the message tables, still passes conditions (a)+(b) — the engine
+        has no artifact to verify a DBA-managed DB against (the config-only ``.mfbak`` is a decoupled
+        backup). #223 formally ACCEPTS that residual (ASVS-style risk acceptance) AND adds an OPT-IN third
+        condition:
+
+        3. an OPTIONAL **restore-token cross-check** (:meth:`_verify_restore_token`), active ONLY when
+           ``[dr].restore_token`` is set. It gives a VINTAGE FLOOR a bare boolean attestation cannot — but
+           it is still an attestation (does not prove message-table completeness), an explicitly WEAKER
+           posture than SQLite (which snapshot-verifies the whole store), not a match for it. Unset (the
+           default) → this method is byte-identical to the #102 gate."""
+        if self._store.backend not in (StoreBackend.POSTGRES, StoreBackend.SQLSERVER):
+            # SQLite: the cold-seed archive verified the whole store.db (integrity_check + row counts).
+            # Nothing to add — leave the path byte-identical (BACKLOG #102 is a server-DB-only gap).
+            return
+        # (a) Explicit, per-activation DBA attestation. A server-DB ``mefor`` DB is restored OUT of band by
+        # a DBA; the engine has no way to prove it happened, so it refuses to promote onto it without the
+        # operator's deliberate attestation. Absent → fail closed (secure-by-default).
+        if not dba_attests_restored:
+            await self._record_aborted(
+                "seed",
+                "server-DB store (postgres/sqlserver): the DR 'mefor' database is DBA-restored and the "
+                "config-only cold-seed archive cannot verify it — refusing to activate without an explicit "
+                "DBA attestation that the database has been restored (pass dba_attests_restored=true on "
+                "POST /dr/activate); ADR 0048 fail-closed, BACKLOG #102",
+                actor,
+                now,
+            )
+        # (b) Live restore-provenance probe (defense in depth) — even WITH the attestation, the restored DB
+        # must carry prior backup history (≥1 dr_backup row), which a fresh/unrestored bootstrap lacks.
+        try:
+            restored = await self._store.has_prior_backup_history()
+        except Exception as exc:  # unreachable / absent / no audit_log table on the restored DB
+            await self._record_aborted(
+                "seed",
+                "server-DB live seed probe failed (the restored 'mefor' database is unreachable or has no "
+                f"audit_log): {safe_exc(exc)} — refusing to activate (ADR 0048 fail-closed, BACKLOG #102)",
+                actor,
+                now,
+            )
+        if not restored:
+            await self._record_aborted(
+                "seed",
+                "server-DB live seed probe: the restored 'mefor' database carries NO prior backup history "
+                "(no dr_backup audit row) — it looks freshly bootstrapped, not restored from the primary; "
+                "a DBA attestation was given but the database was not actually restored. Refusing to "
+                "activate against a fresh/unrestored store (ADR 0048 fail-closed defense-in-depth, "
+                "BACKLOG #102)",
+                actor,
+                now,
+            )
+        # (c) OPTIONAL restore-token vintage-floor cross-check (BACKLOG #223, ADR 0102). Runs ONLY when the
+        # operator opted in via [dr].restore_token; unset → this is a no-op and the gate is byte-identical
+        # to #102. A stale/wrong native restore's latest dr_backup anchor differs from the DBA-recorded
+        # expected one, so this refuses it closed — a vintage floor a bare boolean attestation cannot give.
+        if self._settings.restore_token:
+            await self._verify_restore_token(actor, now)
+
+    async def _verify_restore_token(self, actor: str, now: float) -> None:
+        """OPTIONAL server-DB restore-token cross-check (BACKLOG #223, ADR 0102 — option b). Active only
+        when ``[dr].restore_token`` is set. The DBA/operator places a small JSON token on the DR box —
+        ``{"expected_backup_archive": "<archive name>"}`` — recording the EXPECTED source-backup anchor of
+        the native restore: the ``archive`` filename of the most-recent engine ``dr_backup`` the restored
+        ``mefor`` DB should carry, sourced OUT-of-band from the PRIMARY's backup record (NOT read back from
+        the restored DB, which would be self-fulfilling). This gate reads that expected anchor and the
+        restored DB's OWN latest *successful* ``dr_backup`` archive (via :meth:`_latest_backup_archive`) and
+        requires them to MATCH: a stale-but-real restore carries an OLDER latest anchor and is refused; a
+        wrong DB carries a DIFFERENT anchor and is refused — closing part of the #102 vintage residual (it
+        does NOT prove message-table completeness; that is deferred option (a)). Every failure aborts closed
+        (records ``dr_activation_aborted`` + raises :class:`DrActivationError`, kind ``seed``). The token is
+        read OFF the event loop; it carries only a PHI-free archive filename."""
+        token_path = self._settings.restore_token
+        try:
+            text = await asyncio.to_thread(Path(token_path).read_text, encoding="utf-8")
+        except OSError as exc:
+            await self._record_aborted(
+                "seed",
+                "server-DB restore-token cross-check: the configured [dr].restore_token file could not be "
+                f"read ({safe_exc(exc)}) — the DBA must place the recorded source-backup anchor on the DR "
+                "box before activation (BACKLOG #223, ADR 0102 fail-closed)",
+                actor,
+                now,
+            )
+        expected = _parse_restore_token(text)
+        if expected is None:
+            await self._record_aborted(
+                "seed",
+                "server-DB restore-token cross-check: the [dr].restore_token file is not a JSON object "
+                "carrying a non-empty 'expected_backup_archive' string — refusing to activate (BACKLOG "
+                "#223, ADR 0102 fail-closed)",
+                actor,
+                now,
+            )
+        restored_anchor = await self._latest_backup_archive()
+        if restored_anchor is None:
+            await self._record_aborted(
+                "seed",
+                "server-DB restore-token cross-check: the restored 'mefor' database carries no SUCCESSFUL "
+                "dr_backup audit row to anchor a vintage against — refusing to activate (BACKLOG #223, "
+                "ADR 0102 fail-closed)",
+                actor,
+                now,
+            )
+        if restored_anchor != expected:
+            await self._record_aborted(
+                "seed",
+                "server-DB restore-token cross-check: the restored database's latest dr_backup anchor does "
+                "NOT match the DBA-recorded expected source backup — the native restore is a different "
+                "(likely STALE) vintage than intended. Refusing to activate (BACKLOG #223, ADR 0102 "
+                "fail-closed vintage floor)",
+                actor,
+                now,
+            )
+        log.warning(
+            "DR restore-token cross-check PASSED: the restored vintage matches the DBA-recorded source "
+            "backup anchor (BACKLOG #223)"
+        )
+
+    async def _latest_backup_archive(self) -> str | None:
+        """The ``archive`` filename of the restored store's most-recent SUCCESSFUL ``dr_backup`` audit row,
+        or ``None`` if none is found. Scans the recent ``dr_backup`` rows (most-recent-first) and returns
+        the first whose PHI-free ``detail`` carries an ``archive`` field — a FAILURE row's detail is
+        ``{"outcome": "error", ...}`` with no ``archive``, so it is skipped. Read-only (a single bounded,
+        indexed ``list_audit`` query); the archive filename is PHI-free (instance + UTC only)."""
+        rows = await self._store.list_audit(action="dr_backup", limit=50)
+        for row in rows:
+            if "detail" not in row.keys():
+                continue
+            raw = row["detail"]
+            if not isinstance(raw, str):
+                continue
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                archive = parsed.get("archive")
+                if isinstance(archive, str) and archive:
+                    return archive
+        return None
+
     async def _record_seed_marker(self, archive: str, verify: VerifyResult, now: float) -> str:
         """Open a NEW audit-chain segment on the cold-seeded box: record a ``dr_seed`` marker whose
         genesis is the source-backup snapshot SHA-256 + the config/DEK fingerprints + the **restored
@@ -468,3 +652,20 @@ def _basename(path: str) -> str:
     from pathlib import PurePath
 
     return PurePath(path).name if path else ""
+
+
+def _parse_restore_token(text: str) -> str | None:
+    """Parse a restore-token file body → the expected source-backup ``archive`` name (BACKLOG #223, ADR
+    0102), or ``None`` if the body is not a JSON object carrying a non-empty ``expected_backup_archive``
+    string. PHI-free (an archive filename only). A ``None`` return is treated by the caller as a
+    fail-closed abort (an opted-in but unsatisfiable check never silently passes)."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict):
+        return None
+    expected = doc.get("expected_backup_archive")
+    if isinstance(expected, str) and expected.strip():
+        return expected.strip()
+    return None

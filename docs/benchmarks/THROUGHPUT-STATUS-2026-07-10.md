@@ -116,7 +116,40 @@ Every figure below is sourced and validity-tagged. Configuration is load-bearing
 | Engine **intake** wall | 193 msg/s (1 engine), 383 (2 engines) — **ACK only, no delivery** | `dests=1`, SQLite | PR #713 / #719 |
 | Single strict-FIFO interface e2e | ~60 ingress/s | fan-out ~1, SQL Server LAN | `docs/THROUGHPUT.md` |
 | Store commit capacity | ~23,600 c/s (SQLite NVMe); **~27–29k c/s (SQL Server)** vs a ~750 c/s pipeline demand — **36× headroom** | microbench | ADR 0069 |
-| **Fleet N-shard scaling** | **UNMEASURED.** `N` was never varied by any throughput run. | — | — |
+| **Fleet N-shard scaling (C1, two-point)** | per-shard capacity **DECLINES** with `N`: whole-fleet peak **11.33 → 15.42 ingress/s = 1.36× for 4× shards** (N=1 → N=4). Direction firm; magnitudes soft (both 900 s soaks collapsed — climb-peak overstates; see note). | pooled, `dests=8`, one SQL Server store, 2026-07-10 | `c1-arm-a-n1.json` / `c1-arm-b-n4.json` |
+| C1 — the shard penalty is **load-dependent** | near-linear at light load (**1.01×** at 2/shard) → **1.53×** at 6/shard → **collapse** at 12/shard, where N=1 still sustains | matched per-shard offered load, pooled, `dests=8` | C1 handback |
+| C1 — `claim_mean` rises with shard count | N=1 flat ~13 ms; N=4 runs away **12.6 → 48.8 ms**, tracking the throughput penalty almost exactly | pooled, SQL Server, `dests=8` | C1 handback |
+| **Fleet N-shard scaling (C2, light-load sweep)** | at a *fixed* 2/shard load a true 900 s soak **sustains N=1/2/4 (100% delivered)** and **collapses at N=8 (18%) / N=16 (5%)** — light-load scaling **BREAKS beyond N=4** | pooled, `dests=8`, 2/shard, 900 s soaks, one SQL Server store, 2026-07-10 | `c2-arm-*.json` |
+| C2 — the wall is **store-side**, not engine/CPU/sink | engine box CPU p95 ~16%, busiest single core **≤43%** (GIL wall excluded); load-gen idle; `send_ack` flat; `claim`+`mark_done` run away (claim_mean 19 → ~262 → ~557 ms across N=4/8/16) | C2 handback |
+| C2 — localized to **tempdb system-catalog PAGELATCH** | `PAGELATCH_SH/EX` **14.6× dominant** (N=8); hottest page **2:1:97 = `syssingleobjrefs`**; I/O + `LCK_*` waits absent — the pooled claim's per-cycle temp-object churn | store `dm_os_wait_stats` + `dm_os_waiting_tasks`, 2026-07-10 | C2 handback |
+| **Fleet N-shard scaling (C3, latch-removed counterfactual)** | identical 2/shard sweep with `MEMORY_OPTIMIZED TEMPDB_METADATA=ON`: the C2 catalog PAGELATCH is **eliminated** at both arms (page `2:1:97` hits 3 365→**3**, 11 557→**43**). **N=8 collapse (18%)→ PASS 100%** (drained, stranded 0); **N=16 (4.8%)→ still COLLAPSE, 27.9%** (~6×). Knee moves **exactly one shard-doubling**: (4,8]→(8,16]. **PARTIAL — a diagnostic, not a deployment fix.** | pooled, `dests=8`, 2/shard, RG pool @25%, one SQL Server store, 2026-07-10 | C3 handback |
+| C3 — N=16 residual is **store-CPU saturation**, mechanism UNPROVEN | latch gone → store box CPU **92–93%**; top wait `SOS_SCHEDULER_YIELD` is #1 only *by default* (PAGELATCH→~0), it did **not** surge (+11%). Store CPU was already ~87% in C2 — **unmasked, not new**. **No per-query CPU attribution** — churn→CPU link is a hypothesis; pooled-claim rewrite sufficiency at N=16 **UNVERIFIED** *(C4 has since supplied the attribution — see the C4 row below and §8; the rewrite as scoped is now INSUFFICIENT)*. Engine box far from saturation (busiest core ≤44%). | store DMVs + `cpu_soak.csv`, 2026-07-10 | C3 handback |
+| **Per-query CPU attribution (C4) — VERDICT: WITHHELD** | ran the attribution C3 lacked. **#1 N=16 query-CPU consumer = `list_fifo_lanes` (dispatcher discovery scan) at 47.46%; CLAIM #2 at 40.33%** → AMBIGUOUS (two families >40%). Reconciliation pre-gate does **not** robustly clear 70% (70.68% only on idle-diluted denominator + off-wall collapse-tail; every sustained/phase-matched denominator 64.5–69.6%). CLAIM `cpu_us_per_exec` rises 8.4× N=4→16 (honest, not spin/empty-claim) but "deeper-queue-scan driven", a **necessary target, not sufficiency**. The ~540 ms **N=16 CLAIM wall is ~72% off-CPU WAIT** (`cpu/elapsed=0.28`) — CPU may be the wrong lever. **Claim-only rewrite would NOT clear the wall** (`list_fifo_lanes` remains #1). Apparatus perturbed: C4 ran ~68% heavier `claim_mean` than C3; c4-8 flipped sustained→not. | pooled, `dests=8`, 2/shard, N=4/8/16, same commit as C3, 2026-07-11 | C4 handback |
+
+> **C1 magnitude caveat.** Both of C1's 900 s soaks collapsed at their auto-picked pinned rate, so its per-shard
+> figures are *climb-peak* rates that overstate the sustainable rate — the definitive 900 s N=4 point is still the
+> 10 ingress/s = 2.5/shard row above. C1 measured the *scaling shape* (per-shard declines with `N`, load-dependently),
+> not a new sustainable magnitude. Its job was to test whether shard count can *close* the ~5.8× gap; it cannot do so
+> efficiently (4× shards → 1.36×). See Phase 5.
+>
+> **C2 update.** C2's fixed-2/shard sweep settled what C1 left open: the near-linear light-load scaling **does not
+> survive beyond N=4** — a shared store tolerates ~4 lightly-loaded shards, then falls off a cliff. The wall is a real
+> store-side one (tempdb system-catalog PAGELATCH), not a harness/CPU artifact. So shard count cannot buy the target
+> beyond N=4 **on the current SQL config** — and "config" is load-bearing: C2 established correlation, not a proven
+> remedy (see Phase 5 / C3).
+>
+> **C3 update — PARTIAL (the config counterfactual).** Rerunning the identical 2/shard sweep with `MEMORY_OPTIMIZED
+> TEMPDB_METADATA=ON` **eliminated** the C2 catalog PAGELATCH at both arms, which **proves the mechanism** C2 fingered
+> was real — and it **cleared N=8** (18% → 100% delivered, drained). But it moved the knee only **one shard-doubling**
+> (N=16 still collapses, 27.9% vs 4.8%), so it is a **diagnostic, not a deployment fix**. With the latch gone the N=16
+> wall is **store-CPU saturation (92–93%)** that the latch had *masked* (store CPU was already ~87% in C2) — **not** a
+> newly-emerged wall. Critically, C3 gives **no per-query CPU attribution**, so the hypothesis that this CPU is the
+> pooled claim's temp-object churn is *unproven*, and the pooled-claim rewrite's sufficiency at N=16 is **UNVERIFIED** —
+> it must be measured against this exact sweep, not assumed. Two handoff errata the run corrected: the enabling T-SQL is
+> `MEMORY_OPTIMIZED TEMPDB_METADATA` (two keywords, **not** the underscore form), and the feature is **not**
+> Enterprise-only (available on all editions since SQL 2019, subject to In-Memory OLTP memory limits — confirm against
+> current licensing before treating edition as a deployment constraint). Config was **torn down** to the C2 baseline
+> after the run. §8 stays **unflipped**; `per_lane` stays off.
 
 ### Retracted
 
@@ -312,10 +345,14 @@ average, and it is not what 1,500 connections looks like. **Retracted.**
 | change | serial txn | lane ceiling @3.5 ms | nature |
 |---|---:|---:|---|
 | today | 40 | 7.1 msg/s | — |
-| `fifo_claim_batch > 1` (ships OFF) | 21 | 13.6 msg/s | config |
+| `fifo_claim_batch > 1` (ships OFF) | 21 *(K≥20)* · ~34 *(K=8)* | 13.6 · ~12.7 msg/s | config |
 | `accepts=` seam (`H` 20 → 4) | 8 | 35.7 msg/s | config + seam |
 | both | 5 | 57.1 msg/s | config + seam |
 | **+ intra-message concurrency** | ~1 | ~286 msg/s | **engine, new** |
+
+> **The `fifo_claim_batch` row is `H·(1 + 1/K)`, not a flat `H+1`** — so `21` requires **`K ≥ H = 20`**, while
+> the shipped guidance is **K = 8–16**. It is a **claim-only** batch (verified 2026-07-11, §8 Phase 3(2)); that
+> is *why* the cost is `H+1` and not `~2`. It **cannot** touch the OUTBOUND claim (hard-1).
 
 The last row is a **verified, unexploited opportunity.** `fifo_claim_batch` batches the *claim* into one
 commit, but the dispatcher then loops `for item in items:` — *"processed in FIFO order below"* —
@@ -327,13 +364,24 @@ while message-level FIFO is preserved. No ADR contemplates this.
 ### `H` is also a STORAGE amplifier — and the spec gives us a budget to check it against
 
 `store.py`: *"Both `ingress` and `routed` rows hold the raw body"* — **one routed row per selected handler,
-each a full copy of the raw message.** So bytes written per ingress message scale as `(1 + H + N)`:
+each a full copy of the raw message.** Body copies written per ingress message scale as `(2 + H + N)`:
 
-| feed | rows written | of which are raw copies |
+| feed | queue rows written | body copies written |
 |---|---:|---:|
-| simple (`H=1, N=1`) | 3 | 2 |
-| bench (`dests=8`) | 17 | 9 |
-| **ADT hub (`H=20, N=4`)** | **25** | **21** |
+| simple (`H=1, N=1`) | 3 | 4 |
+| bench (`dests=8`) | 17 | 18 |
+| **ADT hub (`H=20, N=4`)** | **25** | **26** |
+
+> ✅ **Corrected 2026-07-10 (step A2); now pinned by `tests/test_bytes_per_message_amplification.py`.**
+> This read `(1 + H + N)`. Measured against the real store methods, `enqueue_ingress` writes **two** copies
+> of the raw — `messages.raw`, retained for the message's lifetime, *and* the ingress `queue.payload` — in
+> one transaction. The hub writes **26** body copies, not 25.
+>
+> A second correction, in the same direction: **SQL Server does not deduplicate identical fan-out bodies.**
+> SQLite implements store-once-deliver-many (`shared_body` + `body_ref`); `sqlserver.py`'s own schema
+> comment records that *"on SQL Server `body_ref` stays NULL today"*. So `N` identical delivery bodies cost
+> **1** copy on SQLite and **N** on SQL Server — the backend the rig and production actually run. Any
+> storage figure measured on SQLite understates SQL Server.
 
 The incumbent's budget is **10.9 KB per message** (`500 GB/day ÷ 45M`). A first-order estimate for
 MessageFoundry — assuming a ~2 KB raw HL7 body and ~2.67× encoding inflation (`NVARCHAR(MAX)` at 2 B/char ×
@@ -345,6 +393,16 @@ parity; but the ADT hub alone is **~27 KB/event**, about **2.5× the budget**.
 > The structural claim does not depend on the raw size: **write volume, like transaction count, scales with
 > `H`.** Cutting `H` from 20 to 4 cuts both — and the 15 TB / 30-day drive sizing an adopter is told to buy
 > depends on it.
+>
+> **Do not publish the `~11 KB` / `~27 KB` figures.** Step A2 pinned the copy count exactly (`2 + H + N`),
+> but converting copies to *durable bytes* needs three multipliers that remain unmeasured: character width
+> (`NVARCHAR(MAX)` is UTF-16 — 2 B/ASCII char — with no UTF-8 collation on this schema), cipher expansion
+> (`mfenc` ≈ `4/3·raw + 64`, and **off by default**), and everything the database writes that is not the
+> body — row and page overhead, indexes, and above all the **transaction log**, which durably records each
+> of the `3 + 2H + 2N` transactions. Copies × width is a *lower bound* on body bytes, not a figure for
+> durable bytes. The honest measurement is a `db.size_bytes` delta over a live run at a known message count
+> — the harness already samples it as `EngineSample.db_size_bytes`. Until then this row is **UNKNOWN**, and
+> a confident number here would be exactly the failure this audit documents.
 
 ---
 
@@ -409,11 +467,31 @@ entire `2H` thesis is wrong.
    *Buys:* ADT `txn/msg` **51 → 19 (2.68×)**; estate 4.64 → 3.55 txn/event; that feed's lane ceiling **×5**.
    *Costs:* the per-destination `FILTERED` disposition row disappears. **Needs an ADR** — it touches the
    count-and-log invariant.
-2. **`fifo_claim_batch > 1`.** `_PREFIX_STAGES = {INGRESS, ROUTED}` already supports claiming the contiguous
-   due head-prefix in one commit (ADR 0058/0066), and one message's routed rows share a lane. It ships
-   **`default=1` = OFF**.
-   *Unverified:* whether a batched claim also batches the **handoff** commit, or only the claim.
-   **Read the ROUTED dispatcher before quoting a number.**
+2. **`fifo_claim_batch > 1`.** `_PREFIX_STAGES = {INGRESS, ROUTED}` (`pipeline/wiring_runner.py:237`) supports
+   claiming the contiguous due head-prefix in one commit (ADR 0058/0066), and one message's routed rows share a
+   lane (keyed on `channel_id`). It ships **`default=1` = OFF**.
+
+   **RESOLVED 2026-07-11 (was open question #3) — and the question was posed backwards.** The dispatcher batches
+   the **claim only**; the handoff stays one commit per row, by explicit design (`stage_dispatcher.py:797-800`
+   loops `for item in items: await self._process_item(...)`; ADR 0058 calls batched handoff a non-goal — *"the
+   `N`/msg handoff commits remain the floor"*). But `2H → H+1` **is the claim-only figure** — H claim commits
+   collapse to 1, the H handoff commits remain. So the **13.6 msg/s lane ceiling in §7 was never conditional on
+   anything**, and the "unverified" flag was misplaced. Had the handoff *also* batched, the cost would be ~2, not
+   `H+1`.
+
+   *Correction to the §7 table:* the steady-state serial cost is `H·(1 + 1/K)`, not a flat `H+1`. **`H+1 = 21`
+   requires `K ≥ H = 20`.** At the shipped guidance of **K = 8–16** (`docs/CONFIGURATION.md`,
+   `docs/AOAG-DEPLOYMENT.md`), the H=20 hub lands at ~34 txn/msg (a **~33% cut**, lane ceiling ~12.7 msg/s), not
+   21/13.6.
+
+   ⚠️ **It is a cost-model lever, not (demonstrably) a shard-wall lever.** `per_lane_limit` is **hard-clamped to
+   1 for OUTBOUND/RESPONSE** in three independent layers (`wiring_runner.py:237`, `stage_dispatcher.py:246`, and
+   each store — e.g. `store/sqlserver.py:4302`), so `fifo_claim_batch` **cannot batch the outbound claim** — the
+   one C1/C2/C3 actually measured and the one carrying `dests`× the rows. Its effect on the tempdb churn is
+   therefore **not zero but UNMEASURED**: it *can* cut INGRESS/ROUTED claim-*call* count (up to 8× at the swept
+   shape, where a message's 8 routed rows share one lane), and the tempdb catalog latch is a **store-wide shared**
+   resource. No artifact records a per-stage claim-call rate — the captured `claim_phase_soak` telemetry is
+   **outbound-only**. **Do not publish it as a shard-wall non-factor without that measurement** (see #227).
 3. **Advisory lint** in `messagefoundry check`: flag handlers whose leading statements are pure guards ending
    in `return None`, and price them.
 
@@ -457,8 +535,175 @@ unified store.
 - **Declining** → a shared bottleneck (the store's claim path). Phases 3–4 become the whole game and shards
   buy nothing.
 
-This separates "sizing problem" from "engine problem." It is cheaper than any lever, every lever's value
-depends on it, and **it has never been run.**
+This separates "sizing problem" from "engine problem." It is cheaper than any lever, and every lever's value
+depends on it.
+
+**C1 (2026-07-10) ran the first two points — N=1 vs N=4 — and the answer is DECLINING, but load-dependently.**
+Per-shard capacity is near-linear at light load (1.01× penalty at 2/shard) and degrades as each shard is driven
+harder (1.53× at 6/shard; collapse at 12/shard, a load the solo shard still holds); whole-fleet peak scaled only
+**1.36× for 4× shards**. `claim_mean` rose 12.6 → 48.8 ms with shard count, tracking the penalty — the shared
+pooled claim is the measured wall, reconciling with the claim-runaway row in §3. Two things C1 deliberately did
+**not** settle, and neither can be settled from two points: (1) whether the penalty **compounds or saturates**
+past N=4; (2) whether the near-linear **light-load (2/shard)** scaling — the *only* regime that could reach
+520.83 events/s, since driving few shards hard just triggers the collapse — survives to N=8/N=16. C1 also could
+not localize the wall (tempdb-metadata churn vs store-CPU vs the UPDLOCK storm) without SQL wait-stats; per-PID
+CPU stayed `UNKNOWN` by design (a wrong number is worse than none).
+
+**C2 (2026-07-10) ran that light-load sweep — N = 1/2/4/8/16 at a fixed 2/shard — and the answer is BREAKS beyond
+N=4.** A true 900 s soak sustains cleanly at N=1/2/4 (100% delivered) and collapses at N=8 (18%) and N=16 (5%): a
+shared store tolerates ~4 lightly-loaded shards, then falls off a cliff. The collapse is **store-side, decisively** —
+engine box CPU p95 ~16% with the busiest single core ≤43% (the `max_core%` reading finally excludes a GIL-bound
+thread, closing the per-PID-`0.00` loophole), load-gen idle, `send_ack` flat, while `claim` and `mark_done` run away.
+SQL wait-stats localize it to **tempdb system-catalog PAGELATCH** (14.6× dominant at N=8; hottest page `2:1:97` =
+`syssingleobjrefs`; I/O and lock waits absent) — the pooled claim's per-cycle temp-object churn, now shown to scale
+with shard count at fixed per-shard load. So the "many lightly-loaded shards" path to 520.83 events/s is dead **beyond
+N=4 on the current SQL config** — with the load-bearing caveat that C2 established *correlation*, not a proven remedy.
+
+**C3 (2026-07-10/11) ran that counterfactual — the identical 2/shard sweep with `MEMORY_OPTIMIZED TEMPDB_METADATA=ON`
+— and the answer is PARTIAL: the latch was real, but removing it buys exactly one shard-doubling.** The feature
+converted the C2 catalog tables to latch-free memory-optimized structures and the hot page `2:1:97` collapsed to near
+zero at both arms — so the mechanism C2 fingered is **proven**. That **cleared N=8 outright** (18% → 100% delivered,
+backlog drained to zero, stranded 0) but left **N=16 collapsing** (27.9%, up ~6× from 4.8%): the knee moved (4,8] →
+(8,16] and no further. With the latch gone, the N=16 residual is **store-CPU saturation (92–93%)** — but read that
+carefully, because it is the same adjacency trap C2 was retracted for: `SOS_SCHEDULER_YIELD` is #1 only *by default*
+(PAGELATCH went to ~0), it did **not** surge (+11%), and store CPU was **already ~87% in C2**. The honest framing is
+that the store's pre-existing CPU cost was **unmasked**, not that a successor wall emerged — and C3 has **zero
+per-query CPU attribution**, so pinning that CPU on the pooled claim's temp-object churn is a *hypothesis*, not a
+result. **Consequences for the plan:** (1) the `N`-sizing path is **not** resurrected — even latch-free, the shared
+store tops out at N=8 (and N=8 is a *marginal* clear: backlog slope +4 rows/s, store CPU climbing 40→60% through the
+soak, headroom above 16/s uncharacterized — a longer/higher-rate N=8 soak is an unretired re-check before calling it
+durable). (2) The pooled-claim rewrite was C3's leading durable, edition-portable lever, **but its sufficiency
+at N=16 was UNVERIFIED** — and **C4 (2026-07-11) has since supplied the per-query attribution C3 lacked and the
+answer is worse than "unverified": the claim-only rewrite is now known INSUFFICIENT.** The N=16 store-CPU
+wall's #1 consumer is the dispatcher's `list_fifo_lanes` discovery scan (47.46%), **not** the claim (#2,
+40.33%) — a `claim_fifo_heads`-only rewrite removes 40.33% but leaves `list_fifo_lanes` #1 and standing.
+Worse, ~72% of the ~540 ms N=16 CLAIM wall is off-CPU WAIT (`cpu/elapsed=0.28`), so reducing store CPU may
+not clear it at all. C4's own verdict is **WITHHELD** (reconciliation pre-gate fails to robustly clear 70%; CLAIM is not the
+plurality). See the dedicated "C4 — the per-query CPU attribution result" subsection at the end of §8. Two
+handoff errata the C3 run fixed: the T-SQL is `MEMORY_OPTIMIZED
+TEMPDB_METADATA` (two keywords, not the underscore form), and the feature is **not** Enterprise-only (all editions
+since SQL 2019, subject to In-Memory OLTP limits). Config was torn down to the C2 baseline. §8 stays unflipped;
+`per_lane` stays off.
+
+### The capacity frontier — clearing N=16 is necessary, and demonstrably not sufficient
+
+C1/C2/C3 each answered a *scaling-shape* question. None of them ever stated the *capacity* consequence, and
+the arithmetic had never been written down. It is worth writing down, because it changes what a successful
+pooled-claim rewrite is worth.
+
+**The sustained ledger.** Gate on `result`, count only arms that fully drained (`drained: true`,
+`stranded: 0`):
+
+| config | best **sustained** fleet | shape | vs 520.83 |
+|---|---:|---|---:|
+| **shipped default** (pooled, `MEMORY_OPTIMIZED TEMPDB_METADATA=OFF`) | **90.0 events/s** | 10 ingress/s, N=4, `dests=8`, 900 s (`redo-pooled-soak10`) | **5.79× short** |
+| **C3 config** (`…TEMPDB_METADATA=ON`, reverted after the run) | **144.0 events/s** | N=8 × 2/shard × (1+8), 900 s (`c3-8`) | **3.62× short** |
+| *any* mode, for the record | ≥252 events/s | `per_lane`, 16 lanes, 540 s | ≤2.07× short |
+
+The `per_lane` row is **excluded from the shard-scaling story, not from the record**: it ships OFF, it was
+measured at 16 lanes and storms the store at the 1,500-lane target, and its run had engine-box CPU at 88.4%
+p95 — so the `≥` may be a *bench-box* bound rather than an engine one.
+
+⚠️ **`c2-4`'s 72.0 events/s is NOT the shipped-default ceiling** — it is a pinned 2/shard probe that was
+simply offered less than `redo-pooled-soak10` was. Reading it as a capacity number is the same error class
+as B8/B10: a run parameter mistaken for a measurement.
+
+**The consequence.** If the pooled-claim rewrite fully cleared N=16 *at the swept probe load*, the fleet
+would sit at `16 × 2 × 9 = 288 events/s` — still **1.81× short**. That 288 is a **floor, not a ceiling**:
+2/shard is a deliberately light scaling probe and per-shard headroom at N=8/N=16 has **never been
+characterized** (C3 never drove N=8 above 16/s; its "pinned ceiling" is a self-declared floor). So the honest
+statement is not "a cleared N=16 delivers 288" — it is:
+
+> **Closing the residual 1.81× requires *either* ~3.62 ingress/s per shard at N=16 — a rate *above* the
+> 3/shard load that already failed to drain at N=4 on the pooled default — *or* roughly two further
+> shard-doublings past a knee that has already collapsed twice ((4,8] pre-C3, (8,16] post-C3). Neither has
+> been measured.**
+
+What per-shard headroom *is* characterized, all on the pooled default at N=4: **2.5/shard sustains**
+(10 ingress/s, drained); **3/shard fails to drain** (12 ingress/s, `in_pipeline_final` 825, slope +12.17);
+and C1's matched-load penalty *worsens* monotonically with per-shard load (1.01× @2/sh → 1.53× @6 → 3.12×
+@10; collapse @12) — direction firm, **magnitudes soft** (both C1 soaks collapsed). Every one of those points
+says the same thing: the store gets *less* tolerant as you drive a shard harder, so the "raise per-shard load"
+escape runs into the wall from the other side.
+
+**Therefore:** clearing N=16 is **necessary but not sufficient** — and **C4 (below) has now STRENGTHENED
+this conclusion twice over:** the pooled claim is *not even the N=16 wall's #1 CPU consumer* (the dispatcher's
+`list_fifo_lanes` discovery scan is), and a claim-only rewrite would not clear it — *and* the N=16 wall is
+~72% off-CPU WAIT, so "reduce store CPU" may be the wrong lever entirely. Even the earlier, more optimistic
+"a CONFIRMED C4 + a successful rewrite would still leave a gap" framing was too generous: **C4 came back
+WITHHELD, and the rewrite as previously scoped is now known INSUFFICIENT.** The rewrite is not a parity plan
+on its own; it has to be *composed* with the `txn/event` levers (Phase 3) rather than sequenced ahead of them
+— and Phase 3 (the just-merged `accepts=` seam, #213) is correspondingly *more* important now, not less.
+**Do not read C4 as "the rewrite gets us to 45M/day"** — read it as "the rewrite, even hypothetically
+CONFIRMED, was never sufficient, and its target was mis-identified."
+
+*Falsifier:* measure per-shard headroom at N=8 latch-free. If a shard sustains ≳3.6/s at N=8/16, the sizing
+path reopens and this section is wrong.
+
+### C4 — the per-query CPU attribution result (VERDICT: WITHHELD)
+
+**C4 (2026-07-11) ran the per-query CPU attribution C3 lacked — the "is the N=16 store CPU the pooled claim's
+temp-object churn?" question — and the verdict is WITHHELD: not confirmed, not refuted.** It captured
+`sys.dm_exec_query_stats` deltas + `sched.store_proc_cpu` per arm (N=4/8/16, 2/shard, same engine commit as
+C3), then ran the prereg reconciliation contract. Two independent, compounding failures — either sufficient
+on its own — block CONFIRMED:
+
+1. **The blocking reconciliation pre-gate does not robustly clear 70%.** The contract required attributed
+   query-CPU to explain ≥70% of the box store-CPU at N=16 before family precedence is authoritative. It
+   "passes" at exactly **70.68%** — but only on the idle-diluted prereg denominator (window-mean 84.4%,
+   contaminated by snap0=0% / snap1=37% idle-ramp samples the CPU-delta numerator never credits), and only
+   via the 4 **collapse-tail** intervals where the box has *dropped off the wall* (92–94% → 82–88%). Every
+   sustained / phase-matched / C3-consistent denominator lands at **64.5–69.6%** (the INCONCLUSIVE-INSTRUMENT
+   band): plateau(6–20)=64.6%, drop-ramp-only=69.6%, C3-consistent sustained wall (box 92–94%)=64.5%. The
+   plateau intervals — the *actual* wall — never exceed 69.1%. With no arm robustly passing, **family
+   precedence is not authoritative at any N → CONFIRMED is unreachable.**
+2. **Under the ratified family map, CLAIM is not the plurality at N=16.** The **#1 query-CPU consumer is
+   `list_fifo_lanes` at 47.46%** (2446 cpu-s) — the pooled `StageDispatcher`'s read-only, clock-driven
+   ready-lane **discovery** scan (`sqlserver.py:4378`, `_sweep_loop` backstop). CLAIM (`claim_fifo_heads`, 13
+   hashes) is **#2 at 40.33%** (2079 cpu-s). Two families both >40% → **AMBIGUOUS**. The single heaviest hash
+   (one `list_fifo_lanes` shape, 45.81%) alone exceeds all 13 CLAIM hashes summed. The metrics-scan rival
+   hypothesis is REFUTED (8.60%, distant third).
+
+**The headline for the plan — the mechanism was mis-identified.** The N=16 store-CPU wall's #1 consumer is
+the dispatcher's `list_fifo_lanes` discovery scan, **not the claim.** So the previously-leading fix — a
+`claim_fifo_heads`-only SQL rewrite — removes 40.33% (2079 cpu-s) but leaves `list_fifo_lanes` (2446 cpu-s,
+still #1, faster-growing, an O(pending-rows) DISTINCT+CROSS APPLY scan) standing → **it would NOT clear the
+N=16 wall.** Even a *hypothetical* CONFIRMED is a TARGET condition, not sufficiency.
+
+**The deeper reframe — the N=16 wall may be WAIT-bound, not CPU-bound.** Per-claim CPU is a real but
+**minority** slice of the wall: ~72% of the ~540 ms N=16 claim wall is **off-CPU lock/latch WAIT**
+(`cpu/elapsed=0.28`). So "store CPU is the wall" is itself the wrong frame at N=16 — reducing store CPU
+(claim *or* dispatch) may not clear a WAIT-bound wall at all. This subsumes and reframes the §8 store-CPU
+narrative: the CPU is real, but it is not most of the ~540 ms.
+
+**What survives cleanly.** CLAIM `cpu_us_per_exec` rises **8.4× monotonically** N=4→16 (826.9 → 6971 µs) and
+it is honest query CPU — *not* spin-inflation (`cpu/elapsed` DROPS 0.93→0.70→0.28; the excess is off-CPU
+WAIT, not counted in worker_time), *not* an empty-claim storm (`empty_claim_ratio` falls, rows/claim≈1.0).
+**But** it is "largely deeper-queue-scan driven (~4.3× reads growth) with a ~2× per-page-cost elevation" —
+**not** the "intrinsic per-cycle churn" the hypothesis assumed — and it is a **necessary target condition
+only, not sufficiency**, gated by the reconciliation that now fails.
+
+**Apparatus caveat — every C4 number is under a perturbed regime.** C4 ran measurably heavier than the clean
+C3 baseline (same commit `98bec81`; the qstats capture worker's own in-store DMV scan is the sole differing
+variable): **c4-8 flipped sustained→not** (backlog slope 7.48 vs C3's 4.04), **c4-16 `claim_mean` 93.4 ms vs
+C3's 55.7 ms (+68%)**, stranded 208,766 vs 166,231. A lighter / out-of-process re-capture is a recommendation
+before any C4 figure is treated as load-bearing.
+
+**OPEN RATIFICATION (owner decision, NOT self-decided).** Does `list_fifo_lanes` count as **CLAIM machinery**
+(fold → 87.79% combined, a decisive plurality) or as a **separate DISPATCH family** (keep separate →
+AMBIGUOUS)? **Even folding does NOT yield CONFIRMED** — the reconciliation pre-gate fails independently. The
+coordinator's **recommendation is to keep them separate → AMBIGUOUS** (rationale: `list_fifo_lanes` is an
+independent clock-driven `_sweep_loop` backstop, a pure RCSI read with no locking hints / no OUTPUT / zero
+temp objects, is not per-claim triggered — `sweep_now` fires only on reload/resume/recovery — and needs a
+*different* fix than the claim batch), **but that is a recommendation, not a decision.** Recorded OPEN in §9.
+
+**Consequence for the plan.** (1) Do **not** build the `claim_fifo_heads`-only rewrite as the sole wall fix —
+sufficiency analysis shows it would not clear N=16 (`list_fifo_lanes` remains #1). Re-target CPU reduction to
+the **pooled `StageDispatcher` lane-servicing path as a whole** (discovery scan *and* claim batch) — *if* CPU
+is even the lever, which the 72%-WAIT reframe puts in doubt. (2) The `txn/event` levers (Phase 3, `accepts=`
+#213, just merged) are relatively **more** important now. (3) Ratify the family question and instrument-fix
+before any re-run (phase-matched denominator, C3 cross-check, a scan-confound control for `list_fifo_lanes`,
+a lighter capture worker).
 
 ### Rig sizing — do the AWS boxes need to grow?
 
@@ -573,15 +818,72 @@ percentages alone cannot attribute anything.
 
 ## 9. Open questions, ranked
 
-1. **Does shard scaling hold?** (Phase 5.) Everything else is downstream of this.
-2. **What is `per_lane`'s real ceiling** at a 900 s hold on the fixed harness?
-3. **Does a batched ROUTED claim also batch the handoff commit?** Decides whether `fifo_claim_batch` is a
-   default-flip or a no-op.
-4. **Is a GIL-bound core co-binding?** The engine-side CPU collector reads `0.00` on the SQL Server rig. Until
-   it is fixed, no CPU claim is admissible.
-5. **What is the realistic HL7 fan-out** for a target deployment? It selects which bottleneck you measure —
+1. **Is the N=16 wall even CPU-bound, or is it WAIT-bound?** *(NEW — C4, 2026-07-11.)* This now precedes the
+   rewrite question, because C4 showed **~72% of the ~540 ms N=16 claim wall is off-CPU lock/latch WAIT**
+   (`cpu/elapsed=0.28`) — per-claim CPU is a real but **minority** slice. If the wall is WAIT-bound, reducing
+   store CPU (claim *or* dispatch) may not clear it at all, and the entire "store-CPU rewrite" framing is
+   attacking the wrong resource. A WAIT-decomposition at N=16 (which lock/latch classes dominate the 72%) is
+   unrun and is the highest-leverage next diagnostic.
+2. **Does `list_fifo_lanes` count as CLAIM machinery or a separate DISPATCH family?** *(NEW — C4 OPEN
+   RATIFICATION, owner decision.)* C4's #1 N=16 query-CPU consumer is `list_fifo_lanes` (47.46%), CLAIM #2
+   (40.33%). **Separate** (coordinator's recommendation) → two families >40% → **AMBIGUOUS**, CLAIM not the
+   plurality. **Folded** → 87.79% combined plurality. **Even folding does NOT yield CONFIRMED** (the
+   reconciliation pre-gate fails independently). This is a spec-author ratification C4 was forbidden to
+   self-decide; recorded OPEN. Recommendation rationale: `list_fifo_lanes` is an independent clock-driven
+   `_sweep_loop` backstop, a pure RCSI read (no locking hints / no OUTPUT / zero temp objects), not per-claim
+   triggered, needing a *different* fix than the claim batch — flagged as recommendation, **not** decision.
+3. **What instrument fixes are needed before any attribution re-run?** *(NEW — C4.)* C4's reconciliation
+   pre-gate did not robustly clear 70% under any sustained/phase-matched denominator (64.5–69.6%). Before a
+   re-run: (a) bake a **phase-matched / sustained-plateau denominator** into the analyzer (drop the min=0
+   idle-ramp contamination that carried the lone 70.68% pass); (b) add the **C3 cross-consistency check**
+   (store at 92–93%) the prereg's INC-16 skipped; (c) add a **scan-confound control for `list_fifo_lanes`**
+   (cpu/exec vs reads/exec, as MUST-FIX 18 did for claim) before calling its 47% share a wall *cause* rather
+   than a collapse *effect*; (d) re-capture with a **lighter / out-of-process qstats worker** (C4 ran ~68%
+   heavier `claim_mean` than C3 and c4-8 flipped sustained→not — the decomposition is under a perturbed
+   regime).
+4. **Does *any* rewrite of the pooled `StageDispatcher` lane-servicing path clear N=16 — and is `N`-sizing
+   viable at all?** (Phase 5 / C3 / C4.) C1→C2→C3 (2026-07-10) walked the scaling shape: light-load 2/shard
+   scaling *declines*, **BREAKS beyond N=4**; the C2 wall was the tempdb system-catalog PAGELATCH; C3's
+   `MEMORY_OPTIMIZED TEMPDB_METADATA=ON` **removes that latch and clears N=8 but only buys one shard-doubling**
+   (N=16 still collapses). **C4 (2026-07-11) supplied the per-query attribution C3 lacked and changed the
+   target:** the N=16 store-CPU wall's #1 consumer is the dispatcher's `list_fifo_lanes` discovery scan
+   (47.46%), **not** the claim (#2, 40.33%). So a `claim_fifo_heads`-only rewrite is now known **INSUFFICIENT**
+   — it removes 40.33% but leaves `list_fifo_lanes` #1 and standing. Re-target to the **whole pooled
+   lane-servicing path** (discovery scan *and* claim batch) — *if* CPU is even the lever (see #1). Any such
+   rewrite must be built *and* measured against this exact 2/shard sweep before `N`-sizing is called viable or
+   dead. A cheaper unretired re-check sits alongside it: a longer/higher-rate **N=8** soak, to confirm C3's N=8
+   clear is durable and not marginal.
+5. **Is per-shard headroom at N=8 latch-free above ~3.6 ingress/s?** This is the *falsifier for the capacity
+   frontier* (§8): clearing N=16 at the swept 2/shard probe load still lands 1.81× short, so the sizing path
+   only reopens if a shard sustains ≳3.6/s at N=8/16. C3 never drove N=8 above 16/s — its "pinned ceiling" is a
+   self-declared floor. **Cheap, unrun, and it bounds the value of any lane-servicing-path rewrite.**
+6. **What is `per_lane`'s real ceiling** at a 900 s hold on the fixed harness?
+7. **What does `fifo_claim_batch > 1` contribute to the *shard wall*** (as opposed to the cost model, where it
+   is now settled)? It cannot batch the outbound claim (hard-1), but it can cut INGRESS/ROUTED claim-*call*
+   count, and the tempdb catalog latch is store-wide. **Unmeasurable today: the `claim_phase_soak` telemetry is
+   outbound-only.** Needs a per-stage claim-call rate (#227).
+8. **What is the realistic HL7 fan-out** for a target deployment? It selects which bottleneck you measure —
    `dests=8` is outbound-heavy (89% of events); `dests=1..2` shifts the load onto the ACK-serialized inbound
    commit.
 
+*(Answered 2026-07-11 — the old "is the N=16 store-CPU the pooled claim's temp-object churn?" attribution
+question: **C4 verdict WITHHELD** — not confirmed, not refuted. The #1 N=16 query-CPU consumer is the
+dispatcher's `list_fifo_lanes` discovery scan (47.46%), **not** the claim (#2, 40.33%); the reconciliation
+pre-gate does not robustly clear 70%; and the wall is ~72% off-CPU WAIT. The claim-only rewrite is INSUFFICIENT.
+This "answered" only closes "is it the claim?" — it opens the three NEW questions #1–#3 above. See the "C4 —
+the per-query CPU attribution result" subsection in §8.)*
+
 *(Resolved 2026-07-10: the claim is a **flat** 520.83 events/s sustained, not a peak-honoured figure. The
 estate's own 2.28–2.89× diurnal peaking in §6 characterises the estate, not the target.)*
+
+*(Resolved 2026-07-11 — old #3, "does a batched ROUTED claim also batch the handoff commit?": **the claim
+only**, and the question was posed backwards — `2H → H+1` **is** the claim-only figure, so §7's 13.6 msg/s
+lane ceiling was never conditional on it. See §8 Phase 3(2) for the resolution, the `K ≥ H` correction, and
+the OUTBOUND hard-1 clamp that keeps it out of the shard-wall story.)*
+
+*(Resolved 2026-07-11 — old #4, "is a GIL-bound core co-binding?": the per-PID `0.00` was diagnosed and fixed
+in **#861** (A3). There is no in-harness per-PID sampler in shardcert at all — it only advertises `node_pids`
+for an external capture; the connscale `FdSampler` now degrades a flat counter to `None` rather than
+rendering `0.00`, and re-walks the subtree so a sharded engine's children are seen. `max_core%` remains the
+validated substitute for shardcert runs, and it already excluded a GIL-pegged thread at C2/C3 (≤43%). The
+residual is **#220** — differencing subtree CPU sums taken over *different* process sets is not a delta.)*

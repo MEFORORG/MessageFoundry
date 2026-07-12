@@ -18,7 +18,7 @@ fully-offline path that a no-AI builder uses instead.
 | `/review` | `messagefoundry check` + `validate` (Problems panel, on-save) | ✅ shipped | `ide/src/validate.ts`, `checks.py` |
 | `/test` | **Test Bench** (dry-run, disposition, before/after) + **Generate Samples** (synthetic corpora) | ✅ shipped; deepening | `ide/src/testBench.ts`, `generate.ts` + PLAN-7 **L4/L7** |
 | `/explain` | **Cookbook + Walkthrough** — searchable "solved problems" gallery that inserts editable Python + `contributes.walkthroughs` onboarding + HL7-schema hover/autocomplete | ⚠️ **partial today** → filled by Cookbook | BACKLOG **#104** + PLAN-7 **L3** |
-| `/migrate` | Deterministic Corepoint-import tooling (Action-List → code-first Router/Handler scaffold) | ❌ **open gap** | BACKLOG **#105** (deferred, owner-gated) |
+| `/migrate` | **Deterministic Corepoint import** — `messagefoundry import corepoint <export> --out <dir>` scaffolds one editable `@router`/`@handler` module per channel ([`corepoint_import.py`](../messagefoundry/corepoint_import.py)) | ✅ shipped (synthetic schema) | BACKLOG **#105**, [ADR 0086](adr/0086-deterministic-corepoint-import.md) |
 
 **The immediacy an interactive AI loop would give** is supplied deterministically by the **#92 live-debug
 loop** (PLAN-7 L2 v1 + L6 v2): edit → save → watch per-line values + disposition update inline, no
@@ -26,12 +26,15 @@ breakpoints, no AI, fully offline. That is the deterministic analogue of "ask th
 — you *watch* it do it.
 
 ## Findings
-- **Five of six** chat subcommands already have a first-class deterministic sibling that is shipped or
-  actively being deepened by PLAN-7 (L1/L4/L7) — a builder with AI off loses **no essential capability**
-  today except discoverability-of-examples, which **#104 Cookbook** closes.
-- **The one genuine gap is `/migrate`** — there is no deterministic Corepoint-import tool; migration
-  currently leans on the AI `/migrate` subcommand. Filed as **BACKLOG #105** (deferred, owner-gated): a
-  larger design item that needs its own scope + ADR, not agent-buildable in the PLAN-7 waves.
+- **All six** chat subcommands now have a first-class deterministic sibling that is shipped or actively
+  being deepened by PLAN-7 (L1/L4/L7) — a builder with AI off loses **no essential capability** today
+  except discoverability-of-examples, which **#104 Cookbook** closes.
+- **The former `/migrate` gap is closed** — the deterministic Corepoint import shipped 2026-07-10 (BACKLOG
+  **#105**, [ADR 0086](adr/0086-deterministic-corepoint-import.md)): `messagefoundry import corepoint`
+  scaffolds editable `@router`/`@handler` Python from a Corepoint action-list export. The export **schema is
+  synthetic-until-validated** (no real Corepoint export exists in-repo, #87 recon is git-ignored), so it
+  needs reconciliation against a real export before it is trusted on production channels — but the AI-off
+  migrator now has a deterministic starting point instead of leaning on the AI `/migrate` subcommand.
 
 ## Guardrail (why "deterministic sibling" is safe where "no-code" is not)
 Every sibling above **emits editable Python** (or is pure validation/visualization/testing). None is a

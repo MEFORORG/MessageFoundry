@@ -18,6 +18,7 @@ import urllib.request
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import DICOMweb
 from messagefoundry.parsing import RawMessage
 from messagefoundry.transports import build_destination
@@ -136,6 +137,50 @@ def test_dicomweb_cleartext_credentials_refused() -> None:
                 ).settings,
             )
         )
+
+
+def test_dicomweb_cleartext_http_nonloopback_refused_without_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ASVS 12.2.1: the STOW-RS body carries the DICOM object (PHI), so a cleartext http egress to a
+    # non-loopback host is refused even with NO credentials, unless the explicit escape is set.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with pytest.raises(ValueError, match="cleartext http to a non-loopback host"):
+        build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.DICOMWEB,
+                settings=DICOMweb(url="http://pacs.example.org/dicom-web").settings,
+            )
+        )
+
+
+def test_dicomweb_cleartext_http_loopback_allowed() -> None:
+    # On-box loopback cleartext egress is not a network exposure → allowed (byte-identical posture).
+    dest = build_destination(
+        Destination(
+            name="OB",
+            type=ConnectorType.DICOMWEB,
+            settings=DICOMweb(url="http://127.0.0.1:8042/dicom-web").settings,
+        )
+    )
+    assert isinstance(dest, DicomWebDestination)
+
+
+def test_dicomweb_cleartext_http_nonloopback_allowed_with_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    # #200 (ADR 0092): the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
+    with active_hop_posture(HopPosture(is_phi=True, production=False)):
+        dest = build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.DICOMWEB,
+                settings=DICOMweb(url="http://pacs.example.org/dicom-web").settings,
+            )
+        )
+    assert isinstance(dest, DicomWebDestination)  # built (warns loudly), not refused
 
 
 # --- multipart framing -------------------------------------------------------

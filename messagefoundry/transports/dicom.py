@@ -50,13 +50,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import ssl
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import BytesIO
 from typing import Any, cast
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
-from messagefoundry.config.tls_policy import harden_kex_groups, harden_verify_flags
+from messagefoundry.config.tls_policy import (
+    TrustAnchorPolicy,
+    build_verifying_client_context,
+    harden_kex_groups,
+    harden_verify_flags,
+    relax_verify_expiry,
+    resolve_trust_anchor,
+)
 from messagefoundry.parsing.binary import BinaryCarriageError
 from messagefoundry.parsing.binary import decode as _carriage_decode
 from messagefoundry.parsing.dicom._deps import load_dcmread
@@ -72,6 +79,7 @@ from messagefoundry.transports.base import (
     register_destination,
     register_source,
 )
+from messagefoundry.transports.mllp import InsecureHopGuard
 
 __all__ = ["DicomScpSource", "DicomScuDestination", "DEFAULT_MAX_OBJECT_BYTES"]
 
@@ -338,7 +346,9 @@ class DicomScpSource(SourceConnector):
         self._ae = None
 
 
-def _client_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
+def _client_ssl_context(
+    s: dict[str, Any], *, trust_anchor_policy: TrustAnchorPolicy | None = None
+) -> ssl.SSLContext | None:
     """Build the SCU's **client** ``SSLContext`` for DICOM-over-TLS dialing a downstream PACS, or
     ``None`` when ``tls`` is off. Built via :func:`ssl.create_default_context` (like MLLP/REST) so it
     verifies the peer's server cert (hostname + chain) and — crucially — loads the **system trust
@@ -347,12 +357,27 @@ def _client_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
     ``tls_key_file`` opt into mTLS. Verification is never disabled (a downstream is a PHI egress). TLS
     1.2+ floor. Built once at construction so a bad cert/key fails at build (dry-run/``check``), not at
     the first delivery — the client mirror of :func:`_server_ssl_context`. ``tls_key_password`` decrypts
-    a passphrase-encrypted mTLS client key (``env()``-sourced, mirroring MLLP)."""
+    a passphrase-encrypted mTLS client key (``env()``-sourced, mirroring MLLP).
+
+    ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback when
+    the connection names no ``tls_ca_file`` of its own: an internal hop verifies against the org internal
+    CA per the resolved anchor. ``None`` (a direct test build) keeps the historical
+    ``create_default_context(cafile=…)`` behaviour, byte-identical. It only selects WHICH roots verify the
+    peer — verification is never disabled — so the internal CA never weakens a refusal."""
     if not s.get("tls"):
         return None
     ca = s.get("tls_ca_file")
-    # cafile=None → load_default_certs() (the OS trust store); cafile=path → pin that anchor only.
-    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(ca) if ca else None)
+    if trust_anchor_policy is not None:
+        # #190 (ADR 0093): the connection's own tls_ca_file wins verbatim, else the internal-CA anchor.
+        anchor = resolve_trust_anchor(
+            connection_ca_file=str(ca) if ca else None,
+            host=str(s.get("host", "")),
+            policy=trust_anchor_policy,
+        )
+        ctx = build_verifying_client_context(anchor)
+    else:
+        # cafile=None → load_default_certs() (the OS trust store); cafile=path → pin that anchor only.
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(ca) if ca else None)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     cert, key = s.get("tls_cert_file"), s.get("tls_key_file")
     if cert:  # opt-in mTLS: present a client cert to the peer SCP
@@ -366,6 +391,10 @@ def _client_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
         ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of the peer's server cert (ASVS 12.1.4)
+    # #129 (ADR 0094): opt-in granular expiry-only relaxation — honour an expired downstream PACS cert
+    # while STILL validating chain + hostname (verification stays ON; default off = byte-identical).
+    if s.get("tls_allow_expired"):
+        relax_verify_expiry(ctx, host=str(s.get("host", "")))
     return ctx
 
 
@@ -412,10 +441,36 @@ class DicomScuDestination(DestinationConnector):
         self._timeout = float(s.get("timeout_seconds", 30.0))
         self._connect_timeout = float(s.get("connect_timeout", 10.0))
         # Build the client TLS context now so a bad cert/key fails at construction (check/dry-run), not
-        # at the first delivery (like the SCP / MLLP / REST).
-        self._ssl = _client_ssl_context(s)
+        # at the first delivery (like the SCP / MLLP / REST). #190 (ADR 0093): thread the instance [tls]
+        # internal-CA trust-anchor policy so an internal hop that names no tls_ca_file of its own verifies
+        # against the org internal CA.
+        self._ssl = _client_ssl_context(s, trust_anchor_policy=config.trust_anchor_policy)
+        # #200 (ADR 0092): a plaintext DIMSE association (DICOM-over-TLS off) is a cleartext PHI hop —
+        # guard it on the posture gradient (a production-PHI hop off-loopback is refused at the enforced
+        # construction gate). None when TLS is on: a verified association needs no cleartext guard.
+        # tls_hop_attested opts a legitimately-secure hop (trusted segment) back in per-connection.
+        self._hop_guard: InsecureHopGuard | None = (
+            InsecureHopGuard.capture(
+                host=self._host,
+                port=self._port,
+                cell="DICOM C-STORE SCU",
+                description="plaintext DIMSE C-STORE association",
+                attested=config.tls_hop_attested,
+                attested_reason=config.tls_hop_attested_reason,
+            )
+            if self._ssl is None
+            else None
+        )
+        if self._hop_guard is not None:
+            self._hop_guard.enforce_construction()
 
-    async def send(self, payload: str) -> DeliveryResponse | None:
+    async def send(
+        self, payload: str, *, metadata: Mapping[str, str] | None = None
+    ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
+        if self._hop_guard is not None:
+            # Zero-I/O byte-crossing backstop (#200) before the association carries any object byte
+            # (defense in depth against a reload routing PHI around the construction gate).
+            self._hop_guard.assert_send()
         object_bytes = recover_dicom_object_bytes(payload, label="DICOM C-STORE SCU")
         if self._max_object_bytes is not None and len(object_bytes) > self._max_object_bytes:
             # Over the configured cap — a config/Handler issue a retry of the same object won't fix.

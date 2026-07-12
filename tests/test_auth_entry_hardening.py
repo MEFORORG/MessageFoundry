@@ -77,6 +77,25 @@ def test_rate_limiter_global() -> None:
     assert not rl.allow("c")  # global cap hit regardless of key
 
 
+async def test_admin_write_limiter_per_actor(engine: Engine) -> None:
+    # BACKLOG #193 (ASVS 2.4.2): allow_admin_write is a per-actor sliding window; a different actor is
+    # independent, and enabled=False is a transparent pass-through.
+    svc = await _service(
+        engine,
+        AuthSettings(
+            admin_write_rate_limit_per_actor=2, admin_write_rate_limit_window_seconds=60.0
+        ),
+    )
+    assert svc.allow_admin_write("a")
+    assert svc.allow_admin_write("a")
+    assert not svc.allow_admin_write("a")  # third write from the same actor is throttled
+    assert svc.allow_admin_write("b")  # a different actor is unaffected (no cross-actor cap)
+
+    off = await _service(engine, AuthSettings(admin_write_rate_limit_enabled=False))
+    for _ in range(50):
+        assert off.allow_admin_write("a")  # disabled limiter → always allowed
+
+
 async def test_login_rate_limited_per_ip(engine: Engine) -> None:
     service = await _service(
         engine, AuthSettings(login_rate_limit_per_ip=2, login_rate_limit_global=1000)

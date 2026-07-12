@@ -14,11 +14,20 @@ import { configDir, runJson, workspaceDir } from "./cli";
 
 // §2 DETAIL/GRID — the shape `show` emits and `upsert` consumes. Rows are an array-of-arrays (a grid
 // is positional; headers carry the names once in `columns`), each inner row aligned to `columns`.
-interface Detail {
+// #162 — a code set's declared unmapped-value policy (how a lookup miss resolves), authored via the
+// `codesets/<name>.policy.toml` sidecar and SHOWN read-only in the grid. `kind:"none"` (or an absent
+// policy) is the backward-compatible default: a miss returns the caller's `.get()` default / raises.
+export interface Policy {
+  kind: "none" | "default" | "passthrough" | "flag";
+  default_value: string | null;
+}
+
+export interface Detail {
   name: string;
   format: "csv" | "toml";
   columns: string[];
   rows: string[][];
+  policy?: Policy; // #162 — read-only in the grid (authored via the .policy.toml sidecar for v1)
 }
 
 // §2 SUMMARY — one per code set, from `codeset list` (used here only for the existing-name list so
@@ -31,6 +40,7 @@ interface Summary {
   value_columns: string[];
   shape: "scalar" | "dict";
   entries: number;
+  policy?: Policy; // #162
 }
 
 let panel: vscode.WebviewPanel | undefined;
@@ -112,7 +122,7 @@ export async function openCodeSetEditor(
   );
 
   const readonly = initial?.format === "toml";
-  current.webview.html = formHtml(current.webview, initial, readonly, existing);
+  current.webview.html = codeSetFormHtml(current.webview, initial, readonly, existing);
 }
 
 async function save(detail: Detail, current: vscode.WebviewPanel, onSaved?: () => void): Promise<void> {
@@ -197,7 +207,7 @@ function embed(value: unknown): string {
   return JSON.stringify(value ?? null).replace(/</g, "\\u003c");
 }
 
-function formHtml(
+export function codeSetFormHtml(
   webview: vscode.Webview,
   initial: Detail | null,
   readonly: boolean,
@@ -238,6 +248,9 @@ function formHtml(
     td.keycell.empty .cellinput { background: var(--vscode-inputValidation-warningBackground, rgba(255,200,0,0.18)); }
     th .colbtn, .rowbtn { background: transparent; border: none; color: var(--vscode-errorForeground); cursor: pointer; padding: 0 4px; font-size: 12px; }
     th .colhead { display: flex; align-items: center; }
+    .filterbar { margin-top: 8px; display: flex; align-items: center; gap: 8px; }
+    input.search { width: 280px; }
+    .searchcount { font-size: 11px; color: var(--vscode-descriptionForeground); }
     .toolbar { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
     .actions { margin-top: 18px; display: flex; gap: 8px; }
     button { font-family: inherit; color: var(--vscode-button-foreground); background: var(--vscode-button-background);
@@ -247,6 +260,10 @@ function formHtml(
     button:hover { background: var(--vscode-button-hoverBackground); }
     button:disabled { opacity: 0.5; cursor: default; }
     .hint { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 4px; }
+    .policy { margin: 4px 0 0; padding: 6px 10px; font-size: 12px; border-radius: 2px;
+      color: var(--vscode-foreground); background: var(--vscode-editorWidget-background, transparent);
+      border: 1px solid var(--vscode-panel-border); }
+    .policy code { font-family: var(--vscode-editor-font-family, monospace); }
     .warn { display: none; margin-top: 8px; font-size: 12px; color: var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground)); white-space: pre-wrap; }
     .error { display: none; margin-top: 12px; font-size: 12px; color: var(--vscode-errorForeground); white-space: pre-wrap; }
   </style>
@@ -263,6 +280,16 @@ function formHtml(
   <label for="name">Code-set name</label>
   <input id="name" class="name" placeholder="epic_diets" />
   <div class="hint">A bare file stem (no path, no <code>.csv</code>/<code>.toml</code> extension). Saved as <code>codesets/&lt;name&gt;.csv</code>.</div>
+
+  <!-- #162 — the declared unmapped-value policy, SHOWN read-only (authored via the .policy.toml sidecar for v1). -->
+  <label>Unmapped-value policy (on a lookup miss)</label>
+  <div id="policy" class="policy">No policy declared — a miss returns the caller's <code>.get()</code> default (unchanged).</div>
+  <div class="hint">Declared in <code>codesets/&lt;name&gt;.policy.toml</code> and applied by <code>code_set(name).translate(key)</code>. Read-only here.</div>
+
+  <div class="filterbar">
+    <input id="search" type="search" class="search" placeholder="Filter rows by key or value…" />
+    <span id="searchcount" class="searchcount"></span>
+  </div>
 
   <div class="grid-wrap">
     <table id="grid"><thead><tr id="headrow"></tr></thead><tbody id="body"></tbody></table>
@@ -296,9 +323,28 @@ function formHtml(
     let rows = [['', '']];
     const originalName = INITIAL ? INITIAL.name : null;
 
+    // #162 — SHOW the declared unmapped-value policy read-only (authored via the .policy.toml sidecar).
+    function renderPolicy(policy) {
+      const el = $('policy');
+      if (!el) return;
+      const kind = policy && policy.kind ? policy.kind : 'none';
+      if (kind === 'default') {
+        const dv = policy && policy.default_value != null ? String(policy.default_value) : '';
+        el.innerHTML = 'On a miss, return the configured default: <code></code>';
+        el.querySelector('code').textContent = dv;
+      } else if (kind === 'passthrough') {
+        el.textContent = 'On a miss, return the original key unchanged (passthrough).';
+      } else if (kind === 'flag') {
+        el.textContent = 'On a miss, return a flag-for-review outcome the handler/operator can see.';
+      } else {
+        el.innerHTML = 'No policy declared — a miss returns the caller\\'s <code>.get()</code> default (unchanged).';
+      }
+    }
+
     if (INITIAL) {
       $('title').textContent = 'Edit ' + INITIAL.name;
       $('name').value = INITIAL.name;
+      renderPolicy(INITIAL.policy);
       // Renaming is a distinct CLI op; we keep the name field editable but a name change on Save is
       // treated as upsert-of-new unless the row action's rename is used. To avoid an accidental
       // duplicate, lock the name in edit mode (rename uses the tree's Rename action).
@@ -377,6 +423,7 @@ function formHtml(
         body.appendChild(tr);
       });
       recompute();
+      filterRows();
     }
 
     // LIVE highlight: a duplicate non-empty key is a load error; a blank key is dropped on write.
@@ -403,6 +450,22 @@ function formHtml(
       else { warnEl.style.display = 'none'; }
     }
 
+    // In-grid row filter (#161): display-only — a non-matching row is hidden but its inputs stay in
+    // the DOM, so syncFromDom()/Save still capture every row. Re-applied at the end of render() so it
+    // survives add/remove-row and add/remove-column. Case-insensitive substring over all cells.
+    function filterRows() {
+      const q = ($('search').value || '').trim().toLowerCase();
+      const bodyRows = $('body').querySelectorAll('tr');
+      let shown = 0;
+      bodyRows.forEach((tr) => {
+        const cells = Array.from(tr.querySelectorAll('.cellinput'));
+        const match = !q || cells.some((el) => String(el.value).toLowerCase().includes(q));
+        tr.style.display = match ? '' : 'none';
+        if (match) shown++;
+      });
+      $('searchcount').textContent = q ? (shown + ' / ' + bodyRows.length + ' rows') : '';
+    }
+
     function addRow() { syncFromDom(); rows.push(columns.map(() => '')); render(); }
     function addColumn() { syncFromDom(); columns.push('value' + columns.length); rows = rows.map((r) => { const c = r.slice(); c.push(''); return c; }); render(); }
     function removeRow(r) { rows.splice(r, 1); if (rows.length === 0) rows = [columns.map(() => '')]; render(); }
@@ -418,6 +481,7 @@ function formHtml(
     $('addRow').addEventListener('click', addRow);
     $('addCol').addEventListener('click', addColumn);
     $('name').addEventListener('input', recompute);
+    $('search').addEventListener('input', filterRows);
 
     function buildDetail() {
       syncFromDom();

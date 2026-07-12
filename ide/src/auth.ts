@@ -27,6 +27,18 @@ export async function clearToken(ctx: vscode.ExtensionContext, url: string): Pro
   await ctx.secrets.delete(secretKey(url));
 }
 
+/**
+ * The cached token for `url`, or undefined — NEVER prompts. For background callers (the live-status
+ * poll): a poll must not pop a sign-in from a timer, so it reads passively and degrades to "no live
+ * data" when there is no session. Interactive flows keep using {@link ensureToken}/{@link withAuth}.
+ */
+export async function peekToken(
+  ctx: vscode.ExtensionContext,
+  url: string,
+): Promise<string | undefined> {
+  return await ctx.secrets.get(secretKey(url));
+}
+
 /** Prompt for credentials and sign in to `url`; stores + returns the token, or undefined if cancelled. */
 async function login(ctx: vscode.ExtensionContext, url: string): Promise<string | undefined> {
   // Belt-and-suspenders: any caller of login()/withAuth() (not just promote) inherits the non-TLS

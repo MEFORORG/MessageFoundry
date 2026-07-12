@@ -38,6 +38,7 @@ import asyncio
 import logging
 import smtplib
 from email.message import EmailMessage
+from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
@@ -123,7 +124,9 @@ class EmailDestination(DestinationConnector):
                 self.host,
             )
 
-    async def send(self, payload: str) -> DeliveryResponse | None:
+    async def send(
+        self, payload: str, *, metadata: Mapping[str, str] | None = None
+    ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
         # smtplib is blocking — keep it off the event loop (the delivery worker awaits this). A one-way
         # delivery: SMTP submission has no application reply to capture, so return None (like File).
         await asyncio.to_thread(self._send, payload)

@@ -30,3 +30,8 @@ fhir_base_url = "http://127.0.0.1:8480/fhir"
 # (samples/config/IB_RADIOLOGY_SR.py): a local test MLLP receiver in DEV (ADR 0025).
 powerscribe_host = "127.0.0.1"
 powerscribe_port = 2761
+
+# Downstream results receiver for OB_DEMO_ORU (the per-feed "Hybrid" layout example authored across
+# connections.toml + IB_DEMO_ORU_router.py + IB_DEMO_ORU_handler.py): a local test receiver in DEV.
+demo_oru_host = "127.0.0.1"
+demo_oru_port = 2641

@@ -41,12 +41,14 @@ from harness.load.shardcert_ladder import (
     _claim_lines,
     _engine_rung_payload,
     _phase_lines,
+    _OBSERVER_DISAGREE_TOL,
     aggregate_claim_timing,
     aggregate_phase_timing,
     build_consolidated_report,
     build_rung_outcome,
     classify_rung,
     in_pipeline_slope,
+    observers_inconclusive,
     pick_soak_rate,
     plan_climb_rungs,
     slope_is_draining,
@@ -60,6 +62,8 @@ def _drive(
     *,
     ingress: float,
     dests: int = 8,
+    handlers: int | None = None,
+    delivering: int | None = None,
     acked: int,
     sink_received: int | None = None,
     lane_inversions: int = 0,
@@ -68,11 +72,19 @@ def _drive(
     hold_seconds: float = 60.0,
     drained: bool = True,
 ) -> ShardCertDriveReport:
-    """A synthetic multi-process drive report. Defaults are a clean, lossless rung (S == A*dests)."""
-    s = acked * dests if sink_received is None else sink_received
+    """A synthetic multi-process drive report. Defaults are a clean, lossless rung (S == A*delivering).
+
+    BACKLOG #209: ``handlers`` (H) and ``delivering`` (D) both default to ``dests``, so every test written
+    before the split is byte-identical (the pre-#209 graph WAS H = D = dests). The FAN-OUT is D — the
+    lossless default and every delivery assertion below key off it, never off ``dests``."""
+    h = dests if handlers is None else handlers
+    d = dests if delivering is None else delivering
+    s = acked * d if sink_received is None else sink_received
     return ShardCertDriveReport(
         shards=("a", "b", "c", "d"),
         dests=dests,
+        handlers=h,
+        delivering=d,
         driver_count=4,
         sink_count=dests,
         aggregate_rate=ingress,
@@ -138,6 +150,16 @@ def _phase_line(san: int, sam: float, samx: float, mdn: int, mdm: float, mdmx: f
         f"delivery phase timing (stage=outbound): send_ack n={san} mean={sam:.2f}ms max={samx:.2f}ms "
         f"| mark_done n={mdn} mean={mdm:.2f}ms max={mdmx:.2f}ms"
     )
+
+
+def free_budget_at_hub(acked: int, handlers: int, delivering: int) -> int:
+    """The A4b non-delivering-handler strand budget the guard credits at H > D: ``A × max(0, H − D)``.
+
+    At the ADT-hub shape the router selects H handlers but only D DELIVER; the other H − D per message
+    self-filter, so up to ``A × (H − D)`` stranded/dead ROUTED rows block ZERO deliveries. The A4b permit
+    (:func:`observers_inconclusive`) subtracts from a DELIVERY count (``A × D``), so only strands BEYOND this
+    budget can have blocked a real delivery. Mirrors the ``free`` expression in the guard exactly."""
+    return acked * max(0, handlers - delivering)
 
 
 # --- new coord constants -----------------------------------------------------
@@ -413,11 +435,27 @@ def test_build_rung_outcome_frozen_tail() -> None:
 # --- soak-rate pick ----------------------------------------------------------
 
 
-def _outcome(rate: float, verdict: RungVerdict, *, is_soak: bool = False, lanes_observed: int = 4):
+def _outcome(
+    rate: float,
+    verdict: RungVerdict,
+    *,
+    is_soak: bool = False,
+    lanes_observed: int = 4,
+    dests: int = 8,
+    handlers: int | None = None,
+    delivering: int | None = None,
+):
     rung = LadderRung(
         index=0, ingress_rate=rate, hold_seconds=60.0, drain_timeout=150.0, is_soak=is_soak
     )
-    drive = _drive(ingress=rate, acked=int(rate * 60), lanes_observed=lanes_observed)
+    drive = _drive(
+        ingress=rate,
+        acked=int(rate * 60),
+        lanes_observed=lanes_observed,
+        dests=dests,
+        handlers=handlers,
+        delivering=delivering,
+    )
     out = build_rung_outcome(rung, drive, _gate(), _report())
     # force the verdict/shape for report-shape tests independent of the drive's actual numbers. Kept-up
     # rungs (drive_drain_seconds=0.0 ⇒ honest sustainable rate == offered) so these SELECTION/shape tests
@@ -451,11 +489,21 @@ def test_pick_soak_rate_none_when_nothing_sustained() -> None:
 
 
 def _rep(
-    climb, soak=None, climb_aborted: bool = False, soak_aborted: bool = False
+    climb,
+    soak=None,
+    climb_aborted: bool = False,
+    soak_aborted: bool = False,
+    *,
+    dests: int = 8,
+    handlers: int | None = None,
+    delivering: int | None = None,
 ) -> ConsolidatedLadderReport:
+    # H and D default to dests ⇒ the pre-#209 H = D = dests report, so every existing test is unchanged.
     return build_consolidated_report(
         shards=("a", "b", "c", "d"),
-        dests=8,
+        dests=dests,
+        handlers=dests if handlers is None else handlers,
+        delivering=dests if delivering is None else delivering,
         driver_count=4,
         sink_count=8,
         climb=climb,
@@ -515,16 +563,38 @@ def test_report_target_clearing_events() -> None:
     assert math.isclose(TARGET_EVENTS_PER_S, 45_000_000 / 86_400)
 
 
-@pytest.mark.parametrize("dests", [1, 2, 4, 8, 16])
-def test_target_gate_fires_exactly_at_total_events_boundary(dests: int) -> None:
-    # The A0 falsifier. The gate must fire exactly at ingress = 520.8333 / (1 + dests), for every fan-out.
-    # A drain of 0 makes pinned_ingress_rate == the offered rate exactly, isolating the gate arithmetic.
-    boundary = TARGET_EVENTS_PER_S / (1 + dests)
+@pytest.mark.parametrize(
+    ("dests", "handlers", "delivering"),
+    [
+        # H = D = dests — the pre-#209 shapes. The gate arithmetic is unchanged for every one of them.
+        (1, 1, 1),
+        (2, 2, 2),
+        (4, 4, 4),
+        (8, 8, 8),
+        (16, 16, 16),
+        # BACKLOG #209: the fan-out is now INDEPENDENT of the topology and of the selection width. The
+        # boundary must key on D alone — a D=2 graph is a D=2 graph whether it declares 2 connections or 16,
+        # and whether the router selects 2 handlers or 20.
+        (16, 16, 2),
+        (4, 20, 4),  # the reference ADT hub
+        (8, 20, 1),
+    ],
+)
+def test_target_gate_fires_exactly_at_total_events_boundary(
+    dests: int, handlers: int, delivering: int
+) -> None:
+    # The A0 falsifier, re-keyed on DELIVERING. The gate must fire exactly at
+    # ingress = 520.8333 / (1 + delivering), for every fan-out — and must NOT move when `dests` or
+    # `handlers` move at a fixed D. A drain of 0 makes pinned_ingress_rate == the offered rate exactly,
+    # isolating the gate arithmetic.
+    boundary = TARGET_EVENTS_PER_S / (1 + delivering)
 
     def rep_at(ingress: float) -> ConsolidatedLadderReport:
         return build_consolidated_report(
             shards=("a", "b", "c", "d"),
             dests=dests,
+            handlers=handlers,
+            delivering=delivering,
             driver_count=4,
             sink_count=8,
             climb=[_honest_rung(ingress, drain_seconds=0.0)],
@@ -537,6 +607,38 @@ def test_target_gate_fires_exactly_at_total_events_boundary(dests: int) -> None:
     assert rep_at(boundary * 1.001).clears_target_events is True
     assert rep_at(boundary * 0.999).clears_target_events is False
     assert rep_at(boundary).sustained_events_per_s == pytest.approx(TARGET_EVENTS_PER_S)
+
+
+def test_sustained_events_per_s_keys_on_delivering_not_dests_or_handlers() -> None:
+    """THE B10 SITE, guarded at the reference hub (BACKLOG #209).
+
+    `sustained_events_per_s` is the number the SYSTEM-REQUIREMENTS §8 decision keys off. One ingress
+    message yields itself plus one event per DELIVERED copy — `1 + D`. The two plausible-but-wrong
+    multipliers both OVERSTATE it, in the permissive direction:
+
+    * `1 + dests` — the pre-#209 formula. Model the hub by raising `dests` to 20 and it reports `p*21`
+      against a truth of `p*5`: a **4.2x** overstatement.
+    * `1 + handlers` — reading the router's selection width as the fan-out: `p*21` again.
+
+    The hub here declares 4 destination CONNECTIONS, the router SELECTS 20 handlers, and 4 deliver.
+    """
+    p = 10.0
+    shape: dict[str, int] = {"dests": 4, "handlers": 20, "delivering": 4}
+    hub = _rep([_honest_rung(p, drain_seconds=0.0, **shape)], **shape)
+
+    assert hub.pinned_ingress_rate == pytest.approx(p)
+    assert hub.sustained_events_per_s == pytest.approx(p * 5)  # 1 + D
+    assert hub.sustained_events_per_s != pytest.approx(p * 21)  # NOT 1 + handlers
+    assert hub.pinned_outbound_rate == pytest.approx(p * 4)  # deliveries/s = ingress * D
+    # The rung agrees with the report — and its txn/msg is the ADR 0051 hub cost, 3 + 2(20) + 2(4).
+    assert hub.climb[0].outbound_rate() == pytest.approx(p * 4)
+    assert hub.climb[0].txn_per_message == 51
+
+    # And the same D with a 20-connection topology reports the SAME events — dests is not in the math.
+    wide_shape: dict[str, int] = {"dests": 20, "handlers": 20, "delivering": 4}
+    wide = _rep([_honest_rung(p, drain_seconds=0.0, **wide_shape)], **wide_shape)
+    assert wide.sustained_events_per_s == pytest.approx(p * 5)
+    assert wide.sustained_events_per_s != pytest.approx(p * 21)
 
 
 def test_target_gate_is_not_the_old_ingress_gate() -> None:
@@ -592,7 +694,7 @@ def test_collapsed_soak_reports_soak_not_sustained_not_pass() -> None:
     assert js["result"] == "SOAK_NOT_SUSTAINED"  # was "PASS" before B9
     assert js["soak_not_sustained"] is True
     assert js["exit_code"] == 0
-    assert js["schema_version"] == 3
+    assert js["schema_version"] == 4  # v4 (#209): `dests` stopped meaning the fan-out
     assert "SOAK NOT SUSTAINED" in rep.render()
 
 
@@ -742,7 +844,8 @@ def test_report_renders_and_serializes() -> None:
     assert "pinned sustainable ceiling: 24 ingress/s = 192 outbound/s" in text
     assert "TOTAL-EVENTS target" in text
     # B10: the render must show the total-events arithmetic, not compare ingress against the budget.
-    assert "24 ingress/s x (1 + 8 dests) = 216 events/s" in text
+    # #209: the multiplier is DELIVERING (here == dests == 8, the default shape ⇒ 216 is unchanged).
+    assert "24 ingress/s x (1 + 8 delivering) = 216 events/s" in text
     assert "soak" in text.lower()
 
     js = rep.to_json_dict()
@@ -752,7 +855,7 @@ def test_report_renders_and_serializes() -> None:
     assert js["ceiling"]["pinned_ingress_rate"] == 24.0
     assert js["ceiling"]["pinned_outbound_rate"] == 192.0
     assert js["ceiling"]["first_collapse_ingress_rate"] == 28.0
-    assert js["ceiling"]["sustained_events_per_s"] == 216.0  # 24 ingress x (1 + 8 dests)
+    assert js["ceiling"]["sustained_events_per_s"] == 216.0  # 24 ingress x (1 + 8 delivering)
     assert js["ceiling"]["clears_target_events"] is False  # 216 < 520.83
     # B10 (v3): the old ingress-denominated keys are REMOVED, not redefined — a stale consumer must
     # KeyError rather than branch on a boolean whose meaning silently flipped.
@@ -780,11 +883,14 @@ def _honest_rung(
     hold: float = 60.0,
     sink_received: int | None = None,
     phase_windows: int = 0,
+    dests: int = 8,
+    handlers: int | None = None,
+    delivering: int | None = None,
 ):
     """A RungOutcome with an EXPLICIT measured drain + phase windows / sink count for the honest-rate +
     delivered-rate tests — unlike ``_outcome`` (kept-up, drain 0). Phase is ALWAYS set (windows=0 ⇒ no
-    delivered rate)."""
-    base = _outcome(rate, verdict)
+    delivered rate). The #209 shape passes through (H/D default to ``dests``)."""
+    base = _outcome(rate, verdict, dests=dests, handlers=handlers, delivering=delivering)
     overrides: dict[str, object] = {
         "drive_drain_seconds": drain_seconds,
         "hold_seconds": hold,
@@ -1369,3 +1475,811 @@ def test_engine_rung_payload_marks_aborted_invalid() -> None:
     assert p["aborted"] is True and p["valid"] is False and p["engine_ok"] is False
     p2 = _engine_rung_payload(_engine_report(aborted=False, drained=True, stranded=0))
     assert p2["aborted"] is False and p2["valid"] is True and p2["engine_ok"] is True
+
+
+# --- A4b: the cross-observer INCONCLUSIVE guard (BACKLOG #219) -----------------------------------------
+#
+# The ladder has TWO independent observers of a rung's outcome — the ENGINE store-truth tally (drained /
+# stranded / dead) and the DRIVE sink socket count (S vs A*dests). When they DISAGREE, or a required
+# collector reads zero on a non-zero-volume run, the outcome must downgrade to INCONCLUSIVE rather than be
+# silently resolved by trusting one observer (the B-class fabrication). These tests force the disagreement
+# in BOTH directions and assert INCONCLUSIVE, and assert that genuine AGREEMENT still yields a real
+# SUSTAINED / COLLAPSED — the semantics change must be surgical, not a blanket downgrade.
+
+
+def test_observers_inconclusive_inert_without_counts() -> None:
+    # The boolean truth-table callers pass no counts (sentinel <0) ⇒ the guard is INERT, so the historical
+    # classify_rung verdicts are preserved. This is what keeps every pre-A4b test above green.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=-1,
+            sink_received=-1,
+            delivering=1,
+            engine_stranded=0,
+            engine_dead_total=0,
+        )
+        is False
+    )
+    assert (
+        observers_inconclusive(
+            engine_ok=True,
+            acked=1000,
+            sink_received=-1,  # one side missing ⇒ still inert
+            delivering=8,
+            engine_stranded=0,
+            engine_dead_total=0,
+        )
+        is False
+    )
+
+
+def test_observers_inconclusive_trigger_a_sink_overcounts_engine_permit() -> None:
+    # (a) The engine says it could NOT clear the load (stranded=400 ⇒ at most A*dests-400 deliveries can have
+    # happened) but the sink observed MORE than that permit beyond slack — a hard inter-observer contradiction.
+    # expected = 1000*8 = 8000; permit = 7600; slack = 0.01*8000 = 80; threshold = 7680.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=1000,
+            sink_received=8000,  # fully lossless sink while the store says it stranded 400 rows
+            delivering=8,
+            engine_stranded=400,
+            engine_dead_total=0,
+        )
+        is True
+    )
+
+
+def test_observers_inconclusive_trigger_a_tolerance_boundary() -> None:
+    # A benign teardown tail within slack is NOT a contradiction (trust the engine ⇒ COLLAPSED); one delivery
+    # beyond the slack IS. permit=7600, slack=80 ⇒ threshold 7680.
+    def at(sink_received: int) -> bool:
+        return observers_inconclusive(
+            engine_ok=False,
+            acked=1000,
+            sink_received=sink_received,
+            delivering=8,
+            engine_stranded=400,
+            engine_dead_total=0,
+        )
+
+    assert at(7680) is False  # exactly at the slack edge
+    assert at(7681) is True  # one past ⇒ inconsistent
+    assert at(7000) is False  # sink UNDER-counts (a genuine collapse) ⇒ never trips (a)
+
+
+def test_observers_inconclusive_trigger_a_needs_known_strand_tally() -> None:
+    # A collapse whose strand/dead tally is UNKNOWN (sentinel -1) can't compute the permit, so (a) can't
+    # detect an over-count — the rung is left to the COLLAPSED branch rather than guessed INCONCLUSIVE.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=1000,
+            sink_received=8000,
+            delivering=8,
+            engine_stranded=-1,  # unknown
+            engine_dead_total=-1,
+        )
+        is False
+    )
+
+
+def test_observers_inconclusive_trigger_b_blind_collector() -> None:
+    # (b) The engine store-truth says it delivered a non-zero intake CLEAN, yet the sink — the drive's only
+    # reliable delivery observer — counted ZERO. That is a blind/absent collector, not a measured zero.
+    assert (
+        observers_inconclusive(
+            engine_ok=True,
+            acked=1000,
+            sink_received=0,
+            delivering=8,
+            engine_stranded=0,
+            engine_dead_total=0,
+        )
+        is True
+    )
+    # But a genuine TOTAL collapse also reads S==0 — there the engine CONFIRMS it (engine_ok False, everything
+    # stranded), so it is honestly COLLAPSED, NOT flagged by the blind-collector rule.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=1000,
+            sink_received=0,
+            delivering=8,
+            engine_stranded=1000,  # permit = 8000-8000 = 0; S==0 is consistent
+            engine_dead_total=0,
+        )
+        is False
+    )
+
+
+def test_observers_inconclusive_zero_volume_is_inert() -> None:
+    # No non-zero volume to reconcile (acked==0) ⇒ inert (a vacuous run is caught elsewhere, not here).
+    assert (
+        observers_inconclusive(
+            engine_ok=True,
+            acked=0,
+            sink_received=0,
+            delivering=8,
+            engine_stranded=0,
+            engine_dead_total=0,
+        )
+        is False
+    )
+
+
+def test_classify_rung_cross_observer_disagreement_is_inconclusive_not_collapsed() -> None:
+    # THE semantic change: engine store-truth says COLLAPSED (engine_ok False, stranded>0) but the sink
+    # counted every expected delivery (no_loss True / S==A*dests). Pre-A4b this was silently stamped
+    # COLLAPSED (trusting the engine, fabricating a bracket); now it is INCONCLUSIVE.
+    assert (
+        classify_rung(
+            engine_reported=True,
+            engine_ok=False,
+            no_loss=True,
+            lane_inversions=0,
+            lane_repeats=0,
+            acked=1000,
+            sink_received=8000,
+            delivering=8,
+            engine_stranded=400,
+            engine_dead_total=0,
+        )
+        is RungVerdict.INCONCLUSIVE
+    )
+
+
+def test_classify_rung_agreeing_collapse_still_collapsed() -> None:
+    # Agreement in the collapse direction: the engine stranded 400 rows AND the sink is short by 400 (both
+    # observers see the loss). No contradiction ⇒ a REAL COLLAPSED, not a downgrade.
+    assert (
+        classify_rung(
+            engine_reported=True,
+            engine_ok=False,
+            no_loss=False,
+            lane_inversions=0,
+            lane_repeats=0,
+            acked=1000,
+            sink_received=8000 - 400,
+            delivering=8,
+            engine_stranded=400,
+            engine_dead_total=0,
+        )
+        is RungVerdict.COLLAPSED
+    )
+
+
+def test_classify_rung_agreeing_sustained_still_sustained() -> None:
+    # Agreement in the sustain direction: engine drained clean AND the sink is fully lossless ⇒ SUSTAINED,
+    # untouched by the guard.
+    assert (
+        classify_rung(
+            engine_reported=True,
+            engine_ok=True,
+            no_loss=True,
+            lane_inversions=0,
+            lane_repeats=0,
+            acked=1000,
+            sink_received=8000,
+            delivering=8,
+            engine_stranded=0,
+            engine_dead_total=0,
+        )
+        is RungVerdict.SUSTAINED
+    )
+
+
+def test_classify_rung_blind_collector_is_inconclusive_not_frozen_tail() -> None:
+    # A "frozen tail" with ZERO deliveries on a non-zero, engine-confirmed-clean run is not a latency tail —
+    # it is a blind sink collector ⇒ INCONCLUSIVE, never a benign FROZEN_TAIL (which would let the climb read
+    # it as sustained-adjacent).
+    assert (
+        classify_rung(
+            engine_reported=True,
+            engine_ok=True,
+            no_loss=False,
+            lane_inversions=0,
+            lane_repeats=0,
+            acked=1000,
+            sink_received=0,
+            delivering=8,
+            engine_stranded=0,
+            engine_dead_total=0,
+        )
+        is RungVerdict.INCONCLUSIVE
+    )
+
+
+def test_classify_rung_correctness_still_outranks_cross_observer() -> None:
+    # A FIFO inversion / dup outranks everything, even a cross-observer contradiction — the ordering is
+    # correctness first, then the store-truth/observer guards.
+    assert (
+        classify_rung(
+            engine_reported=True,
+            engine_ok=False,
+            no_loss=True,
+            lane_inversions=1,  # correctness break present
+            lane_repeats=0,
+            acked=1000,
+            sink_received=8000,
+            delivering=8,
+            engine_stranded=400,
+            engine_dead_total=0,
+        )
+        is RungVerdict.CORRECTNESS_FAIL
+    )
+
+
+def test_build_rung_outcome_cross_observer_disagreement_inconclusive_with_note() -> None:
+    # Integration: a lossless drive (S==A*dests) whose ENGINE store-truth reports a collapse (stranded>0) is
+    # a contradiction the classifier must not resolve by trusting one side — build_rung_outcome yields
+    # INCONCLUSIVE and records WHY, distinct from the store-truth-unconfirmed INCONCLUSIVE.
+    drive = _drive(ingress=28.0, acked=1680)  # sink_received defaults to A*dests = fully lossless
+    out = build_rung_outcome(
+        _rung(idx=2, rate=28.0),
+        drive,
+        _gate(engine_ok=False, drained=False, stranded=400),
+        None,
+    )
+    assert out.engine_reported is True  # store-truth DID arrive — this is not the unconfirmed cause
+    assert out.verdict is RungVerdict.INCONCLUSIVE
+    assert any("cross-observer INCONCLUSIVE" in n for n in out.notes)
+
+
+def test_build_rung_outcome_agreeing_collapse_still_collapsed() -> None:
+    # The engine stranded 400 AND the sink is short by 400 — the observers AGREE, so it stays a real COLLAPSED
+    # (regression guard: the guard must not over-fire on a genuine collapse).
+    drive = _drive(ingress=28.0, acked=1680, sink_received=1680 * 8 - 400)
+    out = build_rung_outcome(
+        _rung(idx=2, rate=28.0),
+        drive,
+        _gate(engine_ok=False, drained=False, stranded=400),
+        None,
+    )
+    assert out.verdict is RungVerdict.COLLAPSED
+    assert not any("cross-observer" in n for n in out.notes)
+
+
+def test_cross_observer_inconclusive_propagates_to_ladder_result_and_json() -> None:
+    # A cross-observer INCONCLUSIVE climb rung must propagate exactly like the store-truth-unconfirmed one:
+    # store_truth_unconfirmed ⇒ SETUP_DEGRADED / exit 2 (nothing certified), and it EXCLUDES itself from the
+    # collapse bracket so it can never fabricate a false ceiling.
+    sustained = build_rung_outcome(
+        _rung(idx=0, rate=20.0), _drive(ingress=20.0, acked=1200), _gate(), _report()
+    )
+    disagreeing = build_rung_outcome(
+        _rung(idx=1, rate=24.0),
+        _drive(ingress=24.0, acked=1440),  # fully lossless sink ...
+        _gate(engine_ok=False, drained=False, stranded=400),  # ... but the store says it collapsed
+        None,
+    )
+    assert disagreeing.verdict is RungVerdict.INCONCLUSIVE
+    rep = _rep([sustained, disagreeing])
+    assert rep.store_truth_unconfirmed is True
+    assert (
+        rep.first_collapse_ingress_rate is None
+    )  # the inconsistent rung never brackets the ceiling
+    # the floor is still the honest sustained rung (its drain-discounted rate), never the inconsistent one
+    assert rep.pinned_ingress_rate == pytest.approx(sustained.sustainable_ingress_rate)
+    assert rep.pinned_rung is sustained
+    assert rep.setup_degraded is True
+    assert rep.exit_code == 2
+    js = rep.to_json_dict()
+    assert js["result"] == "SETUP_DEGRADED"
+    assert js["store_truth_unconfirmed"] is True
+    assert js["schema_version"] == 4  # v4 (#209) — the A4b keys themselves are unchanged/additive
+    assert js["climb"][1]["verdict"] == "inconclusive"  # the enum value carries into the JSON
+
+
+def test_default_observer_tolerance_is_a_small_fraction() -> None:
+    # The tolerance is a small fraction of expected deliveries — big enough to absorb a few-delivery tail,
+    # small enough that a material contradiction always trips. Pin it so a careless widening turns red.
+    assert 0.0 < _OBSERVER_DISAGREE_TOL <= 0.05
+
+
+# --- BACKLOG #209: routed_fanout != delivered (H != D) ------------------------------------------------
+#
+# The ladder's delivery arithmetic used to key on `dests`, which was only ever correct because the graph
+# hardwired H = N = dests. Now `dests` is TOPOLOGY (outbound CONNECTIONS / sink port-band width) and the
+# FAN-OUT is `delivering` (D). Every site that multiplies an intake by a fan-out must use D. These pin the
+# ones that can silently fabricate a result: the no-loss identity and the A4b cross-observer guard (the
+# 45M/day headline is guarded above by test_sustained_events_per_s_keys_on_delivering_not_dests_or_handlers).
+
+
+def test_no_loss_expects_A_times_delivering_not_dests() -> None:
+    """The no-loss identity is ``S == A * delivering``, NOT ``S == A * dests``.
+
+    The hub shape: 8 destination CONNECTIONS declared, the router selects 20 handlers, only 4 deliver. A
+    perfectly healthy rung therefore lands ``A * 4`` copies at the sinks. Keyed on ``dests`` the drive would
+    expect ``A * 8``, read a 50% shortfall as LOSS, and NOTHING would ever sustain — the ladder would report
+    a collapse at every rate and pin a ceiling of NONE.
+    """
+    a = 1000
+    healthy = _drive(ingress=20.0, acked=a, dests=8, handlers=20, delivering=4, sink_received=a * 4)
+    assert healthy.no_loss is True
+    assert healthy.ok is True
+
+    # The wrong expectation, made explicit: A*dests is 2x the truth here.
+    assert a * healthy.dests == 2 * (a * healthy.delivering)
+
+    # A genuinely short sink (one delivery lost) still FAILS — the re-keying is not a blanket relaxation.
+    lossy = _drive(
+        ingress=20.0, acked=a, dests=8, handlers=20, delivering=4, sink_received=a * 4 - 1
+    )
+    assert lossy.no_loss is False
+
+    # And a sink that somehow saw A*dests copies is NOT lossless either — it is over-counted, not healthy.
+    over = _drive(ingress=20.0, acked=a, dests=8, handlers=20, delivering=4, sink_received=a * 8)
+    assert over.no_loss is False
+
+    # The default shape (H = D = dests) is unchanged: A*dests and A*delivering coincide.
+    default = _drive(ingress=20.0, acked=a)
+    assert default.no_loss is True and default.sink_received == a * 8
+
+
+def test_a4b_guard_still_fires_at_H_ne_N() -> None:
+    """*** THE SINGLE TEST THAT CATCHES THE SILENT REGRESSION. ***
+
+    A4b (BACKLOG #219): when the ENGINE store-truth says it STRANDED rows but the DRIVE sink counted a
+    fully lossless delivery, the two independent observers CONTRADICT each other and the rung must be
+    INCONCLUSIVE — never a COLLAPSED bracket fabricated by silently trusting the engine.
+
+    Leave ``observers_inconclusive`` keyed on ``dests`` and, at D < dests, BOTH ``expected`` and ``permit``
+    inflate::
+
+        expected = A*dests  = 8000   (truth: A*delivering = 4000)
+        permit   = 8000-400 = 7600   (truth: 4000-400     = 3600)
+        S        = 4000              (a FULLY lossless run at D=4)
+        trigger (a): S > permit + slack  =>  4000 > 7680  =>  FALSE
+
+    ...so trigger (a) CAN NEVER FIRE. The guard is DISARMED — no error, no note, no existing test failure
+    (every pre-#209 test runs D == dests, where the two coincide). The rung falls through to ``not
+    engine_ok`` and is stamped COLLAPSED: a bracketed ceiling fabricated out of a contradiction. Keyed on D
+    it fires::
+
+        expected = 4000, permit = 3600, slack = 40  =>  4000 > 3640  =>  TRUE
+
+    UPDATED (BACKLOG #209, non-delivering-handler strand budget): the UNIT assertions below pin the D-vs-dests
+    key and do NOT pass ``handlers`` (so ``free == 0`` and they are byte-identical to before). The END-TO-END
+    assertion, however, now flows ``drive.handlers`` (H=20) into the permit, which credits the non-delivering
+    budget ``free = A×(H−D) = 16000``. The old end-to-end scenario stranded only 400 rows — WITHIN that budget,
+    so it is NOT a contradiction but an honest COLLAPSED (the previously-asserted INCONCLUSIVE there was itself
+    the fabricated verdict the fix removes; see
+    ``test_a4b_does_not_fabricate_inconclusive_on_a_genuine_H_gt_D_collapse``). To keep this a GENUINE
+    contradiction the end-to-end block strands MORE than ``free`` (delivery-bearing excess), so the guard still
+    honestly fires INCONCLUSIVE.
+    """
+    a = 1000
+    dests, handlers, delivering = 8, 20, 4
+    lossless_at_D = a * delivering  # the sink saw EVERY expected copy
+
+    # The unit: the guard sees the contradiction.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=lossless_at_D,
+            delivering=delivering,
+            engine_stranded=400,
+            engine_dead_total=0,
+        )
+        is True
+    )
+    # ...and it is exactly the D-vs-dests substitution that would have disarmed it.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=lossless_at_D,
+            delivering=dests,  # the BUG: the topology count standing in for the fan-out
+            engine_stranded=400,
+            engine_dead_total=0,
+        )
+        is False
+    ), "keyed on dests the A4b guard is silently disarmed at D < dests"
+
+    # The classifier: INCONCLUSIVE, not a fabricated COLLAPSED.
+    assert (
+        classify_rung(
+            engine_reported=True,
+            engine_ok=False,
+            no_loss=True,
+            lane_inversions=0,
+            lane_repeats=0,
+            acked=a,
+            sink_received=lossless_at_D,
+            delivering=delivering,
+            engine_stranded=400,
+            engine_dead_total=0,
+        )
+        is RungVerdict.INCONCLUSIVE
+    )
+
+    # And end-to-end through the integration path, which is where the wiring actually has to be right:
+    # build_rung_outcome must hand the guard `drive.delivering`, not `drive.dests`.
+    #
+    # BACKLOG #209 update: the integration path also passes `drive.handlers` (H=20) into the permit, which
+    # credits the non-delivering-handler strand budget `free = A×(H−D) = 1000×16 = 16000`. To be a GENUINE
+    # cross-observer contradiction here (fully-lossless sink at D, yet the store stranded DELIVERY-bearing
+    # rows) the strand tally must EXCEED that budget — otherwise the strands are all attributable to the 16
+    # self-filtering handlers per message and there is no contradiction (that case is an honest COLLAPSED,
+    # exercised by `test_a4b_does_not_fabricate_inconclusive_on_a_genuine_H_gt_D_collapse`). Pre-fix the guard
+    # subtracted every stranded row from a DELIVERY permit, so any stranded count (400, or 20000) tripped it;
+    # the earlier version of this test used stranded=400 and asserted INCONCLUSIVE — that was the fabricated
+    # verdict the #209 fix removes. We now strand MORE than the free budget so the contradiction is real.
+    stranded_excess = (
+        free_budget_at_hub(a, handlers, delivering) + 500
+    )  # 16000 + 500, beyond `free`
+    drive = _drive(
+        ingress=24.0,
+        acked=a,
+        dests=dests,
+        handlers=handlers,
+        delivering=delivering,
+        sink_received=lossless_at_D,
+    )
+    assert drive.no_loss is True  # the sink is fully lossless at the TRUE fan-out
+    out = build_rung_outcome(
+        _rung(idx=1, rate=24.0),
+        drive,
+        _gate(engine_ok=False, drained=False, stranded=stranded_excess),
+        None,
+    )
+    assert out.verdict is RungVerdict.INCONCLUSIVE, (
+        "the A4b cross-observer guard did not fire at H != D — either it is keyed on dests (permit "
+        "inflated) or it failed to charge the DELIVERY-bearing strand excess beyond the non-delivering "
+        "budget against the permit: the rung was stamped COLLAPSED, a fabricated ceiling bracket"
+    )
+    assert any("cross-observer INCONCLUSIVE" in n for n in out.notes)
+
+    # The climb must not bracket a ceiling from it (the whole point of INCONCLUSIVE).
+    rep = _rep([out], dests=dests, handlers=handlers, delivering=delivering)
+    assert rep.first_collapse_ingress_rate is None
+    assert rep.store_truth_unconfirmed is True and rep.exit_code == 2
+
+
+def test_a4b_guard_still_finds_a_genuine_collapse_at_H_ne_N() -> None:
+    # The complement: at H != D a REAL collapse (both observers see the loss) must still read COLLAPSED —
+    # the D-keying must not turn the guard into a blanket downgrade.
+    a = 1000
+    drive = _drive(
+        ingress=24.0,
+        acked=a,
+        dests=8,
+        handlers=20,
+        delivering=4,
+        sink_received=a * 4 - 400,  # short by exactly what the engine says it stranded
+    )
+    out = build_rung_outcome(
+        _rung(idx=1, rate=24.0), drive, _gate(engine_ok=False, drained=False, stranded=400), None
+    )
+    assert out.verdict is RungVerdict.COLLAPSED
+    assert not any("cross-observer" in n for n in out.notes)
+
+
+# --- BACKLOG #209: A4b permit UNIT bug — `expected` is a DELIVERY count (A×D) but stranded/dead are ROW
+# counts across ALL stages. At H==D they coincide (every pre-#209 test passed); at H>D routed strands scale
+# with H while deliveries scale with D, so subtracting every strand from a DELIVERY permit drives it strongly
+# negative and fabricates INCONCLUSIVE on a GENUINE collapse. The fix credits the non-delivering-handler
+# strand budget `free = A×(H−D)` (rows whose transform returns None ⇒ block ZERO deliveries) before any strand
+# counts against the delivery permit. These four pin: the H==D byte-identity, that a genuine H>D collapse is
+# NOT fabricated, that a REAL over-count still fires, and (above) the #209 D-keying regression guard.
+
+
+def _old_a4b_permit(*, acked: int, delivering: int, stranded: int, dead: int) -> int:
+    """The PRE-#209 permit expression the fix must be byte-identical to at H==D: it subtracts EVERY strand and
+    dead row from the DELIVERY count, with no non-delivering-handler credit. Used to (a) pin the H==D identity
+    and (b) demonstrate the OLD formula's fabricated verdict at H>D."""
+    return acked * delivering - max(0, stranded) - max(0, dead)
+
+
+def test_a4b_permit_is_byte_identical_at_H_equals_D() -> None:
+    """At H==D the fixed permit MUST equal the pre-#209 `A*D - stranded - dead` exactly — this PINS that no
+    published run (all pre-#209 runs had H==D) can regress. `free = A*max(0,H-D) = 0` at H==D, so the
+    non-delivering budget is empty and `blocked == stranded + dead`, folding to the old expression."""
+    a, d = 1000, 8
+    # A spread of (stranded, dead, sink) tuples at H==D. For each: assert the guard's verdict matches what the
+    # OLD `S > (A*D - stranded - dead) + slack` yields, for both engine_ok states the guard reaches.
+    slack = int(_OBSERVER_DISAGREE_TOL * a * d)  # 0.01*8000 = 80
+    cases = [
+        (0, 0, a * d),  # lossless, nothing stranded
+        (400, 0, a * d),  # fully lossless sink while store stranded 400 ⇒ contradiction
+        (400, 100, a * d - 500),  # sink short by exactly the loss ⇒ honest collapse, agrees
+        (400, 0, a * d - 400 + slack),  # exactly at the slack edge
+        (400, 0, a * d - 400 + slack + 1),  # one past the edge ⇒ contradiction
+        (2000, 0, a * d),  # heavy strand, lossless sink
+    ]
+    for stranded, dead, sink in cases:
+        old_permit = _old_a4b_permit(acked=a, delivering=d, stranded=stranded, dead=dead)
+        old_verdict = sink > old_permit + _OBSERVER_DISAGREE_TOL * (a * d)
+        # (1) handlers explicitly == delivering (H==D)
+        new_h_eq_d = observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=sink,
+            delivering=d,
+            handlers=d,  # H == D ⇒ free == 0
+            engine_stranded=stranded,
+            engine_dead_total=dead,
+        )
+        # (2) handlers UNSET (default 0) — a caller that never passed handlers must also be byte-identical
+        new_h_unset = observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=sink,
+            delivering=d,
+            engine_stranded=stranded,
+            engine_dead_total=dead,
+        )
+        assert new_h_eq_d is old_verdict, (stranded, dead, sink, old_permit)
+        assert new_h_unset is old_verdict, (stranded, dead, sink, old_permit)
+
+
+def test_a4b_does_not_fabricate_inconclusive_on_a_genuine_H_gt_D_collapse() -> None:
+    """*** THE HEADLINE. *** A GENUINE H>D collapse where the two observers AGREE must be honestly COLLAPSED,
+    NOT fabricated INCONCLUSIVE. The bug: `expected = A*D` (a DELIVERY count) but the engine strands ROUTED
+    rows that scale with H. At H=20, D=4 the router selects 20 handlers per message and 16 self-filter, so a
+    real collapse strands a large number of NON-delivering routed rows. The OLD permit subtracts every one
+    from a delivery count ⇒ permit goes strongly negative ⇒ `S > permit + slack` fires on any nonzero sink ⇒
+    the collapse is mislabeled INCONCLUSIVE — a fabricated verdict in the honesty guard itself."""
+    a, dests, handlers, delivering = 1000, 8, 20, 4
+    # A genuine collapse: the engine stranded a large number of routed rows that are WITHIN the non-delivering
+    # budget (they are the self-filtering handlers' rows — they block zero deliveries), and the sink honestly
+    # UNDER-counts (S well below A*D). The observers AGREE: loss happened, both saw it.
+    free = free_budget_at_hub(a, handlers, delivering)  # 1000*(20-4) = 16000
+    stranded = (
+        free - 4000
+    )  # 12000: large, but WITHIN the non-delivering budget ⇒ blocks 0 deliveries
+    sink = (
+        a * delivering - 3000
+    )  # 4000 - 3000 = 1000: sink honestly under-counts (a real shortfall)
+    assert sink > 0 and stranded > 0 and stranded < free  # a real, in-budget collapse
+
+    # The FIX: NOT inconclusive — so classify_rung can honestly stamp it COLLAPSED.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=sink,
+            delivering=delivering,
+            handlers=handlers,
+            engine_stranded=stranded,
+            engine_dead_total=0,
+        )
+        is False
+    )
+    # The OLD formula (no free budget) WOULD have fabricated INCONCLUSIVE here — proving the bug was real and
+    # the fix closes it. old_permit = 4000 - 12000 = -8000; slack = 40; S=1000 > -7960 ⇒ True (fabricated).
+    old_permit = _old_a4b_permit(acked=a, delivering=delivering, stranded=stranded, dead=0)
+    assert old_permit < 0  # the delivery permit went negative — the tell-tale of the unit bug
+    assert sink > old_permit + _OBSERVER_DISAGREE_TOL * (
+        a * delivering
+    )  # OLD ⇒ True ⇒ INCONCLUSIVE
+
+    # End-to-end: the classifier stamps the honest COLLAPSED, not the fabricated INCONCLUSIVE.
+    assert (
+        classify_rung(
+            engine_reported=True,
+            engine_ok=False,
+            no_loss=False,
+            lane_inversions=0,
+            lane_repeats=0,
+            acked=a,
+            sink_received=sink,
+            delivering=delivering,
+            handlers=handlers,
+            engine_stranded=stranded,
+            engine_dead_total=0,
+        )
+        is RungVerdict.COLLAPSED
+    )
+    drive = _drive(
+        ingress=24.0,
+        acked=a,
+        dests=dests,
+        handlers=handlers,
+        delivering=delivering,
+        sink_received=sink,
+    )
+    out = build_rung_outcome(
+        _rung(idx=1, rate=24.0),
+        drive,
+        _gate(engine_ok=False, drained=False, stranded=stranded),
+        None,
+    )
+    assert out.verdict is RungVerdict.COLLAPSED, (
+        "a GENUINE H>D collapse was fabricated INCONCLUSIVE — the A4b permit subtracted non-delivering "
+        "routed strands from a DELIVERY count and went negative (BACKLOG #209 unit bug)"
+    )
+    assert not any("cross-observer" in n for n in out.notes)
+
+
+def test_a4b_still_fires_on_a_real_overcount_at_H_gt_D() -> None:
+    """The guard must NOT be neutered by the fix — it must still fire on a genuine over-count at H>D. Three
+    proofs it narrowed the guard rather than disabling it:
+
+    (i)  a sink that counts MORE than the store could possibly have delivered (S > A*D + slack) — an impossible
+         over-count regardless of strands;
+    (ii) a lossless sink (S == A*D) while the engine stranded a count EXCEEDING the free budget; and
+    (iii) a lossless sink (S == A*D) while the engine stranded a count WITHIN the free budget — STILL a hard
+         contradiction. A fully-lossless sink means every accepted message delivered all D copies, which leaves
+         ZERO non-terminal rows; a self-filtering handler's routed row is finalized TERMINAL and never enters
+         the ``stranded`` tally, so the ``free`` budget has no in-tally population to absorb. Crediting an
+         in-budget strand to ``free`` here would forgive a genuinely-stuck ingress/delivering row as if it
+         blocked nothing — the stage-blind over-forgiveness that let a lossless sink coincident with strands
+         fabricate a bracketed COLLAPSED. So the lossless-sink clause fires BEFORE ``free`` is consulted."""
+    a, handlers, delivering = 1000, 20, 4
+    expected = a * delivering  # 4000
+    slack = _OBSERVER_DISAGREE_TOL * expected  # 40
+    free = free_budget_at_hub(a, handlers, delivering)  # 16000
+
+    # (i) The sink observed MORE than the engine could ever have delivered — over-count, strands irrelevant.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=expected + int(slack) + 1,  # 4041 > A*D + slack
+            delivering=delivering,
+            handlers=handlers,
+            engine_stranded=0,
+            engine_dead_total=0,
+        )
+        is True
+    )
+
+    # (ii) A FULLY lossless sink at D, while the engine stranded MORE than the free budget.
+    stranded_excess = (
+        free + 500
+    )  # 16500: 500 beyond what the non-delivering handlers can account for
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=expected,  # fully lossless at the true fan-out
+            delivering=delivering,
+            handlers=handlers,
+            engine_stranded=stranded_excess,
+            engine_dead_total=0,
+        )
+        is True
+    )
+    # (iii) The SAME lossless sink with strands INSIDE the free budget is STILL a contradiction — a lossless
+    # sink cannot coexist with ANY stuck row, and self-filtering handler rows (which `free` models) are
+    # terminal, so they never appear in the strand tally to be absorbed. The lossless clause fires regardless.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=expected,
+            delivering=delivering,
+            handlers=handlers,
+            engine_stranded=free - 1,  # 15999: in-budget, but a lossless sink still contradicts it
+            engine_dead_total=0,
+        )
+        is True
+    )
+
+
+def test_a4b_lossless_sink_with_ingress_strand_is_not_forgiven_by_free() -> None:
+    """*** THE FINDING. *** A stage-blind ``free`` budget must NOT forgive a delivery-blocking strand that
+    coincides with a fully-lossless sink. Scenario: A=1000, H=20, D=4, engine STRANDS 500 rows at INGRESS
+    (those 500 messages never routed ⇒ delivered 0 of their 4 copies ⇒ at most (1000-500)*4 = 2000 deliveries
+    were physically possible), yet the DRIVE sink reports the FULL A*D = 4000 (lossless). That is a hard
+    cross-observer contradiction: a lossless sink is impossible if 500 messages never left ingress.
+
+    The pre-finding formula credited the 500 strands to ``free = A*(H-D) = 16000`` (blocked=0, permit=4000),
+    so ``4000 > 4040`` was False, the guard stayed silent, and ``classify_rung`` stamped a FABRICATED
+    COLLAPSED — a bracketed ceiling built from a genuine contradiction, the exact B-class defect the guard
+    exists to prevent. ``free`` is stage-blind and models a NON-EXISTENT population (self-filtering handler
+    rows are terminal, never stranded), so a lossless sink coincident with ANY strand must fire BEFORE ``free``
+    is consulted."""
+    a, dests, handlers, delivering = 1000, 20, 20, 4
+    lossless = (
+        a * delivering
+    )  # 4000: the sink saw EVERY copy — impossible if 500 msgs stranded at ingress
+    ingress_strand = 500
+    # Sanity: 500 ingress strands cap physically-possible deliveries at 2000, far below the lossless 4000.
+    assert (a - ingress_strand) * delivering < lossless
+
+    # The unit: the guard MUST fire — a lossless sink cannot coexist with a stranded row.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=lossless,
+            delivering=delivering,
+            handlers=handlers,
+            engine_stranded=ingress_strand,  # well within free=16000, but delivery-blocking
+            engine_dead_total=0,
+        )
+        is True
+    ), "stage-blind free forgave an ingress strand coincident with a lossless sink"
+
+    # The classifier: INCONCLUSIVE, not the fabricated COLLAPSED.
+    assert (
+        classify_rung(
+            engine_reported=True,
+            engine_ok=False,
+            no_loss=True,
+            lane_inversions=0,
+            lane_repeats=0,
+            acked=a,
+            sink_received=lossless,
+            delivering=delivering,
+            handlers=handlers,
+            engine_stranded=ingress_strand,
+            engine_dead_total=0,
+        )
+        is RungVerdict.INCONCLUSIVE
+    )
+
+    # End-to-end: no bracketed ceiling is pinned from the contradiction.
+    drive = _drive(
+        ingress=24.0,
+        acked=a,
+        dests=dests,
+        handlers=handlers,
+        delivering=delivering,
+        sink_received=lossless,
+    )
+    assert drive.no_loss is True
+    out = build_rung_outcome(
+        _rung(idx=1, rate=24.0),
+        drive,
+        _gate(engine_ok=False, drained=False, stranded=ingress_strand),
+        None,
+    )
+    assert out.verdict is RungVerdict.INCONCLUSIVE
+    assert any("cross-observer INCONCLUSIVE" in n for n in out.notes)
+    rep = _rep([out], dests=dests, handlers=handlers, delivering=delivering)
+    assert rep.first_collapse_ingress_rate is None  # no fabricated bracket
+
+
+def test_rung_json_carries_the_shape_and_schema_v4() -> None:
+    # The report has to SAY which shape it served, or a reader cannot tell a 4.2x-overstated headline from a
+    # correct one. schema_version 4 is the signal that `dests` stopped meaning the fan-out.
+    shape: dict[str, int] = {"dests": 4, "handlers": 20, "delivering": 4}
+    out = _outcome(20.0, RungVerdict.SUSTAINED, **shape)
+    rep = _rep([out], **shape)
+
+    js = rep.to_json_dict()
+    rung_js = js["climb"][0]
+    assert rung_js["dests"] == 4
+    assert rung_js["handlers"] == 20
+    assert rung_js["delivering"] == 4
+    assert rung_js["txn_per_message"] == 51  # 3 + 2(20) + 2(4) — the ADR 0051 hub cost
+    assert rung_js["outbound_expected"] == out.acked * 4  # A * D, never A * dests
+
+    assert js["schema_version"] == 4
+    topo = js["topology"]
+    assert topo["dests"] == 4 and topo["handlers"] == 20 and topo["delivering"] == 4
+    assert topo["txn_per_message"] == 51
+    assert topo["events_per_message"] == 5  # 1 + D, NOT 1 + handlers (21)
+
+
+def test_drive_report_json_carries_the_shape_and_schema_v2() -> None:
+    js = _drive(ingress=20.0, acked=1000, dests=8, handlers=20, delivering=4).to_json_dict()
+    assert (
+        js["schema_version"] == 2
+    )  # `dests` stopped meaning the fan-out ⇒ a stale reader must notice
+    topo = js["topology"]
+    assert (topo["dests"], topo["handlers"], topo["delivering"]) == (8, 20, 4)
+    assert topo["txn_per_message"] == 51 and topo["events_per_message"] == 5
+
+
+def test_render_states_the_right_model() -> None:
+    # The topology line used to STATE the wrong model in prose ("delivered = ingress x dests"). An operator
+    # reading a hub run would have been told the wrong arithmetic in the same breath as the wrong number.
+    rep = _rep(
+        [_honest_rung(10.0, drain_seconds=0.0, dests=4, handlers=20, delivering=4)],
+        dests=4,
+        handlers=20,
+        delivering=4,
+    )
+    text = rep.render()
+    assert "delivered = ingress x D" in text
+    assert "total events = ingress x (1 + D)" in text
+    assert "delivered = ingress x dests" not in text  # the old, wrong prose is gone
+    assert "H=20 selected, D=4 delivering" in text
+    assert "txn/msg = 3 + 2H + 2D = 51" in text

@@ -29,6 +29,11 @@ class Permission(str, Enum):
     MESSAGES_VIEW_SUMMARY = "messages:view_summary"  # PHI: patient identifiers in list summaries
     MESSAGES_VIEW_RAW = "messages:view_raw"  # PHI: the full message body
     MESSAGES_REPLAY = "messages:replay"
+    MESSAGES_RESEND = "messages:resend"  # resend a stored body to an ALTERNATE outbound (ADR 0090)
+    # Edit a stored message and resubmit the edited body (ADR 0090 §9, BACKLOG #153). The edited body IS
+    # PHI, so this IMPLIES messages:view_raw — every built-in role granting it also grants view_raw (the
+    # client fetches the editable copy over the view_raw seam). Deny-by-default: no role gets it for free.
+    MESSAGES_EDIT = "messages:edit"
     MESSAGES_PURGE = "messages:purge"
     CONNECTIONS_CONTROL = "connections:control"
     CONNECTIONS_TEST = (
@@ -43,6 +48,7 @@ class Permission(str, Enum):
     USERS_READ = "users:read"
     USERS_MANAGE = "users:manage"
     AUDIT_READ = "audit:read"
+    AUDIT_EXPORT = "audit:export"  # download a filtered audit report (CSV export, BACKLOG #170)
     APPROVALS_APPROVE = (
         "approvals:approve"  # release a pending high-value action (dual-control, 2.3.5)
     )
@@ -86,6 +92,8 @@ _OPERATOR_PERMISSIONS: frozenset[Permission] = frozenset(
         Permission.MESSAGES_VIEW_SUMMARY,
         Permission.MESSAGES_VIEW_RAW,
         Permission.MESSAGES_REPLAY,
+        Permission.MESSAGES_RESEND,
+        Permission.MESSAGES_EDIT,  # implies view_raw (co-granted above) — ADR 0090 §9 / BACKLOG #153
         Permission.MESSAGES_PURGE,
         Permission.CONNECTIONS_CONTROL,
         Permission.CONNECTIONS_TEST,
@@ -113,7 +121,9 @@ BUILTIN_ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
         }
     ),
     Role.VIEWER: frozenset({Permission.MONITORING_READ, Permission.MESSAGES_READ}),
-    Role.AUDITOR: frozenset({Permission.MONITORING_READ, Permission.AUDIT_READ}),
+    Role.AUDITOR: frozenset(
+        {Permission.MONITORING_READ, Permission.AUDIT_READ, Permission.AUDIT_EXPORT}
+    ),
 }
 
 

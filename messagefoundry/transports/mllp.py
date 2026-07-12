@@ -30,11 +30,32 @@ from datetime import datetime
 from typing import Any
 
 import hl7
+from dataclasses import dataclass
+
 from hl7.containers import Component, Field, Repetition
 
 from messagefoundry.config.models import AckMode, ConnectorType, Destination, Source
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
-from messagefoundry.config.tls_policy import harden_kex_groups, harden_verify_flags
+from messagefoundry.config.settings import (
+    INSECURE_TLS_ESCAPE_ENV,
+    hop_insecure_escape_downgrades,
+    weakened_tls_escape_permitted_here,
+)
+from messagefoundry.config.tls_policy import (
+    HopDisposition,
+    HopPosture,
+    InsecureHopRefused,
+    TrustAnchorPolicy,
+    build_verifying_client_context,
+    current_hop_posture,
+    enforce_insecure_hop,
+    harden_kex_groups,
+    harden_verify_flags,
+    insecure_hop_disposition,
+    is_loopback_hop_host,
+    relax_verify_expiry,
+    resolve_trust_anchor,
+)
+from messagefoundry.parsing.message import emit_raw_separators
 from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.framing import MLLP_CODEC, FrameDecoder, FrameError
@@ -67,6 +88,7 @@ __all__ = [
     "reencode_delimiters",
     "MLLPDestination",
     "MLLPSource",
+    "InsecureHopGuard",
 ]
 
 logger = logging.getLogger(__name__)
@@ -86,6 +108,116 @@ DEFAULT_RECEIVE_TIMEOUT = 60.0  # seconds — close inbound sockets idle this lo
 # in-flight commit before the connection tasks are cancelled — bounds shutdown so a peer holding a
 # connection open can't hang it (review H-2).
 _CLIENT_SHUTDOWN_GRACE = 5.0
+
+
+# --- posture-keyed cleartext-hop refusal (#200, ADR 0092) --------------------------------------
+#
+# The raw-TCP / DIMSE / plain-FTP outbound transports carry PHI over a hop with NO TLS (mllp/dicom when
+# tls is off) or no TLS option at all (tcp/x12/anonymous-ftp). Off-loopback that is cleartext PHI on the
+# wire, and it was UNGUARDED before #200. `InsecureHopGuard` consumes the ONE pure authority
+# (`config.tls_policy.insecure_hop_disposition`) so every raw transport decides identically — refuse a
+# production-PHI cleartext hop, warn on a non-production PHI hop, allow a loopback / synthetic /
+# per-connection-attested hop. It lives here (the raw-TCP hub tcp.py/x12.py already import from) and is
+# imported by dicom.py/remotefile.py too, so the gradient is applied in exactly one place, never re-forked.
+
+
+@dataclass(frozen=True, slots=True)
+class InsecureHopGuard:
+    """A captured cleartext-hop refusal decision for one outbound connector (#200, ADR 0092).
+
+    Built once at connector construction via :meth:`capture`, which snapshots the active hop posture
+    (:func:`~messagefoundry.config.tls_policy.current_hop_posture`). :meth:`enforce_construction` is the
+    ENFORCED gate — it fires inside ``build_check`` (``messagefoundry check`` / dry-run / reload / the
+    serve pre-flight), where the derived posture IS stamped, and refuses a production-PHI cleartext hop
+    there. :meth:`assert_send` is the zero-I/O send-time backstop at the byte crossing. Both **no-op when
+    the posture is unstamped** (``None`` — a live serve build after the pre-flight, or a direct
+    test/embedding): the enforced gate has already validated the config, so fail-closing here would
+    wrongly refuse a legitimate non-prod cleartext lane that ``build_check`` allowed (and would break
+    every live serve of such a lane, since the live-build sites are deliberately not re-gated)."""
+
+    host: str
+    port: int
+    cell: str
+    description: str
+    attested: bool
+    attested_reason: str | None
+    posture: HopPosture | None
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        host: str,
+        port: int,
+        cell: str,
+        description: str,
+        attested: bool,
+        attested_reason: str | None,
+    ) -> InsecureHopGuard:
+        """Snapshot the decision inputs + the active hop posture for a cleartext outbound hop. ``cell`` is
+        a short PHI-free label of the crossing; ``description`` explains the hop (scheme only — never a
+        credential or a body)."""
+        return cls(
+            host=host,
+            port=port,
+            cell=cell,
+            description=description,
+            attested=attested,
+            attested_reason=attested_reason,
+            posture=current_hop_posture(),
+        )
+
+    def _disposition(self, posture: HopPosture) -> HopDisposition:
+        return insecure_hop_disposition(
+            is_phi=posture.is_phi,
+            production=posture.production,
+            is_loopback_hop=is_loopback_hop_host(self.host),
+            hop_attested=self.attested,
+            # The global escape is CLAMPED to non-production upstream (settings.hop_insecure_escape_
+            # downgrades), so on production this is always False and can never satisfy a prod-PHI hop.
+            audited_opt_out=hop_insecure_escape_downgrades(production=posture.production),
+        )
+
+    def _detail(self) -> str:
+        return f"{self.description} to {self.host}:{self.port} (no verified TLS on the hop)"
+
+    def enforce_construction(self) -> None:
+        """The ENFORCED construction gate: raise
+        :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` on a production-PHI cleartext hop,
+        loud-log (+ audit the attestation) on a warned hop, allow the rest. No-op when the posture is
+        unstamped (``None``) — the build_check gate is the authority; see the class docstring."""
+        posture = self.posture
+        if posture is None:
+            return
+        disposition = self._disposition(posture)
+        # Audit an attestation that SUPPRESSED a would-be production-PHI refusal (decision 3): the
+        # disposition is ALLOW only because `tls_hop_attested` fired before the production REFUSE arm.
+        if (
+            disposition is HopDisposition.ALLOW
+            and self.attested
+            and posture.is_phi
+            and posture.production
+            and not is_loopback_hop_host(self.host)
+        ):
+            logger.warning(
+                "insecure hop crossed on operator attestation — %s: %s (tls_hop_attested; reason: %s)",
+                self.cell,
+                self._detail(),
+                self.attested_reason or "(none provided)",
+            )
+        enforce_insecure_hop(disposition, message=self._detail(), cell=self.cell)
+
+    def assert_send(self) -> None:
+        """Zero-I/O send-time backstop: re-assert the captured decision at the byte crossing (defense in
+        depth against a reload / per-message routing PHI around the construction-only gate). Raises
+        :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` on REFUSE; silent otherwise (the
+        construction gate already logged any WARN, so re-warning per message would flood the log). No-op
+        when the posture is unstamped (``None``)."""
+        posture = self.posture
+        if posture is None:
+            return
+        if self._disposition(posture) is HopDisposition.REFUSE:
+            raise InsecureHopRefused(f"{self.cell}: {self._detail()}")
 
 
 def _set_tcp_nodelay(writer: asyncio.StreamWriter) -> None:
@@ -332,7 +464,12 @@ def reencode_delimiters(payload: str, target: EncodingCharacters) -> str:
 # --- destination -------------------------------------------------------------
 
 
-def _mllp_ssl_context(s: Mapping[str, Any], *, server: bool) -> ssl.SSLContext | None:
+def _mllp_ssl_context(
+    s: Mapping[str, Any],
+    *,
+    server: bool,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
+) -> ssl.SSLContext | None:
     """Build the per-connection MLLP ``SSLContext`` (WP-13b, ADR 0002), or ``None`` when ``tls`` is off.
 
     Built once in the connector ``__init__`` (a bad cert/key fails at build, like LDAPS). TLS 1.2+ floor.
@@ -341,6 +478,13 @@ def _mllp_ssl_context(s: Mapping[str, Any], *, server: bool) -> ssl.SSLContext |
     verify the peer's cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
     and optionally present ``tls_cert_file`` for mTLS. ``tls_verify=False`` (outbound) is MITM-able and
     refused unless ``insecure_tls_allowed()``, with a loud warning — exactly as LDAPS / SQL Server.
+
+    ``trust_anchor_policy`` (#190, ADR 0093, OUTBOUND verify path only) supplies the instance ``[tls]``
+    internal-CA fallback: when the connection names no ``tls_ca_file`` of its own, an internal hop
+    verifies against the org internal CA per the resolved anchor (``system``/``augment``/``pinned``).
+    ``None`` (a direct test build) keeps the historical ``create_default_context(cafile=…)`` behaviour,
+    byte-identical. It only chooses WHICH roots verify the peer — it never touches the ``tls_verify=false``
+    refusal below — so the internal CA can never bypass verification.
 
     ``tls_key_password`` decrypts a passphrase-encrypted private key (``env()``-sourced, mirroring the
     API listener's ``MEFOR_API_TLS_KEY_PASSWORD``); ``None`` (the default) loads an unencrypted key
@@ -367,14 +511,29 @@ def _mllp_ssl_context(s: Mapping[str, Any], *, server: bool) -> ssl.SSLContext |
         harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
         return ctx
-    # Outbound (client): verify the server cert unless explicitly — and loudly — disabled.
+    # Outbound (client): verify the server cert unless explicitly — and loudly — disabled. #200 (ADR
+    # 0092 decision 2): the escape is CLAMPED to non production-PHI (weakened_tls_escape_permitted_here),
+    # so tls_verify=false can no longer be silenced by MEFOR_ALLOW_INSECURE_TLS on a prod-PHI instance —
+    # matching the plaintext-MLLP InsecureHopGuard. Byte-identical off the construction gate (unstamped).
     verify = bool(s.get("tls_verify", True))
-    if not verify and not insecure_tls_allowed():
+    if not verify and not weakened_tls_escape_permitted_here():
         raise ValueError(
             "MLLP tls_verify=false disables server-certificate verification (MITM risk). Use a trusted "
-            f"CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a trusted-network bind."
+            f"CA (tls_ca_file), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a trusted-network bind "
+            "(refused on a production-PHI instance even with the escape, #200)."
         )
-    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
+    # #190 (ADR 0093): resolve the trust anchor — the connection's own tls_ca_file wins verbatim, else an
+    # internal hop may anchor on the [tls] internal CA. Only the VERIFY path uses it; the tls_verify=false
+    # branch below stays CERT_NONE and is already refused above, so the internal CA never bypasses a refusal.
+    if verify and trust_anchor_policy is not None:
+        anchor = resolve_trust_anchor(
+            connection_ca_file=str(ca) if ca else None,
+            host=str(s.get("host", "127.0.0.1")),
+            policy=trust_anchor_policy,
+        )
+        ctx = build_verifying_client_context(anchor)
+    else:
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
         ctx.check_hostname = bool(s.get("tls_check_hostname", True))
@@ -390,6 +549,12 @@ def _mllp_ssl_context(s: Mapping[str, Any], *, server: bool) -> ssl.SSLContext |
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
     if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert
+        # #129 (ADR 0094): granular expiry-only relaxation — honour a partner cert whose notAfter has
+        # passed while STILL validating chain + hostname. Opt-in per connection (default False = byte-
+        # identical); applied on the verify path only, so it composes with (never bypasses) the
+        # tls_verify=false refusal above and the #200 cleartext/verify-off hop refusals.
+        if s.get("tls_allow_expired"):
+            relax_verify_expiry(ctx, host=str(s.get("host", "127.0.0.1")))
     return ctx
 
 
@@ -460,6 +625,11 @@ class MLLPDestination(DestinationConnector):
         self.encoding_characters: EncodingCharacters | None = (
             parse_encoding_characters(chars) if chars is not None else None
         )
+        # BACKLOG #107: per-outbound escape-hatch — emit reserved HL7 structural separators as RAW bytes
+        # instead of \F\ \S\ \R\ \T\ escapes for a partner that cannot decode escapes. Read from the typed
+        # Destination field (assembled by _dest_config from the outbound's hl7_raw_separators setting).
+        # False (default) = ship the payload as-is (byte-identical); applied in send() before framing.
+        self.hl7_raw_separators: bool = config.hl7_raw_separators
         # ADR 0013: when True, send() returns a DeliveryResponse carrying the application ACK (the
         # MSA/ERR the partner returned) for the delivery worker to capture. Default False → returns None,
         # byte-identical. A *read* failure (peer-close, frame-size) is never captured — it stays a
@@ -467,7 +637,30 @@ class MLLPDestination(DestinationConnector):
         self.capture_response: bool = bool(s.get("capture_response", False))
         # WP-13b: per-connection outbound TLS (verify the peer). Built once here so a bad cert/CA fails
         # at build (dry-run/check), not per delivery. None when tls is off → plaintext, byte-identical.
-        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=False)
+        # #190 (ADR 0093): thread the instance [tls] internal-CA trust-anchor policy so an internal hop
+        # that names no tls_ca_file of its own can verify against the org internal CA.
+        self._ssl: ssl.SSLContext | None = _mllp_ssl_context(
+            s, server=False, trust_anchor_policy=config.trust_anchor_policy
+        )
+        # #200 (ADR 0092): a plaintext MLLP egress (tls off) is a cleartext PHI hop — guard it on the
+        # posture gradient (a production-PHI hop off-loopback is refused at the enforced construction
+        # gate). None when TLS is on: a verified hop needs no cleartext guard, and the verify-off case is
+        # already refused separately in _mllp_ssl_context. tls_hop_attested opts a legitimately-secure
+        # hop (proxy-terminated / trusted segment) back in per-connection.
+        self._hop_guard: InsecureHopGuard | None = (
+            InsecureHopGuard.capture(
+                host=self.host,
+                port=self.port,
+                cell="MLLP outbound",
+                description="cleartext MLLP egress",
+                attested=config.tls_hop_attested,
+                attested_reason=config.tls_hop_attested_reason,
+            )
+            if self._ssl is None
+            else None
+        )
+        if self._hop_guard is not None:
+            self._hop_guard.enforce_construction()
 
     @staticmethod
     def _describe_error(exc: BaseException) -> str:
@@ -491,7 +684,9 @@ class MLLPDestination(DestinationConnector):
         name = type(exc).__name__
         return f"{name}: {' '.join(extras)}" if extras else name
 
-    async def send(self, payload: str) -> DeliveryResponse | None:
+    async def send(
+        self, payload: str, *, metadata: Mapping[str, str] | None = None
+    ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
         # ADR 0067 §2.5: the worker-per-lane structure already serializes send(); ASSERT it rather
         # than trust it. A re-entrant/concurrent send() on one instance would interleave two frames
         # on one socket — a pipeline-invariant bug that must fail loud (it lands in the delivery
@@ -503,6 +698,11 @@ class MLLPDestination(DestinationConnector):
             )
         self._sending = True
         try:
+            if self._hop_guard is not None:
+                # Zero-I/O byte-crossing backstop (#200): assert the cleartext hop is still permitted
+                # before any payload byte leaves the box (defense in depth against a reload routing PHI
+                # around the construction-only gate).
+                self._hop_guard.assert_send()
             if self.encoding_characters is not None:
                 # Re-encode the body with this destination's delimiters before framing. A non-HL7/
                 # garbled payload can't be rewritten — surface it as a DeliveryError (the message
@@ -512,6 +712,17 @@ class MLLPDestination(DestinationConnector):
                     payload = reencode_delimiters(payload, self.encoding_characters)
                 except ValueError as exc:
                     raise DeliveryError(f"MLLP encoding-character override failed: {exc}") from exc
+            if self.hl7_raw_separators:
+                # BACKLOG #107: re-serialize emitting the reserved structural separators as raw bytes
+                # (composes after any delimiter rewrite above). A non-HL7 / unparseable payload can't be
+                # rewritten — surface a DeliveryError (the message reached neither wire nor peer) rather
+                # than framing a corrupted message; the pipeline records the ERROR.
+                try:
+                    payload = emit_raw_separators(payload)
+                except (hl7.HL7Exception, ValueError) as exc:
+                    raise DeliveryError(
+                        f"MLLP hl7_raw_separators emit failed (payload not parseable HL7): {exc}"
+                    ) from exc
             if not self.persistent:
                 return await self._send_once(payload)
             return await self._send_persistent(payload)

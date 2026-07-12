@@ -17,11 +17,11 @@ from __future__ import annotations
 import abc
 import asyncio
 import ipaddress
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, ClassVar
 
-from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.models import ContentType, ConnectorType, Destination, Source
 
 __all__ = [
     "InboundHandler",
@@ -114,12 +114,21 @@ class NegativeAckError(DeliveryError):
     the partner will never accept this message, so the worker dead-letters it immediately rather than
     holding the FIFO lane hostage to a head that can't succeed. ``AE`` (transient error) stays
     ``permanent=False`` and is retried like a transport failure.
+
+    ``credential_fault`` (BACKLOG #109, ADR 0095) marks a permanent failure that is a **bad
+    credential / would lock out the partner account** (an auth rejection), as opposed to a bad
+    *message*. The delivery worker treats it specially under the ``credential_fault_policy`` — STOP the
+    lane and retain the backlog un-errored rather than dead-letter each queued row and hammer the
+    partner's auth (which could trip an account lockout). Only meaningful when ``permanent`` is True.
     """
 
-    def __init__(self, message: str, *, code: str, permanent: bool) -> None:
+    def __init__(
+        self, message: str, *, code: str, permanent: bool, credential_fault: bool = False
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.permanent = permanent
+        self.credential_fault = credential_fault
 
 
 class TestNotSupportedError(Exception):
@@ -182,6 +191,15 @@ class SourceConnector(abc.ABC):
     #: it an injected awaitable keeps ``transports/`` free of any ``store``/``pipeline`` import.
     on_connection_event: ConnectionEventSink | None = None
 
+    #: The inbound's declared payload format (ADR 0004), **injected by the runner after build** (same
+    #: runtime-injection shape as ``on_connection_event`` — not a builder arg, since the transport
+    #: :class:`~messagefoundry.config.models.Source` config carries no content_type; that lives on the
+    #: wiring's ``InboundConnection``). A content-sniffing poll source (RemoteFileSource) uses it to
+    #: gate the HL7-header quarantine to ``hl7v2`` drops only, so a legitimate X12/DICOM/binary drop is
+    #: not wrongly rejected. ``None`` (the default) = unset → no content gating, so a direct caller /
+    #: test that never sets it is byte-identical.
+    content_type: ContentType | None = None
+
     @abc.abstractmethod
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -218,10 +236,23 @@ class DestinationConnector(abc.ABC):
     byte-identical to before ADR 0013). A **response-capturing** outbound returns a
     :class:`DeliveryResponse` carrying the partner's reply; the delivery worker persists it inside the
     same transaction that marks the row done. ``aclose`` releases any held resources (no-op by default).
+
+    ``metadata`` (BACKLOG #68) is this message's read-only **user** metadata bag (the ADR 0081 ``SetMeta``
+    writes, decrypted), or ``None``. It rides the message as pure DATA — the delivery worker supplies it
+    only when :attr:`consumes_metadata` is set, so the default path is byte-identical and pays no read.
+    A connector interprets it for a per-message transport knob (the REST/FHIR destinations project
+    ``http.header.*`` entries onto per-message request headers); every other connector ignores it.
     """
 
+    #: Whether this connector wants the per-message user-metadata bag passed to :meth:`send` (#68). Left
+    #: ``False`` by default so the delivery worker skips the metadata read entirely (byte-identical); a
+    #: connector that consumes per-message metadata (REST/FHIR with ``dynamic_headers``) sets it ``True``.
+    consumes_metadata: bool = False
+
     @abc.abstractmethod
-    async def send(self, payload: str) -> DeliveryResponse | None: ...
+    async def send(
+        self, payload: str, *, metadata: Mapping[str, str] | None = None
+    ) -> DeliveryResponse | None: ...
 
     async def aclose(self) -> None:
         return None

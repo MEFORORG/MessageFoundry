@@ -1,0 +1,27 @@
+{
+  "module": "samples/config/IB_FHIR_INTAKE.py",
+  "handlers": [
+    {
+      "handler": "fhir_handler",
+      "module": "samples/config/IB_FHIR_INTAKE.py",
+      "def_line": 52,
+      "rows": [
+        {
+          "kind": "code",
+          "line_start": 55,
+          "line_end": 55,
+          "nesting": 0
+        },
+        {
+          "kind": "send",
+          "outbounds": [
+            "OB_FHIR_SERVER"
+          ],
+          "line_start": 56,
+          "line_end": 56,
+          "nesting": 0
+        }
+      ]
+    }
+  ]
+}

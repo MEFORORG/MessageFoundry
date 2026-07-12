@@ -65,6 +65,11 @@ console = [
 ]
 # EXPERIMENTAL SQL Server store backend. Also needs the Microsoft ODBC Driver 18 for SQL Server
 # installed at the OS level (not pip-installable). Lazy-imported, so SQLite-only installs skip it.
+# aioodbc pulls pyodbc transitively; the lock resolves pyodbc 5.3.0 — the newest release and the
+# first to support Python 3.14 (nothing older ships py3.14 wheels). 5.3.0 has an UPSTREAM py3.14
+# parameter-binding segfault against SQL Server 2025 (mkleehammer/pyodbc#1459, still open), which the
+# CI throughput-invariant step works around with scripts/ci/retry-native-crash.sh. When #1459 ships a
+# fix, raise the floor to that pyodbc release here and drop that CI retry wrapper.
 sqlserver = ["aioodbc>=0.5"]
 # PostgreSQL store backend (production server-DB with single-node parity). No OS-level dependency
 # (ships compiled C/Cython wheels). Lazy-imported, so SQLite-only installs skip it.
@@ -119,6 +124,16 @@ xml = ["lxml>=6.0.0", "xmlschema>=4.0.0", "signxml>=4.0.0"]
 # CVE-2026-30922 decoder-DoS fix version; treat 0.6.3 as a floor, never let a re-lock regress it).
 # OSV sweep 2026-07-03: all five pins CLEAR (webauthn/pyopenssl/pyasn1/pyasn1-modules/cbor2).
 webauthn = ["webauthn>=3.0.0,<4"]
+# HashiCorp Vault KeyProvider (ADR 0019 §3, BACKLOG #196): envelope-decrypt the store DEK via Vault
+# Transit. `hvac` is the OFFICIAL HashiCorp Vault Python client (Apache-2.0), named in ADR 0019 §3's
+# provider table. Lazy-imported (store/keyprovider_vault.py), so installs that never select
+# `[store].key_provider=vault` skip it and the base install still pulls ZERO Vault SDK. Floor >=2.3.0:
+# the current 2.x line (Python 3.8+, requests-based); a bare `>=` would silently jump a major on re-lock,
+# so keep the floor pinned to the 2.x series. Net-new transitives (dep-vet 2026-07-10): requests + urllib3
+# (both ubiquitous, mature; the lock resolves urllib3>=2.7.0 — CVE-2025-50181/50182 SSRF-redirect fixes)
+# plus charset-normalizer/idna/certifi. hvac ships NO type stubs — mypy-strict containment lives inside
+# store/keyprovider_vault.py (a targeted typed local), never a repo-wide ignore.
+vault = ["hvac>=2.3.0"]
 # The browser ops console ([api].serve_ui, ADR 0065) is a separately-versioned second wheel
 # (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin in-process via
 # mount_ui. It is deliberately NOT declared as a [webconsole] extra yet: the wheel isn't published to an

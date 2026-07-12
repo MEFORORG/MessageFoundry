@@ -16,6 +16,7 @@ GET /ui/login
 GET /ui/messages
 GET /ui/messages/search
 GET /ui/messages/{message_id}
+GET /ui/messages/{message_id}/edit
 GET /ui/messages/{message_id}/parse-tree
 GET /ui/nav-status
 GET /ui/reauth
@@ -49,6 +50,7 @@ POST /ui/connections/{name}/purge/{scope}
 POST /ui/connections/{name}/restart
 POST /ui/connections/{name}/start
 POST /ui/connections/{name}/stop
+POST /ui/csp-report
 POST /ui/dead-letters/replay-all
 POST /ui/dead-letters/{channel_id}/replay
 POST /ui/dead-letters/{channel_id}/{destination_name}/replay
@@ -56,6 +58,7 @@ POST /ui/dr/activate
 POST /ui/dr/release
 POST /ui/login
 POST /ui/logout
+POST /ui/messages/{message_id}/edit-resend
 POST /ui/messages/{message_id}/replay
 POST /ui/reauth
 POST /ui/reauth/webauthn

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -74,6 +75,10 @@ class RetentionPass:
     # Resolved operator-alert instances pruned this pass (#56, ADR 0044) — metadata-only, on the same
     # window as connection events. Never an open/acknowledged instance.
     alert_instances_purged: int = 0
+    # Application log FILES deleted this pass (#120): app-log files past the `app_log_days` window
+    # removed from `[logging].log_dir`. Metadata only (mtime) — file content is never read. 0 when the
+    # window/log_dir is unset (byte-identical audit for a deployment that doesn't use it).
+    app_logs_deleted: int = 0
 
     @property
     def did_work(self) -> bool:
@@ -86,6 +91,7 @@ class RetentionPass:
             or self.conn_events_purged > 0
             or self.documents_messages_stripped > 0
             or self.alert_instances_purged > 0
+            or self.app_logs_deleted > 0
             or self.vacuumed
             or self.over_limit
         )
@@ -105,9 +111,13 @@ class RetentionRunner:
         clock: Callable[[], float] = time.time,
         coordinator: ClusterCoordinator | None = None,
         registry_source: Callable[[], Registry | None] | None = None,
+        log_dir: str | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
+        # The configured `[logging].log_dir` for application-log-file retention (#120). None (the
+        # default; embedding/tests, or a stdout-only deployment) → the app-log sweep is a no-op.
+        self._log_dir = log_dir
         # Per-connection retention overrides (#34, ADR 0027) are read from the LIVE registry each pass, so
         # a reload that changes an override takes effect on the next pass. None (the default) = no registry
         # wired → no overrides → a single global cutoff, byte-identical to the prior behaviour.
@@ -145,6 +155,11 @@ class RetentionRunner:
             or s.vacuum_time() is not None
         ):
             return True
+        # Application log-file retention (#120) needs BOTH a window and a log_dir to do anything, so
+        # only start the runner for it when both are present (avoids a no-op task for a configured
+        # window on a stdout-only deployment).
+        if s.app_log_days > 0 and self._log_dir:
+            return True
         registry = self._registry_source() if self._registry_source is not None else None
         if registry is not None and any(
             ic.prune_documents_after is not None for ic in registry.inbound.values()
@@ -165,12 +180,13 @@ class RetentionRunner:
         self._task = asyncio.create_task(self._run())
         log.info(
             "retention enabled: messages_days=%d dead_letter_days=%d max_db_mb=%d "
-            "wal_checkpoint_seconds=%g vacuum_at=%r (every %gs)",
+            "wal_checkpoint_seconds=%g vacuum_at=%r app_log_days=%d (every %gs)",
             self._settings.messages_days,
             self._settings.dead_letter_days,
             self._settings.max_db_mb,
             self._settings.wal_checkpoint_seconds,
             self._settings.vacuum_at,
+            self._settings.app_log_days,
             self._settings.purge_interval_seconds,
         )
 
@@ -329,6 +345,14 @@ class RetentionRunner:
                 older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
             )
 
+        # Application log-file retention (#120): delete app-log FILES older than `app_log_days` from
+        # `[logging].log_dir`. Filesystem I/O (scandir/stat/unlink is blocking), so it runs off the
+        # event loop; metadata only (mtime) — file content is never read (no PHI). A no-op unless the
+        # window and a log_dir are both set, so a deployment that doesn't use it is byte-identical.
+        app_logs_deleted = 0
+        if s.app_log_days > 0 and self._log_dir:
+            app_logs_deleted = await asyncio.to_thread(self._sweep_app_logs, now)
+
         wal_checkpointed = False
         if s.wal_checkpoint_seconds > 0 and now - self._last_wal >= s.wal_checkpoint_seconds:
             await self._store.wal_checkpoint()
@@ -359,6 +383,7 @@ class RetentionRunner:
             documents_bytes_reclaimed=strip.bytes_reclaimed,
             document_prune_overrides=doc_overrides,
             alert_instances_purged=alert_instances_purged,
+            app_logs_deleted=app_logs_deleted,
         )
         if result.did_work:
             await self._audit(result)
@@ -450,6 +475,37 @@ class RetentionRunner:
                 log.warning("storage_threshold alert sink failed", exc_info=True)
         return size_bytes, over
 
+    def _sweep_app_logs(self, now: float) -> int:
+        """Delete application-log FILES older than ``app_log_days`` from ``[logging].log_dir`` — one
+        level, non-recursive, only ``.log``/``.txt`` regular files (the same notion of "app-log file"
+        the ``/status`` metering and support-bundle tail use), by **mtime** so the currently-written
+        file is never eligible. **Metadata only** — file content is never read (no PHI). Blocking
+        (``scandir``/``stat``/``unlink``), so the caller runs it off the event loop. Never raises: a
+        locked/vanished/permission-denied entry is skipped, not fatal — a log-retention hiccup must
+        never take a purge pass down. Returns the number of files deleted."""
+        days = self._settings.app_log_days
+        if days <= 0 or not self._log_dir:
+            return 0
+        cutoff = now - days * _SECONDS_PER_DAY
+        deleted = 0
+        try:
+            entries = list(os.scandir(self._log_dir))
+        except OSError:
+            return 0  # directory absent/unreadable → nothing swept, never raise
+        for entry in entries:
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if os.path.splitext(entry.name)[1].lower() not in (".log", ".txt"):
+                    continue
+                if entry.stat(follow_symlinks=False).st_mtime >= cutoff:
+                    continue
+                os.remove(entry.path)
+                deleted += 1
+            except OSError:
+                continue  # locked/vanished/denied file → skip, never fatal
+        return deleted
+
     async def _audit(self, result: RetentionPass) -> None:
         """Append one audit row recording the cutoffs + counts (no message content — no PHI)."""
         detail = json.dumps(
@@ -477,6 +533,9 @@ class RetentionRunner:
                 "documents_bytes_reclaimed": result.documents_bytes_reclaimed,
                 # Resolved operator-alert instances pruned this pass (#56, ADR 0044) — metadata only.
                 "alert_instances_purged": result.alert_instances_purged,
+                # Application log files deleted this pass (#120) + the window — metadata only, no PHI.
+                "app_log_days": self._settings.app_log_days,
+                "app_logs_deleted": result.app_logs_deleted,
                 "vacuumed": result.vacuumed,
                 "db_size_bytes": result.size_bytes,
                 "max_db_mb": self._settings.max_db_mb,

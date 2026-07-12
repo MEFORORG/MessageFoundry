@@ -234,6 +234,48 @@ def test_run_checks_no_lint_excludes_tools() -> None:
     assert "validate" in names and "dryrun" in names
 
 
+def test_accepts_candidate_flags_leading_guard_filter_and_is_advisory(tmp_path: Path) -> None:
+    """The accepts= advisory (ADR 0084) flags a @handler that OPENS with a guard-filter and cites the
+    ADR, ignores a handler that filters only after real work, and never blocks (required=False)."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import handler, Send\n\n"
+        "@handler('H_guard')\n"
+        "def h_guard(msg):\n"
+        "    if msg.field('MSH-9') != 'ADT':\n"
+        "        return []\n"
+        "    return [Send('OB_X', msg)]\n\n"
+        "@handler('H_clean')\n"
+        "def h_clean(msg):\n"
+        "    out = msg\n"
+        "    if out.field('X') == 'Y':\n"
+        "        return []\n"
+        "    return [Send('OB_X', out)]\n",
+        encoding="utf-8",
+    )
+    res = checks._check_accepts_candidate(cfg)
+    assert res.required is False and res.ok is True  # advisory: never blocks the gate
+    assert res.skipped is False
+    assert "h_guard" in res.detail and "h_clean" not in res.detail
+    assert "0084" in res.detail
+
+
+def test_accepts_candidate_inert_without_leading_guard(tmp_path: Path) -> None:
+    """A handler that does NOT open with a guard-filter yields a skipped no-op, still advisory."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import handler, Send\n\n"
+        "@handler('H')\n"
+        "def h(msg):\n"
+        "    return [Send('OB', msg)]\n",
+        encoding="utf-8",
+    )
+    res = checks._check_accepts_candidate(cfg)
+    assert res.ok is True and res.required is False and res.skipped is True
+
+
 def test_results_relay_template_passes_check() -> None:
     # The committed Wave-1 porting template must stay validate + dryrun green on every CI run.
     report = run_checks(RESULTS_RELAY, messages_dir=RESULTS_RELAY / "messages", run_lint=False)

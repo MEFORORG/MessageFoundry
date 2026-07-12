@@ -21,6 +21,19 @@ from harness.acceptance.runner import RowResult
 #: A run is a failure if any executed row failed or errored; MANUAL/SKIP never fail the run.
 _FAILING = (Status.FAIL, Status.ERROR)
 
+# CSV formula-injection (CWE-1236 / ASVS 1.2.10): a spreadsheet treats a cell beginning with one of
+# these as a formula. A leading "'" forces it to be read as literal text on open. The acceptance CSV
+# is a report artifact (never re-parsed as data), so escaping its free-text cells is loss-free.
+# Mirrors harness/load/report.py:_spreadsheet_safe.
+_CSV_FORMULA_TRIGGERS = frozenset("=+-@\t\r\x00")
+
+
+def _spreadsheet_safe(value: str) -> str:
+    """Neutralize a leading formula trigger so a free-text cell (title/detail/evidence) can't execute
+    when the CSV is opened in Excel/Sheets. Applied only to the free-text columns of
+    :func:`render_csv`; the structured columns (id/section/status/coverage) are controlled vocab."""
+    return "'" + value if value[:1] in _CSV_FORMULA_TRIGGERS else value
+
 
 def summarize(results: Sequence[RowResult]) -> Counter[Status]:
     """Count results by status."""
@@ -83,16 +96,18 @@ def render_csv(results: Sequence[RowResult]) -> str:
         ["id", "section", "title", "per_db", "coverage", "status", "detail", "evidence"]
     )
     for r in results:
+        # Free-text cells (title/detail/evidence) are neutralized against spreadsheet formula
+        # injection; the structured cells are controlled vocab (enum values / ids / bools).
         writer.writerow(
             [
                 r.row.id,
                 r.row.section,
-                r.row.title,
+                _spreadsheet_safe(r.row.title),
                 r.row.per_db,
                 r.row.coverage.value,
                 r.status.value,
-                r.detail,
-                r.evidence,
+                _spreadsheet_safe(r.detail),
+                _spreadsheet_safe(r.evidence),
             ]
         )
     return buf.getvalue()

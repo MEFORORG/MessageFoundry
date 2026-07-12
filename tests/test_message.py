@@ -341,6 +341,23 @@ def test_add_segment_custom_separators() -> None:
     assert Message.parse(m.encode()).field("ODS-2.2") == "Regular"
 
 
+def test_add_segment_bare_id_is_settable() -> None:
+    # Regression: a bare segment id (no field separator) must graft a SETTABLE segment. Previously
+    # count_segments() saw it but a subsequent set() raised "cannot set absent segment" because the
+    # grafted segment had no data field for the write path to address.
+    m = Message.parse(ORU)
+    m.add_segment("ZAL")  # bare id, no fields
+    assert m.count_segments("ZAL") == 1
+    m.set("ZAL-2", "hello")
+    assert m.field("ZAL-2") == "hello"
+    assert Message.parse(m.encode()).field("ZAL-2") == "hello"
+    # A bare id is equivalent to the trailing-separator form.
+    m2 = Message.parse(ORU)
+    m2.add_segment("ZAL|")
+    m2.set("ZAL-2", "hello")
+    assert m.encode() == m2.encode()
+
+
 def test_delete_segments() -> None:
     m = Message.parse(ORU)
     assert m.delete_segments("OBX") == 2

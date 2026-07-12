@@ -195,12 +195,15 @@ def check_console_importable() -> CheckResult:
 
 
 def check_console_no_window() -> CheckResult:
-    """The console's service-control path passes CREATE_NO_WINDOW (no console flash on Status poll)."""
+    """The service-control path passes CREATE_NO_WINDOW (no console flash on the Status poll).
+
+    The body moved to :mod:`messagefoundry.service` (ADR 0088); it depends only on the stdlib, so
+    unlike the old console.service_control it is always importable (no [console] extra), and the SKIP
+    branch below is now effectively unreachable — retained defensively."""
     try:
-        # find_spec on a SUBMODULE imports the parent package; if console/__init__ ever drags a
-        # missing [console]-extra dep (e.g. httpx) this raises ModuleNotFoundError. Degrade to SKIP
-        # like every sibling check instead of crashing the whole `verify` run on a non-[console] box.
-        spec = importlib.util.find_spec("messagefoundry.console.service_control")
+        # find_spec imports the parent package. messagefoundry.service is stdlib-only, so this no
+        # longer risks a missing [console]-extra dep; degrade to SKIP defensively all the same.
+        spec = importlib.util.find_spec("messagefoundry.service")
     except (ImportError, ValueError):
         spec = None
     if spec is None or not spec.origin:
@@ -208,7 +211,7 @@ def check_console_no_window() -> CheckResult:
             "host.noflash",
             "Console no-window flag",
             Status.SKIP,
-            "console.service_control not installed (no [console] extra)",
+            "messagefoundry.service not importable",
         )
     try:
         text = Path(spec.origin).read_text(encoding="utf-8")

@@ -82,6 +82,19 @@ class AlertSink(Protocol):
         Emitted by the :class:`~messagefoundry.pipeline.cert_expiry.CertExpiryRunner`."""
         ...
 
+    def secret_rotation_due(
+        self, name: str, *, secret: str, last_rotated: str, days_overdue: int
+    ) -> None:
+        """A tracked long-lived secret is overdue (or within the warn window) for rotation (#195b, ADR
+        0019 §5). ``name`` labels the secret (e.g. ``"store data-encryption key"``); ``secret`` is the
+        secret's config/env **identifier** (e.g. ``"MEFOR_STORE_ENCRYPTION_KEY"``); ``last_rotated`` is
+        the operator-configured ISO date it was last rotated; ``days_overdue`` is positive once past the
+        max age, negative while still within the warn window. **No key material** is ever read or logged —
+        only the identifier + rotation dates (no PHI). Emitted by the
+        :class:`~messagefoundry.pipeline.secret_rotation.SecretRotationRunner`. Dedicated (not reusing
+        :meth:`cert_expiry`) so an operator can route a rotation reminder apart from a cert-expiry alert."""
+        ...
+
     def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
         """Startup self-attestation found loaded engine module(s) that do not match the installed
         wheel ``RECORD`` baseline — a runtime in-place tamper tripwire (ADR 0041 D3, #54). ``name``
@@ -189,6 +202,27 @@ class LoggingAlertSink:
                 path,
                 days_remaining,
                 not_after,
+            )
+
+    def secret_rotation_due(
+        self, name: str, *, secret: str, last_rotated: str, days_overdue: int
+    ) -> None:
+        if days_overdue > 0:
+            log.warning(
+                "ALERT secret_rotation: %r (%s) is OVERDUE for rotation by %d day(s) "
+                "(last_rotated=%s)",
+                name,
+                secret,
+                days_overdue,
+                last_rotated,
+            )
+        else:
+            log.warning(
+                "ALERT secret_rotation: %r (%s) is due for rotation in %d day(s) (last_rotated=%s)",
+                name,
+                secret,
+                -days_overdue,
+                last_rotated,
             )
 
     def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:

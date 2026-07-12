@@ -100,6 +100,21 @@ _ARGON2_MAX_CONCURRENCY = max(2, min(8, os.cpu_count() or 2))
 # side effects of the 8.4.2 signal; the step-up decision never depends on it, so eviction is harmless.
 _NEW_IP_DEDUP_MAX = 4096
 
+# Global safety bound on outstanding single-use per-action step-up grants (ADR 0077). Each grant is
+# consumed on the next matching sensitive request (or expires with the step-up window), so the live set
+# is normally tiny; this only caps a pathological accumulation. On overflow the OLDEST grant is evicted
+# (fail-safe: a dropped grant just re-prompts, never a bypass), mirroring `_new_ip_seen`'s self-eviction.
+_ACTION_STEP_UP_GRANT_MAX = 4096
+
+# Action identifiers for the per-action step-up grants (ADR 0077). Named constants so the JSON API deps
+# and the tests all reference the SAME grant string (a typo would only ever fail closed — an unmatched
+# grant re-prompts — but the shared constants keep the wiring legible). Only the JSON factor-binding
+# routes that are actually gated are defined here; WebAuthn register/verify and the browser /ui twins
+# stay on the legacy session-window step-up (deferred to a Wave-1 follow-on, see ADR 0077 residuals).
+STEP_UP_ACTION_MFA_ENROLL = "mfa_enroll"
+STEP_UP_ACTION_MFA_CONFIRM = "mfa_confirm"
+STEP_UP_ACTION_MFA_DISABLE = "mfa_disable"
+
 _T = TypeVar("_T")
 
 
@@ -255,6 +270,19 @@ class AuthService:
             if settings.phi_read_rate_limit_enabled
             else None
         )
+        # Per-actor anti-automation pacing for the state-changing admin surface (BACKLOG #193, ASVS
+        # 2.4.2). Built like _phi_read_limiter but consulted from the step-up gate for NON-GET sensitive
+        # ops. glob=0 (no cross-actor dimension): one operator's write burst must never throttle
+        # another's, and a single unified engine has no need for a global write ceiling here.
+        self._admin_write_limiter: SlidingWindowRateLimiter | None = (
+            SlidingWindowRateLimiter(
+                per_key=settings.admin_write_rate_limit_per_actor,
+                glob=0,
+                window_seconds=settings.admin_write_rate_limit_window_seconds,
+            )
+            if settings.admin_write_rate_limit_enabled
+            else None
+        )
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
         # last new client address already flagged for that session. Bounded (_NEW_IP_DEDUP_MAX).
         self._new_ip_seen: dict[str, str] = {}
@@ -262,6 +290,11 @@ class AuthService:
         # the rate-limiter precedent (single API process is structural). Keys are token-hashes the
         # SERVICE computes; the cache module never sees a session token.
         self._webauthn_challenges = webauthn.ChallengeCache()
+        # Single-use per-action step-up grants (ADR 0077): (token_hash, action) -> monotonic deadline.
+        # Bounded, TTL'd, process-local — the same shape as the WebAuthn ceremony cache above (and the
+        # same accepted per-process caveat). Minted ONLY by reauth(purpose=...) — never by login or
+        # verify_mfa — so a login-seeded step-up window can't authorize a durable factor-binding action.
+        self._action_step_up_grants: dict[tuple[str, str], float] = {}
         # Boot-time Kerberos acceptor preflight outcome (ADR 0068 §9): None = usable (or the
         # preflight never ran); a reason string = browser SSO degraded until restart.
         self._kerberos_unavailable_reason: str | None = None
@@ -284,6 +317,13 @@ class AuthService:
             return True
         return self._phi_read_limiter.allow(actor)
 
+    def allow_admin_write(self, actor: str) -> bool:
+        """Per-actor anti-automation pacing for the state-changing admin surface (BACKLOG #193, ASVS
+        2.4.2). True = proceed; False = throttle. Always True when the limiter is disabled."""
+        if self._admin_write_limiter is None:
+            return True
+        return self._admin_write_limiter.allow(actor)
+
     @property
     def policy(self) -> PasswordPolicy:
         return self._policy
@@ -291,6 +331,14 @@ class AuthService:
     @property
     def ad_enabled(self) -> bool:
         return self._ldap is not None
+
+    @property
+    def action_step_up_required(self) -> bool:
+        """Whether the durable-takeover routes gate on a per-action step-up grant (ADR 0077, default)
+        vs. the legacy session-window step-up. Drives the ``require_step_up_action`` /
+        ``require_reauth_only_action`` fallback so an org can opt out via
+        ``[auth].require_action_step_up = false``."""
+        return self._settings.require_action_step_up
 
     @property
     def kerberos_enabled(self) -> bool:
@@ -743,6 +791,33 @@ class AuthService:
             return None
         return await self._build_identity(user)
 
+    async def identity_for_username(self, username: str) -> Identity | None:
+        """Resolve a username directly to its :class:`Identity` (roles + custom-role overlay), or
+        ``None`` when the user is unknown or disabled — WITHOUT a bearer session.
+
+        Used by the mTLS-client-cert → principal path (#200, ADR 0002): a VERIFIED peer cert whose
+        subject maps (via ``[api].tls_client_cert_identities``) to a username is resolved here to the
+        principal whose RBAC then authorizes the service-to-service request. A disabled account grants
+        no identity (fail-closed), exactly as the token path treats it (:meth:`identity_for_token`)."""
+        user = await self._store.get_user_by_username(username)
+        if user is None or user.disabled:
+            return None
+        return await self._build_identity(user)
+
+    async def identity_for_user_id(self, user_id: str) -> Identity | None:
+        """Resolve a user id directly to its :class:`Identity` (roles + custom-role overlay), or
+        ``None`` when no such user exists — WITHOUT a bearer session.
+
+        Used by the effective-permission inspector (BACKLOG #177): an admin resolves the FLATTENED
+        effective permission set (built-in-role ∪ custom-role ∪ extras) for an arbitrary user via the
+        same :meth:`Identity.build` path :meth:`identity_for_token` uses for the caller. Unlike the
+        token / username auth paths, a *disabled* user still resolves here — the point is to inspect a
+        user's grants for troubleshooting (including a locked-out account), not to authenticate them."""
+        user = await self._store.get_user(user_id)
+        if user is None:
+            return None
+        return await self._build_identity(user)
+
     async def logout(self, token: str | None, *, actor: str | None = None) -> None:
         if token:
             await self._store.revoke_session(hash_token(token))
@@ -845,12 +920,24 @@ class AuthService:
         return await self._argon2(verify_password, user.password_hash, password)
 
     async def reauth(
-        self, identity: Identity, password: str, *, token: str, client: str | None = None
+        self,
+        identity: Identity,
+        password: str,
+        *,
+        token: str,
+        client: str | None = None,
+        purpose: str | None = None,
     ) -> bool:
         """Step-up re-verification (ASVS 7.5.3): re-prove the caller's credential and, on success,
         refresh the current session's ``reauth_at`` so it may perform highly sensitive operations for
         the configured window. Local accounts re-verify the password (argon2); **AD accounts do a live
-        re-bind** against the directory so AD operators aren't locked out. Always audited."""
+        re-bind** against the directory so AD operators aren't locked out. Always audited.
+
+        ``purpose`` (ADR 0077) additionally mints a **single-use, action-bound** step-up grant for that
+        named action, so a durable-takeover route (TOTP enroll/confirm, disable-MFA) can require a fresh
+        proof tied to *it* rather than riding the broad session window. It is purely
+        additive — the session-window refresh above is unchanged (the broad admin/replay/config routes
+        keep using it), and the grant is minted ONLY here, never by login or ``verify_mfa``."""
         if identity.auth_provider is AuthProvider.AD:
             ok = await self._reauth_ad(identity.username, password)
         else:
@@ -859,12 +946,51 @@ class AuthService:
             # Re-anchor the session to the address it re-verified from, so a forced step-up triggered
             # by a roamed/new client IP (WP-L3-13) clears once the caller re-proves from there.
             await self._store.mark_session_reauthed(hash_token(token), client=client)
+            if purpose is not None:
+                # Bind THIS fresh proof to the single action named by `purpose` (single-use), so a broad
+                # login-seeded window can never authorize a factor-binding action (ASVS 7.5.1 / 8.2.4).
+                self._grant_action_step_up(hash_token(token), purpose)
         await self._audit(
             "auth.reauth",
             actor=identity.username,
-            detail=_json({"ok": ok, "provider": identity.auth_provider.value}),
+            detail=_json({"ok": ok, "provider": identity.auth_provider.value, "purpose": purpose}),
         )
         return ok
+
+    def _grant_action_step_up(self, token_hash: str, action: str) -> None:
+        """Mint a single-use per-action step-up grant (ADR 0077), bounded + TTL'd, process-local.
+
+        The deadline reuses ``[auth].step_up_max_age_seconds`` so a minted-but-unconsumed grant expires
+        on the same clock as the session window. On the global-bound overflow the OLDEST grant is
+        evicted (fail-safe: a dropped grant just re-prompts, never a bypass)."""
+        now = time.monotonic()
+        self._prune_action_step_up_grants(now)
+        key = (token_hash, action)
+        if key not in self._action_step_up_grants and (
+            len(self._action_step_up_grants) >= _ACTION_STEP_UP_GRANT_MAX
+        ):
+            oldest = min(self._action_step_up_grants, key=self._action_step_up_grants.__getitem__)
+            del self._action_step_up_grants[oldest]
+        self._action_step_up_grants[key] = now + self._settings.step_up_max_age_seconds
+
+    def _prune_action_step_up_grants(self, now: float) -> None:
+        """Drop expired per-action grants (monotonic clock — a wall-clock step can't widen the window)."""
+        expired = [k for k, deadline in self._action_step_up_grants.items() if deadline <= now]
+        for key in expired:
+            del self._action_step_up_grants[key]
+
+    async def has_action_step_up(self, token: str | None, action: str) -> bool:
+        """Whether the caller holds a fresh step-up grant BOUND to ``action`` — and **consume** it
+        (single-use). ADR 0077. A grant is minted only by ``reauth(purpose=action)`` (POST /me/reauth
+        or /ui/reauth), never by login or ``verify_mfa``, so a login-seeded step-up window cannot bind a
+        new authenticator. Returns False for a missing token / no grant / an expired grant."""
+        if not token:
+            return False
+        now = time.monotonic()
+        self._prune_action_step_up_grants(now)
+        # pop = single-use: the grant is gone whether or not it was still live (a stale pop is harmless).
+        deadline = self._action_step_up_grants.pop((hash_token(token), action), None)
+        return deadline is not None and deadline > now
 
     async def _reauth_ad(self, username: str, password: str) -> bool:
         """Re-verify an AD credential via a live directory re-bind (no session adopted)."""
@@ -1065,7 +1191,11 @@ class AuthService:
         secret = await self._store.get_totp_secret(identity.user_id)
         if not secret:
             raise ValueError("no enrollment in progress")
-        if not totp.verify_totp(secret, code.strip()):
+        # Verify the enrollment proof under the SAME configured clock-skew window as a login (BACKLOG
+        # #187): default 0 = strict current-step only. Enrolling under the same window a login uses
+        # avoids the trap of a skewed-clock authenticator that confirms enrollment yet then fails every
+        # login (the mismatch surfaces at enroll time instead).
+        if not totp.verify_totp(secret, code.strip(), window=self._settings.totp_skew_steps):
             await self._audit(
                 "auth.mfa_failed", actor=identity.username, detail=_json({"phase": "enroll"})
             )
@@ -1136,7 +1266,14 @@ class AuthService:
             return False
         secret = await self._store.get_totp_secret(user.id)
         if secret:
-            matched_step = totp.verify_totp_step(secret, code)
+            # Clock-skew window is operator-configurable (BACKLOG #187; ASVS 6.5.5). Default
+            # totp_skew_steps=0 accepts only the current 30 s step (strict, tightest replay window);
+            # 1/2 is the documented opt-out restoring RFC-6238 network-delay tolerance. verify_totp_step
+            # still clamps a tolerated fast-clock future code to the current step (SEC-014), so a wider
+            # window never advances the single-use high-water mark past now.
+            matched_step = totp.verify_totp_step(
+                secret, code, window=self._settings.totp_skew_steps
+            )
             if matched_step is not None:
                 # Single-use within the step window (ASVS 6.5.1): the store advances the user's
                 # highest-consumed time-step atomically, so a code captured and replayed inside its
@@ -1791,6 +1928,20 @@ class AuthService:
     ) -> None:
         await self._audit(
             "auth.permission_denied",
+            actor=identity.username,
+            detail=_json({"permission": permission.value, "path": path}),
+        )
+
+    async def audit_permission_granted(
+        self, identity: Identity, permission: Permission, path: str
+    ) -> None:
+        """Twin of :meth:`audit_permission_denied` for the authorization-GRANT side (BACKLOG #195a,
+        ASVS 16.3.2). The API layer emits this ONLY for the sensitive / state-changing surface (never on
+        a read or a poll — see the ``_GRANT_AUDIT_PERMISSIONS`` scope in ``api/security.py``), so the
+        hash-chained audit log records who was allowed to perform a sensitive op without being flooded by
+        console polling or the /ws/stats feed."""
+        await self._audit(
+            "auth.permission_granted",
             actor=identity.username,
             detail=_json({"permission": permission.value, "path": path}),
         )

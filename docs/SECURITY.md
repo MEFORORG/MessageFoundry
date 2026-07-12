@@ -64,13 +64,48 @@ directory); resetting your own account is refused (use self-service change-passw
 audited (`auth.password_reset`). For the same reason, **admin-created accounts are flagged
 `must_change_password`** so the operator's initial password is a one-time temp the user must rotate.
 
-**Anti-automation (ASVS 2.4.2).** A per-actor/per-operation human-timing *pacing floor* on sensitive
-authenticated writes is **deliberately not implemented** for the default deployment: the API binds
-`127.0.0.1`, every sensitive write is RBAC-gated to an authenticated operator, and the unauthenticated
-brute-force surface is already bounded by the sliding-window rate limiter (`auth/ratelimit.py`) plus
-the per-actor PHI-read throttle. Machine-speed abuse of an authenticated admin endpoint is not material
-in the single-tenant, on-loopback, desktop-console model; a pacing floor would be revisited only if a
-sensitive write is exposed off-loopback (alongside the ADR 0002 transport work).
+**Anti-automation (ASVS 2.4.2).** A per-actor human-timing *pacing floor* on sensitive authenticated
+writes is **built** (BACKLOG #193). The step-up gate (`require_step_up`) that guards the state-changing
+admin surface — purge, replay, config deploy/reload — runs each **non-GET** request through a per-actor
+sliding-window limiter (`allow_admin_write`, keyed on the acting user; the sole step-up GET
+`/messages/search` is exempt). Over the limit the write is refused with `429 Too Many Requests` +
+`Retry-After` and logged (never silent). The floor (`[auth].admin_write_rate_limit_per_actor` over
+`admin_write_rate_limit_window_seconds`, default 12 writes/second) sits an order of magnitude above
+human console interaction and above the worst-case `403 → POST /me/reauth → retry` burst, so an
+operator is never throttled while a machine-speed loop trips immediately. It complements — does not
+replace — the RBAC gate, the step-up re-verification, the unauthenticated login limiter
+(`auth/ratelimit.py`), and the per-actor PHI-read throttle. In-process only (per API process): an
+off-loopback deployment must additionally front the API with a proxy/WAF limiter. Disable with
+`[auth].admin_write_rate_limit_enabled = false`.
+
+**Authorization-decision audit (ASVS 16.3.2).** Authorization **grants** on the sensitive surface are
+audited (`auth.permission_granted`), the twin of the existing `auth.permission_denied` (BACKLOG #195a).
+Because `require()` / `authorize_ws` fire on *every* protected request (including console polling and
+the `/ws/stats` feed), auditing every read grant would flood the hash-chained audit log — so the grant
+audit is deliberately **scoped** to the sensitive / state-changing / config / user-mgmt permission set
+(`_GRANT_AUDIT_PERMISSIONS` in `api/security.py`), on non-GET requests only. Read/monitoring grants are
+a **documented read-polling deviation** (not audited), and PHI-view grants are excluded because the
+PHI-access audit path already records those accesses (no double-audit).
+
+**Delegated identity & admin device posture (#193 sibling; ASVS 13.2.1 / 13.3.2 / 8.4.2 — the delegation
+boundary).** Three controls whose enforcement is largely the deploying organization's to provide.
+MessageFoundry states the boundary and adds one opt-in precondition check (#203):
+
+- **Managed identity over static credentials.** The store can authenticate with a managed / delegated
+  identity — SQL Server `[store].auth = integrated` (gMSA / Windows Integrated) or `entra` (Microsoft
+  Entra ID) — instead of a static username + password. Set `[store].require_managed_identity = true` to
+  make it a **checked precondition**: on a **production** instance `serve` **refuses to start** (a
+  non-production instance **warns**) if the store still uses a static SQL login, or a Postgres store
+  (which has no managed-identity mode). Off by default. AD (`ad_bind_password`) and SMTP
+  (`email_password`) have no managed-identity mode yet — supply those secrets via the environment
+  (`MEFOR_*`, never the config file) under a least-privilege service account.
+- **Least-privilege secret access** is the operator's precondition: secrets live in the environment, the
+  engine's service account is granted only what it needs (the least-privilege account + ACLs are the
+  Windows-service install's job), and at-rest custody is the DPAPI / KeyProvider chain. The precondition
+  flag above surfaces the *store* slice of this at start time; the rest is asserted, not engine-checked.
+- **Admin device posture** (managed / compliant admin endpoints) stays **100 % deployment-delegated**:
+  enforce it at the reverse proxy (mTLS client certificates) plus MDM in front of an off-loopback `/ui`,
+  not inside the engine — the engine has no device-attestation channel and does not attempt one.
 
 ---
 
@@ -82,16 +117,17 @@ catalog; holding multiple roles grants the **union** of their permissions (deny-
 | Role | Permissions |
 |---|---|
 | **Administrator** | everything (incl. `users:manage`, `audit:read`) |
-| **Operator** | `monitoring:read`, `monitoring:diagnose`, `messages:read`, `messages:view_summary`, `messages:view_raw`, `messages:replay`, `messages:purge`, `connections:control`, `connections:test` |
+| **Operator** | `monitoring:read`, `monitoring:diagnose`, `messages:read`, `messages:view_summary`, `messages:view_raw`, `messages:replay`, `messages:resend`, `messages:edit`, `messages:purge`, `connections:control`, `connections:test` |
 | **Deployment** | `monitoring:read`, `config:deploy`, `config:validate`, `connections:test` |
 | **Coding** | `monitoring:read`, `code:edit`, `config:validate`, `ai:assist` |
 | **Viewer** | `monitoring:read`, `messages:read` |
 | **Auditor** | `monitoring:read`, `audit:read` |
 
 Permission catalog: `monitoring:read`, `monitoring:diagnose`, `messages:read`,
-`messages:view_summary` (PHI), `messages:view_raw` (PHI), `messages:replay`, `messages:purge`,
-`connections:control`, `connections:test`, `config:deploy`, `config:validate`*, `code:edit`*,
-`service:configure`*, `ai:assist`, `users:read`, `users:manage`, `audit:read`, `approvals:approve`.
+`messages:view_summary` (PHI), `messages:view_raw` (PHI), `messages:replay`, `messages:resend`,
+`messages:edit` (PHI — implies `messages:view_raw`), `messages:purge`, `connections:control`,
+`connections:test`, `config:deploy`, `config:validate`*, `code:edit`*, `service:configure`*,
+`ai:assist`, `users:read`, `users:manage`, `audit:read`, `approvals:approve`.
 
 \* `config:validate`, `code:edit`, and `service:configure` have no API endpoint yet; the permissions
 are defined so the Deployment/Coding roles are complete and those endpoints can be gated the moment
@@ -117,6 +153,8 @@ they land. (`config:deploy` already gates `POST /config/reload`.)
 | `GET /messages/{id}` | `messages:view_raw` (the raw body); `messages:view_summary` unlocks `summary`/`error` and the nested `last_error`/event `detail` (per-property — see *Field-level authorization*) |
 | `GET /messages/{id}/responses` | `messages:read`; `messages:view_summary` unlocks the captured-reply `detail`, `messages:view_raw` the reply `body` (per-property) |
 | `POST /messages/{id}/replay` | `messages:replay` |
+| `POST /messages/{id}/resend` | `messages:resend` (step-up; per-channel access to BOTH the origin's and the alternate outbound's channel) |
+| `POST /messages/{id}/edit-resend` | `messages:edit` (step-up; implies `messages:view_raw`; the DIRECT `to` power-path additionally requires per-channel access to the alternate outbound's channel) |
 | `GET /dead-letters` | `messages:read`; `messages:view_summary` unlocks the `summary`/`last_error` fields (per-property — see *Field-level authorization*) |
 | `POST /dead-letters/replay` | `messages:replay` |
 | `POST /connections/{name}/{start,stop,restart}` | `connections:control` |
@@ -197,12 +235,18 @@ returns a setup key + `otpauth://` URI for an authenticator app, `POST /me/mfa/c
 returns the **single-use recovery codes** (shown once), and `POST /auth/mfa-verify` satisfies a session's
 second factor with a TOTP code or a recovery code. `DELETE /me/mfa` disables it; an administrator clears a
 lost authenticator via `POST /users/{id}/reset-mfa` (which also revokes the user's sessions). With
-`[auth].require_mfa` on, the **Administrator** role must satisfy MFA before any step-up operation (the gate
-returns `403` + `X-MFA-Required` until verified); other users may opt in by enrolling. **AD/Kerberos MFA is
-delegated to the directory** (Entra Conditional Access / an MFA proxy) — a directory login is never
-prompted for an engine TOTP and is MFA-satisfied at issuance. The TOTP secret is stored **encrypted at
-rest** (the store cipher) and recovery codes are **argon2id-hashed**; verification uses the server clock and
-a constant-time compare with a ±1-step window. TOTP is a shared-secret factor — L3 *prefers*
+`[auth].require_mfa` on — **the default since BACKLOG #187 (secure-by-default, including the loopback
+bind)** — the **Administrator** role must satisfy MFA before any step-up operation (the gate returns
+`403` + `X-MFA-Required` until verified); other users may opt in by enrolling. A required-but-unenrolled
+admin is never locked out — the enroll/confirm routes sit behind an action-bound **password** step-up,
+not the MFA gate, so the bootstrap admin enrolls then satisfies it. The documented org opt-out is
+`[auth].require_mfa = false`. **AD/Kerberos MFA is delegated to the directory** (Entra Conditional Access
+/ an MFA proxy) — a directory login is never prompted for an engine TOTP and is MFA-satisfied at issuance.
+The TOTP secret is stored **encrypted at rest** (the store cipher) and recovery codes are
+**argon2id-hashed**; verification uses the server clock and a constant-time compare over a **configurable
+clock-skew window** (`[auth].totp_skew_steps`, **default `0` = the current 30 s step only** — strictest
+replay window, ASVS 6.5.5; set `1`/`2` to restore RFC-6238 ±1 network-delay tolerance, the forward step
+clamped to the current step so single-use holds). TOTP is a shared-secret factor — L3 *prefers*
 phishing-resistant factors: **WebAuthn passkeys are the built WP-14b sibling** (next section), and TOTP
 stays fully supported alongside them (it remains the desktop console's second factor).
 
@@ -269,14 +313,15 @@ password verifies through the **same** `auth.login` directory-bind seam as the J
 allow-listed provider values only, one session per form POST (the AD role-resync/revocation side
 effect fires once at login, never per navigation), MFA stays delegated to the directory.
 
-`require_mfa` defaults **off** (the loopback shipping posture is byte-for-byte unchanged), but it is not
-left purely to a runbook at exposure: when the API is bound **off-loopback** with `require_mfa` off,
-`serve` makes the posture explicit at startup — it **refuses to start** on a **production PHI** instance
-and **warns** on a non-production PHI instance (a synthetic instance stays quiet), mirroring the
-keyless-store and open-egress startup gates. So an exposed PHI deployment can't silently run the
-Administrator interface single-factor. `require_mfa` is safe to enable even on an **AD-only** deployment —
-it gates only **local** Administrator accounts (AD/Kerberos MFA stays delegated to the directory), so the
-remediation is always simply to set `[auth].require_mfa=true` (or keep the bind on loopback).
+`require_mfa` defaults **on** (BACKLOG #187 — secure-by-default, including the loopback bind; the
+documented org opt-out is `[auth].require_mfa = false`). The exposure gate now guards the **explicit
+opt-out**: when the API is bound **off-loopback** with `require_mfa` *turned off*, `serve` makes the
+posture explicit at startup — it **refuses to start** on a **production PHI** instance and **warns** on a
+non-production PHI instance (a synthetic instance stays quiet), mirroring the keyless-store and
+open-egress startup gates. So an exposed PHI deployment can't silently run the Administrator interface
+single-factor. `require_mfa` is safe to keep on even on an **AD-only** deployment — it gates only
+**local** Administrator accounts (AD/Kerberos MFA stays delegated to the directory), so an operator who
+opts out at exposure simply re-enables `[auth].require_mfa=true` (or keeps the bind on loopback).
 
 ### Administrative-interface defense-in-depth (WP-L3-13, ASVS 8.4.2)
 
@@ -544,17 +589,77 @@ before the feature are chained on first start. This is in-DB tamper-*evidence*, 
 restrict the store/file ACL (and run least-privilege; see [SERVICE.md](SERVICE.md)) so the log can't
 be rewritten in the first place.
 
-**Off-box forwarding (sec-offbox-log).** The hash chain detects on-host tampering but lives on the same
-host as the data it protects; if that host is compromised, local evidence can be tampered with. The
-**general log** can therefore be shipped **off-box** to a syslog/SIEM collector (`[logging].forward_enabled`
-+ `forward_host`/`_port`/`_protocol`/`_format`; structured JSON via `[logging].format = "json"`), so an
-independent copy survives a host compromise. The same PHI-redaction + control-char-scrub filters apply to
-the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-redaction)); the syslog transport
-is plaintext, so terminate it at a local TLS-forwarding agent or keep it on a trusted management network.
+**Off-box forwarding (sec-offbox-log; ADR 0080).** The hash chain detects on-host tampering but lives on
+the same host as the data it protects; if that host is compromised, local evidence can be tampered with.
+The **general log** can therefore be shipped **off-box** to a syslog/SIEM collector
+(`[logging].forward_host` + `_port`/`_protocol`/`_format`; structured JSON via `[logging].format = "json"`),
+so an independent copy survives a host compromise. The same PHI-redaction + control-char-scrub filters apply
+to the forwarded stream as to stdout (see [PHI.md §7](PHI.md#7-logging--phi-redaction)).
+
+- **Default-on-when-configured (ADR 0080).** `forward_enabled` is unset by default and *derived* from whether
+  a collector is named: pointing `forward_host` at a SIEM turns forwarding **on**, `forward_enabled = false`
+  is the explicit opt-out, and with no `forward_host` forwarding stays **off** (byte-identical stdout-only
+  startup). So an operator who configures a collector can't silently forget the enable flag.
+- **Native TLS transport (`forward_protocol = "tls"`; RFC 5425, ADR 0080).** The hop can be encrypted
+  **without a local agent** — an `ssl`-wrapped TCP socket. The collector's certificate is verified against an
+  explicit PEM trust anchor (`forward_tls_ca_file`; **only** that CA is trusted, not the system bundle) with
+  hostname checking on by default; `forward_tls_verify = false` is the documented insecure opt-out and
+  `forward_tls_client_cert` adds mutual TLS. The handshake is bounded by the same socket timeout as a plain
+  TCP send, so a stalled/mis-certified collector can't block the engine (it's skipped at startup with a loud
+  warning). `udp`/`tcp` remain available — terminate TLS at a local forwarding agent instead if you prefer,
+  or keep plaintext on a trusted management network.
+
 The **`audit_log`** rows *themselves* are **also** forwarded off-box (sec-offbox-log #361/#363): every
 committed audit row ships as PHI-redacted metadata through the `messagefoundry.audit` logger to the same
-forwarder, across all three store backends — so both the operational log and the tamper-evident audit
-trail survive a host/DB compromise.
+forwarder — so it inherits the TLS transport automatically — across all three store backends, so both the
+operational log and the tamper-evident audit trail survive a host/DB compromise.
+
+**Clock-sync gate (ASVS 16.2.2; ADR 0080).** Cross-host log/audit correlation assumes the engine host's
+clock tracks a reference. `[logging].require_time_sync` + `ntp_peer` arms an **opt-in**, fully-bounded SNTP
+probe at startup (before listeners begin): it **warns loudly** when the local clock skews past
+`time_sync_max_skew_seconds` (default 2 s) or the peer is unreachable, and with `time_sync_fail_closed`
+it **refuses to start** instead. It is opt-in rather than default-on because the engine cannot verify
+synchronization without an operator-chosen peer; the default is a no-op.
+
+### Outbound TLS trust anchor — pinned internal CA (`[tls]`, #190, ADR 0093)
+
+An outbound connector that verifies a downstream **server** certificate (MLLP/DICOM-SCU/FTPS) anchors
+trust in the **OS trust store** by default. A hospital estate whose internal endpoints present certs
+from a **private / internal CA** not in the box-global store can pin that CA once via the small opt-in
+`[tls]` section rather than installing it box-wide or repeating a per-connection `tls_ca_file`:
+
+- `[tls].internal_ca_file` — a PEM **path** (NOT a secret) to the org internal CA.
+- `[tls].trust_anchor_mode` — `system` (default; OS trust store only — **byte-identical**, the internal
+  CA is ignored), `augment` (OS roots **plus** the internal CA — a mixed public + private estate), or
+  `pinned` (**only** the internal CA, not the public bundle — a fully-private estate; the same
+  single-anchor posture as the off-box syslog `forward_tls_ca_file`).
+
+A connection that names its **own** `tls_ca_file` always **wins verbatim**; a loopback (on-box) hop is
+exempt (it needs no org-PKI anchor). The anchor **supplies which roots verify the peer** — it **never
+disables verification** — so it composes with, and never weakens, the existing fail-closed refusals: a
+`tls_verify=false` hop is still refused (an internal CA cannot silence it), and a plaintext hop is still
+governed by the posture-keyed cleartext refusal (ADR 0092). It is **not** applied to the API server
+context (`build_api_ssl_context`), which verifies **client** certs for opt-in mTLS (ADR 0083) — a
+different trust role. With no `[tls]` block the built SSL context is byte-identical to before.
+
+### PHI data-plane integrity residuals — scope-outs (#190, ADR 0093)
+
+BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** and **two scoped out**:
+
+- **Detached-JWS message signing — shipped (ADR 0018), scoped out.** A detached RFC 7515 JWS over the
+  exact outbound body is already built (`transports/signing.py`, opt-in per REST/SOAP outbound). #190's
+  ask was a *runbook decision* (does the exposure runbook mandate it), not new engine code. Every
+  PHI-plane surface already carries integrity: outbound bodies (ADR 0018), the audit trail (the HMAC
+  hash-chain), and data at rest (AES-256-GCM AEAD).
+- **ECH (Encrypted Client Hello) for outbound SNI — infeasible, documented risk acceptance
+  (12.1.5).** Hiding the destination hostname in the outbound TLS ClientHello is not buildable here:
+  Python 3.14's stdlib `ssl` exposes **no ECH API**, there is **no SVCB/HTTPS DNS resolver** (ECHConfig
+  is DNS-published) and adding one is out of scope, and a working ECH client would require a
+  **third-party TLS stack** — violating the no-new-dependency rule for a security-core path. The
+  destination SNI is therefore visible on the outbound handshake. Compensating context: on-prem, a
+  trusted network segment, an operator-configured `[egress]`-allowlisted destination, and TLS still
+  protects the payload. Re-open when the stdlib gains a first-class ECH API (no new dep) and an
+  SVCB/HTTPS resolver is in scope.
 
 ### HIPAA §164.312 alignment
 
@@ -624,7 +729,7 @@ SLSA + the Sigstore identity check) per [INSTALL-GUIDE.md](INSTALL-GUIDE.md#veri
 ## Not yet built (deliberate follow-ups)
 
 Entra ID / OIDC federation, custom roles, and the remaining `code:edit` / `config:validate` /
-`service:configure` endpoints those permissions will gate. **Transport TLS is built** — API/WS (WP-13a), the reverse-proxy / forwarded-header path (WP-15), and MLLP-over-TLS (WP-13b, per-connection `tls`/`tls_*`), per [ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md) (*Accepted*). The §0 **exposed-gate is enforced** — a non-loopback *plaintext* API or MLLP bind is refused at startup unless `serve --allow-insecure-bind`. ADR-0002 **MFA (WP-14) is now built** — native TOTP for local accounts (see "Multi-factor authentication" above); AD/Kerberos MFA is delegated to the directory. The **DICOM C-STORE SCP inbound** (ADR 0025 Phase 1) carries the same posture: it accepts only allowlisted calling AE titles + peer IPs, supports **DICOM-over-TLS**, and a non-loopback bind is refused unless explicitly overridden. **Outbound egress auth** for the FHIR/REST connector is built as a **SMART Backend Services token provider** (ADR 0024) — OAuth2 `client_credentials` with a signed-JWT (RS384/ES384) client assertion (extending the ADR 0018 signing core, no new dependency), opted in per connection via `with_smart_backend()`; it mints a per-request bearer and re-mints on `401`, and the token endpoint is gated by `[egress].allowed_http`. It is **client-only** — no App Launch flow and no authorization-server facade. (Encryption at rest, audit hash-chaining,
+`service:configure` endpoints those permissions will gate. **Transport TLS is built** — API/WS (WP-13a), the reverse-proxy / forwarded-header path (WP-15), and MLLP-over-TLS (WP-13b, per-connection `tls`/`tls_*`), per [ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md) (*Accepted*). The §0 **exposed-gate is enforced** — a non-loopback *plaintext* API or MLLP bind is refused at startup unless `serve --allow-insecure-bind`. ADR-0002 **MFA (WP-14) is now built** — native TOTP for local accounts (see "Multi-factor authentication" above); AD/Kerberos MFA is delegated to the directory. The **DICOM C-STORE SCP inbound** (ADR 0025 Phase 1) carries the same posture: it accepts only allowlisted calling AE titles + peer IPs, supports **DICOM-over-TLS**, and a non-loopback bind is refused unless explicitly overridden. **Outbound egress auth** for the FHIR/REST connector is built as a **SMART Backend Services token provider** (ADR 0024) — OAuth2 `client_credentials` with a signed-JWT (RS384/ES384) client assertion (extending the ADR 0018 signing core, no new dependency), opted in per connection via `with_smart_backend()`; it mints a per-request bearer and re-mints on `401`, and the token endpoint is gated by `[egress].allowed_http`. It is **client-only** — no App Launch flow and no authorization-server facade. **SMART trust boundary (BACKLOG #204, ASVS 10.4.16):** the engine *presents* a `private_key_jwt` client assertion (RFC 7523) to the token endpoint, but *enforcing* that method — validating the assertion signature/audience/expiry, refusing a weaker `client_secret_post`/`client_secret_basic` for this client, and replay-protecting the `jti` — is the **authorization server's responsibility**, a boundary the client engine does not and cannot police. MessageFoundry assumes an AS that mandates private_key_jwt for Backend Services clients; an AS that *also* accepts a weaker authentication method is an AS-side misconfiguration, not a client-engine defect. (Encryption at rest, audit hash-chaining,
 **per-channel RBAC** — including the console scope editor and AD-group→scope mapping — and the
 **committed dependency lockfile** are now built; see [PHI.md §3](PHI.md#3-encryption-at-rest),
 *Audit*, the per-channel-scoping note, and *Dependency lockfile (DEP-1)* above.)

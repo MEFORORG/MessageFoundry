@@ -56,9 +56,11 @@ __all__ = [
     "raw_field",
     "set_field",
     "encode",
+    "encode_raw_separators",
     "segment_ids",
     "separators",
     "unescape",
+    "unescape_separators",
     "escape_leaf",
     "raise_if_blank_segment_scan",
     "scan_segment_index",
@@ -584,6 +586,51 @@ def escape_leaf(value: str, seps: tuple[str, str, str, str, str]) -> str:
     return out
 
 
+def unescape_separators(value: str, seps: tuple[str, str, str, str, str]) -> str:
+    """Convert ONLY the four structural-delimiter escapes (``\\F\\ \\S\\ \\R\\ \\T\\``) to their RAW
+    MSH-derived separator characters, passing everything else through **verbatim** (BACKLOG #107).
+
+    This is the deliberate escape-hatch codec that emits reserved separators as raw bytes for a partner
+    that cannot decode HL7 escapes — the inverse of :func:`escape_leaf` for the *structural* set only.
+    Unlike :func:`unescape` it does **not** expand hex/rich-text runs or drop unmappable sequences: any
+    non-structural escape (``\\E\\``, ``\\Xhh\\``, ``\\.br\\``, ``\\H\\`` …) is re-emitted unchanged, and
+    a real (already-raw) separator inside ``value`` passes straight through — so the function is safe to
+    run over a whole field/segment's raw text, not just a single leaf.
+
+    It walks ``value`` with the escape-char **state machine** (never a blind ``str.replace``) so an
+    escaped escape ``\\E\\`` is consumed as one protected unit: a literal-backslash datum written as
+    ``\\E\\F\\E\\`` is preserved as ``\\E\\F\\E\\``, never mis-read as a ``\\F\\`` to raw-ize. Separators
+    are read from ``seps`` (MSH-1/MSH-2), never hardcoded. An unterminated trailing escape is emitted
+    verbatim rather than dropped, so no byte is lost.
+    """
+    field_sep, comp_sep, rep_sep, sub_sep, esc = seps
+    if esc not in value:
+        return value  # no escape character at all → nothing to convert, byte-identical
+    structural = {"F": field_sep, "S": comp_sep, "R": rep_sep, "T": sub_sep}
+    out: list[str] = []
+    collecting: list[str] = []
+    in_seq = False
+    for c in value:
+        if in_seq:
+            if c == esc:
+                in_seq = False
+                seq = "".join(collecting)
+                collecting = []
+                if seq in structural:
+                    out.append(structural[seq])  # \F\ \S\ \R\ \T\ → raw byte
+                else:
+                    out.append(f"{esc}{seq}{esc}")  # \E\, hex, rich-text: emit unchanged
+            else:
+                collecting.append(c)
+        elif c == esc:
+            in_seq = True
+        else:
+            out.append(c)
+    if in_seq:  # unterminated escape run: re-emit the opener + remainder verbatim (never drop data)
+        out.append(esc + "".join(collecting))
+    return "".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Writes
 # ---------------------------------------------------------------------------
@@ -705,3 +752,53 @@ def encode(msg: ParsedMessage) -> str:
     rebuilt = "\r".join(lines) + "\r"
     msg["raw"] = rebuilt
     return rebuilt
+
+
+def _encode_segment_raw_separators(
+    msg: ParsedMessage, seg_index: int, seps: tuple[str, str, str, str, str]
+) -> str:
+    """Rebuild one segment's ``\\r``-line, emitting the four reserved structural separators as RAW bytes
+    (BACKLOG #107) — the raw-separator sibling of :func:`_encode_segment`.
+
+    Every data field/leaf runs through :func:`unescape_separators` (``\\F\\ \\S\\ \\R\\ \\T\\`` → the
+    message's own field/component/repetition/subcomponent char). **MSH/BHS/FHS MSH-1 and MSH-2 are left
+    untouched** — MSH-2 literally carries the escape char, so running the codec over it would corrupt the
+    header; only the real fields (index 3+) are transformed. A still-lazy non-MSH segment's raw line has
+    real field separators (which pass through) and escaped structurals inside its leaves (which convert),
+    so the codec is applied to the whole line safely.
+    """
+    seg = msg["segments"][seg_index]
+    seg_id = seg["id"]
+    field_sep = seps[0]
+    if seg_id in ("MSH", "BHS", "FHS"):
+        # Header segments are always split eagerly (never lazy); MSH-1/MSH-2 stay raw, fields 3+ convert.
+        fields = seg["fields"]
+        texts = [_field_text(f) if not isinstance(f, str) else f for f in fields]
+        if len(texts) >= 3:
+            head = texts[0] + texts[1] + texts[2] + texts[1]
+            return head + field_sep.join(unescape_separators(t, seps) for t in texts[3:])
+        return field_sep.join(texts)
+    lazy_raw = msg["_lazy"].get(seg_index)
+    if lazy_raw is not None:
+        return unescape_separators(lazy_raw, seps)
+    fields = seg["fields"]
+    if not fields:
+        return seg_id  # empty/blank segment
+    texts = [_field_text(f) if not isinstance(f, str) else f for f in fields]
+    return field_sep.join(unescape_separators(t, seps) for t in texts)
+
+
+def encode_raw_separators(msg: ParsedMessage) -> str:
+    """Serialize like :func:`encode`, but emit the four reserved **structural** separators as RAW bytes
+    instead of their ``\\F\\ \\S\\ \\R\\ \\T\\`` escape sequences (BACKLOG #107).
+
+    This is the per-outbound escape-hatch for a partner that cannot decode HL7 escapes. Each data leaf's
+    structural escape is converted to the message's own field/component/repetition/subcomponent character
+    (read from MSH via :func:`unescape_separators`); real separators and MSH-1/MSH-2 are untouched, and no
+    other escape (``\\E\\``, hex, rich-text) is expanded. The result is deliberately **non-conformant** —
+    a formerly-escaped ``^`` now reads as a component separator — which is the whole point. When the message
+    carries no structural escapes the output is **byte-identical** to :func:`encode`. Always rebuilds (the
+    raw cache is the escaped form), so it never poisons a later :func:`encode`."""
+    seps = msg["seps"]
+    lines = [_encode_segment_raw_separators(msg, i, seps) for i in range(len(msg["segments"]))]
+    return "\r".join(lines) + "\r"

@@ -1,0 +1,27 @@
+{
+  "module": "samples/config/IB_IMMUNIZATION_VXU.py",
+  "handlers": [
+    {
+      "handler": "immunization_submit_handler",
+      "module": "samples/config/IB_IMMUNIZATION_VXU.py",
+      "def_line": 55,
+      "rows": [
+        {
+          "kind": "code",
+          "line_start": 58,
+          "line_end": 62,
+          "nesting": 0
+        },
+        {
+          "kind": "send",
+          "outbounds": [
+            "OB_IMMUNIZATION_REGISTRY"
+          ],
+          "line_start": 63,
+          "line_end": 63,
+          "nesting": 0
+        }
+      ]
+    }
+  ]
+}

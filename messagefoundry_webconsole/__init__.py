@@ -26,7 +26,7 @@ __version__ = "0.2.15"
 
 #: The engine contract versions this console build supports (``api._ui_seam.ENGINE_UI_SEAM``). A pair
 #: outside this set is refused at startup — the runtime backstop behind the PEP 508 compat range.
-SUPPORTED_ENGINE_SEAMS: frozenset[int] = frozenset({1})
+SUPPORTED_ENGINE_SEAMS: frozenset[int] = frozenset({2})
 
 #: The vendored static assets shipped in THIS wheel (mounted at /ui/static by :func:`mount_ui`).
 STATIC_DIR = Path(__file__).parent / "static"

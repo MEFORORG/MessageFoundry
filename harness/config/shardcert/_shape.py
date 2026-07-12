@@ -21,7 +21,22 @@ Knobs (all optional; safe defaults so a plain ``serve`` works):
 * ``MEFOR_SHARDCERT_LANES_PER_SHARD`` — inbound→router→handler chains PER shard (default 1 = one fat
   lane, byte-identical to today). ``C>1`` gives ``N*C`` many-thin-lanes (distinct inbound + port each);
   the MSH-6 FIFO lane key gains the lane index so per-lane FIFO/inversion accounting stays meaningful.
-* ``MEFOR_SHARDCERT_DESTS``        — count of SHARED outbound destinations every shard sends to (default 4).
+* ``MEFOR_SHARDCERT_DESTS``        — **TOPOLOGY ONLY** (BACKLOG #209): the count of SHARED outbound
+  destination CONNECTIONS every shard declares, i.e. the width of the sink port band. It is **not** the
+  fan-out and **not** the transform-stage width — those are ``DELIVERING`` and ``HANDLERS`` below. Default 8.
+* ``MEFOR_SHARDCERT_HANDLERS``     — ``H``: handlers the router SELECTS per (shard, lane). Feeds the reported
+  ``txn/msg = 3 + 2H + 2D`` (ADR 0051) and NEVER appears in delivery arithmetic. Default ``= dests``.
+* ``MEFOR_SHARDCERT_DELIVERING``   — ``D``: destinations each accepted message ACTUALLY delivers to — **the
+  fan-out**. Handler ``j`` owns destination ``j`` for ``j < D``; handlers ``j >= D`` are SELF-FILTERING (they
+  read a field, then return ``None``), so they cost the full 2 txn (routed-row claim + a zero-delivery
+  ``transform_handoff``) and produce no outbound row. That 2-txn-for-nothing is the quantity the ``accepts=``
+  seam (BACKLOG #213 / ADR 0084) removes, and what this knob exists to make measurable. Default ``= dests``.
+
+  Invariants (**fail loud**): ``1 <= D <= dests`` and ``D <= H``. The defaults ``H = D = dests`` reproduce the
+  pre-#209 graph byte-for-byte (``routed == delivered``), so no published run changes. Setting ``dests`` alone
+  to model an ``H=20, N=4`` hub would build 20 outbound connections and 20 delivered copies and report
+  ``events/msg = 21`` against a truth of ``5`` — a 4.2x overstatement of the headline number (harness defect
+  class B10, in the permissive direction). Split the three, never overload ``dests``.
 * ``MEFOR_SHARDCERT_SINK_HOST``    — sink host every destination delivers to (default 127.0.0.1).
 * ``MEFOR_SHARDCERT_SINK_PORT``    — base sink port (default 3700).
 * ``MEFOR_SHARDCERT_SINK_PORTS``   — contiguous sink ports to round-robin across (default 1).
@@ -81,6 +96,7 @@ class ShardCertShape:
 
     shards: tuple[str, ...]  # sorted shard ids — one inbound each
     inbound_base: int
+    # TOPOLOGY ONLY: shared outbound destination CONNECTIONS = sink port-band width. NOT the fan-out.
     dests: int
     sink_host: str
     sink_port: int
@@ -88,6 +104,33 @@ class ShardCertShape:
     transform: str
     persistent: bool  # give the shared outbounds the ADR 0067 persistent connection (default off)
     lanes_per_shard: int  # inbound→router→handler chains per shard (1 = one fat lane, default)
+    # H: handlers the router SELECTS per (shard, lane). Cost model only — never delivery arithmetic.
+    handlers: int
+    # D: destinations an accepted message actually delivers to. *** THE FAN-OUT ***
+    delivering: int
+
+    def delivers_to(self, handler_index: int) -> int | None:
+        """The destination index handler ``handler_index`` delivers to, or ``None`` if it SELF-FILTERS.
+
+        Handler ``j`` owns destination ``j`` for ``j < delivering`` (so at the default ``H == D == dests``
+        every handler delivers and the graph is byte-identical to the pre-#209 one); handlers ``j >= D``
+        take the message, read it, and deliver nothing — the real hub shape (``H=20`` selected, ``D=4``
+        delivered) the bench previously could not express."""
+        return handler_index if handler_index < self.delivering else None
+
+    @property
+    def txn_per_message(self) -> int:
+        """The ADR 0051 durable-write cost of one ingress message on THIS shape: ``3 + 2H + 2D``. A
+        self-filtering handler still costs its 2 (routed-row claim + a zero-delivery ``transform_handoff``),
+        which is why ``H`` — not ``D`` — carries the ``2H`` term."""
+        return 3 + 2 * self.handlers + 2 * self.delivering
+
+    @property
+    def events_per_message(self) -> int:
+        """Counted message events per ingress message (the 45M/day currency): the message itself plus ONE
+        per DELIVERED copy — ``1 + D``. Never ``1 + dests``: a destination CONNECTION that no handler sends
+        to produces no event."""
+        return 1 + self.delivering
 
     def inbound_port(self, shard_index: int, lane_index: int = 0) -> int:
         """Lane ``l`` of shard ``i`` (both in sorted/enumerated order) binds
@@ -106,16 +149,35 @@ def load_shape() -> ShardCertShape:
         raise ValueError(
             f"MEFOR_SHARDCERT_TRANSFORM must be one of {sorted(_TRANSFORMS)}, got {transform!r}"
         )
+    dests = _env_int("MEFOR_SHARDCERT_DESTS", 8)
+    # H and D both DEFAULT to dests ⇒ H = D = dests, the pre-#209 graph, byte-for-byte.
+    handlers = _env_int("MEFOR_SHARDCERT_HANDLERS", dests)
+    delivering = _env_int("MEFOR_SHARDCERT_DELIVERING", dests)
+    # FAIL LOUD, never clamp: a silently-truncated fan-out would make `events/msg = 1 + D` and the sink's
+    # socket truth `S == A*D` disagree with the graph the fleet actually serves — a fabricated headline
+    # number, which is precisely the harness's B1-B10 defect class.
+    if delivering > dests:
+        raise ValueError(
+            f"MEFOR_SHARDCERT_DELIVERING ({delivering}) > MEFOR_SHARDCERT_DESTS ({dests}): a message "
+            "cannot deliver to more destinations than the graph declares connections for"
+        )
+    if handlers < delivering:
+        raise ValueError(
+            f"MEFOR_SHARDCERT_HANDLERS ({handlers}) < MEFOR_SHARDCERT_DELIVERING ({delivering}): every "
+            "delivering destination needs a handler that owns it (handler j owns destination j)"
+        )
     return ShardCertShape(
         shards=_env_shards("MEFOR_SHARDCERT_SHARDS"),
         inbound_base=_env_int("MEFOR_SHARDCERT_INBOUND_BASE", 3600),
-        dests=_env_int("MEFOR_SHARDCERT_DESTS", 8),
+        dests=dests,
         sink_host=os.environ.get("MEFOR_SHARDCERT_SINK_HOST", "127.0.0.1") or "127.0.0.1",
         sink_port=_env_int("MEFOR_SHARDCERT_SINK_PORT", 3700),
         sink_ports=_env_int("MEFOR_SHARDCERT_SINK_PORTS", 1),
         transform=transform,
         persistent=_env_bool("MEFOR_SHARDCERT_PERSISTENT"),
         lanes_per_shard=_env_int("MEFOR_SHARDCERT_LANES_PER_SHARD", 1),
+        handlers=handlers,
+        delivering=delivering,
     )
 
 

@@ -8,7 +8,7 @@ import { configDir, runJson, workspaceDir } from "./cli";
 
 const TRANSPORTS = ["mllp", "tcp", "file", "rest", "database", "database_poll", "soap", "sftp", "ftp"];
 
-interface ConnObj {
+export interface ConnObj {
   direction: "inbound" | "outbound";
   name: string;
   transport: string;
@@ -21,11 +21,20 @@ interface ConnObj {
   [k: string]: unknown;
 }
 
+/** Sibling connections in the same connections.toml, for the customEditor's picker (#221b). When
+ *  present, the form renders a "＋ New / <name>…" dropdown above the title so the whole file's
+ *  connections are reachable from the one custom editor; omitted for the command-opened single form. */
+export interface SiblingPicker {
+  names: string[];
+  current: string | null; // the connection currently shown (null → the blank "New" form)
+}
+
 let panel: vscode.WebviewPanel | undefined;
 
 export interface EditorOpts {
   routers: string[];
   editName?: string; // edit an existing (TOML-authored) connection; omit to create
+  cloneFrom?: string; // #175: open CREATE mode pre-filled from this connection (a new name is required)
   onSaved?: () => void;
 }
 
@@ -42,8 +51,12 @@ export async function openConnectionEditor(
     return;
   }
 
+  // Clone (#175) opens CREATE mode pre-filled from an existing connection (a new name is required);
+  // edit opens in-place. Both load the source from `connection list`.
+  const lookupName = opts.editName ?? opts.cloneFrom;
+  const clone = opts.editName == null && opts.cloneFrom != null;
   let initial: ConnObj | undefined;
-  if (opts.editName) {
+  if (lookupName) {
     let entries: ConnObj[];
     try {
       entries = await runJson<ConnObj[]>(["connection", "list", "--config", configDir()], ws);
@@ -51,11 +64,11 @@ export async function openConnectionEditor(
       void vscode.window.showErrorMessage(`MessageFoundry: could not read connections — ${String(e)}`);
       return;
     }
-    initial = entries.find((c) => c.name === opts.editName);
+    initial = entries.find((c) => c.name === lookupName);
     if (!initial) {
       void vscode.window.showInformationMessage(
-        `MessageFoundry: ${opts.editName} is authored in code (a .py module), not connections.toml — ` +
-          "edit its source. The GUI manages connections.toml connections.",
+        `MessageFoundry: ${lookupName} is authored in code (a .py module), not connections.toml — ` +
+          "the GUI manages connections.toml connections.",
       );
       return;
     }
@@ -66,7 +79,7 @@ export async function openConnectionEditor(
   }
   panel = vscode.window.createWebviewPanel(
     "messagefoundry.connectionEditor",
-    initial ? `Edit ${initial.name}` : "New Connection",
+    clone ? "New Connection (clone)" : initial ? `Edit ${initial.name}` : "New Connection",
     vscode.ViewColumn.Active,
     { enableScripts: true },
   );
@@ -87,7 +100,7 @@ export async function openConnectionEditor(
     }
   });
 
-  current.webview.html = formHtml(current.webview, opts.routers, initial);
+  current.webview.html = connectionFormHtml(current.webview, opts.routers, initial, undefined, clone);
 }
 
 async function save(conn: ConnObj, current: vscode.WebviewPanel, onSaved?: () => void): Promise<void> {
@@ -151,7 +164,13 @@ function embed(value: unknown): string {
   return JSON.stringify(value ?? null).replace(/</g, "\\u003c");
 }
 
-function formHtml(webview: vscode.Webview, routers: string[], initial?: ConnObj): string {
+export function connectionFormHtml(
+  webview: vscode.Webview,
+  routers: string[],
+  initial?: ConnObj,
+  siblings?: SiblingPicker,
+  clone?: boolean,
+): string {
   const n = nonce();
   return `<!DOCTYPE html>
 <html lang="en">
@@ -190,6 +209,10 @@ function formHtml(webview: vscode.Webview, routers: string[], initial?: ConnObj)
   </style>
 </head>
 <body>
+  <div id="conn-picker-row" style="display:none;margin-bottom:10px;">
+    <label for="connPicker">Connection in this file</label>
+    <select id="connPicker"></select>
+  </div>
   <h2 id="title">New Connection</h2>
   <p class="sub">Edits <code>connections.toml</code> — transport config as data. Routers/handlers stay in .py.
      Secrets/peers use an env() reference, never inline.</p>
@@ -259,9 +282,25 @@ function formHtml(webview: vscode.Webview, routers: string[], initial?: ConnObj)
     const INITIAL = ${embed(initial)};
     const ROUTERS = ${embed(routers)};
     const TRANSPORTS = ${embed(TRANSPORTS)};
-    const EDIT = INITIAL !== null;
+    const SIBLINGS = ${embed(siblings)};
+    const CLONE = ${embed(clone)};              // #175: create mode pre-filled from INITIAL, new name required
+    const EDIT = INITIAL !== null && !CLONE;    // clone is NOT edit: name editable, no delete
     const $ = (id) => document.getElementById(id);
     const errorEl = $('error');
+
+    // customEditor sibling picker: list every connection in the file + a "New connection" option, so
+    // switching connections (or starting a new one) stays inside the one custom editor. A change posts
+    // 'select' back to the provider, which re-renders the form for the chosen connection.
+    if (SIBLINGS && Array.isArray(SIBLINGS.names)) {
+      $('conn-picker-row').style.display = '';
+      const sel = $('connPicker');
+      { const o = document.createElement('option'); o.value = '\\u0000new'; o.textContent = '＋ New connection'; sel.appendChild(o); }
+      for (const nm of SIBLINGS.names) { const o = document.createElement('option'); o.value = nm; o.textContent = nm; sel.appendChild(o); }
+      sel.value = SIBLINGS.current == null ? '\\u0000new' : SIBLINGS.current;
+      sel.addEventListener('change', () => {
+        vscode.postMessage({ command: 'select', name: sel.value === '\\u0000new' ? null : sel.value });
+      });
+    }
 
     // populate selects
     for (const t of TRANSPORTS) { const o = document.createElement('option'); o.value = t; o.textContent = t; $('transport').appendChild(o); }
@@ -307,11 +346,10 @@ function formHtml(webview: vscode.Webview, routers: string[], initial?: ConnObj)
       $('outbound-opts').style.display = isInbound() ? 'none' : '';
     }
 
-    // ----- load initial (edit) or defaults (create) -----
-    if (EDIT) {
-      $('title').textContent = 'Edit ' + INITIAL.name;
-      $('direction').value = INITIAL.direction; $('direction').disabled = true;
-      $('name').value = INITIAL.name; $('name').disabled = true;  // rename = remove + create
+    // ----- load initial (edit / clone) or defaults (create) -----
+    // Shared field pre-fill from INITIAL — everything except name/direction, which edit and clone set
+    // differently (edit locks them; clone keeps direction editable and clears the name).
+    function prefillFieldsFromInitial() {
       $('transport').value = INITIAL.transport;
       if (INITIAL.router) $('router').value = INITIAL.router;
       $('ackMode').value = INITIAL.ack_mode || '';
@@ -327,7 +365,21 @@ function formHtml(webview: vscode.Webview, routers: string[], initial?: ConnObj)
           else settingRow(key, val, false, '');
         }
       } else settingRow('', '', false, '');
+    }
+    if (EDIT) {
+      $('title').textContent = 'Edit ' + INITIAL.name;
+      $('direction').value = INITIAL.direction; $('direction').disabled = true;
+      $('name').value = INITIAL.name; $('name').disabled = true;  // rename = remove + create
+      prefillFieldsFromInitial();
       $('delete').style.display = '';
+    } else if (CLONE && INITIAL) {
+      // #175: pre-fill every field from the source connection but require a NEW name (Save = create).
+      $('title').textContent = 'New Connection (clone of ' + INITIAL.name + ')';
+      $('direction').value = INITIAL.direction;   // editable — a clone is a brand-new connection
+      $('name').value = '';
+      $('name').placeholder = 'new name (was ' + INITIAL.name + ')';
+      prefillFieldsFromInitial();
+      setTimeout(() => $('name').focus(), 0);
     } else {
       prefillHints();
     }

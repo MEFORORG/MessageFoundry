@@ -10,6 +10,7 @@ import logging.handlers
 import re
 import sys
 import time
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 import pytest
@@ -422,3 +423,349 @@ def test_serve_wires_off_box_forwarder_and_logs_enabled(
     assert len(fwd) == 1
     assert not isinstance(fwd[0].formatter, JsonFormatter)  # forward_format="text" honored
     assert "off-box log forwarding enabled" in capsys.readouterr().out
+
+
+# --- ADR 0080: native TLS-syslog transport ------------------------------------
+
+
+def _make_tls_certs(dir_path: Any) -> SimpleNamespace:
+    """Generate a self-signed cert (IP SAN 127.0.0.1) usable as a syslog collector's cert, its private
+    key, and a combined cert+key PEM (usable as a client chain for mutual-TLS tests). No PHI."""
+    import datetime
+    import ipaddress
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")]))
+        .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")]))
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(hours=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    key_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    )
+    ca = dir_path / "ca.pem"
+    ca.write_bytes(cert_pem)
+    keyf = dir_path / "key.pem"
+    keyf.write_bytes(key_pem)
+    combined = dir_path / "client.pem"
+    combined.write_bytes(key_pem + cert_pem)
+    return SimpleNamespace(ca=str(ca), key=str(keyf), combined=str(combined))
+
+
+class _TlsSyslogServer:
+    """A minimal one-connection TLS syslog collector for the roundtrip test. Accepts a single TLS
+    client, reads everything it sends, and records the plaintext bytes."""
+
+    def __init__(self, certfile: str, keyfile: str) -> None:
+        import socket
+        import ssl
+        import threading
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        self._ctx = ctx
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(1)
+        self.port = self._sock.getsockname()[1]
+        self.received = bytearray()
+        self._got_data = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _serve(self) -> None:
+        self._sock.settimeout(10.0)
+        try:
+            raw, _ = self._sock.accept()
+        except OSError:
+            return
+        try:
+            with self._ctx.wrap_socket(raw, server_side=True) as tls:
+                tls.settimeout(10.0)
+                while True:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        break
+                    self.received += chunk
+                    self._got_data.set()
+        except OSError:
+            pass  # client hangup / handshake abort — the test asserts on what arrived
+
+    def wait_for_data(self, timeout: float = 10.0) -> bool:
+        return self._got_data.wait(timeout)
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+def test_build_tls_context_verify_off_disables_checks() -> None:
+    import ssl
+
+    from messagefoundry.logging_setup import _build_tls_context
+
+    ctx = _build_tls_context(SyslogForward(host="h", protocol="tls", tls_verify=False))
+    assert ctx.check_hostname is False
+    assert ctx.verify_mode == ssl.CERT_NONE
+
+
+def test_build_tls_context_anchors_only_the_given_ca(tmp_path: Any) -> None:
+    import ssl
+
+    from messagefoundry.logging_setup import _build_tls_context
+
+    certs = _make_tls_certs(tmp_path)
+    ctx = _build_tls_context(
+        SyslogForward(host="127.0.0.1", protocol="tls", tls_ca_file=certs.ca, tls_verify=True)
+    )
+    assert ctx.check_hostname is True
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    # Only the supplied CA is trusted — the ~hundreds of public system roots are NOT loaded, so exactly
+    # one X509 sits in the trust store (the roundtrip test proves this anchor verifies end-to-end).
+    assert ctx.cert_store_stats()["x509"] == 1
+
+
+def test_build_tls_context_loads_client_cert(tmp_path: Any) -> None:
+    from messagefoundry.logging_setup import _build_tls_context
+
+    certs = _make_tls_certs(tmp_path)
+    # A bad/missing client chain would raise inside load_cert_chain; a clean return proves it loaded.
+    ctx = _build_tls_context(
+        SyslogForward(
+            host="127.0.0.1",
+            protocol="tls",
+            tls_ca_file=certs.ca,
+            tls_verify=True,
+            tls_client_cert=certs.combined,
+        )
+    )
+    assert ctx.verify_mode.name == "CERT_REQUIRED"
+
+
+def test_build_syslog_handler_selects_tls_and_wires_context(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The tls branch must build a _TlsSysLogHandler carrying the ssl context + SNI hostname, WITHOUT a
+    # live collector — stub createSocket so no connect happens.
+    from messagefoundry.logging_setup import _TlsSysLogHandler, _build_syslog_handler
+
+    monkeypatch.setattr(_TlsSysLogHandler, "createSocket", lambda self: None)
+    certs = _make_tls_certs(tmp_path)
+    handler = _build_syslog_handler(
+        SyslogForward(host="127.0.0.1", port=6514, protocol="tls", tls_ca_file=certs.ca)
+    )
+    assert isinstance(handler, _TlsSysLogHandler)
+    assert handler._server_hostname == "127.0.0.1"
+    assert handler._ssl_context.check_hostname is True
+
+
+def test_configure_logging_tolerates_unreachable_tls_collector(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A down TLS collector must be best-effort exactly like TCP: the connect to an unbound port raises
+    # OSError before any handshake, configure_logging warns and runs without the forwarder.
+    installed = configure_logging(
+        "INFO",
+        forward=SyslogForward(host="127.0.0.1", port=65501, protocol="tls", tls_verify=False),
+    )
+    assert installed is False
+    assert len(logging.getLogger().handlers) == 1  # only stdout remains
+    assert "unavailable" in capsys.readouterr().out
+
+
+def test_configure_logging_tls_forwarder_roundtrip(tmp_path: Any) -> None:
+    # End-to-end over real TLS: a verified handshake against the private CA must succeed (installed) and
+    # an emitted record must arrive at the collector encrypted-in-transit / decrypted server-side.
+    certs = _make_tls_certs(tmp_path)
+    server = _TlsSyslogServer(certs.ca, certs.key)
+    server.start()
+    try:
+        installed = configure_logging(
+            "INFO",
+            forward=SyslogForward(
+                host="127.0.0.1",
+                port=server.port,
+                protocol="tls",
+                tls_ca_file=certs.ca,
+                tls_verify=True,
+                fmt="text",
+            ),
+        )
+        assert installed is True  # CA-verified, hostname-checked handshake succeeded
+        fwd = [
+            h for h in logging.getLogger().handlers if isinstance(h, logging.handlers.SysLogHandler)
+        ]
+        assert len(fwd) == 1
+        logging.getLogger("mefor.tls").warning("tls_marker_%s", "OB_ACME")
+        assert server.wait_for_data(timeout=10.0), "collector received no data"
+        assert b"tls_marker_OB_ACME" in bytes(server.received)
+    finally:
+        server.close()
+
+
+# --- ADR 0080: SNTP probe (query_sntp_offset) ---------------------------------
+
+
+def _fake_udp_reply(server_unix: float) -> bytes:
+    """A 48-byte SNTP reply whose transmit timestamp encodes ``server_unix`` (Unix seconds)."""
+    from messagefoundry.logging_setup import _NTP_UNIX_EPOCH_DELTA
+
+    ntp_seconds = int(server_unix + _NTP_UNIX_EPOCH_DELTA)
+    return bytes(40) + ntp_seconds.to_bytes(4, "big") + (0).to_bytes(4, "big")
+
+
+class _FakeUDPSocket:
+    def __init__(self, reply: bytes) -> None:
+        self._reply = reply
+
+    def __enter__(self) -> "_FakeUDPSocket":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def settimeout(self, _t: float) -> None:
+        pass
+
+    def sendto(self, _data: bytes, _addr: Any) -> None:
+        pass
+
+    def recvfrom(self, _n: int) -> tuple[bytes, Any]:
+        return self._reply, ("127.0.0.1", 123)
+
+
+def test_query_sntp_offset_computes_offset(monkeypatch: pytest.MonkeyPatch) -> None:
+    from messagefoundry import logging_setup
+
+    # Server clock 30s BEHIND local → local leads → positive offset ≈ +30s.
+    reply = _fake_udp_reply(time.time() - 30.0)
+    # String target so mypy doesn't need `socket` re-exported from logging_setup's namespace.
+    monkeypatch.setattr(
+        "messagefoundry.logging_setup.socket.socket", lambda *a, **k: _FakeUDPSocket(reply)
+    )
+    offset = logging_setup.query_sntp_offset("ntp.local")
+    assert 25.0 < offset < 35.0
+
+
+def test_query_sntp_offset_short_reply_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    from messagefoundry import logging_setup
+
+    monkeypatch.setattr(
+        "messagefoundry.logging_setup.socket.socket", lambda *a, **k: _FakeUDPSocket(b"\x00" * 10)
+    )
+    with pytest.raises(OSError):
+        logging_setup.query_sntp_offset("ntp.local")
+
+
+def test_query_sntp_offset_timeout_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    from messagefoundry import logging_setup
+
+    class _Timing(_FakeUDPSocket):
+        def recvfrom(self, _n: int) -> tuple[bytes, Any]:
+            raise TimeoutError(
+                "timed out"
+            )  # socket.timeout is an alias for TimeoutError (⊂ OSError)
+
+    monkeypatch.setattr("messagefoundry.logging_setup.socket.socket", lambda *a, **k: _Timing(b""))
+    with pytest.raises(OSError):
+        logging_setup.query_sntp_offset("ntp.local")
+
+
+# --- ADR 0080: startup clock-sync gate in serve() -----------------------------
+
+
+def _write_timesync_toml(tmp_path: Any, *, fail_closed: bool) -> None:
+    body = (
+        '[logging]\nrequire_time_sync = true\nntp_peer = "ntp.example.test"\n'
+        "time_sync_max_skew_seconds = 1.0\n"
+    )
+    if fail_closed:
+        body += "time_sync_fail_closed = true\n"
+    (tmp_path / "messagefoundry.toml").write_text(body, encoding="utf-8")
+
+
+def test_serve_time_sync_fail_closed_refuses_on_skew(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_timesync_toml(tmp_path, fail_closed=True)
+    monkeypatch.setattr("messagefoundry.__main__.query_sntp_offset", lambda peer, **kw: 30.0)
+    rc = __main__.main(
+        ["serve", "--config", str(tmp_path), "--db", str(tmp_path / "x.db"), "--env", "dev"]
+    )
+    assert rc == 2
+
+
+def test_serve_time_sync_fail_closed_refuses_on_unreachable_peer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_timesync_toml(tmp_path, fail_closed=True)
+
+    def _unreachable(peer: str, **kw: Any) -> float:
+        raise OSError("no route to host")
+
+    monkeypatch.setattr("messagefoundry.__main__.query_sntp_offset", _unreachable)
+    rc = __main__.main(
+        ["serve", "--config", str(tmp_path), "--db", str(tmp_path / "x.db"), "--env", "dev"]
+    )
+    assert rc == 2
+
+
+def test_serve_time_sync_warns_but_starts_when_not_fail_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import uvicorn
+
+    monkeypatch.chdir(tmp_path)
+    _write_timesync_toml(tmp_path, fail_closed=False)
+    monkeypatch.setattr("messagefoundry.__main__.query_sntp_offset", lambda peer, **kw: 30.0)
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: None)
+    rc = __main__.main(
+        ["serve", "--config", str(tmp_path), "--db", str(tmp_path / "x.db"), "--env", "dev"]
+    )
+    assert rc == 0  # warn-only: the engine still starts
+    out = capsys.readouterr().out
+    assert "clock-sync" in out  # the skew warning surfaced on the general log
+
+
+def test_serve_time_sync_ok_within_threshold_starts_clean(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    import uvicorn
+
+    monkeypatch.chdir(tmp_path)
+    _write_timesync_toml(
+        tmp_path, fail_closed=True
+    )  # even fail-closed must NOT trip within threshold
+    monkeypatch.setattr("messagefoundry.__main__.query_sntp_offset", lambda peer, **kw: 0.05)
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: None)
+    rc = __main__.main(
+        ["serve", "--config", str(tmp_path), "--db", str(tmp_path / "x.db"), "--env", "dev"]
+    )
+    assert rc == 0

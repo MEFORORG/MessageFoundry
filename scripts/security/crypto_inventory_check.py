@@ -51,14 +51,20 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/config/fingerprint.py": frozenset({"hashlib"}),
     "messagefoundry/config/tls_policy.py": frozenset({"ssl"}),
     "messagefoundry/config/wiring.py": frozenset({"hashlib"}),
-    # CONSOLE-3: the console verifies the engine API server cert — the OS trust store
-    # (truststore.SSLContext) by default, or a pinned PEM via --cacert (ssl.create_default_context),
-    # plus opt-in client-cert mTLS (load_cert_chain). Builds the client-side TLS verification context.
-    "messagefoundry/console/client.py": frozenset({"ssl"}),
+    # CONSOLE-3 (ADR 0088: extracted from console/client.py to the Qt-free apiclient library): the
+    # engine-client verifies the engine API server cert — the OS trust store (truststore.SSLContext)
+    # by default, or a pinned PEM via --cacert (ssl.create_default_context), plus opt-in client-cert
+    # mTLS (load_cert_chain). Builds the client-side TLS verification context.
+    "messagefoundry/apiclient/client.py": frozenset({"ssl"}),
     # ADR 0041 (D3): SHA-256 hashes of the loaded first-party modules vs the wheel dist-info/RECORD at
     # startup self-attestation — drift detection (integrity/tamper-evidence, not a secret); the engine
     # alerts by default and (opt-in) fails closed on drift.
     "messagefoundry/integrity.py": frozenset({"hashlib"}),
+    # BACKLOG #202 (ADR 0080): native TLS-syslog off-box forwarding wraps the syslog TCP socket in an
+    # ssl.SSLContext (forward_protocol="tls") — verified against forward_tls_ca_file per forward_tls_verify,
+    # with opt-in client-cert mTLS. Transport-layer confidentiality for the off-box audit/log stream; the
+    # default udp/tcp forwarders and the no-collector path use no crypto.
+    "messagefoundry/logging_setup.py": frozenset({"ssl"}),
     # BACKLOG #31: XML-DSig signature verification for the XML codec runs via signxml (which pulls in
     # cryptography + hashlib for the DSig digest/signature primitives). The hashlib import in
     # signature.py is the crypto-inventory anchor making that otherwise-transitive provenance visible.
@@ -78,19 +84,27 @@ INVENTORY: dict[str, frozenset[str]] = {
     # as per-frame AAD + the one-way key_id fingerprint. Net-new crypto surface; the store DEK key source
     # is reused, the cipher mechanism is new.
     "messagefoundry/store/backup_codec.py": frozenset({"hashlib", "cryptography"}),
+    # crypto.py also derives the audit-chain HMAC key (#190) via HKDF-SHA256 (cryptography) from the
+    # store DEK — no new import (still hashlib + cryptography), an additive key-derivation off the DEK.
     "messagefoundry/store/crypto.py": frozenset({"hashlib", "cryptography"}),
     # ADR 0064: hashlib = the sha256 CONTENT hash of the shipped schema-DDL batch, stored in the
     # schema_meta marker so a current DB's open can skip the batch + the exclusive schema lock.
     # Content addressing / cache invalidation — not a security control, no secret material involved.
     "messagefoundry/store/postgres.py": frozenset({"hashlib", "ssl"}),
     "messagefoundry/store/sqlserver.py": frozenset({"hashlib"}),
-    "messagefoundry/store/store.py": frozenset({"hashlib"}),
+    # #190: hmac = the keyed HMAC-SHA256 audit-chain digest (audit_row_hash) — tamper-evidence that a
+    # row-writer without the store DEK cannot forge; hashlib = the keyless SHA-256 chain + delivery/body
+    # digests. The HMAC key is HKDF-derived (in crypto.py) from the DEK.
+    "messagefoundry/store/store.py": frozenset({"hashlib", "hmac"}),
     # ADR 0025: the DICOM C-STORE SCP's server SSLContext (Phase 1) + the C-STORE SCU's client SSLContext
     # (Phase 2) for DICOM-over-TLS (the MLLP inbound/outbound posture).
     "messagefoundry/transports/dicom.py": frozenset({"ssl"}),
     # ADR 0025 Phase 2: a per-request random multipart boundary (secrets.token_hex) for the DICOMweb
     # STOW-RS body, generated absent from the object bytes (RFC 2046 §5.1.1) — framing, not a secret.
     "messagefoundry/transports/dicomweb.py": frozenset({"secrets"}),
+    # ADR 0085: DIRECT-HISP outbound S/MIME — cryptography.serialization.pkcs7 SIGN then ENCRYPT of the
+    # Handler body + x509 recipient-cert / trust-anchor cross-validation at construction. No new dependency.
+    "messagefoundry/transports/direct.py": frozenset({"cryptography"}),
     # ADR 0023: the inbound HTTP/1.1 listen source reuses MLLP's _mllp_ssl_context (server=True) to
     # build its per-connection HTTPS server identity (+ opt-in mTLS) — the same MLLP inbound-TLS posture.
     "messagefoundry/transports/http_listener.py": frozenset({"ssl"}),

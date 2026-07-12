@@ -33,6 +33,8 @@ from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
     CodeSet,
     CodeSetError,
+    UnmappedPolicy,
+    is_policy_sidecar,
     load_code_set,
     load_code_sets,
 )
@@ -40,6 +42,12 @@ from messagefoundry.config.wiring import WiringError
 
 #: Extensions the loader recognises (the writer only ever *writes* ``.csv``; both are read).
 _SUPPORTED_EXTS = (".csv", ".toml")
+
+
+def _policy_detail(policy: UnmappedPolicy) -> dict[str, Any]:
+    """The unmapped-value policy (#162) as a JSON-ready dict for the grid editor to SHOW."""
+    return {"kind": policy.kind.value, "default_value": policy.default_value}
+
 
 #: Run after a write to prove the file loads; the CLI passes the real loader. It receives the written
 #: ``.csv`` path and raises on any problem (which triggers a rollback).
@@ -96,6 +104,9 @@ def show_code_set(config_dir: str | Path, name: str) -> dict[str, Any]:
         "value_columns": columns[1:],
         "shape": _shape(len(columns) - 1),
         "entries": len(cs),
+        # #162: the declared unmapped-value policy, SHOWN read-only in the grid (authored via the
+        # <name>.policy.toml sidecar for v1). Absent sidecar ⇒ {"kind": "none", ...}.
+        "policy": _policy_detail(cs.policy),
     }
 
 
@@ -156,8 +167,22 @@ def rename_code_set(
         raise WiringError(_collision_message(new, codesets_dir))
 
     dest = codesets_dir / f"{new}{src.suffix}"
+    # Referent pre-flight (#152): a code set is named by string literals in the Router/Handler modules
+    # that call code_set("old"). PLAN the referent rewrite BEFORE moving the file — the plan is built
+    # from the loaded graph while "old" still resolves (the loader would otherwise fail on a
+    # code_set("old") capture whose table just vanished). impact.py owns the tokenize-safe rewriter, so
+    # it is never duplicated here. Best-effort + additive: the file rename is the core operation, so a
+    # config that doesn't load leaves the result byte-identical to the pre-#152 shape.
+    plan = _plan_code_set_referents(config_dir, old, new)
     os.replace(src, dest)
-    return {"op": "rename", "name": old, "to": new}
+    result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
+    if plan is not None:
+        from messagefoundry.config import impact
+
+        rewritten = len(impact.apply_rename(plan))
+        if rewritten:
+            result["referents_rewritten"] = rewritten
+    return result
 
 
 def remove_code_set(config_dir: str | Path, name: str, *, validate: Validate) -> dict[str, Any]:
@@ -174,8 +199,17 @@ def remove_code_set(config_dir: str | Path, name: str, *, validate: Validate) ->
     # embedded ext) BEFORE building a filesystem path, or a `remove` could unlink any file on disk.
     _validate_name(codesets_dir, name)
     path = _existing_path(codesets_dir, name)
+    # Delete pre-flight (#152): surface the live Router/Handler referents that will now dangle (a
+    # code_set("name") that no longer resolves). Computed BEFORE the unlink — while "name" still
+    # resolves — because the reverse index only builds a code_set edge for a *registered* table, so a
+    # reload after the file is gone would find no referrers. Mirrors the rename path (plan-before-move).
+    # Best-effort + additive: the delete is the core op, so an unloadable graph yields no referrers.
+    dangling = _code_set_referrers(config_dir, name)
     path.unlink()
-    return {"op": "remove", "name": name}
+    result: dict[str, Any] = {"op": "remove", "name": name}
+    if dangling:
+        result["referrers"] = dangling
+    return result
 
 
 # --- structural validation ---------------------------------------------------
@@ -308,7 +342,10 @@ def _iter_code_set_files(codesets_dir: Path) -> list[Path]:
     return [
         p
         for p in sorted(codesets_dir.iterdir())
-        if p.is_file() and p.suffix.lower() in _SUPPORTED_EXTS
+        # Skip the #162 <name>.policy.toml sidecars — they are policy metadata, not code sets. Only a
+        # TRUE sidecar (companion code set present) is skipped; a standalone x.policy.toml still lists
+        # as a code set, mirroring the loader (code_sets.is_policy_sidecar).
+        if p.is_file() and p.suffix.lower() in _SUPPORTED_EXTS and not is_policy_sidecar(p)
     ]
 
 
@@ -368,6 +405,7 @@ def _summary(path: Path, name: str, registry: dict[str, CodeSet]) -> dict[str, A
             "value_columns": value_columns,
             "shape": _shape(len(value_columns)),
             "entries": len(cs),
+            "policy": _policy_detail(cs.policy),  # #162
         }
     # TOML: best-effort header derivation (read-only in the grid).
     columns, _ = _toml_grid(cs)
@@ -380,6 +418,7 @@ def _summary(path: Path, name: str, registry: dict[str, CodeSet]) -> dict[str, A
         "value_columns": value_columns,
         "shape": _shape(len(value_columns)),
         "entries": len(cs),
+        "policy": _policy_detail(cs.policy),  # #162
     }
 
 
@@ -441,17 +480,38 @@ def _toml_grid(cs: Any) -> tuple[list[str], list[list[str]]]:
 
 # --- CSV writing + atomic write ----------------------------------------------
 
+# CSV formula-injection (CWE-1236 / ASVS 1.2.10): a spreadsheet treats a cell beginning with one of
+# these as a formula, so an operator who opens codesets/<name>.csv in Excel/Sheets could execute one.
+# A leading "'" forces the cell to be read as literal text on open. Mirrors harness/load/report.py.
+_CSV_FORMULA_TRIGGERS = frozenset("=+-@\t\r\x00")
+
+
+def _spreadsheet_safe(value: str) -> str:
+    """Neutralize a leading formula trigger so a cell can't execute when the CSV is opened in a
+    spreadsheet.
+
+    NOTE (round-trip caveat): the codeset CSV is *also* re-parsed by the loader
+    (:func:`~messagefoundry.config.code_sets.load_code_set`), which reads cells verbatim. So for a
+    cell an operator deliberately begins with one of :data:`_CSV_FORMULA_TRIGGERS`, the loaded value
+    carries the defensive ``'`` prefix (e.g. a value ``-5`` round-trips as ``'-5``). This is accepted:
+    codeset cells are operator-authored reference data (never PHI / attacker-influenced), and a
+    healthcare code-translation key/value that legitimately starts with ``=+-@``/tab/NUL is
+    pathological. The far more common alphanumeric cell is untouched (byte-identical round-trip)."""
+    return "'" + value if value[:1] in _CSV_FORMULA_TRIGGERS else value
+
 
 def _build_csv_text(headers: list[str], rows: list[list[str]]) -> str:
     """Render ``headers`` + ``rows`` to CSV text using the stdlib default dialect.
 
     ``newline=""`` + the default dialect quotes a cell that contains ``,``/``"``/newline — symmetric
-    with the loader's ``csv.DictReader(..., newline="")``."""
+    with the loader's ``csv.DictReader(..., newline="")``. Every cell is additionally run through
+    :func:`_spreadsheet_safe` (ASVS 1.2.10) so a formula-trigger cell can't execute if the file is
+    later opened in a spreadsheet — see that helper's round-trip caveat."""
     buf = io.StringIO(newline="")
     writer = csv.writer(buf)
-    writer.writerow(headers)
+    writer.writerow([_spreadsheet_safe(h) for h in headers])
     for row in rows:
-        writer.writerow(row)
+        writer.writerow([_spreadsheet_safe(cell) for cell in row])
     return buf.getvalue()
 
 
@@ -486,3 +546,52 @@ def _secure_file(path: Path) -> None:
     from messagefoundry.store.store import _secure_file as _secure
 
     _secure(path)
+
+
+# --- #152 referent pre-flight composition ------------------------------------
+
+
+def _plan_code_set_referents(config_dir: str | Path, old: str, new: str) -> Any:
+    """The :class:`~messagefoundry.config.impact.RenamePlan` rewriting a code set's ``code_set("old")``
+    referents to ``new``, or ``None`` when the graph can't be loaded / ``old`` isn't referenced. Built
+    while ``old`` still resolves (call BEFORE moving the file). The tokenize-safe rewriter lives in
+    :mod:`messagefoundry.config.impact` and is never duplicated here."""
+    registry = _load_referent_registry(config_dir)
+    if registry is None:
+        return None
+    from messagefoundry.config import impact
+
+    try:
+        return impact.plan_rename(registry, config_dir, "code_set", old, new)
+    except WiringError:
+        return None
+
+
+def _code_set_referrers(config_dir: str | Path, name: str) -> list[dict[str, str]]:
+    """The live Router/Handler referrers of code set ``name`` (delete pre-flight), as JSON dicts.
+    Best-effort: an unloadable config yields ``[]``."""
+    registry = _load_referent_registry(config_dir)
+    if registry is None:
+        return []
+    from messagefoundry.config import impact
+    from messagefoundry.config.reachability import build_reference_index
+
+    index = build_reference_index(registry)
+    return [
+        {"referrer_kind": r.referrer_kind, "referrer": r.referrer}
+        for r in impact.delete_impact(index, "code_set", name)
+    ]
+
+
+def _load_referent_registry(config_dir: str | Path) -> Any:
+    """Load the config graph for the referent pre-flight, or ``None`` if it can't be loaded.
+
+    The code-set edit itself is standalone data (validated by re-loading the one file); the referent
+    pre-flight additionally needs the wired graph. Loading executes config modules, so a broken /
+    absent graph must never fail the core code-set operation — swallow and skip."""
+    from messagefoundry.config.wiring import load_config
+
+    try:
+        return load_config(config_dir)
+    except (WiringError, FileNotFoundError, OSError, ValueError):
+        return None

@@ -26,6 +26,7 @@ the smoke inside the pytest-timeout budget.
 from __future__ import annotations
 
 import contextlib
+import os
 import socket
 import tempfile
 from pathlib import Path
@@ -46,7 +47,16 @@ _DRAIN_TIMEOUT_S = 8.0  # bounded: a shared-SQLite write-lock stall returns FAST
 #                         required); a clean drain (2 conns, a handful of messages) finishes well under it
 
 
-def _free_window(span: int, *, lo: int = 20000, hi: int = 60000) -> int:
+def _free_window(
+    span: int,
+    *,
+    # The floor is per-PROCESS (tests/conftest.py claims a slot), not a fixed 20000. Probing alone is a
+    # TOCTOU race: measured, three concurrent processes each probed, each saw the window at 20000 free,
+    # and each took it — four concurrent runs of this suite then produced three WinError 10048 failures.
+    # Disjoint floors make the probe meaningful again.
+    lo: int = int(os.environ.get("MEFOR_TEST_PORT_BASE", "20000")),
+    hi: int = 60000,
+) -> int:
     """Find a base ``b`` in [lo, hi) where EVERY port in ``[b, b + span)`` is currently free. The
     engines bind FIXED ports (inbound_base + stride*k, sink_base + stride*k, api_base + k), so — unlike
     ephemeral port 0 — a stale engine from a prior run (or the dev box's own :2575) could otherwise own

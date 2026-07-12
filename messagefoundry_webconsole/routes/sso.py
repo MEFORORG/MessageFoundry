@@ -84,5 +84,5 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # 0068 §9 records this as the current posture).
             return RedirectResponse("/ui/login?e=sso_failed", status_code=303)
         resp = RedirectResponse("/ui", status_code=303)
-        set_session_cookie(resp, outcome.token, secure=deps.cookie_secure(request))
+        set_session_cookie(resp, outcome.token, request=request)
         return resp

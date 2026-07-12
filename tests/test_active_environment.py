@@ -79,15 +79,15 @@ def test_handler_reads_active_environment_via_runner_bracket() -> None:
     reg = _registry_with_face_handler()
 
     with activated("staging"):
-        deliveries, _ = transform_one(reg, "h", ADT, "hl7v2")
+        deliveries, _, _ = transform_one(reg, "h", ADT, "hl7v2")
     assert "|T|2.5.1" in deliveries[0].payload  # MSH-11 stamped T on the test face
 
     with activated("prod"):
-        deliveries, _ = transform_one(reg, "h", ADT, "hl7v2")
+        deliveries, _, _ = transform_one(reg, "h", ADT, "hl7v2")
     assert "|P|2.5.1" in deliveries[0].payload  # left P in prod
 
     # No active environment (e.g. a pure dry-run): defaults to the leave-as-is (P) branch.
-    deliveries, _ = transform_one(reg, "h", ADT, "hl7v2")
+    deliveries, _, _ = transform_one(reg, "h", ADT, "hl7v2")
     assert "|P|2.5.1" in deliveries[0].payload
 
 

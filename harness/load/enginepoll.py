@@ -4,7 +4,7 @@
 
 Polls the engine's HTTP API on an interval (``/stats``, ``/connections``, ``/status``) to track
 engine-side throughput (Δdone/Δt), backlog, dead-letter accumulation, and DB/WAL growth over the run,
-then measures **drain time** after offered load stops. The :class:`~messagefoundry.console.client`
+then measures **drain time** after offered load stops. The :class:`~messagefoundry.apiclient`
 ``EngineClient`` is synchronous (httpx), so every call runs in a thread via ``run_in_executor`` — the
 load engine's event loop is never blocked. The harness reaches the engine only through this API; it
 never touches the store.
@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence, TypeVar
 
-from messagefoundry.console.client import ApiError, EngineClient
+from messagefoundry.apiclient import ApiError, EngineClient
 
 from harness.load.metrics import Counters
 
@@ -94,6 +94,12 @@ class EngineSample:
     empty_claims: int = 0  # Σ cumulative empty claims (wall #3)
     empty_claims_idle_poll: int = 0  # the idle-poll re-SELECT share
     empty_claims_wake_fanout: int = 0  # the per-commit wake-fanout (thundering-herd) share
+    # A1 live cost counters (cumulative since engine start; run totals are last − first). committed_txns =
+    # physical transactions committed (the 3+2H+2N/msg cost-model currency, ADR 0051); body_copies =
+    # raw/payload body strings durably written (the 2+H+N/msg amplification). Σ across shards; default 0 so
+    # an older engine without the /stats fields reads as zero.
+    committed_txns: int = 0
+    body_copies: int = 0
     executor_queue_depth: int | None = None  # default-pool submit-queue depth (wall #1; shim-only)
     executor_busy: int | None = None  # default-pool in-flight count (wall #1; shim-only)
     pool_size: int | None = None  # server-store pool: connections open (wall #2; None on SQLite)
@@ -130,6 +136,8 @@ class _ShardSample:
     empty_claims: int = 0
     empty_claims_idle_poll: int = 0
     empty_claims_wake_fanout: int = 0
+    committed_txns: int = 0  # A1 live cost counter (summable across shards)
+    body_copies: int = 0  # A1 live cost counter (summable across shards)
     executor_queue_depth: int | None = None
     executor_busy: int | None = None
     pool_size: int | None = None
@@ -336,6 +344,8 @@ class EnginePoller:
             empty_claims=sum(s.empty_claims for s in shard_samples),
             empty_claims_idle_poll=sum(s.empty_claims_idle_poll for s in shard_samples),
             empty_claims_wake_fanout=sum(s.empty_claims_wake_fanout for s in shard_samples),
+            committed_txns=sum(s.committed_txns for s in shard_samples),  # A1
+            body_copies=sum(s.body_copies for s in shard_samples),  # A1
             executor_queue_depth=_first_not_none(s.executor_queue_depth for s in shard_samples),
             executor_busy=_first_not_none(s.executor_busy for s in shard_samples),
             pool_size=_first_not_none(s.pool_size for s in shard_samples),
@@ -382,6 +392,9 @@ class EnginePoller:
             empty_claims=getattr(stats, "empty_claims", 0) or 0,
             empty_claims_idle_poll=getattr(stats, "empty_claims_idle_poll", 0) or 0,
             empty_claims_wake_fanout=getattr(stats, "empty_claims_wake_fanout", 0) or 0,
+            committed_txns=getattr(stats, "committed_txns", 0)
+            or 0,  # A1 (getattr → older-engine safe)
+            body_copies=getattr(stats, "body_copies", 0) or 0,  # A1 (getattr → older-engine safe)
             executor_queue_depth=getattr(stats, "executor_queue_depth", None),
             executor_busy=getattr(stats, "executor_busy", None),
             pool_size=_pool_attr(status, "size"),

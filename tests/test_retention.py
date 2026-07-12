@@ -8,6 +8,7 @@ Time is injected throughout for determinism."""
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import pytest
@@ -392,6 +393,70 @@ def test_enabled_property(store: MessageStore) -> None:
     assert RetentionRunner(store, RetentionSettings(messages_days=1)).enabled is True
     assert RetentionRunner(store, RetentionSettings(max_db_mb=10)).enabled is True
     assert RetentionRunner(store, RetentionSettings(vacuum_at="03:30")).enabled is True
+    # #120: app-log retention needs BOTH a window and a log_dir to enable the runner.
+    assert RetentionRunner(store, RetentionSettings(app_log_days=7)).enabled is False
+    assert RetentionRunner(store, RetentionSettings(app_log_days=7), log_dir="x").enabled is True
+    assert RetentionRunner(store, RetentionSettings(app_log_days=0), log_dir="x").enabled is False
+
+
+# --- application log-file retention (#120) ------------------------------------
+
+
+async def test_app_log_retention_deletes_old_log_files_only(store: MessageStore, tmp_path) -> None:
+    """The sweep deletes only ``.log``/``.txt`` files older than ``app_log_days`` (by mtime) from the
+    configured ``log_dir``; the actively-written file, recent files, non-log files, and subdirectories
+    are left alone. The pass is audited (metadata only — the window + count, never file content)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "engine-2026-07-01.log"
+    old_txt = logs / "stderr-old.txt"
+    fresh_log = logs / "engine.log"  # the currently-written file (recent mtime) → kept
+    other = logs / "keep.db"  # not a .log/.txt → kept even though old
+    (logs / "archive").mkdir()  # a subdirectory → never touched
+    for p in (old_log, old_txt, fresh_log, other):
+        p.write_text("x")
+    old = now - 10 * DAY
+    fresh = now - 1 * DAY
+    os.utime(old_log, (old, old))
+    os.utime(old_txt, (old, old))
+    os.utime(other, (old, old))
+    os.utime(fresh_log, (fresh, fresh))
+
+    runner = RetentionRunner(
+        store, RetentionSettings(app_log_days=7), clock=lambda: now, log_dir=str(logs)
+    )
+    result = await runner.run_once()
+
+    assert result.app_logs_deleted == 2
+    assert result.did_work
+    assert not old_log.exists() and not old_txt.exists()
+    assert fresh_log.exists() and other.exists() and (logs / "archive").is_dir()
+    audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
+    assert len(audit) == 1
+    detail = json.loads(audit[0]["detail"])
+    assert detail["app_logs_deleted"] == 2 and detail["app_log_days"] == 7
+
+
+async def test_app_log_retention_noop_without_window_or_dir(store: MessageStore, tmp_path) -> None:
+    """No window (``app_log_days=0``) OR no ``log_dir`` → nothing is swept and no audit row is written
+    (a deployment that doesn't use the feature is byte-identical)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    old = logs / "old.log"
+    old.write_text("x")
+    os.utime(old, (1 * DAY, 1 * DAY))
+    now = 30 * DAY
+
+    r1 = await RetentionRunner(
+        store, RetentionSettings(app_log_days=7), clock=lambda: now
+    ).run_once()
+    assert r1.app_logs_deleted == 0 and not r1.did_work and old.exists()
+
+    r2 = await RetentionRunner(
+        store, RetentionSettings(app_log_days=0), clock=lambda: now, log_dir=str(logs)
+    ).run_once()
+    assert r2.app_logs_deleted == 0 and old.exists()
 
 
 # --- settings validation ------------------------------------------------------
@@ -402,6 +467,8 @@ def test_settings_validation() -> None:
         RetentionSettings(vacuum_at="25:00")
     with pytest.raises(ValueError):
         RetentionSettings(messages_days=-1)
+    with pytest.raises(ValueError):
+        RetentionSettings(app_log_days=-1)
     with pytest.raises(ValueError):
         RetentionSettings(purge_interval_seconds=0)
     assert RetentionSettings(vacuum_at="3:30").vacuum_time() == (3, 30)

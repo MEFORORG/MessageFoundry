@@ -6,8 +6,11 @@ This wraps the **existing** dry-run path (:func:`messagefoundry.pipeline.dryrun.
 line-addressable execution tracer and emits a JSON trace: per Router/Handler invocation, the lines it
 executed, the locals each line assigned, the ``msg[...]``/``msg.set(...)`` field writes on each line,
 the routing decision / would-send outbounds, and — for a live ``db_lookup``/``fhir_lookup`` that a pure
-dry-run cannot run — a ``live_lookup_skipped`` annotation. It is the data source for the #92 live-debug
-loop and #84 profiling/coverage.
+dry-run cannot run — a ``live_lookup_skipped`` annotation. A handler the Router named but whose
+``accepts=`` predicate declined (ADR 0084) never runs, so it is absent from ``handlers``; it is named in
+``accepts_declined`` (and the predicate's own execution is traced as an ``"accepts"`` invocation) so an
+author can see *why* it didn't. It is the data source for the #92 live-debug loop and #84
+profiling/coverage.
 
 **Additive + preview-only (do not break).** The tracer is a *pure observer*: it never mutates a frame's
 locals, never swallows a Router/Handler exception, and never resumes a handler past a raised live-lookup
@@ -58,7 +61,7 @@ from typing import Any, Iterator
 
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.fhir_lookup import FhirLookupError
-from messagefoundry.config.wiring import HandlerFn, Payload, RouterFn, Send
+from messagefoundry.config.wiring import HandlerAccepts, HandlerFn, Payload, RouterFn, Send
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.dryrun import dry_run
 
@@ -135,9 +138,11 @@ def _routed_from(result: object) -> list[str]:
 
 
 class _Recorder:
-    """Captures one Router or Handler invocation's execution trace."""
+    """Captures one Router / Handler / ``accepts=``-predicate invocation's execution trace."""
 
-    def __init__(self, kind: str, name: str, fn: RouterFn | HandlerFn, show_phi: bool) -> None:
+    def __init__(
+        self, kind: str, name: str, fn: RouterFn | HandlerFn | HandlerAccepts, show_phi: bool
+    ) -> None:
         self.kind = kind
         self.name = name
         self.show_phi = show_phi
@@ -219,8 +224,11 @@ class _Recorder:
     def record_return(self, result: object) -> None:
         if self.kind == "router":
             self.routed_to = _routed_from(result)
-        else:
+        elif self.kind == "handler":
             self.sends = _sends_from(result)
+        # An "accepts" predicate (ADR 0084) returns a bool — it has neither routed_to nor sends, and its
+        # verdict is reported at message level (`accepts_declined`). Named explicitly so it isn't quietly
+        # coerced through the Handler branch (`_sends_from(True)` happens to yield [], but only by luck).
 
     def classify_live_lookup(self, exc: BaseException) -> None:
         """Add a ``live_lookup_skipped`` annotation for a terminal ``db_lookup``/``fhir_lookup`` raise.
@@ -304,6 +312,9 @@ class _Tracer:
     def __init__(self, show_phi: bool) -> None:
         self.show_phi = show_phi
         self.invocations: list[_Recorder] = []
+        # Handlers the Router selected but whose `accepts=` predicate declined (ADR 0084). Without this
+        # the handler simply vanishes from `handlers` with no trace of WHY — the author's whole question.
+        self.accepts_declined: list[str] = []
 
     def trace_router(self, fn: RouterFn, name: str, payload: Payload) -> Any:
         return self._run("router", fn, name, payload)
@@ -311,7 +322,18 @@ class _Tracer:
     def trace_handler(self, fn: HandlerFn, name: str, payload: Payload) -> Any:
         return self._run("handler", fn, name, payload)
 
-    def _run(self, kind: str, fn: RouterFn | HandlerFn, name: str, payload: Payload) -> Any:
+    def trace_accepts(self, pred: HandlerAccepts, name: str, payload: Payload) -> bool:
+        """Trace an ``accepts=`` predicate (ADR 0084) and record a decline. A pure observer like the
+        other two: the verdict is returned unchanged and a raise propagates, so the traced routing
+        decision stays byte-identical to the untraced one."""
+        verdict = bool(self._run("accepts", pred, name, payload))
+        if not verdict:
+            self.accepts_declined.append(name)
+        return verdict
+
+    def _run(
+        self, kind: str, fn: RouterFn | HandlerFn | HandlerAccepts, name: str, payload: Payload
+    ) -> Any:
         rec = _Recorder(kind, name, fn, self.show_phi)
         self.invocations.append(rec)
         prev = (
@@ -379,6 +401,11 @@ def trace_dry_run(
         "control_id": result.control_id,
         # message-level routing outcome (the untraced dry-run's authoritative fields)
         "handlers": result.handlers,
+        # Handlers the Router named but that declined at routing time via `accepts=` (ADR 0084). They
+        # are absent from `handlers` by construction (no routed row was materialized), so naming them
+        # here is the only way an author sees why a handler they expected to run didn't — the #92
+        # live-debug question. Handler names carry no PHI, so this is not show_phi-gated.
+        "accepts_declined": tracer.accepts_declined,
         "sends": [{"outbound": d.to} for d in result.deliveries],
         "error": result.error,
         # trace_ok verifies the tracer actually observed lines on the calling thread (thread-locality).

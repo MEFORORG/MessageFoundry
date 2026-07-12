@@ -36,6 +36,7 @@ _SCALAR_FIELDS = (
     "ack_after",
     "strict",
     "hl7_version",
+    "strict_timeout_s",
     "ordering",
     "internal_error",
     "simulate",

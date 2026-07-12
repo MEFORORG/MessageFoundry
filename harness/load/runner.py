@@ -15,7 +15,7 @@ import contextlib
 import time
 from typing import Sequence
 
-from messagefoundry.console.client import ApiError
+from messagefoundry.apiclient import ApiError
 
 from harness.load.corpus import build_corpus
 from harness.load.correlator import Correlator

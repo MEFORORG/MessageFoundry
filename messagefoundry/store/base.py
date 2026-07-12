@@ -31,6 +31,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import SqliteSync, StoreBackend, StoreSettings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT,
     MAX_SCAN_LIMIT,
@@ -56,6 +57,14 @@ from messagefoundry.store.store import (
     MessageStore,
     OutboxItem,
     OwnedLanes,
+    ReingressOriginMissing,
+    ReingressOutcome,
+    ResendError,
+    ResendKeyConflict,
+    ResendOutcome,
+    ResendSourceAmbiguous,
+    ResendSourceEmpty,
+    ResendSourceNotFound,
     SessionRecord,
     Stage,
     UserRecord,
@@ -76,6 +85,14 @@ __all__ = [
     "OwnedLanes",
     "PoolStatus",
     "QueueStore",
+    "ReingressOriginMissing",
+    "ReingressOutcome",
+    "ResendError",
+    "ResendKeyConflict",
+    "ResendOutcome",
+    "ResendSourceAmbiguous",
+    "ResendSourceEmpty",
+    "ResendSourceNotFound",
     "Row",
     "SearchSpec",
     "SearchTarget",
@@ -175,6 +192,22 @@ class QueueStore(StoreLifecycle, Protocol):
     #: fused-hop dispatcher gates on this flag before taking the sync path.
     supports_fused_sync_handoff: bool = False
 
+    #: A1 live cost counters (always-on, additive; surfaced via ``/stats``). ``committed_txns`` = durable
+    #: **write**-path transactions committed on this handle — the *committed transactions per message*
+    #: currency ADR 0051 sizes capacity on (``3 + 2H + 2N`` per ingress message, H = handlers routed,
+    #: N = destinations). Read-snapshot-release commits (e.g. the RCSI hygiene commit a SQL Server read
+    #: needs, or SQLite's read-pool ``COMMIT``) are excluded, so the counter stays the write currency the
+    #: cost model validates rather than a superset that also counts every live lookup.
+    #: ``body_copies`` = raw/payload body strings durably written (the ``2 + H + N`` per-message
+    #: amplification), counted store-once-aware where a backend dedups an identical fan-out body. Both
+    #: start at 0 and only grow; incrementing them is a bare int add at the existing commit / body-write
+    #: sites (no new lock, no commit-boundary change). Fully wired on SQLite + SQL Server; the Postgres
+    #: handle exposes them at 0 for protocol / ``/stats`` uniformity (its ``async with conn.transaction()``
+    #: commit idiom is a separate wiring pass). Consumers read them with ``getattr(store, name, 0)`` so an
+    #: older engine without the fields degrades gracefully.
+    committed_txns: int
+    body_copies: int
+
     # --- write path ----------------------------------------------------------
     async def enqueue_message(
         self,
@@ -273,6 +306,7 @@ class QueueStore(StoreLifecycle, Protocol):
         deliveries: Sequence[tuple[str, str]],
         state_ops: Sequence[tuple[str, str, Any]] = (),
         pt_deliveries: Sequence[tuple[str, str]] = (),
+        meta_ops: Sequence[tuple[str, str]] = (),
         correlation_depth_cap: int = 8,
         now: float | None = None,
     ) -> bool:
@@ -552,6 +586,16 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None: ...
 
+    async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
+        """Complete N delivered outbound rows in **one transaction** — the batch counterpart of
+        :meth:`mark_done` (ADR 0082 / BACKLOG #134). All N were delivered by a single ``BHS``…``BTS``
+        envelope send, so they flip ``DONE`` together: each writes its H2 idempotency-ledger row and
+        ``delivered`` event, and the finalizer runs **once per distinct ``message_id``**. A vanished
+        member is an idempotent per-row no-op. Atomic — a crash before commit rolls all N back to
+        ``INFLIGHT`` and :meth:`reset_stale_inflight` recovers them in ``seq`` order for a byte-identical
+        re-send."""
+        ...
+
     async def complete_with_response(
         self,
         outbox_id: str,
@@ -653,6 +697,28 @@ class QueueStore(StoreLifecycle, Protocol):
         finite ``max_attempts`` is exhausted)."""
         ...
 
+    async def mark_batch_failed(
+        self,
+        outbox_ids: Sequence[str],
+        error: str,
+        retry: RetryPolicy,
+        now: float | None = None,
+    ) -> float | None:
+        """Re-pend (or dead-letter) N outbound rows that FAILED **as a unit** — the batch counterpart of
+        :meth:`mark_failed` (ADR 0082). One disposition, decided from the head member's attempts and
+        applied identically to every member, so all N re-pend to the same ``next_attempt_at`` (re-claimed
+        as the identical contiguous prefix — strict FIFO preserved) or all dead-letter together. Returns
+        the shared ``next_attempt_at`` when rescheduled, ``None`` when the batch dead-lettered."""
+        ...
+
+    async def dead_letter_batch(
+        self, outbox_ids: Sequence[str], error: str, now: float | None = None
+    ) -> None:
+        """Force N outbound rows terminal (``DEAD``) in one transaction — the batch counterpart of
+        :meth:`dead_letter_now` (ADR 0082 ratified decision #1). A **permanent** envelope reject
+        dead-letters all N together (atomic, no retry consumed); the operator replays the batch."""
+        ...
+
     # --- recovery / replay ---------------------------------------------------
     async def pending_depth(
         self, name: str, *, stage: str = Stage.OUTBOUND.value
@@ -695,6 +761,26 @@ class QueueStore(StoreLifecycle, Protocol):
 
     async def replay(self, message_id: str, now: float | None = None) -> int: ...
 
+    async def resend_to(
+        self,
+        *,
+        message_id: str,
+        to: str,
+        idempotency_key: str,
+        from_: str | None = None,
+        body_override: str | None = None,
+        now: float | None = None,
+    ) -> ResendOutcome: ...
+
+    async def reingress(
+        self,
+        *,
+        origin_message_id: str,
+        raw: str,
+        idempotency_key: str,
+        now: float | None = None,
+    ) -> ReingressOutcome: ...
+
     async def replay_dead(
         self,
         *,
@@ -716,6 +802,15 @@ class QueueStore(StoreLifecycle, Protocol):
     # Row sequences are returned as Sequence[Row] (covariant) so a backend may return its own row
     # type (e.g. aiosqlite.Row) — list[Row] would be invariant and reject that.
     async def get_message(self, message_id: str) -> dict[str, Any] | None: ...
+
+    async def message_metadata_json(self, message_id: str) -> str | None:
+        """The message's **decrypted** ``metadata`` JSON (ADR 0081), or ``None`` when absent/unknown.
+
+        A lightweight read for the delivery worker's per-message dynamic HTTP headers (#68): it decrypts
+        ONLY the small metadata column, never the raw PHI body ``get_message`` would. Returns the full
+        metadata object (engine-internal + ``user`` keys); the caller extracts the ``user`` bag with
+        :func:`~messagefoundry.store.metadata.user_metadata`."""
+        ...
 
     async def list_messages(
         self,
@@ -1036,7 +1131,24 @@ class AuditStore(Protocol):
         now: float | None = None,
     ) -> None: ...
 
-    async def list_audit(self, *, limit: int = 50) -> Sequence[Row]: ...
+    async def list_audit(
+        self,
+        *,
+        limit: int = 50,
+        actor: str | None = None,
+        action: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+    ) -> Sequence[Row]:
+        """Most-recent-first audit entries, optionally scoped (BACKLOG #170).
+
+        The optional filters — ``actor`` (exact identity), ``action`` (exact event type), and an
+        inclusive time window ``since <= ts <= until`` (``ts`` is the epoch-float audit column on
+        every backend) — are ANDed. Every value is passed as a bound parameter (never interpolated),
+        so an attacker-influenced filter can never inject SQL. Ordering, ``limit``, and the hash-chain
+        read semantics are unchanged; passing no filter is byte-identical to the limit-only query.
+        """
+        ...
 
     async def security_events_for_user(
         self, username: str, *, limit: int = 100
@@ -1066,6 +1178,25 @@ class AuditStore(Protocol):
     async def verify_audit_chain(
         self, *, expected_anchor: tuple[int, str] | None = None
     ) -> tuple[bool, str | None]: ...
+
+    async def rekey_audit_chain(
+        self, *, expected_anchor: tuple[int, str] | None = None
+    ) -> tuple[bool, str]:
+        """Non-silent #190-D migration: enable HMAC keying of the audit chain on an existing keyless
+        store. Refuses without a DEK, is a no-op if already keyed, and verifies the existing keyless
+        chain first (refusing on any break, so a forged chain is never blessed). Sets a watermark; never
+        rewrites existing row hashes. Returns ``(ok, message)``."""
+        ...
+
+    async def has_prior_backup_history(self) -> bool:
+        """True iff the audit log carries at least one ``dr_backup`` row — the #102 server-DB DR-seed
+        gate's "restored, not freshly-bootstrapped" signal. A ``dr_backup`` row is written on every
+        leader-gated backup SUCCESS (the run that PRODUCES a seed archive), so a server DB restored from
+        an operating primary carries ≥1; a passive DR standby is never the leader and writes none, so a
+        fresh/unrestored DR DB (non-empty only because engine bootstrap + operator login wrote to it) has
+        zero. Read-only (a single indexed existence check), all backends. NOTE: this proves prior backup
+        history, NOT vintage/completeness of a DBA-managed restore (see BACKLOG #102 residuals)."""
+        ...
 
 
 class AuthStore(Protocol):
@@ -1327,17 +1458,35 @@ def resolve_decrypt_keys(settings: StoreSettings) -> list[str]:
     return keyring
 
 
-async def open_store(settings: StoreSettings) -> Store:
+async def open_store(
+    settings: StoreSettings,
+    *,
+    message_events: str = "all",
+    posture: HopPosture | None = None,
+) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
 
     ``sqlite`` is the default; ``postgres`` is a production server-DB backend with single-node parity
     (lazy-imported, needs the ``postgres`` extra); ``sqlserver`` is a production server-DB backend,
     lazy-imported (needs the ``sqlserver`` extra). Unknown backends raise ``NotImplementedError``.
+
+    ``message_events`` is the ``[diagnostics].message_events`` verbosity (#63) — sourced by the caller
+    that holds ``ServiceSettings`` (serve/engine); it lives outside ``StoreSettings``, mirroring the
+    ``engine._connection_events`` caller-gate. The audit-chain HMAC key (#190) is derived here from the
+    live cipher and threaded into every backend, so no caller has to handle key material.
+
+    ``posture`` (#200, ADR 0092) is the deriving instance's :class:`HopPosture`, threaded into the
+    server-DB backends so the engine<->store weakened-TLS refusal (``connection_string`` / ``_build_ssl``)
+    clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` (SQLite —
+    no TLS — or a backup/restore utility / test) leaves it unclamped, byte-identical to pre-#200.
     """
     # AES-256-GCM keyring at rest when a key is set (STORE-1): active key (env or DPAPI key file) +
     # any retired decrypt-only keys for an in-progress rotation (WP-5). No key → identity cipher.
     retired = [k.strip() for k in settings.encryption_keys_retired.split(",") if k.strip()]
     cipher = make_cipher(resolve_active_key(settings), retired)
+    # #190: HKDF-derived HMAC key for the tamper-evident audit chain; None for the identity cipher (the
+    # chain then stays the keyless SHA-256 chain, byte-identical to a pre-#190 store).
+    audit_mac_key = cipher.audit_mac_key()
     if settings.backend is StoreBackend.SQLITE:
         return await MessageStore.open(
             settings.path,
@@ -1345,15 +1494,29 @@ async def open_store(settings: StoreSettings) -> Store:
             cipher=cipher,
             group_commit_window_ms=settings.group_commit_window_ms,
             group_commit_max_batch=settings.group_commit_max_batch,
+            audit_mac_key=audit_mac_key,
+            message_events=message_events,
         )
     if settings.backend is StoreBackend.SQLSERVER:
         from messagefoundry.store.sqlserver import SqlServerStore  # lazy: optional aioodbc dep
 
-        return await SqlServerStore.open(settings, cipher=cipher)
+        return await SqlServerStore.open(
+            settings,
+            cipher=cipher,
+            audit_mac_key=audit_mac_key,
+            message_events=message_events,
+            posture=posture,
+        )
     if settings.backend is StoreBackend.POSTGRES:
         from messagefoundry.store.postgres import PostgresStore  # lazy: optional asyncpg dep
 
-        return await PostgresStore.open(settings, cipher=cipher)
+        return await PostgresStore.open(
+            settings,
+            cipher=cipher,
+            audit_mac_key=audit_mac_key,
+            message_events=message_events,
+            posture=posture,
+        )
     raise NotImplementedError(f"store backend {settings.backend.value!r} is not implemented yet")
 
 

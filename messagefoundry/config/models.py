@@ -15,10 +15,14 @@ touching this file.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime, time
 from enum import Enum
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from messagefoundry.config.tls_policy import TrustAnchorPolicy
 
 
 class ConnectorType(str, Enum):
@@ -44,6 +48,9 @@ class ConnectorType(str, Enum):
     EMAIL = (
         "email"  # SMTP-send outbound email destination — plain-text message via smtplib (ADR 0029)
     )
+    # Direct-Project S/MIME-over-SMTP outbound destination — SIGN then ENCRYPT the PHI body to a
+    # per-partner recipient cert, deliver over STARTTLS SMTP (ADR 0085, PR1 outbound only).
+    DIRECT = "direct"
     # DATABASE also has an inbound poll source (DatabasePoll, ADR 0003 §3 + 0004); REMOTEFILE is both
     # source and destination. TIMER is source-only (it generates, never delivers). HTTP is the inbound
     # web-service LISTEN source (ADR 0023) — a connector-owned bound HTTP/1.1 socket, NOT a route in
@@ -167,12 +174,41 @@ class InternalErrorPolicy(str, Enum):
     STOP = "stop"
 
 
+def _check_hop_attestation(attested: bool, reason: str | None) -> None:
+    """Load-validate the per-connection insecure-hop attestation pair (#200, ADR 0092).
+
+    A ``tls_hop_attested_reason`` is only meaningful alongside ``tls_hop_attested=true`` — a reason
+    without the flag is a config mistake (the operator meant to attest but didn't), so it fails loud at
+    load. A blank/whitespace-only reason is likewise rejected: an attestation that suppresses a would-be
+    production-PHI refusal should carry a real justification for the audit trail."""
+    if reason is not None and not attested:
+        raise ValueError(
+            "tls_hop_attested_reason is set without tls_hop_attested=true — set the flag to attest "
+            "the hop is secure, or drop the reason"
+        )
+    if attested and reason is not None and not reason.strip():
+        raise ValueError("tls_hop_attested_reason must be non-empty when provided")
+
+
 class Source(BaseModel):
     """An inbound connector endpoint."""
 
     type: ConnectorType
     settings: dict[str, Any] = Field(default_factory=dict)
     ack_mode: AckMode = AckMode.ORIGINAL
+    # Per-connection insecure-hop attestation (#200, ADR 0092): the operator affirms THIS connection's
+    # transport hop is legitimately secure by other means (a proxy-terminated / trusted-segment hop),
+    # so the posture-keyed hop-refusal gate ALLOWs it even on a production-PHI instance. Default False →
+    # the gate keys purely on posture (every existing connection is byte-identical). A surgical opt-in
+    # that replaces reliance on the blunt global MEFOR_ALLOW_INSECURE_TLS escape; audited by the cell
+    # when it suppresses a would-be production refusal. `tls_hop_attested_reason` records why (audit).
+    tls_hop_attested: bool = False
+    tls_hop_attested_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_hop_attestation(self) -> Source:
+        _check_hop_attestation(self.tls_hop_attested, self.tls_hop_attested_reason)
+        return self
 
 
 class RetryPolicy(BaseModel):
@@ -217,6 +253,133 @@ class StallThreshold(BaseModel):
     ``stall=`` override > the ``[delivery]`` global default > built-in (off)."""
 
     max_oldest_seconds: float | None = None
+
+
+class ActiveWindow(BaseModel):
+    """One **active window** in a per-connection schedule (BACKLOG #147, ADR 0095).
+
+    The window is a recurring time-of-day span on a set of weekdays, evaluated in its own IANA
+    ``timezone`` (default ``UTC``) — so a feed can be scheduled in the site's local time regardless of
+    the engine host's clock. ``days`` are ``datetime.weekday()`` ordinals (``0`` = Monday … ``6`` =
+    Sunday). ``start``/``end`` are wall-clock times of day: a window with ``start < end`` is a same-day
+    span (``[start, end)``, end-exclusive); a window with ``start > end`` **wraps past midnight** (e.g.
+    ``22:00``–``06:00``) and is anchored on its **start** weekday, so the after-midnight tail belongs to
+    the day the window began. ``start == end`` is rejected as ambiguous (an empty or 24-hour span — use
+    a full-day window explicitly if that is meant).
+
+    Whether being *inside* a window means the connection is **up** (an availability window) or **down**
+    (a maintenance window) is decided by :attr:`Schedule.invert`, not here — a window only answers
+    :meth:`contains`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Weekdays the window's START falls on — ``datetime.weekday()`` ordinals (0=Mon … 6=Sun).
+    days: frozenset[int] = Field(min_length=1)
+    start: time  # inclusive local time-of-day the window opens
+    end: time  # exclusive local time-of-day the window closes (wraps past midnight when <= start)
+    timezone: str = "UTC"  # IANA tz name the start/end/days are evaluated in
+
+    @field_validator("days")
+    @classmethod
+    def _check_days(cls, days: frozenset[int]) -> frozenset[int]:
+        bad = sorted(d for d in days if d < 0 or d > 6)
+        if bad:
+            raise ValueError(
+                f"active-window days must be datetime.weekday() ordinals 0..6 (0=Mon, 6=Sun); "
+                f"got out-of-range {bad}"
+            )
+        return days
+
+    @field_validator("timezone")
+    @classmethod
+    def _check_timezone(cls, tz: str) -> str:
+        # Resolve the IANA name at load so a typo fails loud in dry-run / `messagefoundry check`,
+        # not silently at the first schedule tick. ZoneInfo is stdlib (no new dependency).
+        try:
+            ZoneInfo(tz)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown IANA timezone {tz!r}: {exc}") from exc
+        return tz
+
+    @model_validator(mode="after")
+    def _check_span(self) -> ActiveWindow:
+        if self.start == self.end:
+            raise ValueError(
+                "active-window start and end must differ (start == end is ambiguous — use "
+                "00:00..00:00 is not allowed; express a full day as a distinct start/end)"
+            )
+        return self
+
+    def contains(self, now_utc: datetime) -> bool:
+        """Whether ``now_utc`` (a timezone-aware UTC instant) lies within this window, evaluated in the
+        window's own timezone. Same-day spans test ``start <= t < end`` on a matching weekday; a
+        past-midnight span (``start > end``) matches either the evening tail on the start weekday
+        (``t >= start``) OR the morning tail on the day AFTER a start weekday (``t < end``)."""
+        local = now_utc.astimezone(ZoneInfo(self.timezone))
+        t = local.timetz().replace(tzinfo=None)
+        today = local.weekday()
+        if self.start < self.end:
+            return today in self.days and self.start <= t < self.end
+        # Wrap past midnight: the evening portion is on the start day; the morning portion belongs to
+        # the window that OPENED yesterday, so its anchor weekday is (today - 1) mod 7.
+        yesterday = (today - 1) % 7
+        return (today in self.days and t >= self.start) or (yesterday in self.days and t < self.end)
+
+
+class Schedule(BaseModel):
+    """A per-connection **active-window schedule** (BACKLOG #147, ADR 0095) the RegistryRunner honors to
+    auto-start and auto-stop a connection on a time-of-day / day-of-week calendar.
+
+    ``None`` on a connection (the default) means **always-on** — no scheduler task is created and the
+    connection's lifecycle is byte-identical to before this feature. When set, the connection is
+    considered *scheduled-up* whenever :meth:`is_active` is true and *scheduled-down* otherwise; the
+    runner parks a scheduled-down connection with a **clean stop** (the same drain/stop the API uses,
+    never a crash) and starts a scheduled-up one via the same start path.
+
+    ``invert`` picks the polarity of the ``windows``: with ``invert=False`` (default) they are
+    **availability** windows — the connection is UP *inside* any window and parked outside. With
+    ``invert=True`` they are **maintenance** windows — the connection is parked *inside* any window and
+    UP outside (the way to say "down every night 02:00–03:00 for the partner's maintenance")."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    windows: list[ActiveWindow] = Field(min_length=1)
+    invert: bool = False
+
+    def is_active(self, now_utc: datetime) -> bool:
+        """Whether the connection should be **up** at ``now_utc`` (a timezone-aware UTC instant). True
+        when ``now_utc`` is inside some window (availability) — or OUTSIDE every window when
+        ``invert`` makes the windows maintenance downtime."""
+        inside = any(w.contains(now_utc) for w in self.windows)
+        return (not inside) if self.invert else inside
+
+
+class BatchConfig(BaseModel):
+    """Opt-in per-outbound HL7 **batch aggregation** (BACKLOG #134 / ADR 0082): coalesce up to
+    ``max_count`` consecutive outbound messages on this lane into ONE ``BHS``…``BTS`` envelope on a
+    single send.
+
+    The delivery worker claims the lane's contiguous FIFO head-prefix and triggers a send when **either**
+    ``max_count`` rows are ready **or** the head row has waited ``max_wait_ms`` — whichever comes first
+    (count-or-timeout **on the head**, so a partial batch never strands and strict FIFO never reorders).
+    All N complete in one transaction. The envelope framing is **deterministic given a member set** (no
+    clock — BHS-7 from the head's re-run-stable ingest time, BHS-11 from the head member's control id); a
+    crash **before** the send re-runs cleanly, and a crash **after** the send re-sends the batch (which may
+    coalesce newly-arrived rows into a larger envelope), so at-least-once relies on the partner being
+    **per-message idempotent** (dedup by MSH-10) — the standard HL7-batch behaviour (ADR 0082).
+
+    Constraints (enforced at wiring time, not here): **MLLP (HL7v2) outbounds only** — there is no
+    BHS/BTS analogue for other transports — and **not** on a response-capturing / re-ingressing outbound
+    (ADR 0013), since one batch-level ACK cannot fan out to N per-row captured replies. ``max_wait_ms``
+    trades tail latency for envelope size."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # ge=2: framing a single message is not a batch. le=1000: an upper bound so the coalescing loop
+    # (which holds the lane's processing slot for up to max_count sequential claims) can never pin a
+    # slot unboundedly — a batch of 1000 messages is already very large.
+    max_count: int = Field(ge=2, le=1000)
+    max_wait_ms: int = Field(ge=1)  # head age-out (ms) that flushes a short batch
 
 
 class SignatureAlgorithm(str, Enum):
@@ -307,6 +470,31 @@ class Destination(BaseModel):
     # (the default) = OFF — every existing outbound is byte-identical. Assembled from the env-resolved
     # sign_* settings by the runner's _dest_config; the connector mints the signature in send().
     sign: OutboundSigning | None = None
+    # BACKLOG #107: opt-in per-outbound escape-hatch — emit the reserved HL7 structural separators
+    # (field/component/repetition/subcomponent) as RAW bytes instead of their \F\ \S\ \R\ \T\ escape
+    # sequences on serialize, for the rare partner that cannot decode HL7 escapes. Default False → every
+    # existing outbound is BYTE-IDENTICAL. Enabling it DELIBERATELY produces non-conformant output (that
+    # is the point); read via _dest_config from the outbound's env-resolved `hl7_raw_separators` setting
+    # and applied in the MLLP connector's send() before framing (HL7v2/MLLP outbound only today).
+    hl7_raw_separators: bool = False
+    # Per-connection insecure-hop attestation (#200, ADR 0092) — see :class:`Source`. On an outbound the
+    # attested hop is the egress crossing (e.g. a cleartext http hop into a trusted segment / a
+    # proxy-terminated TLS hop): with `tls_hop_attested=true` the posture-keyed refusal gate ALLOWs it
+    # even on production-PHI. Default False → keyed purely on posture (existing outbounds byte-identical).
+    tls_hop_attested: bool = False
+    tls_hop_attested_reason: str | None = None
+    # #190 (ADR 0093): the instance-wide [tls] client trust-anchor policy, threaded by the runner's
+    # _dest_config so the internal-outbound TLS context builders (MLLP/DICOM/FTPS) resolve the same
+    # anchor at build_check AND live construction. Default = system/None → a no-op (the OS trust store
+    # verifies the peer, byte-identical). A connection's own tls_ca_file always wins verbatim; the
+    # policy only supplies the org internal CA to an internal hop that named none. NEVER disables
+    # verification, so it composes with the connectors' fail-closed no-CA/verify-off/cleartext refusals.
+    trust_anchor_policy: TrustAnchorPolicy = Field(default_factory=TrustAnchorPolicy)
+
+    @model_validator(mode="after")
+    def _validate_hop_attestation(self) -> Destination:
+        _check_hop_attestation(self.tls_hop_attested, self.tls_hop_attested_reason)
+        return self
 
 
 class Validation(BaseModel):
@@ -316,3 +504,8 @@ class Validation(BaseModel):
     hl7_version: str | None = None  # e.g. "2.5.1"; None = infer from MSH-12
     strict: bool = False
     profile: str | None = None  # path to a conformance profile, optional
+    # Wall-clock seconds a strict hl7apy validate may run before the message dead-letters (#89, DoS
+    # backstop against a pathological body that makes hl7apy's structure/cardinality parse spin). A
+    # slow-parse input can otherwise pin the listener; the timeout bounds it. ``None`` inherits the
+    # engine default (``_STRICT_VALIDATE_TIMEOUT_SECONDS``); ``<= 0`` disables the backstop.
+    strict_timeout_s: float | None = None

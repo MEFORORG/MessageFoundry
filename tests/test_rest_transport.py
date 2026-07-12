@@ -16,6 +16,7 @@ import pytest
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Rest, WiringError
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports import build_destination
@@ -148,7 +149,10 @@ def test_rest_verify_tls_false_refused_without_escape(monkeypatch: pytest.Monkey
 
 def test_rest_verify_tls_false_allowed_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    dest = _dest(verify_tls=False)  # builds a no-verify opener; no exception
+    # #200 (ADR 0092): the global escape now only DOWNGRADES REFUSE→WARN on a NON-production instance
+    # (decision 2). Under a non-prod PHI posture it warns-and-builds; on production it would refuse.
+    with active_hop_posture(HopPosture(is_phi=True, production=False)):
+        dest = _dest(verify_tls=False)  # builds a no-verify opener; no exception
     assert dest._opener is not None
 
 
@@ -169,13 +173,15 @@ def test_rest_credentials_over_cleartext_http_allowed_with_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    dest = build_destination(
-        Destination(
-            name="OB",
-            type=ConnectorType.REST,
-            settings=Rest(url="http://api.example.com/x", bearer_token="tok").settings,
+    # #200: the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
+    with active_hop_posture(HopPosture(is_phi=True, production=False)):
+        dest = build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.REST,
+                settings=Rest(url="http://api.example.com/x", bearer_token="tok").settings,
+            )
         )
-    )
     assert isinstance(dest, RestDestination)  # built (warns), not refused
 
 
@@ -187,6 +193,51 @@ def test_rest_cleartext_http_without_credentials_is_allowed() -> None:
         )
     )
     assert isinstance(dest, RestDestination)
+
+
+def test_rest_cleartext_http_loopback_ip_without_credentials_is_allowed() -> None:
+    # ASVS 12.2.1: on-box loopback (127.0.0.1) cleartext egress is NOT a network exposure → allowed,
+    # so the default loopback posture and existing loopback sinks stay byte-identical.
+    dest = build_destination(
+        Destination(
+            name="OB",
+            type=ConnectorType.REST,
+            settings=Rest(url="http://127.0.0.1:8000/x").settings,
+        )
+    )
+    assert isinstance(dest, RestDestination)
+
+
+def test_rest_cleartext_http_nonloopback_refused_without_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ASVS 12.2.1: even with NO Authorization header the request body is PHI, so a cleartext http
+    # egress to a non-loopback host is refused unless the explicit escape is set.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with pytest.raises(ValueError, match="cleartext http to a non-loopback host"):
+        build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.REST,
+                settings=Rest(url="http://api.example.com/x").settings,
+            )
+        )
+
+
+def test_rest_cleartext_http_nonloopback_allowed_with_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    # #200: the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
+    with active_hop_posture(HopPosture(is_phi=True, production=False)):
+        dest = build_destination(
+            Destination(
+                name="OB",
+                type=ConnectorType.REST,
+                settings=Rest(url="http://api.example.com/x").settings,
+            )
+        )
+    assert isinstance(dest, RestDestination)  # built (warns loudly), not refused
 
 
 def test_rest_egress_allowlist_blocks_unlisted_host() -> None:
@@ -207,3 +258,97 @@ def test_rest_egress_unrestricted_when_empty() -> None:
         name="OB", type=ConnectorType.REST, settings=Rest(url="https://anywhere.example/x").settings
     )
     check_egress_allowed(dest, EgressSettings())  # empty allowlist = unrestricted
+
+
+# --- per-message dynamic HTTP headers (BACKLOG #68) -------------------------------------------------
+
+
+def test_rest_dynamic_headers_flag_opt_in() -> None:
+    # consumes_metadata (the delivery worker's read gate) is off by default and on only when opted in.
+    assert _dest().consumes_metadata is False
+    assert _dest(dynamic_headers=True).consumes_metadata is True
+
+
+async def test_rest_per_message_header_from_metadata_appears_on_request() -> None:
+    dest = _dest()
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(
+        '{"a": 1}',
+        metadata={"http.header.X-Idempotency-Key": "abc123", "note": "not-a-header"},
+    )
+    req = opener.requests[0]
+    assert req.get_header("X-idempotency-key") == "abc123"
+    # A non-http.header.* metadata key is display-only — it never rides the request.
+    assert not req.has_header("Note")
+
+
+async def test_rest_per_message_header_overrides_static_and_keeps_others() -> None:
+    dest = _dest(headers={"X-Trace": "static", "X-Keep": "kept"})
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send("x", metadata={"http.header.X-Trace": "dynamic"})
+    req = opener.requests[0]
+    assert req.get_header("X-trace") == "dynamic"  # per-message value wins over the static one
+    assert req.get_header("X-keep") == "kept"  # an unrelated static header is untouched
+
+
+async def test_rest_no_metadata_is_byte_identical() -> None:
+    # Default (no metadata) sends exactly the static headers — no dynamic-header machinery on the wire.
+    dest = _dest(headers={"X-Source": "mf"})
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send("x")
+    req = opener.requests[0]
+    assert req.get_header("X-source") == "mf"
+
+
+async def test_rest_crlf_in_header_value_is_neutralized_no_injection() -> None:
+    # A message-derived value carrying CR/LF must not split the request into a second header line.
+    dest = _dest()
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send("x", metadata={"http.header.X-Evil": "ok\r\nX-Injected: pwned"})
+    req = opener.requests[0]
+    assert req.get_header("X-evil") == "okX-Injected: pwned"  # control chars stripped in place
+    assert not req.has_header("X-injected")  # no smuggled second header
+
+
+async def test_rest_invalid_header_name_is_dropped() -> None:
+    dest = _dest()
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send(
+        "x",
+        metadata={"http.header.Bad Name": "v", "http.header.X-Ok": "v"},
+    )
+    req = opener.requests[0]
+    assert req.get_header("X-ok") == "v"
+    assert not req.has_header("Bad name")  # a name that isn't a valid token can't be emitted
+
+
+async def test_rest_dynamic_headers_dont_clobber_authorization() -> None:
+    # A message-derived value must not overwrite the security-critical Authorization header.
+    dest = _dest(bearer_token="tok")
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send("x", metadata={"http.header.Authorization": "Bearer attacker"})
+    req = opener.requests[0]
+    assert req.get_header("Authorization") == "Bearer tok"
+
+
+def test_outbound_headers_from_metadata_is_pure_and_sanitizing() -> None:
+    from messagefoundry.transports.rest import outbound_headers_from_metadata
+
+    bag = {
+        "http.header.X-Trace-Id": "t-1",
+        "http.header.X-Bad": "line1\r\nline2\x00",
+        "http.header.Illegal Name": "v",
+        "plain": "ignored",
+    }
+    first = outbound_headers_from_metadata(bag)
+    second = outbound_headers_from_metadata(bag)
+    assert first == second  # deterministic — a re-run yields identical headers (pure)
+    assert first == {"X-Trace-Id": "t-1", "X-Bad": "line1line2"}
+    assert outbound_headers_from_metadata(None) == {}
+    assert outbound_headers_from_metadata({}) == {}

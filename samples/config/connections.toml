@@ -26,3 +26,21 @@ router    = "acme_adt_router"          # picked from the routers registered in t
 #   port = { env = "acme_adt_port", cast = "int" }
 #   [outbound.retry]
 #   max_attempts = 5
+
+# --- IB_DEMO_ORU: the per-feed "Hybrid" layout worked example (docs/CONNECTIONS.md §"Decomposing by
+# role"). The connections live HERE as data; the @router / @handler / transform steps live in the
+# sibling IB_DEMO_ORU_router.py / IB_DEMO_ORU_handler.py / _demo_oru_transforms.py. One feed, split by
+# role — no monolithic module bundling transport + routing + transform.
+[[inbound]]
+name      = "IB_DEMO_ORU"
+transport = "mllp"
+router    = "demo_oru_router"          # bound by name to the @router in IB_DEMO_ORU_router.py
+  [inbound.settings]
+  port = 2640                          # inbound MLLP takes only a port (bind host is a service setting)
+
+[[outbound]]
+name      = "OB_DEMO_ORU"              # referenced by name from IB_DEMO_ORU_handler.py
+transport = "mllp"
+  [outbound.settings]
+  host = { env = "demo_oru_host" }            # resolved per environment (environments/<env>.toml)
+  port = { env = "demo_oru_port", cast = "int" }

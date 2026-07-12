@@ -1001,6 +1001,53 @@
     setInterval(poll, 15000);
   });
 
+  // Edit-and-resubmit editor (ADR 0090 §9, BACKLOG #153). Reveal a "Modified" badge as soon as the
+  // edited COPY differs from the pristine original, enable a Revert button that restores the original
+  // copy, and show the direct-outbound field only when "Send directly" is chosen. Pure client-side
+  // progressive enhancement — the Resubmit itself is an ordinary server-validated, same-origin form POST
+  // (no fetch), so the step-up/unlock re-auth flow applies unchanged and the feature is optional. The
+  // ORIGINAL message is never touched: this edits a copy the server rendered from the audited raw view.
+  feature("[data-mf-edit]", function (form) {
+    var ta = form.querySelector("#edit-raw");
+    var badge = form.querySelector("#edit-modified");
+    var revert = form.querySelector("#edit-revert");
+    var toRow = form.querySelector("#edit-to-row");
+    var toInput = form.querySelector("#edit-to");
+    if (!ta) return;
+    // Normalize CR/CRLF → LF on BOTH sides: a browser textarea normalizes the DOM value's newlines, so
+    // comparing against the raw (\r-delimited HL7) attribute would flag "modified" on open with no edit.
+    function norm(s) {
+      return (s || "").replace(/\r\n?/g, "\n");
+    }
+    var original = norm(ta.getAttribute("data-original"));
+    function sync() {
+      var changed = norm(ta.value) !== original;
+      if (badge) badge.hidden = !changed;
+      if (revert) revert.disabled = !changed;
+    }
+    ta.addEventListener("input", sync);
+    if (revert)
+      revert.addEventListener("click", function () {
+        ta.value = ta.getAttribute("data-original") || "";
+        sync();
+        ta.focus();
+      });
+    function modeSync() {
+      var checked = form.querySelector("input[name=mode]:checked");
+      var isDirect = checked && checked.value === "direct";
+      if (toRow) toRow.hidden = !isDirect;
+      if (toInput) toInput.required = !!isDirect;
+    }
+    Array.prototype.forEach.call(
+      form.querySelectorAll("input[name=mode]"),
+      function (r) {
+        r.addEventListener("change", modeSync);
+      }
+    );
+    sync();
+    modeSync();
+  });
+
   // Deferred script → DOM already parsed. Run each feature whose hook is present on this page.
   inits.forEach(function (pair) {
     var el = document.querySelector(pair[0]);

@@ -95,6 +95,8 @@ class SqlServerCoordinator:
         node_timeout_seconds: float = 30.0,
         leader_lease_ttl_seconds: float = 30.0,
         leader_fence_timeout_seconds: float = 20.0,
+        acquire_delay_seconds: float = 0.0,
+        promotable: bool = True,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._store = store
@@ -105,6 +107,11 @@ class SqlServerCoordinator:
         self._fence_timeout = leader_fence_timeout_seconds
         # Small relative to the fence timeout so a fence fires promptly (well before the lease TTL).
         self._fence_tick = max(0.05, min(1.0, leader_fence_timeout_seconds / 5.0))
+        # Leader-preference (ADR 0096): `acquire_delay` handicaps ONLY take-over of an EXPIRED lease (added
+        # to the expiry on the DB clock), never a renew; `promotable=False` = never claim/hold the lease.
+        # Default (0.0, True) = byte-identical. Mirrors DbCoordinator.
+        self._acquire_delay = acquire_delay_seconds
+        self._promotable = promotable
         self._monotonic = monotonic
         # Schema-namespace the DDL applock + the lease key, exactly as DbCoordinator does, so two
         # deployments sharing one database via different schemas don't contend / co-elect.
@@ -231,8 +238,8 @@ class SqlServerCoordinator:
         """One :class:`ClusterMember` per node; ``is_leader`` derived as the single freshest fresh
         ``is_leader``-flagged node (so a crashed ex-leader's stale flag is never the live leader)."""
         rows = await self._store._fetchall(
-            "SELECT node_id, host, pid, started_at, last_seen, status, is_leader"
-            " FROM nodes ORDER BY node_id"
+            "SELECT node_id, host, pid, started_at, last_seen, status, is_leader,"
+            " acquire_delay_seconds, promotable FROM nodes ORDER BY node_id"
         )
         now = time.time()
         leader_node_id: str | None = None
@@ -252,6 +259,8 @@ class SqlServerCoordinator:
                 last_seen=r["last_seen"],
                 status=r["status"],
                 is_leader=(r["node_id"] == leader_node_id),
+                acquire_delay_seconds=float(r["acquire_delay_seconds"]),
+                promotable=bool(r["promotable"]),
             )
             for r in rows
         ]
@@ -297,7 +306,24 @@ class SqlServerCoordinator:
                     " node_id NVARCHAR(256) NOT NULL PRIMARY KEY, host NVARCHAR(256) NULL,"
                     " pid INT NULL, started_at FLOAT NULL, last_seen FLOAT NULL,"
                     " status NVARCHAR(32) NULL,"
-                    " is_leader BIT NOT NULL CONSTRAINT DF_nodes_is_leader DEFAULT 0);"
+                    " is_leader BIT NOT NULL CONSTRAINT DF_nodes_is_leader DEFAULT 0,"
+                    # ADR 0096 leader-preference config, mirrored per-node for the /cluster/nodes API.
+                    " acquire_delay_seconds FLOAT NOT NULL"
+                    " CONSTRAINT DF_nodes_acquire_delay DEFAULT 0,"
+                    " promotable BIT NOT NULL CONSTRAINT DF_nodes_promotable DEFAULT 1);"
+                )
+                # ADR 0096: additively migrate a pre-existing nodes table (cluster upgraded in place). No
+                # ADD COLUMN IF NOT EXISTS in T-SQL, so guard on COL_LENGTH; idempotent and under the same
+                # sp_getapplock DDL guard so two nodes opening at once can't race it (REL-1).
+                await cur.execute(
+                    "IF COL_LENGTH(N'nodes', N'acquire_delay_seconds') IS NULL"
+                    " ALTER TABLE nodes ADD acquire_delay_seconds FLOAT NOT NULL"
+                    " CONSTRAINT DF_nodes_acquire_delay DEFAULT 0;"
+                )
+                await cur.execute(
+                    "IF COL_LENGTH(N'nodes', N'promotable') IS NULL"
+                    " ALTER TABLE nodes ADD promotable BIT NOT NULL"
+                    " CONSTRAINT DF_nodes_promotable DEFAULT 1;"
                 )
                 await cur.execute(
                     "IF OBJECT_ID(N'leader_lease', N'U') IS NULL"
@@ -330,14 +356,16 @@ class SqlServerCoordinator:
 
     async def _register(self) -> None:
         now = time.time()
+        # acquire_delay_seconds / promotable are static per-node config (ADR 0096): written on register
+        # (incl. a restart's conflict-update) and never touched by the heartbeat.
         await self._store._execute(
             "SET NOCOUNT ON;"
             " MERGE nodes WITH (HOLDLOCK) AS t USING (SELECT ? AS node_id) AS s"
             " ON t.node_id = s.node_id"
             " WHEN MATCHED THEN UPDATE SET host=?, pid=?, started_at=?, last_seen=?, status=?,"
-            " is_leader=0"
+            " is_leader=0, acquire_delay_seconds=?, promotable=?"
             " WHEN NOT MATCHED THEN INSERT (node_id, host, pid, started_at, last_seen, status,"
-            " is_leader) VALUES (?, ?, ?, ?, ?, ?, 0);",
+            " is_leader, acquire_delay_seconds, promotable) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?);",
             (
                 self.node_id,
                 self._host,
@@ -345,12 +373,16 @@ class SqlServerCoordinator:
                 now,
                 now,
                 "active",
+                self._acquire_delay,
+                1 if self._promotable else 0,
                 self.node_id,
                 self._host,
                 self._pid,
                 now,
                 now,
                 "active",
+                self._acquire_delay,
+                1 if self._promotable else 0,
             ),
         )
 
@@ -402,13 +434,26 @@ class SqlServerCoordinator:
         (epoch 1) or a take-over of an *expired/foreign* lease (``t.leader_epoch + 1``) — and left
         unchanged on a renew (``t.owner = me``), mirroring :meth:`DbCoordinator._claim_or_renew_lease`.
         ``OUTPUT inserted.leader_epoch`` carries the held value back so :meth:`_maintain_leadership`
-        caches it; the store then fences a superseded ex-leader (``held >= leader_lease.leader_epoch``)."""
+        caches it; the store then fences a superseded ex-leader (``held >= leader_lease.leader_epoch``).
+
+        **Leader preference (ADR 0096).** A ``promotable=False`` node short-circuits to not-held BEFORE
+        the MERGE (never inserts, takes over, or renews). ``acquire_delay_seconds`` handicaps ONLY the
+        take-over-of-EXPIRED predicate — ``t.lease_expires_at + @delay < @now`` — so a delayed node claims
+        only once the lease has been expired for ``delay`` seconds (DB clock), letting a preferred
+        (delay=0) node win the routine race. The delay is on the expiry side only (a strictly stricter
+        predicate → claim later, never earlier → no two-leader window); the ``t.owner = ?`` renew branch
+        is NOT delayed. Mirrors :meth:`DbCoordinator._claim_or_renew_lease`."""
+        if not self._promotable:
+            # NON-PROMOTABLE: never acquire or renew, so this node can never become/remain leader. Touch no
+            # DB row — _maintain_leadership demotes a somehow-already-leader node; the fence is the backstop.
+            return False
         row = await self._store._fetchone(
             "SET NOCOUNT ON;"
             f" DECLARE @now FLOAT = {_DB_NOW};"
             " MERGE leader_lease WITH (HOLDLOCK) AS t USING (SELECT ? AS lease_key) AS s"
             " ON t.lease_key = s.lease_key"
-            " WHEN MATCHED AND (t.owner = ? OR t.lease_expires_at < @now)"
+            # Renew (t.owner=me) is NOT delayed; take-over-of-EXPIRED adds @delay to the expiry (ADR 0096).
+            " WHEN MATCHED AND (t.owner = ? OR t.lease_expires_at + ? < @now)"
             " THEN UPDATE SET owner = ?, lease_expires_at = @now + ?,"
             " leader_epoch = CASE WHEN t.owner = ? THEN t.leader_epoch ELSE t.leader_epoch + 1 END"
             " WHEN NOT MATCHED"
@@ -418,6 +463,7 @@ class SqlServerCoordinator:
             (
                 self._lease_key,
                 self.node_id,  # WHEN MATCHED AND (t.owner = ? ...)
+                self._acquire_delay,  # ... OR t.lease_expires_at + ? < @now
                 self.node_id,  # UPDATE SET owner = ?
                 self._lease_ttl,  # lease_expires_at = @now + ?
                 self.node_id,  # CASE WHEN t.owner = ?

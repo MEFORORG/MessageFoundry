@@ -9,7 +9,7 @@ interface Action {
   soon?: boolean;
 }
 
-const GROUPS: { title: string; actions: Action[] }[] = [
+const GROUPS: { title: string; actions: Action[]; collapsed?: boolean }[] = [
   {
     title: "Wizards",
     actions: [
@@ -30,10 +30,17 @@ const GROUPS: { title: string; actions: Action[] }[] = [
   },
   {
     title: "Operate",
+    actions: [{ id: "messagefoundry.promote", label: "Stage → Promote" }],
+  },
+  {
+    // One-time setup + config, tucked below the everyday actions and collapsed by default so it
+    // stays out of the way. Also the discoverable home for the extension's settings (liveStatus, …).
+    title: "Setup",
+    collapsed: true,
     actions: [
       { id: "messagefoundry.setupSourceControl", label: "Set Up Version Control & Checks" },
       { id: "messagefoundry.setRepoStorage", label: "Config Repo Storage Location" },
-      { id: "messagefoundry.promote", label: "Stage → Promote" },
+      { id: "messagefoundry.openSettings", label: "Extension Settings" },
     ],
   },
 ];
@@ -73,7 +80,9 @@ export class HomeView implements vscode.WebviewViewProvider {
     const n = nonce();
     const groups = GROUPS.map(
       (g) =>
-        `<details class="group" data-key="${esc(g.title)}" open><summary class="title">${esc(
+        `<details class="group" data-key="${esc(g.title)}" data-default="${
+          g.collapsed ? "closed" : "open"
+        }"${g.collapsed ? "" : " open"}><summary class="title">${esc(
           g.title,
         )}</summary><div class="body">${g.actions
           .map(
@@ -92,17 +101,17 @@ export class HomeView implements vscode.WebviewViewProvider {
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${n}';" />
   <style>
-    body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 6px 8px; }
-    .group { margin-bottom: 12px; }
+    body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 4px 8px; }
+    .group { margin-bottom: 6px; }
     summary.title { display: flex; align-items: center; gap: 4px; font-size: 11px; text-transform: uppercase;
-      letter-spacing: .04em; color: var(--vscode-descriptionForeground); margin: 6px 2px; cursor: pointer;
+      letter-spacing: .04em; color: var(--vscode-descriptionForeground); margin: 3px 2px; cursor: pointer;
       user-select: none; list-style: none; }
     summary.title::-webkit-details-marker { display: none; }
     summary.title::before { content: "▸"; font-size: 14px; transition: transform .12s ease; }
     details[open] > summary.title::before { transform: rotate(90deg); }
     details:not([open]) > .body { display: none; }
     button.action { display: flex; align-items: center; justify-content: space-between; width: 100%;
-      text-align: left; font-family: inherit; font-size: 13px; margin: 3px 0; padding: 6px 10px; cursor: pointer;
+      text-align: left; font-family: inherit; font-size: 13px; margin: 1px 0; padding: 5px 10px; cursor: pointer;
       color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground);
       border: none; border-radius: 3px; }
     button.action:hover { background: var(--vscode-button-hoverBackground); }
@@ -114,12 +123,14 @@ export class HomeView implements vscode.WebviewViewProvider {
   ${groups}
   <script nonce="${n}">
     const vscode = acquireVsCodeApi();
-    const state = vscode.getState() || { collapsed: {} };
+    const state = vscode.getState() || {};
+    const collapsed = state.collapsed || (state.collapsed = {});
     for (const d of document.querySelectorAll('details.group')) {
       const key = d.dataset.key;
-      if (state.collapsed[key]) { d.open = false; }
+      // Persisted choice wins; otherwise fall back to the group's declared default (Setup ships closed).
+      d.open = (key in collapsed) ? !collapsed[key] : (d.dataset.default === 'open');
       d.addEventListener('toggle', () => {
-        state.collapsed[key] = !d.open;
+        collapsed[key] = !d.open;
         vscode.setState(state);
       });
     }

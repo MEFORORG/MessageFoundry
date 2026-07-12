@@ -62,10 +62,12 @@ backend that consumes the server-DB keys lands incrementally (the settings + val
 | `allow_unencrypted_phi` | bool | `false` | secure-by-default (H3): with no key, a **PHI** instance (`[ai].data_class = phi`, **any** environment — the gate is on `data_class`, not the env label) **refuses to start**. Set `true` for the explicit, **audited** opt-out that lets such an instance start keyless (still warns). A synthetic/non-PHI instance stays key-free regardless; `require_encryption = true` overrides this. The effective posture is visible at `GET /security/posture` (authenticated, `monitoring:read`). |
 | `server`, `port` | str/int | — / 1433 | server DBs (required for `sqlserver`) |
 | `database` | str | — | server DBs (required for `sqlserver`) |
-| `auth` | enum | `sql` | `sql` · `integrated` · `entra` (SQL Server) |
+| `auth` | enum | `sql` | `sql` · `integrated` · `entra` (SQL Server). `integrated` connects `Trusted_Connection=yes` — the **service account's** Windows identity authenticates (no SQL password); the turnkey **gMSA** walkthrough (grant the gMSA a SQL login + run the service under it) is [`DEPLOY-SERVER-DB.md` §1.1](DEPLOY-SERVER-DB.md). |
 | `username` | str | — | server DBs (required when `auth = sql`) |
 | `password` | secret | — | **env only** (`MEFOR_STORE_PASSWORD`) |
+| `require_managed_identity` | bool | `false` | delegated-identity precondition (#203, ASVS 13.2.1/13.3.2): when `true`, `serve` **refuses** (production) / **warns** (non-production) unless the store authenticates via a managed identity — SQL Server `auth = integrated`/`entra`. SQLite is exempt; Postgres cannot satisfy it. Off by default |
 | `encrypt`, `trust_server_certificate` | bool | `true`/`false` | TLS to the DB |
+| `ssl_root_cert` | path | — | server DBs — pin the DB server's certificate by **file** so a private/self-signed DB CA verifies **without** a machine-wide trust import, on the **secure** posture only (`encrypt = true`, `trust_server_certificate = false`) — it never disables verification. **Postgres:** an asyncpg `SSLContext` CA-bundle (chain + hostname still checked). **SQL Server:** the ODBC Driver **18.1+** `ServerCertificate` keyword (a leaf/exact-cert match; needs driver ≥ 18.1). Rejected for SQLite (no TLS); a missing file fails loud at load. A path, not a secret — may live in the file. See [`DEPLOY-SERVER-DB.md` §5](DEPLOY-SERVER-DB.md). |
 | `pool_size` | int | 40 | server DBs — **server-DB only** (no-op on SQLite). The inverted-U optimum (raised from 5; do **not** set higher — over-provisioning is catastrophic, [ADR 0062](adr/0062-default-store-pool-size.md)). **Per engine:** `engines × pool_size` share one `max_connections` — see [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §3 |
 | `connect_timeout`, `command_timeout` | int (s) | 15 / 30 | server DBs |
 | `warm_pool` | bool | `true` | server DBs — pre-open pooled connections in the background on graph start/promotion so a connection burst (the post-promotion delivery workers, or a cold start) finds them warm instead of paying cold connects (TCP+TLS+login). Best-effort, self-releasing, **no-op on SQLite**. On by default (it touches no commit/correctness seam); set `false` to opt out on a connection-constrained/licensed site. |
@@ -370,8 +372,9 @@ password is a **secret** supplied via env (`MEFOR_AUTH_AD_BIND_PASSWORD`), never
 | `phi_read_rate_limit_per_actor` | int | 120 | max PHI reads per user per window (generous — clears console/human use; `0` disables this dimension) |
 | `phi_read_rate_limit_global` | int | 0 | max PHI reads across all users per window (`0` = off) |
 | `phi_read_rate_limit_window_seconds` | float | 60 | sliding-window length |
-| `notify_security_events` | bool | `true` | email the affected user on lockout / first-success-after-failures / password-email-role-disable changes (ASVS 6.3.5/6.3.7). Reuses the `[alerts]` SMTP transport, sent to the user's own address; no SMTP configured → email skipped. The `GET /me/security-events` feed (over the audit log) is always available regardless of this toggle. |
-| `require_mfa` | bool | `false` | require a native **TOTP** second factor for the **Administrator** role (WP-14, ASVS 6.3.3). Off by default (preserves loopback behavior byte-for-byte); turn on for an off-loopback bind that serves local accounts. **`serve` enforces the posture at exposure:** an **off-loopback** PHI bind with this off **refuses to start** in production and **warns** in a non-production PHI environment (synthetic stays quiet), like the keyless-store / open-egress gates. Safe to enable even AD-only — it gates only local Administrator accounts. Non-admins may opt in by enrolling. AD/Kerberos MFA is delegated to the directory (never an engine TOTP). See [SECURITY.md](SECURITY.md) "Multi-factor authentication". |
+| `notify_security_events` | bool | `true` | email the affected user on lockout / first-success-after-failures / password-email-role-disable changes (ASVS 6.3.5/6.3.7). Reuses the `[alerts]` SMTP transport, sent to the user's own address; no SMTP configured → email skipped. The `GET /me/security-events` feed (over the audit log) is always available regardless of this toggle. On a **PHI production** instance this push must be *effective* — see `[alerts].security_notifications_required` (BACKLOG #188). |
+| `require_mfa` | bool | `true` | require a native **TOTP** second factor for the **Administrator** role (WP-14, ASVS 6.3.3). **Default ON (secure-by-default, BACKLOG #187) — including the loopback bind** (an intentional change from the pre-#187 byte-identical-loopback posture). It cannot lock out a fresh admin: a required-but-unenrolled Administrator still reaches the enroll/confirm routes (gated by an action-bound password step-up, not the MFA gate), so the bootstrap admin enrolls then satisfies it. **Documented org opt-out: `require_mfa = false`.** `serve` enforces the posture at exposure: an **off-loopback** PHI bind with this **explicitly opted out** **refuses to start** in production and **warns** in a non-production PHI environment (synthetic stays quiet), like the keyless-store / open-egress gates. Safe to leave on even AD-only — it gates only local Administrator accounts. Non-admins may opt in by enrolling. AD/Kerberos MFA is delegated to the directory (never an engine TOTP). See [SECURITY.md](SECURITY.md) "Multi-factor authentication". |
+| `totp_skew_steps` | int | `0` | TOTP clock-skew tolerance in 30 s steps applied at verify time (BACKLOG #187, ASVS 6.5.5). **Default `0` = STRICT: only the current 30 s step verifies** (tightest replay window — a captured code is valid at most for the rest of its own step). Set `1` (or `2`) — the documented opt-out — to restore RFC-6238 network-delay / clock-drift tolerance (`1` also accepts the immediately-prior and the fast-clock-clamped next step, i.e. the historical ±1 behaviour; the forward step is clamped to the current step so it never advances the single-use high-water mark). Range 0–2. |
 | `mfa_recovery_code_count` | int | 10 | single-use recovery codes minted at TOTP enrollment (the lost-authenticator escape hatch; `0` disables them, leaving an admin reset as the only recovery path). Range 0–50. |
 | `admin_new_ip_step_up` | bool | `false` | admin-interface contextual-risk signal (WP-L3-13, ASVS 8.4.2): when on, a step-up (sensitive admin) request from a client IP the session has not verified from emits an `auth.admin_action_new_ip` audit + notice and **forces a fresh step-up** (a re-verify from that address clears it). Advisory + step-up-forcing only — never changes an RBAC decision, never blocks the non-admin path; the audit + notice fire once per (session, new address). Off by default (byte-identical on loopback — `127.0.0.1` and `::1` are treated as one host); recommended on for an off-loopback admin deployment. See [SECURITY.md](SECURITY.md) "Administrative-interface defense-in-depth". |
 | `ad_enabled` | bool | `false` | turn on Active Directory login |
@@ -419,16 +422,25 @@ the rest are forward-compat placeholders for the future engine broker (accepted-
 | `level` | enum | `info` | log level; never run prod at `debug` (PHI) — `serve` refuses it (Gate #1) |
 | `format` | enum | `text` | stdout rendering: `text` (default) or structured `json` (one object per line). Stdlib only — no structlog |
 | `log_dir` | str | _unset_ | the directory NSSM (or another supervisor) **rotates the engine's captured stdout/stderr into**. The engine never writes log **files** itself (it logs to stdout); set this only to tell it where the supervisor parks them, and `GET /status` then **meters that directory's total bytes + filesystem free space** alongside the DB metrics (#50). Unset = stdout-only, no metering. **Metadata only** — the file contents are never read. |
-| `forward_enabled` | bool | `false` | ship a copy of every record off-box to a syslog/SIEM collector (sec-offbox-log) so evidence survives a host compromise; requires `forward_host` |
-| `forward_host` | str | — | syslog/SIEM collector host (**required** when `forward_enabled`) |
+| `forward_enabled` | bool | _derived_ | ship a copy of every record off-box to a syslog/SIEM collector (sec-offbox-log) so evidence survives a host compromise. **Default-on-when-configured (ADR 0080):** unset ⇒ on iff `forward_host` is set. Set `false` to opt out even with a host; no `forward_host` ⇒ off (stdout-only, unchanged) |
+| `forward_host` | str | — | syslog/SIEM collector host. Setting it turns forwarding on by default (above) |
 | `forward_port` | int | `514` | collector port (1–65535) |
-| `forward_protocol` | enum | `udp` | `udp` (fire-and-forget) or `tcp`. The forwarder never blocks the engine indefinitely: a TCP collector down at startup is skipped with a warning, and a runtime stall is bounded by a socket timeout (record dropped). Synchronous send — prefer `udp`/a local agent for high volume |
+| `forward_protocol` | enum | `udp` | `udp` (fire-and-forget), `tcp`, or **`tls`** (RFC 5425 — native `ssl`-wrapped TCP, ADR 0080). A `tcp`/`tls` collector down at startup is skipped with a warning; a runtime stall is bounded by a socket timeout (record dropped) and the TLS handshake is bounded too, so a wedged collector never blocks the engine. Synchronous send — prefer `udp`/a local agent for high volume |
 | `forward_format` | enum | `json` | wire format sent off-box, independent of stdout `format`. JSON guarantees one record per line; `text` framing is best-effort (multi-line tracebacks span lines) |
+| `forward_tls_ca_file` | str | — | PEM trust anchor for the collector's cert (**required** when `forward_protocol = "tls"` and verification is on). Only this CA is trusted — the public system bundle is **not** loaded, so an on-prem SIEM's private cert is anchored explicitly |
+| `forward_tls_verify` | bool | `true` | verify + hostname-check the collector's certificate. `false` is the documented **insecure** opt-out (`CERT_NONE`, no CA file needed) — lab / pinned-network only |
+| `forward_tls_client_cert` | str | — | optional PEM cert+key chain for **mutual** TLS to the collector |
+| `require_time_sync` | bool | `false` | **opt-in** startup clock-sync gate (ASVS 16.2.2, ADR 0080): before listeners start, probe `ntp_peer` and warn on skew. Requires `ntp_peer`. Default = no-op |
+| `ntp_peer` | str | — | NTP/SNTP host to compare the local clock against (**required** when `require_time_sync`) |
+| `time_sync_max_skew_seconds` | float | `2.0` | \|local − peer\| above this is "skewed" (must be > 0) |
+| `time_sync_fail_closed` | bool | `false` | **refuse to start** (instead of warn) on skew or an unreachable peer. Further opt-in; requires `require_time_sync` |
 | `file`, `max_bytes`, `backups` | str/int | — | **planned** rotation (NSSM captures stdout today) |
 
 > PHI redaction + control-char scrubbing are **always-on handler filters** (not a toggle) applied to
-> **every** sink, including the off-box forwarder; the syslog transport is plaintext, so front it with a
-> local TLS-forwarding agent or a trusted network. See [PHI.md §7](PHI.md#7-logging--phi-redaction).
+> **every** sink, including the off-box forwarder. For an encrypted hop set `forward_protocol = "tls"`
+> (native RFC 5425, no agent needed); alternatively front a plaintext `udp`/`tcp` forward with a local
+> TLS-forwarding agent or a trusted network. See [PHI.md §7](PHI.md#7-logging--phi-redaction) and
+> [ADR 0080](adr/0080-offbox-forwarding-tls-defaults.md).
 
 ### `[retention]`
 Enforced by the engine's retention/purge task ([pipeline/retention.py](../messagefoundry/pipeline/retention.py)).
@@ -440,8 +452,10 @@ so retention is opt-in.
 |---|---|---|---|
 | `messages_days` | int | `0` | past N days, null inbound bodies (`raw`/`summary`/`error`) of **fully-resolved** messages (no `pending`/`inflight` delivery), keeping metadata. `0` = keep |
 | `dead_letter_days` | int | `0` | past N days, null the bodies of **dead-lettered** outbound rows (their own window — a dead row stays replayable until purged). `0` = keep |
+| `allow_unbounded_phi` | bool | `false` | **secure-by-default gate (BACKLOG #186, ASVS 14.2.4).** On a **PHI** instance with `messages_days` **or** `dead_letter_days` left unbounded (`0`), `serve` **refuses to start in production** and **warns** in a non-production PHI env (synthetic/dev is byte-identical). Set `true` to deliberately retain PHI bodies forever — an audited override that downgrades the production refusal to a loud warning. |
 | `state_max_age_days` | int | `0` | past N days, **delete** transform-state entries (ADR 0005) last written before the cutoff — keeps the in-memory state cache + table bounded. A simple global age purge (by `set_at`); per-namespace policy is a follow-up. `0` = keep |
 | `connection_event_retention_hours` | int | `0` | past N **hours**, **delete** `connection_event` rows (the `[diagnostics]` #46 transport/lifecycle log — high-volume under a connect-per-message sender or a probe storm, so its own short window in **hours**, not days). `0` = inherit the `messages_days` body window (the ADR 0021 §7.5 default). |
+| `app_log_days` | int | `0` | past N days, **delete** application **log files** (`.log`/`.txt`, one level) from the configured `[logging].log_dir` (#120). The supervisor (NSSM `AppRotateBytes`) rotates the daily logs by **size** but never by **age**, so the log dir grows unbounded; this bounds it (by file mtime, so the currently-written file is never eligible). `0` = keep. **No-op unless `[logging].log_dir` is set.** Metadata only — file content is never read |
 | `audit_days` | int | `0` | **reserved / not enforced.** The `audit_log` is a tamper-evident hash chain and HIPAA expects ~6-year retention, so audit is **keep-forever by design**; archive-first pruning is a tracked follow-up. Accepted so a forward-looking file still loads |
 | `max_db_mb` | int | `0` | advisory only: warn (WARNING log + an `AlertSink` `storage_threshold` event) when the DB (+ `-wal`/`-shm`) exceeds this. Never auto-deletes. `0` = off |
 | `purge_interval_seconds` | float | `3600` | how often the purge/maintenance loop runs a pass |
@@ -499,6 +513,28 @@ Because the local diff is cheap and PHI-safe it is **on by default** (zero phone
 | `pooled_claim_lane_chunk` | int (1–500) | 256 | Pooled-only: max lanes batch-claimed per claim round-trip (clamped down to the backend store's chunk — SQLite 200, SS/PG 500). |
 | `pooled_max_processing_lanes` | int (≥1) | 256 | Pooled-only: max concurrently-processing lanes per stage (the decrypted-body / crash-exposure bound). |
 | `require_rcsi_for_pooled` | bool | `true` | Pooled-only (SQL Server): fail closed at startup if `READ_COMMITTED_SNAPSHOT` is OFF (the §3.2 correctness proofs assume RCSI on); `false` downgrades to a loud warning + a `/stats` `rcsi_off_degraded` gauge. No-op on SQLite/Postgres. |
+| `credential_fault_policy` | enum | `stop` | **Partner-account-lockout protection** (#109, [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)). What an outbound File/FTP/SFTP sender does on a **permanent credential/auth fault** (bad password, key rejected). `stop` (default) halts the lane **immediately** (not after a streak) and **retains the queued rows un-errored** (they stay pending/claimable, never dead-lettered), so a backlog can't re-authenticate in a loop and trip the partner's account lockout — reusing the STOP muscle (`connection_stopped` alert; reload/restart re-arms the lane once the credential is fixed). `dead_letter` keeps the historical fail-fast (dead-letter just the offending row and advance). A **content**-permanent reject (AR/CR, no-such-dir) is unaffected — it still dead-letters. |
+| `schedule_tick_seconds` | float (>0) | 30.0 | **Active-window scheduler tick** (#147, [ADR 0095](adr/0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)). The reconcile granularity for a connection's per-connection `schedule` (a window boundary is honoured within one tick). Only affects connections that declare a `schedule`; connections with none are byte-identical always-on. |
+
+### `[sandbox]`
+**Opt-in subprocess isolation for Routers/Handlers** ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md),
+BACKLOG #197, ASVS 15.2.5). Routers/Handlers are admin-authored pure Python the engine runs in its own
+address space (the DEK, audit chain, and live sockets live there). `mode="off"` (the default) runs them
+in-process, **byte-identically and with zero overhead**. `mode="subprocess"` runs each inbound's
+Router/Handler in a **persistent per-inbound worker child** (never a per-message fork), enforcing a
+forbidden-import guard (socket/store/crypto), the resource caps below, and a **fail-closed** refusal of
+the live `db_lookup`/`fhir_lookup` bridges (they re-enter the event loop — a subprocess boundary breaks
+that; a Handler needing live enrichment runs with `mode=off`). An isolation denial (forbidden op, cap
+overrun, worker crash) routes the message to `ERROR`/dead-letter **post-ACK** (no NAK, never dropped).
+**Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `mode` | enum | `off` | `off` (in-process, byte-identical, no subprocess) or `subprocess` (persistent per-inbound worker child). |
+| `wall_seconds` | float (>0) | 5.0 | **Authoritative** wall-clock cap per Router/Handler call on **every** platform — the parent kills a worker that overruns it, so a pathological busy-loop can't wedge intake. |
+| `cpu_seconds` | float (>0) | 2.0 | POSIX-only `RLIMIT_CPU` backstop inside the child (a no-op on Windows, where `wall_seconds` governs). |
+| `mem_mb` | int (≥1) or null | 512 | POSIX-only `RLIMIT_AS` address-space cap (MiB) inside the child (no-op on Windows). `null` disables it. |
+| `startup_seconds` | float (>0) | 30.0 | Bound on the one-time child bootstrap (config load + guard install) before start fails closed. |
 
 ### `[diagnostics]`
 The Corepoint-style **event log** (#46) — a metadata-only record of connection lifecycle / pre-ingress
@@ -531,7 +567,7 @@ checked against the resolved (`env()`-substituted) destination.
 | `allowed_http` | list | `[]` | allowed REST/SOAP (HTTP) destination hosts; each entry is `host` (any port) or `host:port` (ADR 0003). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_HTTP` |
 | `allowed_db` | list | `[]` | allowed DATABASE destination servers; each entry is `host` (any port) or `host:port` (ADR 0003). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DB` |
 | `allowed_remote` | list | `[]` | allowed RemoteFile (SFTP/FTP/FTPS) hosts — gates the connector in **both** directions (source poll + destination upload); each entry is `host` (any port) or `host:port`. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_REMOTE` |
-| `deny_by_default` | bool | `false` | **fail-closed master switch**: when `true`, a transport with an **empty** allowlist refuses *every* destination of that type (so each permitted destination, dial-out source, and `db_lookup` server must be listed). Default `false` keeps the per-list opt-in above. |
+| `deny_by_default` | bool | `false` | **fail-closed master switch**: when `true`, a transport with an **empty** allowlist refuses *every* destination of that type (so each permitted destination, dial-out source, and `db_lookup` server must be listed). Default `false` keeps the per-list opt-in above. **On a production PHI instance `serve` flips the *effective* value ON when you have not set it (secure-by-default, BACKLOG #186 — announced on stderr); an outbound with an empty `[egress].allowed_*` list then fails closed at wiring. Set `deny_by_default = false` explicitly to keep allow-any (audited).** |
 
 > `serve` warns at startup in a `prod`/`staging` environment when egress is fully open (no allowlist set
 > **and** `deny_by_default` off) — a transform could then send PHI anywhere. Lock it down with
@@ -581,6 +617,7 @@ best-effort and runs on a background task, so it never blocks or hangs a deliver
 | `email_password` | str | _unset_ | **secret** — supply via `MEFOR_ALERTS_EMAIL_PASSWORD`, never the file |
 | `email_timeout` | num | 30 | seconds per send |
 | `smtp_allowed_hosts` | list | `[]` | egress allowlist for the SMTP host (`[]` = any); parity with `webhook_allowed_hosts` (WP-11c) |
+| `security_notifications_required` | bool | `true` | **secure-by-default gate (BACKLOG #188, ASVS 6.3.5/6.3.7).** On a **PHI** instance, if no effective out-of-band security-notification channel is configured — `[auth].notify_security_events` on **and** `email_smtp_host` + `email_from` set — `serve` **refuses to start in production** and **warns** in a non-production PHI env. Set `false` to accept the pull-only `GET /me/security-events` feed instead (audited). |
 | `realert_seconds` | num | 300 | suppress re-notifying the same (event, connection) more often than this (anti-spam for a flapping lane). A matching rule's `cooldown_seconds` overrides it. |
 | `rules` | list | `[]` | ordered `[[alerts.rules]]` table array — per-event severity, transport routing, thresholds, suppression, cooldown (see below). Empty = today's behaviour (every event → every transport at `warning`). |
 
@@ -660,6 +697,40 @@ warn_days = 45            # start warning 45 days out
 event_type = "cert_expiry"
 severity = "critical"
 transports = ["webhook"]
+```
+
+### `[secret_rotation]`
+Periodic **secret-rotation reminder** ([ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) §5.1) —
+the secret-side twin of [`[cert_monitor]`](#cert_monitor). A TLS cert carries its own expiry, but a
+long-lived secret (the **store data-encryption key** today; connector credentials in a future
+`SecretProvider`) has none, so a stale key can sit unrotated with no in-engine signal. The engine
+periodically compares each tracked secret's operator-recorded **last-rotated date** against its **max
+age** and raises a **`secret_rotation_due`** alert (an [`[alerts]`](#alerts) event — route it with a
+`[[alerts.rules]]` rule) when it is overdue or within `warn_days` of due. It reads only the rotation
+**dates** you configure here — **never any secret value** (PHI-free). This is a *reminder*, not
+enforcement: it never rotates a key or blocks startup (run `rotate-key` to rotate the store DEK).
+
+The store DEK is tracked **deny-by-default**: it is watched only once you set `store_key_last_rotated`.
+On by default with a 14-day look-ahead once a secret is tracked; set `warn_days = 0` to disable.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `warn_days` | int | 14 | alert when a tracked secret is due within this many days; **`0` disables** the reminder |
+| `check_interval_seconds` | num | 86400 | rescan cadence (default 24h); the per-secret re-alert throttle is `[alerts].realert_seconds` |
+| `store_key_last_rotated` | str | — | ISO `YYYY-MM-DD` the store DEK was last rotated; **unset ⇒ the DEK is not tracked** |
+| `store_key_max_age_days` | int | 365 | rotate the store DEK within this many days of `store_key_last_rotated` |
+
+```toml
+[secret_rotation]
+store_key_last_rotated = "2026-01-15"   # when you last ran rotate-key
+store_key_max_age_days = 365            # remind me a year later
+warn_days = 30                          # start 30 days ahead
+
+# Page when the store DEK is overdue for rotation.
+[[alerts.rules]]
+event_type = "secret_rotation"
+severity = "warning"
+transports = ["email"]
 ```
 
 ### `[cluster]` — active-passive HA coordination (Track B)
@@ -773,6 +844,8 @@ nodes automatically:
 | `reclaim_interval_seconds` | num | 30 | how often the **leader** runs the lease-reclaim sweep that recovers crashed nodes' in-flight rows (followers no-op). Must be > 0 |
 | `leader_lease_ttl_seconds` | num | 30 | the leadership lease TTL (active-passive self-fencing). The leader renews to `DB_now + this`; a standby acquires only once the lease has expired (on the DB clock, so node skew is irrelevant). Must be > 0 |
 | `leader_fence_timeout_seconds` | num | 20 | a leader that can't renew within this (its own monotonic clock, no DB I/O) self-fences — the split-brain guard. Must be > 0, `> heartbeat_seconds`, and `< leader_lease_ttl_seconds` |
+| `acquire_delay_seconds` | num | 0 | **leader-preference handicap** (ADR 0096, per-node). Seconds this node waits PAST the lease-expiry time before it may take over an **expired** lease, so a preferred (`0`) node wins the routine take-over race. NEVER delays a renewal by the current leader, and only ever makes a node claim later — so it can't open a two-leader window. Governs take-over of an expired lease only (the first election on an empty table is a plain race). Must be `>= 0`. Surfaced per-node in `/cluster/nodes` |
+| `promotable` | bool | true | **non-promotable standby** flag (ADR 0096, per-node). `false` = this node may never become leader (never inserts/takes-over/renews the lease); a node that somehow already leads steps down cleanly. Use for a warm, passive DR engine. **At least one promotable node must exist** or no node ever acquires the lease. `[dr].activate` cannot be combined with `[cluster].enabled` (a warm DR node is a non-promotable member, not a `[dr]` box). Surfaced per-node in `/cluster/nodes` |
 
 ### `[approvals]`
 Optional **dual-control (maker-checker)** approval for high-value actions (ASVS 2.3.5) — see
@@ -834,10 +907,14 @@ port = 8765
 [logging]
 level = "info"
 format = "json"                       # structured stdout (one JSON object per line)
-forward_enabled = true                # ship a copy off-box to a syslog/SIEM collector
-forward_host = "siem.hospital.local"
-forward_port = 514
-forward_protocol = "tcp"              # udp (default) | tcp
+# Setting forward_host turns forwarding ON by default (ADR 0080); forward_enabled = false opts out.
+forward_host = "siem.hospital.local"  # ship a copy off-box to a syslog/SIEM collector
+forward_port = 6514                   # RFC 5425 syslog-over-TLS default
+forward_protocol = "tls"              # udp (default) | tcp | tls (native RFC 5425, no agent)
+forward_tls_ca_file = "C:/mefor/siem-ca.pem"   # required for tls unless forward_tls_verify = false
+# Opt-in startup clock-sync gate (ASVS 16.2.2) — warns on skew; add fail-closed to refuse start:
+# require_time_sync = true
+# ntp_peer = "ntp.hospital.local"
 
 [retention]
 messages_days = 30      # null inbound bodies after 30 days, keep metadata

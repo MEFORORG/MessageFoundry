@@ -518,14 +518,18 @@ async def test_handler_filters_is_logged_filtered(store: MessageStore, tmp_path:
 # --- MLLP inbound: ACK / strict NACK -----------------------------------------
 
 
-def _mllp_registry(outdir: Path, *, strict: bool = False) -> Registry:
+def _mllp_registry(
+    outdir: Path, *, strict: bool = False, strict_timeout_s: float | None = None
+) -> Registry:
     reg = Registry()
     reg.add_inbound(
         InboundConnection(
             "mllp_in",
             ConnectionSpec(ConnectorType.MLLP, {"host": "127.0.0.1", "port": 0}),
             router="r",
-            validation=Validation(strict=strict, hl7_version="2.5.1"),
+            validation=Validation(
+                strict=strict, hl7_version="2.5.1", strict_timeout_s=strict_timeout_s
+            ),
         )
     )
     reg.add_outbound(
@@ -578,6 +582,43 @@ async def test_strict_validation_nacks(store: MessageStore, tmp_path: Path) -> N
     # so hl7apy error strings that quote an offending field VALUE can't land raw in messages.error.
     errored = (await store.list_messages(channel_id="mllp_in", status=MessageStatus.ERROR.value))[0]
     assert (errored["error"] or "").startswith("strict-validation failed:")
+
+
+async def test_strict_validation_timeout_dead_letters_and_naks(
+    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #89 DoS backstop: a strict validate that outruns the per-connection strict_timeout_s must
+    # dead-letter the message (disposition ERROR, PHI-safe/value-free string) and NAK AE — instead of
+    # pinning the listener behind a hung hl7apy parse. We monkeypatch the MODULE-LOCAL `validate` that
+    # wiring_runner imported (NOT messagefoundry.parsing.validate.validate), so the runner's off-loop
+    # call hits our blocking stand-in. It runs on a worker thread (via to_thread), so a plain
+    # time.sleep here does not stall the event loop — wait_for fires at the tiny 0.05s budget while the
+    # stub thread runs on (the accepted-by-design thread leak, bounded by the size caps in prod).
+    import messagefoundry.pipeline.wiring_runner as wr
+
+    def _hang(*_args: object, **_kwargs: object) -> object:
+        import time
+
+        time.sleep(
+            1.0
+        )  # >> the 0.05s strict_timeout_s below; the wrap trips long before this returns
+        raise AssertionError("validate should have been cancelled by wait_for before returning")
+
+    monkeypatch.setattr(wr, "validate", _hang)
+
+    reg = _mllp_registry(tmp_path / "out", strict=True, strict_timeout_s=0.05)
+    runner = await _run(reg, store)
+    try:
+        port = runner._sources["mllp_in"].sockport  # type: ignore[attr-defined]
+        with pytest.raises(DeliveryError, match="negative ACK"):  # the AE NAK
+            await _mllp_client(port).send(ADT)
+        await _until_message(store, MessageStatus.ERROR.value, channel_id="mllp_in")
+    finally:
+        await runner.stop()
+    assert (await store.stats()) == {}  # dead-lettered pre-ingress, never enqueued for delivery
+    errored = (await store.list_messages(channel_id="mllp_in", status=MessageStatus.ERROR.value))[0]
+    # PHI-safe: the persisted disposition carries only the numeric timeout, never a message field value.
+    assert (errored["error"] or "").startswith("strict-validation timed out")
 
 
 # --- delivery worker: retry / dead-letter ------------------------------------

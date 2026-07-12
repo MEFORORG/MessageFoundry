@@ -109,3 +109,24 @@ Two-way door: if the lens disappoints, phase 1's vocabulary remains independentl
 - **`libcst`-based rewriting** — deferred (dep + DEP-1 cost vs. the splice approach; revisit via ADR amendment if splicing proves brittle).
 - **Notebook (`.ipynb`) authoring surface** — rejected for authoring (a second artifact format); the notebook *rendering* fork stays a #92-side presentation question.
 - **Standalone designer / Theia studio** — rejected for now per the research §7 ranking (parked exit path; nothing here is stranded by a later move since the lens is a custom editor over files).
+
+---
+
+## Addendum (2026-07-10): live-value acquisition (BACKLOG #225)
+
+Phase 2b shipped the lens with the live-value slot **stubbed** (each row rendered the redacted placeholder; no values were fetched). This addendum records how the shipped lens actually obtains those per-row values, wiring #225.
+
+**Decision.** The lens acquires live values by shelling a **second traced dry-run** — `messagefoundry dryrun --trace json` (ADR 0072) — against a chosen **synthetic** sample, and folds the result onto rows. Concretely: the provider runs the trace, filters the invocations to the open module (`invocationsForFile`), folds the per-line assigned locals + `msg[...]` writes into inline annotations (`traceRowValues`), and attaches them to rows by **line containment** via the already-tested `mergeLiveValues` (a trace event on 0-based line *n* belongs to the row whose 1-based `[line_start, line_end]` contains *n+1*).
+
+**Sample selection** reuses the Test Bench's existing pattern — an open dialog defaulting to `messageSetsDir`, `.hl7`-filtered — surfaced as a lens toolbar control ("Pick Sample…"); the pick is remembered and reused across the open lens editors. No new sample manager is introduced.
+
+**Dirty-buffer alignment (skip while unsaved).** The trace reads the module **from disk**, but the rows are projected from the **live buffer** (`lens parse -` over stdin). After an unsaved **structural** edit (insert/delete/move) the buffer's rows shift relative to disk, so the disk trace's line numbers describe the pre-edit file; mapping them onto the shifted rows by line containment would attach a marker to the **wrong row**. A dry-run cannot reflect an unsaved buffer, so the lens **skips** live values while `document.isDirty` (`shouldAttachLiveValues`) — the redacted placeholder stands — and **re-attaches** them on the next save, when `disk == buffer` realigns the coordinates. This is the same "sync on save" guardrail the projection itself follows.
+
+**Rejected alternative — reading `LiveDebugController`'s last-trace state.** The #92 live-debug controller already holds a last trace in memory, so the lens could have read it directly. Rejected: it **couples the lens to the controller's internal state**, and it **only works when live-debug is already toggled on** (the lens must annotate whether or not the user has enabled the live loop). A self-contained second dry-run keeps the lens independent; the extra dry-run is a dev-time preview cost, not a hot path.
+
+**PHI posture — reuses ADR 0072's `--show-phi` redaction gate, adds no second gate, persists nothing (CLAUDE.md §9):**
+- **Redacted by default.** The lens's trace argv **never contains `--show-phi`** (`buildLensTraceArgs` cannot emit it), so the CLI redacts every captured value at the source; the fold renders the same `▸ ⋯` placeholder the #92 inline path uses. This is the same redaction gate as live-debug — not a new one.
+- **Never auto-reveal.** The fold defaults `reveal` off and the provider **always** calls it off; nothing in the lens flips it on or auto-passes `--show-phi`. (A future reveal control, if added, must match live-debug's separate, off-by-default, per-session "reveal values" convention exactly.)
+- **Never persisted.** The trace JSON is consumed **in-memory over stdout** — there is no on-disk trace artifact to leak or accidentally commit.
+- **Synthetic only.** The picker defaults to `messageSetsDir` (PHI-free corpora); tests use synthetic samples exclusively.
+- **Graceful, never an error.** No sample picked, an exec-gated (untrusted) workspace, or a failed/empty trace all yield no values — the rows carry none and the toolbar's redacted placeholder stands; a live-value failure is never surfaced as an error.

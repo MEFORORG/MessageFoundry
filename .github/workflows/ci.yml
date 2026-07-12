@@ -90,6 +90,29 @@ jobs:
       # `push || workflow_dispatch` (NOT `!= 'pull_request'`) so the nightly `schedule` event does NOT
       # re-run this full functional matrix — the cron is reserved for the long load legs only.
 
+      # DELIBERATELY UNGATED — the one step in this job with no `code` condition.
+      #
+      # The ledger gate polices the ADR/BACKLOG number space, and an ADR-only PR is by definition
+      # DOCS-ONLY, so `code == 'false'` and every gated step above is skipped. Gating this one the same
+      # way would skip it on exactly the pull requests it exists to police. It needs only git + stdlib
+      # python (no install), so it costs seconds and runs on every PR.
+      #
+      # It rides inside the already-REQUIRED `test` leg rather than becoming a new required context: a
+      # brand-new required check wedges every PR opened before it existed (see the `ci-gate` roll-up).
+      #
+      # This is the backstop for `git commit --no-verify` and for a branch cut from a stale main — each
+      # branch is internally consistent, and the duplicate number only exists once BOTH have merged, so
+      # only a check against freshly-fetched main can see it.
+      - name: Ledger gate (ADR / BACKLOG number space)
+        if: runner.os == 'Linux'
+        run: |
+          # Only `origin/main` needs fetching: the gate reads it (`git show origin/main:…`, `ls-tree`) and
+          # TWO-dot-diffs it against HEAD. No ancestry is resolved, so the shallow checkout is fine and no
+          # deepening is required -- see the long note in ledger_check.py's tree-access section for why
+          # three-dot was wrong here, and why its failure was silent.
+          git fetch --no-tags --depth=200 origin main
+          python scripts/hooks/ledger_check.py --ci
+
       # PySide6's offscreen platform plugin needs a few system libraries even
       # headless. Linux-only; Windows runners need no equivalent.
       - name: Install Qt offscreen system libraries
@@ -105,7 +128,7 @@ jobs:
       # hosted runners, the persistent on-disk uv cache on a self-hosted runner — keyed on the glob.
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -470,7 +493,7 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -577,12 +600,24 @@ jobs:
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
           MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
           MEFOR_ALLOW_INSECURE_TLS: "1"
+          # If every retry below still crashes, dump the native (C-level) frame so the upstream
+          # pyodbc bug can be diagnosed from the log. faulthandler only DUMPS — it never kills.
+          PYTHONFAULTHANDLER: "1"
         # The staged-pipeline throughput levers (ADR 0057 inline fast-path, ADR 0058 batch-claim, ...) carry
         # reliability-core invariant tests — crash-replay, poison-bound, and the per-lane-FIFO locked-head-
         # BLOCKS (#285) gate — that are MEFOR_TEST_SQLSERVER-gated but live in their OWN files, so the named
         # suites above never picked them up and they ran only on SQLite. Run them here against the real
         # backend. APPEND each new lever's test file per docs/throughput-build-plan.md.
+        #
+        # RETRY WRAPPER: pyodbc 5.3.0 intermittently segfaults in its C parameter-binding path under
+        # py3.14 against the SQL Server 2025 container (upstream mkleehammer/pyodbc#1459, unfixed; 5.3.0
+        # is the newest pyodbc and the first with py3.14 wheels, so there is nothing to bump to). The
+        # crash kills the interpreter, so pytest-rerunfailures can't recover it — retry the WHOLE step at
+        # the process level, but ONLY on a native-crash exit (139 SIGSEGV / 134 SIGABRT); a real failure
+        # (exit 1) is NOT retried, so this never masks a regression. Remove the wrapper when #1459 ships a
+        # fix and the pyodbc floor moves to it. See scripts/ci/retry-native-crash.sh.
         run: >-
+          bash scripts/ci/retry-native-crash.sh
           pytest -v
           tests/test_inline_fast_path.py
           tests/test_batch_claim_fifo.py
@@ -632,7 +667,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -750,7 +785,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -852,7 +887,7 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry; ALTER DATABASE MessageFoundry SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -941,7 +976,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -973,9 +1008,15 @@ jobs:
           # BUILTIN\Users (S-1-5-32-545) write. The in-process config-source trust guard (SEC-003,
           # wiring._assert_safe_config_source_windows) then REFUSES to load it ("writable-by-others
           # path") and `serve` crash-loops to SERVICE_PAUSED, so /health never comes up. Locking the
-          # config dir (strip inheritance -> SYSTEM/Administrators only; the LocalSystem service still
-          # reads it) is the production-correct posture docs/SERVICE.md prescribes, and exercises the
-          # real -LockConfigDir install path rather than the MEFOR_ALLOW_INSECURE_CONFIG_SOURCE dev escape.
+          # config dir (strip inheritance -> SYSTEM/Administrators + the run-as account, RX) is the
+          # production-correct posture docs/SERVICE.md prescribes, and exercises the real -LockConfigDir
+          # install path rather than the MEFOR_ALLOW_INSECURE_CONFIG_SOURCE dev escape.
+          # #224: NO -ServiceAccount and NO -AllowLocalSystem, so this install exercises the NEW DEFAULT -
+          # the least-privilege virtual account NT SERVICE\MessageFoundry (no password). This leg is the
+          # gate for that flip: it proves the virtual account is granted config-read (RX, via the
+          # -LockConfigDir path that now runs AFTER ObjectName so the per-service SID resolves) + data-dir
+          # read/write, gets SeServiceLogonRight, and actually starts and serves /health + MLLP. Pass
+          # -AllowLocalSystem here if a run-as-LocalSystem smoke is ever needed instead.
           .\scripts\service\install-service.ps1 -AppExe $exe -LogLevel INFO -Environment prod -LockConfigDir
           # The shipped samples graph includes a mutual-TLS WS-* SOAP feed (IB_IMMUNIZATION_VXU) whose
           # connector LOADS its client cert at wiring time, so the engine refuses to start the graph

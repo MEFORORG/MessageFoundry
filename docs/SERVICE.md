@@ -132,22 +132,33 @@ If `nssm` isn't on `PATH`, it's the auto-downloaded copy at `<DataDir>\bin\nssm.
 
 ### Run as a least-privilege account (DEPLOY-1)
 
-By default the service runs as **LocalSystem** — the most privileged local account. The engine
-needs only **read** on the config directory and **read/write** on the data directory, so
-LocalSystem grants far more than required and widens the blast radius of any compromise (for
-example, a config module is executed in-process — see *Lock down the config directory* below).
+By default the service now installs under a **least-privilege per-service virtual account** —
+`NT SERVICE\<ServiceName>` (e.g. `NT SERVICE\MessageFoundry`), which needs **no password** (#224). A
+bare install therefore lands on the least-privilege posture with nothing extra to configure:
 
-Install under a dedicated low-privilege account instead. A **virtual service account** needs no
-password and is the simplest option:
+```powershell
+.\scripts\service\install-service.ps1 -Environment prod   # runs as NT SERVICE\MessageFoundry
+```
+
+The engine needs only **read** on the config directory and **read/write** on the data directory, so
+the virtual account grants exactly what is required. The installer **auto-grants the account what it
+needs**: read+execute on the config directory and read/write on the data directory — and, because a
+per-service virtual-account SID does not resolve until the service exists, those ACLs are applied
+**after** the service is registered and its run-as account is set (the manual `icacls` lines below are
+only needed if you point the engine at directories outside those). Running as **LocalSystem** — the
+most privileged local account — widens the blast radius of any compromise (a config module is executed
+in-process — see *Lock down the config directory* below), so it is now an explicit opt-out:
+
+```powershell
+.\scripts\service\install-service.ps1 -Environment prod -AllowLocalSystem   # opt out to LocalSystem
+```
+
+To run under a **different** account (a domain gMSA, a dedicated local user, or another virtual
+account), pass `-ServiceAccount` — it always wins over the default:
 
 ```powershell
 .\scripts\service\install-service.ps1 -Environment prod -ServiceAccount "NT SERVICE\MessageFoundry"
 ```
-
-When `-ServiceAccount` is supplied the install script now **auto-grants the account exactly what it
-needs**: read+execute on the config directory and read/write on the data directory (the manual
-`icacls` lines below are only needed if you point the engine at directories outside those). Omitting
-`-ServiceAccount` still works but prints a loud warning that the service is running as LocalSystem.
 
 ```powershell
 # only if config/data live outside the script-managed paths:
@@ -158,6 +169,26 @@ icacls "C:\ProgramData\MessageFoundry" /grant "NT SERVICE\MessageFoundry:(OI)(CI
 A domain **gMSA** or a dedicated local user works the same way (pass `-ServiceAccountPassword`
 for a password-based account — it's taken as a `SecureString`). The store file itself is further
 restricted to its owner at runtime; account choice governs who that owner is.
+
+**gMSA preflight + "Log on as a service" (#99).** When `-ServiceAccount` names a **gMSA** (a name ending
+in `$`, e.g. `CORP\mefor-svc$`), the installer runs `Test-ADServiceAccount` first (verifying the account
+is installed + usable on this host — run `Install-ADServiceAccount <name>` if not) and then grants the
+account **`SeServiceLogonRight`** ("Log on as a service") via `secedit` before registering — without that
+right the service fails to start with **error 1069**. Both steps are **best-effort and degrade
+gracefully**: on a non-domain / RSAT-less dev box the preflight skips with a message and the install
+proceeds; neither ever aborts. Pass `-SkipGmsaPreflight` when the account is provisioned by a separate
+runbook. The end-to-end SQL-Server-integrated-auth gMSA walkthrough (grant the gMSA a SQL login,
+`[store].auth = "integrated"`) is in [DEPLOY-SERVER-DB.md §1.1](DEPLOY-SERVER-DB.md).
+
+**Default flipped to least-privilege; `-AllowLocalSystem` is the LocalSystem opt-out (#224, built on #99).**
+Omitting both `-ServiceAccount` and `-AllowLocalSystem` now installs under the virtual account
+`NT SERVICE\<ServiceName>` — **not** LocalSystem. To run as LocalSystem you must pass `-AllowLocalSystem`
+explicitly (it prints a warning that LocalSystem is the acknowledged, non-default choice). An existing
+unattended install that already passed `-ServiceAccount` is unaffected; one that relied on the old
+LocalSystem default now needs `-AllowLocalSystem` to keep running as LocalSystem — the recommended
+migration is to accept the new virtual-account default instead. This flip is exercised end-to-end by the
+`windows-service-smoke` CI leg (a bare `-LockConfigDir` install, which now runs under the virtual account,
+must start and serve `/health` + MLLP on both Windows Server SKUs).
 
 ### Protect the store encryption key at rest (WP-11d)
 
@@ -359,8 +390,10 @@ are left in place.
   `Get-Process messagefoundry,python | Format-Table Id,ProcessName,Path`.
 - **`/health` doesn't respond.** Confirm the service is `SERVICE_RUNNING`
   (`nssm status MessageFoundry`) and that nothing else owns port `8765`.
-- **Permissions on the data dir.** The service runs as `LocalSystem` by default, which
-  can read/write `C:\ProgramData\MessageFoundry`. If you point `-DataDir` somewhere the
-  service account can't write, startup fails — pick a writable location, or (recommended)
-  install under a least-privilege `-ServiceAccount` and grant it read/write on the data dir
-  (see *Security hardening* above).
+- **Permissions on the data dir.** The service runs by default as the least-privilege virtual
+  account `NT SERVICE\<ServiceName>`, to which the installer grants read/write on
+  `C:\ProgramData\MessageFoundry` (after registration, once the per-service SID resolves). If
+  you point `-DataDir` somewhere outside the script-managed path, grant that account read/write
+  there too (the installer only ACLs the default data dir), or startup fails — pick a writable
+  location and grant it, or opt out to LocalSystem with `-AllowLocalSystem` (see *Security
+  hardening* above).

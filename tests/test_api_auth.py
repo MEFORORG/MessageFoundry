@@ -33,7 +33,12 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _service(engine: Engine, settings: AuthSettings | None = None) -> AuthService:
-    service = AuthService(engine.store, settings or AuthSettings())
+    # These RBAC/CRUD/step-up tests predate the BACKLOG #187 secure default (require_mfa now ON): they
+    # exercise step-up recency + role enforcement, not the MFA gate, so pin require_mfa=False to keep
+    # the single-factor admin posture they were written against. The MFA-default behaviour (a
+    # required-but-unenrolled admin, and the no-lockout enroll path) is covered by the dedicated MFA
+    # tests below, which pass require_mfa explicitly.
+    service = AuthService(engine.store, settings or AuthSettings(require_mfa=False))
     await service.initialize()  # seeds roles + a bootstrap admin we don't use here
     return service
 
@@ -75,6 +80,16 @@ async def _login(
 
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+async def _reauth(
+    c: httpx.AsyncClient, token: str, *, purpose: str | None = None, password: str = PW
+) -> httpx.Response:
+    """POST /me/reauth. ADR 0077: pass ``purpose`` to mint a single-use grant bound to that action."""
+    body: dict[str, str] = {"password": password}
+    if purpose is not None:
+        body["purpose"] = purpose
+    return await c.post("/me/reauth", json=body, headers=_auth(token))
 
 
 async def test_unauthenticated_is_rejected_but_health_is_open(engine: Engine) -> None:
@@ -136,13 +151,15 @@ async def test_mfa_enroll_confirm_and_step_up_gate(engine: Engine) -> None:
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]
 
-        # Enrollment is step-up gated; the login itself counts as the first credential verification
-        # (sudo-timestamp model), so a just-logged-in session can enroll within the step-up window.
+        # ADR 0077: enrollment binds to a fresh per-action proof, NOT the login window — a per-action
+        # reauth unlocks each step (enroll, then confirm) exactly once (single-use).
+        assert (await _reauth(c, tok, purpose="mfa_enroll")).status_code == 200
         r = await c.post("/me/mfa/enroll", headers=_auth(tok))
         assert r.status_code == 200
         secret = r.json()["secret"]
 
         # Confirm with a live code → activates MFA + returns the one-time recovery codes.
+        assert (await _reauth(c, tok, purpose="mfa_confirm")).status_code == 200
         r = await c.post("/me/mfa/confirm", json={"code": totp.totp(secret)}, headers=_auth(tok))
         assert r.status_code == 200 and len(r.json()["recovery_codes"]) == 10
         st = (await c.get("/me/mfa", headers=_auth(tok))).json()
@@ -170,7 +187,9 @@ async def test_mfa_verify_accepts_recovery_code_once(engine: Engine) -> None:
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
         tok = (await _login(c, "adm")).json()["token"]
+        await _reauth(c, tok, purpose="mfa_enroll")  # ADR 0077: per-action step-up unlocks enroll
         secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
+        await _reauth(c, tok, purpose="mfa_confirm")  # …and a fresh one unlocks confirm
         confirm = await c.post(
             "/me/mfa/confirm", json={"code": totp.totp(secret)}, headers=_auth(tok)
         )
@@ -195,6 +214,7 @@ async def test_mfa_enrollment_requires_explicit_reauth_for_require_mfa_admin(
     # Security review (bootstrap bypass): a require_mfa Administrator's fresh, not-yet-enrolled session
     # is MFA-pending, so it is NOT step-up-fresh — enrollment is refused until an explicit password
     # re-verify. This stops a stolen pre-MFA token from binding an attacker-controlled authenticator.
+    # ADR 0077 tightens this further: the re-verify must be BOUND to the enroll action (single-use).
     service = await _service(engine, AuthSettings(require_mfa=True, login_rate_limit_enabled=False))
     await _add(service, "adm", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
@@ -204,11 +224,46 @@ async def test_mfa_enrollment_requires_explicit_reauth_for_require_mfa_admin(
         # No explicit reauth yet → enroll is step-up-refused (the login no longer seeds step-up here).
         r = await c.post("/me/mfa/enroll", headers=_auth(tok))
         assert r.status_code == 403 and r.headers.get("X-Step-Up-Required") == "1"
-        # Re-prove the password, then enrollment proceeds.
-        r = await c.post("/me/reauth", json={"password": PW}, headers=_auth(tok))
-        assert r.status_code == 200
+        assert r.headers.get("X-Step-Up-Action") == "mfa_enroll"  # names the action to reauth for
+        # A plain (unbound) password re-verify does NOT unlock enroll — the proof must be action-bound.
+        assert (await _reauth(c, tok)).status_code == 200
+        assert (await c.post("/me/mfa/enroll", headers=_auth(tok))).status_code == 403
+        # Re-prove the password BOUND to the enroll action → enrollment proceeds.
+        assert (await _reauth(c, tok, purpose="mfa_enroll")).status_code == 200
         r = await c.post("/me/mfa/enroll", headers=_auth(tok))
         assert r.status_code == 200
+
+
+async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> None:
+    # BACKLOG #187: require_mfa now DEFAULTS ON. A fresh Administrator who has not yet enrolled a second
+    # factor must NOT be locked out — the enroll/confirm routes are gated by an action-bound PASSWORD
+    # step-up, never by the MFA gate, so there is no chicken-and-egg deadlock. Drive the whole escape
+    # path end-to-end under the DEFAULT settings and confirm the admin ends up MFA-enrolled + satisfied.
+    service = await _service(engine, AuthSettings(login_rate_limit_enabled=False))  # require_mfa on
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        lr = (await _login(c, "adm")).json()
+        assert lr["mfa_required"] is True  # proves the default flip is in force for this admin
+        tok = lr["token"]
+        # Unenrolled + MFA-required: a step-up admin op is refused for the MISSING SECOND FACTOR...
+        blocked = await c.post(
+            "/users",
+            headers=_auth(tok),
+            json={"username": "x", "password": PW, "roles": ["viewer"]},
+        )
+        assert blocked.status_code == 403 and blocked.headers.get("X-MFA-Required") == "1"
+        # ...yet the enroll path is reachable via an action-bound password reauth (no MFA gate there).
+        assert (await _reauth(c, tok, purpose="mfa_enroll")).status_code == 200
+        secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
+        assert (await _reauth(c, tok, purpose="mfa_confirm")).status_code == 200
+        confirmed = await c.post(
+            "/me/mfa/confirm", headers=_auth(tok), json={"code": totp.totp(secret)}
+        )
+        assert confirmed.status_code == 200 and confirmed.json()["recovery_codes"]
+        # The admin has escaped the required-but-unenrolled state: MFA is active and — because confirming
+        # marked the session second-factor-satisfied — the session is now usable. No lockout occurred.
+        status = (await c.get("/me/mfa", headers=_auth(tok))).json()
+        assert status["enabled"] is True and status["required"] is True
 
 
 async def test_security_events_feed_payload_is_phi_free(engine: Engine) -> None:
@@ -379,6 +434,232 @@ async def test_viewer_cannot_read_audit_or_manage_users(engine: Engine) -> None:
         h = _auth((await _login(c, "vw")).json()["token"])
         assert (await c.get("/audit", headers=h)).status_code == 403
         assert (await c.get("/users", headers=h)).status_code == 403
+
+
+async def test_permission_inspector_flattens_builtin_and_custom(engine: Engine) -> None:
+    # BACKLOG #177: GET /users/{id}/permissions resolves the FLATTENED effective set
+    # (built-in-role ∪ custom-role ∪ extras) for an arbitrary user via the same Identity.build path
+    # /auth/me uses — and lists the held role ids (built-in + custom:) for troubleshooting.
+    service = await _service(engine)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    role = await service.create_custom_role(
+        display_name="Replay",
+        description=None,
+        permissions=["messages:replay"],
+        actor="test",
+    )
+    subject_id = await service.create_local_user(
+        username="lab",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.VIEWER.value, role.id],
+        actor="test",
+    )
+    await _clear_must_change(service, subject_id)
+    async with _client(engine, service) as c:
+        admin = _auth((await _login(c, "root")).json()["token"])
+        r = await c.get(f"/users/{subject_id}/permissions", headers=admin)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["user_id"] == subject_id and body["username"] == "lab"
+        # held role ids: both the built-in and the custom overlay, sorted
+        assert body["roles"] == sorted([Role.VIEWER.value, role.id])
+        perms = body["permissions"]
+        assert perms == sorted(perms)  # sorted, deduped union
+        # VIEWER's monitoring:read + messages:read, unioned with the custom messages:replay
+        assert {"monitoring:read", "messages:read", "messages:replay"} <= set(perms)
+        # deny-by-default: nothing the catalog gates elsewhere leaked in
+        assert "users:manage" not in perms and "messages:view_raw" not in perms
+        # the inspector matches EXACTLY what that user would see about themselves via /auth/me
+        subject = _auth((await _login(c, "lab")).json()["token"])
+        me = (await c.get("/auth/me", headers=subject)).json()
+        assert me["permissions"] == perms
+
+
+async def test_permission_inspector_requires_users_read(engine: Engine) -> None:
+    # Deny-by-default: a caller lacking the USERS_READ gate (a VIEWER) is refused, like /users.
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)
+    await _add(service, "target", Role.OPERATOR)
+    target = await service.store.get_user_by_username("target")
+    assert target is not None
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "vw")).json()["token"])
+        assert (await c.get(f"/users/{target.id}/permissions", headers=h)).status_code == 403
+
+
+async def test_permission_inspector_unknown_user_404(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        admin = _auth((await _login(c, "root")).json()["token"])
+        assert (await c.get("/users/does-not-exist/permissions", headers=admin)).status_code == 404
+
+
+async def test_audit_query_filters_by_actor_action_and_time(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "root", Role.ADMINISTRATOR)
+    await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0)
+    await engine.store.record_audit("message_view", actor="bob", detail="{}", now=200.0)
+    await engine.store.record_audit("config_reload", actor="alice", detail="{}", now=300.0)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "root")).json()["token"])
+
+        by_actor = (await c.get("/audit?actor=alice", headers=h)).json()["entries"]
+        assert {e["action"] for e in by_actor} == {"message_view", "config_reload"}
+
+        by_action = (await c.get("/audit?action=message_view", headers=h)).json()["entries"]
+        assert {e["actor"] for e in by_action} == {"alice", "bob"}
+
+        windowed = (await c.get("/audit?since=150&until=250", headers=h)).json()["entries"]
+        assert [e["ts"] for e in windowed] == [200.0]
+
+        combo = (await c.get("/audit?actor=alice&action=message_view&until=150", headers=h)).json()[
+            "entries"
+        ]
+        assert len(combo) == 1 and combo[0]["ts"] == 100.0
+
+
+async def test_audit_csv_export_content_and_audit_event(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "auditor", Role.AUDITOR)
+    await engine.store.record_audit("message_view", actor="alice", detail='{"n": 1}', now=100.0)
+    await engine.store.record_audit("config_reload", actor="bob", detail="{}", now=200.0)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "auditor")).json()["token"])
+        resp = await c.get("/audit/export?format=csv&actor=alice", headers=h)
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/csv")
+        assert "attachment" in resp.headers["content-disposition"]
+        lines = [ln for ln in resp.text.splitlines() if ln]
+        assert lines[0] == "ts,actor,action,channel_id,detail"
+        # only alice's row (filtered), and the header row
+        assert len(lines) == 2
+        assert "alice" in lines[1] and "message_view" in lines[1]
+        assert "bob" not in resp.text
+    # the export itself was recorded as an audit.export event attributed to the auditor
+    exports = [dict(r) for r in await engine.store.list_audit(action="audit.export", limit=10)]
+    assert exports and exports[0]["actor"] == "auditor"
+    assert '"count": 1' in exports[0]["detail"]
+
+
+async def test_audit_export_denied_to_unauthorized_role(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        vh = _auth((await _login(c, "vw")).json()["token"])
+        assert (await c.get("/audit/export?format=csv", headers=vh)).status_code == 403
+        oh = _auth((await _login(c, "op")).json()["token"])
+        # an operator can view/operate but is NOT granted audit:export (separation of duties)
+        assert (await c.get("/audit/export?format=csv", headers=oh)).status_code == 403
+
+
+async def test_audit_export_injection_in_filter_is_safe(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "auditor", Role.AUDITOR)
+    await engine.store.record_audit("message_view", actor="alice", detail="{}", now=100.0)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "auditor")).json()["token"])
+        resp = await c.get(
+            "/audit/export?format=csv&actor=alice%27%20OR%20%271%27%3D%271", headers=h
+        )
+        assert resp.status_code == 200
+        lines = [ln for ln in resp.text.splitlines() if ln]
+        assert lines == [
+            "ts,actor,action,channel_id,detail"
+        ]  # header only — payload matched nothing
+    # the seeded row survived; the table was not dropped/altered
+    assert len(await engine.store.list_audit(action="message_view")) == 1
+
+
+def test_csv_safe_neutralizes_formula_triggers() -> None:
+    # CWE-1236 CSV/formula injection: a cell whose first non-space char is =/+/-/@ (or a raw leading
+    # TAB/CR/LF) gets a single-quote prefix so a spreadsheet renders it as literal text.
+    from messagefoundry.api.auth_routes import _csv_safe
+
+    assert _csv_safe("=cmd|'/c calc'!A1") == "'=cmd|'/c calc'!A1"
+    assert _csv_safe("+1234") == "'+1234"
+    assert _csv_safe("-2+3") == "'-2+3"
+    assert _csv_safe("@SUM(A1)") == "'@SUM(A1)"
+    assert _csv_safe("   =evil()") == "'   =evil()"  # trigger behind leading spaces
+    assert _csv_safe("\t=evil()") == "'\t=evil()"  # raw leading TAB is itself a trigger
+    # benign values (incl. a plain float ts and a leading-digit string) pass through untouched
+    assert _csv_safe("alice") == "alice"
+    assert _csv_safe("message_view") == "message_view"
+    assert _csv_safe('{"n": 1}') == '{"n": 1}'
+    assert _csv_safe(100.0) == 100.0
+    assert _csv_safe("") == ""
+
+
+async def test_audit_export_neutralizes_formula_injection_in_cells(engine: Engine) -> None:
+    # A malicious actor name that reaches a stored audit row must come back neutralized in the CSV so it
+    # can't execute when a compliance officer opens audit-export.csv in Excel/Sheets (CWE-1236).
+    service = await _service(engine)
+    await _add(service, "auditor", Role.AUDITOR)
+    payload = "=cmd|'/c calc'!A1"
+    await engine.store.record_audit("message_view", actor=payload, detail="{}", now=100.0)
+    await engine.store.record_audit("message_view", actor="alice", detail="{}", now=200.0)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "auditor")).json()["token"])
+        resp = await c.get("/audit/export?format=csv", headers=h)
+        assert resp.status_code == 200
+        # the malicious actor cell is prefixed with an apostrophe so the spreadsheet treats it as text
+        assert "'=cmd|'" in resp.text
+        # no un-neutralized formula cell leaks: the raw payload never begins a field
+        assert ",=cmd|" not in resp.text
+        # a benign actor row is untouched
+        assert "alice" in resp.text
+
+
+async def test_admin_write_is_pace_limited_but_reads_are_not(engine: Engine) -> None:
+    # BACKLOG #193 (ASVS 2.4.2): sensitive admin WRITES are per-actor pace-limited on the step-up gate
+    # (429 over the floor), while GET reads, login, and PHI reads are unaffected. A fresh non-MFA admin
+    # login is step-up-fresh, so PUT /ad-group-map (require_step_up(USERS_MANAGE)) succeeds until the
+    # per-actor limiter trips. Long window + per_actor=2 makes the third write the one that 429s.
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False,
+            login_rate_limit_enabled=False,
+            admin_write_rate_limit_per_actor=2,
+            admin_write_rate_limit_window_seconds=60.0,
+        ),
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "adm")).json()["token"])
+        body = {"entries": []}
+        assert (await c.put("/ad-group-map", json=body, headers=h)).status_code == 200  # 1
+        assert (await c.put("/ad-group-map", json=body, headers=h)).status_code == 200  # 2
+        throttled = await c.put("/ad-group-map", json=body, headers=h)  # 3 — over the floor
+        assert throttled.status_code == 429
+        assert throttled.headers.get("Retry-After")  # a Retry-After hint is returned, not silent
+        # Reads are exempt (method == GET): the same actor can still poll after the write floor trips.
+        assert (await c.get("/ad-group-map", headers=h)).status_code == 200
+        assert (await c.get("/stats", headers=h)).status_code == 200
+        # Login is not paced by the admin-write floor either (a separate limiter, disabled here).
+        assert (await _login(c, "adm")).status_code == 200
+
+
+async def test_admin_write_floor_has_headroom_over_a_legit_burst(engine: Engine) -> None:
+    # BACKLOG #193 floor tuning: at the DEFAULT floor a realistic operator burst — including the extra
+    # write the 403 → POST /me/reauth → retry pattern costs, plus the reauth itself (a POST, but NOT a
+    # require_step_up route, so it is uncounted) — must NOT 429. A handful of sensitive writes plus a
+    # reauth stay comfortably under the default per_actor floor (12/second).
+    service = await _service(
+        engine, AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "adm")).json()["token"]
+        h = _auth(token)
+        body = {"entries": []}
+        assert (await _reauth(c, token)).status_code == 200  # uncounted (not a step-up route)
+        # Six sensitive writes back-to-back — twice the worst-case reauth-retry cost — all pass.
+        for _ in range(6):
+            assert (await c.put("/ad-group-map", json=body, headers=h)).status_code == 200
 
 
 async def test_change_own_password_revokes_sessions(engine: Engine) -> None:

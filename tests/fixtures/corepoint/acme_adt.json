@@ -1,0 +1,30 @@
+{
+  "format": "corepoint-actionlist",
+  "version": 1,
+  "channels": [
+    {
+      "name": "ACME_ADT",
+      "inbound": {"connector": "mllp", "name": "IB_ACME_ADT", "port": 2600},
+      "destinations": [
+        {"name": "OB_ACME_ADT", "connector": "mllp", "host": "10.20.30.40", "port": 6000}
+      ],
+      "handlers": [
+        {
+          "name": "acme_adt_transform",
+          "actions": [
+            {"class": "ItemCopy", "source": "PID-5.1", "destination": "NK1-2.1"},
+            {"class": "ItemReplace", "target": "MSH-6", "value": "ACME"},
+            {"class": "ItemAppend", "target": "MSH-3", "suffix": "_IMPORTED"},
+            {"class": "ItemFormatDate", "target": "PID-7", "outputFormat": "%Y%m%d"},
+            {"class": "ItemConvert", "target": "PID-5.2", "mode": "upper"},
+            {"class": "ItemCodeLookup", "target": "PID-8", "table": {"M": "male", "F": "female"}, "default": "unknown"},
+            {"class": "ItemSplit", "source": "PID-5", "separator": "^", "destinations": ["PID-5.1", "PID-5.2"]},
+            {"class": "SegmentCopy", "segment": "NK1"},
+            {"class": "SegmentDelete", "segment": "Z01"},
+            {"class": "ItemCustomScript", "target": "OBX-5", "script": "return v.trim()"}
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -20,6 +20,13 @@ HTTP status + a redacted host (the response body may echo the token). The privat
 ``env()`` (``smart_private_key`` is in ``_SECRET_SETTING_KEYS``); only the public-verifiable signature
 and the registered ``kid`` leave the box.
 
+**Trust boundary (ASVS 10.4.16).** The authorization server named by ``token_url`` is **trusted and
+operator-pinned** — the engine takes an explicit ``token_url`` (no ``.well-known`` discovery, so it can't
+be redirected to a rogue AS), gates it through the fail-closed ``[egress].allowed_http`` allowlist (the
+signed ``client_assertion`` only ever POSTs to an allow-listed host), and — per RFC 7523 / SMART — sets
+the assertion ``aud`` to that same ``token_url`` by default (:attr:`SmartBackendTokenProvider.audience`),
+so the credential is bound to the pinned endpoint and is not replayable at another AS.
+
 **Out of scope (ADR 0024):** SMART App Launch (the human-user browser flow), the SMART
 authorization/resource server, JWKS hosting, ``.well-known`` discovery (the MVP takes an explicit
 ``token_url``), and Bulk Data ``$export`` (a later read client that reuses this same provider).

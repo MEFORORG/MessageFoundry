@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -507,6 +508,62 @@ async def test_route_handoff_no_handlers_sets_unrouted(store: MessageStore) -> N
     assert (await store.get_message(mid))["status"] == MessageStatus.UNROUTED.value
     cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue WHERE message_id=?", (mid,))
     assert (await cur.fetchone())["n"] == 0  # ingress consumed, no routed rows
+
+
+async def test_all_declined_finalizes_unrouted(store: MessageStore, tmp_path: Path) -> None:
+    """ADR 0084 AC-2 (the ratified §4 disposition shift). When EVERY handler the Router selected
+    declines via its ``accepts=`` predicate, no routed row is ever materialized, so the message falls
+    to the router worker's existing ``ROUTED if names else UNROUTED`` line — **UNROUTED**, not
+    FILTERED (which requires a prior ROUTED stamp: ``_finalize_from_message_status``).
+
+    The count-and-log invariant must still hold end to end, so assert it directly: persisted RECEIVED
+    **before** any routing happened (the pre-ACK state), then a terminal, listable disposition — never
+    accepted-and-dropped, and never left in flight."""
+    from messagefoundry.config.wiring import InboundConnection, OutboundConnection, Send
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "IB",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path), "pattern": "*.hl7"}),
+            router="r",
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "OB",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path), "filename": "x.hl7"}),
+        )
+    )
+    reg.add_router("r", lambda m: ["h1", "h2"])  # the Router SELECTS two…
+    for h in ("h1", "h2"):
+        reg.add_handler(h, lambda m: Send("OB", str(m)), lambda m: False)  # …both DECLINE
+    reg.validate()
+
+    mid = await store.enqueue_ingress(channel_id="IB", raw=RAW, control_id="MSG1")
+    # The ACK-on-receipt state: durably RECEIVED before the router ever runs (inbound counts intact).
+    assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
+
+    item = await _claim_ingress(store, "IB")
+    assert item is not None
+    await RegistryRunner(reg, store)._process_ingress_item("IB", item)
+
+    msg = await store.get_message(mid)
+    assert msg["status"] == MessageStatus.UNROUTED.value  # the §4 ruling — not FILTERED
+    assert msg["raw"] == RAW  # the raw is preserved for the operator
+    # Terminal: the ingress row was consumed in the handoff and no routed row was ever created — the
+    # 2 transactions per declining handler are simply never spent (ADR 0051's 2H term).
+    cur = await store._db.execute("SELECT COUNT(*) AS n FROM queue WHERE message_id=?", (mid,))
+    assert (await cur.fetchone())["n"] == 0
+    # Listable + logged (never accepted-and-dropped), and the disposition is a real logged event.
+    assert mid in {m["id"] for m in await store.list_messages(status=MessageStatus.UNROUTED.value)}
+    assert "unrouted" in [e["event"] for e in await store.events_for(mid)]
+
+    # The finalizer cannot relabel it: FILTERED is reachable ONLY through a prior ROUTED stamp, and
+    # this message was never stamped ROUTED. Re-driving the finalizer must leave UNROUTED standing.
+    await store._maybe_finalize_message(mid, time.time())
+    assert (await store.get_message(mid))["status"] == MessageStatus.UNROUTED.value
 
 
 async def test_route_handoff_idempotent_against_restart(store: MessageStore) -> None:

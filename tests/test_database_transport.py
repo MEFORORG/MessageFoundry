@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -28,7 +29,9 @@ from messagefoundry.transports.database import (
     DatabaseDestination,
     DatabaseSource,
     _bind_params,
+    _build_connection,
     _build_dsn,
+    _build_odbc_dsn,
     _classify_db_error,
     _is_transient,
     _parse_named_params,
@@ -135,6 +138,176 @@ def test_build_dsn_weak_tls_allowed_with_escape(monkeypatch: pytest.MonkeyPatch)
 def test_build_dsn_bad_auth() -> None:
     with pytest.raises(ValueError):
         _build_dsn({"server": "s", "database": "d", "auth": "kerberos"})
+
+
+# --- generic ODBC dialect (#66) ---------------------------------------------
+
+
+def test_build_connection_sqlserver_is_byte_identical() -> None:
+    # The default dialect must be byte-identical to the SQL Server preset (_build_dsn) + report weakened.
+    s = {"server": "sql.example.com", "database": "MFDB", "username": "u", "password": "p"}
+    dsn, weakened = _build_connection(dict(s))
+    assert dsn == _build_dsn(dict(s))
+    assert weakened is False
+
+
+def test_build_connection_dispatches_generic() -> None:
+    s = {"dialect": "generic", "odbc_driver": "PostgreSQL Unicode", "server": "db.example"}
+    dsn, weakened = _build_connection(dict(s))
+    assert dsn == _build_odbc_dsn(dict(s))
+    # Generic path never reports weakened — TLS is the operator's responsibility on this path.
+    assert weakened is False
+
+
+def test_build_connection_rejects_unknown_dialect() -> None:
+    with pytest.raises(ValueError, match="dialect must be"):
+        _build_connection({"dialect": "mongo", "server": "s"})
+
+
+def test_build_odbc_dsn_postgres_shape() -> None:
+    dsn = _build_odbc_dsn(
+        {
+            "odbc_driver": "PostgreSQL Unicode",
+            "server": "db.example",
+            "database": "mefor",
+            "username": "svc",
+            "password": "pw",
+            "odbc_params": {"PORT": 5432, "SSLmode": "verify-full"},
+        }
+    )
+    assert "DRIVER={PostgreSQL Unicode}" in dsn
+    assert "SERVER=db.example" in dsn and "SERVER={" not in dsn  # host unbraced, like the SS preset
+    assert "DATABASE={mefor}" in dsn
+    assert "UID={svc}" in dsn and "PWD={pw}" in dsn  # default credential keywords
+    assert "PORT={5432}" in dsn and "SSLmode={verify-full}" in dsn
+    # No SQL-Server TLS keywords are forced onto the generic path.
+    assert "Encrypt=" not in dsn and "TrustServerCertificate=" not in dsn
+
+
+def test_build_odbc_dsn_no_weak_tls_refusal() -> None:
+    # A generic DSN with no TLS keyword is NOT refused (unlike the SQL Server preset with encrypt=false)
+    # — MessageFoundry cannot introspect an arbitrary driver's TLS posture; the operator owns it.
+    dsn = _build_odbc_dsn({"odbc_driver": "MySQL ODBC 8.0 Unicode Driver", "server": "db.example"})
+    assert dsn.startswith("DRIVER={MySQL ODBC 8.0 Unicode Driver};SERVER=db.example")
+
+
+def test_generic_dsn_warns_when_no_tls_keyword(caplog: pytest.LogCaptureFixture) -> None:
+    # Fail-safe visibility (#66 review): the generic path can't enforce/introspect TLS, so with no
+    # ssl/tls/encrypt keyword in odbc_params it must WARN loudly rather than silently cross in plaintext.
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        _build_odbc_dsn({"odbc_driver": "PostgreSQL Unicode", "server": "db.example"})
+    assert any("TLS verification is NOT enforced" in r.getMessage() for r in caplog.records)
+
+
+def test_generic_dsn_no_warn_when_tls_keyword_present(caplog: pytest.LogCaptureFixture) -> None:
+    # An operator who set a TLS keyword (SSLmode) has taken ownership → no WARNING (DEBUG only).
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        _build_odbc_dsn(
+            {
+                "odbc_driver": "PostgreSQL Unicode",
+                "server": "db.example",
+                "odbc_params": {"SSLmode": "verify-full"},
+            }
+        )
+    assert not any("TLS verification is NOT enforced" in r.getMessage() for r in caplog.records)
+
+
+def test_build_odbc_dsn_custom_credential_keywords() -> None:
+    dsn = _build_odbc_dsn(
+        {
+            "odbc_driver": "MySQL ODBC 8.0 Unicode Driver",
+            "server": "db.example",
+            "username": "svc",
+            "password": "pw",
+            "odbc_user_key": "USER",
+            "odbc_password_key": "PASSWORD",
+        }
+    )
+    assert "USER={svc}" in dsn and "PASSWORD={pw}" in dsn
+
+
+def test_build_odbc_dsn_requires_driver() -> None:
+    with pytest.raises(ValueError, match="requires an 'odbc_driver'"):
+        _build_odbc_dsn({"server": "db.example"})
+
+
+def test_build_odbc_dsn_brace_quotes_values() -> None:
+    # An injection attempt in a param value can't close the brace early (the inner } is doubled).
+    dsn = _build_odbc_dsn(
+        {"odbc_driver": "PostgreSQL Unicode", "server": "db.example", "password": "p};DROP"}
+    )
+    assert "PWD={p}};DROP}" in dsn
+
+
+@pytest.mark.parametrize("bad", ["host;x", "host{x", "host=x", "host\nx"])
+def test_build_odbc_dsn_rejects_server_injection(bad: str) -> None:
+    with pytest.raises(ValueError, match="server must not contain"):
+        _build_odbc_dsn({"odbc_driver": "PostgreSQL Unicode", "server": bad})
+
+
+@pytest.mark.parametrize("bad_key", ["a;b", "a=b", "a{b", "1abc", "a\nb"])
+def test_build_odbc_dsn_rejects_bad_param_key(bad_key: str) -> None:
+    with pytest.raises(ValueError, match="not a valid ODBC keyword"):
+        _build_odbc_dsn(
+            {"odbc_driver": "PostgreSQL Unicode", "server": "s", "odbc_params": {bad_key: "v"}}
+        )
+
+
+@pytest.mark.parametrize("reserved", ["DRIVER", "server", "Database"])
+def test_build_odbc_dsn_rejects_reserved_param_key(reserved: str) -> None:
+    with pytest.raises(ValueError, match="must not set"):
+        _build_odbc_dsn(
+            {"odbc_driver": "PostgreSQL Unicode", "server": "s", "odbc_params": {reserved: "v"}}
+        )
+
+
+def test_generic_destination_builds_without_database() -> None:
+    # The generic dialect may omit `database` (e.g. Oracle service name) — the destination still builds.
+    d = build_destination(
+        Destination(
+            name="OB_DB_GEN",
+            type=ConnectorType.DATABASE,
+            settings=Database(
+                server="db.example",
+                dialect="generic",
+                odbc_driver="PostgreSQL Unicode",
+                statement=INSERT,
+                odbc_params={"PORT": "5432"},
+            ).settings,
+        )
+    )
+    assert isinstance(d, DatabaseDestination)
+    assert d._dialect == "generic"
+    assert d._weakened_tls is False  # generic never crosses the weakened-TLS machinery
+
+
+def test_sqlserver_destination_still_requires_database() -> None:
+    with pytest.raises(ValueError, match="requires a 'database'"):
+        build_destination(
+            Destination(
+                name="OB_DB_SS",
+                type=ConnectorType.DATABASE,
+                settings=Database(server="db.example", statement=INSERT).settings,
+            )
+        )
+
+
+def test_generic_destination_dsn_has_no_sqlserver_tls() -> None:
+    d = _dest(dialect="generic", odbc_driver="PostgreSQL Unicode", database="mefor")
+    assert "Encrypt=" not in d._dsn and "DRIVER={PostgreSQL Unicode}" in d._dsn
+
+
+def test_database_odbc_params_reject_envref() -> None:
+    from messagefoundry.config.wiring import env
+
+    with pytest.raises(WiringError, match="may not use env"):
+        Database(
+            server="db.example",
+            dialect="generic",
+            odbc_driver="PostgreSQL Unicode",
+            statement=INSERT,
+            odbc_params={"SSLmode": env("pg_sslmode")},
+        )
 
 
 @pytest.mark.parametrize("missing", ["server", "database", "statement"])

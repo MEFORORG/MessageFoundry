@@ -78,6 +78,17 @@ class ConfigCodeLensProvider implements vscode.CodeLensProvider {
     const lenses: vscode.CodeLens[] = [];
     for (const el of findElements(document.getText())) {
       const range = new vscode.Range(el.line, 0, el.line, 0);
+      // Handlers get the Steps toggle first, so the row reads as a toolbar: View as Steps · Test · Validate · Insert.
+      if (el.kind === "handler") {
+        lenses.push(
+          new vscode.CodeLens(range, {
+            title: "$(list-tree) View as Steps",
+            tooltip: "Open this Handler as the read-only Steps view (ADR 0076)",
+            command: "messagefoundry.openSteps",
+            arguments: [document.uri],
+          }),
+        );
+      }
       lenses.push(
         new vscode.CodeLens(range, {
           title: "$(beaker) Test Bench",

@@ -96,6 +96,9 @@ def _make_store(conn: _FakeConn, events: list[str]) -> SqlServerStore:
     store._pool = _FakePool(conn, events)  # type: ignore[assignment]
     store._settings = types.SimpleNamespace(command_timeout=0)  # type: ignore[assignment]
     store._acquire_wait = AcquireWaitHistogram()
+    # A1 live cost counters — normally set by __init__ (bypassed here); _commit bumps committed_txns.
+    store.committed_txns = 0
+    store.body_copies = 0
     return store
 
 

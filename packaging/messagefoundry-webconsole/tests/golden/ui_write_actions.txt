@@ -9,6 +9,7 @@
 ^/ui/connections/purge-confirm$
 ^/ui/dead-letters/[^/?#]+(/[^/?#]+)?/replay$
 ^/ui/dead-letters/replay-all$
+^/ui/messages/[^/?#]+/edit$
 ^/ui/messages/[^/?#]+/replay$
 ^/ui/messages/search$
 ^/ui/roles/[^/?#]+/edit$

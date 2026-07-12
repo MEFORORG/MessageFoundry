@@ -181,7 +181,7 @@ def probe_console_gui() -> ProbeResult:
 
 def probe_console_no_window() -> ProbeResult:
     """F7 — the console's service-control subprocess path passes CREATE_NO_WINDOW (no flash)."""
-    src = _REPO_ROOT / "messagefoundry" / "console" / "service_control.py"
+    src = _REPO_ROOT / "messagefoundry" / "service.py"
     if not src.is_file():
         return ProbeResult(Status.ERROR, f"expected source not found: {src}")
     text = src.read_text(encoding="utf-8")
