@@ -15,11 +15,11 @@ Split out of the monolithic [MULTISESSION-PLAN-11](../MULTISESSION-PLAN-11.md) o
 | 2 | [ide-code-sets-editors](w02-ide-code-sets-editors.md) | #161 · #162 · #175 | 🚧 Partially built |
 | 3 | [hl7-parsing-serialization](w03-hl7-parsing-serialization.md) | #107 · #108 · #89 | 🚧 Partially built |
 | 3 | [message-replay-resend](w03-message-replay-resend.md) | #123 · #153 | ○ Not started |
-| 4 | [http-outbound-connectors](w04-http-outbound-connectors.md) | #112 · #127 · #68 | ○ Not started |
-| 4 | [auth-audit-rotation-rbac](w04-auth-audit-rotation-rbac.md) | #195 · #177 | 🚧 Partially built |
+| 4 | [http-outbound-connectors](w04-http-outbound-connectors.md) | #112 · #127 · #68 | 🚧 #68 shipped (#970); #112/#127 dropped |
+| 4 | [auth-audit-rotation-rbac](w04-auth-audit-rotation-rbac.md) | #195 · #177 | ✅ Complete (#177 #971) |
 | 5 | [streaming-large-payloads](w05-streaming-large-payloads.md) | #149 | ○ Not started |
 | 5 | [console-display-flags-theme](w05-console-display-flags-theme.md) | #137 · #164 · #133 · #131 | ○ Not started |
-| 6 | [connector-store-backend-breadth](w06-connector-store-backend-breadth.md) | #66 · #160 · #45 | ○ Not started |
+| 6 | [connector-store-backend-breadth](w06-connector-store-backend-breadth.md) | #66 · #160 · #45 | 🚧 #66+#45 shipped (#969); #160 dropped |
 | 6 | [ide-test-bench](w06-ide-test-bench.md) | #84 · #167 · #168 · #132 | ○ Not started |
 | 7 | [connection-lifecycle-scheduling](w07-connection-lifecycle-scheduling.md) | #109 · #147 | ✅ Complete (#966, ADR 0095) |
 | 7 | [log-uploaded-files-console](w07-log-uploaded-files-console.md) | #125 · #126 | ○ Not started |
@@ -29,7 +29,7 @@ Split out of the monolithic [MULTISESSION-PLAN-11](../MULTISESSION-PLAN-11.md) o
 | 11 | [alert-escalation-recipients-templates](w11-alert-escalation-recipients-templates.md) | #81 · #146 · #138 | ○ Not started |
 | 12 | [alert-events-mute-actions](w12-alert-events-mute-actions.md) | #144 · #143 | ○ Not started |
 | 13 | [alert-test-saturation-kpi](w13-alert-test-saturation-kpi.md) | #118 · #93 | ○ Not started |
-| 14 | [cluster-ha-dr-alerts](w14-cluster-ha-dr-alerts.md) | #101 · #145 | ○ Not started |
+| 14 | [cluster-ha-dr-alerts](w14-cluster-ha-dr-alerts.md) | #101 · #145 | ✅ Complete (#101 #977, ADR 0096; #145→P10) |
 | 15 | [shared-named-queues](w15-shared-named-queues.md) | #130 | ○ Not started |
 | 15 | [ai-assist-broker](w15-ai-assist-broker.md) | #95 | ○ Not started |
 | 16 | [handler-sandbox-isolation](w16-handler-sandbox-isolation.md) | #197 | ✅ Complete |

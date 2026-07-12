@@ -6,7 +6,7 @@
 |---|---|
 | **Session** | `auth-audit-rotation-rbac` |
 | **Wave** | 4 |
-| **Status** | **🚧 Partially built** |
+| **Status** | **✅ Complete** |
 | **Effort** | 8 |
 | **Backlog items** | #195 · #177 |
 | **ADR** | Yes — #195 rotation policy. |
@@ -17,7 +17,7 @@
 | Item | Title | Status |
 |---|---|---|
 | #195 | Audit completeness: log all authorization decisions; enforce secret rotation | ✅ shipped #902 (#195a) + #904 (#195b) (PLAN-9 Wave 2) |
-| #177 | Effective-permission inspector for a user | ○ open |
+| #177 | Effective-permission inspector for a user | ✅ shipped #971 — `GET /users/{id}/permissions` reusing the existing flattening (deny-by-default, 403/404) |
 
 ## Owned files / seams
 

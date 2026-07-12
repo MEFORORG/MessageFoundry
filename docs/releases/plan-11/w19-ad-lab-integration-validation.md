@@ -30,7 +30,7 @@
 
 | Item | What it needs | Note |
 |---|---|---|
-| **#224** | Least-priv **virtual** service-account (`NT SERVICE\<name>`) installer default + the S4 ACL-ordering restructure. Rides the **`windows-service-smoke` CI leg**, no AD. | **Overlaps #99(b)** — reconcile: whichever of Session A's `-AllowLocalSystem` flip and #224 lands second must not re-implement the flip. Bundle here so the deployment-hardening validation is one pass. |
+| **#224** | Least-priv **virtual** service-account (`NT SERVICE\<name>`) installer default + the S4 ACL-ordering restructure. Rides the **`windows-service-smoke` CI leg**, no AD. | ✅ **SHIPPED #978 (2026-07-12)** — default flipped, ACL reorder done (built on #99's `-AllowLocalSystem` opt-out; adversarial review verified no #44 startup break). **Smoke validation still owed here:** the `windows-service-smoke` leg is `github.repository == 'MEFORORG'`-gated, so it runs **only on the public-mirror nightly**, never the private repo — confirm it green on the mirror. |
 
 ## Track 1c — AD-adjacent, mockable (domain only makes it realistic; keep demand-gate)
 

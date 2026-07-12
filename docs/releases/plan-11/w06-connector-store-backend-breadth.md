@@ -6,7 +6,7 @@
 |---|---|
 | **Session** | `connector-store-backend-breadth` |
 | **Wave** | 6 |
-| **Status** | **○ Not started** |
+| **Status** | **🚧 Partially built** — #66 + #45 shipped; #160 dropped |
 | **Effort** | 12 |
 | **Backlog items** | #66 · #160 · #45 |
 | **ADR** | No (dep-adding — verify deps first). |
@@ -16,9 +16,9 @@
 
 | Item | Title | Status |
 |---|---|---|
-| #66 | Non-SQL-Server database connectors (Postgres / Oracle / MySQL / ODBC DSN) | ○ open |
-| #160 | Timer-source cron / calendar schedule | ○ open |
-| #45 | Per-store TLS CA-file knob for server-DB backends | ○ open |
+| #66 | Non-SQL-Server database connectors (Postgres / Oracle / MySQL / ODBC DSN) | ✅ shipped #969 — generic-ODBC dialect (no new Python dep; SQL-Server preset byte-identical); native async drivers scoped out |
+| #160 | Timer-source cron / calendar schedule | ⛔ dropped — clean code-first time-filter workaround; #147 scheduler shipped adjacent |
+| #45 | Per-store TLS CA-file knob for server-DB backends | ✅ shipped #969 — SQL Server `ServerCertificate` slice (Postgres half prior); never weakens verification |
 
 ## Owned files / seams
 

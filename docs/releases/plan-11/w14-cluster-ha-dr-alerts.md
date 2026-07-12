@@ -6,7 +6,7 @@
 |---|---|
 | **Session** | `cluster-ha-dr-alerts` |
 | **Wave** | 14 |
-| **Status** | **○ Not started** |
+| **Status** | **✅ Complete** — #101 shipped; #145 → PLAN-10 |
 | **Effort** | 5 |
 | **Backlog items** | #101 · #145 |
 | **ADR** | Yes — #145 AlertSink protocol method; #101 lease-race. |
@@ -16,7 +16,7 @@
 
 | Item | Title | Status |
 |---|---|---|
-| #101 | `[cluster]` leader preference / non-promotable standby | ○ open |
+| #101 | `[cluster]` leader preference / non-promotable standby | ✅ shipped #977 (ADR 0096) — `acquire_delay_seconds` + `promotable` on the expired-lease branch (no two-leader window); default byte-identical |
 | #145 | HA / DR failover event alert | ↪️ deferred → PLAN-10 **ALERTS-OPS** · not yet merged |
 
 ## Owned files / seams

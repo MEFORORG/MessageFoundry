@@ -6,19 +6,19 @@
 |---|---|
 | **Session** | `http-outbound-connectors` |
 | **Wave** | 4 |
-| **Status** | **○ Not started** |
+| **Status** | **🚧 Partially built** — #68 shipped; #112/#127 dropped |
 | **Effort** | 14 |
 | **Backlog items** | #112 · #127 · #68 |
-| **ADR** | Yes — #68 per-message carry. |
+| **ADR** | ADR 0081 amended (#68 rode the shipped metadata bag; no new carry). |
 | **Store schema / 3-backend** | Yes — #68. |
 
 ## Items
 
 | Item | Title | Status |
 |---|---|---|
-| #112 | Outbound forward web-proxy address ('Use Default Web Proxy') | ○ open |
-| #127 | Web-proxy credential types (Basic / Digest / NTLM / Windows) | ○ open |
-| #68 | Dynamic per-message outbound HTTP headers | ○ open |
+| #112 | Outbound forward web-proxy address ('Use Default Web Proxy') | ⛔ dropped — `HTTP_PROXY` env covers the common case |
+| #127 | Web-proxy credential types (Basic / Digest / NTLM / Windows) | ⛔ dropped — depends on #112; env-var/cntlm workaround |
+| #68 | Dynamic per-message outbound HTTP headers | ✅ shipped #970 — per-message headers via the shipped ADR 0081 metadata bag (no new store column; default byte-identical) |
 
 ## Owned files / seams
 
