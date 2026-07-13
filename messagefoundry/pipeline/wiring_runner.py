@@ -249,6 +249,27 @@ def _strict_validate_timeout(ic: InboundConnection) -> float | None:
 _INGRESS_MAX_BYTES = DEFAULT_MAX_MESSAGE_BYTES
 
 
+def _nul_safe_error_raw(raw: bytes, content_type: str, *, text: str | None = None) -> str:
+    """Return a store-bindable ``str`` for a failed-ingress ``raw`` (INGEST-4 / ADR 0028 §168).
+
+    The ERROR/dead-letter paths store a byte view of the rejected body. A latin-1 (or decoded) view
+    that carries a NUL (U+0000) is store-hostile: Postgres REJECTS it at bind (the raise is uncaught,
+    unwinds out of ``_handle_inbound`` into the transport's ``except`` and drops the whole TCP
+    connection with NO ERROR row — a count-and-log violation, CLAUDE.md §2), and SQLite/SQL Server
+    truncate the stored value at the first NUL. U+0000 is the ONLY store-hostile latin-1 codepoint
+    (U+0001..U+00FF ride TEXT/NVARCHAR intact), so we keep the faithful, human-readable view when it
+    is NUL-free and escalate to the ADR 0028 ``mfb64:v1:`` byte-carriage only when a NUL is present —
+    the exact original bytes are then recoverable via ``RawMessage.raw_bytes``. Because ``b"\\x00" in
+    raw`` and ``"\\x00" in raw.decode("latin-1")`` are bijective, the NUL check on the view is exact.
+
+    ``text`` supplies an already-decoded view (the post-decode NUL guard reuses this helper); when
+    omitted the pre-decode ERROR paths get the lossless ``latin-1`` view of the raw bytes."""
+    view = text if text is not None else raw.decode("latin-1")
+    if "\x00" not in view:
+        return view
+    return RawMessage.from_bytes(raw, content_type).raw
+
+
 class _StreamBudgetExceeded(Exception):
     """A very-large-document detach was refused because it would push the aggregate in-flight streaming
     budget ([inbound].stream_inflight_budget_bytes) over its ceiling (#149, ADR 0105 Phase 1a) — the
@@ -2738,7 +2759,7 @@ class RegistryRunner:
             if len(raw) > _INGRESS_MAX_BYTES:
                 await self.store.record_received(
                     channel_id=ic.name,
-                    raw=raw.decode("latin-1"),
+                    raw=_nul_safe_error_raw(raw, ic.content_type.value),
                     status=MessageStatus.ERROR,
                     error=f"ingress exceeds max size ({len(raw)} > {_INGRESS_MAX_BYTES} bytes)",
                     source_type=src,
@@ -2766,9 +2787,25 @@ class RegistryRunner:
         except UnicodeDecodeError as exc:
             await self.store.record_received(
                 channel_id=ic.name,
-                raw=raw.decode("latin-1"),  # lossless byte view — the declared encoding rejected it
+                raw=_nul_safe_error_raw(raw, ic.content_type.value),
                 status=MessageStatus.ERROR,
                 error=f"decode error ({encoding}): {safe_exc(exc)}",
+                source_type=src,
+                message_type=None if hl7v2 else ic.content_type.value,
+            )
+            return None
+
+        if "\x00" in text:
+            # INGEST-4: the body decoded cleanly but carries a NUL (U+0000) — invalid in every text
+            # payload we accept (HL7 v2 field data, JSON, XML 1.0, X12) and store-hostile (Postgres
+            # rejects it at bind → dropped connection; SQLite/SQL Server truncate). Dead-letter it here,
+            # BEFORE Peek.parse and any store write, so text (and every value derived from it) is
+            # NUL-free for the rest of this handler. HTTP owns its own 202/4xx response — no HL7 ACK.
+            await self.store.record_received(
+                channel_id=ic.name,
+                raw=_nul_safe_error_raw(raw, ic.content_type.value, text=text),
+                status=MessageStatus.ERROR,
+                error="ingress body contains a NUL (U+0000), invalid in a text/HL7 payload",
                 source_type=src,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
@@ -2946,9 +2983,7 @@ class RegistryRunner:
             if len(raw) > _INGRESS_MAX_BYTES:
                 await self.store.record_received(
                     channel_id=ic.name,
-                    raw=raw.decode(
-                        "latin-1"
-                    ),  # lossless byte view (same pattern as the decode-error path)
+                    raw=_nul_safe_error_raw(raw, ic.content_type.value),
                     status=MessageStatus.ERROR,
                     error=f"ingress exceeds max size ({len(raw)} > {_INGRESS_MAX_BYTES} bytes)",
                     source_type=src,
@@ -2987,7 +3022,7 @@ class RegistryRunner:
             decode_err = f"decode error ({encoding}): {safe_exc(exc)}"
             mid = await self.store.record_received(
                 channel_id=ic.name,
-                raw=raw.decode("latin-1"),  # lossless byte view — the declared encoding rejected it
+                raw=_nul_safe_error_raw(raw, ic.content_type.value),
                 status=MessageStatus.ERROR,
                 error=decode_err,
                 source_type=src,
@@ -3006,6 +3041,39 @@ class RegistryRunner:
                     ack_phase="decode",
                     ack_body=None,
                     detail=decode_err,
+                )
+            return ack
+
+        if "\x00" in text:
+            # INGEST-4: the body decoded cleanly but carries a NUL (U+0000) — invalid in every text
+            # payload we accept (HL7 v2 field data, JSON, XML 1.0, X12) and store-hostile (Postgres
+            # rejects it at bind, which would unwind out of this handler into the transport and drop the
+            # whole connection with no ERROR row — a count-and-log violation; SQLite/SQL Server truncate
+            # at the first NUL). Dead-letter it here, BEFORE Peek.parse and any store write, so text (and
+            # control_id/summary/strict-fail errors derived from it) is NUL-free for the rest of this
+            # handler. NAK AR mirrors the decode/parse-error precedent for a malformed body.
+            nul_err = "ingress body contains a NUL (U+0000), invalid in a text/HL7 payload"
+            mid = await self.store.record_received(
+                channel_id=ic.name,
+                raw=_nul_safe_error_raw(raw, ic.content_type.value, text=text),
+                status=MessageStatus.ERROR,
+                error=nul_err,
+                source_type=src,
+                message_type=None if hl7v2 else ic.content_type.value,
+            )
+            ack = (
+                build_ack(raw, code="AR", text="invalid NUL in body", ack_mode=ack_mode)
+                if (hl7v2 and reply)
+                else None
+            )
+            if ack is not None and self._capture_ack_enabled(ic):
+                await self._capture_ack(
+                    mid,
+                    ic.name,
+                    ack_code="AR",
+                    ack_phase="decode",
+                    ack_body=None,
+                    detail=nul_err,
                 )
             return ack
 

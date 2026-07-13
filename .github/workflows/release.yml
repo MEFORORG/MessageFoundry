@@ -39,6 +39,19 @@ permissions: {}
 
 jobs:
   release:
+    # Source-repo only. The public mirror carries a copy of this file, and the owner tags the mirror on
+    # its own snapshot sha — which fired this workflow there and red-X'd every tag. The mirror must never
+    # release: PyPI Trusted Publishing is bound to the SOURCE repo + `release.yml`, so a mirror upload is
+    # rejected on an OIDC claim mismatch, and a mirror `gh release create` would publish a release nobody
+    # asked for.
+    #
+    # The guard is INVERTED (`!=` the public slug) on purpose — DO NOT "normalize" it to
+    # `== 'MEFORORG/MessageFoundry'`. scripts/publish/publish.ps1 rewrites the private slug to the
+    # public one across *.yml when it materializes the mirror, so an `==` private-slug test is rewritten
+    # into `== 'MEFORORG/MessageFoundry'` and becomes TRUE exactly where it must be false. This form names
+    # only the public slug, so the rewrite cannot touch it: true on the source repo, false on the mirror.
+    # (Same rewrite-proof shape as ci.yml's `windows service smoke`, which pins itself ON the mirror.)
+    if: github.repository != 'MEFORORG/MessageFoundry'
     runs-on: ubuntu-latest
     permissions:
       contents: write       # create the release + upload its assets
@@ -207,6 +220,11 @@ jobs:
     # until the owner sets up the harness Trusted Publisher AND PUBLISH_HARNESS=true (see the header note),
     # this job still BUILDS + version-checks the wheel and attaches it to the GitHub release, but does not
     # publish — so a missing harness PyPI project can never red a release.
+    #
+    # Source-repo only, same rewrite-proof guard as `release` above (see the rationale there). `needs:
+    # release` already cascades the skip, so this is belt-and-braces: it keeps the harness release from
+    # firing on the mirror even if that dependency is ever dropped.
+    if: github.repository != 'MEFORORG/MessageFoundry'
     needs: release
     runs-on: ubuntu-latest
     permissions:

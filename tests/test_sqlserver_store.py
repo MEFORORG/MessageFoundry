@@ -101,6 +101,50 @@ async def test_binary_carriage_round_trips_nul_bearing(store) -> None:
     assert RawMessage(msg["raw"], "binary").raw_bytes == data
 
 
+# Synthetic HL7 only — never real PHI. \xff makes the first body invalid UTF-8 (decode-error path); the
+# second is valid UTF-8 with a NUL in a PID field (the post-decode guard / happy path).
+_INGEST4_DECODE_ERR_NUL = b"MSH|^~\\&|S|F|R|F|20260101||ADT^A01|MSG1|P|2.5\rPID|1||X\x00Y\xff\r"
+_INGEST4_HAPPY_NUL = b"MSH|^~\\&|S|F|R|F|20260101||ADT^A01|MSG1|P|2.5\rPID|1||X\x00Y\r"
+
+
+def _ingest4_registry() -> Registry:
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            name="IB_HL7",
+            spec=ConnectionSpec(ConnectorType.MLLP, {"host": "127.0.0.1", "port": 0}),
+            router="r",
+        )
+    )
+    reg.add_router("r", lambda m: [])
+    return reg
+
+
+async def test_ingest4_nul_ingress_persists_error_row(store) -> None:
+    # INGEST-4 twin of the Postgres test (mirrored-pair convention: same name/body, backend-specific
+    # comment). SQL Server never RAISED on a NUL — it SILENTLY TRUNCATES the NVARCHAR(MAX) at the first
+    # NUL, so pre-fix the ERROR row persisted but the stored raw was cut mid-body (a fidelity defect, not
+    # a dropped connection). The fix makes that moot: a NUL-bearing body is carried as ADR 0028 base64, so
+    # the ERROR row persists with the EXACT bytes recoverable via raw_bytes — no truncation.
+    from messagefoundry.parsing import RawMessage
+
+    runner = RegistryRunner(_ingest4_registry(), store)
+    ic = runner.registry.inbound["IB_HL7"]
+
+    for body in (_INGEST4_DECODE_ERR_NUL, _INGEST4_HAPPY_NUL):
+        before = {m["id"] for m in await store.list_messages(channel_id="IB_HL7")}
+        ack = await runner._handle_inbound(ic, body)  # must NOT raise
+        assert ack is not None and "MSA|AR" in ack  # AR NAK
+        after = await store.list_messages(channel_id="IB_HL7")
+        new = [m for m in after if m["id"] not in before]
+        assert len(new) == 1
+        erow = new[0]
+        assert erow["status"] == MessageStatus.ERROR.value
+        raw = (await store.get_message(erow["id"]))["raw"]
+        assert "\x00" not in raw and RawMessage(raw, "hl7v2").is_binary
+        assert RawMessage(raw, "hl7v2").raw_bytes == body  # full bytes, no NVARCHAR truncation
+
+
 async def test_record_received_filtered_and_error(store) -> None:
     f = await store.record_received(channel_id="IB", raw=RAW, status=MessageStatus.FILTERED)
     e = await store.record_received(
