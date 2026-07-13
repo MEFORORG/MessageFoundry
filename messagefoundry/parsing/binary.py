@@ -30,7 +30,7 @@ from __future__ import annotations
 import base64
 import binascii
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable, Iterator
 
 if TYPE_CHECKING:
     # Type-only import: keep parsing.message out of this module's *runtime* imports so the dependency
@@ -50,10 +50,27 @@ MARKER = "mfb64:v1:"
 #: carriage value (``is_marked`` / ``RawMessage.is_binary`` go False) and is never re-decoded as binary.
 DOC_TOMBSTONE_MARKER = "mfdoc:v1:pruned:"
 
+#: The self-describing *live document-handle* marker (#149, ADR 0105). When a very-large document is
+#: detached from a message into a content-addressed attachment (in-store chunks, or a #94 external
+#: BLOB), the bulky value is replaced by ``mfdoc:v1:ref:<sha256>:<content-type>`` — a small, ASCII-safe
+#: **live handle** that dereferences to the real bytes (contrast the ``mfdoc:v1:pruned:`` *tombstone*,
+#: a DEAD placeholder for an evicted document). One pointer format + one deref seam serves both the
+#: in-store chunked attachment and #94's external-BLOB offload (ADR 0105 §"unified with #94"). It shares
+#: the ``mfdoc:v1:`` family prefix with the tombstone but its own ``ref:`` discriminator, so
+#: :func:`is_doc_ref` and :func:`is_document_tombstone` never confuse the two.
+DOC_REF_MARKER = "mfdoc:v1:ref:"
+
+#: A content address is a lowercase-hex SHA-256 — 64 hex chars, no ``:`` — so ``mfdoc:v1:ref:<sha256>:
+#: <content-type>`` splits unambiguously on the FIRST ``:`` after the marker (the hash can never contain
+#: one). Validated on build + parse so a malformed handle fails loud rather than dereferencing garbage.
+_SHA256_HEX_LEN = 64
+
 __all__ = [
     "MARKER",
     "DOC_TOMBSTONE_MARKER",
+    "DOC_REF_MARKER",
     "BinaryCarriageError",
+    "DocRefError",
     "encode",
     "decode",
     "is_marked",
@@ -61,9 +78,24 @@ __all__ = [
     "extract_obx_document",
     "is_document_tombstone",
     "make_document_tombstone",
+    "is_doc_ref",
+    "make_doc_ref",
+    "parse_doc_ref",
+    "iter_obx_documents",
+    "chunk_b64",
+    "DETACH_CHUNK_BYTES",
     "strip_documents",
     "strip_documents_in_hl7",
+    "reattach_documents_in_hl7",
 ]
+
+#: Slice size (in base64 characters) the ingress detach cuts an oversized OBX-5.5 document into before
+#: handing the pieces to the store's ``put_attachment`` (#149, ADR 0105 Phase 1a). Each slice is sealed
+#: independently (a bounded plaintext window per AES-GCM seal — the whole document is never materialized
+#: to seal it), and because the content address is the sha256 of the concatenated slices the chunk
+#: boundary is invisible to dedup (any slicing of the same bytes yields the same ref). 1 MiB is a
+#: comfortable seal window; a base64 char is one ASCII byte, so this is ~1 MiB of stored ciphertext.
+DETACH_CHUNK_BYTES = 1024 * 1024
 
 
 class BinaryCarriageError(ValueError):
@@ -71,6 +103,13 @@ class BinaryCarriageError(ValueError):
     base64 that fails to decode (bad padding / non-alphabet content). Subclasses ``ValueError`` so a
     Router/Handler can let it propagate to the **error/dead-letter** path (status ``ERROR``) rather
     than yielding a silently-truncated body — honoring the count-and-log invariant (CLAUDE.md §2)."""
+
+
+class DocRefError(ValueError):
+    """A value could not be parsed as a live document handle (#149, ADR 0105): a missing
+    ``mfdoc:v1:ref:`` marker, or a malformed body (a content address that is not a 64-hex SHA-256).
+    Subclasses ``ValueError`` so a mis-formed handle propagates to the error/dead-letter path rather
+    than dereferencing garbage."""
 
 
 def _b64encode_unbroken(data: bytes) -> str:
@@ -203,6 +242,113 @@ def is_document_tombstone(text: str) -> bool:
     return text.startswith(DOC_TOMBSTONE_MARKER)
 
 
+# --- live document handle (#149, ADR 0105) ----------------------------------------------------------
+# A very-large document detached from a message is replaced in place by a small LIVE handle
+# `mfdoc:v1:ref:<sha256>:<content-type>` (contrast the DEAD `mfdoc:v1:pruned:` tombstone above). These
+# pure helpers just carry the exact bytes — under Approach B (owner ruling, ADR 0105) the attachment
+# holds the OBX-5.5 value VERBATIM, so there is NO decode/encode here: the stored bytes ARE the value;
+# the handle only names the content address + content-type the detach/inflate wiring (Phase 1) resolves
+# through the store's `read_attachment` (in-store chunks) or #94's external-BLOB deref (one seam, both).
+
+
+def is_doc_ref(value: str) -> bool:
+    """Whether ``value`` is a live document handle (carries the ``mfdoc:v1:ref:`` marker). False for a
+    ``mfdoc:v1:pruned:`` tombstone (a DEAD placeholder — its ``pruned:`` discriminator differs) and for
+    a plain value, so the three are cleanly distinguished (mirrors :func:`is_marked` /
+    :func:`is_document_tombstone`)."""
+    return value.startswith(DOC_REF_MARKER)
+
+
+def make_doc_ref(sha256: str, content_type: str) -> str:
+    """Build a live document handle ``mfdoc:v1:ref:<sha256>:<content-type>`` (#149, ADR 0105) for a
+    detached, content-addressed document. ``sha256`` is the content address (the SHA-256 hex of the
+    VERBATIM document bytes — the store's ``attachment`` id, or a #94 external-BLOB key), validated to be
+    64 lowercase-hex chars. ``content_type`` is sanitized of the structural characters (``:`` and HL7
+    delimiters) that would re-split the field or corrupt the handle, mirroring
+    :func:`make_document_tombstone`, so an arbitrary declared content-type can't break the round-trip.
+    Recover the parts with :func:`parse_doc_ref`."""
+    h = (sha256 or "").strip().lower()
+    if len(h) != _SHA256_HEX_LEN or any(c not in "0123456789abcdef" for c in h):
+        raise DocRefError(
+            f"content address must be a {_SHA256_HEX_LEN}-hex SHA-256, got {sha256!r}"
+        )
+    safe_ct = (content_type or _UNKNOWN_CONTENT_TYPE).strip() or _UNKNOWN_CONTENT_TYPE
+    for bad in ":|^~&\\\r\n":
+        safe_ct = safe_ct.replace(bad, "_")
+    return f"{DOC_REF_MARKER}{h}:{safe_ct}"
+
+
+def parse_doc_ref(value: str) -> tuple[str, str]:
+    """A live document handle → ``(sha256, content_type)`` (#149, ADR 0105). Raises :class:`DocRefError`
+    if ``value`` is not a ``mfdoc:v1:ref:`` handle or the content address is not a 64-hex SHA-256. The
+    content address contains no ``:``, so the remainder after the first ``:`` is the (verbatim)
+    content-type — a content-type that somehow carried a ``:`` was sanitized away on
+    :func:`make_doc_ref`, so this split is unambiguous."""
+    if not is_doc_ref(value):
+        raise DocRefError(
+            "not a live document handle (missing mfdoc:v1:ref: marker); check is_doc_ref first"
+        )
+    body = value[len(DOC_REF_MARKER) :]
+    sha256, sep, content_type = body.partition(":")
+    sha256 = sha256.lower()
+    if len(sha256) != _SHA256_HEX_LEN or any(c not in "0123456789abcdef" for c in sha256):
+        raise DocRefError(f"malformed document handle: bad content address in {value!r}")
+    if not sep or not content_type:
+        raise DocRefError(f"malformed document handle: missing content-type in {value!r}")
+    return sha256, content_type
+
+
+# --- ingress document detach (#149, ADR 0105 Phase 1a) ----------------------------------------------
+# The INGRESS-side mechanism: identify each oversized OBX-5 ED base64 document in a parsed Message so the
+# pipeline can DETACH it into the store's attachment substrate (put_attachment) and replace it in place
+# with a small `mfdoc:v1:ref:` handle (make_doc_ref). This is the VERBATIM (Approach B) sibling of
+# strip_documents_in_hl7's tombstone strip: it reuses the SAME OBX-5 ED iteration + Message-model replace,
+# but the value it lifts out is stored byte-for-byte (no decode/encode) so a later delivery can splice the
+# exact bytes back. These helpers stay PURE (Message read/iterate + base64 slicing) — the async store
+# put_attachment + the OBX-5.5 replace are orchestrated by the ingress path (pipeline/), which owns the
+# store. The value returned per document IS the exact OBX-5.5 base64 string: the base64 alphabet carries
+# no HL7 delimiter, so the message's own escaping is a no-op on it and Message.field yields it verbatim.
+
+
+def iter_obx_documents(
+    message: "Message", *, min_b64_len: int = 0
+) -> Iterator[tuple[int, str, str]]:
+    """Yield ``(occurrence, verbatim_base64, content_type)`` for every OBX-5 ED **Base64** document in
+    ``message`` whose base64 length is at least ``min_b64_len`` (#149, ADR 0105 Phase 1a).
+
+    Mirrors :func:`strip_documents_in_hl7`'s qualifying-embed scan (``OBX-2 == "ED"``, ``OBX-5.4`` is
+    ``"Base64"``, ``OBX-5.5`` non-empty and not already a tombstone **or** a live ``mfdoc:v1:ref:``
+    handle — a re-scan of an already-detached skeleton yields nothing, so a re-run is a no-op). The
+    ``content_type`` is the ED type-of-data component (``OBX-5.2``), the same label the tombstone uses.
+    Pure and read-only — the caller does the ``put_attachment`` + ``message.set("OBX-5.5", handle)``."""
+    count = message.count_segments("OBX")
+    for occ in range(1, count + 1):
+        if (message.field("OBX-2", occurrence=occ) or "").upper() != "ED":
+            continue
+        if (message.field("OBX-5.4", occurrence=occ) or "").strip().lower() != _ED_ENCODING.lower():
+            continue  # not Base64-encoded ED — leave it
+        data_b64 = message.field("OBX-5.5", occurrence=occ) or ""
+        if not data_b64 or is_document_tombstone(data_b64) or is_doc_ref(data_b64):
+            continue  # empty / already-stripped / already-detached — idempotent
+        if len(data_b64) < min_b64_len:
+            continue
+        ed_type = message.field("OBX-5.2", occurrence=occ) or _UNKNOWN_CONTENT_TYPE
+        yield occ, data_b64, ed_type
+
+
+def chunk_b64(b64: str, chunk_len: int = DETACH_CHUNK_BYTES) -> Iterator[str]:
+    """Slice a verbatim base64 document into ``chunk_len``-char pieces for ``put_attachment`` (#149, ADR
+    0105 Phase 1a) — a bounded plaintext window per AES-GCM seal, so the whole document is never
+    materialized to seal it. Concatenating the pieces reconstructs the exact input, so the store's
+    content address (sha256 of the concatenation) is invariant to ``chunk_len``. ``chunk_len`` must be
+    positive; a non-empty document yields at least one piece (an empty one yields none — the caller
+    skips empty OBX-5.5 values via :func:`iter_obx_documents`)."""
+    if chunk_len <= 0:
+        raise ValueError("chunk_len must be positive")
+    for i in range(0, len(b64), chunk_len):
+        yield b64[i : i + chunk_len]
+
+
 def strip_documents(
     raw: str,
     *,
@@ -310,3 +456,66 @@ def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int,
     if stripped == 0:
         return raw, 0, 0
     return message.encode(), stripped, reclaimed
+
+
+# --- delivery document re-attach (#149, ADR 0105 Phase 1b) ------------------------------------------
+# The DELIVERY-side inverse of the ingress detach: re-materialize each `mfdoc:v1:ref:` handle in an HL7
+# skeleton back into the full inline document just before it hits the wire, so a partner (Epic's inline
+# MLLP MDM receiver — no frame cap) receives the exact document the sender sent. Under Approach B (owner
+# ruling, ADR 0105) the attachment holds the OBX-5.5 value VERBATIM, so this splices the exact stored
+# base64 back with NO decode/encode — byte-for-byte fidelity, and a re-run/retry re-derives an identical
+# frame (the attachment is immutable + content-addressed). This mirrors `strip_documents_in_hl7`'s OBX-5
+# iteration + Message-model replace, but the `reader` that supplies the bytes is INJECTED so the function
+# stays PURE (no store/I/O import) and unit-testable — the pipeline supplies the async `read_attachment`.
+
+
+async def reattach_documents_in_hl7(
+    text: str, reader: Callable[[str], Awaitable[str | None]]
+) -> str:
+    """Re-materialize every detached document handle in an HL7 body — the delivery-side inverse of the
+    ingress detach (#149, ADR 0105 Phase 1b, Approach B — VERBATIM).
+
+    Scans each ``OBX-5.5``; for every value that is a live ``mfdoc:v1:ref:`` handle (:func:`is_doc_ref`)
+    it parses the content address (:func:`parse_doc_ref`), ``await``\\ s ``reader(sha256)`` for the stored
+    VERBATIM base64 string, and splices it back into ``OBX-5.5`` **byte-for-byte** (no decode/encode — the
+    exact bytes the partner sent; the base64 alphabet carries no HL7 delimiter, so the message's own
+    escaping is a no-op on it). Returns the fully re-materialized HL7 text.
+
+    ``reader`` is an INJECTED ``async`` callable (``sha256 -> verbatim base64``) so this function stays
+    PURE and unit-testable: the caller (``pipeline/``) supplies the async store ``read_attachment`` read
+    (run off the event loop like every store read). **Fail-loud** (owner invariant): if a value LOOKS
+    like a handle but ``reader`` raises **or** returns ``None`` (the attachment is missing / GC'd), a
+    :class:`DocRefError` propagates — the raw ``mfdoc:v1:ref:`` text is **never** emitted (delivering it
+    into a partner's ``OBX-5.5`` would be silent corruption). A malformed handle likewise fails loud via
+    :func:`parse_doc_ref`. A body with **no** handle is returned UNCHANGED (byte-identical), mirroring
+    :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched."""
+    # Local import keeps the one-way dependency (message.py imports binary.py, never the reverse) — the
+    # cycle is broken by importing inside the function, exactly as _strip_obx_ed does.
+    from messagefoundry.parsing.message import Message
+
+    message = Message.parse(text)
+    reattached = 0
+    count = message.count_segments("OBX")
+    for occ in range(1, count + 1):
+        value = message.field("OBX-5.5", occurrence=occ) or ""
+        if not is_doc_ref(value):
+            continue
+        sha256, _content_type = parse_doc_ref(
+            value
+        )  # DocRefError on a malformed handle → fail loud
+        verbatim = await reader(sha256)
+        if verbatim is None:
+            # The handle names a document the store no longer has (missing / GC'd). Fail loud rather
+            # than deliver the raw handle text into the partner's OBX-5.5 (silent corruption).
+            raise DocRefError(
+                f"attachment {sha256!r} not found for re-attach (missing / GC'd); refusing to "
+                "deliver an un-hydrated document handle"
+            )
+        message.set("OBX-5.5", verbatim, occurrence=occ)
+        reattached += 1
+    if reattached == 0:
+        # No handle in any OBX-5.5 — return the ORIGINAL text unchanged (byte-identical). The caller's
+        # DOC_REF_MARKER substring gate may pass on a marker sitting outside an OBX-5.5 ED value; that is
+        # not a detached document, so it is carried through verbatim (mirrors strip's no-op return).
+        return text
+    return message.encode()

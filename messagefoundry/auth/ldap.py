@@ -19,6 +19,7 @@ import ssl
 from dataclasses import dataclass
 from typing import Any
 
+from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AuthSettings,
@@ -81,10 +82,23 @@ def _cn_of(dn: str) -> str | None:
 class LdapAuthenticator:
     """Binds against Active Directory over LDAPS and resolves a user's (nested) group membership."""
 
-    def __init__(self, settings: AuthSettings) -> None:
+    def __init__(
+        self, settings: AuthSettings, *, secret_provider: SecretProvider | None = None
+    ) -> None:
         if not settings.ad_server or not settings.ad_user_search_base:
             raise LdapError("AD is enabled but ad_server / ad_user_search_base are not configured")
-        if not settings.ad_bind_dn or not settings.ad_bind_password:
+        # Resolve the effective service-account bind password ONCE at construction (ADR 0019 §5): from a
+        # [secrets].provider when ad_bind_password_secret is set, else the env-sourced ad_bind_password
+        # (byte-identical when no reference/provider). A configured-but-unresolvable reference fails closed
+        # here (SecretProviderError propagates) — a blank bind is never used. Held on the instance so a
+        # Vault-backed secret is fetched once, not on every authenticate().
+        self._bind_password = resolve_connector_secret(
+            secret_provider,
+            ref=settings.ad_bind_password_secret,
+            literal=settings.ad_bind_password,
+            label="[auth].ad_bind_password",
+        )
+        if not settings.ad_bind_dn or not self._bind_password:
             raise LdapError("AD is enabled but the service-account bind is not configured")
         self._s = settings
         # A disabled-cert-verification posture (ad_tls_verify=false over LDAPS) makes the service-
@@ -120,7 +134,7 @@ class LdapAuthenticator:
         return ldap3.Connection(
             self._server(),
             user=self._s.ad_bind_dn,
-            password=self._s.ad_bind_password,
+            password=self._bind_password,  # resolved once in __init__ (env or [secrets].provider)
             authentication=ldap3.SIMPLE,
             auto_bind=True,
         )

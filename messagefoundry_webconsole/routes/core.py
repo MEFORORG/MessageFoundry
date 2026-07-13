@@ -303,6 +303,23 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return HTMLResponse(pages.parse_tree_unavailable(message_id, str(exc)))
         return HTMLResponse(pages.parse_tree_page(message_id, nodes))
 
+    @app.get("/ui/messages/{message_id}/attachments/{attachment_id}")
+    async def ui_download_attachment(
+        message_id: str,
+        attachment_id: str,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(require_ui(Permission.MESSAGES_VIEW_RAW, phi=True)),
+    ) -> Response:
+        # Reuse the engine's single audited download path (linkage + channel-scope 404 guard +
+        # record_view + attachment_download audit), then hand its Response straight to the browser. A
+        # top-level GET nav can't carry the bearer token, so the /ui gate re-asserts view_raw via the
+        # session cookie; the engine handler does the same PHI audit as the JSON API route.
+        result: Response = await core.download_attachment(
+            message_id, attachment_id, engine=engine, identity=identity
+        )
+        return result
+
     @app.get("/ui/dead-letters", response_class=HTMLResponse)
     async def ui_dead_letters(
         request: Request,

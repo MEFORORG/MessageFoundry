@@ -27,6 +27,7 @@
 // The trace reads the module FROM DISK, so while the buffer is DIRTY (an unsaved edit shifted rows off
 // disk) the lens SKIPS live values rather than mapping stale disk line numbers onto shifted rows (BACKLOG
 // #225) — they re-attach on the next save, when disk == buffer.
+import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
@@ -68,6 +69,15 @@ import {
   type RowKind,
   type StructuralRequest,
 } from "./stepsModel";
+import {
+  loadSchema,
+  loadStructures,
+  segmentsOf,
+  type Hl7Schema,
+  type Hl7Structures,
+} from "./hl7schema";
+import { buildSegmentScope, sampleSegments } from "./hl7scope";
+import { pickHl7Path, type PickScope } from "./hl7Picker";
 
 /** Debounce (ms) before re-parsing after the underlying document changes in a split text view. */
 const RERENDER_DEBOUNCE_MS = 250;
@@ -94,10 +104,49 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
   // a glance (and it bumps per change, so a reinstall is visibly distinct — no more "did the new vsix load?").
   // extensionUri locates media/stepsWebview.js — the webview script is loaded as an EXTERNAL file (via
   // asWebviewUri), NOT inline, so it can never hit the inline-script/CSP class of silent load failures.
+  // The bundled HL7 schema (ADR 0104 §2.3 field picker) + the optional message-structure/verified artifact
+  // (§2.3 P2/P3; `undefined` until that build lands). Loaded once — pure in-memory data, no per-pick I/O.
+  private readonly schema: Hl7Schema | undefined;
+  private readonly structures: Hl7Structures | undefined;
+  // ADR 0104 §2.3 P2: handler name -> its recognized message type, stashed by render() from the lens parse
+  // (a projection of the current parse, never persisted state). Read by scopeFor to rank the picker.
+  private handlerTypes = new Map<
+    string,
+    { acceptsTypes?: string[]; inferredType?: { code?: string; trigger?: string } }
+  >();
+
   constructor(
     private readonly version: string,
     private readonly extensionUri: vscode.Uri,
-  ) {}
+  ) {
+    this.schema = loadSchema(extensionUri.fsPath);
+    this.structures = loadStructures(extensionUri.fsPath);
+  }
+
+  /** The segment ranking/scope for a handler's recognized message type (ADR 0104 §2.3 P2). Undefined when
+   *  there is no schema bundle or the type is unresolvable → the picker offers the generic, unscoped
+   *  segment list. Reads the (synthetic, PHI-safe) sample so its Z-segments / segments union in. */
+  private scopeFor(handler: string): PickScope | undefined {
+    if (!this.schema) {
+      return undefined;
+    }
+    const t = this.handlerTypes.get(handler);
+    let sample: string[] = [];
+    if (this.samplePath) {
+      try {
+        sample = sampleSegments(fs.readFileSync(this.samplePath, "utf8"));
+      } catch {
+        sample = []; // no/unreadable sample → no sample union, still scoped by type
+      }
+    }
+    return buildSegmentScope(
+      segmentsOf(this.schema),
+      this.structures,
+      t?.acceptsTypes,
+      t?.inferredType,
+      sample,
+    );
+  }
 
   /**
    * Acquire the redacted-by-default live values for the open handler via a SECOND traced dry-run
@@ -204,6 +253,14 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       }
       // parse is non-null here (shouldFallBackToText returned fallback:false only for a real handler set).
       const handlers = buildHandlerViewModels(parse as LensParseResult, source);
+      // ADR 0104 §2.3 P2: stash each handler's recognized message type for the field picker's scope (a
+      // projection of THIS parse — not persisted state).
+      this.handlerTypes = new Map(
+        (parse as LensParseResult).handlers.map((h) => [
+          h.handler,
+          { acceptsTypes: h.accepts_types, inferredType: h.inferred_type },
+        ]),
+      );
       // Live values come from a SECOND `dryrun --trace` that reads the module FROM DISK, but the rows
       // above are projected from the LIVE buffer. While the buffer is dirty (an unsaved structural edit
       // shifted rows relative to disk — or any unsaved change made buffer != disk) the disk trace's line
@@ -348,6 +405,36 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       return applied;
     };
 
+    // Apply a PICKED HL7 path (ADR 0104 §2.3). A pick is a `set_params` value swap — **coordinate-preserving**,
+    // NOT a structural op — so it goes through the SAME `applyOne` splice a typed edit uses (no new artifact,
+    // no new .py execution path) AND must uphold the same F5 guarantee: a typed edit that queued while the
+    // pick's `lens rewrite` was in flight is **drained** (`takePending`), never dropped (a `clearPending` here
+    // would silently discard a still-valid edit, since the pick did not shift any row's coordinates). It
+    // claims the single edit slot around the pick + drain, then ALWAYS re-projects — a picked value has no
+    // optimistic DOM value to rely on (unlike a typed edit). The F7 `expect_src` stale guard rides through
+    // `applyOne` unchanged: a coordinate shifted by a raced edit is REFUSED, not mis-spliced.
+    const applyPickedEdit = async (msg: EditMessage): Promise<void> => {
+      if (!guard.beginEdit()) {
+        void vscode.window.showInformationMessage(
+          "MessageFoundry: an edit is in progress — try again in a moment.",
+        );
+        return;
+      }
+      try {
+        let current: EditMessage | undefined = msg;
+        while (current) {
+          await applyOne(current); // applyOne handles its own error + revert-render
+          current = guard.takePending(); // drain a raced typed edit (F5) — NEVER clearPending (that drops it)
+        }
+      } finally {
+        guard.endEdit();
+      }
+      if (disposed) {
+        return;
+      }
+      await render(); // reflect the picked value (no optimistic DOM value) + any drained edits
+    };
+
     // Undo / redo the document's edit stack. Every Steps edit lands there as a WorkspaceEdit (see applyOne
     // / applyStructural), so VS Code's own undo/redo already covers them — these buttons just surface it
     // inside the webview, where Ctrl+Z doesn't reach the document. Runs as a lone op behind the edit guard
@@ -397,6 +484,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         text?: string;
         level?: string;
         position?: string;
+        mode?: string;
       }) => {
         if (m?.command === "test") {
           // Reuse the existing Test Bench (dry-run this workspace's config — no engine, no sending).
@@ -446,6 +534,48 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             // guard input. Never recomputed from the live buffer here (that made the guard tautological).
             expectSrc: m.expectSrc,
           });
+        } else if (
+          m?.command === "pickPath" &&
+          typeof m.handler === "string" &&
+          typeof m.lineStart === "number" &&
+          typeof m.lineEnd === "number" &&
+          typeof m.name === "string" &&
+          typeof m.expectSrc === "string"
+        ) {
+          // ADR 0104 §2.3: run the native cascading field picker OUTSIDE the edit guard (a modal must not
+          // hold the single edit slot — mirrors pickSample), then apply the chosen path through the SAME
+          // set_params splice. No schema bundle → nothing to pick (silent no-op). Capture the narrowed
+          // fields in consts so their types survive into the async closure.
+          const handler = m.handler;
+          const lineStart = m.lineStart;
+          const lineEnd = m.lineEnd;
+          const name = m.name;
+          const expectSrc = m.expectSrc;
+          const mode = m.mode === "segment" ? "segment" : "path";
+          const seed = typeof m.value === "string" ? m.value : "";
+          void (async () => {
+            if (!this.schema || disposed) {
+              return;
+            }
+            const picked = await pickHl7Path(this.schema, {
+              mode,
+              scope: this.scopeFor(handler),
+              verified: this.structures?.verified,
+              seed,
+            });
+            if (picked === undefined || disposed) {
+              return; // cancelled — no write
+            }
+            await applyPickedEdit({
+              command: "edit",
+              handler,
+              lineStart,
+              lineEnd,
+              name,
+              value: picked,
+              expectSrc,
+            });
+          })();
         } else if (
           m?.command === "deleteRow" &&
           typeof m.handler === "string" &&
@@ -759,6 +889,15 @@ function pageHtml(
        the lens can't round-trip) is visibly muted. */
     .params .field input:disabled { opacity: 0.6; cursor: default; }
     .params .field input.edit:focus { outline: 1px solid var(--vscode-focusBorder); }
+    /* ADR 0104 §2.3 field picker: the ⋮ button sits beside its input (the input keeps flexing, so free-text
+       stays first-class). Only a pickable path/segment slot gets the .edit-row wrapper. */
+    .params .field .edit-row { display: flex; align-items: stretch; gap: 3px; }
+    .params .field .edit-row input.edit { flex: 1 1 auto; min-width: 0; }
+    button.pickpath { flex: 0 0 auto; cursor: pointer; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+                      border-radius: 2px; background: var(--vscode-input-background);
+                      color: var(--vscode-icon-foreground, var(--vscode-foreground)); padding: 0 7px; font-size: 13px; line-height: 1; }
+    button.pickpath:hover { background: rgba(127,127,127,0.18); }
+    button.pickpath:focus { outline: 1px solid var(--vscode-focusBorder); }
     /* An empty editable field hints [blank] (a placeholder, never a value) so a freshly-inserted
        template reads as "fill me in" without the analyst erasing a literal token. Muted + italic so it
        never reads as real content. */

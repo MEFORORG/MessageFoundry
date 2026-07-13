@@ -1,0 +1,16 @@
+# sampled dm_os_waiting_tasks 698x over 180s; PAGELATCH hits {'PAGELATCH_SH': 4, 'PAGELATCH_EX': 10}
+# top contended pages (dbid:file:page -> waiter-hits): [('5:1:281223', 3), ('5:1:296508', 2), ('5:1:280215', 1), ('5:1:281315', 1), ('5:1:281893', 1), ('5:1:282745', 1), ('5:1:284120', 1), ('5:1:280720', 1), ('5:1:280792', 1), ('5:1:286205', 1)]
+# hottest-page identities (db + object):
+  5:1:281223 hits=3 -> db=mfbench obj=queue object_id=1333579789 index_id=2 (None)
+  5:1:296508 hits=2 -> db=mfbench obj=message_events object_id=1429580131 index_id=1 (None)
+  5:1:280215 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=5 (None)
+  5:1:281315 hits=1 -> db=mfbench obj=None object_id=None index_id=None (None)
+  5:1:281893 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=2 (None)
+  5:1:282745 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=1 (None)
+# top SQL statements waiting on PAGELATCH (store-internal, parameterized -- names the churn):
+  [3] (@P1 float,@P2 nvarchar(12),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(20))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P1, @stage NVARCHAR(16) = @P2, @k I
+  [3] (@P1 float,@P2 nvarchar(16),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(24))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P1, @stage NVARCHAR(16) = @P2, @k I
+  [2] (@P1 nvarchar(16),@P2 nvarchar(14),@P3 int,@P4 nvarchar(1))SET NOCOUNT ON; DECLARE @stage NVARCHAR(16) = @P1, @pending NVARCHAR(32) = @P2, @limit INT = @P3, @after NVARCHAR(256) =
+  [2] (@P1 nvarchar(64),@P2 nvarchar(64),@P3 nvarchar(16),@P4 nvarchar(20),@P5 nvarchar(24),@P6 nvarchar(1380),@P7 nvarchar(14),@P8 float,@P9 float,@P10 float,@P11 nvarchar(64),@P12 floa
+  [2] (@P1 float,@P2 nvarchar(16),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(24),@P7 nvarchar(24))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P1, @stage NVARCHA
+  [1] (@P1 nvarchar(64))SELECT stage, status, COUNT(*) AS n FROM queue WHERE message_id=@P1 GROUP BY stage, status

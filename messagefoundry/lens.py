@@ -276,7 +276,21 @@ def parse_source(source: str, *, module: str = "<source>") -> list[dict[str, Any
         # never share a suite id in the flat webview row list).
         rows = _partition_suite(node.body, body_start, body_end, 0, source, lines, str(node.lineno))
         rows = _merge_code_rows(rows)
-        handlers.append({"handler": name, "module": module, "def_line": node.lineno, "rows": rows})
+        entry: dict[str, Any] = {
+            "handler": name,
+            "module": module,
+            "def_line": node.lineno,
+            "rows": rows,
+        }
+        # ADR 0104 §2.3 P2: the handler's recognized message type, for the field-picker scope. Emitted only
+        # when present, so a typeless handler / an older contract is byte-identical (→ generic scope).
+        accepts = _handler_accepts(node)
+        if accepts is not None:
+            entry["accepts_types"] = accepts
+        inferred = _handler_inferred_type(node)
+        if inferred is not None:
+            entry["inferred_type"] = inferred
+        handlers.append(entry)
     return handlers
 
 
@@ -310,6 +324,101 @@ def _callee_name(func: ast.expr) -> str | None:
     if isinstance(func, ast.Attribute):
         return func.attr
     return None
+
+
+# --- handler message type (ADR 0104 §2.3 P2 — field-picker scope) -------------
+
+#: The message-type attribute a name access contributes to an inferred type.
+_TYPE_ATTRS: dict[str, str] = {
+    "message_code": "code",
+    "trigger_event": "trigger",
+    "message_type": "type",
+}
+
+
+def _handler_accepts(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str] | None:
+    """The literal specs from ``accepts=message_type_of("ADT^A01", …)`` on the ``@handler`` decorator, or
+    None. **Authoritative** — it IS the enforced predicate, so it cannot drift from what the handler
+    accepts; and ``message_type_of`` returns an opaque runtime predicate, so the decorator AST is the only
+    place the specs are readable."""
+    for dec in node.decorator_list:
+        if not isinstance(dec, ast.Call) or _callee_name(dec.func) != "handler":
+            continue
+        for kw in dec.keywords:
+            if (
+                kw.arg == "accepts"
+                and isinstance(kw.value, ast.Call)
+                and _callee_name(kw.value.func) == "message_type_of"
+            ):
+                specs = [
+                    a.value
+                    for a in kw.value.args
+                    if isinstance(a, ast.Constant) and isinstance(a.value, str)
+                ]
+                return specs or None
+    return None
+
+
+def _type_attr(expr: ast.expr) -> str | None:
+    """The message-type attribute of ``<name>.message_code`` / ``.trigger_event`` / ``.message_type`` (the
+    handler's message param, any receiver name), or None."""
+    if (
+        isinstance(expr, ast.Attribute)
+        and isinstance(expr.value, ast.Name)
+        and expr.attr in _TYPE_ATTRS
+    ):
+        return expr.attr
+    return None
+
+
+def _handler_inferred_type(node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, str] | None:
+    """A best-effort ``{"code"?, "trigger"?}`` from a LEADING type guard. **Advisory only** (a handler fed
+    mixed types makes it wrong), so the picker ranks-not-removes and always keeps an All-segments escape.
+    Conservative: only the first non-docstring statement, only a direct
+    ``msg.message_code``/``.trigger_event``/``.message_type`` compare to a string constant — a
+    ``msg["MSH-9.2"]`` subscript or a computed value is NOT inferred (the ``accepts=`` decorator is the
+    authoritative source)."""
+    body = [
+        s
+        for s in node.body
+        if not (
+            isinstance(s, ast.Expr)
+            and isinstance(s.value, ast.Constant)
+            and isinstance(s.value.value, str)
+        )
+    ]
+    if not body or not isinstance(body[0], ast.If):
+        return None
+    found: dict[str, str] = {}
+    for cmp in ast.walk(body[0].test):
+        if not isinstance(cmp, ast.Compare) or not cmp.comparators:
+            continue
+        left, right = cmp.left, cmp.comparators[0]
+        attr = _type_attr(left)
+        const = (
+            right.value
+            if isinstance(right, ast.Constant) and isinstance(right.value, str)
+            else None
+        )
+        if attr is None:
+            attr = _type_attr(right)
+            const = (
+                left.value
+                if isinstance(left, ast.Constant) and isinstance(left.value, str)
+                else None
+            )
+        if attr is None or const is None:
+            continue
+        key = _TYPE_ATTRS[attr]
+        if key == "type":  # message_type is the whole MSH-9 ("CODE^TRIGGER" or a bare "CODE")
+            code, _sep, trig = const.partition("^")
+            if code:
+                found.setdefault("code", code)
+            if trig:
+                found.setdefault("trigger", trig)
+        else:
+            found.setdefault(key, const)
+    return found or None
 
 
 # --- partition (the coverage invariant) --------------------------------------

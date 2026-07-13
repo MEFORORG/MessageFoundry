@@ -1,0 +1,4 @@
+# sampled dm_os_waiting_tasks 713x over 180s; PAGELATCH hits {}
+# top contended pages (dbid:file:page -> waiter-hits): []
+# hottest-page identities (db + object):
+# top SQL statements waiting on PAGELATCH (store-internal, parameterized -- names the churn):

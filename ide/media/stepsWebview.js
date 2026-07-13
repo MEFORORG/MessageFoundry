@@ -166,6 +166,29 @@
         expectSrc: inp.dataset.expectSrc,
       }));
     }
+    // ADR 0104 §2.3: the HL7 field picker button beside a path/segment input. It posts pickPath; the
+    // provider runs a native cascading quick-pick, then applies the chosen path through the SAME edit
+    // splice (no new artifact). The input is untouched, so free-text stays available.
+    for (const b of document.querySelectorAll('button.pickpath')) {
+      // Don't let the button's mousedown blur+commit the focused path input — that would post a racing
+      // `edit` that shifts the row and staleness-refuses the pick (F7). The picked value supersedes any
+      // uncommitted partial text the user had typed.
+      b.addEventListener('mousedown', (ev) => ev.preventDefault());
+      b.addEventListener('click', (ev) => {
+        ev.stopPropagation(); // a picker click must not also (re)select the row
+        const inp = b.parentElement && b.parentElement.querySelector('input.edit');
+        vscode.postMessage({
+          command: 'pickPath',
+          handler: b.dataset.handler,
+          lineStart: Number(b.dataset.lineStart),
+          lineEnd: Number(b.dataset.lineEnd),
+          name: b.dataset.name,
+          value: inp ? inp.value : '',
+          expectSrc: b.dataset.expectSrc,
+          mode: b.dataset.mode,
+        });
+      });
+    }
     // Per-row structural affordances — each posts a delete/move command. The provider runs it as a lone op
     // (never batched) and forces a full re-projection afterwards (ADR 0076 §5 v2). data-op maps to the
     // command; each carries the row's coordinates + projection-time source (F7 stale guard). (The per-row

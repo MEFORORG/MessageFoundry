@@ -517,7 +517,12 @@ jobs:
           # required to connect. The store's TLS-hardening guard refuses that MITM-able combination
           # unless this escape is set — exactly the trusted-network dev/test case it exists for.
           MEFOR_ALLOW_INSECURE_TLS: "1"
-        run: pytest tests/test_sqlserver_store.py -v
+          # Dump the native (C-level) frame if a retry still crashes (faulthandler only DUMPS, never kills).
+          PYTHONFAULTHANDLER: "1"
+        # pyodbc 5.3.0 + py3.14 native-crash retry (#973 follow-up, upstream pyodbc#1459): re-runs ONLY on a 139/134 crash exit, never on exit 1, so it can't mask a regression. See scripts/ci/retry-native-crash.sh.
+        run: >-
+          bash scripts/ci/retry-native-crash.sh
+          pytest -v tests/test_sqlserver_store.py
 
       - name: Run the SQL Server coordinator suite (active-passive HA leader election)
         env:
@@ -536,7 +541,12 @@ jobs:
           # SqlServerCoordinator leader-lease (MERGE WITH(HOLDLOCK) acquire/renew/take-over, self-fence,
           # membership) against the real T-SQL the faked-driver tests can't.
           MEFOR_ALLOW_INSECURE_TLS: "1"
-        run: pytest tests/test_sqlserver_coordinator.py -v
+          # Dump the native (C-level) frame if a retry still crashes (faulthandler only DUMPS, never kills).
+          PYTHONFAULTHANDLER: "1"
+        # pyodbc 5.3.0 + py3.14 native-crash retry (#973 follow-up, upstream pyodbc#1459): re-runs ONLY on a 139/134 crash exit, never on exit 1, so it can't mask a regression. See scripts/ci/retry-native-crash.sh.
+        run: >-
+          bash scripts/ci/retry-native-crash.sh
+          pytest -v tests/test_sqlserver_coordinator.py
 
       - name: Run the SQL Server failover suite (real TTL takeover + 2-node lifecycle)
         env:
@@ -552,7 +562,12 @@ jobs:
           # Same trusted-network TLS escape (self-signed container cert). Drives two coordinators sharing
           # the store through real DB-clock lease expiry + the full start()/stop() election + failover.
           MEFOR_ALLOW_INSECURE_TLS: "1"
-        run: pytest tests/test_cluster_failover_sqlserver.py -v
+          # Dump the native (C-level) frame if a retry still crashes (faulthandler only DUMPS, never kills).
+          PYTHONFAULTHANDLER: "1"
+        # pyodbc 5.3.0 + py3.14 native-crash retry (#973 follow-up, upstream pyodbc#1459): re-runs ONLY on a 139/134 crash exit, never on exit 1, so it can't mask a regression. See scripts/ci/retry-native-crash.sh.
+        run: >-
+          bash scripts/ci/retry-native-crash.sh
+          pytest -v tests/test_cluster_failover_sqlserver.py
 
       - name: Run the DATABASE connector round-trip (against the real DB)
         env:
@@ -566,7 +581,12 @@ jobs:
           # escape (self-signed container cert), exactly like the store suite above. This is the live
           # aioodbc/ODBC round-trip backing the connector's "production" status (PR D).
           MEFOR_ALLOW_INSECURE_TLS: "1"
-        run: pytest tests/test_database_connector_integration.py -v
+          # Dump the native (C-level) frame if a retry still crashes (faulthandler only DUMPS, never kills).
+          PYTHONFAULTHANDLER: "1"
+        # pyodbc 5.3.0 + py3.14 native-crash retry (#973 follow-up, upstream pyodbc#1459): re-runs ONLY on a 139/134 crash exit, never on exit 1, so it can't mask a regression. See scripts/ci/retry-native-crash.sh.
+        run: >-
+          bash scripts/ci/retry-native-crash.sh
+          pytest -v tests/test_database_connector_integration.py
 
       - name: Run the failover-LOAD test (two nodes, SIGKILL the primary mid-load, against the real DB)
         env:
@@ -586,7 +606,12 @@ jobs:
           # not hard-gated (host-variable — see docs/LOAD-TESTING.md). This run guards the #285 claim-FIFO
           # fix. The orchestrator spawns the nodes with auth off + the cluster env; they inherit MEFOR_STORE_*.
           MEFOR_ALLOW_INSECURE_TLS: "1"
-        run: pytest tests/test_load_failover_sqlserver.py -v
+          # Dump the native (C-level) frame if a retry still crashes (faulthandler only DUMPS, never kills).
+          PYTHONFAULTHANDLER: "1"
+        # pyodbc 5.3.0 + py3.14 native-crash retry (#973 follow-up, upstream pyodbc#1459): re-runs ONLY on a 139/134 crash exit, never on exit 1, so it can't mask a regression. See scripts/ci/retry-native-crash.sh.
+        run: >-
+          bash scripts/ci/retry-native-crash.sh
+          pytest -v tests/test_load_failover_sqlserver.py
 
       - name: Run the throughput-lever backend invariants on real SQL Server (B1 inline, B2 batch-claim, ...)
         env:

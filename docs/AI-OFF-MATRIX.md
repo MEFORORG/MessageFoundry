@@ -17,7 +17,7 @@ fully-offline path that a no-AI builder uses instead.
 | `/router` | **Router Wizard** + `route-by-type` / `route-to-multiple` palette idioms | ✅ shipped | `ide/src/newRoute.ts` + #48/L1 |
 | `/review` | `messagefoundry check` + `validate` (Problems panel, on-save) | ✅ shipped | `ide/src/validate.ts`, `checks.py` |
 | `/test` | **Test Bench** (dry-run, disposition, before/after) + **Generate Samples** (synthetic corpora) | ✅ shipped; deepening | `ide/src/testBench.ts`, `generate.ts` + PLAN-7 **L4/L7** |
-| `/explain` | **Cookbook + Walkthrough** — searchable "solved problems" gallery that inserts editable Python + `contributes.walkthroughs` onboarding + HL7-schema hover/autocomplete | ⚠️ **partial today** → filled by Cookbook | BACKLOG **#104** + PLAN-7 **L3** |
+| `/explain` | **Cookbook + Walkthrough** — searchable "solved problems" gallery that inserts editable Python + `contributes.walkthroughs` onboarding + HL7-schema hover/autocomplete | ✅ shipped (Cookbook gallery + walkthrough) | BACKLOG **#104** + PLAN-7 **L3** |
 | `/migrate` | **Deterministic Corepoint import** — `messagefoundry import corepoint <export> --out <dir>` scaffolds one editable `@router`/`@handler` module per channel ([`corepoint_import.py`](../messagefoundry/corepoint_import.py)) | ✅ shipped (synthetic schema) | BACKLOG **#105**, [ADR 0086](adr/0086-deterministic-corepoint-import.md) |
 
 **The immediacy an interactive AI loop would give** is supplied deterministically by the **#92 live-debug
@@ -28,7 +28,7 @@ breakpoints, no AI, fully offline. That is the deterministic analogue of "ask th
 ## Findings
 - **All six** chat subcommands now have a first-class deterministic sibling that is shipped or actively
   being deepened by PLAN-7 (L1/L4/L7) — a builder with AI off loses **no essential capability** today
-  except discoverability-of-examples, which **#104 Cookbook** closes.
+  except discoverability-of-examples, which the now-shipped **#104 Cookbook** (gallery + walkthrough) closes.
 - **The former `/migrate` gap is closed** — the deterministic Corepoint import shipped 2026-07-10 (BACKLOG
   **#105**, [ADR 0086](adr/0086-deterministic-corepoint-import.md)): `messagefoundry import corepoint`
   scaffolds editable `@router`/`@handler` Python from a Corepoint action-list export. The export **schema is

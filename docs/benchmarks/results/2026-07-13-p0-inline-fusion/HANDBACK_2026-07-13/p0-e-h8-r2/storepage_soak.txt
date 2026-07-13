@@ -1,0 +1,10 @@
+# sampled dm_os_waiting_tasks 709x over 180s; PAGELATCH hits {'PAGELATCH_EX': 2}
+# top contended pages (dbid:file:page -> waiter-hits): [('5:1:82500', 1), ('5:1:86741', 1)]
+# hottest-page identities (db + object):
+  5:1:82500 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=5 (None)
+  5:1:86741 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=2 (None)
+# top SQL statements waiting on PAGELATCH (store-internal, parameterized -- names the churn):
+  [2] (@P1 float,@P2 nvarchar(12),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(20))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P1, @stage NVARCHAR(16) = @P2, @k I
+  [2] (@P1 nvarchar(64),@P2 nvarchar(12),@P3 nvarchar(16))DELETE FROM queue OUTPUT deleted.id WHERE id=@P1 AND stage=@P2 AND status=@P3
+  [1] (@P1 float,@P2 nvarchar(14),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(20))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P1, @stage NVARCHAR(16) = @P2, @k I
+  [1] (@P1 nvarchar(64),@P2 nvarchar(64),@P3 nvarchar(14),@P4 nvarchar(20),@P5 nvarchar(1154),@P6 nvarchar(14),@P7 float,@P8 float,@P9 float)INSERT INTO queue (id, message_id, stage, cha

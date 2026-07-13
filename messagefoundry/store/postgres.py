@@ -237,6 +237,32 @@ _SCHEMA: list[str] = [
         refcount   INTEGER NOT NULL,
         created_at DOUBLE PRECISION NOT NULL
     )""",
+    # Streaming very-large attachments (#149, ADR 0105 Phase 4 — Postgres parity with the SQLite
+    # substrate). `attachment.id` = sha256 of the VERBATIM concatenated plaintext (content address →
+    # identical documents dedup), CHUNKED into `attachment_chunk` rows each carrying ONE mfenc-sealed
+    # slice of the plaintext (cipher-covered at rest exactly like queue.payload/shared_body.body — TEXT
+    # ciphertext, rides the key-rotation re-seal). `refcount` GC's the header + all chunks at 0.
+    # `message_attachment` records which DISTINCT attachments a message holds (Phase 3a linkage) so
+    # retention decrefs exactly those on purge. Logical refs — no FK (mirrors queue.body_ref →
+    # shared_body.hash); the startup sweep reclaims refcount-0 headers AND header-less orphan chunks.
+    """CREATE TABLE IF NOT EXISTS attachment (
+        id           TEXT PRIMARY KEY,
+        content_type TEXT NOT NULL,
+        total_bytes  BIGINT NOT NULL,
+        refcount     INTEGER NOT NULL,
+        created_at   DOUBLE PRECISION NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS attachment_chunk (
+        attachment_id TEXT NOT NULL,
+        seq           INTEGER NOT NULL,
+        ciphertext    TEXT NOT NULL,
+        PRIMARY KEY (attachment_id, seq)
+    )""",
+    """CREATE TABLE IF NOT EXISTS message_attachment (
+        message_id    TEXT NOT NULL,
+        attachment_id TEXT NOT NULL,
+        PRIMARY KEY (message_id, attachment_id)
+    )""",
     # ix_queue_lease (the reclaim sweep's index) is created in _migrate_lease_columns, AFTER the lease
     # columns are guaranteed present — on a Step-1 table the index references a not-yet-added column.
     """CREATE TABLE IF NOT EXISTS message_events (
@@ -618,6 +644,12 @@ class PostgresStore:
     # so there is no store-call crossing to fuse and no synchronous asyncpg entry can exist. Kept False
     # by construction; the async path stays.
     supports_fused_sync_handoff = False
+
+    # #149 / ADR 0105 Phase 4: the streaming-attachment substrate is now implemented on Postgres at
+    # byte-for-byte behavioral parity with the SQLite reference (content-addressed sha256 ref, per-chunk
+    # mfenc seal, dedup, refcount + GC-at-0, two-object ingress commit, retention decref/dead-row split,
+    # key-rotation re-seal). Go-live parity met across all three backends.
+    supports_streaming_attachments = True
     backend = StoreBackend.POSTGRES
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
@@ -1435,6 +1467,17 @@ class PostgresStore:
                 batch,
                 value_col=col,
             )
+        # `attachment_chunk` ciphertext (#149, ADR 0105) is cipher-covered with a composite PK
+        # (attachment_id, seq) — rides the composite helper. Re-seals each detached-document chunk under
+        # the active key, one at a time; the content-address id is over the PLAINTEXT (rotation-stable).
+        total += await self._reencrypt_composite(
+            cipher,
+            "attachment_chunk",
+            ("attachment_id", "seq"),
+            active_like,
+            batch,
+            value_col="ciphertext",
+        )
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         return total
@@ -1888,14 +1931,25 @@ class PostgresStore:
         source_type: str | None = None,
         summary: str | None = None,
         metadata: str | None = None,
+        attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the **ingress stage** — the staged
         pipeline's ACK-on-receipt boundary (ADR 0001). In one transaction: insert the message
         (status ``RECEIVED``) and a single ``stage='ingress'`` queue row holding the raw body. Once
-        this returns the message is durable and the inbound may be ACKed. Returns the message id."""
+        this returns the message is durable and the inbound may be ACKed. Returns the message id.
+
+        ``attachment_refs`` (#149, ADR 0105 Phase 4) are the content addresses of documents the ingress
+        detach lifted out of ``raw`` into the attachment substrate (``put_attachment``, which committed
+        them at ``refcount=0``). Each distinct ref is **increffed in this same transaction** as the
+        skeleton row — the two-object commit's second half — AND its ``message_attachment`` linkage row is
+        inserted (Phase 3a). A missing ref fails loud → the whole ingress rolls back → no ACK for a body
+        we couldn't reference. Empty/None → the byte-identical no-detach path."""
         now = time.time() if now is None else now
         mid = uuid4().hex
+        # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
+        # (== its live join rows), so a later release decrefs by the same count.
+        refs = list(dict.fromkeys(attachment_refs or ()))
         async with self._timed_acquire() as conn:
             async with conn.transaction():
                 await self._insert_message(
@@ -1930,6 +1984,23 @@ class PostgresStore:
                     now,
                 )
                 await self._event(conn, mid, "received", None, "ingress", now)
+                # #149 two-object commit: incref each detached attachment AND record its
+                # message→attachment linkage row in THIS transaction (same commit as the skeleton row).
+                # put_attachment already committed the chunks at refcount 0; a missing row here means it
+                # was GC'd/never stored, so fail loud (the transaction rolls back → no ACK). `refs` is
+                # de-duplicated, so the message_attachment PK never conflicts and the refcount is bumped
+                # once per distinct ref (== its live join rows).
+                for ref in refs:
+                    result = await conn.execute(
+                        "UPDATE attachment SET refcount = refcount + 1 WHERE id=$1", ref
+                    )
+                    if _rowcount(result) == 0:
+                        raise KeyError(f"attachment {ref!r} not found for ingress incref")
+                    await conn.execute(
+                        "INSERT INTO message_attachment (message_id, attachment_id) VALUES ($1,$2)",
+                        mid,
+                        ref,
+                    )
         return mid
 
     async def handoff(
@@ -3667,6 +3738,237 @@ class PostgresStore:
                     recovered += _rowcount(result)
         return recovered
 
+    # --- streaming attachments (#149, ADR 0105 Phase 4 — Postgres parity) ----------------------------
+    # Byte-for-byte behavioral parity with the SQLite reference (store/store.py): content-addressed
+    # sha256 ref, per-chunk mfenc seal, dedup, refcount + GC-at-0, two-object ingress commit (above),
+    # retention decref + dead-row split (purge_message_bodies / purge_dead_letters), key-rotation re-seal.
+
+    async def put_attachment(self, chunks: Iterable[str], content_type: str) -> str:
+        """Store a detached document as content-addressed, per-chunk-sealed rows; return its ``ref`` (the
+        sha256 of the VERBATIM concatenated plaintext). Each chunk is AES-GCM-sealed independently (a
+        bounded plaintext window per seal). Identical content **dedups** to one copy (a re-put returns the
+        same ref and writes nothing). The fresh attachment sits at ``refcount=0`` until increffed."""
+        hasher = hashlib.sha256()
+        total = 0
+        sealed: list[str] = []
+        for chunk in chunks:
+            data = chunk.encode("utf-8")
+            hasher.update(data)
+            total += len(data)
+            sealed.append(
+                self._cipher.encrypt(chunk)
+            )  # bounded plaintext window: one chunk per seal
+        ref = hasher.hexdigest()
+        now = time.time()
+        async with self._timed_acquire() as conn:
+            async with conn.transaction():
+                if await conn.fetchval("SELECT 1 FROM attachment WHERE id=$1", ref) is not None:
+                    return ref  # dedup: identical content already stored — write nothing
+                await conn.execute(
+                    "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
+                    " VALUES ($1,$2,$3,0,$4)",
+                    ref,
+                    content_type,
+                    total,
+                    now,
+                )
+                if sealed:
+                    await conn.executemany(
+                        "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext)"
+                        " VALUES ($1,$2,$3)",
+                        [(ref, seq, ct) for seq, ct in enumerate(sealed)],
+                    )
+        return ref
+
+    async def read_attachment(self, ref: str) -> AsyncIterator[str]:
+        """Yield the detached document's chunks back as decrypted plaintext, in ``seq`` order — the exact
+        verbatim slices that were put (Approach B: concatenating them reconstructs OBX-5.5 byte-for-byte).
+        Raises :class:`KeyError` if the attachment does not exist (corruption or already GC'd)."""
+        async with self._timed_acquire() as conn:
+            if await conn.fetchval("SELECT 1 FROM attachment WHERE id=$1", ref) is None:
+                raise KeyError(f"attachment {ref!r} not found")
+            rows = await conn.fetch(
+                "SELECT ciphertext FROM attachment_chunk WHERE attachment_id=$1 ORDER BY seq", ref
+            )
+        for r in rows:
+            yield self._cipher.decrypt(r["ciphertext"])
+
+    async def attachments_for(self, message_id: str) -> list[dict[str, Any]]:
+        """The distinct attachments ``message_id`` holds — the operator read surface (#149, ADR 0105
+        Phase 3b, Postgres parity). JOINs ``message_attachment`` to its ``attachment`` header and returns
+        one row per attachment carrying ``attachment_id`` (the sha256 content address), ``content_type``,
+        and ``total_bytes``. **Metadata only** — the chunk ciphertext is never touched/decrypted. Returns
+        ``[]`` for a message with no detached document."""
+        if not self.supports_streaming_attachments:
+            return []
+        async with self._timed_acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT a.id AS attachment_id, a.content_type, a.total_bytes "
+                "FROM message_attachment ma JOIN attachment a ON a.id = ma.attachment_id "
+                "WHERE ma.message_id=$1 ORDER BY a.id",
+                message_id,
+            )
+        return [dict(r) for r in rows]
+
+    async def attachment_incref(self, ref: str) -> None:
+        """Add one live reference to an attachment (store-once refcount). Raises :class:`KeyError` if the
+        attachment does not exist — an incref must name a real stored document."""
+        async with self._timed_acquire() as conn:
+            result = await conn.execute(
+                "UPDATE attachment SET refcount = refcount + 1 WHERE id=$1", ref
+            )
+            if _rowcount(result) == 0:
+                raise KeyError(f"attachment {ref!r} not found")
+
+    async def _decref_attachment(self, conn: Any, ref: str, count: int = 1) -> None:
+        """Drop ``count`` references to an attachment and **GC the attachment + all its chunks at
+        refcount 0**, in the CALLER's transaction (no commit of its own). Clamped at 0 via ``GREATEST`` (a
+        double-decref can't drive it negative). The transaction-participant sibling of
+        :meth:`attachment_decref`."""
+        await conn.execute(
+            "UPDATE attachment SET refcount = GREATEST(0, refcount - $1) WHERE id=$2", count, ref
+        )
+        # GC at 0: delete chunks (while the header still exists to gate on) then the header.
+        await conn.execute(
+            "DELETE FROM attachment_chunk WHERE attachment_id IN"
+            " (SELECT id FROM attachment WHERE id=$1 AND refcount<=0)",
+            ref,
+        )
+        await conn.execute("DELETE FROM attachment WHERE id=$1 AND refcount<=0", ref)
+
+    async def attachment_decref(self, ref: str) -> None:
+        """Drop one reference and **GC the attachment + all its chunks at refcount 0** (store-once
+        retention). Clamped at 0; tolerant of a missing ref (a no-op), so a purge re-run is idempotent."""
+        async with self._timed_acquire() as conn:
+            async with conn.transaction():
+                await self._decref_attachment(conn, ref, 1)
+
+    async def _release_message_attachments(self, conn: Any, where: str, params: list[Any]) -> None:
+        """Release every attachment held by the messages matching ``where`` (#149, ADR 0105 Phase 4 — the
+        attachment sibling of the SQLite retention seam). Tally each distinct attachment the matching
+        messages reference via the ``message_attachment`` linkage, decref each by how many of these
+        messages reference it (GC at 0), then DELETE those join rows so the release is exactly-once even
+        if the purge re-runs. Runs in the CALLER's transaction. **Re-run is a no-op:** a re-run finds the
+        join rows gone and decrefs nothing — no double-decref, no refcount underflow, no premature GC of
+        an attachment a SIBLING message still holds. ``where`` is a code-controlled ``$N`` fragment
+        (numbered from ``$1``); ``params`` binds it identically in both statements."""
+        rows = await conn.fetch(
+            f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment"
+            f" WHERE {where} GROUP BY attachment_id",
+            *params,
+        )
+        if not rows:
+            return
+        for r in rows:
+            await self._decref_attachment(conn, r["attachment_id"], int(r["n"]))
+        # Delete the just-released join rows so a re-run of the purge decrefs nothing (idempotent GC).
+        await conn.execute(f"DELETE FROM message_attachment WHERE {where}", *params)
+
+    @staticmethod
+    def _attachment_still_referenced_sql(msg_col: str, inflight_ph: int, dead_ph: int) -> str:
+        """A correlated ``EXISTS`` fragment true iff message ``msg_col`` still has a queue row that could
+        be **delivered or replayed** (so it still needs its attachment when a send hydrates the
+        ``mfdoc:v1:ref:`` handle). A row is a **live holder** when it is ``pending``/``inflight`` OR it is
+        ``dead`` but still replayable (its ``payload`` is kept OR its ``body_ref`` is not yet released).
+        Callers negate it (``NOT EXISTS``) to release only when the LAST holder is gone — the per-MESSAGE
+        analogue of the ``shared_body`` done/cancelled-vs-dead split (SQLite parity). ``inflight_ph`` binds
+        a ``[pending, inflight]`` text array; ``dead_ph`` binds the ``dead`` status scalar."""
+        return (
+            f"EXISTS (SELECT 1 FROM queue q WHERE q.message_id = {msg_col}"
+            f" AND (q.status = ANY(${inflight_ph}::text[])"
+            f" OR (q.status = ${dead_ph} AND (q.payload <> '' OR q.body_ref IS NOT NULL))))"
+        )
+
+    def _attachment_release_body_where(
+        self, older_than: float, connection_cutoffs: Mapping[str, float] | None
+    ) -> tuple[str, list[Any]]:
+        """Build the ``(where, params)`` (``$1``-based) for :meth:`purge_message_bodies`' attachment
+        release: every message past its (per-connection-or-global) cutoff with NO remaining replayable
+        row. Mirrors the SQLite inline predicate."""
+        cutoff_sql, cutoff_params, idx = _pg_cutoff_case(
+            "m.channel_id", older_than, connection_cutoffs, start=1
+        )
+        still = self._attachment_still_referenced_sql("m.id", idx, idx + 1)
+        where = (
+            f"message_id IN (SELECT id FROM messages m WHERE m.received_at < {cutoff_sql}"
+            f" AND NOT {still})"
+        )
+        params = [
+            *cutoff_params,
+            [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
+            OutboxStatus.DEAD.value,
+        ]
+        return where, params
+
+    def _attachment_release_dead_where(
+        self, older_than: float, connection_cutoffs: Mapping[str, float] | None
+    ) -> tuple[str, list[Any]]:
+        """Build the ``(where, params)`` (``$1``-based) for :meth:`purge_dead_letters`' attachment
+        release: the messages owning a dead row purged in this window whose LAST replayable row is now
+        gone. ``$1``=OUTBOUND stage, ``$2``=DEAD status, cutoff from ``$3``. Mirrors SQLite."""
+        cutoff_sql, cutoff_params, idx = _pg_cutoff_case(
+            "q0.destination_name", older_than, connection_cutoffs, start=3
+        )
+        still = self._attachment_still_referenced_sql("q0.message_id", idx, idx + 1)
+        where = (
+            "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0"
+            f" WHERE q0.stage=$1 AND q0.status=$2 AND q0.updated_at < {cutoff_sql}"
+            f" AND NOT {still})"
+        )
+        params = [
+            Stage.OUTBOUND.value,
+            OutboxStatus.DEAD.value,
+            *cutoff_params,
+            [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
+            OutboxStatus.DEAD.value,
+        ]
+        return where, params
+
+    async def release_message_attachments(self, message_id: str) -> None:
+        """Release (decref + delete the linkage rows for) every attachment a SINGLE message holds, in ONE
+        transaction — the standalone form of the retention decref (#149, ADR 0105). Idempotent: a re-run
+        finds the join rows gone and decrefs nothing (no underflow, no premature GC of an attachment a
+        sibling message still references)."""
+        async with self._timed_acquire() as conn:
+            async with conn.transaction():
+                await self._release_message_attachments(conn, "message_id = $1", [message_id])
+
+    async def sweep_orphan_attachments(self) -> int:
+        """Reclaim orphaned attachment storage at startup so **no PHI chunk accumulates at rest** (#149,
+        ADR 0105). Two disjoint classes: refcount-0 attachments (header + chunks deleted) and header-less
+        incomplete-write chunk groups (a future incremental writer that crashed before finalizing the
+        header). Returns the number of attachments reclaimed. Idempotent: a second run finds nothing."""
+        async with self._timed_acquire() as conn:
+            async with conn.transaction():
+                # Count header-less chunk groups BEFORE any delete (while refcount-0 headers still exist,
+                # so their chunks don't miscount — those are reclaimed as the refcount-0 class).
+                incomplete = int(
+                    await conn.fetchval(
+                        "SELECT COUNT(DISTINCT attachment_id) FROM attachment_chunk"
+                        " WHERE attachment_id NOT IN (SELECT id FROM attachment)"
+                    )
+                    or 0
+                )
+                # Reclaim refcount-0 attachments: chunks (gated on the header's refcount) then the header.
+                await conn.execute(
+                    "DELETE FROM attachment_chunk WHERE attachment_id IN"
+                    " (SELECT id FROM attachment WHERE refcount<=0)"
+                )
+                headers = _rowcount(await conn.execute("DELETE FROM attachment WHERE refcount<=0"))
+                # Reclaim any header-less orphan chunks (incomplete writes).
+                await conn.execute(
+                    "DELETE FROM attachment_chunk WHERE attachment_id NOT IN (SELECT id FROM attachment)"
+                )
+        reclaimed = headers + incomplete
+        if reclaimed:
+            log.info(
+                "reclaimed %d orphaned attachment(s) at startup (%d refcount-0, %d incomplete-write)",
+                reclaimed,
+                headers,
+                incomplete,
+            )
+        return reclaimed
+
     # --- multi-node row leases (Track B Step 2; additive, Postgres-only) ------
     # These are NOT on the Store protocol and NOT on the SQLite backend: SQLite is single-node, so its
     # unconditional reset_stale_inflight remains correct. In active-passive mode the leader runs the
@@ -5386,6 +5688,17 @@ class PostgresStore:
                     Stage.OUTBOUND.value,
                     [OutboxStatus.DONE.value, OutboxStatus.CANCELLED.value],
                 )
+                # #149 Phase 4 (mirrors SQLite Phase 3a): release the streaming attachment each eligible
+                # message holds — but ONLY once it has NO queue row that could still be delivered/replayed
+                # (the negated live-holder predicate). The done/cancelled payloads were just blanked above,
+                # so an all-done/cancelled message now has no live holder and its attachment is decref'd
+                # (GC at 0) + its join rows DELETEd in THIS transaction. A message whose outbound rows are
+                # all DEAD keeps its attachment (DEAD payloads stay replayable, deferred to
+                # purge_dead_letters). Idempotent — a re-run finds the join rows gone and decrefs nothing.
+                rel_where, rel_params = self._attachment_release_body_where(
+                    older_than, connection_cutoffs
+                )
+                await self._release_message_attachments(conn, rel_where, rel_params)
                 await conn.execute(
                     f"UPDATE message_events SET detail=NULL"
                     f" WHERE detail IS NOT NULL AND message_id IN ({eligible})",
@@ -5489,14 +5802,27 @@ class PostgresStore:
         cutoff_sql, cutoff_params, _ = _pg_cutoff_case(
             "destination_name", older_than, connection_cutoffs, start=3
         )
-        result = await self._pool.execute(
-            "UPDATE queue SET payload='', last_error=NULL"
-            f" WHERE stage=$1 AND status=$2 AND payload <> '' AND updated_at < {cutoff_sql}",
-            Stage.OUTBOUND.value,
-            OutboxStatus.DEAD.value,
-            *cutoff_params,
-        )
-        return _rowcount(result)
+        async with self._timed_acquire() as conn:
+            async with conn.transaction():
+                result = await conn.execute(
+                    "UPDATE queue SET payload='', last_error=NULL"
+                    f" WHERE stage=$1 AND status=$2 AND payload <> '' AND updated_at < {cutoff_sql}",
+                    Stage.OUTBOUND.value,
+                    OutboxStatus.DEAD.value,
+                    *cutoff_params,
+                )
+                purged = _rowcount(result)
+                # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
+                # it can no longer be replayed. If that was the message's LAST replayable row, release its
+                # streaming attachment here — the deferred half of the per-MESSAGE dead-row split with
+                # purge_message_bodies. Runs in THIS transaction, after the blank above, so the just-purged
+                # dead rows already read as non-replayable. Idempotent join-row DELETE → a re-run decrefs
+                # nothing (no underflow, no premature GC of an attachment a sibling message still holds).
+                rel_where, rel_params = self._attachment_release_dead_where(
+                    older_than, connection_cutoffs
+                )
+                await self._release_message_attachments(conn, rel_where, rel_params)
+        return purged
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries last written before ``older_than`` (ADR 0005 retention) and

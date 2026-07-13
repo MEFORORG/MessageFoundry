@@ -31,6 +31,7 @@ from messagefoundry.auth.notifications import (
     ROLES_CHANGED,
     SecurityEvent,
 )
+from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AlertsSettings
 from messagefoundry.pipeline.alert_sinks import _BackgroundDispatcher, send_plain_email
 
@@ -151,18 +152,30 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         )
 
 
-def security_notifier_from_settings(alerts: AlertsSettings) -> SecurityEventNotifier | None:
+def security_notifier_from_settings(
+    alerts: AlertsSettings, *, secret_provider: SecretProvider | None = None
+) -> SecurityEventNotifier | None:
     """Build the per-user security notifier from ``[alerts]`` SMTP settings, or ``None`` when no SMTP
-    server/sender is configured (then only the ``/me/security-events`` feed records events)."""
+    server/sender is configured (then only the ``/me/security-events`` feed records events).
+
+    ``secret_provider`` (ADR 0019 §5) resolves the SMTP password from a ``[secrets].provider`` when
+    ``email_password_secret`` is set (fail-closed); ``None``/no reference → the env-sourced
+    ``email_password``, byte-identical to before."""
     if not (alerts.email_smtp_host and alerts.email_from):
         return None
+    smtp_password = resolve_connector_secret(
+        secret_provider,
+        ref=alerts.email_password_secret,
+        literal=alerts.email_password,
+        label="[alerts].email_password",
+    )
     return SecurityEventNotifier(
         host=alerts.email_smtp_host,
         port=alerts.email_smtp_port,
         sender=alerts.email_from,
         use_tls=alerts.email_use_tls,
         username=alerts.email_username,
-        password=alerts.email_password,
+        password=smtp_password,
         timeout=alerts.email_timeout,
         allowed_hosts=tuple(alerts.smtp_allowed_hosts),
     )

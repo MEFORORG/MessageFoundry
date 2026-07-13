@@ -73,8 +73,11 @@ The policy is two independent axes, then **clamped** by the instance's **product
    request exceeds it.
 2. **`phi` hard rule** — `phi` survives only under `managed_claude_baa`; otherwise it falls back to
    `code_only`.
-3. **`deidentified` hard rule** — `deidentified` always falls back to `code_only` today, because the
-   de-identification framework is **not built** (roadmap only — see [PHI.md §9](PHI.md#9-de-identification)).
+3. **`deidentified` hard rule** — `deidentified` always falls back to `code_only` today, because **no
+   de-identification is wired into the AI-assist path**. (A de-id framework,
+   [`messagefoundry/anon/`](../messagefoundry/anon/) / ADR 0030, exists to build PHI-free **test
+   datasets**; it does not de-identify message bodies flowing to the assistant — see
+   [PHI.md §9](PHI.md#9-de-identification).)
 4. **`off` normalization** — when `mode == off`, `data_scope` is irrelevant and resolves to `code_only`.
 
 **`mode` is never clamped by posture** — only `data_scope` is. Every clamp is recorded in a
@@ -86,7 +89,7 @@ configured. Representative results:
 | `byo`, `code_only`, `true` | `code_only` | no clamp (this is the default) |
 | `byo`, `phi`, `true` | `code_only` | production ceiling for non-BAA mode |
 | `managed_claude_baa`, `phi`, `true` | `phi` | the full PHI-safe end — no clamp |
-| `managed_claude_baa`, `deidentified`, `true` | `code_only` | de-id framework unbuilt |
+| `managed_claude_baa`, `deidentified`, `true` | `code_only` | no AI-path de-id wired |
 | `managed_claude_baa`, `synthetic`, `true` | `synthetic` | under both ceiling and the phi rule |
 | `byo`, `phi`, `false` | `synthetic` | non-production ceiling |
 | `byo`, `deidentified`, `false` | `synthetic` | ceiling reached before the de-id rule |
@@ -214,8 +217,10 @@ an explicit guard against attaching anything beyond code. See [PHI.md](PHI.md#ai
   engine — not the IDE — will broker the provider connection, so egress is centrally controlled and
   **per-use auditable**. `managed_claude_baa` over a **BAA + zero-data-retention** connection is the
   **only** path by which `phi` scope ever becomes reachable.
-- **De-identification** (the `deidentified` scope) is **roadmap only** — there is no de-id framework
-  in the repo today, and this MVP never claims one. It falls back to `code_only`. See
+- **Runtime de-identification** (the `deidentified` scope) is **roadmap only** — the AI-assist path has
+  no message de-identification wired in today, so the scope falls back to `code_only`. (A de-id
+  framework, [`messagefoundry/anon/`](../messagefoundry/anon/) / ADR 0030, exists to build PHI-free
+  **test datasets**; it does not de-identify message bodies for the live assistant.) See
   [PHI.md §9](PHI.md#9-de-identification).
 - The `provider` / `model` / `baa_attested` / `endpoint` config keys are **accepted but unused**
   today; they exist so the broker can consume them without a config migration.

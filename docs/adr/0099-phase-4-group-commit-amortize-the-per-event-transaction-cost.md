@@ -1,5 +1,20 @@
 # 0099 — Phase 4 reconciled: group-commit is WITHDRAWN; the surviving lever is gated behind a measurement
 
+> # ✅ THE GATE HAS RUN — and it returned **ABANDON**. See [ADR 0107](0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md).
+> §Decision 4 of this ADR refused to authorize a Phase-4 build until a pre-registered P0 measurement cleared its bar.
+> **P0 ran 2026-07-13. It did not clear the bar — it landed in the NULL band.**
+>
+> - The intervention **engaged** (`committed_txns/msg` **10.47 → 7.49**, a 28.5% cut — manipulation check passed).
+> - Throughput moved **−0.56%** — inside the pre-registered null band, below the replicate noise.
+> - **Arm E bounded the whole lever class:** a ~3× swing in committed transactions costs only **11.7%** of throughput
+>   → **elasticity −0.115**. No transaction-reduction mechanism can close a 5.79× gap against that.
+>
+> **`txn/event` is now a MEASURED DEAD END** and joins the four store-side dead ends of
+> [ADR 0098](0098-store-side-scaling-levers-are-exhausted-transaction-amortization-is-the-only-path-to-45m-day.md).
+> **Phase 4 is closed ([ADR 0107](0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)); do not build
+> F2 or F3.** This ADR's *decision* (withdraw group-commit, ratify 0069, gate the survivor) stands and was vindicated —
+> the gate is exactly what stopped the wrong build.
+
 > ⚠️ **The allocated filename reads *"Phase-4 group commit — amortize the per-event transaction cost."* That was the
 > title I allocated before reading the ledger. **It is wrong.** Group-commit is not being built — it is being
 > **withdrawn**. The filename is retained because the ledger gate keys on the *number*; **the H1 above is the

@@ -593,6 +593,12 @@ class MLLPDestination(DestinationConnector):
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.connect_timeout: float = float(s.get("connect_timeout", 10.0))
         self.encoding: str = s.get("encoding", "utf-8")
+        # Per-outbound frame cap. This bounds ONLY the ACK-read decoder (the reply we read back); the
+        # OUTGOING frame written by send() is deliberately UNCAPPED (frame() never truncates), so a
+        # re-attached very-large document (#149, ADR 0105 Phase 1b — a base64 PDF spliced back into
+        # OBX-5.5 for an inline MDM) or a Handler-built large MDM streams inline to a receiver that does
+        # not cap the frame (Epic). Raise/lower it per outbound only to bound a partner's ACK size; a
+        # falsy value disables the ACK cap entirely (`max_frame_bytes=0`).
         mf = s.get("max_frame_bytes", DEFAULT_MAX_FRAME_BYTES)
         self.max_frame_bytes: int | None = int(mf) if mf else None
         # ADR 0067: persistent outbound connection. Shipped OPT-IN this release (default OFF): the

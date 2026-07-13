@@ -28,6 +28,7 @@ from messagefoundry.store.store import (
     OutboxItem,
     OutboxStatus,
     Stage,
+    StreamingAttachmentsUnsupported,
 )
 
 __all__ = [
@@ -44,6 +45,7 @@ __all__ = [
     "Stage",
     "Store",
     "StoreLifecycle",
+    "StreamingAttachmentsUnsupported",
     "StripResult",
     "open_store",
     "sqlite_settings",

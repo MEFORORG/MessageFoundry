@@ -61,6 +61,21 @@ class AlertSink(Protocol):
         name + age only."""
         ...
 
+    def saturation_rising(
+        self, name: str, *, stage: str, depth: int, depth_start: int, growth_per_second: float
+    ) -> None:
+        """A lane is **becoming** overloaded (#93, ADR 0014 amendment): its pending backlog has been
+        **rising sustained** across the sampling window — the DERIVATIVE signal, distinct from the
+        absolute-snapshot ceilings of :meth:`queue_buildup` / :meth:`message_stall`. Sustained rising
+        depth is, by conservation of the queue, ingest > drain held over the window, so a
+        bursty-but-DRAINING lane (a spike that then falls back) never fires this while a genuinely
+        saturating one does. ``name`` is the lane (connection) label; ``stage`` is the pipeline stage
+        (``ingress``/``routed``/``outbound``) the backlog is growing in; ``depth`` is the current
+        pending depth, ``depth_start`` the window's starting depth, ``growth_per_second`` the net rise
+        rate. Off by default (deny-by-default — only fires when a threshold is configured). No PHI —
+        the connection name + queue-shape derivative only. Emitted by the ``RegistryRunner``."""
+        ...
+
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
         """An outbound connection's delivery lane went **down** — the first transport failure
         (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
@@ -173,6 +188,18 @@ class LoggingAlertSink:
             "ALERT message_stall: outbound %r oldest undelivered message stalled %.0fs",
             name,
             oldest_age_seconds,
+        )
+
+    def saturation_rising(
+        self, name: str, *, stage: str, depth: int, depth_start: int, growth_per_second: float
+    ) -> None:
+        log.warning(
+            "ALERT saturation: lane %r (%s) backlog RISING — depth %d→%d (+%.2f/s); ingest exceeding drain",
+            name,
+            stage,
+            depth_start,
+            depth,
+            growth_per_second,
         )
 
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:

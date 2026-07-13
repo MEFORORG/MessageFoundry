@@ -443,3 +443,61 @@ def test_shipped_sample_connections_toml_loads() -> None:
     ib = reg.inbound["IB_ACME_ADT_TCP"]
     assert ib.router == "acme_adt_router"  # binds the code-first router from IB_ACME_ADT.py
     assert ib.spec.settings["port"] == 2700
+
+
+def test_streaming_knobs_roundtrip_toml(tmp_path: Path) -> None:
+    """#149 (ADR 0105 Phase 1a): the per-inbound very-large-document streaming knobs desugar through the
+    same build_inbound_connection factory as code-first, so a TOML entry resolves to the identical
+    InboundConnection fields."""
+    reg = load_config(
+        _config(
+            tmp_path,
+            """
+            [[inbound]]
+            name = "IB"
+            transport = "mllp"
+            router = "r"
+            stream_threshold_bytes = 8192
+            max_message_bytes = 134217728
+              [inbound.settings]
+              port = 2600
+              max_frame_bytes = 134217728
+
+            [[outbound]]
+            name = "OB"
+            transport = "mllp"
+              [outbound.settings]
+              host = "epic.example"
+              port = 2700
+            """,
+        )
+    )
+    ib = reg.inbound["IB"]
+    assert ib.stream_threshold_bytes == 8192
+    assert ib.max_message_bytes == 134217728
+
+
+def test_streaming_threshold_hl7_only_toml(tmp_path: Path) -> None:
+    with pytest.raises(WiringError, match="stream_threshold_bytes is HL7-specific"):
+        load_config(
+            _config(
+                tmp_path,
+                """
+                [[inbound]]
+                name = "IB"
+                transport = "mllp"
+                router = "r"
+                content_type = "json"
+                stream_threshold_bytes = 8192
+                  [inbound.settings]
+                  port = 2600
+
+                [[outbound]]
+                name = "OB"
+                transport = "mllp"
+                  [outbound.settings]
+                  host = "epic.example"
+                  port = 2700
+                """,
+            )
+        )

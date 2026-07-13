@@ -1,0 +1,8 @@
+# sampled dm_os_waiting_tasks 702x over 180s; PAGELATCH hits {'PAGELATCH_EX': 3}
+# top contended pages (dbid:file:page -> waiter-hits): [('5:1:310623', 1), ('5:1:307604', 1), ('5:1:306091', 1)]
+# hottest-page identities (db + object):
+  5:1:310623 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=4 (None)
+  5:1:307604 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=2 (None)
+  5:1:306091 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=4 (None)
+# top SQL statements waiting on PAGELATCH (store-internal, parameterized -- names the churn):
+  [1] (@P1 float,@P2 nvarchar(16),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(24),@P7 nvarchar(24))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P1, @stage NVARCHA

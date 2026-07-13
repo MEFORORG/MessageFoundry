@@ -185,6 +185,95 @@ suite("Steps edit — which rows/params are editable (code/control are read-only
     );
   });
 
+  test("ADR 0104 §2.3: the HL7 field picker button renders on a path slot, and ONLY there", () => {
+    const render = (row: LensRow): string =>
+      renderRowHtml(
+        buildHandlerViewModels(
+          { module: "m", handlers: [{ handler: "h", module: "m", def_line: 1, rows: [row] }] },
+          "line_1\nline_2",
+        )[0].rows[0],
+        "h",
+      );
+
+    // set_field: the `path` literal slot gets a pick button; the `value` slot does not.
+    const html = render({
+      kind: "action",
+      action: "set_field",
+      params: { path: "PID-3.1", value: "X" },
+      literal_params: ["path", "value"],
+      line_start: 2,
+      line_end: 2,
+      nesting: 0,
+    });
+    assert.strictEqual(
+      (html.match(/class="pickpath"/g) ?? []).length,
+      1,
+      "exactly one pick button — on `path`, never on `value`",
+    );
+    assert.ok(
+      html.includes('data-name="path" data-mode="path"'),
+      "the button targets the path slot in path mode",
+    );
+    assert.ok(html.includes('data-name="path" value="PID-3.1"'), "path stays a free-text input too");
+    assert.ok(html.includes('data-name="value" value="X"'), "value stays a plain free-text input");
+
+    // An expression-valued path (not in literal_params) is neither an editable input nor pickable (F6).
+    const exprHtml = render({
+      kind: "action",
+      action: "set_field",
+      params: { path: 'f"PID-{i}"', value: "X" },
+      literal_params: ["value"],
+      line_start: 2,
+      line_end: 2,
+      nesting: 0,
+    });
+    assert.ok(!exprHtml.includes('class="pickpath"'), "an expression-valued path gets no picker");
+
+    // delete_segment: the segment_id slot gets a SEGMENT-only picker (no field/component).
+    const delHtml = render({
+      kind: "action",
+      action: "delete_segment",
+      params: { segment_id: "ZAL" },
+      literal_params: ["segment_id"],
+      line_start: 2,
+      line_end: 2,
+      nesting: 0,
+    });
+    assert.ok(delHtml.includes('data-mode="segment"'), "delete_segment offers a segment-only picker");
+
+    // code_lookup is a LOOKUP row (its recognized name is in `call`, not `action`) — its path slot still
+    // gets the picker (pickMode keys off the recognized name, action ?? call).
+    const lookupHtml = render({
+      kind: "lookup",
+      call: "code_lookup",
+      params: { path: "PID-8", table: "gender" },
+      literal_params: ["path", "table"],
+      line_start: 2,
+      line_end: 2,
+      nesting: 0,
+    });
+    assert.ok(lookupHtml.includes('class="pickpath"'), "code_lookup's path slot gets a picker");
+    assert.ok(lookupHtml.includes('data-name="path" data-mode="path"'), "code_lookup path picker, path mode");
+
+    // db_lookup (no HL7 path param) gets NO picker — a lookup row without a pickable slot is untouched.
+    const dbHtml = render({
+      kind: "lookup",
+      call: "db_lookup",
+      params: { connection: "C", statement: "select 1", params: "{}" },
+      literal_params: ["connection", "statement"],
+      line_start: 2,
+      line_end: 2,
+      nesting: 0,
+    });
+    assert.ok(!dbHtml.includes('class="pickpath"'), "db_lookup gets no picker (no HL7 path param)");
+
+    // A code row never gets a picker (nothing editable at all).
+    assert.ok(
+      !render({ kind: "code", line_start: 2, line_end: 2, nesting: 0 }).includes('class="pickpath"'),
+      "a code row never gets a picker button",
+    );
+  });
+
   test("a contract without literal_params (older engine / hand-built row) stays all-editable", () => {
     const action: LensRow = {
       kind: "action",

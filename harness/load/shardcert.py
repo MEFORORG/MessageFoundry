@@ -290,6 +290,16 @@ class ShardCertReport:
     offered: int = 0  # intended load over the hold (round(aggregate_rate * hold_seconds))
     achieved_intake: int = 0  # messages the fleet accept-ACKed (== acked; the intake number)
     in_pipeline_peak: int = -1  # peak NOT-DONE rows during the hold; -1 = not sampled (default)
+    #: END-TO-END message latency (2026-07-13). The correlator has been recording into `metrics.e2e`
+    #: (`correlator.py:67`) all along and the report summarised `ack` ONLY — so the single measurement of
+    #: a FULL message's life (send -> sink arrival) was built and thrown away on every run ever done.
+    #: VALID ONLY where the sender and the correlating sink share one process and one clock (this
+    #: single-box report and the two-box DRIVER half). In the multi-process drive the sinks are separate
+    #: processes and every arrival is a `correlation_miss` — it is NOT surfaced there, deliberately.
+    #: `e2e_count == 0` means "not measured", never "zero latency".
+    e2e_count: int = 0
+    e2e_p50_ms: float = 0.0
+    e2e_p99_ms: float = 0.0
     ack_p50_ms: float = 0.0  # ACK-on-receipt latency (across every shard lane)
     ack_p99_ms: float = 0.0
     recovery_seconds: float | None = None
@@ -840,6 +850,7 @@ async def run_shardcert(
 
     ctr = metrics.counters
     ack = metrics.ack.summary()
+    e2e = metrics.e2e.summary()  # the full-message-life histogram the report used to discard
     return ShardCertReport(
         shards=tuple(ids_list),
         owned=owned,
@@ -864,6 +875,9 @@ async def run_shardcert(
         offered=round(aggregate_rate * hold_seconds),
         achieved_intake=ctr.acked,
         in_pipeline_peak=(peak_holder[0] if capture_peak else -1),
+        e2e_count=e2e.count,
+        e2e_p50_ms=e2e.p50_ms,
+        e2e_p99_ms=e2e.p99_ms,
         ack_p50_ms=ack.p50_ms,
         ack_p99_ms=ack.p99_ms,
         recovery_seconds=recovery_seconds,

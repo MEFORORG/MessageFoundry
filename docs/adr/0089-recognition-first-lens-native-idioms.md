@@ -1,6 +1,6 @@
 # ADR 0089 — Recognition-first lens: render native Message-API idioms as editable action rows
 
-**Status:** Proposed (2026-07-11) — draft for owner ratification. Extends ADR 0076. Build is **gated on Acceptance**.
+**Status:** Accepted (2026-07-13) — owner-ratified. Extends ADR 0076. Phase A (native-idiom recognition) is built and adopted (owner Steps-view endorsement); the ADR 0104 §2.3 HL7 field picker and the remaining phases build against it. (The 0/1,283 scan measured non-use of the ADR 0076 vocabulary API — **not** Steps-view adoption.)
 **Deciders:** owner + IDE/DX working group
 **Related:** ADR **0076** (the Steps lens this extends — vocabulary + `lens parse`/`rewrite` machinery, byte-stability gate 2, sync-on-save, one-editor, text fallback), BACKLOG **#222** (the lens), **#225** (live values), **#226–#230** (this ADR's build phases), ADR **0072** (traced dry-run / live values rendered beside rows), ADR **0010/0043** (`db_lookup`/`fhir_lookup` — the read-only lookups a value expression may call), CLAUDE.md §8 (Message API), §9 (PHI).
 **Code references** are `origin/main @ 1bbb409`; line numbers drift — locate at implementation time.

@@ -45,6 +45,8 @@ def test_sample_config_loads_and_routes() -> None:
         "fhir_router",
         "sr_router",
         "demo_oru_router",
+        "stream_mdm_router",  # #149 streaming: MDM-with-embedded-PDF pass-through (IB_STREAM_MDM.py)
+        "pdf_mdm_router",  # #149 streaming: PDF-file → base64 → MDM build (IB_PDF_TO_MDM.py)
     }
     assert set(reg.handlers) == {
         "archive",
@@ -56,6 +58,8 @@ def test_sample_config_loads_and_routes() -> None:
         "fhir_handler",
         "sr_to_oru",
         "demo_oru_relay",
+        "stream_mdm_handler",  # #149 streaming (IB_STREAM_MDM.py)
+        "pdf_mdm_handler",  # #149 streaming (IB_PDF_TO_MDM.py)
     }
     assert reg.inbound["IB_PARTNER_X12"].spec.settings["port"] == 2710
     assert reg.inbound["IB_PARTNER_X12"].content_type.value == "x12"

@@ -22,6 +22,7 @@ re-encode.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -483,6 +484,22 @@ class Message:
         # parse is byte-parity with python-hl7, so the round-trip is faithful.
         return _builtin_hl7.encode_raw_separators(_builtin_hl7.parse(normalize(str(self._m))))
 
+    def copy(self) -> Message:
+        """An independent, mutable **structural clone** of this message's current in-memory state
+        (ADR 0104) — the primitive behind copy-on-Send and the explicit ``msg.copy()`` sugar.
+
+        Deep-clones the backing parse tree and wraps it in a fresh :class:`Message`. Deliberately **not**
+        ``Message.parse(self.encode())``: (1) :meth:`parse` uses the default (built-ins) backend whenever
+        :func:`~messagefoundry.parsing._backend.use_builtin` is on, so a source parsed via the python-hl7
+        **fallback** would silently *switch backends* on clone; (2) an encode→parse round-trip would make
+        clone fidelity depend on that round-trip being byte-stable. ``copy.deepcopy`` clones whichever
+        container ``self._m`` is (the built-ins ``dict`` model or an ``hl7.Message``) faithfully, and
+        :meth:`__init__` re-derives ``self._builtin`` from the *clone*, so the clone keeps the source's own
+        backend with no branch here. Pure: no clock/RNG/I/O, and the ingress raw is never touched. Note it
+        does **not** re-run the hl7apy strict tier — a clone of a strict-validated inbound is not
+        re-validated (by design)."""
+        return Message(copy.deepcopy(self._m))
+
     def __str__(self) -> str:
         return self.encode()
 
@@ -611,6 +628,20 @@ def emit_raw_separators(payload: str) -> str:
     return Message.parse(payload).encode_raw_separators()
 
 
+def snapshot_payload(payload: Message | RawMessage | str) -> Message | RawMessage | str:
+    """Copy-on-Send dispatch (ADR 0104): return an independent snapshot of ``payload`` so a ``Send``
+    constructed now is decoupled from a later mutation of the same object within the handler.
+
+    A :class:`Message` becomes a structural :meth:`Message.copy`; a :class:`RawMessage` becomes a
+    :meth:`RawMessage.copy` (re-capturing its ``raw`` string); a ``str`` is immutable and returned
+    **as-is** (identity preserved), so the caller can detect "no snapshot needed" via ``is``."""
+    if isinstance(payload, Message):
+        return payload.copy()
+    if isinstance(payload, RawMessage):
+        return payload.copy()
+    return payload
+
+
 class RawMessage:
     """A **non-HL7** inbound payload (ADR 0004) — what a code-first Router/Handler receives when the
     inbound connection's ``content_type`` is not ``hl7v2`` (a database row, a JSON/SOAP body, …).
@@ -683,6 +714,15 @@ class RawMessage:
     def encode(self) -> str:
         """The body verbatim — symmetry with :meth:`Message.encode` so a pass-through ``Send`` works."""
         return self.raw
+
+    def copy(self) -> RawMessage:
+        """A snapshot of this payload at copy-on-Send time (ADR 0104): re-capture the current ``raw``
+        (an immutable ``str``) into a fresh :class:`RawMessage`. This closes the **within-handler**
+        duplicate-delivery case — a ``Send`` built now is decoupled from a later ``rm.raw = …`` in the
+        same handler. It does **not** address the **cross-handler** leak (one ``RawMessage`` is shared
+        across a message's sibling handlers), which is a separate scan-gated fast-follow (freeze
+        ``RawMessage.raw``); do not treat ``RawMessage`` as immutable."""
+        return RawMessage(self.raw, self.content_type)
 
     def __str__(self) -> str:
         return self.raw

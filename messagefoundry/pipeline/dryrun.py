@@ -445,6 +445,7 @@ def route_message(
     ingest_time: float | None = None,
     tracer: TraceHook | None = None,
     sandbox: SandboxSession | None = None,
+    snapshot_on_send: bool = False,
 ) -> RouteOutcome:
     """Run ``ic``'s Router then the named Handlers; return what they selected and would send.
 
@@ -460,6 +461,14 @@ def route_message(
 
     ``tracer`` (ADR 0072) is threaded to :func:`route_only` / :func:`transform_one` so the traced
     dry-run can observe each Router/Handler call; it is a pure observer, so the outcome is byte-identical.
+
+    ``snapshot_on_send`` (ADR 0104) mirrors the ``[pipeline].snapshot_on_send`` service setting for the
+    preview: ``False`` (the default — the default engine posture) previews the last-write-collapse
+    behaviour; ``True`` activates copy-on-Send so a divergent fan-out (mutate the same message between two
+    ``Send``\\ s) previews per-destination bytes exactly as an engine with the flag enabled delivers them.
+    The offline ``messagefoundry dryrun`` / ``check`` CLIs do not load service settings, so they preview
+    the default (``False``) posture; a programmatic caller (or the Test Bench, once the default flips) may
+    pass ``True`` for parity with such an engine.
     """
     # Publish the graph's code sets so a call-time code_set(...) inside a Router/Handler resolves
     # during a dry-run / Test Bench / `messagefoundry check` preview (the loader only had them active
@@ -491,6 +500,7 @@ def route_message(
         ingest_time=ingest_time,
         # #162: a dry-run/preview has no persisted message, so message_id stays None — the
         # unmapped-capture drain has no id to key by (and the default sink is None here anyway).
+        snapshot_on_send=snapshot_on_send,  # ADR 0104: preview copy-on-Send iff the caller opts in
     )
     with run_contexts(rc, phase="transform"):
         ct = ic.content_type.value
@@ -576,11 +586,19 @@ def _dry_run_raw(
     raw: str | bytes,
     *,
     tracer: TraceHook | None = None,
+    snapshot_on_send: bool = False,
 ) -> DryRunResult:
     """Dry-run a non-HL7 inbound (ADR 0004): no HL7 peek/validate; route the body as a RawMessage."""
     text = raw if isinstance(raw, str) else raw.decode("utf-8")
     try:
-        outcome = route_message(registry, ic, text, ingest_time=time.time(), tracer=tracer)
+        outcome = route_message(
+            registry,
+            ic,
+            text,
+            ingest_time=time.time(),
+            tracer=tracer,
+            snapshot_on_send=snapshot_on_send,
+        )
     except Exception as exc:  # a router/handler script raised
         return DryRunResult(
             inbound=ic.name,
@@ -606,6 +624,7 @@ def dry_run(
     *,
     inbound: str | None = None,
     tracer: TraceHook | None = None,
+    snapshot_on_send: bool = False,
 ) -> DryRunResult:
     """Parse → (strict-validate) → route one message, returning disposition + would-send payloads.
 
@@ -617,7 +636,7 @@ def dry_run(
     """
     ic = select_inbound(registry, inbound)
     if ic.content_type is not ContentType.HL7V2:
-        return _dry_run_raw(registry, ic, raw, tracer=tracer)
+        return _dry_run_raw(registry, ic, raw, tracer=tracer, snapshot_on_send=snapshot_on_send)
     text = normalize(raw)
 
     try:
@@ -643,7 +662,14 @@ def dry_run(
             )
 
     try:
-        outcome = route_message(registry, ic, text, ingest_time=time.time(), tracer=tracer)
+        outcome = route_message(
+            registry,
+            ic,
+            text,
+            ingest_time=time.time(),
+            tracer=tracer,
+            snapshot_on_send=snapshot_on_send,
+        )
     except Exception as exc:  # a router/handler script raised
         return DryRunResult(
             inbound=ic.name,

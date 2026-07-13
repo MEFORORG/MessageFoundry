@@ -209,8 +209,20 @@ def message_search(
     return page("Content search", *parts, active="messages")
 
 
+def _human_size(n: int) -> str:
+    """A compact human-readable byte size (e.g. ``1.2 MiB``) for the attachments panel. Binary units;
+    integer bytes below 1 KiB. Pure display — never affects the download."""
+    size = float(max(n, 0))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{n} B"  # unreachable; keeps mypy happy on the loop's implicit path
+
+
 def message_detail(detail: MessageDetail) -> Markup:
-    """A single message: metadata + the AUDITED raw body (escaped inside <pre>) + deliveries/events."""
+    """A single message: metadata + the AUDITED raw body (escaped inside <pre>) + deliveries/events, plus
+    an Attachments panel (#149, ADR 0105 Phase 3b) when very-large documents were detached at ingress."""
     meta = rows_table(
         ["Field", "Value"],
         [
@@ -251,6 +263,35 @@ def message_detail(detail: MessageDetail) -> Markup:
         href=f"/ui/messages/{detail.id}/edit",
         class_="btn-link",
     )
+    # Attachments panel (#149, ADR 0105 Phase 3b): shown only when a very-large document was detached
+    # from this message. Metadata only (content type + human size); the bytes ride the audited,
+    # view_raw-gated download link (a top-level GET carrying the session cookie — the /ui route reuses
+    # the engine's audited download handler in-process). Rendered as a normal same-origin link.
+    attachments_section: list[object] = []
+    if detail.attachments:
+        att_rows = [
+            [
+                a.content_type,
+                _human_size(a.total_bytes),
+                el(
+                    "a",
+                    "Download",
+                    href=f"/ui/messages/{detail.id}/attachments/{a.id}",
+                    class_="btn-link",
+                ),
+            ]
+            for a in detail.attachments
+        ]
+        attachments_section = [
+            el("h2", "Attachments"),
+            el(
+                "p",
+                "Very-large documents detached from this message. Downloading a document is audited "
+                "PHI access.",
+                class_="muted",
+            ),
+            rows_table(["Content type", "Size", ""], att_rows),
+        ]
     return page(
         "Message",
         el("p", el("a", "← Messages", href="/ui/messages")),
@@ -263,6 +304,7 @@ def message_detail(detail: MessageDetail) -> Markup:
             class_="detail-head",
         ),
         raw,
+        *attachments_section,
         el("h2", "Deliveries"),
         outbox,
         el("h2", "Events"),

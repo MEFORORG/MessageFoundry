@@ -39,7 +39,20 @@ from messagefoundry.console import service_control
 from messagefoundry.console._async import AsyncRunner
 from messagefoundry.console.client import ApiError, EngineClient
 
-_ENGINE_ROWS = ["Reachable", "Version", "Config", "Uptime", "PID", "Channels", "Queue"]
+# "Endpoints" + "Throughput" are the #93 engine-wide KPI headline: combined inbound+outbound endpoint
+# count (running/stopped) and the engine-wide msg/s rate — the single-glance roll-up no per-connection
+# row gives. They sit beside "Channels" (which counts inbound only) and reuse the recent_done window.
+_ENGINE_ROWS = [
+    "Reachable",
+    "Version",
+    "Config",
+    "Uptime",
+    "PID",
+    "Channels",
+    "Endpoints",
+    "Throughput",
+    "Queue",
+]
 _DB_ROWS = [
     "Path",
     "Size",
@@ -252,6 +265,13 @@ class EngineStatusPage(QWidget):
         self._engine["Uptime"].setText(_human_uptime(e.uptime_seconds))
         self._engine["PID"].setText(str(e.pid))
         self._engine["Channels"].setText(f"{e.channels_running} running / {e.channels_total} total")
+        # #93 engine-wide KPI headline: combined inbound+outbound endpoints + the engine-wide rate.
+        kpi = snap.status.kpis
+        self._engine["Endpoints"].setText(
+            f"{kpi.connections_running} running / {kpi.connections_total} total"
+            f" ({kpi.connections_stopped} stopped)"
+        )
+        self._engine["Throughput"].setText(f"{kpi.messages_per_second:.1f} msg/s")
         queue = ", ".join(f"{k}={v}" for k, v in sorted(e.outbox_by_status.items()))
         self._engine["Queue"].setText(queue or "empty")
         self._engine["Config"].setText(_provenance_text(snap.provenance))

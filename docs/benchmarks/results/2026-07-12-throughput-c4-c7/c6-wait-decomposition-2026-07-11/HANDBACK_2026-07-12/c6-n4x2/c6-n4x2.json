@@ -1,0 +1,176 @@
+{
+  "schema_version": 3,
+  "kind": "shardcert_ladder_two_box",
+  "result": "PASS",
+  "exit_code": 0,
+  "climb_aborted": false,
+  "soak_aborted": false,
+  "soak_not_sustained": false,
+  "soak_store_truth_unconfirmed": false,
+  "store_truth_unconfirmed": false,
+  "topology": {
+    "shards": [
+      "a",
+      "b",
+      "c",
+      "d"
+    ],
+    "dests": 8,
+    "driver_count": 4,
+    "sink_count": 8
+  },
+  "target_events_per_s": 520.833,
+  "ceiling": {
+    "pinned_ingress_rate": 7.684,
+    "pinned_outbound_rate": 61.475,
+    "pinned_measured_delivered_rate_per_s": 69.818,
+    "first_collapse_ingress_rate": null,
+    "bracketed": false,
+    "sustained_events_per_s": 69.16,
+    "clears_target_events": false
+  },
+  "soak": {
+    "index": -1,
+    "is_soak": true,
+    "verdict": "sustained",
+    "ingress_rate": 8.0,
+    "outbound_rate": 64.0,
+    "sustainable_ingress_rate": 7.955,
+    "dests": 8,
+    "hold_seconds": 900.0,
+    "offered_ingress": 7200,
+    "acked": 7200,
+    "sink_received": 57600,
+    "outbound_expected": 57600,
+    "no_loss": true,
+    "lane_inversions": 0,
+    "lane_repeats": 0,
+    "lanes_observed": 16,
+    "ack_ms": {
+      "p50": 10.125,
+      "p99": 41.889
+    },
+    "drive_drain_seconds": null,
+    "engine_drain_seconds": 5.120002199999362,
+    "engine": {
+      "reported": true,
+      "ok": true,
+      "drained": true,
+      "stranded": 0,
+      "dead_total": 0,
+      "in_pipeline_final": 0
+    },
+    "in_pipeline_slope": 0.0016094160296252255,
+    "phase_timing": {
+      "windows": 705,
+      "deliveries": 57469,
+      "send_ack_mean_ms": 0.52,
+      "send_ack_max_ms": 4.21,
+      "mark_done_mean_ms": 9.983,
+      "mark_done_max_ms": 135.0
+    },
+    "claim_timing": {
+      "windows": 2107,
+      "claims": 134932,
+      "claim_mean_ms": 13.316,
+      "claim_max_ms": 174.81,
+      "lanes_per_claim": 1.081,
+      "rows_per_claim": 0.903,
+      "rearm": 0,
+      "empty": 22727
+    },
+    "notes": [
+      "engine drain gate: engine_ok=True stranded=0 dead_total=0",
+      "[sink-0] ShardCert SINK 0/8  ports=3700 / sink_received=7200 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+      "[sink-1] ShardCert SINK 1/8  ports=3701 / sink_received=7200 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+      "[sink-2] ShardCert SINK 2/8  ports=3702 / sink_received=7200 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+      "[sink-3] ShardCert SINK 3/8  ports=3703 / sink_received=7200 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+      "[sink-4] ShardCert SINK 4/8  ports=3704 / sink_received=7200 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+      "[sink-5] ShardCert SINK 5/8  ports=3705 / sink_received=7200 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+      "[sink-6] ShardCert SINK 6/8  ports=3706 / sink_received=7200 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+      "[sink-7] ShardCert SINK 7/8  ports=3707 / sink_received=7200 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+      "[worker-0] ShardCert DRIVER-WORKER 0/4  bands=0,1,2,3 / sent=1800 acked=1800 ack p50/p99=9.7/37.9ms",
+      "[worker-1] ShardCert DRIVER-WORKER 1/4  bands=4,5,6,7 / sent=1800 acked=1800 ack p50/p99=10.1/37.9ms",
+      "[worker-2] ShardCert DRIVER-WORKER 2/4  bands=8,9,10,11 / sent=1800 acked=1800 ack p50/p99=8.1/37.9ms",
+      "[worker-3] ShardCert DRIVER-WORKER 3/4  bands=12,13,14,15 / sent=1800 acked=1800 ack p50/p99=8.8/41.9ms",
+      "engine: observed DRIVE_START (driver t0=1783874134.4170854)"
+    ]
+  },
+  "soak_ok": true,
+  "climb": [
+    {
+      "index": 0,
+      "is_soak": false,
+      "verdict": "sustained",
+      "ingress_rate": 8.0,
+      "outbound_rate": 64.0,
+      "sustainable_ingress_rate": 7.684,
+      "dests": 8,
+      "hold_seconds": 60.0,
+      "offered_ingress": 480,
+      "acked": 480,
+      "sink_received": 3840,
+      "outbound_expected": 3840,
+      "no_loss": true,
+      "lane_inversions": 0,
+      "lane_repeats": 0,
+      "lanes_observed": 16,
+      "ack_ms": {
+        "p50": 8.125,
+        "p99": 24.903
+      },
+      "drive_drain_seconds": null,
+      "engine_drain_seconds": 2.464029999999184,
+      "engine": {
+        "reported": true,
+        "ok": true,
+        "drained": true,
+        "stranded": 0,
+        "dead_total": 0,
+        "in_pipeline_final": 0
+      },
+      "in_pipeline_slope": null,
+      "phase_timing": {
+        "windows": 44,
+        "deliveries": 3581,
+        "send_ack_mean_ms": 0.523,
+        "send_ack_max_ms": 1.51,
+        "mark_done_mean_ms": 8.713,
+        "mark_done_max_ms": 161.35
+      },
+      "claim_timing": {
+        "windows": 152,
+        "claims": 8480,
+        "claim_mean_ms": 12.094,
+        "claim_max_ms": 269.08,
+        "lanes_per_claim": 1.087,
+        "rows_per_claim": 0.908,
+        "rearm": 0,
+        "empty": 1429
+      },
+      "notes": [
+        "engine drain gate: engine_ok=True stranded=0 dead_total=0",
+        "[sink-0] ShardCert SINK 0/8  ports=3700 / sink_received=480 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+        "[sink-1] ShardCert SINK 1/8  ports=3701 / sink_received=480 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+        "[sink-2] ShardCert SINK 2/8  ports=3702 / sink_received=480 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+        "[sink-3] ShardCert SINK 3/8  ports=3703 / sink_received=480 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+        "[sink-4] ShardCert SINK 4/8  ports=3704 / sink_received=480 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+        "[sink-5] ShardCert SINK 5/8  ports=3705 / sink_received=480 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+        "[sink-6] ShardCert SINK 6/8  ports=3706 / sink_received=480 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+        "[sink-7] ShardCert SINK 7/8  ports=3707 / sink_received=480 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=16",
+        "[worker-0] ShardCert DRIVER-WORKER 0/4  bands=0,1,2,3 / sent=120 acked=120 ack p50/p99=7.7/19.2ms",
+        "[worker-1] ShardCert DRIVER-WORKER 1/4  bands=4,5,6,7 / sent=120 acked=120 ack p50/p99=7.7/23.0ms",
+        "[worker-2] ShardCert DRIVER-WORKER 2/4  bands=8,9,10,11 / sent=120 acked=120 ack p50/p99=8.1/22.5ms",
+        "[worker-3] ShardCert DRIVER-WORKER 3/4  bands=12,13,14,15 / sent=120 acked=120 ack p50/p99=7.8/24.9ms",
+        "engine: observed DRIVE_START (driver t0=1783873909.408259)"
+      ]
+    }
+  ],
+  "notes": [],
+  "run": {
+    "run_id": "c6-n4x2",
+    "rate_ladder": "8",
+    "generated_at": "2026-07-12T16:53:10.985388+00:00",
+    "commit_sha": "98bec81d0a5ca74bfb98c52a59281cc74cd5f1c1"
+  }
+}

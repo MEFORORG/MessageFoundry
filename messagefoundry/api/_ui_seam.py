@@ -28,7 +28,9 @@ from typing import Any
 #: (a CoreHandlers/AdminHandlers field, a rendered DTO field set, the app.state attributes the
 #: console reads, the ``api.security`` deps it imports directly, or the ``/ws`` push shape). The
 #: console declares ``SUPPORTED_ENGINE_SEAMS`` and refuses a skew at startup (``assert_engine_seam``).
-ENGINE_UI_SEAM: int = 2
+#: seam v4: MessageDetail gained the additive `attachments` list + a `download_attachment` handler
+#: (the streaming-attachment operator read surface, BACKLOG #149 / ADR 0105 Phase 3b).
+ENGINE_UI_SEAM: int = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +45,9 @@ class CoreHandlers:
     list_connections: Callable[..., Awaitable[Any]]
     list_messages: Callable[..., Awaitable[Any]]
     get_message: Callable[..., Awaitable[Any]]
+    download_attachment: Callable[
+        ..., Awaitable[Any]
+    ]  # streaming-attachment download (#149, seam v4)
     list_dead_letters: Callable[..., Awaitable[Any]]
     start_connection: Callable[..., Awaitable[Any]]
     stop_connection: Callable[..., Awaitable[Any]]

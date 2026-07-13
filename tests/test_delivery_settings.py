@@ -13,7 +13,13 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry import BuildupThreshold, InternalErrorPolicy, RetryPolicy, StallThreshold
+from messagefoundry import (
+    BuildupThreshold,
+    InternalErrorPolicy,
+    RetryPolicy,
+    SaturationThreshold,
+    StallThreshold,
+)
 from messagefoundry.config.settings import DeliverySettings, load_settings
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline import Engine
@@ -92,6 +98,21 @@ def test_stall_threshold_default_off_and_toml_override(tmp_path: Path) -> None:
     cfg.write_text("[delivery]\nstall_max_oldest_seconds = 120\n")
     st = load_settings(config_path=cfg).delivery.stall_threshold()
     assert st.max_oldest_seconds == 120.0
+
+
+def test_saturation_threshold_default_off_and_toml_override(tmp_path: Path) -> None:
+    # The [delivery] saturation_sustain_samples key mirrors SaturationThreshold; the saturation
+    # (rising-backlog derivative) alert is OFF by default (deny-by-default, #93, ADR 0014 amendment),
+    # and the file turns it on. Floor of 2 is enforced by the model (fewer can't tell a burst from
+    # sustained growth).
+    assert DeliverySettings().saturation_threshold() == SaturationThreshold()
+    assert (
+        DeliverySettings().saturation_threshold().sustain_samples is None
+    )  # off unless configured
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text("[delivery]\nsaturation_sustain_samples = 4\n")
+    sat = load_settings(config_path=cfg).delivery.saturation_threshold()
+    assert sat.sustain_samples == 4
 
 
 def test_outbound_stall_override_kept_when_set(tmp_path: Path) -> None:

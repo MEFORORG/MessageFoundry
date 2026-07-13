@@ -24,9 +24,11 @@ This module is **pure** (no I/O) and imports nothing from :mod:`messagefoundry.c
 consumed by the ``GET /ai/policy`` API endpoint and the ``messagefoundry ai-policy`` CLI, which both
 serialize :class:`EffectivePolicy` to the shared snake_case wire shape.
 
-Note: the ``deidentified`` scope depends on a de-identification framework that **does not exist in
-this repo** (roadmap only); :func:`resolve_effective_policy` therefore always clamps it down rather
-than pretending it is reachable.
+Note: the ``deidentified`` scope needs runtime de-identification wired into the AI-assist path,
+which does not exist yet (roadmap only). A de-id framework *does* live in the repo
+(:mod:`messagefoundry.anon`, ADR 0030), but it de-identifies data for building PHI-free test
+datasets — not message bodies flowing to the assistant — so :func:`resolve_effective_policy`
+always clamps this scope down rather than pretending it is reachable.
 """
 
 from __future__ import annotations
@@ -49,7 +51,7 @@ class AiDataScope(str, Enum):
 
     CODE_ONLY = "code_only"  # graph names + editor code only (PHI-safe by construction)
     SYNTHETIC = "synthetic"  # plus synthetic/sample HL7
-    DEIDENTIFIED = "deidentified"  # de-identified PHI (needs the unbuilt de-id framework)
+    DEIDENTIFIED = "deidentified"  # de-identified PHI (needs runtime AI-path de-id; not wired yet)
     PHI = "phi"  # real message bodies (only over a BAA + zero-retention provider)
 
 
@@ -95,7 +97,7 @@ def resolve_effective_policy(
     """Clamp a requested (mode, data_scope) to the enforceable effective policy for this instance.
 
     The algorithm (in order): apply the production-posture data-scope ceiling; defensively block
-    ``phi`` unless the mode is BAA-managed; block ``deidentified`` (the de-id framework is unbuilt);
+    ``phi`` unless the mode is BAA-managed; block ``deidentified`` (no AI-path de-id wired yet);
     and normalize scope to ``code_only`` when the mode is ``off``. ``mode`` is never clamped — a
     central ``off``/managed choice is honored regardless of posture. ``production`` is the instance's
     posture flag (decoupled from the environment *name*, ADR 0017), not whether it is literally named
@@ -122,11 +124,12 @@ def resolve_effective_policy(
         eff = AiDataScope.CODE_ONLY
         reasons.append("phi scope requires managed_claude_baa mode; fell back to code_only")
 
-    # 3. deidentified hard rule: the de-id framework is roadmap only, so this scope is never live.
+    # 3. deidentified hard rule: no runtime AI-path de-id wired yet, so this scope is never live.
     if eff is AiDataScope.DEIDENTIFIED:
         eff = AiDataScope.CODE_ONLY
         reasons.append(
-            "deidentified scope requires the (unbuilt) de-id framework; fell back to code_only"
+            "deidentified scope requires runtime de-identification not yet wired into the "
+            "AI-assist path; fell back to code_only"
         )
 
     # 4. off normalization: when AI is off the scope is irrelevant — pin it to the safe floor.

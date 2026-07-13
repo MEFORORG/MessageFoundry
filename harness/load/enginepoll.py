@@ -98,6 +98,12 @@ class EngineSample:
     # physical transactions committed (the 3+2H+2N/msg cost-model currency, ADR 0051); body_copies =
     # raw/payload body strings durably written (the 2+H+N/msg amplification). Σ across shards; default 0 so
     # an older engine without the /stats fields reads as zero.
+    # Pool acquire-wait COUNT + MEAN (2026-07-13). PoolWaitInfo exposes both; the poller read only the
+    # percentiles. Differencing mean_ms x count across the soak splits a store round-trip into
+    # engine-side QUEUEING vs actual STORE SERVICE:  store_service_ms = claim_mean_ms - acquire_wait_mean_ms.
+    # Until now the "~2.84 ms round-trip" was never measured -- it was 20 / 7 (ADR 0057 §1).
+    pool_acquire_wait_count: int = 0
+    pool_acquire_wait_mean_ms: float = 0.0
     committed_txns: int = 0
     body_copies: int = 0
     executor_queue_depth: int | None = None  # default-pool submit-queue depth (wall #1; shim-only)
@@ -137,6 +143,11 @@ class _ShardSample:
     empty_claims_idle_poll: int = 0
     empty_claims_wake_fanout: int = 0
     committed_txns: int = 0  # A1 live cost counter (summable across shards)
+    # Pool acquire-wait COUNT + MEAN (2026-07-13) — PoolWaitInfo exposes both; the poller read only the
+    # percentiles. mean_ms x count differenced across a soak splits a store round-trip into engine-side
+    # QUEUEING vs actual STORE SERVICE. Mirrors the same two fields on EngineSample.
+    pool_acquire_wait_count: int = 0
+    pool_acquire_wait_mean_ms: float = 0.0
     body_copies: int = 0  # A1 live cost counter (summable across shards)
     executor_queue_depth: int | None = None
     executor_busy: int | None = None
@@ -346,6 +357,15 @@ class EnginePoller:
             empty_claims_wake_fanout=sum(s.empty_claims_wake_fanout for s in shard_samples),
             committed_txns=sum(s.committed_txns for s in shard_samples),  # A1
             body_copies=sum(s.body_copies for s in shard_samples),  # A1
+            # Pool acquire-wait: the COUNT sums across shards, but the MEAN must be N-WEIGHTED —
+            # a plain mean-of-means would let an idle shard with 3 waits outvote a busy one with 3,000.
+            pool_acquire_wait_count=sum(s.pool_acquire_wait_count for s in shard_samples),
+            pool_acquire_wait_mean_ms=(
+                sum(s.pool_acquire_wait_mean_ms * s.pool_acquire_wait_count for s in shard_samples)
+                / _wait_n
+                if (_wait_n := sum(s.pool_acquire_wait_count for s in shard_samples))
+                else 0.0
+            ),
             executor_queue_depth=_first_not_none(s.executor_queue_depth for s in shard_samples),
             executor_busy=_first_not_none(s.executor_busy for s in shard_samples),
             pool_size=_first_not_none(s.pool_size for s in shard_samples),
@@ -403,4 +423,7 @@ class EnginePoller:
             pool_wait_p95_ms=_pool_wait_attr(status, "p95_ms"),
             pool_wait_p99_ms=_pool_wait_attr(status, "p99_ms"),
             pool_wait_max_ms=_pool_wait_attr(status, "max_ms"),
+            # The two PoolWaitInfo fields the poller never read (2026-07-13) — see the field comments.
+            pool_acquire_wait_count=int(_pool_wait_attr(status, "count") or 0),
+            pool_acquire_wait_mean_ms=float(_pool_wait_attr(status, "mean_ms") or 0.0),
         )

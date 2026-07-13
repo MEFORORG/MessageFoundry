@@ -24,7 +24,7 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
 
-from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.transports.base import (
@@ -277,11 +277,20 @@ class FileSource(SourceConnector):
                 # rather than quarantining a healthy file. Logged, never silently swallowed.
                 logger.warning("could not read %s (will retry next scan): %s", path.name, exc)
                 continue
-            if not _looks_like_hl7(raw):
-                # Content doesn't match the declared .hl7 type (binary / non-HL7 text) — quarantine
+            if self.content_type in (ContentType.HL7V2, None) and not _looks_like_hl7(raw):
+                # Content doesn't match the declared hl7v2 type (binary / non-HL7 text) — quarantine
                 # before its bytes reach the pipeline (ASVS 5.2.2). Like the oversize reject above, it
                 # never became a "received message", so there's no store disposition; preserve it in
                 # .error and log it (never a silent drop).
+                #
+                # Gated on the inbound's declared content_type (mirrors RemoteFileSource): the header
+                # sniff runs ONLY for an hl7v2 inbound. A legitimate non-hl7v2 drop (binary/x12/dicom/…)
+                # has no MSH/FHS/BHS header by design, so it must NOT be rejected for lacking one — its
+                # raw bytes flow on to the content_type-aware pipeline (handed off verbatim by _emit,
+                # carried NUL-safely via RawMessage.from_bytes / mfb64, ADR 0028). The runner injects
+                # content_type; it is None only for a direct caller/test that never had it set — treated
+                # as "unknown", which KEEPS the sniff ON (the pre-gate default), so only an explicitly
+                # non-hl7v2 inbound skips it and the None path stays byte-identical to before.
                 logger.warning(
                     "file %s is not HL7 (no MSH/FHS/BHS header); routing to error dir", path.name
                 )
@@ -335,6 +344,16 @@ class FileSource(SourceConnector):
     async def _emit(self, raw: bytes) -> None:
         """Hand every HL7 message in ``raw`` to the pipeline handler, in file order (FIFO).
 
+        **Non-hl7v2 ingress** (ADR 0004): when the inbound declares a non-HL7 ``content_type``
+        (binary/x12/dicom/text/json) the raw file bytes are handed off **verbatim** with no batch
+        split — the split below is HL7-specific (it text-decodes to find MSH boundaries) and would
+        corrupt a binary payload (a PDF's non-text bytes) or split on a false MSH boundary, so a
+        non-HL7 drop bypasses it entirely and its exact bytes reach the content_type-aware pipeline
+        (carried NUL-safely via ``RawMessage.from_bytes`` / mfb64, ADR 0028). This mirrors
+        RemoteFileSource, which hands raw bytes straight to the handler. ``content_type`` is None only
+        for a direct caller/test that never had it injected — that path falls through to the HL7 split
+        below, byte-identical to before this gate existed.
+
         Corepoint-style **batch split** (Tier 2.2-A): a dropped file may hold several MSH-delimited
         messages (a batch, or an FHS/BHS envelope). Each becomes one pipeline hand-off — the same
         per-message split a dry-run / ``messagefoundry check`` sees, via the shared
@@ -354,6 +373,11 @@ class FileSource(SourceConnector):
         leaves the whole file in place for the next scan — preserving at-least-once with no partial
         move (see :meth:`_scan_once`)."""
         assert self._handler is not None
+        if self.content_type is not None and self.content_type is not ContentType.HL7V2:
+            # Non-hl7v2: hand the file's RAW BYTES off verbatim — no text-decode, no HL7 batch split
+            # (see the docstring). A binary payload's exact bytes survive to RawMessage.from_bytes.
+            await self._handler(raw)
+            return
         try:
             text = raw.decode(self.encoding)
         except (UnicodeDecodeError, LookupError):

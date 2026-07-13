@@ -1,35 +1,9 @@
 // Live, no-server completion: HL7 field paths inside msg["..."]/.field("...")/.set("...") from the
 // bundled hl7schema.json, and connection/router names in Send("...")/router="..." from the cached
 // graph. All answered from in-memory data — no per-keystroke Python.
-import * as fs from "node:fs";
-import * as path from "node:path";
 import * as vscode from "vscode";
 import { GraphProvider } from "./graphTree";
-
-interface Hl7Component {
-  index: number;
-  name: string | null;
-  datatype: string | null;
-}
-interface Hl7Field {
-  index: number;
-  name: string | null;
-  datatype: string | null;
-  components: Hl7Component[];
-}
-interface Hl7Schema {
-  version: string;
-  segments: Record<string, { fields: Hl7Field[] }>;
-}
-
-function loadSchema(context: vscode.ExtensionContext): Hl7Schema | undefined {
-  try {
-    const file = path.join(context.extensionPath, "media", "hl7schema.json");
-    return JSON.parse(fs.readFileSync(file, "utf8")) as Hl7Schema;
-  } catch {
-    return undefined;
-  }
-}
+import { Hl7Schema, loadSchema, segmentSortText } from "./hl7schema";
 
 function rangeFor(partial: string, pos: vscode.Position): vscode.Range {
   return new vscode.Range(pos.line, pos.character - partial.length, pos.line, pos.character);
@@ -47,17 +21,6 @@ function nameItems(names: string[], partial: string, pos: vscode.Position): vsco
 }
 
 const RETRIGGER: vscode.Command = { command: "editor.action.triggerSuggest", title: "" };
-
-// Most-used HL7 segments float to the top of the segment list (the rest stay alphabetical).
-const COMMON_SEGMENTS = [
-  "MSH", "PID", "PV1", "EVN", "OBR", "ORC", "OBX", "MSA",
-  "NK1", "AL1", "DG1", "IN1", "GT1", "RXA", "RXR", "SPM", "SCH", "AIS",
-];
-
-function segmentSortText(seg: string): string {
-  const rank = COMMON_SEGMENTS.indexOf(seg);
-  return rank >= 0 ? `0${String(rank).padStart(2, "0")}` : `1${seg}`;
-}
 
 function pathItems(
   schema: Hl7Schema,
@@ -128,7 +91,7 @@ const SEND_CTX = /\bSend\(\s*"([^"]*)$/;
 const ROUTER_CTX = /\brouter\s*=\s*"([^"]*)$/;
 
 export function registerCompletion(context: vscode.ExtensionContext, graph: GraphProvider): void {
-  const schema = loadSchema(context);
+  const schema = loadSchema(context.extensionPath);
 
   const provider: vscode.CompletionItemProvider = {
     provideCompletionItems(document, position) {

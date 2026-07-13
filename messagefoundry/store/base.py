@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -67,6 +67,7 @@ from messagefoundry.store.store import (
     ResendSourceNotFound,
     SessionRecord,
     Stage,
+    StreamingAttachmentsUnsupported,
     UserRecord,
     WebAuthnCredential,
 )
@@ -98,6 +99,7 @@ __all__ = [
     "SearchTarget",
     "Store",
     "StoreLifecycle",
+    "StreamingAttachmentsUnsupported",
     "make_spec",
     "open_store",
     "sqlite_settings",
@@ -192,6 +194,15 @@ class QueueStore(StoreLifecycle, Protocol):
     #: fused-hop dispatcher gates on this flag before taking the sync path.
     supports_fused_sync_handoff: bool = False
 
+    #: Whether this backend ships the streaming-attachment substrate (#149, ADR 0105): the
+    #: ``attachment`` + ``attachment_chunk`` + ``message_attachment`` tables and :meth:`put_attachment` /
+    #: :meth:`read_attachment` / :meth:`attachments_for` / :meth:`attachment_incref` /
+    #: :meth:`attachment_decref` / :meth:`sweep_orphan_attachments`. ``True`` on SQLite, Postgres, and
+    #: SQL Server (all three ship the substrate after Phase 4); a backend that leaves it ``False`` has its
+    #: streaming ops raise :class:`~messagefoundry.store.store.StreamingAttachmentsUnsupported`, so a
+    #: streaming connection targeting it fails clearly rather than silently degrading.
+    supports_streaming_attachments: bool = False
+
     #: A1 live cost counters (always-on, additive; surfaced via ``/stats``). ``committed_txns`` = durable
     #: **write**-path transactions committed on this handle — the *committed transactions per message*
     #: currency ADR 0051 sizes capacity on (``3 + 2H + 2N`` per ingress message, H = handlers routed,
@@ -248,11 +259,17 @@ class QueueStore(StoreLifecycle, Protocol):
         source_type: str | None = None,
         summary: str | None = None,
         metadata: str | None = None,
+        attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the ingress stage (status ``RECEIVED`` +
         one ``stage='ingress'`` queue row) in one transaction — the staged pipeline's ACK-on-receipt
-        boundary. The inbound may be ACKed once this returns. Returns the message id."""
+        boundary. The inbound may be ACKed once this returns. Returns the message id.
+
+        ``attachment_refs`` (#149, ADR 0105 Phase 1a) are the content addresses of documents the ingress
+        detach lifted into the attachment substrate; each distinct ref is increffed in the SAME
+        transaction as the skeleton row (the two-object commit). Only a backend whose
+        :attr:`supports_streaming_attachments` is True ever receives a non-empty value."""
         ...
 
     async def handoff(
@@ -764,6 +781,55 @@ class QueueStore(StoreLifecycle, Protocol):
         """Dead-letter non-terminal **routed** rows whose ``handler_name`` left the registry (a removed
         handler no transform worker can run). The routed-stage parallel of
         :meth:`dead_letter_missing_destinations`; call once at startup. Returns the rows killed."""
+        ...
+
+    # --- streaming attachments (#149, ADR 0105 Phase 0) ----------------------
+    async def put_attachment(self, chunks: Iterable[str], content_type: str) -> str:
+        """Store a detached very-large document as content-addressed, per-chunk-sealed rows and return
+        its ``ref`` (the sha256 of the verbatim concatenated plaintext). Identical content **dedups** to
+        the same ref. The fresh attachment sits at ``refcount=0`` until the caller increfs (Phase 1).
+        Raises :class:`~messagefoundry.store.store.StreamingAttachmentsUnsupported` on a backend whose
+        :attr:`supports_streaming_attachments` is ``False``."""
+        ...
+
+    def read_attachment(self, ref: str) -> AsyncIterator[str]:
+        """Yield the detached document's chunks back as decrypted plaintext in ``seq`` order — the exact
+        verbatim slices that were put (Approach B: concatenating them reconstructs the OBX-5.5 value
+        byte-for-byte). Raises :class:`KeyError` if the attachment does not exist."""
+        ...
+
+    async def attachments_for(self, message_id: str) -> Sequence[Row]:
+        """The distinct attachments a single message holds — the operator read surface (#149, ADR 0105
+        Phase 3b). One row per ``message_attachment`` linkage JOINed to its ``attachment`` header,
+        carrying ``attachment_id`` (the sha256 content address), ``content_type``, and ``total_bytes``.
+        **Metadata only — no chunk ciphertext is read or decrypted** (the bulky bytes ride
+        :meth:`read_attachment`), so this stays cheap enough for the message-detail view. Returns ``[]``
+        for a message with no detached document (or on a backend without the substrate)."""
+        ...
+
+    async def attachment_incref(self, ref: str) -> None:
+        """Add one live reference to an attachment (store-once refcount). Raises :class:`KeyError` if the
+        attachment does not exist."""
+        ...
+
+    async def attachment_decref(self, ref: str) -> None:
+        """Drop one reference and GC the attachment + all its chunks at refcount 0. Clamped at 0;
+        tolerant of a missing ref (idempotent)."""
+        ...
+
+    async def sweep_orphan_attachments(self) -> int:
+        """Reclaim orphaned attachment storage at startup (refcount-0 **and** header-less/incomplete
+        chunks) so no PHI chunk accumulates at rest. Call once where :meth:`reset_stale_inflight` runs.
+        Returns the number of attachments reclaimed."""
+        ...
+
+    async def release_message_attachments(self, message_id: str) -> None:
+        """Release (decref + delete the linkage rows for) every attachment a single message holds, in one
+        transaction (#149, ADR 0105 Phase 3a). Idempotent — a re-run finds the join rows gone and decrefs
+        nothing, so a shared attachment a sibling message still references never underflows/GCs early.
+        :meth:`purge_message_bodies` releases the whole eligible set via the same seam. Raises
+        :class:`~messagefoundry.store.store.StreamingAttachmentsUnsupported` on a backend whose
+        :attr:`supports_streaming_attachments` is ``False``."""
         ...
 
     async def replay(self, message_id: str, now: float | None = None) -> int: ...

@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import asyncio
 
+from pathlib import Path
+
 import pytest
 
 from harness.load import shardcert
+from harness.load.shardcert_ladder import ClaimTiming, aggregate_claim_timing
 from harness.load.shardcert import (
     ShardCertStepRecord,
     parse_rate_ladder,
@@ -201,3 +204,75 @@ def test_ladder_report_renders_and_serializes(monkeypatch: pytest.MonkeyPatch) -
     assert js["kind"] == "shardcert_ladder"
     assert js["ceiling_rate"] == 40.0
     assert isinstance(js["records"], list) and len(js["records"]) == 1
+
+
+# --- claim timing is PER STAGE, not a four-stage blend (2026-07-13) --------------------------------
+#
+# The engine emits one `claim phase timing (stage=%s)` line PER STAGE per window. The ladder's regex did
+# not capture `stage=`, so aggregate_claim_timing n-weighted INGRESS + ROUTED + OUTBOUND + RESPONSE into a
+# single `claim_mean_ms`. Every claim_mean this programme has quoted is therefore a BLEND, not the outbound
+# claim — and the outbound claim is the one the throughput analysis reasons about. These pin the split.
+
+
+def _claim_line(stage: str, n: int, mean: float) -> str:
+    return (
+        f"2026-07-13 00:00:00 INFO claim phase timing (stage={stage}): "
+        f"claim n={n} mean={mean:.2f}ms max={mean * 2:.2f}ms | "
+        f"lanes/claim=1.00 rows/claim=1.00 rearm=0 empty=0 claimers=1"
+    )
+
+
+def test_claim_timing_splits_by_stage_and_blend_is_unchanged(tmp_path: Path) -> None:
+    log = tmp_path / "shard-a.log"
+    # A ramp window (dropped), then two stages with very different claim costs.
+    log.write_text(
+        "\n".join(
+            [
+                _claim_line("ingress", 1, 99.0),  # first window per log = the dropped ramp window
+                _claim_line("ingress", 100, 2.0),
+                _claim_line("outbound", 100, 20.0),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    ct = aggregate_claim_timing([log])
+
+    # The BLEND is retained byte-identically (existing reports quote it): n-weighted over both stages.
+    assert ct.claims == 200
+    assert ct.claim_mean_ms == pytest.approx(11.0)  # (100*2 + 100*20) / 200
+
+    # ...but it is NOT the outbound claim, and the split now says so.
+    assert set(ct.by_stage) == {"ingress", "outbound"}
+    assert ct.by_stage["ingress"].claim_mean_ms == pytest.approx(2.0)
+    assert ct.by_stage["outbound"].claim_mean_ms == pytest.approx(20.0)
+    assert ct.by_stage["outbound"].claims == 100
+    # The blend understates the outbound claim by ~2x here — the whole point of the fix.
+    assert ct.claim_mean_ms < ct.by_stage["outbound"].claim_mean_ms
+
+
+def test_claim_timing_by_stage_round_trips_through_json(tmp_path: Path) -> None:
+    log = tmp_path / "shard-a.log"
+    log.write_text(
+        "\n".join([_claim_line("outbound", 1, 9.0), _claim_line("outbound", 10, 5.0)]),
+        encoding="utf-8",
+    )
+    ct = aggregate_claim_timing([log])
+    back = ClaimTiming.from_json_dict(ct.to_json_dict())
+    assert back.by_stage["outbound"].claim_mean_ms == pytest.approx(5.0)
+    assert back.claim_mean_ms == pytest.approx(ct.claim_mean_ms)
+
+
+def test_claim_timing_parses_a_legacy_pre_stage_log(tmp_path: Path) -> None:
+    """A log from before the engine emitted `stage=` must still parse — blend only, no split."""
+    log = tmp_path / "shard-a.log"
+    log.write_text(
+        "INFO claim phase timing: claim n=1 mean=1.00ms max=1.00ms | "
+        "lanes/claim=1.00 rows/claim=1.00 rearm=0 empty=0 claimers=1\n"
+        "INFO claim phase timing: claim n=10 mean=4.00ms max=8.00ms | "
+        "lanes/claim=1.00 rows/claim=1.00 rearm=0 empty=0 claimers=1",
+        encoding="utf-8",
+    )
+    ct = aggregate_claim_timing([log])
+    assert ct.claims == 10
+    assert ct.claim_mean_ms == pytest.approx(4.0)
+    assert ct.by_stage == {}  # no stage in the log => no split, and never a fabricated one

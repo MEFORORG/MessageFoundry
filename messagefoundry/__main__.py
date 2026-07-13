@@ -318,6 +318,13 @@ def main(argv: list[str] | None = None) -> int:
     schema = sub.add_parser("hl7schema", help="print HL7 v2.5.1 segment/field schema")
     schema.add_argument("--json", action="store_true", help="emit JSON")
 
+    structures = sub.add_parser(
+        "hl7structures",
+        help="print HL7 v2.5.1 message-structure metadata (trigger->structure + structure->segments; "
+        "ADR 0104 §2.3 field-picker scope) — regenerate ide/media/hl7structures.json",
+    )
+    structures.add_argument("--json", action="store_true", help="emit JSON")
+
     lens = sub.add_parser(
         "lens",
         help="structured Steps view over Handlers (ADR 0076): statically parse a config module "
@@ -1732,7 +1739,9 @@ def _serve(args: argparse.Namespace) -> int:
         internal_error_default=settings.delivery.internal_error,
         buildup_default=settings.delivery.buildup_threshold(),
         stall_default=settings.delivery.stall_threshold(),
+        saturation_default=settings.delivery.saturation_threshold(),
         ack_after_default=settings.inbound.ack_after,
+        stream_inflight_budget_bytes=settings.inbound.stream_inflight_budget_bytes,
         priority_default=settings.delivery.priority,
         max_correlation_depth=settings.pipeline.max_correlation_depth,
         per_lane_wake=settings.pipeline.per_lane_wake,
@@ -1750,6 +1759,7 @@ def _serve(args: argparse.Namespace) -> int:
         fuse_thread_hops=settings.pipeline.fuse_thread_hops,
         pooled_fusing_workers=settings.pipeline.pooled_fusing_workers,
         batch_handoff_statements=settings.pipeline.batch_handoff_statements,
+        snapshot_on_send=settings.pipeline.snapshot_on_send,
         sandbox_settings=settings.sandbox,
         connection_events=settings.diagnostics.connection_events,
         response_sent_default=settings.diagnostics.response_sent,
@@ -1758,6 +1768,7 @@ def _serve(args: argparse.Namespace) -> int:
         auth_settings=settings.auth,
         ai_settings=settings.ai,
         alerts_settings=settings.alerts,
+        secrets_settings=settings.secrets,
         retention_settings=settings.retention,
         cert_monitor_settings=settings.cert_monitor,
         secret_rotation_settings=settings.secret_rotation,
@@ -2104,6 +2115,13 @@ def _hl7schema(args: argparse.Namespace) -> int:
     from messagefoundry.hl7schema import hl7_schema
 
     _print_json(hl7_schema(), compact=args.json)
+    return 0
+
+
+def _hl7structures(args: argparse.Namespace) -> int:
+    from messagefoundry.hl7structures import to_json
+
+    _print_json(to_json(), compact=args.json)
     return 0
 
 
@@ -3225,6 +3243,7 @@ _DISPATCH = {
     "alert": _alert,
     "generate": _generate,
     "hl7schema": _hl7schema,
+    "hl7structures": _hl7structures,
     "lens": _lens,
     "gen-key": _gen_key,
     "protect-key": _protect_key,

@@ -23,6 +23,7 @@ import pytest
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.content_search import make_spec
+from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
 _ADT_SEARCH = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN9001^^^H^MR||DOE^JANE\r"
@@ -39,6 +40,9 @@ _TABLES = (
     "message_events",
     "audit_log",
     "cluster_config",
+    "message_attachment",  # #149 attachment linkage (no FK)
+    "attachment_chunk",  # #149 attachment chunks (no FK)
+    "attachment",  # #149 attachment headers (no FK)
     "queue",
     "response",
     "delivered_keys",
@@ -1975,3 +1979,378 @@ async def test_mark_failed_returns_reschedule_time(store) -> None:
     next_at = await store.mark_failed(item.id, "transient", RetryPolicy(), now=1000.0)
     assert next_at == 1005.0  # attempts=1 → backoff 5.0 * 2**0
     assert await store.mark_failed("no-such-row", "x", RetryPolicy(), now=1000.0) is None
+
+
+# --- #149 Phase 4: streaming attachment substrate parity (ADR 0105) ------------------------------
+# Mirrors tests/test_attachment_substrate.py (the SQLite reference) against a real Postgres — same
+# assertions as the SQL Server parity block: verbatim chunked round-trip, per-chunk seal at rest,
+# content-address dedup, refcount incref/decref + GC, two-object ingress commit + rollback on a missing
+# ref, retention decref + join-DELETE (idempotent, no shared-attachment underflow), the dead-row
+# keeps/releases split (either purge order), fan-out single decref, below-threshold byte-identical, and
+# the key-rotation re-seal.
+
+import hashlib as _hashlib  # noqa: E402 - local to the attachment block, mirrors the SQLite suite
+
+_A_CHUNKS = ["QUJDRA==part0::", "RUZHSA==part1::", "SUpLTA==part2::"]
+_A_DOC = "".join(_A_CHUNKS)
+_A_REF = _hashlib.sha256(_A_DOC.encode("utf-8")).hexdigest()
+DAY = 86_400.0
+
+
+async def _a_read(s, ref: str) -> list[str]:
+    return [c async for c in s.read_attachment(ref)]
+
+
+async def _a_refcount(s, ref: str) -> int | None:
+    row = await s._fetchone("SELECT refcount FROM attachment WHERE id=$1", ref)
+    return None if row is None else int(row["refcount"])
+
+
+async def _a_chunks(s, ref: str) -> int:
+    row = await s._fetchone(
+        "SELECT COUNT(*) AS n FROM attachment_chunk WHERE attachment_id=$1", ref
+    )
+    return int(row["n"])
+
+
+async def _a_joins(s, mid: str) -> int:
+    row = await s._fetchone("SELECT COUNT(*) AS n FROM message_attachment WHERE message_id=$1", mid)
+    return int(row["n"])
+
+
+async def _a_row_payload(s, oid: str) -> str:
+    row = await s._fetchone("SELECT payload FROM queue WHERE id=$1", oid)
+    return str(row["payload"])
+
+
+async def _a_detach_and_settle(s, *, now: float, ref: str) -> str:
+    mid = await s.enqueue_ingress(channel_id="IB", raw="MSH|skel", attachment_refs=[ref], now=now)
+    item = await s.claim_next_fifo("IB", stage=Stage.INGRESS.value)
+    assert item is not None
+    await s.handoff(
+        ingress_id=item.id,
+        message_id=mid,
+        channel_id="IB",
+        deliveries=[],
+        disposition=MessageStatus.FILTERED,
+        now=now,
+    )
+    return mid
+
+
+async def _a_dead_deliver(s, *, now: float, ref: str, dest: str = "OB_D") -> tuple[str, str]:
+    mid = await s.enqueue_ingress(channel_id="IB", raw="MSH|skel", attachment_refs=[ref], now=now)
+    item = await s.claim_next_fifo("IB", stage=Stage.INGRESS.value)
+    assert item is not None
+    await s.handoff(
+        ingress_id=item.id,
+        message_id=mid,
+        channel_id="IB",
+        deliveries=[(dest, "MSH|dead|mfdoc:v1:ref:doc")],
+        disposition=MessageStatus.ROUTED,
+        now=now,
+    )
+    [row] = await s.outbox_for(mid)
+    await s.claim_ready(now=now)
+    await s.dead_letter_now(row["id"], "permanent reject (AR)", now=now)
+    return mid, row["id"]
+
+
+async def test_attachment_put_read_roundtrip_verbatim(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    assert ref == _A_REF
+    assert await _a_chunks(store, ref) == len(_A_CHUNKS)
+    assert await _a_read(store, ref) == _A_CHUNKS
+    assert "".join(await _a_read(store, ref)) == _A_DOC
+    assert await _a_refcount(store, ref) == 0
+
+
+async def test_attachment_read_missing_raises(store) -> None:
+    with pytest.raises(KeyError):
+        await _a_read(store, _A_REF)
+
+
+async def test_attachment_dedups_identical_content(store) -> None:
+    r1 = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    r2 = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    assert r1 == r2 == _A_REF
+    assert await _a_chunks(store, r1) == len(_A_CHUNKS)
+    row = await store._fetchone("SELECT COUNT(*) AS n FROM attachment WHERE id=$1", r1)
+    assert int(row["n"]) == 1
+    other = await store.put_attachment(["totally different"], "text/plain")
+    assert other != r1
+
+
+async def test_attachment_incref_decref_gc_at_zero(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    await store.attachment_incref(ref)
+    await store.attachment_incref(ref)
+    assert await _a_refcount(store, ref) == 2
+    await store.attachment_decref(ref)
+    assert await _a_refcount(store, ref) == 1
+    assert await _a_read(store, ref) == _A_CHUNKS
+    await store.attachment_decref(ref)
+    assert await _a_refcount(store, ref) is None
+    assert await _a_chunks(store, ref) == 0
+    with pytest.raises(KeyError):
+        await _a_read(store, ref)
+    await store.attachment_decref(ref)  # tolerant no-op past zero
+
+
+async def test_attachment_incref_missing_raises(store) -> None:
+    with pytest.raises(KeyError):
+        await store.attachment_incref("f" * 64)
+
+
+async def test_attachment_startup_sweep_reclaims_orphans_and_incomplete(store) -> None:
+    zero_ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    orphan_id = "a" * 64
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext) VALUES ($1,$2,$3)",
+            orphan_id,
+            0,
+            store._cipher.encrypt("orphaned pdf bytes"),
+        )
+    live_ref = await store.put_attachment(["a live document"], "text/plain")
+    await store.attachment_incref(live_ref)
+
+    assert await store.sweep_orphan_attachments() == 2
+    assert await _a_refcount(store, zero_ref) is None
+    assert await _a_chunks(store, zero_ref) == 0
+    assert await _a_chunks(store, orphan_id) == 0
+    assert await _a_refcount(store, live_ref) == 1
+    assert "".join(await _a_read(store, live_ref)) == "a live document"
+    assert await store.sweep_orphan_attachments() == 0
+
+
+async def test_attachment_ingress_two_object_commit(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    assert await _a_refcount(store, ref) == 0
+    mid = await store.enqueue_ingress(channel_id="IB", raw="MSH|skel", attachment_refs=[ref])
+    assert await _a_refcount(store, ref) == 1
+    assert await _a_joins(store, mid) == 1
+    row = await store._fetchone(
+        "SELECT attachment_id FROM message_attachment WHERE message_id=$1", mid
+    )
+    assert row["attachment_id"] == ref
+
+
+async def test_attachment_ingress_dedups_duplicate_refs(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    await store.enqueue_ingress(channel_id="IB", raw="skel", attachment_refs=[ref, ref])
+    assert await _a_refcount(store, ref) == 1
+
+
+async def test_attachments_for_returns_linked_metadata(store) -> None:
+    # #149 Phase 3b operator read surface: attachments_for JOINs the linkage → header (metadata only).
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    mid = await store.enqueue_ingress(channel_id="IB", raw="MSH|skel", attachment_refs=[ref])
+    rows = await store.attachments_for(mid)
+    assert len(rows) == 1
+    row = dict(rows[0])
+    assert row["attachment_id"] == ref
+    assert row["content_type"] == "application/pdf"
+    assert row["total_bytes"] == len(_A_DOC.encode("utf-8"))
+    # A message with no detached document → empty.
+    plain = await store.enqueue_ingress(channel_id="IB", raw="MSH|plain")
+    assert await store.attachments_for(plain) == []
+
+
+async def test_attachment_ingress_missing_ref_rolls_back(store) -> None:
+    with pytest.raises(KeyError):
+        await store.enqueue_ingress(channel_id="IB", raw="skel", attachment_refs=["0" * 64])
+    row = await store._fetchone("SELECT COUNT(*) AS n FROM messages")
+    assert int(row["n"]) == 0
+
+
+async def test_attachment_purge_decrefs_and_deletes_linkage(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    mid = await _a_detach_and_settle(store, now=0.0, ref=ref)
+    assert await _a_refcount(store, ref) == 1
+
+    assert await store.purge_message_bodies(older_than=10 * DAY) == 1
+    assert (await store.get_message(mid))["raw"] == ""
+    assert await _a_refcount(store, ref) is None
+    assert await _a_chunks(store, ref) == 0
+    assert await _a_joins(store, mid) == 0
+
+
+async def test_attachment_shared_refcount_two_purge_each(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    m1 = await _a_detach_and_settle(store, now=0.0, ref=ref)
+    m2 = await _a_detach_and_settle(store, now=20 * DAY, ref=ref)
+    assert await _a_refcount(store, ref) == 2
+
+    assert await store.purge_message_bodies(older_than=10 * DAY) == 1
+    assert await _a_refcount(store, ref) == 1
+    assert await _a_chunks(store, ref) == len(_A_CHUNKS)
+    assert "".join(await _a_read(store, ref)) == _A_DOC
+    assert await _a_joins(store, m1) == 0 and await _a_joins(store, m2) == 1
+
+    assert await store.purge_message_bodies(older_than=30 * DAY) == 1
+    assert await _a_refcount(store, ref) is None
+    assert await _a_chunks(store, ref) == 0
+
+
+async def test_attachment_double_purge_idempotent_no_underflow(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    m1 = await _a_detach_and_settle(store, now=0.0, ref=ref)
+    m2 = await _a_detach_and_settle(store, now=20 * DAY, ref=ref)
+    assert await _a_refcount(store, ref) == 2
+
+    assert await store.purge_message_bodies(older_than=10 * DAY) == 1
+    assert await store.purge_message_bodies(older_than=10 * DAY) == 0
+
+    assert await _a_refcount(store, ref) == 1
+    assert await _a_chunks(store, ref) == len(_A_CHUNKS)
+    assert "".join(await _a_read(store, ref)) == _A_DOC
+    assert await _a_joins(store, m1) == 0 and await _a_joins(store, m2) == 1
+
+
+async def test_attachment_fanout_single_decref_at_purge(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    mid = await store.enqueue_ingress(
+        channel_id="IB", raw="MSH|skel", attachment_refs=[ref], now=0.0
+    )
+    item = await store.claim_next_fifo("IB", stage=Stage.INGRESS.value)
+    assert item is not None
+    await store.handoff(
+        ingress_id=item.id,
+        message_id=mid,
+        channel_id="IB",
+        deliveries=[("OB_A", "pa"), ("OB_B", "pb")],
+        disposition=MessageStatus.ROUTED,
+        now=0.0,
+    )
+    assert await _a_refcount(store, ref) == 1
+    rows = await store.outbox_for(mid)
+    assert len(rows) == 2
+    await store.claim_ready(now=0.0)
+    for r in rows:
+        await store.mark_done(r["id"], now=0.0)
+    assert await _a_refcount(store, ref) == 1
+
+    assert await store.purge_message_bodies(older_than=10 * DAY) == 1
+    assert await _a_refcount(store, ref) is None
+    assert await _a_joins(store, mid) == 0
+
+
+async def test_attachment_no_attachment_retention_byte_identical(store) -> None:
+    mid = await store.enqueue_ingress(channel_id="IB", raw="MSH|plain", now=0.0)
+    item = await store.claim_next_fifo("IB", stage=Stage.INGRESS.value)
+    assert item is not None
+    await store.handoff(
+        ingress_id=item.id,
+        message_id=mid,
+        channel_id="IB",
+        deliveries=[],
+        disposition=MessageStatus.FILTERED,
+        now=0.0,
+    )
+    assert await _a_joins(store, mid) == 0
+    assert await store.purge_message_bodies(older_than=10 * DAY) == 1
+    assert (await store.get_message(mid))["raw"] == ""
+    row = await store._fetchone("SELECT COUNT(*) AS n FROM message_attachment")
+    assert int(row["n"]) == 0
+
+
+async def test_attachment_release_standalone_and_idempotent(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    mid = await store.enqueue_ingress(channel_id="IB", raw="MSH|skel", attachment_refs=[ref])
+    assert await _a_refcount(store, ref) == 1
+    await store.release_message_attachments(mid)
+    assert await _a_refcount(store, ref) is None
+    assert await _a_joins(store, mid) == 0
+    await store.release_message_attachments(mid)
+    assert await _a_refcount(store, ref) is None
+
+
+async def test_attachment_dead_row_keeps_through_body_purge(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    mid, oid = await _a_dead_deliver(store, now=0.0, ref=ref)
+    assert await _a_refcount(store, ref) == 1
+
+    assert await store.purge_message_bodies(older_than=10 * DAY) == 1
+    assert (await store.get_message(mid))["raw"] == ""
+    assert await _a_row_payload(store, oid) == "MSH|dead|mfdoc:v1:ref:doc"
+    assert await _a_refcount(store, ref) == 1
+    assert "".join(await _a_read(store, ref)) == _A_DOC
+
+
+async def test_attachment_dead_purge_releases_after_body_purge(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    mid, oid = await _a_dead_deliver(store, now=0.0, ref=ref)
+    assert await store.purge_message_bodies(older_than=10 * DAY) == 1
+    assert await _a_refcount(store, ref) == 1
+
+    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert await _a_row_payload(store, oid) == ""
+    assert await _a_refcount(store, ref) is None
+    assert await _a_joins(store, mid) == 0
+
+
+async def test_attachment_dead_purge_releases_when_run_first(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    mid, oid = await _a_dead_deliver(store, now=0.0, ref=ref)
+
+    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert await _a_row_payload(store, oid) == ""
+    assert await _a_refcount(store, ref) is None
+    assert await _a_joins(store, mid) == 0
+
+    assert await store.purge_message_bodies(older_than=10 * DAY) == 1
+    assert (await store.get_message(mid))["raw"] == ""
+    assert await _a_refcount(store, ref) is None
+
+
+async def test_attachment_dead_purge_idempotent_no_underflow(store) -> None:
+    ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
+    m1, _ = await _a_dead_deliver(store, now=0.0, ref=ref, dest="OB_1")
+    m2, _ = await _a_dead_deliver(store, now=20 * DAY, ref=ref, dest="OB_2")
+    assert await _a_refcount(store, ref) == 2
+
+    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert await store.purge_dead_letters(older_than=10 * DAY) == 0
+
+    assert await _a_refcount(store, ref) == 1
+    assert await _a_chunks(store, ref) == len(_A_CHUNKS)
+    assert await _a_joins(store, m1) == 0 and await _a_joins(store, m2) == 1
+
+
+async def test_attachment_chunks_sealed_at_rest_and_reseal_on_rotation(store) -> None:
+    # The `store` fixture truncated the attachment tables → clean slate. Use dedicated keyed handles for
+    # the seal/rotation round-trip (mirrors the SQLite reseal test on a persistent server DB).
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+    k1, k2 = generate_key(), generate_key()
+
+    s1 = await PostgresStore.open(settings, cipher=make_cipher(k1))
+    try:
+        ref = await s1.put_attachment(_A_CHUNKS, "application/pdf")
+        rows = await s1._fetchall(
+            "SELECT ciphertext FROM attachment_chunk WHERE attachment_id=$1 ORDER BY seq", ref
+        )
+        assert len(rows) == len(_A_CHUNKS)
+        for r in rows:
+            assert r["ciphertext"].startswith(MARKER_PREFIX)
+        assert await _a_read(s1, ref) == _A_CHUNKS
+    finally:
+        await s1.close()
+
+    s2 = await PostgresStore.open(settings, cipher=make_cipher(k2, [k1]))
+    try:
+        rotated = await s2.reencrypt_to_active()
+        assert rotated >= len(_A_CHUNKS)
+        assert await _a_read(s2, ref) == _A_CHUNKS
+    finally:
+        await s2.close()
+
+    s3 = await PostgresStore.open(settings, cipher=make_cipher(k2))
+    try:
+        assert await _a_read(s3, ref) == _A_CHUNKS
+        assert ref == _A_REF
+    finally:
+        await s3.close()

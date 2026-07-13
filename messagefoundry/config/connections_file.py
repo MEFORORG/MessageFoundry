@@ -101,6 +101,8 @@ _INBOUND_KEYS = frozenset(
         "messages_days",
         "prune_documents_after",
         "prune_documents_min_bytes",
+        "stream_threshold_bytes",
+        "max_message_bytes",
         "priority",
         "shard",
         "schedule",
@@ -184,6 +186,8 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         messages_days=_optional_int(table, "messages_days", where),
         prune_documents_after=_optional_int(table, "prune_documents_after", where),
         prune_documents_min_bytes=_optional_int(table, "prune_documents_min_bytes", where),
+        stream_threshold_bytes=_optional_int(table, "stream_threshold_bytes", where),
+        max_message_bytes=_optional_int(table, "max_message_bytes", where),
         priority=_enum(Priority, table["priority"], "priority", where)
         if table.get("priority") is not None
         else None,

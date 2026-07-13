@@ -1,0 +1,7 @@
+# sampled dm_os_waiting_tasks 711x over 180s; PAGELATCH hits {'PAGELATCH_EX': 2}
+# top contended pages (dbid:file:page -> waiter-hits): [('5:1:157956', 1), ('5:1:166082', 1)]
+# hottest-page identities (db + object):
+  5:1:157956 hits=1 -> db=mfbench obj=None object_id=None index_id=None (None)
+  5:1:166082 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=2 (None)
+# top SQL statements waiting on PAGELATCH (store-internal, parameterized -- names the churn):
+  [1] (@P1 nvarchar(64),@P2 nvarchar(64),@P3 nvarchar(14),@P4 nvarchar(20),@P5 nvarchar(1562),@P6 nvarchar(14),@P7 float,@P8 float,@P9 float)INSERT INTO queue (id, message_id, stage, cha

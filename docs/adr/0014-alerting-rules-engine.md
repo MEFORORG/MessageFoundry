@@ -124,3 +124,57 @@ and reset on restart (advisory alerting, acceptable).
 2. Confirm no leader-gating in v1 (per-node `connection_stopped`); document the duplicate-`queue_buildup`
    limitation. *(Recommended.)*
 3. Confirm the MVP omits timed multi-stage escalation chains. *(Recommended.)*
+
+## Amendment (2026-07-12) — a `saturation` alert on the backlog DERIVATIVE (BACKLOG #93)
+
+**Status:** Built — additive. A new `saturation` event type + `AlertSink.saturation_rising` emit
+method, a per-`(stage, lane)` `SaturationDetector` and emit site on the `RegistryRunner`, and a
+`SaturationThreshold` / `[delivery].saturation_sustain_samples` config knob. Fully off by default
+(deny-by-default); empty config = today's behaviour byte-for-byte.
+
+**Context — the gap.** Every operational alert this ADR governs (`queue_buildup`, `message_stall`, and
+the ceilings in `AlertRule.min_depth` / `min_oldest_seconds`) keys on an **absolute snapshot**: a
+pending-depth ceiling or an oldest-message-age ceiling. On that axis a **bursty-but-DRAINING** lane (a
+spike the worker is clearing) and a genuinely **OVERLOADED** one look identical until a ceiling trips —
+and by then the operator is already behind. Nothing fires on the **rate of change**: the system
+*becoming* overloaded is invisible.
+
+**Decision — a derivative dimension, not an escalation chain.** Add `saturation` as a first-class alert
+event keyed on the queue **derivative**: a lane's pending depth **rising sustained** across a small
+bounded sampling window. By conservation of the queue, sustained rising depth over the window is
+exactly *arrivals > departures* (**ingest > drain**) held over it — so a lane that spikes then drains
+(depth falls back) never fires, while one whose depth climbs monotonically does. That "does **not**
+fire on a bursty-but-draining lane" is the defining property, enforced by `SaturationDetector` (a
+`deque(maxlen=sustain_samples+1)` of `(ts, depth)`; fires only when the newest depth strictly exceeds
+the oldest **and** no step in the window decreased). The detector is pure/synchronous and unit-tested
+directly. It rides the existing per-lane buildup tick (`_maybe_alert_buildup` → `_maybe_alert_saturation`),
+so it adds **no new sampler** — and returns before any store read when disabled (zero cost when off).
+
+**Coverage (inherited from the buildup tick).** The sampler covers exactly where that tick runs today:
+**ingress and routed** are sampled on the regular per-batch interval (full coverage), and the **outbound**
+stage is sampled on its **delivery-failure / retry** paths. So the realistic saturation cases — a
+failing/retrying outbound, a slow router, a slow transform — all page; but a **healthy-but-behind**
+outbound (delivering successfully while its backlog climbs monotonically) is **not** sampled. That
+outbound blind spot is inherited from the pre-existing buildup architecture, not introduced by this
+amendment; closing it with a periodic owned-outbound depth sweep is a scoped follow-up (BACKLOG #93 residual).
+
+The alert flows through the **same** ADR 0014 machinery unchanged: `AlertRuleSet.decide` (a rule may
+set its severity, route it to a transport subset, or **suppress** it for a known-bursty feed via
+`connection` glob + `transports=[]`), the per-`(type, connection)` `realert_seconds` throttle, and the
+ADR 0044 resolvable alert-state observer. No new transport, no fire-site fan-out.
+
+**This is NOT the declined timed multi-stage escalation (§ "To resolve" #3).** That decline stands:
+`saturation` is a single, throttled, edge-ish notification on a *different input signal* (a rate), not
+a time-ordered escalation chain (warn→page→exec) over one condition. It adds an axis (derivative vs
+absolute), not the sequenced-severity machinery §3 rejected.
+
+**Deny-by-default & scope.** `saturation_sustain_samples` defaults `None` (**off**) because the
+signal's coverage overlaps `queue_buildup`'s age dimension; an operator opts in globally via
+`[delivery]`. `sustain_samples` has a floor of 2 (fewer can't distinguish a burst from sustained
+growth). Global-only for now; a per-connection `saturation=` override is a documented follow-up (a
+per-connection `AlertRule` can already suppress it per lane in the interim). Detector history is
+in-memory/per-node and dropped on connection teardown/reload (same posture as the other alert state).
+
+**Consequences.** Operators get an early "this lane is *becoming* overloaded" page before a ceiling
+trips, without false-paging a draining burst. Costs: another in-memory per-lane structure (bounded to
+`sustain_samples+1` samples) and, when enabled, one extra cheap `pending_depth` COUNT+MIN per tick.

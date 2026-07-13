@@ -13,6 +13,19 @@ the engine compatibility range.
 
 ## [Unreleased]
 
+**Supported engine UI seam: `2`, `3`.**
+
+### Added
+- **Engine-wide KPI headline on the status page** (BACKLOG #93). The status page now renders the
+  top-line roll-up the engine surfaces on `/status` as `SystemStatus.kpis`: combined inbound+outbound
+  endpoint count (running/stopped), total messages, and an engine-wide msg/s rate. Metadata only, no
+  PHI.
+
+### Changed
+- **Engine UI seam bumped to `3`** (`SystemStatus` gained the additive `kpis` field). The console now
+  `SUPPORTED_ENGINE_SEAMS = {2, 3}`: seam `2` is retained because the new field has a default, so a
+  seam-`2` engine (whose `/status` omits `kpis`) still renders here with default (zeroed) KPI values.
+
 ## [0.2.15] — 2026-07-06 — Early Access
 
 Initial release of the web console as a standalone distribution. **Supported engine UI seam: `1`.**

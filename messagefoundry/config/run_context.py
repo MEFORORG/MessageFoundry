@@ -42,6 +42,7 @@ from messagefoundry.config.code_sets import activated as _code_sets_activated
 from messagefoundry.config.code_sets import capturing as _unmapped_capturing
 from messagefoundry.config.reference import activated as _reference_activated
 from messagefoundry.config.response import activated as _response_activated
+from messagefoundry.config.send_snapshot import activated as _snapshot_activated
 from messagefoundry.config.state import activated as _state_activated
 
 __all__ = [
@@ -80,6 +81,9 @@ class RunContext:
     )
     message_id: str | None = (
         None  # #162: the run's message id, so the unmapped-capture sink can key idempotently
+    )
+    snapshot_on_send: bool = (
+        False  # ADR 0104: activate copy-on-Send for this transform run (default off)
     )
 
 
@@ -154,6 +158,16 @@ register_run_context(
     "environment",
     lambda c: _environment_activated(c.active_environment),
     phases={ROUTER, TRANSFORM},
+)
+# ADR 0104: copy-on-Send. Registered AFTER environment and BEFORE unmapped_capture (which stays
+# innermost, per this module's docstring). TRANSFORM-only — routers construct no Send objects, so the
+# flag would be dead weight in the router phase. run_contexts(rc, phase="transform") is entered on every
+# handler-executing path (split, inline, fused, and the sandbox child), so activating it here makes
+# Send.__post_init__ snapshot uniformly wherever a handler runs.
+register_run_context(
+    "snapshot_on_send",
+    lambda c: _snapshot_activated(c.snapshot_on_send),
+    phases={TRANSFORM},
 )
 # #162: the run-scoped unmapped-input capture buffer. Registered LAST (innermost) — a router/handler's
 # code_set(...).translate() miss is recorded regardless of nesting depth (the run body sits inside every

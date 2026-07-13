@@ -36,6 +36,7 @@ from prometheus_client.core import (
 )
 
 from messagefoundry import __version__
+from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.store import DestinationMetrics, InboundMetrics, LatencyHistogram
 
 if TYPE_CHECKING:  # avoid pulling the heavy engine import into the default path
@@ -126,6 +127,13 @@ class _Snapshot:
     host_mem_used_bytes: float | None = None
     host_mem_total_bytes: float | None = None
     process_rss_bytes: float | None = None
+    # DB throughput signals (BACKLOG #93). The server-store connection-pool snapshot (None on SQLite —
+    # no pool), plus the always-on A1 cost counters (physical commits + body copies) that /stats already
+    # exposes, surfaced here as Prometheus counters. All label-less (host/store aggregates), so the
+    # strict {connection,destination,status,version,le} label allowlist is untouched.
+    pool: PoolStatus | None = None
+    committed_txns: int = 0
+    body_copies: int = 0
 
 
 async def gather_snapshot(engine: Engine) -> _Snapshot:
@@ -143,6 +151,12 @@ async def gather_snapshot(engine: Engine) -> _Snapshot:
     outbox = await engine.store.stats()
     in_pipeline = await engine.store.in_pipeline_depth()
     host = _read_host_metrics()
+    # DB throughput signals (#93): the connection-pool snapshot (sync, cached counters — no DB I/O; None
+    # on SQLite) + the always-on A1 physical-commit / body-copy counters (getattr-with-default so a
+    # backend without them reports 0 rather than raising a scrape).
+    pool = engine.store.pool_status()
+    committed_txns = int(getattr(engine.store, "committed_txns", 0))
+    body_copies = int(getattr(engine.store, "body_copies", 0))
     return _Snapshot(
         version=__version__,
         inbound=cm.inbound,
@@ -155,6 +169,9 @@ async def gather_snapshot(engine: Engine) -> _Snapshot:
         host_mem_used_bytes=host.mem_used_bytes,
         host_mem_total_bytes=host.mem_total_bytes,
         process_rss_bytes=host.process_rss_bytes,
+        pool=pool,
+        committed_txns=committed_txns,
+        body_copies=body_copies,
     )
 
 
@@ -277,6 +294,74 @@ class _MetricsCollector:
         )
         in_pipeline.add_metric([], float(s.in_pipeline))
         yield in_pipeline
+
+        # --- DB throughput signals (BACKLOG #93) -----------------------------
+        # Always-on A1 cost counters: physical commits + raw/payload body copies (process lifetime).
+        # These are the store's write/commit-throughput signal (the DB work per message) — label-less.
+        committed = CounterMetricFamily(
+            "messagefoundry_store_committed_txns",
+            "Physical store transactions committed (process lifetime).",
+        )
+        committed.add_metric([], float(s.committed_txns))
+        yield committed
+        body_copies = CounterMetricFamily(
+            "messagefoundry_store_body_copies",
+            "Raw/payload body strings durably written to the store (process lifetime).",
+        )
+        body_copies.add_metric([], float(s.body_copies))
+        yield body_copies
+
+        # Connection-pool saturation + acquire-wait (server backends only; absent on SQLite, which has
+        # no pool). [store].pool_size previously emitted NO saturation metric — these close that gap.
+        pool = s.pool
+        if pool is not None:
+            pool_max = GaugeMetricFamily(
+                "messagefoundry_store_pool_max_connections",
+                "Configured maximum size of the store connection pool.",
+            )
+            pool_max.add_metric([], float(pool.max_size))
+            yield pool_max
+            pool_size = GaugeMetricFamily(
+                "messagefoundry_store_pool_open_connections",
+                "Connections currently open in the store pool.",
+            )
+            pool_size.add_metric([], float(pool.size))
+            yield pool_size
+            pool_idle = GaugeMetricFamily(
+                "messagefoundry_store_pool_idle_connections",
+                "Currently-free (idle) connections in the store pool.",
+            )
+            pool_idle.add_metric([], float(pool.idle))
+            yield pool_idle
+            # The explicit SATURATION signal: 1 when the pool has zero idle connections (every stage
+            # worker waiting on it contends), 0 otherwise.
+            pool_saturated = GaugeMetricFamily(
+                "messagefoundry_store_pool_saturated",
+                "1 when the store pool has zero idle connections (saturated), else 0.",
+            )
+            pool_saturated.add_metric([], 1.0 if pool.idle == 0 else 0.0)
+            yield pool_saturated
+            # Acquire-wait percentiles (seconds — Prometheus base unit) + the sampled count. The time a
+            # worker waits for a pooled connection grows monotonically with contention once saturated.
+            aw = pool.acquire_wait
+            for name, value_ms in (
+                ("p50", aw.p50_ms),
+                ("p95", aw.p95_ms),
+                ("p99", aw.p99_ms),
+                ("max", aw.max_ms),
+            ):
+                g = GaugeMetricFamily(
+                    f"messagefoundry_store_pool_acquire_wait_{name}_seconds",
+                    f"Store pool acquire() wait {name} (seconds) since process start.",
+                )
+                g.add_metric([], value_ms / 1000.0)
+                yield g
+            waits = CounterMetricFamily(
+                "messagefoundry_store_pool_acquire_waits",
+                "Store pool acquire() waits sampled (process lifetime).",
+            )
+            waits.add_metric([], float(aw.count))
+            yield waits
 
         # --- delivery-latency histogram (per connection/destination) ---------
         latency = HistogramMetricFamily(

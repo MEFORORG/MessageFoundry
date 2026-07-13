@@ -1,7 +1,10 @@
 # ADR 0019 — Pluggable KeyProvider seam (HSM/KMS/Vault envelope decryption) for store-key material (ASVS 13.3.3)
 
 - **Status:** **Accepted (2026-06-17); Amended 2026-06-18 — core seam BUILT; Amended 2026-07-10 — `vault`
-  provider (BACKLOG #196) + secret-rotation reminder (§5.1, BACKLOG #195b) BUILT.** Designs the pluggable
+  provider (BACKLOG #196) + secret-rotation reminder (§5.1, BACKLOG #195b) BUILT; Amended 2026-07-12 —
+  connector `SecretProvider` (§5) promoted design → BUILT, AD-bind + SMTP credential points wired (see
+  the [2026-07-12 amendment](#amendment-2026-07-12--connector-secretprovider-5-promoted-to-built)).**
+  Designs the pluggable
   **KeyProvider** seam (work package **WP-BL3-04**) that lets the store's at-rest data-encryption key be
   sourced from an external HSM / cloud KMS / Vault via **envelope decryption**. **As of the 2026-06-18
   amendment the core seam is built** ([store/keyprovider.py](../../messagefoundry/store/keyprovider.py)):
@@ -287,13 +290,11 @@ This is a **reminder**, not enforcement: it never rotates a key or blocks startu
 the operator running `rotate-key` (store DEK) / re-provisioning a credential; §4's fail-closed resolution
 is unchanged.
 
-**Still design-only (the connector `SecretProvider`).** Generalizing the KeyProvider seam to resolve
-**connector** secrets (AD/SQL/SMTP passwords off the `MEFOR_VALUE_*` path) from the *same* external
-provider — the "SecretProvider half" named above — remains a **follow-on, not built**. #195b builds the
-rotation *reminder* only; it does **not** add a `SecretProvider`, does not touch the `MEFOR_VALUE_*`
-chokepoint, and leaves the two secret paths distinct. When the connector `SecretProvider` lands, the
-reminder's secret source generalizes to enumerate those secrets too (the `MonitoredSecret` source callable
-is already the seam for it).
+**The connector `SecretProvider` (§5) is now BUILT** — see the
+[2026-07-12 amendment](#amendment-2026-07-12--connector-secretprovider-5-promoted-to-built). #195b (this
+section's rotation *reminder*) remains distinct: it does not itself add a `SecretProvider` and leaves the
+rotation reminder's secret source as the seam that can later enumerate provider-sourced secrets too (the
+`MonitoredSecret` source callable).
 
 ## ASVS 13.3.3 mapping — Pass-with-documented-residual (amended 2026-06-18)
 
@@ -431,6 +432,52 @@ this ADR records 13.3.3's verdict-flip intent only — it edits **no** score doc
   terminates). This is the "strictly forward-compatible v2 version token" this ADR reserved, now realized.
 - **WP-BL3-06** (security-config-drift gate) — `[store].key_provider` is a **secure-by-default** field
   (default `auto` / unset = today's env-then-DPAPI behavior) that the drift gate can later pin.
+
+## Amendment 2026-07-12 — connector `SecretProvider` (§5) promoted to BUILT
+
+§5 designed the generalization of the store-DEK KeyProvider seam to a **connector `SecretProvider`** so
+AD/SQL/SMTP credentials stop being sourced only from `MEFOR_*` env vars. That half (BACKLOG #196 residual)
+is now **built**, mirroring the KeyProvider pattern one-for-one:
+
+- **Seam** — [config/secretprovider.py](../../messagefoundry/config/secretprovider.py): a
+  `@runtime_checkable SecretProvider` protocol (`resolve(ref) -> str`), a `SecretProviderError` that fails
+  closed exactly like `KeyProviderError`, the `env` built-in, and the `resolve_secret_provider` /
+  `resolve_connector_secret` dispatch. Selected **by name** via **`[secrets].provider`**
+  ([config/settings.py](../../messagefoundry/config/settings.py) `SecretsSettings`) = `none` (default) |
+  `env` | `vault`. **`none` consults no provider — the credential points stay env-sourced, byte-identical.**
+- **Vault backend** — [config/secretprovider_vault.py](../../messagefoundry/config/secretprovider_vault.py):
+  a **Vault KV v2 read** (`resolve("<path>#<field>")`, field defaults to `value`, mount from
+  `MEFOR_SECRETS_VAULT_KV_MOUNT`) behind the **same** lazy `[vault]` / `hvac` extra the store's Vault
+  KeyProvider already declares — **no new dependency**. (A connector credential is a *stored* secret, so
+  this uses KV, where the store DEK uses Transit envelope-decrypt — §3.) Picked up by name with no edit to
+  `secretprovider.py`. **Never logs the value**; a KV/transport failure surfaces only the type + path.
+- **Wired credential points (end-to-end):**
+  - **AD LDAP bind password** — `[auth].ad_bind_password_secret` → resolved once at
+    `LdapAuthenticator.__init__` ([auth/ldap.py](../../messagefoundry/auth/ldap.py)), threaded via
+    `AuthService(..., secret_provider=)`. The `AuthSettings` validator now accepts the reference *or* the
+    env password (one required).
+  - **SMTP password** — `[alerts].email_password_secret` → resolved in `notifier_from_settings`
+    ([pipeline/alert_sinks.py](../../messagefoundry/pipeline/alert_sinks.py)) and
+    `security_notifier_from_settings` ([pipeline/security_notify.py](../../messagefoundry/pipeline/security_notify.py)).
+  - The provider is built **once** per serve from `[secrets]` in the app lifespan
+    ([api/app.py](../../messagefoundry/api/app.py)) and threaded to all three; an unknown provider / missing
+    extra fails closed there, refusing startup.
+- **Seam-only (documented, not wired):** the **SQL Server auth password**
+  (`[store].password`/`MEFOR_STORE_PASSWORD`). Integrated/Entra **managed identity** is the preferred SS
+  posture (`[store].require_managed_identity`, §4's #203 precondition), so a static store password is the
+  fallback case; wiring it is a mechanical follow-on adding a `[store].password_secret` reference through
+  the same `resolve_connector_secret` helper. Left seam-only to avoid steering deployments toward a static
+  DB credential.
+- **Fail-closed contract** (mirrors §4): a `*_secret` reference with `[secrets].provider` unset, an unknown
+  provider name, a missing `[vault]` extra, or an unresolvable/empty secret all raise `SecretProviderError`
+  at load/connect — never a silent blank credential, never the value in the message/log.
+- **Scope boundary:** this does **not** close ASVS **13.3.3** — the unwrapped store DEK still sits in heap
+  during bulk AES-GCM (BACKLOG #198). It generalizes the seam to *connector* credentials only; the
+  `MEFOR_VALUE_*` graph-`env()` path is untouched, and the store-DEK KeyProvider stays its own chokepoint.
+
+`retired_keys()` and the store-DEK grammar are unchanged. The two secret paths (store DEK via
+`[store].key_provider`; connector creds via `[secrets].provider`) remain distinct backends that happen to
+reuse the same `hvac` extra.
 
 ## To resolve on acceptance
 

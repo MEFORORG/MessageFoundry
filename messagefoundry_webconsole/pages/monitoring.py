@@ -248,6 +248,7 @@ def status(
     """
     e = sys.engine
     db = sys.db
+    kpi = sys.kpis
     engine_tbl = rows_table(
         ["Field", "Value"],
         [
@@ -255,9 +256,19 @@ def status(
             ["Uptime", f"{e.uptime_seconds:.0f}s"],
             ["PID", e.pid],
             [
-                "Connections",
+                "Inbound",
                 f"{e.channels_running}/{e.channels_total} running ({e.channels_stopped} stopped)",
             ],
+            # #93 engine-wide KPI headline: combined inbound+outbound endpoint count + engine-wide
+            # msg/s (reusing the recent_done rate window) — the single-glance roll-up no per-connection
+            # row gives. Metadata only (counts + a rate), no PHI.
+            [
+                "Endpoints (in+out)",
+                f"{kpi.connections_running}/{kpi.connections_total} running "
+                f"({kpi.connections_stopped} stopped)",
+            ],
+            ["Messages (total)", kpi.messages_total],
+            ["Throughput", f"{kpi.messages_per_second:.1f} msg/s"],
             [
                 "Outbox by status",
                 ", ".join(f"{k}: {v}" for k, v in e.outbox_by_status.items()) or "—",

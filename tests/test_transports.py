@@ -14,8 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.models import AckMode, ConnectorType, Destination, Source
+from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.wiring import File, MLLP
+from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.peek import Peek
 from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
@@ -908,6 +909,106 @@ async def test_file_source_leaves_file_in_place_on_handler_failure(tmp_path: Pat
         await task
     assert attempts["n"] >= 2  # the first failure left it in place; a later scan retried it
     assert not (inbox / ".error" / "msg.hl7").exists()  # never quarantined
+
+
+# --- file source: content_type-gated ingress (ADR 0004 / 0028) ---------------
+
+
+async def test_file_source_ingests_binary_file_when_content_type_binary(tmp_path: Path) -> None:
+    # Parity with RemoteFileSource (ADR 0004/0028): a File inbound declared content_type=binary must
+    # INGEST a raw binary drop (e.g. a PDF) verbatim, NOT quarantine it for lacking an MSH/FHS/BHS
+    # header. The exact bytes — including a NUL and high bytes — must survive to the pipeline (read as
+    # BYTES, never text-decoded), recoverable via RawMessage.from_bytes (mfb64 carriage).
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    pdf = b"%PDF-1.7\r\n\x00\x01\x02binary body\xff\xfe\x00tail"  # non-HL7; NUL + high bytes
+    (inbox / "doc.pdf").write_bytes(pdf)
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={"directory": str(inbox), "pattern": "*.pdf", "poll_seconds": 0.01},
+        )
+    )
+    src.content_type = ContentType.BINARY  # runner injects this; set it directly here
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: len(received) == 1)
+    finally:
+        await src.stop()
+        await task
+    assert received == [
+        pdf
+    ]  # handed off verbatim — not text-decoded, not batch-split, not quarantined
+    # The content_type-aware pipeline carries these bytes NUL-safely via mfb64 (ADR 0028); prove the
+    # EXACT bytes round-trip back out of a RawMessage.
+    assert RawMessage.from_bytes(received[0], "binary").raw_bytes == pdf
+    assert not (inbox / ".error" / "doc.pdf").exists()  # NOT quarantined
+    assert (inbox / ".processed" / "doc.pdf").exists()  # processed like any received message
+
+
+async def test_file_source_skips_sniff_for_non_hl7_content_type(tmp_path: Path) -> None:
+    # The header sniff is content_type-gated (mirrors RemoteFileSource): a non-hl7v2 drop (here X12,
+    # which has no MSH header by design) must NOT be rejected for lacking an MSH/FHS/BHS header — it
+    # flows to the pipeline verbatim rather than being quarantined to .error.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    x12 = b"ISA*00*          *00*          *ZZ*SENDER\r"
+    (inbox / "claim.hl7").write_bytes(x12)
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
+        )
+    )
+    src.content_type = ContentType.X12  # non-HL7 → sniff disabled by design
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: len(received) == 1)
+    finally:
+        await src.stop()
+        await task
+    assert received == [x12]  # delivered verbatim
+    assert not (inbox / ".error" / "claim.hl7").exists()
+
+
+async def test_file_source_quarantines_non_hl7_when_content_type_hl7v2(tmp_path: Path) -> None:
+    # The hl7v2 guard is INTACT: a File inbound declared content_type=hl7v2 still runs the MSH/FHS/BHS
+    # header sniff and quarantines a binary/non-HL7 drop to .error before its bytes reach the pipeline
+    # (ASVS 5.2.2) — exactly as before the content_type gate was added.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "bad.hl7").write_bytes(b"\x00\x01not an hl7 message")
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
+        )
+    )
+    src.content_type = ContentType.HL7V2  # hl7v2 inbound → sniff stays ON
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: (inbox / ".error" / "bad.hl7").exists())
+    finally:
+        await src.stop()
+        await task
+    assert received == []  # quarantined before reaching the pipeline
+    assert (inbox / ".error" / "bad.hl7").exists()
+    assert not (inbox / ".processed" / "bad.hl7").exists()
 
 
 # --- file source: leader-gating (Track B Step 4b) ----------------------------

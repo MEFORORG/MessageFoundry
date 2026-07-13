@@ -24,6 +24,7 @@ from messagefoundry.config.models import (
     OrderingMode,
     Priority,
     RetryPolicy,
+    SaturationThreshold,
     StallThreshold,
 )
 from messagefoundry.config.settings import (
@@ -119,6 +120,7 @@ class Engine:
         fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
         pooled_fusing_workers: int = 8,
         batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
+        snapshot_on_send: bool = False,  # ADR 0104: copy-on-Send at Send construction (default-OFF)
         connection_events: bool = True,
         response_sent_default: bool = True,
         audit_verify_on_start: bool = False,
@@ -131,7 +133,9 @@ class Engine:
         internal_error_default: InternalErrorPolicy | None = None,
         buildup_default: BuildupThreshold | None = None,
         stall_default: StallThreshold | None = None,
+        saturation_default: SaturationThreshold | None = None,
         ack_after_default: AckAfter | None = None,
+        stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: streaming-detach concurrency budget ([inbound])
         priority_default: Priority | None = None,
         alert_sink: AlertSink | None = None,
         retention_settings: RetentionSettings | None = None,
@@ -225,6 +229,9 @@ class Engine:
         # ADR 0075 per-hop SQL statement batching (SQL-Server-only, default-OFF); every runner inherits
         # it. Read ONCE here — a /config/reload never re-reads it (restart to change, like fuse_thread_hops).
         self._batch_handoff_statements = batch_handoff_statements
+        # ADR 0104 copy-on-Send (default-OFF); every runner inherits it. Read ONCE here — a /config/reload
+        # never re-reads it (restart to change, exactly like fuse_thread_hops).
+        self._snapshot_on_send = snapshot_on_send
         # [diagnostics] Corepoint-style event log (#46); every runner inherits these master switches.
         self._connection_events = connection_events
         self._response_sent_default = response_sent_default
@@ -315,8 +322,13 @@ class Engine:
         self._internal_error_default = internal_error_default
         self._buildup_default = buildup_default
         self._stall_default = stall_default
+        # Global [delivery] saturation (rising-backlog derivative) threshold default (#93); every runner
+        # inherits it. None → the runner's own SaturationThreshold() (OFF) — deny-by-default.
+        self._saturation_default = saturation_default
         # Global [inbound] ACK-timing default (ADR 0001); every runner inherits it.
         self._ack_after_default = ack_after_default
+        # #149 (ADR 0105 Phase 1a) [inbound].stream_inflight_budget_bytes; every runner inherits it.
+        self._stream_inflight_budget_bytes = stream_inflight_budget_bytes
         # DR run-profile (#61, ADR 0048). The global [delivery].priority default a connection inherits
         # when it declares no priority= (every runner inherits it). The DR run-profile THRESHOLD is
         # active only when this box is a DR standby that has been activated for THIS boot (dr.enabled
@@ -407,6 +419,7 @@ class Engine:
         fuse_thread_hops: bool = False,  # ADR 0071 B5
         pooled_fusing_workers: int = 8,
         batch_handoff_statements: bool = False,  # ADR 0075
+        snapshot_on_send: bool = False,  # ADR 0104
         connection_events: bool = True,
         response_sent_default: bool = True,
         audit_verify_on_start: bool = False,
@@ -420,7 +433,9 @@ class Engine:
         internal_error_default: InternalErrorPolicy | None = None,
         buildup_default: BuildupThreshold | None = None,
         stall_default: StallThreshold | None = None,
+        saturation_default: SaturationThreshold | None = None,
         ack_after_default: AckAfter | None = None,
+        stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105
         alert_sink: AlertSink | None = None,
         retention_settings: RetentionSettings | None = None,
         cert_monitor_settings: CertMonitorSettings | None = None,
@@ -464,6 +479,7 @@ class Engine:
             fuse_thread_hops=fuse_thread_hops,
             pooled_fusing_workers=pooled_fusing_workers,
             batch_handoff_statements=batch_handoff_statements,
+            snapshot_on_send=snapshot_on_send,
             connection_events=connection_events,
             response_sent_default=response_sent_default,
             audit_verify_on_start=audit_verify_on_start,
@@ -476,7 +492,9 @@ class Engine:
             internal_error_default=internal_error_default,
             buildup_default=buildup_default,
             stall_default=stall_default,
+            saturation_default=saturation_default,
             ack_after_default=ack_after_default,
+            stream_inflight_budget_bytes=stream_inflight_budget_bytes,
             alert_sink=alert_sink,
             retention_settings=retention_settings,
             cert_monitor_settings=cert_monitor_settings,
@@ -630,7 +648,9 @@ class Engine:
             internal_error_default=self._internal_error_default,
             buildup_default=self._buildup_default,
             stall_default=self._stall_default,
+            saturation_default=self._saturation_default,
             ack_after_default=self._ack_after_default,
+            stream_inflight_budget_bytes=self._stream_inflight_budget_bytes,
             priority_default=self._priority_default,
             dr_threshold=self._dr_run_threshold(),
             alert_sink=self._alert_sink,
@@ -657,6 +677,7 @@ class Engine:
             fuse_thread_hops=self._fuse_thread_hops,
             pooled_fusing_workers=self._fusing_workers,
             batch_handoff_statements=self._batch_handoff_statements,
+            snapshot_on_send=self._snapshot_on_send,
             connection_events=self._connection_events,
             response_sent_default=self._response_sent_default,
             sandbox_policy=sandbox_policy,
@@ -806,6 +827,22 @@ class Engine:
         # else clustered (Track B Step 4): the leader's periodic reclaim_expired_leases sweep (started
         # below) recovers expired-lease rows; the unconditional reset ignores leases and would steal a
         # live sibling's in-flight rows, so it must NOT run here.
+        # #149 / ADR 0105 Phase 0: reclaim orphaned streaming-attachment storage (refcount-0 + header-less
+        # incomplete-write chunks) so no detached-document PHI accumulates at rest. Runs alongside the
+        # startup crash recovery above, guarded by the capability flag (SQLite-only in Phase 0; the
+        # server backends' stub would raise). Content-addressed + refcount-scoped, not lane-scoped, so it
+        # is safe on any node — and a no-op until Phase 1 wires the detach (the tables are empty today).
+        if getattr(self.store, "supports_streaming_attachments", False):
+            try:
+                reclaimed = await self.store.sweep_orphan_attachments()
+                if reclaimed:
+                    log.info(
+                        "startup attachment sweep reclaimed %d orphaned attachment(s)", reclaimed
+                    )
+            except (
+                Exception
+            ) as exc:  # a sweep failure must never block startup (best-effort hygiene)
+                log.warning("startup attachment sweep failed: %s", safe_exc(exc))
         # #190-E: optional startup audit-chain tamper check. ALERT-ONLY (never crashes startup); runs
         # after recovery so the chain is walked in its post-recovery state.
         if self._audit_verify_on_start:
@@ -1239,7 +1276,9 @@ class Engine:
                 internal_error_default=self._internal_error_default,
                 buildup_default=self._buildup_default,
                 stall_default=self._stall_default,
+                saturation_default=self._saturation_default,
                 ack_after_default=self._ack_after_default,
+                stream_inflight_budget_bytes=self._stream_inflight_budget_bytes,
                 priority_default=self._priority_default,
                 dr_threshold=self._dr_run_threshold(),
                 alert_sink=self._alert_sink,

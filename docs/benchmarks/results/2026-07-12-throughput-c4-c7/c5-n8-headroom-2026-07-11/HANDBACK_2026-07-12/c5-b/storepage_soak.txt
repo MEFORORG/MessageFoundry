@@ -1,0 +1,12 @@
+# sampled dm_os_waiting_tasks 702x over 180s; PAGELATCH hits {'PAGELATCH_EX': 1, 'PAGELATCH_SH': 4}
+# top contended pages (dbid:file:page -> waiter-hits): [('5:1:421464', 1), ('5:1:417314', 1), ('5:1:420704', 1), ('5:1:418374', 1), ('5:1:423181', 1)]
+# hottest-page identities (db + object):
+  5:1:421464 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=4 (None)
+  5:1:417314 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=5 (None)
+  5:1:420704 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=1 (None)
+  5:1:418374 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=5 (None)
+  5:1:423181 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=4 (None)
+# top SQL statements waiting on PAGELATCH (store-internal, parameterized -- names the churn):
+  [2] (@P1 float,@P2 nvarchar(16),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(24))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P1, @stage NVARCHAR(16) = @P2, @k I
+  [1] (@P1 nvarchar(64),@P2 nvarchar(64),@P3 nvarchar(12),@P4 nvarchar(20),@P5 nvarchar(20),@P6 nvarchar(1386),@P7 nvarchar(14),@P8 float,@P9 float,@P10 float,@P11 nvarchar(64),@P12 nvar
+  [1] (@P1 nvarchar(12),@P2 nvarchar(14),@P3 int,@P4 nvarchar(1))SET NOCOUNT ON; DECLARE @stage NVARCHAR(16) = @P1, @pending NVARCHAR(32) = @P2, @limit INT = @P3, @after NVARCHAR(256) =

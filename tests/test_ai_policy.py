@@ -70,7 +70,7 @@ def test_managed_baa_phi_production_is_the_phi_safe_end() -> None:
 
 
 def test_managed_baa_deidentified_production_blocked() -> None:
-    # deidentified needs the unbuilt de-id framework -> always falls back to code_only.
+    # deidentified needs runtime AI-path de-id (not wired yet) -> always falls back to code_only.
     eff = _resolve(AiMode.MANAGED_CLAUDE_BAA, AiDataScope.DEIDENTIFIED, production=True)
     assert eff.data_scope is AiDataScope.CODE_ONLY
     assert "deidentified" in (eff.reason or "")
@@ -146,7 +146,7 @@ def test_invariants_over_all_combinations(
     # 1. effective scope never exceeds the posture ceiling.
     assert _SCOPE_ORDER[eff.data_scope] <= _SCOPE_ORDER[_ceiling(mode, production)]
 
-    # 2. deidentified is never an effective output (the de-id framework is unbuilt).
+    # 2. deidentified is never an effective output (no runtime AI-path de-id wired yet).
     assert eff.data_scope is not AiDataScope.DEIDENTIFIED
 
     # 3. phi is an effective output ONLY when mode == managed_claude_baa.

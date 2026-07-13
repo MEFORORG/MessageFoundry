@@ -250,6 +250,79 @@ async def test_ui_message_detail_audits_like_json(engine: Engine) -> None:
     ), "the /ui raw view must record the same message_view audit as GET /messages/{id}"
 
 
+# --- #149 Phase 3b: the attachments panel + audited /ui download --------------
+
+_DOC = b"%PDF-1.4\nsynthetic webconsole document \x00\x01 not real PHI\n%%EOF\n"
+_DOC_B64 = base64.b64encode(_DOC).decode("ascii")
+
+
+async def _seed_streaming(engine: Engine, *, channel_id: str = "ch1") -> tuple[str, str]:
+    ref = await engine.store.put_attachment([_DOC_B64], "application/pdf")
+    mid = await engine.store.enqueue_ingress(
+        channel_id=channel_id, raw=ADT, control_id="MSG1", attachment_refs=[ref]
+    )
+    return mid, ref
+
+
+def test_message_detail_renders_attachments_panel() -> None:
+    # Pure page render: a MessageDetail carrying an attachment shows the panel + a download link; a
+    # message with none shows no panel (no import of the engine store needed).
+    from messagefoundry.api.models import AttachmentInfo, MessageDetail
+    from messagefoundry_webconsole.pages import message_detail
+
+    ref = "a" * 64
+    detail = MessageDetail(
+        id="m1",
+        channel_id="ch1",
+        received_at=0.0,
+        source_type="file",
+        control_id="MSG1",
+        message_type="ADT^A01",
+        status="processed",
+        error=None,
+        raw="MSH|skel",
+        outbox=[],
+        events=[],
+        attachments=[AttachmentInfo(id=ref, content_type="application/pdf", total_bytes=2048)],
+    )
+    html = str(message_detail(detail))
+    assert "Attachments" in html
+    assert "application/pdf" in html
+    assert f"/ui/messages/m1/attachments/{ref}" in html  # the download link
+    assert "2.0 KiB" in html  # human size
+
+    empty = detail.model_copy(update={"attachments": []})
+    assert "Attachments" not in str(message_detail(empty))
+
+
+async def test_ui_attachment_download_round_trips_and_audits(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid, ref = await _seed_streaming(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        # The detail page shows the panel + link.
+        page = await c.get(f"/ui/messages/{mid}")
+        assert page.status_code == 200
+        assert f"/ui/messages/{mid}/attachments/{ref}" in page.text
+        # The download reuses the engine's audited path (session cookie carries the auth, not a bearer).
+        r = await c.get(f"/ui/messages/{mid}/attachments/{ref}")
+        assert r.status_code == 200
+        assert r.content == _DOC  # byte-for-byte round-trip
+        assert r.headers["content-disposition"].startswith("attachment; filename=")
+    assert any(a["action"] == "attachment_download" for a in await engine.store.list_audit())
+
+
+async def test_ui_attachment_download_requires_view_raw(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)  # no view_raw
+    mid, ref = await _seed_streaming(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "vw")
+        r = await c.get(f"/ui/messages/{mid}/attachments/{ref}")
+        assert r.status_code == 403
+
+
 # --- AC-6: off-loopback /ui requires TLS, even under --allow-insecure-bind ----
 
 

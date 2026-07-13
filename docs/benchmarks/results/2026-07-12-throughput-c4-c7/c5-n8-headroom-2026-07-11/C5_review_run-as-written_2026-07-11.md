@@ -1,0 +1,35 @@
+# HANDOFF — Review note: C5 (`per-shard ceiling at N=8, latch-free`) — read before running
+
+**Date:** 2026-07-11 · **From:** bench verifier · **To:** C5 spec author · **Route:** via bench operator
+**Re:** `HANDOFF_C5_n8_per_shard_headroom.md` · **Primaries read:** that handoff (full) + `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md` §§5/8/9. Public catalog/DMV names only.
+
+**Verdict — C5 should run, but NOT as written on the current rig, and not until C4 clears.** The design is sound; the arithmetic is clean; two items must be fixed before the run so a *rig* limit can't be misread as a *design* verdict.
+
+---
+
+## ① DECISIVE — the decision rung sits on top of the 8-vCPU engine box's own wall
+
+C5-c drives N=8 at 3.62/shard = 29 fleet ingress = **261 events/s** (handoff §2/L58). That is within a whisker of the per_lane **28/s SUSTAINED** point (~252 events/s) that already pushed the 8-vCPU bench engine box to **38.5% mean / 88.4% p95 / 91.9% max** — which the throughput doc itself calls "near saturation… the next wall" (§5/L482) and whose Phase-5 sizing table flags the **current rig as inadequate, needing m7i.4xlarge for N≤8** (L498). Per-message transform/route/outbound compute is largely claim-mode-independent, so that compute floor is real at C5-c regardless of mode, and rungs C5-d (360 ev/s) and C5-e (521 ev/s) are well past it.
+
+**Risk:** R at C5-c and above may be capped by the bench box, yet §3's rule (`R<3.62` → "REWRITE INSUFFICIENT / N-sizing dead", L74–75) carries **no carve-out** for that — a rig artifact would be certified as a design verdict.
+
+**Do not over-state the other way:** 88% is per_lane p95/max (mean was 38.5%), and part of per_lane's engine CPU is its 16 per-lane claim loops that pooled's single shared claim never incurs — so pooled may run cooler and may *not* reach 88% at C5-c. And which resource binds *first* is mode-dependent: pooled+latch-free still carries residual store-claim CPU (C3-16 hit **92–93% store CPU** at 32 ingress/s), so the store could wall first — in which case a fail is a legitimate claim finding, not a rig artifact. Phrase it as "the bench box is a plausible **co-constraint** at C5-c+," never "the box will be the wall."
+
+**Fix (either):** (a) run C5-c and higher on the **m7i.4xlarge** upsize the doc's own Phase-5 already prescribes; **or** (b) cap C5 at the control rungs (C5-a/b, below the saturation load) and accept a narrower falsifier. **Either way**, add to §3 a pre-registered carve-out: *an R capped by engine `max_core%` saturation on the 8-vCPU box **with the store not saturated** voids/defers "REWRITE INSUFFICIENT" pending re-run on a larger engine box* — mirroring the re-run discipline §3 already prescribes for the R≥7.23 rung (L77). §5 already captures engine `max_core%` **and** store CPU% per arm and already asks whether a fail is store-saturated "like C3's N=16 at 92–93%" (L104), so the instruments already settle *which* wall hit; the gap is only §3's decision rule.
+
+## ② MUST RECONCILE BEFORE RUN — the control rung fails §3's own sustain bar
+
+§2 makes **C5-a the control**: "Reproduces C3's `c3-8` PASS… if this does not reproduce, stop" (L56). But §4/L85–87 states `c3-8` was *marginal* — a **+4.04 rows/s GROWING backlog slope** — and §3's sustain definition explicitly rules that out: "a rung with a growing backlog slope is **NOT** a sustain… even if it drains" (L68–71), citing `c3-8`'s +4.04 as the disqualifying case. So if C5-a faithfully reproduces `c3-8`, the **control does not sustain under §3**, and R is undefined before the ladder starts. Reconcile before running: is the control a *drift check* ("reproduces `c3-8`'s numbers" — then don't call it a sustain/PASS), or is latch-free expected to **flatten** the +4.04 so C5-a must hold flat (then "reproduces `c3-8` PASS" is the wrong success criterion and C5-a should be required to *improve* on `c3-8`)? This decides whether R is even well-defined.
+
+## ③ Two smaller corrections
+
+- **Raw-capability vs publishable rate.** §3's rungs (3.62/shard @N=16, 7.23/shard @N=8) are **raw** thresholds — `ingress × N × 9 = 520.83`, no derate (§0/L17–20; §3/L76). The throughput doc's Phase-5 **D4 rule publishes at ≤50% of the measured ceiling**: "Publish `N × per-shard × 0.5`" (L456–457). So an R just above 3.62 earns "POTENTIALLY SUFFICIENT" but its D4-publishable rate is *half* — not a certifiable 45M/day claim (to publish the N=16 requirement you need R ≈ **7.24**). The coincidence is exact, not approximate: `16×9×0.5 = 72 = 8×9`, so C5's raw N=8 threshold (7.23) *is* the D4-publishable-at-N=16 threshold, and the whole "potentially sufficient" band (3.62 ≤ R < 7.23) lies wholly below the publishable-at-N=16 line. **Fix:** one line in §3 — the verdict is *raw latch-free capability* (go/no-go on whether the N-sizing PATH is alive); any *published* N-sizing claim carries the D4 0.5 derate. (By design C5 is a raw screen — this is a missing cross-reference, not an arithmetic error.)
+- **"Retires open-question #2 for free" over-claims — trim it.** §4/L88 says this run *is* throughput-doc §9 OQ#2. It isn't: §9 OQ#2 is "what is **per_lane**'s real ceiling at a 900 s hold?" C5 runs **pooled** (it forbids per_lane, §6/L109) at **fixed N=8** varying only the per-shard rate — so it answers neither OQ#2 (per_lane ceiling) nor OQ#1/Phase-5 (vary-N flatness). At most C5 feeds *one input rung* (pooled per-shard R at N=8) into the Phase-5 analysis. Drop the "retires OQ#2" line. (Minor: §9/L140 cites the doc's §8 as "The capacity frontier," but §8 is titled "The plan" — an edition/citation mismatch worth a quick check.)
+
+## ④ Framing note
+
+§3's verdicts read "REWRITE sufficient/insufficient," but R is a **latch-free per-shard N-sizing ceiling measured "as the code ships today"** (L80) — an N-sizing quantity independent of the rewrite. Whenever C4 returns a **non-CONFIRM** outcome (e.g. HIDDEN-CONSUMER), re-read the verdicts as "**N-sizing** sufficient/insufficient regardless of a claim rewrite." §3's middle verdict already makes itself conditional on C4 CONFIRMING (L76); just extend the same conditional wording to the INSUFFICIENT / target verdicts so a non-CONFIRM C4 result isn't mislabeled as a statement about the rewrite.
+
+---
+
+**What's solid (this is not a rejection):** the arithmetic is correct and free of the units bug — `45,000,000 / 86,400 = 520.83` total events/s, gated on `ingress × (1+dests) = ×9` throughout (7.23/s @N=8, 3.62/s @N=16; C5-c 261 and C5-e 521 all reproduce), matching the doc's B10 fix. Sequencing holds (runs after C4, shares the same `MEMORY_OPTIMIZED TEMPDB_METADATA = ON` pre-flight; feature-OFF = void). The one-sided-falsifier design is sound: `R<3.62` a hard INSUFFICIENT, `R≥3.62` only conditional, and applying the N=8-measured R to the N=16 requirement is optimistic only for the non-committal middle verdict. **One label nit:** the units-bug fix is **B10** (throughput doc Phase 0), not `#861` — in the C5 text `#861` is the per-PID CPU-collector fix (§5/L97); don't cite it as the units correction.

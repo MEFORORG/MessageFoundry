@@ -1,6 +1,25 @@
 # ADR 0057 — Inline Step-A Fast-Path: Collapse the Routed Stage for No-Lookup, All-Deliver, Single-Handler Messages
 
-> # ⚠️ GATED (2026-07-12) by [ADR 0099](0099-phase-4-group-commit-amortize-the-per-event-transaction-cost.md) — **measure before you build**
+> # ⛔ DO NOT PROMOTE (2026-07-13) — MEASURED, AND IT BUYS NOTHING. See [ADR 0107](0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md).
+> **P0 ran the gate below. The mechanism WORKS and the throughput gain is ZERO.**
+>
+> - It cut `committed_txns/msg` **10.47 → 7.49** — a **28.5% reduction**, exactly as designed. The fusion gate fired;
+>   the manipulation check passed decisively.
+> - Sustained throughput moved **−0.56%** — **inside the null band, and smaller than the replicate noise.**
+> - **The txn lever itself is weak.** Arm E measured the cost of the entire `2H` term by *adding* it (H=1→8 on the
+>   split path): a **~3× swing in committed transactions costs only 11.7% of throughput** — an elasticity of **−0.115**.
+> - ⚠️ **But that does NOT prove F2 fails at a bigger shape, and an earlier draft of this banner wrongly said it did.**
+>   F2's arm-E ceiling at H=8 is **+13.2%**, which is **ABOVE** the +8% PROCEED bar **and above**
+>   [ADR 0071](0071-cut-executor-round-trips-b5.md) B5's +6.5…+10% band — **not inside it.** Even net of the *measured*
+>   H=1 give-back (−4.49 pts) it is **+8.75%**, still above. *A bound that permits clearing the bar cannot prove the bar
+>   cannot be cleared.* The deratings that would sink F2 (transform executions it cannot remove; a give-back growing
+>   with H) are **argued, not measured**. And **F2 cannot be measured without being built** — the gate is
+>   `len(names) == 1`, so inline fusion is **H=1-only by construction**.
+>   **⇒ We DECLINE F2 on cost/risk/evidence, NOT on a proof of impossibility.** The ABANDON verdict rests on the
+>   **pre-registered primary A/B null (−0.56%)**, not on arm E. See [ADR 0107](0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md).
+>
+> **This ships `default-OFF` and stays that way, permanently. Do not enable `inline=` on a production inbound. Do not
+> build F2/F3.** The design below is correct and is retained for the record; it is simply not a throughput lever.
 > **This is now the ONLY surviving Phase-4 mechanism** — [ADR 0055](0055-group-commit-durable-write.md)
 > (group-commit), which the Status line below says this "builds on", has been **WITHDRAWN** (its premise was measured
 > false and delayed durability breaks at-least-once on PHI). **Inline fusion stands on its own; it does not depend on

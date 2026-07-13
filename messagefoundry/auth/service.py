@@ -56,6 +56,7 @@ from messagefoundry.auth.permissions import (
 from messagefoundry.auth.policy import PasswordPolicy, _operator_corpus
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
+from messagefoundry.config.secretprovider import SecretProvider
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.base import AdminStore
 from messagefoundry.store.store import SessionRecord, UserRecord, WebAuthnCredential
@@ -222,6 +223,7 @@ class AuthService:
         *,
         ldap: LdapAuthenticator | None = None,
         security_notifier: SecurityNotifier | None = None,
+        secret_provider: SecretProvider | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -246,7 +248,9 @@ class AuthService:
         if ldap is not None:
             self._ldap: LdapAuthenticator | None = ldap
         elif settings.ad_enabled:
-            self._ldap = LdapAuthenticator(settings)
+            # Thread the connector SecretProvider (ADR 0019 §5) so an ad_bind_password_secret reference
+            # resolves the bind password from the external backend (fail-closed) at construction.
+            self._ldap = LdapAuthenticator(settings, secret_provider=secret_provider)
         else:
             self._ldap = None
         # Instance-scoped (one event loop per AuthService) so it never crosses loops in tests.

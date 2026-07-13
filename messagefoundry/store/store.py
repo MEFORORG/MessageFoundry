@@ -1104,6 +1104,55 @@ CREATE TABLE IF NOT EXISTS shared_body (
     created_at REAL NOT NULL
 );
 
+-- Streaming very-large attachments (#149, ADR 0105 — Phase 0 substrate). A very-large document (e.g. a
+-- base64 PDF in OBX-5.5 that would push the frame past the 16 MiB cap) is DETACHED from its message and
+-- stored here as content-addressed, CHUNKED, per-chunk-sealed rows, leaving a small
+-- `mfdoc:v1:ref:<sha256>:<content-type>` handle in the message (parsing/binary.py). This GENERALIZES the
+-- `shared_body` store-once model (content address + refcount + GC-at-0), but for a document too large to
+-- hold whole: `id` is the sha256 of the VERBATIM concatenated plaintext (Approach B — the exact OBX-5.5
+-- value the partner sent, byte-for-byte), so an identical document DEDUPS to one physical copy. Each
+-- `attachment_chunk` is ONE `mfenc`-sealed slice of that plaintext (a bounded plaintext window per seal —
+-- the whole document is never materialized to seal it, and it is cipher-covered at rest exactly like
+-- queue.payload / shared_body.body, riding the key-rotation re-seal). `refcount` is the number of live
+-- references (a delivery/skeleton row); the attachment + all its chunks are GC-deleted the moment it
+-- reaches 0. `attachment_chunk.attachment_id` is a LOGICAL reference (no FK — mirrors queue.body_ref →
+-- shared_body.hash), so a future incremental streaming writer (Phase 1) can insert chunks and finalize
+-- separately; the startup orphan/incomplete sweep (sweep_orphan_attachments) reclaims refcount-0 AND
+-- orphaned-chunk (no-header) attachments so no PHI chunk accumulates at rest. Phase 0 ships the substrate
+-- ONLY (no ingress/delivery wiring); it is dormant until Phase 1, so existing messages are byte-identical.
+CREATE TABLE IF NOT EXISTS attachment (
+    id           TEXT PRIMARY KEY,  -- sha256(verbatim concatenated plaintext) — the content address
+    content_type TEXT NOT NULL,
+    total_bytes  INTEGER NOT NULL,  -- decoded/verbatim plaintext byte length (the reconstructed size)
+    refcount     INTEGER NOT NULL,  -- live references; attachment + chunks GC'd at 0
+    created_at   REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attachment_chunk (
+    attachment_id TEXT NOT NULL,    -- logical ref to attachment.id (no FK: like queue.body_ref)
+    seq           INTEGER NOT NULL, -- 0-based chunk order; read reassembles ORDER BY seq
+    ciphertext    TEXT NOT NULL,    -- one mfenc-sealed slice of the verbatim plaintext (cipher-covered)
+    PRIMARY KEY (attachment_id, seq)
+);
+
+-- Message->attachment linkage (#149, ADR 0105 Phase 3a). ONE row per (message, DISTINCT attachment) the
+-- ingress detach lifted out of a message's body into the `attachment` substrate. It is the durable record
+-- of WHICH attachments a message holds, so retention (`purge_message_bodies`) can DECREF exactly those
+-- attachments when it nulls the message's body (which removes the `mfdoc:v1:ref:` handle) — closing the
+-- Phase-1b over-retention gap (a purged-but-referenced document previously stayed at rest forever because
+-- nothing recorded the linkage to release). Populated in the SAME transaction as the ingress incref +
+-- skeleton row (atomic: a crash leaves neither or both), and each row is DELETEd in the SAME transaction
+-- as its attachment's decref at purge — so a crash-re-run of the purge finds the row already gone and
+-- decrefs nothing (no double-decref, no refcount underflow, no premature GC of an attachment a SIBLING
+-- message still references). `attachment.refcount` therefore equals the count of live `message_attachment`
+-- rows referencing it. Logical refs (no FK — mirrors attachment_chunk.attachment_id / queue.body_ref); the
+-- messages row is kept by retention (Mirth Data-Pruner), so a dangling message_id never occurs in normal
+-- flow. SQLite only in Phase 3a; SQL Server / Postgres gain the whole attachment substrate at Phase 4.
+CREATE TABLE IF NOT EXISTS message_attachment (
+    message_id    TEXT NOT NULL,    -- logical ref to messages.id
+    attachment_id TEXT NOT NULL,    -- logical ref to attachment.id
+    PRIMARY KEY (message_id, attachment_id)
+);
+
 CREATE TABLE IF NOT EXISTS message_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id  TEXT NOT NULL REFERENCES messages(id),
@@ -1395,6 +1444,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user
 _MESSAGE_MIGRATIONS = {"summary": "TEXT", "metadata": "TEXT", "documents_pruned": "REAL"}
 
 
+class StreamingAttachmentsUnsupported(NotImplementedError):
+    """A streaming-attachment operation (#149, ADR 0105) was attempted on a backend whose
+    ``supports_streaming_attachments`` is ``False``. SQLite ships the Phase-0 substrate; SQL Server and
+    Postgres raise this until Phase 4 flips them, so a streaming connection targeting them fails with a
+    clear message rather than silently degrading."""
+
+
 class MessageStore:
     """Async SQLite-backed durable queue. Open with :meth:`open`."""
 
@@ -1419,6 +1475,12 @@ class MessageStore:
     # inside the group-commit serializer, so a sync twin on a worker thread cannot take that lock and
     # would be a second WAL writer — kept False by construction; the async path stays.
     supports_fused_sync_handoff = False
+
+    # #149 / ADR 0105 Phase 0: this backend ships the streaming-attachment substrate (the `attachment` +
+    # `attachment_chunk` tables + put/read/incref/decref/sweep). SQLite is the reference backend; SQL
+    # Server + Postgres carry it as a not-supported stub (their flag is False) until Phase 4, so a
+    # streaming connection targeting them raises a clear error rather than silently degrading.
+    supports_streaming_attachments = True
     backend = StoreBackend.SQLITE
 
     def __init__(
@@ -1860,6 +1922,8 @@ class MessageStore:
         # `id`), so it can't ride the id-keyed loops below — it has its own passes, like state/reference.
         # The `shared_body` table (store-once-deliver-many) is likewise cipher-covered (`body`) but keyed
         # by `hash`, not `id`, so it has its own pass in _encrypt_existing_rows / reencrypt_to_active.
+        # The `attachment_chunk` table (#149, ADR 0105) is cipher-covered (`ciphertext`) with a composite
+        # PK (attachment_id, seq), so it likewise rides its own pass (re-seals each chunk under rotation).
     )
 
     async def _encrypt_existing_rows(self) -> None:
@@ -1977,6 +2041,27 @@ class MessageStore:
                 )
                 await self._commit()
                 total += len(rows)
+            # The `attachment_chunk` table (#149, ADR 0105) is cipher-covered (`ciphertext`) and keyed by
+            # the composite (attachment_id, seq); seal any legacy plaintext chunk. Normally a no-op (a
+            # brand-new table, and Phase 0 writes nothing) — present for parity with shared_body/state.
+            while True:
+                cur = await self._db.execute(
+                    "SELECT attachment_id, seq, ciphertext FROM attachment_chunk"
+                    " WHERE ciphertext NOT LIKE ? AND ciphertext <> '' LIMIT 500",
+                    (like,),
+                )
+                rows = list(await cur.fetchall())
+                if not rows:
+                    break
+                await self._db.executemany(
+                    "UPDATE attachment_chunk SET ciphertext=? WHERE attachment_id=? AND seq=?",
+                    [
+                        (self._cipher.encrypt(r["ciphertext"]), r["attachment_id"], r["seq"])
+                        for r in rows
+                    ],
+                )
+                await self._commit()
+                total += len(rows)
         if total:
             log.info("encrypted %d existing value(s) at rest", total)
 
@@ -2026,9 +2111,42 @@ class MessageStore:
             total += await self._reencrypt_response_to_active(cipher, active_like, batch)
             # The `shared_body` table (store-once-deliver-many) is keyed by `hash`, not `id` — its own pass.
             total += await self._reencrypt_shared_body_to_active(cipher, active_like, batch)
+            # The `attachment_chunk` table (#149, ADR 0105) is keyed by the composite (attachment_id, seq)
+            # — its own pass re-seals each detached-document chunk under the active key (chunk-at-a-time,
+            # so the whole document is never materialized to re-seal it).
+            total += await self._reencrypt_attachment_chunks_to_active(cipher, active_like, batch)
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         return total
+
+    async def _reencrypt_attachment_chunks_to_active(
+        self, cipher: AesGcmCipher, active_like: str, batch: int
+    ) -> int:
+        """Re-seal the ``attachment_chunk`` table's ``ciphertext`` under the active key (#149, ADR 0105;
+        caller holds ``self._lock``). Mirrors :meth:`_reencrypt_shared_body_to_active` but keys on the
+        composite PK ``(attachment_id, seq)``. Decrypt (via the keyring) → encrypt (active), one chunk at
+        a time so the whole document is never materialized to re-seal it; the content-address ``id`` is
+        over the PLAINTEXT, so a re-seal never changes it (rotation-stable)."""
+        rotated = 0
+        while True:
+            cur = await self._db.execute(
+                "SELECT attachment_id, seq, ciphertext FROM attachment_chunk"
+                " WHERE ciphertext NOT LIKE ? AND ciphertext <> '' LIMIT ?",
+                (active_like, batch),
+            )
+            rows = list(await cur.fetchall())
+            if not rows:
+                break
+            updates = [
+                (cipher.encrypt(cipher.decrypt(r["ciphertext"])), r["attachment_id"], r["seq"])
+                for r in rows
+            ]
+            await self._db.executemany(
+                "UPDATE attachment_chunk SET ciphertext=? WHERE attachment_id=? AND seq=?", updates
+            )
+            await self._commit()
+            rotated += len(rows)
+        return rotated
 
     async def _reencrypt_shared_body_to_active(
         self, cipher: AesGcmCipher, active_like: str, batch: int
@@ -2457,6 +2575,269 @@ class MessageStore:
         # Null body_ref on the just-released rows so a re-run of the purge is a no-op (idempotent GC).
         await self._db.execute(f"UPDATE queue SET body_ref=NULL WHERE {where}", params)
 
+    # --- streaming attachments (#149, ADR 0105 Phase 0 substrate) ------------------------------------
+    # A content-addressed, chunked, per-chunk-sealed store for a very-large document DETACHED from its
+    # message (a base64 PDF in OBX-5.5 too large for the frame cap). Generalizes the shared_body store-
+    # once model (content address + refcount + GC-at-0) to a payload too large to hold whole. Phase 0 is
+    # SUBSTRATE ONLY — nothing in the pipeline calls these yet (that is Phase 1), so the tables stay empty
+    # and existing messages are byte-identical.
+
+    def _require_streaming_attachments(self) -> None:
+        """Guard the streaming-attachment ops behind the capability flag (defensive; always passes on
+        SQLite, whose flag is True). SQL Server / Postgres raise :class:`StreamingAttachmentsUnsupported`
+        from their own stubs until Phase 4."""
+        if not self.supports_streaming_attachments:
+            raise StreamingAttachmentsUnsupported(
+                f"streaming attachments are not supported on the {self.backend.value} backend "
+                "(ADR 0105 Phase 4); target a SQLite store"
+            )
+
+    async def put_attachment(self, chunks: Iterable[str], content_type: str) -> str:
+        """Store a detached document as content-addressed, per-chunk-sealed rows; return its ``ref`` (the
+        sha256 content address). ``chunks`` is the document sliced into ordered pieces — under Approach B
+        (ADR 0105 owner ruling) each piece is a VERBATIM slice of the exact OBX-5.5 value the partner
+        sent, so there is no decode/encode; each is AES-GCM-sealed by the store cipher independently (a
+        **bounded plaintext window per seal** — the whole document is never materialized to seal it). The
+        content address is the sha256 of the **verbatim concatenated plaintext**, so an identical
+        document **dedups** to one physical copy (a re-put returns the same ref and writes nothing new).
+
+        Inserts the ``attachment`` header (``refcount=0``) + its chunks in one transaction; the caller
+        increfs (Phase 1, in the same transaction as the referencing skeleton/delivery row). A fresh
+        attachment therefore sits at ``refcount=0`` until increffed — reclaimable by the **next** startup
+        sweep, never mid-run (the sweep is startup-only, like ``reset_stale_inflight``)."""
+        self._require_streaming_attachments()
+        hasher = hashlib.sha256()
+        total = 0
+        sealed: list[str] = []
+        for chunk in chunks:
+            data = chunk.encode("utf-8")
+            hasher.update(data)
+            total += len(data)
+            sealed.append(
+                self._cipher.encrypt(chunk)
+            )  # bounded plaintext window: one chunk per seal
+        ref = hasher.hexdigest()
+        now = time.time()
+        async with self._lock:
+            try:
+                cur = await self._db.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
+                if await cur.fetchone() is not None:
+                    # Dedup: identical content already stored — reuse the single copy, write nothing. The
+                    # SELECT opened no write transaction (SQLite reads don't), so there is nothing to commit.
+                    return ref
+                await self._db.execute(
+                    "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
+                    " VALUES (?,?,?,0,?)",
+                    (ref, content_type, total, now),
+                )
+                if sealed:
+                    await self._db.executemany(
+                        "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext) VALUES (?,?,?)",
+                        [(ref, seq, ct) for seq, ct in enumerate(sealed)],
+                    )
+                await self._commit()
+            except Exception:
+                await self._db.rollback()
+                raise
+        return ref
+
+    async def read_attachment(self, ref: str) -> AsyncIterator[str]:
+        """Yield the detached document's chunks back as **decrypted plaintext**, in ``seq`` order — the
+        exact VERBATIM slices that were put (Approach B: no decode/encode, so concatenating them
+        reconstructs the exact OBX-5.5 value byte-for-byte). Raises :class:`KeyError` if the attachment
+        does not exist (corruption, or already GC'd at ``refcount=0``). Streams one chunk at a time (the
+        whole document is never held in one buffer); the pooled read runs on one consistent WAL snapshot."""
+        self._require_streaming_attachments()
+        async with self._read() as conn:
+            cur = await conn.execute("SELECT 1 FROM attachment WHERE id=?", (ref,))
+            if await cur.fetchone() is None:
+                raise KeyError(f"attachment {ref!r} not found")
+            cur = await conn.execute(
+                "SELECT ciphertext FROM attachment_chunk WHERE attachment_id=? ORDER BY seq", (ref,)
+            )
+            async for row in cur:
+                yield self._cipher.decrypt(row["ciphertext"])
+
+    async def attachments_for(self, message_id: str) -> list[dict[str, Any]]:
+        """The distinct attachments ``message_id`` holds — the operator read surface (#149, ADR 0105
+        Phase 3b). JOINs the ``message_attachment`` linkage to its ``attachment`` header and returns one
+        row per attachment carrying ``attachment_id`` (the sha256 content address), ``content_type``, and
+        ``total_bytes``. **Metadata only** — the chunk ciphertext is never touched/decrypted here (the
+        bytes ride :meth:`read_attachment`), so it stays cheap for the message-detail view. Returns ``[]``
+        for a message with no detached document."""
+        if not self.supports_streaming_attachments:
+            return []
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT a.id AS attachment_id, a.content_type, a.total_bytes "
+                "FROM message_attachment ma JOIN attachment a ON a.id = ma.attachment_id "
+                "WHERE ma.message_id=? ORDER BY a.id",
+                (message_id,),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def attachment_incref(self, ref: str) -> None:
+        """Add one live reference to an attachment (store-once refcount; mirrors ``shared_body``). Raises
+        :class:`KeyError` if the attachment does not exist — an incref must name a real stored document."""
+        self._require_streaming_attachments()
+        async with self._lock:
+            try:
+                cur = await self._db.execute(
+                    "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
+                )
+                if cur.rowcount == 0:
+                    await self._db.rollback()
+                    raise KeyError(f"attachment {ref!r} not found")
+                await self._commit()
+            except Exception:
+                await self._db.rollback()
+                raise
+
+    async def _decref_attachment(self, ref: str, count: int = 1) -> None:
+        """Drop ``count`` references to an attachment and **GC the attachment + all its chunks at
+        refcount 0**, in the CALLER's transaction (no lock/BEGIN/commit of its own — the transaction-
+        participant sibling of :meth:`attachment_decref`, mirroring :meth:`_release_shared_body`). Clamped
+        at 0 (a double-decref can't drive it negative). Used by the retention seam
+        (:meth:`_release_message_attachments`) so the decref commits atomically with the join-row DELETE
+        and the body null; and by :meth:`attachment_decref`, which wraps it in its own transaction."""
+        await self._db.execute(
+            "UPDATE attachment SET refcount = MAX(0, refcount - ?) WHERE id=?", (count, ref)
+        )
+        # GC at 0: delete chunks (while the header still exists to gate on) then the header.
+        await self._db.execute(
+            "DELETE FROM attachment_chunk WHERE attachment_id IN"
+            " (SELECT id FROM attachment WHERE id=? AND refcount<=0)",
+            (ref,),
+        )
+        await self._db.execute("DELETE FROM attachment WHERE id=? AND refcount<=0", (ref,))
+
+    async def attachment_decref(self, ref: str) -> None:
+        """Drop one reference to an attachment and **GC the attachment + all its chunks at refcount 0**
+        (store-once retention; mirrors :meth:`_release_shared_body`). Clamped at 0 (a double-decref can't
+        go negative); tolerant of a missing ref (a no-op), so a re-run of a purge is idempotent."""
+        self._require_streaming_attachments()
+        async with self._lock:
+            try:
+                await self._decref_attachment(ref, 1)
+                await self._commit()
+            except Exception:
+                await self._db.rollback()
+                raise
+
+    async def _release_message_attachments(self, where: str, params: tuple[object, ...]) -> None:
+        """Release every attachment held by the messages matching ``where`` (#149, ADR 0105 Phase 3a — the
+        attachment sibling of :meth:`_release_outbound_body_refs` for ``shared_body``).
+
+        The retention seam that CLOSES the Phase-1b over-retention gap: tally each distinct attachment the
+        matching messages reference via the ``message_attachment`` linkage, decref each by how many of these
+        messages reference it (GC at 0), then DELETE those join rows so the release is exactly-once even if
+        the purge re-runs. Runs in the CALLER's transaction, so the decref + join-row DELETE + body null all
+        commit atomically. **Re-run is a no-op:** a re-run finds the join rows already gone and decrefs
+        nothing — no double-decref, no refcount underflow, no premature GC of an attachment a SIBLING
+        message still holds (a live join row keeps refcount > 0). ``where`` is a code-controlled fragment on
+        ``message_attachment`` (never user input); ``params`` binds it identically in both statements."""
+        cur = await self._db.execute(
+            f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment "
+            f"WHERE {where} GROUP BY attachment_id",
+            params,
+        )
+        releases = [(r["attachment_id"], int(r["n"])) for r in await cur.fetchall()]
+        if not releases:
+            return
+        for attachment_id, count in releases:
+            await self._decref_attachment(attachment_id, count)
+        # Delete the just-released join rows so a re-run of the purge decrefs nothing (idempotent GC).
+        await self._db.execute(f"DELETE FROM message_attachment WHERE {where}", params)
+
+    @staticmethod
+    def _attachment_still_referenced_sql(msg_col: str) -> str:
+        """A correlated ``EXISTS`` fragment true iff message ``msg_col`` still has a queue row that could
+        be **delivered or replayed** and would therefore still need its streaming attachment when a send
+        HYDRATES the ``mfdoc:v1:ref:`` handle (:meth:`wiring_runner._hydrate_payload`).
+
+        A row is such a **live holder** when it is ``pending``/``inflight`` (not yet delivered) OR it is
+        ``dead`` but still replayable — its own ``payload`` is kept OR its store-once ``body_ref`` is not
+        yet released (either carries the handle a replay would re-queue). ``done``/``cancelled`` are
+        terminal (never delivered again) and a *purged* ``dead`` row (``payload=''`` AND ``body_ref``
+        NULL) can no longer be replayed, so neither keeps the attachment alive. Callers negate it
+        (``NOT EXISTS``) to release the attachment only when the LAST holder is gone.
+
+        This is the per-MESSAGE analogue of the per-row ``shared_body`` split: the linkage is held once
+        per message (regardless of fan-out), so the release must fire when the message's last replayable
+        row is blanked — whichever of :meth:`purge_message_bodies` (``done``/``cancelled`` case) or
+        :meth:`purge_dead_letters` (``dead`` case) does so. Gating on replayability (not merely status,
+        and not merely a non-blank inline ``payload``) is what makes it correct under either purge order
+        AND for a store-once row whose ``payload`` is ``''`` but whose ``body_ref`` is still live."""
+        return (
+            "EXISTS (SELECT 1 FROM queue q WHERE q.message_id = "
+            f"{msg_col} AND (q.status IN (?, ?) OR "
+            "(q.status = ? AND (q.payload <> '' OR q.body_ref IS NOT NULL))))"
+        )
+
+    async def release_message_attachments(self, message_id: str) -> None:
+        """Release (decref + delete the linkage rows for) every attachment a SINGLE message holds, in ONE
+        transaction — the standalone form of the retention decref (#149, ADR 0105 Phase 3a). Idempotent: a
+        re-run finds the join rows gone and decrefs nothing (no refcount underflow, no premature GC of an
+        attachment a sibling message still references). :meth:`purge_message_bodies` releases the whole
+        eligible set in its own transaction via the same seam (:meth:`_release_message_attachments`)."""
+        self._require_streaming_attachments()
+        async with self._lock:
+            try:
+                await self._db.execute("BEGIN")
+                await self._release_message_attachments("message_id = ?", (message_id,))
+                await self._commit()
+            except Exception:
+                await self._db.rollback()
+                raise
+
+    async def sweep_orphan_attachments(self) -> int:
+        """Reclaim orphaned attachment storage at startup so **no PHI chunk accumulates at rest** (#149,
+        ADR 0105). Called once at startup where :meth:`reset_stale_inflight` runs. Two disjoint classes:
+
+        * **refcount-0** attachments — a fully-written attachment whose last (or only-ever) reference was
+          never taken or has been released; its header + chunks are deleted.
+        * **incomplete-write** attachments — chunk rows with **no header** at all (a future incremental
+          streaming writer, Phase 1, that inserted chunks then crashed before finalizing the header);
+          the header-less chunks are deleted.
+
+        Returns the number of attachments reclaimed (refcount-0 headers + distinct header-less chunk
+        groups). Idempotent: a second run finds nothing."""
+        self._require_streaming_attachments()
+        async with self._lock:
+            try:
+                # Count header-less chunk groups BEFORE any delete (while refcount-0 headers still exist,
+                # so their chunks don't miscount as orphans — those are reclaimed as the refcount-0 class).
+                cur = await self._db.execute(
+                    "SELECT COUNT(DISTINCT attachment_id) AS n FROM attachment_chunk"
+                    " WHERE attachment_id NOT IN (SELECT id FROM attachment)"
+                )
+                row = await cur.fetchone()
+                incomplete = int(row["n"]) if row is not None else 0
+                # Reclaim refcount-0 attachments: chunks (gated on the header's refcount) then the header.
+                await self._db.execute(
+                    "DELETE FROM attachment_chunk WHERE attachment_id IN"
+                    " (SELECT id FROM attachment WHERE refcount<=0)"
+                )
+                cur = await self._db.execute("DELETE FROM attachment WHERE refcount<=0")
+                headers = cur.rowcount
+                # Reclaim any header-less orphan chunks (incomplete writes).
+                await self._db.execute(
+                    "DELETE FROM attachment_chunk WHERE attachment_id NOT IN (SELECT id FROM attachment)"
+                )
+                await self._commit()
+            except Exception:
+                await self._db.rollback()
+                raise
+            reclaimed = headers + incomplete
+            if reclaimed:
+                log.info(
+                    "reclaimed %d orphaned attachment(s) at startup (%d refcount-0, %d incomplete-write)",
+                    reclaimed,
+                    headers,
+                    incomplete,
+                )
+            return reclaimed
+
     async def _insert_outbound_row(
         self,
         mid: str,
@@ -2547,6 +2928,7 @@ class MessageStore:
         source_type: str | None = None,
         summary: str | None = None,
         metadata: str | None = None,
+        attachment_refs: Sequence[str] | None = None,
         now: float | None = None,
     ) -> str:
         """Durably persist a freshly-received raw message to the **ingress stage** — the staged
@@ -2555,9 +2937,22 @@ class MessageStore:
         In one transaction: insert the message (status ``RECEIVED``) and a single ``stage='ingress'``
         queue row holding the raw body (no routing has happened yet, so there are no outbound rows and
         no destination). Once this returns the message is durable and the inbound may be ACKed; the
-        ingress worker then routes+transforms it and calls :meth:`handoff`. Returns the message id."""
+        ingress worker then routes+transforms it and calls :meth:`handoff`. Returns the message id.
+
+        ``attachment_refs`` (#149, ADR 0105 Phase 1a) are the content addresses of any documents the
+        ingress detach lifted out of ``raw`` into the attachment substrate (``put_attachment``, which
+        committed them at ``refcount=0``). Each distinct ref is **increffed in this same transaction** as
+        the skeleton row — the two-object commit's second half: the attachment chunks were durably
+        committed first, then the referencing skeleton row + its increfs commit together, so the ACK
+        (built only after this returns) fires only once BOTH are durable. A crash between the two commits
+        leaves the attachment at refcount 0 (no ACK → the sender resends; content-addressing dedups the
+        resend and the startup ``sweep_orphan_attachments`` reclaims the orphan). Empty/None → the
+        byte-identical no-detach path (no incref)."""
         now = time.time() if now is None else now
         mid = uuid4().hex
+        # Distinct refs only: one skeleton holds a de-duplicated document (two identical OBX-5.5 values
+        # collapse to one attachment) once, so its release (Phase 3) decrefs by the same count.
+        refs = list(dict.fromkeys(attachment_refs or ()))
 
         async def _body() -> str:
             await self._insert_message(
@@ -2600,6 +2995,24 @@ class MessageStore:
                 await self._db.execute(
                     "INSERT INTO message_events (message_id, ts, event, detail) VALUES (?,?,?,?)",
                     (mid, now, "received", self._enc("ingress")),
+                )
+            # #149 two-object commit: incref each detached attachment AND record its message->attachment
+            # linkage row in THIS transaction (same commit as the skeleton row), so the refcount that keeps
+            # the document's chunks alive — and the linkage retention releases it from (Phase 3a) — land
+            # atomically with the row that references them (never a detached best-effort step — ADR 0105
+            # refcount hazard). put_attachment already committed the chunks at refcount 0; a missing row here
+            # means it was GC'd/never stored, so fail loud (the enclosing _run_grouped rolls back → no ACK).
+            # `refs` is already de-duplicated, so the message_attachment PK(message_id, attachment_id) never
+            # conflicts and the refcount is incremented once per distinct attachment (== its live join rows).
+            for ref in refs:
+                cur = await self._db.execute(
+                    "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
+                )
+                if not cur.rowcount:
+                    raise KeyError(f"attachment {ref!r} not found for ingress incref")
+                await self._db.execute(
+                    "INSERT INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
+                    (mid, ref),
                 )
             return mid
 
@@ -6640,6 +7053,16 @@ class MessageStore:
         can't break a later dead-row replay. Idempotent (guards on a non-blank body); returns the
         number of messages whose body was nulled.
 
+        A message's **streaming attachment** (#149, ADR 0105 Phase 3a) is released (decref → GC at 0 →
+        delete the linkage) here only once the message has **no replayable queue row left** — i.e. no
+        ``pending``/``inflight`` row and no still-replayable ``dead`` row (see
+        :meth:`_attachment_still_referenced_sql`). A message that is body-eligible but still holds a
+        ``dead`` row keeps its attachment: the ``dead`` row's payload is preserved above, so a later
+        replay must still be able to HYDRATE the ``mfdoc:v1:ref:`` handle — releasing the attachment now
+        would GC the document out from under that replay (permanent PHI-document loss). That message's
+        attachment is released instead by :meth:`purge_dead_letters` when it blanks the last ``dead`` row
+        (the per-MESSAGE analogue of the ``shared_body`` done/cancelled-vs-dead split).
+
         ``connection_cutoffs`` (#34, ADR 0027) is an optional ``{channel_id -> cutoff}`` map of
         per-connection retention overrides: a message received by a connection in the map is purged at
         that connection's own cutoff (``float('-inf')`` = keep forever) instead of the global
@@ -6697,6 +7120,28 @@ class MessageStore:
                         OutboxStatus.CANCELLED.value,
                         *cutoff_params,
                         *inflight,
+                    ),
+                )
+                # #149 Phase 3a: release the streaming attachment each eligible message holds — but ONLY
+                # once the message has NO queue row that could still be delivered/replayed (the negated
+                # live-holder predicate). The delivered/cancelled payloads were just blanked above, so an
+                # all-DONE/CANCELLED message now has no live holder and its attachment is decref'd (GC at 0)
+                # + its join rows DELETEd in THIS transaction. A message whose outbound rows are all DEAD is
+                # `eligible` for the body-null above, yet its DEAD rows stay REPLAYABLE (their payload is
+                # deliberately KEPT here, deferred to purge_dead_letters) — so it keeps a live holder and its
+                # attachment MUST survive: releasing it would GC the document out from under a later dead-row
+                # replay (fail-loud DeliveryError in _hydrate_payload, permanent PHI-document loss). The
+                # per-MESSAGE analogue of the shared-body split: whichever purge blanks the LAST replayable
+                # row releases the attachment. Idempotent — a re-run finds the join rows gone and decrefs
+                # nothing (no underflow, no premature GC of an attachment a SIBLING message still holds).
+                await self._release_message_attachments(
+                    f"message_id IN (SELECT id FROM messages m WHERE m.received_at < {cutoff_sql} "
+                    f"AND NOT {self._attachment_still_referenced_sql('m.id')})",
+                    (
+                        *cutoff_params,
+                        OutboxStatus.PENDING.value,
+                        OutboxStatus.INFLIGHT.value,
+                        OutboxStatus.DEAD.value,
                     ),
                 )
                 await self._db.execute(
@@ -6842,6 +7287,11 @@ class MessageStore:
         longer be meaningfully replayed (its body is gone — the intended retention trade-off).
         Idempotent (guards on a non-blank payload); returns the number of dead rows purged.
 
+        When blanking a ``dead`` row removes a message's **last** replayable queue row, this also releases
+        that message's streaming attachment (#149, ADR 0105 Phase 3a) — the deferred half of the
+        per-MESSAGE split with :meth:`purge_message_bodies`, so an attachment held only by dead rows is
+        reclaimed exactly when the last of them is purged (never while one stays replayable).
+
         ``connection_cutoffs`` (#34, ADR 0027) is an optional ``{destination_name -> cutoff}`` map of
         per-connection overrides: a dead row is purged at its outbound's own cutoff (``float('-inf')`` =
         keep forever) instead of the global ``older_than``; an outbound absent from the map falls back to
@@ -6864,6 +7314,27 @@ class MessageStore:
                     "WHERE stage=? AND status=? AND (payload <> '' OR last_error IS NOT NULL) "
                     f"AND updated_at < {cutoff_sql}",
                     (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
+                )
+                # #149 Phase 3a: a dead row just lost its payload + body_ref, so it can no longer be
+                # replayed. If that was the message's LAST replayable row (no pending/inflight and no other
+                # still-replayable dead row, per the negated live-holder predicate), release its streaming
+                # attachment here — the deferred half of the per-MESSAGE split with purge_message_bodies
+                # (which handles the all-done/cancelled case). Scoped to the messages owning a dead row in
+                # THIS purge window; same idempotent join-row DELETE, so a re-run decrefs nothing. Runs in
+                # this transaction, after the body_ref release + payload blank above, so the just-purged
+                # dead rows already read as non-replayable (payload='' AND body_ref NULL).
+                await self._release_message_attachments(
+                    "message_id IN (SELECT DISTINCT q0.message_id FROM queue q0 "
+                    f"WHERE q0.stage=? AND q0.status=? AND q0.updated_at < {cutoff_sql} "
+                    f"AND NOT {self._attachment_still_referenced_sql('q0.message_id')})",
+                    (
+                        Stage.OUTBOUND.value,
+                        OutboxStatus.DEAD.value,
+                        *cutoff_params,
+                        OutboxStatus.PENDING.value,
+                        OutboxStatus.INFLIGHT.value,
+                        OutboxStatus.DEAD.value,
+                    ),
                 )
                 await self._commit()
             except Exception:

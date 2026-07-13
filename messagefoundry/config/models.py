@@ -255,6 +255,26 @@ class StallThreshold(BaseModel):
     max_oldest_seconds: float | None = None
 
 
+class SaturationThreshold(BaseModel):
+    """When to raise a ``saturation`` alert for a lane (BACKLOG #93, ADR 0014 amendment): the lane is
+    *becoming* overloaded — its pending backlog is **rising sustained** across the sampling window.
+
+    Unlike :class:`BuildupThreshold`/:class:`StallThreshold`, which trip on an ABSOLUTE snapshot (a
+    depth / oldest-age ceiling), this trips on the DERIVATIVE. Sustained rising depth is, by
+    conservation of the queue, arrivals > departures (ingest > drain) held over the window, so a
+    bursty-but-DRAINING lane (which spikes then falls back) does not trip while a genuinely saturating
+    one does — the point of the signal.
+
+    ``sustain_samples`` is how many consecutive non-decreasing depth samples (with a net rise) must be
+    observed before the alert fires (the detector keeps ``sustain_samples + 1`` samples, so it needs
+    that many observations to prime). ``None`` (the default) **disables** the saturation alert for the
+    connection — deny-by-default/off unless an operator opts in (it overlaps ``queue_buildup``'s age
+    dimension, so it is opt-in to avoid double-paging). Resolution mirrors the other per-lane policies:
+    the ``[delivery]`` global default > built-in (off)."""
+
+    sustain_samples: int | None = Field(default=None, ge=2)
+
+
 class ActiveWindow(BaseModel):
     """One **active window** in a per-connection schedule (BACKLOG #147, ADR 0095).
 

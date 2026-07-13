@@ -542,6 +542,55 @@ async def test_status_reports_engine_and_db(engine: Engine, client: httpx.AsyncC
     assert body["db"]["size_bytes"] > 0
 
 
+async def test_status_kpis_rollup_combines_endpoints_and_reuses_recent_done(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    # #93 engine-wide KPI headline: combined inbound+outbound endpoint count (running/stopped) + total
+    # messages + an engine-wide msg/s rate REUSING the recent_done window (no second sampler).
+    import time as _time
+
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        InboundConnection,
+        OutboundConnection,
+        Registry,
+        Send,
+    )
+
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection("adt_in", ConnectionSpec(ConnectorType.MLLP, {"port": 2575}), router="r")
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "adt_archive", ConnectionSpec(ConnectorType.FILE, {"directory": "./out"})
+        )
+    )
+    reg.add_router("r", lambda msg: ["h"])
+    reg.add_handler("h", lambda msg: Send("adt_archive", msg))
+    engine.add_registry(reg)  # wired but not started → every endpoint reads "stopped"
+
+    # Drive one outbound row to done with a recent updated_at so it lands in the recent_done window.
+    now = _time.time()
+    await engine.store.enqueue_message(
+        channel_id="adt_in", raw=ADT, deliveries=[("adt_archive", ADT)], source_type="mllp", now=now
+    )
+    item = (await engine.store.claim_ready(now=now, destination_name="adt_archive"))[0]
+    await engine.store.mark_done(item.id, now=now)
+
+    kpis = (await client.get("/status")).json()["kpis"]
+    # Combined inbound + outbound endpoints (vs channels_*, which count inbound only).
+    assert kpis["connections_total"] == 2  # 1 inbound + 1 outbound
+    assert kpis["connections_running"] == 0  # runner built but not started
+    assert kpis["connections_stopped"] == 2
+    assert kpis["connections_stopped"] == kpis["connections_total"] - kpis["connections_running"]
+    # messages_total mirrors the store-wide message count.
+    assert kpis["messages_total"] == 1
+    # The engine-wide rate is derived from recent_done (1 completion) / the 60s rate window — proving it
+    # reuses the same window that powers backlog_seconds rather than adding a second sampler.
+    assert kpis["messages_per_second"] == pytest.approx(1 / 60.0)
+
+
 async def test_status_log_metering_absent_when_no_log_dir(
     engine: Engine, client: httpx.AsyncClient
 ) -> None:

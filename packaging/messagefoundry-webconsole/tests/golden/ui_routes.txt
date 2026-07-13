@@ -16,6 +16,7 @@ GET /ui/login
 GET /ui/messages
 GET /ui/messages/search
 GET /ui/messages/{message_id}
+GET /ui/messages/{message_id}/attachments/{attachment_id}
 GET /ui/messages/{message_id}/edit
 GET /ui/messages/{message_id}/parse-tree
 GET /ui/nav-status

@@ -5,7 +5,7 @@
 # This is a GOLDEN gate: any diff means the seam contract changed - see the test's failure hint.
 
 ## ENGINE_UI_SEAM
-2
+4
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -20,6 +20,7 @@ admin
 list_connections
 list_messages
 get_message
+download_attachment
 list_dead_letters
 start_connection
 stop_connection
@@ -124,6 +125,7 @@ webauthn_rp_from_request
 AlertInstanceInfo: acked_at, acked_by, connection, count, event_type, first_seen, id, last_seen, reason, resolved_at, severity, status
 AlertInstanceList: alerts
 AlertsConfig: email_configured, email_recipient_count, email_smtp_port, email_use_tls, realert_seconds, rules, smtp_allowed_hosts, webhook_allowed_hosts, webhook_configured, webhook_timeout
+AttachmentInfo: content_type, id, total_bytes
 ClusterNodeList: leader_node_id, lease_expires_at, lease_owner, nodes
 ClusterStatus: clustered, config_version, is_leader, node_id, role
 ConfigProvenance: drift, files, fingerprint, git_head, loaded
@@ -133,7 +135,7 @@ DeadLetterList: dead_letters, limit, offset, total
 DeadLetterReplayRequest: channel_id, destination_name
 DrStatus: activation_mode, active, enabled, threshold
 IntegrityResult: detail, ok
-MessageDetail: channel_id, control_id, error, event, events, id, message_type, metadata, outbox, raw, received_at, source_type, status, summary
+MessageDetail: attachments, channel_id, control_id, error, event, events, id, message_type, metadata, outbox, raw, received_at, source_type, status, summary
 MessageList: limit, messages, offset, total
 MessageSearchResults: limit, matched, messages, scan_limit, scanned, truncated
 PendingApprovalResponse: approval_id, detail, operation, status
@@ -143,7 +145,7 @@ SecurityPosture: allow_unencrypted_phi, backend, data_class, encryption_enabled,
 ServiceStatusInfo: enabled, service_name, state
 StatsResetRequest: all, targets
 StatsResetTarget: channel_id, destination, role
-SystemStatus: db, engine, logs, pool, update
+SystemStatus: db, engine, kpis, logs, pool, update
 
 ## api.auth_models DTO fields rendered by the console
 AdGroupMap: entries

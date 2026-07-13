@@ -1,0 +1,16 @@
+# sampled dm_os_waiting_tasks 701x over 180s; PAGELATCH hits {'PAGELATCH_EX': 5, 'PAGELATCH_SH': 3}
+# top contended pages (dbid:file:page -> waiter-hits): [('5:1:42235', 1), ('5:1:38202', 1), ('5:1:39294', 1), ('5:1:49970', 1), ('5:1:42856', 1), ('5:1:51992', 1), ('5:1:44088', 1), ('5:1:54158', 1)]
+# hottest-page identities (db + object):
+  5:1:42235 hits=1 -> db=mfbench obj=message_events object_id=1429580131 index_id=1 (None)
+  5:1:38202 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=1 (None)
+  5:1:39294 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=4 (None)
+  5:1:49970 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=5 (None)
+  5:1:42856 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=4 (None)
+  5:1:51992 hits=1 -> db=mfbench obj=queue object_id=1333579789 index_id=2 (None)
+# top SQL statements waiting on PAGELATCH (store-internal, parameterized -- names the churn):
+  [1] (@P1 nvarchar(64),@P2 nvarchar(64),@P3 nvarchar(16),@P4 nvarchar(20),@P5 nvarchar(24),@P6 nvarchar(1156),@P7 nvarchar(14),@P8 float,@P9 float,@P10 float,@P11 nvarchar(64),@P12 floa
+  [1] (@P1 float,@P2 nvarchar(16),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(24),@P7 nvarchar(24),@P8 nvarchar(24))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P
+  [1] (@P1 nvarchar(64),@P2 nvarchar(12),@P3 nvarchar(16))DELETE FROM queue OUTPUT deleted.id WHERE id=@P1 AND stage=@P2 AND status=@P3
+  [1] (@P1 float,@P2 nvarchar(12),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(20))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P1, @stage NVARCHAR(16) = @P2, @k I
+  [1] (@P1 nvarchar(12),@P2 nvarchar(14),@P3 int,@P4 nvarchar(1))SET NOCOUNT ON; DECLARE @stage NVARCHAR(16) = @P1, @pending NVARCHAR(32) = @P2, @limit INT = @P3, @after NVARCHAR(256) =
+  [1] (@P1 float,@P2 nvarchar(16),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(24))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P1, @stage NVARCHAR(16) = @P2, @k I

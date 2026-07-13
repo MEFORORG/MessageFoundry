@@ -443,3 +443,48 @@ def test_load_config_refuses_group_or_world_writable_dir(tmp_path: Path) -> None
     os.chmod(tmp_path, 0o777)  # world-writable: anyone could drop a malicious module to be exec'd
     with pytest.raises(WiringError, match="writable"):
         load_config(tmp_path)
+
+
+# --- very-large-document streaming knobs (#149, ADR 0105 Phase 1a) -----------
+
+
+def test_stream_threshold_must_be_positive() -> None:
+    with pytest.raises(WiringError, match="stream_threshold_bytes must be > 0"):
+        build_inbound_connection("in", MLLP(port=2575), router="r", stream_threshold_bytes=0)
+
+
+def test_stream_threshold_hl7_only() -> None:
+    # The detach targets OBX-5 documents, so it is meaningless on a non-HL7 content_type.
+    with pytest.raises(WiringError, match="stream_threshold_bytes is HL7-specific"):
+        build_inbound_connection(
+            "in", MLLP(port=2575), router="r", content_type="json", stream_threshold_bytes=1024
+        )
+
+
+def test_max_message_bytes_must_be_positive() -> None:
+    with pytest.raises(WiringError, match="max_message_bytes must be > 0"):
+        build_inbound_connection("in", MLLP(port=2575), router="r", max_message_bytes=0)
+
+
+def test_max_message_bytes_below_threshold_rejected() -> None:
+    # A cap below the detach threshold would reject every message the threshold would detach.
+    with pytest.raises(WiringError, match="must be >= stream_threshold_bytes"):
+        build_inbound_connection(
+            "in",
+            MLLP(port=2575),
+            router="r",
+            stream_threshold_bytes=2048,
+            max_message_bytes=1024,
+        )
+
+
+def test_streaming_knobs_accepted() -> None:
+    ic = build_inbound_connection(
+        "in",
+        MLLP(port=2575),
+        router="r",
+        stream_threshold_bytes=1024,
+        max_message_bytes=100 * 1024 * 1024,
+    )
+    assert ic.stream_threshold_bytes == 1024
+    assert ic.max_message_bytes == 100 * 1024 * 1024

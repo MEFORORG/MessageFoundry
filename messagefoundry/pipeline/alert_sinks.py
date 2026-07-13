@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Any, Generic, Protocol, TypeVar
 
+from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AlertRule,
@@ -433,6 +434,24 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             }
         )
 
+    def saturation_rising(
+        self, name: str, *, stage: str, depth: int, depth_start: int, growth_per_second: float
+    ) -> None:
+        # #93 (ADR 0014 amendment): the lane is BECOMING overloaded — its backlog is rising sustained
+        # (the ingest>drain derivative). The shared _emit throttle keys on (type, connection), so an
+        # ongoing saturation collapses to one notification per cooldown; the payload carries only the
+        # queue-shape derivative (stage + start/end depth + growth rate — no PHI).
+        self._emit(
+            {
+                "type": "saturation",
+                "connection": name,
+                "stage": stage,
+                "depth": depth,
+                "depth_start": depth_start,
+                "growth_per_second": round(growth_per_second, 3),
+            }
+        )
+
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
         # #46: an outbound lane went down. The shared _emit throttle keys on (type, connection), so a
         # retry storm on one lane collapses to one notification per cooldown. detail is safe_exc-scrubbed.
@@ -619,9 +638,21 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 )
 
 
-def notifier_from_settings(alerts: AlertsSettings) -> NotifierAlertSink | None:
+def notifier_from_settings(
+    alerts: AlertsSettings, *, secret_provider: SecretProvider | None = None
+) -> NotifierAlertSink | None:
     """Build a :class:`NotifierAlertSink` from ``[alerts]`` settings, or ``None`` when no transport is
-    configured (the caller then leaves the engine on its default logging sink)."""
+    configured (the caller then leaves the engine on its default logging sink).
+
+    ``secret_provider`` (ADR 0019 §5) resolves the SMTP password from a ``[secrets].provider`` when
+    ``email_password_secret`` is set (fail-closed); ``None``/no reference → the env-sourced
+    ``email_password`` is used, byte-identical to before."""
+    smtp_password = resolve_connector_secret(
+        secret_provider,
+        ref=alerts.email_password_secret,
+        literal=alerts.email_password,
+        label="[alerts].email_password",
+    )
     transports: list[AlertTransport] = []
     if alerts.webhook_url:
         transports.append(
@@ -640,7 +671,7 @@ def notifier_from_settings(alerts: AlertsSettings) -> NotifierAlertSink | None:
                 recipients=list(alerts.email_to),
                 use_tls=alerts.email_use_tls,
                 username=alerts.email_username,
-                password=alerts.email_password,
+                password=smtp_password,
                 timeout=alerts.email_timeout,
                 allowed_hosts=tuple(alerts.smtp_allowed_hosts),
             )

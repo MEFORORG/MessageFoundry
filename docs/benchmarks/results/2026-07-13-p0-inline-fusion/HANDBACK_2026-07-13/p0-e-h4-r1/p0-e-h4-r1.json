@@ -1,0 +1,186 @@
+{
+  "schema_version": 4,
+  "kind": "shardcert_ladder_two_box",
+  "result": "PASS",
+  "exit_code": 0,
+  "climb_aborted": false,
+  "soak_aborted": false,
+  "soak_not_sustained": false,
+  "soak_store_truth_unconfirmed": false,
+  "store_truth_unconfirmed": false,
+  "topology": {
+    "shards": [
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+      "f",
+      "g",
+      "h"
+    ],
+    "dests": 1,
+    "handlers": 4,
+    "delivering": 1,
+    "txn_per_message": 13,
+    "events_per_message": 2,
+    "driver_count": 4,
+    "sink_count": 1
+  },
+  "target_events_per_s": 520.833,
+  "ceiling": {
+    "pinned_ingress_rate": 16.637,
+    "pinned_outbound_rate": 16.637,
+    "pinned_measured_delivered_rate_per_s": 201.354,
+    "first_collapse_ingress_rate": null,
+    "bracketed": false,
+    "sustained_events_per_s": 33.274,
+    "clears_target_events": false
+  },
+  "soak": {
+    "index": -1,
+    "is_soak": true,
+    "verdict": "sustained",
+    "ingress_rate": 27.245,
+    "outbound_rate": 27.245,
+    "sustainable_ingress_rate": 21.109,
+    "dests": 1,
+    "handlers": 4,
+    "delivering": 1,
+    "txn_per_message": 13,
+    "hold_seconds": 300.0,
+    "offered_ingress": 8174,
+    "acked": 8176,
+    "sink_received": 8176,
+    "outbound_expected": 8176,
+    "no_loss": true,
+    "lane_inversions": 0,
+    "lane_repeats": 0,
+    "lanes_observed": 32,
+    "ack_ms": {
+      "p50": 10.751,
+      "p99": 44.479
+    },
+    "drive_drain_seconds": null,
+    "engine_drain_seconds": 87.20304390000092,
+    "engine": {
+      "reported": true,
+      "ok": true,
+      "drained": true,
+      "stranded": 0,
+      "dead_total": 0,
+      "in_pipeline_final": 0
+    },
+    "in_pipeline_slope": 4.609472947458926,
+    "committed_txns_delta": 153803,
+    "committed_txns_per_msg": 18.8115,
+    "committed_txns_run_coord": null,
+    "committed_txns_per_msg_coord": null,
+    "phase_timing": {
+      "windows": 70,
+      "deliveries": 8160,
+      "send_ack_mean_ms": 0.467,
+      "send_ack_max_ms": 1.0,
+      "mark_done_mean_ms": 8.736,
+      "mark_done_max_ms": 71.06
+    },
+    "claim_timing": {
+      "windows": 1007,
+      "claims": 53690,
+      "claim_mean_ms": 13.087,
+      "claim_max_ms": 124.71,
+      "lanes_per_claim": 1.068,
+      "rows_per_claim": 0.908,
+      "rearm": 0,
+      "empty": 8265
+    },
+    "notes": [
+      "P0 coord-side committed_txns: all 5 sample_once() attempts at DRIVE_START returned None (root cause unresolved) -- committed_txns_run/_per_msg_coord unmeasured this rung; the engine-side committed_txns_delta/_per_msg is unaffected",
+      "engine drain gate: engine_ok=True stranded=0 dead_total=0",
+      "[sink-0] ShardCert SINK 0/1  ports=3700 / sink_received=8176 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=32",
+      "[worker-0] ShardCert DRIVER-WORKER 0/4  bands=0,1,2,3,4,5,6,7 / sent=2044 acked=2044 ack p50/p99=10.5/41.9ms",
+      "[worker-1] ShardCert DRIVER-WORKER 1/4  bands=8,9,10,11,12,13,14,15 / sent=2044 acked=2044 ack p50/p99=10.8/40.2ms",
+      "[worker-2] ShardCert DRIVER-WORKER 2/4  bands=16,17,18,19,20,21,22,23 / sent=2044 acked=2044 ack p50/p99=8.8/44.5ms",
+      "[worker-3] ShardCert DRIVER-WORKER 3/4  bands=24,25,26,27,28,29,30,31 / sent=2044 acked=2044 ack p50/p99=9.5/38.7ms",
+      "engine: observed DRIVE_START (driver t0=1783920091.3874903)"
+    ]
+  },
+  "soak_ok": true,
+  "climb": [
+    {
+      "index": 0,
+      "is_soak": false,
+      "verdict": "sustained",
+      "ingress_rate": 27.245,
+      "outbound_rate": 27.245,
+      "sustainable_ingress_rate": 16.637,
+      "dests": 1,
+      "handlers": 4,
+      "delivering": 1,
+      "txn_per_message": 13,
+      "hold_seconds": 60.0,
+      "offered_ingress": 1635,
+      "acked": 1636,
+      "sink_received": 1636,
+      "outbound_expected": 1636,
+      "no_loss": true,
+      "lane_inversions": 0,
+      "lane_repeats": 0,
+      "lanes_observed": 32,
+      "ack_ms": {
+        "p50": 8.98,
+        "p99": 41.06
+      },
+      "drive_drain_seconds": null,
+      "engine_drain_seconds": 38.25655149999875,
+      "engine": {
+        "reported": true,
+        "ok": true,
+        "drained": true,
+        "stranded": 0,
+        "dead_total": 0,
+        "in_pipeline_final": 0
+      },
+      "in_pipeline_slope": null,
+      "committed_txns_delta": null,
+      "committed_txns_per_msg": null,
+      "committed_txns_run_coord": null,
+      "committed_txns_per_msg_coord": null,
+      "phase_timing": {
+        "windows": 13,
+        "deliveries": 1595,
+        "send_ack_mean_ms": 0.477,
+        "send_ack_max_ms": 1.03,
+        "mark_done_mean_ms": 7.846,
+        "mark_done_max_ms": 54.93
+      },
+      "claim_timing": {
+        "windows": 215,
+        "claims": 10275,
+        "claim_mean_ms": 12.177,
+        "claim_max_ms": 112.51,
+        "lanes_per_claim": 1.073,
+        "rows_per_claim": 0.914,
+        "rearm": 0,
+        "empty": 1543
+      },
+      "notes": [
+        "P0 coord-side committed_txns: all 5 sample_once() attempts at DRIVE_START returned None (root cause unresolved) -- committed_txns_run/_per_msg_coord unmeasured this rung; the engine-side committed_txns_delta/_per_msg is unaffected",
+        "engine drain gate: engine_ok=True stranded=0 dead_total=0",
+        "[sink-0] ShardCert SINK 0/1  ports=3700 / sink_received=1636 lane_inversions=0 lane_repeats(dups)=0 lanes_observed=32",
+        "[worker-0] ShardCert DRIVER-WORKER 0/4  bands=0,1,2,3,4,5,6,7 / sent=409 acked=409 ack p50/p99=8.3/41.1ms",
+        "[worker-1] ShardCert DRIVER-WORKER 1/4  bands=8,9,10,11,12,13,14,15 / sent=409 acked=409 ack p50/p99=9.0/35.0ms",
+        "[worker-2] ShardCert DRIVER-WORKER 2/4  bands=16,17,18,19,20,21,22,23 / sent=409 acked=409 ack p50/p99=8.3/37.9ms",
+        "[worker-3] ShardCert DRIVER-WORKER 3/4  bands=24,25,26,27,28,29,30,31 / sent=409 acked=409 ack p50/p99=8.3/35.7ms",
+        "engine: observed DRIVE_START (driver t0=1783919834.4117956)"
+      ]
+    }
+  ],
+  "notes": [],
+  "run": {
+    "run_id": "p0-e-h4-r1",
+    "rate_ladder": "27.245",
+    "generated_at": "2026-07-13T05:29:33.864938+00:00",
+    "commit_sha": "28f860ed4c88ce3708be30c41170286bccdf9323"
+  }
+}

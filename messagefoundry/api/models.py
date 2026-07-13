@@ -78,12 +78,28 @@ class EventInfo(BaseModel):
     detail: str | None
 
 
+class AttachmentInfo(BaseModel):
+    """Metadata for one very-large document detached from a message into the content-addressed
+    attachment substrate (#149, ADR 0105 Phase 3b). **Metadata only — never the document bytes**: ``id``
+    is the sha256 content address (the store's ``attachment.id``), ``content_type`` the declared MIME/ED
+    type, ``total_bytes`` the reconstructed document size. The bytes are pulled on demand from the
+    audited, PHI-gated ``GET /messages/{message_id}/attachments/{id}`` download endpoint."""
+
+    id: str  # sha256 content address (attachment.id)
+    content_type: str
+    total_bytes: int
+
+
 class MessageDetail(MessageSummary):
     """Full single-message view, including the raw body and delivery/audit trail."""
 
     raw: str
     outbox: list[OutboxInfo]
     events: list[EventInfo]
+    # Very-large documents detached from this message at ingress (#149, ADR 0105 Phase 3b). Metadata
+    # only (id/content_type/total_bytes) — the bytes ride the audited per-attachment download endpoint.
+    # Defaulted so an older client (or a message with no detached document) deserializes unchanged.
+    attachments: list[AttachmentInfo] = Field(default_factory=list)
 
 
 class CapturedResponseInfo(BaseModel):
@@ -450,6 +466,24 @@ class EngineInfo(BaseModel):
     outbox_by_status: dict[str, int]
 
 
+class EngineKpis(BaseModel):
+    """Engine-wide TOP-LINE roll-up KPIs (#93) — the single-glance headline no per-connection metric
+    gives, surfaced first-class on ``/status`` (and the console Engine Status page + the #75 dashboard).
+
+    ``messages_total`` is the total messages the engine has received (store-wide, process lifetime);
+    ``connections_total`` / ``connections_running`` / ``connections_stopped`` combine **both** inbound
+    and outbound endpoints (vs :class:`EngineInfo`.channels_*, which count inbound only);
+    ``messages_per_second`` is the engine-wide drain rate, derived by **reusing the same
+    ``recent_done`` rate window** that already powers the dashboard's per-destination backlog ETA (no
+    second sampler). Additive + defaulted so an older client deserializes ``/status`` unchanged."""
+
+    messages_total: int = 0
+    connections_total: int = 0  # inbound + outbound endpoints
+    connections_running: int = 0
+    connections_stopped: int = 0
+    messages_per_second: float = 0.0  # engine-wide, from recent_done / rate_window
+
+
 class DbInfo(BaseModel):
     path: str
     size_bytes: int  # db file + -wal + -shm
@@ -518,6 +552,10 @@ class PoolInfo(BaseModel):
 
 class SystemStatus(BaseModel):
     engine: EngineInfo
+    # Engine-wide top-line roll-up KPIs (#93): total messages, combined in+out connection count with
+    # running/stopped breakdown, and the engine-wide msg/s rate (reusing the recent_done window).
+    # Additive + defaulted so an older client deserializes /status unchanged.
+    kpis: EngineKpis = EngineKpis()
     db: DbInfo
     # App-log disk metering (#50), alongside the DB metrics. ``None`` when no [logging].log_dir is
     # configured (the engine logs to stdout under NSSM) or the directory is unreadable — never raises.

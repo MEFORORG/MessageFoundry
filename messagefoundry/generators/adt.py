@@ -31,71 +31,15 @@ from messagefoundry.parsing import HL7PeekError, Peek, normalize, validate
 from messagefoundry.generators import _core
 from messagefoundry.generators import _hl7data as d
 from messagefoundry.generators._core import Ctx, MessageSpec, next_seq, seg
+from messagefoundry.hl7structures import TRIGGER_TO_STRUCTURE
 
 DEFAULT_SEED = _core.DEFAULT_SEED
 DEFAULT_OUT = "samples/messages/adt"
 
-# Trigger event -> 2.5.1 message structure (HL7 Chapter 3). Every value is one of hl7apy's
-# 25 ADT structures; shared triggers (e.g. A04->ADT_A01) carry the structure in MSH-9.3.
-TRIGGER_TO_STRUCTURE: dict[str, str] = {
-    "A01": "ADT_A01",
-    "A04": "ADT_A01",
-    "A08": "ADT_A01",
-    "A13": "ADT_A01",
-    "A02": "ADT_A02",
-    "A03": "ADT_A03",
-    "A05": "ADT_A05",
-    "A14": "ADT_A05",
-    "A28": "ADT_A05",
-    "A31": "ADT_A05",
-    "A06": "ADT_A06",
-    "A07": "ADT_A06",
-    "A09": "ADT_A09",
-    "A10": "ADT_A09",
-    "A11": "ADT_A09",
-    "A12": "ADT_A12",
-    "A15": "ADT_A15",
-    "A16": "ADT_A16",
-    "A17": "ADT_A17",
-    "A18": "ADT_A18",
-    "A20": "ADT_A20",
-    "A21": "ADT_A21",
-    "A22": "ADT_A21",
-    "A23": "ADT_A21",
-    "A25": "ADT_A21",
-    "A26": "ADT_A21",
-    "A27": "ADT_A21",
-    "A29": "ADT_A21",
-    "A32": "ADT_A21",
-    "A33": "ADT_A21",
-    "A24": "ADT_A24",
-    "A30": "ADT_A30",
-    "A34": "ADT_A30",
-    "A35": "ADT_A30",
-    "A36": "ADT_A30",
-    "A46": "ADT_A30",
-    "A47": "ADT_A30",
-    "A48": "ADT_A30",
-    "A49": "ADT_A30",
-    "A37": "ADT_A37",
-    "A38": "ADT_A38",
-    "A39": "ADT_A39",
-    "A40": "ADT_A39",
-    "A41": "ADT_A39",
-    "A42": "ADT_A39",
-    "A43": "ADT_A43",
-    "A44": "ADT_A43",
-    "A45": "ADT_A45",
-    "A50": "ADT_A50",
-    "A51": "ADT_A50",
-    "A52": "ADT_A52",
-    "A53": "ADT_A52",
-    "A54": "ADT_A54",
-    "A55": "ADT_A54",
-    "A60": "ADT_A60",
-    "A61": "ADT_A61",
-    "A62": "ADT_A61",
-}
+# Trigger event -> 2.5.1 message structure (HL7 Chapter 3): the single source now lives in
+# messagefoundry.hl7structures (also consumed by the ADR 0104 §2.3 field picker) and is imported above, so
+# there is one map, never two (CLAUDE.md — never duplicate). Every value is one of hl7apy's 25 ADT
+# structures; shared triggers (e.g. A04->ADT_A01) carry the structure in MSH-9.3.
 
 ALL_TRIGGERS: list[str] = sorted(TRIGGER_TO_STRUCTURE)
 

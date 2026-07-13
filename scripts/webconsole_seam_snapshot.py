@@ -110,6 +110,7 @@ _API_MODELS_DTOS: tuple[str, ...] = (
     "AlertInstanceInfo",
     "AlertInstanceList",
     "AlertsConfig",
+    "AttachmentInfo",
     "ClusterNodeList",
     "ClusterStatus",
     "ConfigProvenance",

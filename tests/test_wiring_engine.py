@@ -20,6 +20,7 @@ from messagefoundry.config.models import (
     Destination,
     InternalErrorPolicy,
     RetryPolicy,
+    SaturationThreshold,
     StallThreshold,
     Validation,
 )
@@ -866,6 +867,8 @@ class _RecordingAlertSink:
         self.buildups: list[tuple[str, int, float]] = []
         self.stalls: list[tuple[str, float]] = []
         self.errors: list[tuple[str, str]] = []
+        # #93 saturation events: (name, stage, depth, depth_start, growth_per_second)
+        self.saturations: list[tuple[str, str, int, int, float]] = []
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         self.stopped.append((name, detail))
@@ -875,6 +878,11 @@ class _RecordingAlertSink:
 
     def message_stall(self, name: str, *, oldest_age_seconds: float) -> None:
         self.stalls.append((name, oldest_age_seconds))
+
+    def saturation_rising(
+        self, name: str, *, stage: str, depth: int, depth_start: int, growth_per_second: float
+    ) -> None:
+        self.saturations.append((name, stage, depth, depth_start, growth_per_second))
 
     def connection_error(self, name: str, *, kind: str, detail: str | None = None) -> None:
         self.errors.append((name, kind))
@@ -1321,6 +1329,114 @@ async def test_message_stall_per_connection_override(
     # ...while the per-connection override fires.
     await runner._maybe_alert_stall("OB_TIGHT")
     assert sink.stalls and sink.stalls[0][0] == "OB_TIGHT"
+
+
+async def test_saturation_alert_fires_on_rising_backlog(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #93 (ADR 0014 amendment): a lane whose pending depth climbs sustained across the window (ingest >
+    # drain) trips the saturation alert. _maybe_alert_saturation samples pending_depth every tick; here
+    # the stub returns a monotonically-rising depth so the detector primes then fires. Global
+    # [delivery].saturation_sustain_samples=3 (SaturationThreshold) opts the lane in.
+    reg = Registry()
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        saturation_default=SaturationThreshold(sustain_samples=3),
+        alert_sink=sink,
+    )
+    depths = iter([0, 5, 10, 15])
+
+    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+        return (next(depths), None)
+
+    monkeypatch.setattr(store, "pending_depth", _stub)
+    # sustain_samples=3 needs 4 samples to prime; only the 4th (rising end-to-end) fires.
+    for _ in range(4):
+        await runner._maybe_alert_saturation("OB_X", stage=Stage.OUTBOUND.value)
+    assert len(sink.saturations) == 1
+    name, stage, depth, depth_start, _growth = sink.saturations[0]
+    assert name == "OB_X"
+    assert stage == Stage.OUTBOUND.value
+    assert depth == 15 and depth_start == 0  # the window's end/start depth
+
+
+async def test_saturation_alert_silent_on_bursty_but_draining_lane(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE KEY PROPERTY at the runner seam: a lane that spikes then DRAINS (depth falls back within the
+    # window) must NOT page — it is bursty-but-draining, not becoming overloaded. This is exactly what
+    # distinguishes the derivative signal from the absolute-ceiling queue_buildup/message_stall alerts.
+    reg = Registry()
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        saturation_default=SaturationThreshold(sustain_samples=3),
+        alert_sink=sink,
+    )
+    depths = iter([0, 50, 40, 20, 10])  # a burst the worker is clearing (a decrease appears)
+
+    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+        return (next(depths), None)
+
+    monkeypatch.setattr(store, "pending_depth", _stub)
+    for _ in range(5):
+        await runner._maybe_alert_saturation("OB_X", stage=Stage.OUTBOUND.value)
+    assert sink.saturations == []
+
+
+async def test_saturation_alert_off_by_default(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Deny-by-default: with no saturation threshold configured (SaturationThreshold() →
+    # sustain_samples=None), a rising backlog never fires — and pending_depth is never even read (the
+    # method returns before any store I/O), so opting out costs nothing on the buildup tick.
+    reg = Registry()
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(
+        reg, store, poll_interval=0.02, alert_sink=sink
+    )  # no saturation_default
+    read = False
+
+    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+        nonlocal read
+        read = True
+        return (10_000, None)
+
+    monkeypatch.setattr(store, "pending_depth", _stub)
+    for _ in range(6):
+        await runner._maybe_alert_saturation("OB_X", stage=Stage.OUTBOUND.value)
+    assert sink.saturations == []
+    assert read is False  # disabled → no store read (zero cost when off)
+
+
+async def test_saturation_alert_not_paged_for_paused_outbound(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A deliberately-paused outbound's backlog grows by design — it must never false-page saturation.
+    reg = Registry()
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        saturation_default=SaturationThreshold(sustain_samples=3),
+        alert_sink=sink,
+    )
+    runner._outbound_paused.add("OB_PAUSED")
+    depths = iter([0, 5, 10, 15, 20])
+
+    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+        return (next(depths), None)
+
+    monkeypatch.setattr(store, "pending_depth", _stub)
+    for _ in range(5):
+        await runner._maybe_alert_saturation("OB_PAUSED", stage=Stage.OUTBOUND.value)
+    assert sink.saturations == []
 
 
 async def test_transform_worker_dead_letters_missing_handler(

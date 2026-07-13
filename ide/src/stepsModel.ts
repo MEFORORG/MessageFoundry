@@ -62,6 +62,10 @@ export interface LensHandler {
   module: string;
   def_line: number;
   rows: LensRow[];
+  // ADR 0104 §2.3 P2: the handler's recognized message type, for the field-picker scope. Optional — a
+  // typeless handler / older contract omits them (→ generic, unscoped picker).
+  accepts_types?: string[];
+  inferred_type?: { code?: string; trigger?: string };
 }
 
 /** The whole-file `lens parse --json` payload: `{ module, handlers }` (see __main__._lens). */
@@ -104,6 +108,10 @@ export interface RowViewModel {
   subtitle?: string;
   badge?: string; // e.g. "unrecognized" for a control whose test is outside the bounded grammar (§4)
   params: ParamField[];
+  // The recognized vocabulary name — an `action` row's action (e.g. "set_field") OR a `lookup` row's call
+  // (e.g. "code_lookup") — enabling the HL7 field picker on a path slot (ADR 0104 §2.3). Undefined for
+  // code/control rows / hand-built test rows.
+  action?: string;
   /**
    * Names of the params that are editable in phase 3 (ADR 0076 §5) — a subset of `params[].name`.
    * Only recognized `action`/`lookup`/`send` rows have any; `code`/`control` rows are read-only, so this
@@ -330,6 +338,8 @@ export function buildRowViewModel(row: LensRow, index: number, lines: string[]):
     title: rowTitle(row),
     params: rowParams(row),
     editableParams: editableParamNames(row),
+    action: row.action ?? row.call, // ADR 0104 §2.3: recognized name (action OR lookup call, e.g. code_lookup)
+
     // The row's projected source — sliced from the SAME (engine-newline) lines the projection parsed, so
     // it equals `"\n".join(_physical_lines(src)[start-1:end])` on the engine side (F7). `.slice` clamps an
     // over-range end exactly like Python's slice, so a shorter dirty buffer never throws here.
@@ -1540,6 +1550,25 @@ const INDENT_PX = 20; // per nesting level
  * other param stays disabled + read-only. `code`/`control` rows pass an empty `editable` set, so they
  * remain entirely view-only (ADR 0076 §5). Pure — every dynamic value is HTML-escaped.
  */
+// (action, param) pairs whose value is an HL7 path/segment the field picker (ADR 0104 §2.3) can drive.
+// The pick writes the chosen literal through the SAME edit/lens-rewrite splice a typed edit uses, so it is
+// only ever offered on an already-editable literal slot — never on `value`, `occurrence`, `repetition`, or
+// a code/control row.
+const HL7_PATH_PARAMS: Record<string, string[]> = {
+  set_field: ["path"],
+  copy_field: ["src", "dst"],
+  append_to_field: ["path"],
+  format_date: ["path"],
+  convert_case: ["path"],
+  code_lookup: ["path"],
+};
+
+/** Whether `param` of `action` is a pickable HL7 path (`"path"`) or a segment-only slot (`"segment"`). */
+export function pickMode(action: string | undefined, param: string): "path" | "segment" | undefined {
+  if (action === "delete_segment" && param === "segment_id") return "segment";
+  return action && HL7_PATH_PARAMS[action]?.includes(param) ? "path" : undefined;
+}
+
 function renderParamsHtml(params: ParamField[], editable: Set<string>, handlerName: string, row: RowViewModel): string {
   if (params.length === 0) {
     return "";
@@ -1548,18 +1577,31 @@ function renderParamsHtml(params: ParamField[], editable: Set<string>, handlerNa
     .map((p) => {
       const label = `<label>${escapeHtml(p.name)}</label>`;
       if (editable.has(p.name)) {
-        return (
-          `<div class="field">${label}` +
+        // The row's PROJECTION-TIME source (`data-expect-src`) is echoed back on edit as `expect_src` so a
+        // stale coordinate is refused, not mis-spliced (F7). An empty value shows a `[blank]` placeholder (a
+        // hint, NOT a value) so a freshly-inserted template reads as "fill me in"; `placeholder` is inert on
+        // submit, so the F7 round-trip is unaffected.
+        const input =
           `<input type="text" class="edit" data-handler="${escapeHtml(handlerName)}" ` +
           `data-line-start="${row.lineStart}" data-line-end="${row.lineEnd}" ` +
-          // The row's PROJECTION-TIME source, echoed back on edit as `expect_src` so a stale coordinate is
-          // refused, not mis-spliced (F7) — never recomputed from the live buffer at edit time.
           `data-expect-src="${escapeHtml(row.expectSrc ?? "")}" ` +
-          // An empty value shows a `[blank]` placeholder (a hint, NOT a value) so a freshly-inserted
-          // template's empty Set-Field/param inputs read as "fill me in" — the analyst never has to erase a
-          // literal `[blank]`. `placeholder` is inert on submit: the SAVED value stays exactly what's typed
-          // (empty stays empty), so the F7 expect_src round-trip is unaffected.
-          `data-name="${escapeHtml(p.name)}" value="${escapeHtml(p.value)}" placeholder="[blank]" /></div>`
+          `data-name="${escapeHtml(p.name)}" value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
+        // ADR 0104 §2.3: a pickable HL7 path/segment slot gets a picker button BESIDE its input. The input is
+        // NEVER removed (free-text always available); the pick writes through the SAME edit splice. Only a
+        // slot with a pick button gets the horizontal `.edit-row` wrapper — every other editable field's
+        // markup is byte-identical to before.
+        const pm = pickMode(row.action, p.name);
+        const pickBtn = pm
+          ? `<button class="pickpath" data-handler="${escapeHtml(handlerName)}" ` +
+            `data-line-start="${row.lineStart}" data-line-end="${row.lineEnd}" ` +
+            `data-expect-src="${escapeHtml(row.expectSrc ?? "")}" ` +
+            `data-name="${escapeHtml(p.name)}" data-mode="${pm}" ` +
+            `data-tip="Pick an HL7 field">&#8942;</button>`
+          : "";
+        return (
+          `<div class="field">${label}` +
+          (pickBtn ? `<div class="edit-row">${input}${pickBtn}</div>` : input) +
+          `</div>`
         );
       }
       return (

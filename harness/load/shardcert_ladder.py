@@ -117,9 +117,18 @@ _PHASE_WINDOW_SECONDS = 5.0
 #: ``messagefoundry.pipeline.phase_timing.ClaimPhaseTiming``) — the store-claim round-trip #842 could not
 #: see. Deliberately DISJOINT from ``_PHASE_RE`` (no send_ack/mark_done fields; ``_claim_lines`` guards on
 #: the distinct "claim phase timing" substring) so the two phase lines can never cross-match.
+#: NOTE (2026-07-13): the engine emits ONE line PER STAGE per window —
+#: ``claim phase timing (stage=%s): claim n=...`` (``pipeline/phase_timing.py``). The original regex did
+#: NOT capture ``stage=``, so :func:`aggregate_claim_timing` n-weighted INGRESS + ROUTED + OUTBOUND +
+#: RESPONSE into ONE ``claim_mean_ms``. **Every claim_mean this programme has quoted is a four-stage
+#: BLEND, not the outbound claim.** The blended aggregate is retained (its Σn·mean busy-time is still
+#: exact and existing reports depend on it) and the per-stage split is now carried alongside it in
+#: ``ClaimTiming.by_stage``. ``stage`` is OPTIONAL in the pattern so a pre-stage log still parses.
 _CLAIM_RE = re.compile(
-    r"claim n=(\d+) mean=([\d.]+)ms max=([\d.]+)ms \| "
-    r"lanes/claim=([\d.]+) rows/claim=([\d.]+) rearm=(\d+) empty=(\d+) claimers=(\d+)"
+    r"claim phase timing(?: \(stage=(?P<stage>\w+)\))?: "
+    r"claim n=(?P<n>\d+) mean=(?P<mean>[\d.]+)ms max=(?P<max>[\d.]+)ms \| "
+    r"lanes/claim=(?P<lanes>[\d.]+) rows/claim=(?P<rows>[\d.]+) "
+    r"rearm=(?P<rearm>\d+) empty=(?P<empty>\d+) claimers=(?P<claimers>\d+)"
 )
 
 
@@ -246,6 +255,12 @@ class ClaimTiming:
     rows_per_claim: float  # n-weighted mean rows returned per claim
     rearm: int  # Σ H2 skip-and-complete lanes (real work, not overhead)
     empty: int  # Σ pure-overhead claims (returned nothing AND rearmed nothing)
+    #: PER-STAGE split (2026-07-13). The fields ABOVE are a FOUR-STAGE BLEND (ingress + routed +
+    #: outbound + response) — the engine emits one timing line per stage and the parser used to discard
+    #: `stage=`. The blend is retained (its Σn·mean busy-time is exact, and prior reports quote it) but it
+    #: is NOT the outbound claim and must never be read as one. Read `by_stage["outbound"]` for that.
+    #: Empty on a pre-stage log.
+    by_stage: dict[str, "ClaimTiming"] = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
@@ -271,6 +286,14 @@ class ClaimTiming:
             "rows_per_claim": round(self.rows_per_claim, 3),
             "rearm": self.rearm,
             "empty": self.empty,
+            # PER-STAGE (2026-07-13). The flat fields above are a four-stage BLEND — read
+            # by_stage["outbound"] for the outbound claim. Omitted when empty (a pre-stage log), so an
+            # older consumer sees a byte-identical dict.
+            **(
+                {"by_stage": {st: ct.to_json_dict() for st, ct in self.by_stage.items()}}
+                if self.by_stage
+                else {}
+            ),
         }
 
     @classmethod
@@ -284,6 +307,11 @@ class ClaimTiming:
             rows_per_claim=float(d.get("rows_per_claim", 0.0)),
             rearm=int(d.get("rearm", 0)),
             empty=int(d.get("empty", 0)),
+            by_stage={
+                st: ClaimTiming.from_json_dict(v)
+                for st, v in (d.get("by_stage") or {}).items()
+                if isinstance(v, Mapping)
+            },
         )
 
 
@@ -323,6 +351,7 @@ def aggregate_claim_timing(
     rearm = 0
     empty = 0
     windows = 0
+    per_stage: dict[str, dict[str, float]] = {}
     for path in log_paths:
         try:
             text = Path(path).read_text(encoding="utf-8", errors="replace")
@@ -332,16 +361,55 @@ def aggregate_claim_timing(
         if drop_first_window and matches:
             matches = matches[1:]  # drop this shard's first (ramp) window
         for m in matches:
-            cn, cm, cmx = int(m.group(1)), float(m.group(2)), float(m.group(3))
-            lpc, rpc = float(m.group(4)), float(m.group(5))
-            rearm += int(m.group(6))
-            empty += int(m.group(7))
+            # NAMED groups: the pattern gained an optional leading `stage` group (2026-07-13), so the
+            # positional indices this used to read are no longer stable.
+            cn, cm, cmx = int(m["n"]), float(m["mean"]), float(m["max"])
+            lpc, rpc = float(m["lanes"]), float(m["rows"])
+            rearm += int(m["rearm"])
+            empty += int(m["empty"])
             claim_num += cm * cn
             claim_n += cn
             claim_max = max(claim_max, cmx)
             lanes_num += lpc * cn
             rows_num += rpc * cn
             windows += 1
+            # Per-stage split — the whole point of the fix. `stage` is None on a pre-stage log.
+            st = m["stage"]
+            if st:
+                acc = per_stage.setdefault(
+                    st,
+                    {
+                        "num": 0.0,
+                        "n": 0,
+                        "max": 0.0,
+                        "lanes": 0.0,
+                        "rows": 0.0,
+                        "rearm": 0,
+                        "empty": 0,
+                        "windows": 0,
+                    },
+                )
+                acc["num"] += cm * cn
+                acc["n"] += cn
+                acc["max"] = max(acc["max"], cmx)
+                acc["lanes"] += lpc * cn
+                acc["rows"] += rpc * cn
+                acc["rearm"] += int(m["rearm"])
+                acc["empty"] += int(m["empty"])
+                acc["windows"] += 1
+    by_stage = {
+        st: ClaimTiming(
+            windows=int(a["windows"]),
+            claims=int(a["n"]),
+            claim_mean_ms=(a["num"] / a["n"]) if a["n"] else 0.0,
+            claim_max_ms=a["max"],
+            lanes_per_claim=(a["lanes"] / a["n"]) if a["n"] else 0.0,
+            rows_per_claim=(a["rows"] / a["n"]) if a["n"] else 0.0,
+            rearm=int(a["rearm"]),
+            empty=int(a["empty"]),
+        )
+        for st, a in sorted(per_stage.items())
+    }
     return ClaimTiming(
         windows=windows,
         claims=claim_n,
@@ -351,6 +419,7 @@ def aggregate_claim_timing(
         rows_per_claim=(rows_num / claim_n) if claim_n else 0.0,
         rearm=rearm,
         empty=empty,
+        by_stage=by_stage,
     )
 
 

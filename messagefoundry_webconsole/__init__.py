@@ -26,7 +26,10 @@ __version__ = "0.2.15"
 
 #: The engine contract versions this console build supports (``api._ui_seam.ENGINE_UI_SEAM``). A pair
 #: outside this set is refused at startup — the runtime backstop behind the PEP 508 compat range.
-SUPPORTED_ENGINE_SEAMS: frozenset[int] = frozenset({2})
+# Seam 4 adds the additive MessageDetail.attachments list + the download_attachment handler (#149);
+# seam 3 adds the additive SystemStatus.kpis roll-up (#93). Older seams are kept because every new field
+# has a default, so an older engine still renders on this console (the missing field reads as its default).
+SUPPORTED_ENGINE_SEAMS: frozenset[int] = frozenset({2, 3, 4})
 
 #: The vendored static assets shipped in THIS wheel (mounted at /ui/static by :func:`mount_ui`).
 STATIC_DIR = Path(__file__).parent / "static"

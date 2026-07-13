@@ -22,9 +22,13 @@ remote exposure (TLS) is later.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
+import mimetypes
 import os
+import re
 import shutil
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -57,6 +61,7 @@ from messagefoundry.api.models import (
     AlertsConfig,
     ApprovalDecisionResult,
     ApprovalList,
+    AttachmentInfo,
     CapturedResponseInfo,
     ChannelInfo,
     ClusterNode,
@@ -76,6 +81,7 @@ from messagefoundry.api.models import (
     DrActivateRequest,
     DrStatus,
     EngineInfo,
+    EngineKpis,
     EventInfo,
     Health,
     IntegrityResult,
@@ -137,6 +143,7 @@ from messagefoundry.config.models import (
     OrderingMode,
     Priority,
     RetryPolicy,
+    SaturationThreshold,
     StallThreshold,
 )
 from messagefoundry.config.settings import (
@@ -154,6 +161,7 @@ from messagefoundry.config.settings import (
     RetentionSettings,
     SandboxSettings,
     SecretRotationSettings,
+    SecretsSettings,
     ServiceStatusSettings,
     ShadowSettings,
     StoreBackend,
@@ -163,6 +171,7 @@ from messagefoundry.config.settings import (
     hop_posture_from_ai,
 )
 from messagefoundry.config.fingerprint import config_fingerprint_detail
+from messagefoundry.config.secretprovider import resolve_secret_provider
 from messagefoundry.config.wiring import (
     EnvRef,
     Registry,
@@ -423,6 +432,29 @@ def _summary(row: Row) -> MessageSummary:
         # engine-internal ADR-0013 correlation-lineage keys so they never leak to the API.
         metadata=user_metadata(d.get("metadata")),
     )
+
+
+#: A conservative MIME type — ``type/subtype`` of RFC-2045 token chars only, no structural characters
+#: (``;``/space/CR/LF/``"``) that could inject or split the ``Content-Type`` header. An attachment's
+#: ``content_type`` originates from an attacker-influenced OBX-5.2 label, so a value failing this is
+#: served as the generic binary type below rather than trusted into the response header.
+_SAFE_MIME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*$")
+_DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
+
+
+def _safe_attachment_content_type(content_type: str | None) -> str:
+    """The download ``Content-Type``: the stored ``content_type`` when it is a clean ``type/subtype``
+    MIME, else ``application/octet-stream`` (never an attacker-influenced value verbatim in the header)."""
+    ct = (content_type or "").strip()
+    return ct if _SAFE_MIME_RE.match(ct) else _DEFAULT_ATTACHMENT_MIME
+
+
+def _attachment_filename(attachment_id: str, content_type: str) -> str:
+    """A header-safe download filename. ``attachment_id`` is a 64-hex sha256 (safe by construction); a
+    short prefix keeps it readable and a ``mimetypes`` extension (when the MIME is known) hints the type.
+    No user/attacker text reaches the ``Content-Disposition`` header."""
+    ext = mimetypes.guess_extension(content_type) or ""
+    return f"attachment-{attachment_id[:16]}{ext}"
 
 
 def _needle_shape(needle: str) -> str:
@@ -1991,6 +2023,11 @@ def create_app(
         )
         outbox_rows = await engine.store.outbox_for(message_id)
         event_rows = await engine.store.events_for(message_id)
+        # Metadata-only list of the very-large documents detached from this message (#149, ADR 0105
+        # Phase 3b) — id/content_type/total_bytes, never the bytes. No extra PHI exposure over the raw
+        # body this route already gated: it just tells the operator a detached document exists + how to
+        # pull it (the audited /attachments/{id} download). Empty for a normal (non-streaming) message.
+        attachment_rows = await engine.store.attachments_for(message_id)
         detail = MessageDetail(
             **_summary(row).model_dump(),
             raw=row["raw"],
@@ -2014,6 +2051,14 @@ def create_app(
                 )
                 for e in event_rows
             ],
+            attachments=[
+                AttachmentInfo(
+                    id=a["attachment_id"],
+                    content_type=a["content_type"],
+                    total_bytes=a["total_bytes"],
+                )
+                for a in attachment_rows
+            ],
         )
         # Per-property PHI gate (#120): the patient `summary`, the exception `error`, every delivery
         # `last_error`, and every event `detail` gate on messages:view_summary. Redaction keys on the
@@ -2031,6 +2076,73 @@ def create_app(
                 engine.store, identity.username, row["channel_id"], exposed, time.time()
             )
         return detail
+
+    @app.get("/messages/{message_id}/attachments/{attachment_id}")
+    async def download_attachment(
+        message_id: str,
+        attachment_id: str,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
+    ) -> Response:
+        """Download the reconstructed bytes of a very-large document detached from ``message_id`` (#149,
+        ADR 0105 Phase 3b). A detached document is the **same PHI** as the raw body, so this rides the
+        SAME ``MESSAGES_VIEW_RAW`` gate + per-channel scope guard as :func:`get_message` (no separate
+        permission, no step-up).
+
+        The **security crux** is the linkage check: content-addressing means one physical attachment can
+        be shared across many messages/tenants, so an operator must never pull a document by guessing a
+        content address that is not linked to a message IN THEIR CHANNEL SCOPE. This verifies the
+        ``(message_id, attachment_id)`` pair exists in ``message_attachment`` (404 otherwise) AFTER the
+        channel-scope guard, so access is scoped to the message the operator may already read.
+
+        Approach B stored the OBX-5.5 value VERBATIM (base64), so the bytes are reconstructed by
+        concatenating the attachment's chunks and base64-decoding once (buffer-once, mirroring the
+        delivery buffer-once posture). Every download is audited (``record_view`` + an
+        ``attachment_download`` row in the tamper-evident chain, docs/PHI.md §6) BEFORE the bytes leave.
+        The document bytes/base64 are **never logged**."""
+        row = await engine.store.get_message(message_id)
+        # 404 (not 403) outside the caller's channel scope — don't reveal a message in another tenant's
+        # channel (per-channel RBAC), mirroring get_message.
+        if row is None or not identity.can_access_channel(row["channel_id"]):
+            if row is not None:
+                await _audit_channel_denied(engine, identity, row["channel_id"])
+            raise HTTPException(404, f"no such message: {message_id}")
+        # SECURITY CRUX: only serve an attachment that is LINKED to this message. Content-addressing
+        # shares one physical blob across messages/tenants, so the linkage + the channel guard above are
+        # what scope access — a guessed content address unlinked to an in-scope message is a 404.
+        linked = await engine.store.attachments_for(message_id)
+        match = next((a for a in linked if a["attachment_id"] == attachment_id), None)
+        if match is None:
+            raise HTTPException(404, f"no such attachment for message: {attachment_id}")
+        # Reconstruct the verbatim base64 (Approach B) then base64-decode ONCE to the original document
+        # bytes. read_attachment raises KeyError only on a corrupt/GC'd blob a live linkage points at.
+        try:
+            verbatim = "".join(
+                [chunk async for chunk in engine.store.read_attachment(attachment_id)]
+            )
+        except KeyError as exc:
+            raise HTTPException(404, f"attachment content unavailable: {attachment_id}") from exc
+        try:
+            body = base64.b64decode("".join(verbatim.split()), validate=True)
+        except (binascii.Error, ValueError) as exc:
+            # A stored value that isn't clean base64 is corruption — surface it, never the bytes.
+            raise HTTPException(422, "attachment content is not decodable") from exc
+        # Audit the PHI access BEFORE the bytes leave: record_view for the per-message timeline +
+        # attachment_download in the tamper-evident chain (with the acting user + the id pair, NO bytes).
+        await engine.store.record_view(message_id, actor=identity.username)
+        await engine.store.record_audit(
+            "attachment_download",
+            actor=identity.username,
+            channel_id=row["channel_id"],
+            detail=json.dumps({"message_id": message_id, "attachment_id": attachment_id}),
+        )
+        content_type = _safe_attachment_content_type(match["content_type"])
+        filename = _attachment_filename(attachment_id, content_type)
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @app.get("/messages/{message_id}/responses", response_model=MessageResponses)
     async def get_message_responses(
@@ -2458,12 +2570,36 @@ def create_app(
         engine: Engine = Depends(_get_engine),
         _user: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> SystemStatus:
+        now = time.time()
         total = running = 0
+        # Engine-wide KPI roll-up (#93): combined inbound + outbound endpoint counts with a
+        # running/stopped breakdown (vs channels_*, which count inbound only).
+        conn_total = conn_running = 0
         rr = engine.registry_runner
         if rr is not None:  # one "channel" per inbound connection
             total = len(rr.registry.inbound)
             running = sum(1 for name in rr.registry.inbound if rr.inbound_running(name))
+            # outbound_running (not outbound_status) so the running/stopped split gates on the engine
+            # actually running AND the lane not operator-paused — consistent with inbound_running's
+            # actually-started semantics (outbound_status reports "running" for any non-paused lane even
+            # before start, which would over-count a built-but-not-started runner).
+            out_running = sum(1 for name in rr.registry.outbound if rr.outbound_running(name))
+            conn_total = total + len(rr.registry.outbound)
+            conn_running = running + out_running
         db = await engine.store.db_status()
+        # Engine-wide msg/s: REUSE the recent_done rate window that already powers backlog_seconds — sum
+        # every destination's completions in the last _RATE_WINDOW seconds, no second sampler. The view
+        # is offset-adjusted (subtracts operator stats-resets) exactly like /connections.
+        cm = await engine.connection_metrics_view(now=now, rate_window=_RATE_WINDOW)
+        recent_done_total = sum(dm.recent_done for dm in cm.destinations.values())
+        msgs_per_second = (recent_done_total / _RATE_WINDOW) if _RATE_WINDOW > 0 else 0.0
+        kpis = EngineKpis(
+            messages_total=db.messages,
+            connections_total=conn_total,
+            connections_running=conn_running,
+            connections_stopped=conn_total - conn_running,
+            messages_per_second=msgs_per_second,
+        )
         # B11 connection-scale observability: the server-only connection-pool snapshot (acquire-wait
         # percentiles + size/idle occupancy). None on SQLite (no pool), so the payload is unchanged on
         # the default backend. Synchronous + cheap (cached counters + a histogram snapshot, no DB I/O).
@@ -2515,6 +2651,7 @@ def create_app(
                 channels_stopped=total - running,
                 outbox_by_status=await engine.store.stats(),
             ),
+            kpis=kpis,
             db=DbInfo(
                 path=db.path,
                 size_bytes=db.size_bytes,
@@ -2854,6 +2991,7 @@ def create_app(
                 list_connections=list_connections,
                 list_messages=list_messages,
                 get_message=get_message,
+                download_attachment=download_attachment,
                 list_dead_letters=list_dead_letters,
                 start_connection=start_connection,
                 stop_connection=stop_connection,
@@ -2958,7 +3096,9 @@ def create_managed_app(
     internal_error_default: InternalErrorPolicy | None = None,
     buildup_default: BuildupThreshold | None = None,
     stall_default: StallThreshold | None = None,
+    saturation_default: SaturationThreshold | None = None,
     ack_after_default: AckAfter | None = None,
+    stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: [inbound].stream_inflight_budget_bytes
     max_correlation_depth: int = 8,
     per_lane_wake: bool = False,  # B12 (ADR 0061): per-lane wake events; default-OFF singleton wake
     claim_mode: str = "pooled",  # ADR 0066/#744: "pooled" (default) | "per_lane" (byte-identical opt-out)
@@ -2975,6 +3115,7 @@ def create_managed_app(
     fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
     pooled_fusing_workers: int = 8,
     batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
+    snapshot_on_send: bool = False,  # ADR 0104: copy-on-Send at Send construction (default-OFF)
     connection_events: bool = True,
     response_sent_default: bool = True,
     message_events: str = "all",  # #63 [diagnostics].message_events verbosity → open_store
@@ -2983,6 +3124,7 @@ def create_managed_app(
     auth_settings: AuthSettings | None = None,
     ai_settings: AiSettings | None = None,
     alerts_settings: AlertsSettings | None = None,
+    secrets_settings: SecretsSettings | None = None,
     priority_default: Priority | None = None,
     retention_settings: RetentionSettings | None = None,
     cert_monitor_settings: CertMonitorSettings | None = None,
@@ -3054,7 +3196,19 @@ def create_managed_app(
         # Operational alert notifier (webhook/email). None when no transport is configured → the
         # engine falls back to the logging sink. Its background dispatch task is owned by this
         # lifespan: started here, drained + stopped after the engine in the finally below.
-        notifier = notifier_from_settings(alerts_settings) if alerts_settings is not None else None
+        # Connector SecretProvider (ADR 0019 §5, BACKLOG #196): built once from [secrets] and threaded to
+        # every credential point (SMTP password → notifier/security-notifier, AD bind password →
+        # AuthService). None = [secrets].provider unset/'none' → env-sourced credentials, byte-identical.
+        # An unknown provider / missing extra fails closed HERE (resolve_secret_provider raises), refusing
+        # startup rather than degrading to a blank credential.
+        secret_provider = (
+            resolve_secret_provider(secrets_settings) if secrets_settings is not None else None
+        )
+        notifier = (
+            notifier_from_settings(alerts_settings, secret_provider=secret_provider)
+            if alerts_settings is not None
+            else None
+        )
         if notifier is not None:
             # Durable operator alert-state (ADR 0044, #56): wire the open store so every emit upserts a
             # resolvable alert instance (GET /alerts/active) and an inverse signal auto-resolves it. A
@@ -3106,6 +3260,7 @@ def create_managed_app(
             fuse_thread_hops=fuse_thread_hops,
             pooled_fusing_workers=pooled_fusing_workers,
             batch_handoff_statements=batch_handoff_statements,
+            snapshot_on_send=snapshot_on_send,
             connection_events=connection_events,
             response_sent_default=response_sent_default,
             audit_verify_on_start=integ.audit_verify_on_start,
@@ -3118,7 +3273,9 @@ def create_managed_app(
             internal_error_default=internal_error_default,
             buildup_default=buildup_default,
             stall_default=stall_default,
+            saturation_default=saturation_default,
             ack_after_default=ack_after_default,
+            stream_inflight_budget_bytes=stream_inflight_budget_bytes,
             priority_default=priority_default,
             alert_sink=notifier,
             retention_settings=retention_settings,
@@ -3186,10 +3343,17 @@ def create_managed_app(
             # conditions — not here. This task is owned by the lifespan (started here, drained + closed
             # after the engine in the finally below).
             if auth_settings.notify_security_events and alerts_settings is not None:
-                security_notifier = security_notifier_from_settings(alerts_settings)
+                security_notifier = security_notifier_from_settings(
+                    alerts_settings, secret_provider=secret_provider
+                )
                 if security_notifier is not None:
                     security_notifier.start()
-            auth = AuthService(store, auth_settings, security_notifier=security_notifier)
+            auth = AuthService(
+                store,
+                auth_settings,
+                security_notifier=security_notifier,
+                secret_provider=secret_provider,
+            )
             bootstrap = await auth.initialize()
             app.state.auth = auth
             if bootstrap is not None:

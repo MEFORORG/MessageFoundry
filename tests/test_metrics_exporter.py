@@ -206,6 +206,83 @@ async def test_gather_snapshot_carries_aggregates(engine: Engine) -> None:
     assert OutboxStatus.DONE.value  # enum value is the label, used in outbox_status family
 
 
+# --- 3c. DB throughput signals (BACKLOG #93) ---------------------------------
+
+
+def _render_snapshot(snap: object) -> str:
+    """Render one hand-built ``_Snapshot`` through the collector (pure sync) — lets us exercise the
+    server-only pool families that SQLite (no pool) never populates."""
+    from prometheus_client import CollectorRegistry, generate_latest
+
+    from messagefoundry.api.metrics import _MetricsCollector
+
+    reg = CollectorRegistry()
+    reg.register(_MetricsCollector(snap))  # type: ignore[arg-type]
+    return generate_latest(reg).decode()
+
+
+def _pool_snapshot(*, idle: int) -> object:
+    from messagefoundry.api.metrics import _Snapshot
+    from messagefoundry.store.pool_metrics import AcquireWaitSummary, PoolStatus
+
+    return _Snapshot(
+        version="0.0-test",
+        inbound={},
+        destinations={},
+        latency=[],
+        outbox_by_status={},
+        in_pipeline=0,
+        now=1000.0,
+        pool=PoolStatus(
+            backend="postgres",
+            max_size=10,
+            size=10,
+            idle=idle,
+            acquire_wait=AcquireWaitSummary(
+                count=5, p50_ms=1.0, p95_ms=20.0, p99_ms=40.0, max_ms=100.0, mean_ms=10.0
+            ),
+        ),
+        committed_txns=7,
+        body_copies=3,
+    )
+
+
+def test_pool_saturation_metric_emits_when_pool_present() -> None:
+    # The [store].pool_size knob previously emitted NO saturation signal. #93 adds it: pool_saturated=1
+    # when the pool has zero idle connections (every stage worker contends), plus size/idle occupancy
+    # and the acquire-wait percentiles (seconds — the Prometheus base unit).
+    text = _render_snapshot(_pool_snapshot(idle=0))
+    names = {f.name for f in text_string_to_metric_families(text)}
+    assert {
+        "messagefoundry_store_pool_max_connections",
+        "messagefoundry_store_pool_open_connections",
+        "messagefoundry_store_pool_idle_connections",
+        "messagefoundry_store_pool_saturated",
+        "messagefoundry_store_pool_acquire_wait_p95_seconds",
+        "messagefoundry_store_pool_acquire_waits",
+    } <= names
+    assert "messagefoundry_store_pool_saturated 1.0" in text  # idle == 0 → saturated
+    assert "messagefoundry_store_pool_max_connections 10.0" in text
+    assert "messagefoundry_store_pool_acquire_wait_p95_seconds 0.02" in text  # 20ms → 0.02s
+
+
+def test_pool_not_saturated_when_idle_available() -> None:
+    text = _render_snapshot(_pool_snapshot(idle=2))
+    assert "messagefoundry_store_pool_saturated 0.0" in text  # idle > 0 → not saturated
+
+
+async def test_store_cost_counters_always_emit_and_pool_absent_on_sqlite(
+    client: httpx.AsyncClient,
+) -> None:
+    # The always-on A1 cost counters (physical commits + body copies) render on every backend; the
+    # server-only pool families are absent on SQLite (no pool), so the default backend is unchanged.
+    r = await client.get("/metrics")
+    families = {f.name for f in text_string_to_metric_families(r.text)}
+    assert "messagefoundry_store_committed_txns" in families
+    assert "messagefoundry_store_body_copies" in families
+    assert not any(f.startswith("messagefoundry_store_pool_") for f in families)
+
+
 # --- 4. AUTH: /metrics is gated by monitoring:read ---------------------------
 
 

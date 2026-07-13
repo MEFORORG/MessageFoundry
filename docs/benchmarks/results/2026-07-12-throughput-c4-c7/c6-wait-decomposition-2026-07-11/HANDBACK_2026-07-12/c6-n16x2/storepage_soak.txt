@@ -1,0 +1,16 @@
+# sampled dm_os_waiting_tasks 677x over 180s; PAGELATCH hits {'PAGELATCH_EX': 20, 'PAGELATCH_SH': 42}
+# top contended pages (dbid:file:page -> waiter-hits): [('5:1:306606', 12), ('5:1:466777', 11), ('5:1:306619', 9), ('5:1:480764', 4), ('5:1:454762', 2), ('5:1:458587', 2), ('5:1:456946', 2), ('5:1:474589', 2), ('5:1:482020', 2), ('5:1:455107', 1)]
+# hottest-page identities (db + object):
+  5:1:306606 hits=12 -> db=mfbench obj=queue object_id=1333579789 index_id=2 (None)
+  5:1:466777 hits=11 -> db=mfbench obj=queue object_id=1333579789 index_id=2 (None)
+  5:1:306619 hits=9 -> db=mfbench obj=queue object_id=1333579789 index_id=4 (None)
+  5:1:480764 hits=4 -> db=mfbench obj=message_events object_id=1429580131 index_id=1 (None)
+  5:1:454762 hits=2 -> db=mfbench obj=queue object_id=1333579789 index_id=5 (None)
+  5:1:458587 hits=2 -> db=mfbench obj=queue object_id=1333579789 index_id=1 (None)
+# top SQL statements waiting on PAGELATCH (store-internal, parameterized -- names the churn):
+  [12] (@P1 float,@P2 nvarchar(12),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(20))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P1, @stage NVARCHAR(16) = @P2, @k I
+  [8] (@P1 nvarchar(64),@P2 nvarchar(12),@P3 nvarchar(16))DELETE FROM queue OUTPUT deleted.id WHERE id=@P1 AND stage=@P2 AND status=@P3
+  [5] (@P1 float,@P2 nvarchar(12),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(20),@P7 nvarchar(20),@P8 nvarchar(20))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P
+  [5] (@P1 float,@P2 nvarchar(12),@P3 int,@P4 nvarchar(14),@P5 nvarchar(16),@P6 nvarchar(20),@P7 nvarchar(20))SET NOCOUNT ON; SET LOCK_TIMEOUT 0; DECLARE @now FLOAT = @P1, @stage NVARCHA
+  [5] (@P1 nvarchar(12),@P2 nvarchar(14),@P3 int,@P4 nvarchar(1))SET NOCOUNT ON; DECLARE @stage NVARCHAR(16) = @P1, @pending NVARCHAR(32) = @P2, @limit INT = @P3, @after NVARCHAR(256) =
+  [4] (@P1 nvarchar(16),@P2 nvarchar(14),@P3 int,@P4 nvarchar(1))SET NOCOUNT ON; DECLARE @stage NVARCHAR(16) = @P1, @pending NVARCHAR(32) = @P2, @limit INT = @P3, @after NVARCHAR(256) =

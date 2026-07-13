@@ -66,7 +66,8 @@ from messagefoundry.config.models import (
     StallThreshold,
     Validation,
 )
-from messagefoundry.parsing.message import Message, RawMessage
+from messagefoundry.config.send_snapshot import snapshot_on_send_active
+from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
 
 __all__ = [
     "ConnectionSpec",
@@ -122,6 +123,8 @@ __all__ = [
     "router",
     "handler",
     "HandlerAccepts",
+    "message_type_of",
+    "MessageTypeError",
     "load_config",
     "validate_config",
 ]
@@ -1734,6 +1737,20 @@ class Send:
     to: str
     message: Message | RawMessage | str
 
+    def __post_init__(self) -> None:
+        # Copy-on-Send (ADR 0104). When the engine has activated the run-scoped flag for this transform
+        # run, snapshot the payload at THIS construction instant so a later mutation of the same object
+        # (a divergent fan-out: set(); Send(); set(); Send()) does not leak into an already-constructed
+        # Send. The flag is read from a run-scoped ContextVar — never a constructor argument — so this is
+        # a single choke point the fused path (which calls transform_one WITHOUT run_context=) cannot
+        # bypass. Flag OFF (the default, and any Send built outside a transform run — tests, dry-run) =>
+        # the ContextVar default False => a no-op => Send stores the caller's exact reference =>
+        # byte-identical to pre-ADR-0104. Frozen dataclass, so rebind via object.__setattr__.
+        if snapshot_on_send_active():
+            snap = snapshot_payload(self.message)
+            if snap is not self.message:  # a str is returned as-is -> nothing to rebind
+                object.__setattr__(self, "message", snap)
+
 
 #: JSON-serializable scalar/container types a :class:`SetState` value may carry. Validated at
 #: construction (fail loud in the author's code, not deep in a store INSERT), and what
@@ -1873,6 +1890,95 @@ def _check_accepts_predicate(hname: str, pred: object) -> None:
         )
 
 
+class MessageTypeError(ValueError):
+    """A :func:`message_type_of` predicate met a body with no single usable MSH-9 — a
+    :class:`~messagefoundry.parsing.message.RawMessage`, a BHS/FHS batch envelope, a bare multi-message
+    batch (2+ ``MSH``), or an empty MSH-9.1 (ADR 0104).
+
+    Raised **at run time** from inside the predicate. The ``accepts=`` predicate is called bare in the
+    router stage, so this propagates out as a router-stage **content** fault → ``ERROR``/dead-letter —
+    never a silent decline to ``UNROUTED``, never accept-and-drop. Deterministic on the same input, so
+    it is re-run-stable. Subclasses :class:`ValueError` so a broad handler still classifies it as a
+    content fault (parallel to :class:`WiringError` for the *author-time* grammar faults below)."""
+
+
+def _parse_type_spec(spec: str) -> tuple[str | None, str | None]:
+    """Validate + split one ``message_type_of`` spec at author time into ``(code, trigger)`` matchers.
+
+    The spec string always uses a **literal** ``^`` (it is Python source, never the message's own
+    separator); ``*`` in a component means "match any" (→ None). A third component (the structure id,
+    e.g. ``ADT_A01``) is accepted but **ignored** — the match is MSH-9.1 + MSH-9.2 only. Raises
+    :class:`WiringError` on a malformed spec (surfaced at config load / ``check``)."""
+    if not isinstance(spec, str) or not spec:
+        raise WiringError("message_type_of: each spec must be a non-empty str")
+    parts = spec.split("^")
+    if len(parts) > 3 or any(p == "" for p in parts[:2]):
+        raise WiringError(
+            f"message_type_of: malformed spec {spec!r} (expected 'CODE', 'CODE^TRIGGER', or "
+            "'CODE^TRIGGER^STRUCTURE'; '*' is a wildcard component)"
+        )
+    code = None if parts[0] == "*" else parts[0]
+    event = (None if parts[1] == "*" else parts[1]) if len(parts) >= 2 else None
+    return code, event
+
+
+def message_type_of(*specs: str) -> HandlerAccepts:
+    """A pure :data:`HandlerAccepts` predicate (the ADR 0084 ``accepts=`` seam) that matches the HL7
+    message type **component-wise** against the message's own MSH-2 separators (ADR 0104).
+
+    Grammar (one or more specs; a message matching **any** is accepted): code-only ``"ADT"`` (any
+    trigger); exact ``"ADT^A01"``; 3-component ``"ADT^A01^ADT_A01"`` (structure ignored); a ``"*"``
+    wildcard component (``"ADT^*"`` / ``"*^A01"``); a variadic union
+    ``message_type_of("ADT^A01", "ORU^R01")``. Use it as
+    ``@handler("x", accepts=message_type_of("ADT^A01"))``.
+
+    It matches on MSH-9.1 (:attr:`~messagefoundry.parsing.message.Message.message_code`) + MSH-9.2
+    (:attr:`~messagefoundry.parsing.message.Message.trigger_event`), each read through the message's own
+    MSH-2 and unescaped — never a whole-field caret-literal compare, so a conformant 3-component MSH-9
+    and a custom component separator both match correctly. It **fails loud** (:class:`MessageTypeError`
+    → ``ERROR``/dead-letter) on any body without exactly one usable MSH-9 (a ``RawMessage``, a BHS/FHS
+    envelope, a multi-``MSH`` batch, or an empty MSH-9.1) rather than silently declining. HL7-only and
+    optional; inheriting ADR 0084's ``FILTERED → UNROUTED`` shift, it is always a deliberate author
+    choice. A malformed spec raises :class:`WiringError` at construction (config load / ``check``)."""
+    if not specs:
+        raise WiringError("message_type_of() requires at least one message-type spec")
+    parsed = tuple(_parse_type_spec(s) for s in specs)  # eager author-time grammar validation
+
+    def _pred(msg: Payload) -> bool:
+        if not isinstance(msg, Message):  # narrows to Message for the rest (mypy-strict)
+            raise MessageTypeError(
+                f"message_type_of enforces an HL7 message type but received {type(msg).__name__} "
+                f"(content_type={getattr(msg, 'content_type', '?')!r}); it has no MSH-9 to match"
+            )
+        segs = msg.segments()
+        first = segs[0] if segs else None
+        if first != "MSH":  # a BHS/FHS batch envelope (or an empty message) has no single MSH-9
+            raise MessageTypeError(
+                f"message_type_of: message does not lead with MSH (first segment {first!r}); a BHS/FHS "
+                "batch envelope has no single MSH-9 to match"
+            )
+        msh_count = msg.count_segments("MSH")
+        if msh_count != 1:  # a bare multi-message batch (2+ MSH) has no single message type
+            raise MessageTypeError(
+                f"message_type_of: message carries {msh_count} MSH segments (a batch); there is no "
+                "single message type to match"
+            )
+        code = msg.message_code  # MSH-9.1 via the message's OWN MSH-2, unescaped
+        if code is None:
+            raise MessageTypeError(
+                "message_type_of: MSH present but MSH-9.1 (message_code) is empty"
+            )
+        event = msg.trigger_event  # MSH-9.2 (may be None: a code-only MSH-9)
+        for want_code, want_event in parsed:
+            if want_code is not None and want_code != code:
+                continue
+            if want_event is None or want_event == event:
+                return True
+        return False
+
+    return _pred
+
+
 @dataclass(frozen=True)
 class InboundConnection:
     name: str
@@ -1927,6 +2033,20 @@ class InboundConnection:
     # override idiom as messages_days — code-first AND via connections.toml (ADR 0007).
     prune_documents_after: int | None = None
     prune_documents_min_bytes: int | None = None
+    # Per-inbound very-large-document streaming (#149, ADR 0105 Phase 1a). HL7v2 only.
+    #   stream_threshold_bytes: None (default) = OFF, byte-identical to today (no detach, no attachment
+    #     rows). Set (>0) = a received body at/above this size has each oversized OBX-5 ED base64 document
+    #     DETACHED VERBATIM into the store's content-addressed attachment substrate and replaced in the
+    #     stored skeleton by a small `mfdoc:v1:ref:` handle; below-threshold bodies stay on the byte-
+    #     identical fast path. Requires a store whose supports_streaming_attachments is True — now all
+    #     three backends (SQLite + SQL Server + Postgres, ADR 0105 Phase 4 go-live parity).
+    #   max_message_bytes: None (default) = inherit the engine 16 MiB ingress ceiling; set = the
+    #     per-connection TOTAL body cap (the OOM guard that replaces the frame-cap-as-only-guard — a body
+    #     over it is rejected/NAK'd BEFORE detach). A streaming inbound raises this above 16 MiB (and its
+    #     transport's max_frame_bytes) so the large frame is admitted, then detached under the cap.
+    # Same override idiom as messages_days — code-first AND via connections.toml (ADR 0007).
+    stream_threshold_bytes: int | None = None
+    max_message_bytes: int | None = None
     # Per-connection DR / priority tier (#61, ADR 0048): None = inherit the global [delivery].priority
     # default; an explicit value overrides it (resolution in the RegistryRunner: per-connection override
     # > [delivery] global default > built-in NORMAL). The DR run-profile starts only inbound listeners
@@ -2368,6 +2488,8 @@ def build_inbound_connection(
     messages_days: int | None = None,
     prune_documents_after: int | None = None,
     prune_documents_min_bytes: int | None = None,
+    stream_threshold_bytes: int | None = None,
+    max_message_bytes: int | None = None,
     priority: Priority | None = None,
     shard: str | None = None,
     source_file: str | None = None,
@@ -2506,6 +2628,38 @@ def build_inbound_connection(
             f"inbound connection {name!r}: prune_documents_min_bytes is set but prune_documents_after "
             "is not — the threshold has no effect without a pruning window"
         )
+    if stream_threshold_bytes is not None:
+        # Per-inbound very-large-document streaming (#149, ADR 0105 Phase 1a). None = OFF; a set value must
+        # be a POSITIVE byte size and only applies to the HL7 path (the detach targets OBX-5 ED embeds).
+        if stream_threshold_bytes <= 0:
+            raise WiringError(
+                f"inbound connection {name!r}: stream_threshold_bytes must be > 0 bytes "
+                "(omit it to disable very-large-document streaming)"
+            )
+        if content_type is not ContentType.HL7V2:
+            raise WiringError(
+                f"inbound connection {name!r}: stream_threshold_bytes is HL7-specific (it detaches "
+                f"OBX-5 documents) and can't apply to a {content_type.value!r} content_type"
+            )
+    if max_message_bytes is not None and max_message_bytes <= 0:
+        # The per-connection total-body OOM guard (replaces the frame-cap-as-only-guard). None = inherit
+        # the engine 16 MiB ceiling; a set value must be positive. Fail loud at wiring (dry-run / check).
+        raise WiringError(
+            f"inbound connection {name!r}: max_message_bytes must be > 0 bytes "
+            "(omit it to inherit the engine ingress ceiling)"
+        )
+    if (
+        stream_threshold_bytes is not None
+        and max_message_bytes is not None
+        and max_message_bytes < stream_threshold_bytes
+    ):
+        # A cap below the detach threshold is incoherent — a body large enough to detach would always be
+        # rejected first, so streaming could never engage. Catch the likely-mistaken config loud.
+        raise WiringError(
+            f"inbound connection {name!r}: max_message_bytes ({max_message_bytes}) must be >= "
+            f"stream_threshold_bytes ({stream_threshold_bytes}) — a lower cap rejects every message "
+            "the threshold would detach"
+        )
     if shard is not None and not shard.strip():
         # A present-but-blank shard tag would silently collapse into its own nameless shard (the
         # supervisor would spawn a subprocess named ""), a config footgun — fail loud at wiring so
@@ -2535,6 +2689,8 @@ def build_inbound_connection(
         messages_days=messages_days,
         prune_documents_after=prune_documents_after,
         prune_documents_min_bytes=prune_documents_min_bytes,
+        stream_threshold_bytes=stream_threshold_bytes,
+        max_message_bytes=max_message_bytes,
         priority=priority,
         shard=shard,
         source_file=source_file,
@@ -2564,6 +2720,8 @@ def inbound(
     messages_days: int | None = None,
     prune_documents_after: int | None = None,
     prune_documents_min_bytes: int | None = None,
+    stream_threshold_bytes: int | None = None,
+    max_message_bytes: int | None = None,
     priority: Priority | None = None,
     shard: str | None = None,
 ) -> None:
@@ -2635,6 +2793,8 @@ def inbound(
             messages_days=messages_days,
             prune_documents_after=prune_documents_after,
             prune_documents_min_bytes=prune_documents_min_bytes,
+            stream_threshold_bytes=stream_threshold_bytes,
+            max_message_bytes=max_message_bytes,
             priority=priority,
             shard=shard,
             source_file=file,

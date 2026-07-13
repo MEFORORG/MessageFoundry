@@ -1,0 +1,129 @@
+{
+  "arm": "c7-base",
+  "host": "[store]",
+  "monitor_spid": 52,
+  "duration_s": 720,
+  "interval_s": 10,
+  "n_sched": 8,
+  "samples_total": 72,
+  "samples_floor_met": 0,
+  "fraction_floor_met": 0.0,
+  "convoy_present": false,
+  "void_tempdb_catalog_samples": 0,
+  "modal_resource": null,
+  "modal_resource_sample_count": 0,
+  "modal_wait_type": null,
+  "max_suspended_group": 1,
+  "max_chain_depth": 1,
+  "runnable_median": 5,
+  "runnable_max": 11,
+  "wait_delta_fenced_filtered_top": [
+    {
+      "wait_type": "WRITELOG",
+      "d_wait_ms": 513132,
+      "d_signal_ms": 254849,
+      "d_resource_ms": 258283,
+      "d_tasks": 386587
+    },
+    {
+      "wait_type": "CXSYNC_PORT",
+      "d_wait_ms": 144997,
+      "d_signal_ms": 9636,
+      "d_resource_ms": 135361,
+      "d_tasks": 9207
+    },
+    {
+      "wait_type": "MEMORY_ALLOCATION_EXT",
+      "d_wait_ms": 99971,
+      "d_signal_ms": 0,
+      "d_resource_ms": 99971,
+      "d_tasks": 137078701
+    },
+    {
+      "wait_type": "IO_COMPLETION",
+      "d_wait_ms": 19333,
+      "d_signal_ms": 362,
+      "d_resource_ms": 18971,
+      "d_tasks": 33440
+    },
+    {
+      "wait_type": "WAIT_ON_SYNC_STATISTICS_REFRESH",
+      "d_wait_ms": 8735,
+      "d_signal_ms": 0,
+      "d_resource_ms": 8735,
+      "d_tasks": 266
+    },
+    {
+      "wait_type": "PAGELATCH_EX",
+      "d_wait_ms": 14562,
+      "d_signal_ms": 7892,
+      "d_resource_ms": 6670,
+      "d_tasks": 28381
+    },
+    {
+      "wait_type": "LATCH_EX",
+      "d_wait_ms": 5248,
+      "d_signal_ms": 1031,
+      "d_resource_ms": 4217,
+      "d_tasks": 3281
+    },
+    {
+      "wait_type": "SESSION_WAIT_STATS_CHILDREN",
+      "d_wait_ms": 4687,
+      "d_signal_ms": 1665,
+      "d_resource_ms": 3022,
+      "d_tasks": 2847
+    },
+    {
+      "wait_type": "PAGELATCH_SH",
+      "d_wait_ms": 5256,
+      "d_signal_ms": 2850,
+      "d_resource_ms": 2406,
+      "d_tasks": 3364
+    },
+    {
+      "wait_type": "RESERVED_MEMORY_ALLOCATION_EXT",
+      "d_wait_ms": 2041,
+      "d_signal_ms": 0,
+      "d_resource_ms": 2041,
+      "d_tasks": 1771959
+    },
+    {
+      "wait_type": "LCK_M_IX",
+      "d_wait_ms": 2293,
+      "d_signal_ms": 388,
+      "d_resource_ms": 1905,
+      "d_tasks": 327
+    },
+    {
+      "wait_type": "LATCH_SH",
+      "d_wait_ms": 1701,
+      "d_signal_ms": 854,
+      "d_resource_ms": 847,
+      "d_tasks": 851
+    },
+    {
+      "wait_type": "EXECSYNC",
+      "d_wait_ms": 1057,
+      "d_signal_ms": 336,
+      "d_resource_ms": 721,
+      "d_tasks": 495
+    },
+    {
+      "wait_type": "SOS_SCHEDULER_YIELD",
+      "d_wait_ms": 1230373,
+      "d_signal_ms": 1229874,
+      "d_resource_ms": 499,
+      "d_tasks": 622888
+    },
+    {
+      "wait_type": "LOGMGR_FLUSH",
+      "d_wait_ms": 6359,
+      "d_signal_ms": 5988,
+      "d_resource_ms": 371,
+      "d_tasks": 4510
+    }
+  ],
+  "sql_handles_resolved": {},
+  "note": "convoy_present names a wall ONLY when contrasted absent in the PASS control (see \u00a74). wait_delta is CONTEXT (already fenced + exclusion-set filtered); it does NOT name a verdict."
+}

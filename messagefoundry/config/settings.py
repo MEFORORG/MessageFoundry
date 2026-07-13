@@ -39,6 +39,7 @@ from messagefoundry.config.models import (
     OrderingMode,
     Priority,
     RetryPolicy,
+    SaturationThreshold,
     StallThreshold,
 )
 from messagefoundry.config.tls_policy import (
@@ -78,6 +79,7 @@ __all__ = [
     "EgressSettings",
     "ShadowSettings",
     "AlertsSettings",
+    "SecretsSettings",
     "ClusterSettings",
     "ApprovalsSettings",
     "IntegritySettings",
@@ -104,6 +106,7 @@ _SECTIONS = (
     "egress",
     "shadow",
     "alerts",
+    "secrets",  # enables MEFOR_SECRETS_* env overrides (connector SecretProvider selection, ADR 0019 §5)
     "cluster",
     "approvals",
     "integrity",
@@ -773,6 +776,16 @@ class InboundSettings(_Section):
     # delivery) is not yet implemented and is rejected at engine start.
     ack_after: AckAfter = AckAfter.INGEST
 
+    # Very-large-document streaming in-flight budget (#149, ADR 0105 Phase 1a) — the aggregate DoS guard
+    # that replaces the frame-cap-as-only-OOM-guard for streaming inbounds. It caps the TOTAL bytes of
+    # over-threshold message bodies concurrently mid-detach (buffered + being sealed into the attachment
+    # substrate) across ALL inbounds; a detach that would push the running total over it is refused with
+    # backpressure (the message is NAK'd/ERROR'd, never accepted-and-dropped) so a burst of huge uploads
+    # can't exhaust memory. 0 (the default) = unlimited (the per-connection max_message_bytes still bounds
+    # a SINGLE body); a positive value bounds concurrency. Only over-threshold streaming detaches count
+    # against it — below-threshold and non-streaming ingress is byte-identical and never touches it.
+    stream_inflight_budget_bytes: int = 0
+
 
 class DeliverySettings(_Section):
     """Global outbound-delivery defaults. An outbound connection that declares no ``retry=``/
@@ -801,6 +814,14 @@ class DeliverySettings(_Section):
     # StallThreshold (a test guards the sync); None (the default) = the stall alert is OFF — deny-by-
     # default, opt-in because it overlaps queue_buildup's age dimension. Per-connection stall= overrides.
     stall_max_oldest_seconds: float | None = None
+    # saturation alert threshold (#93, ADR 0014 amendment): fire when a lane's backlog is RISING
+    # SUSTAINED over this many samples (the DERIVATIVE signal, distinct from buildup/stall's absolute
+    # ceilings). None (the default) = OFF — deny-by-default, opt-in because it overlaps queue_buildup's
+    # age dimension. Mirror SaturationThreshold (a test guards the sync); floor of 2 (fewer can't tell a
+    # burst from sustained growth). Global-only for now (per-connection saturation= override is a
+    # documented follow-up); a per-connection AlertRule (connection glob + transports=[]) can still
+    # suppress it for a known-bursty feed.
+    saturation_sustain_samples: int | None = None
     # Global DR / priority tier default for every connection (#61, ADR 0048). A connection that declares
     # no priority= of its own inherits this (resolution order: per-connection override > [delivery]
     # global default > built-in NORMAL); the DR run-profile then starts only connections whose resolved
@@ -828,6 +849,11 @@ class DeliverySettings(_Section):
         """The global default :class:`StallThreshold` an outbound inherits when it sets none (#50,
         Corepoint "Max Message Stall"). ``None`` keeps the stall alert off by default."""
         return StallThreshold(max_oldest_seconds=self.stall_max_oldest_seconds)
+
+    def saturation_threshold(self) -> SaturationThreshold:
+        """The global default :class:`SaturationThreshold` every lane inherits (#93, ADR 0014
+        amendment). ``None`` keeps the saturation (rising-backlog derivative) alert off by default."""
+        return SaturationThreshold(sustain_samples=self.saturation_sustain_samples)
 
 
 class PipelineSettings(_Section):
@@ -948,6 +974,14 @@ class PipelineSettings(_Section):
     # /config/reload does NOT re-read it — restart to change, exactly like claim_mode / fuse_thread_hops).
     # Harness A/B via MEFOR_PIPELINE_BATCH_HANDOFF_STATEMENTS.
     batch_handoff_statements: bool = Field(default=True)
+    # ADR 0104: copy-on-Send snapshots each Send's payload at construction so a divergent fan-out
+    # (mutate-between-Sends) delivers per-destination state instead of today's last-write-collapse. When
+    # off (the default) the pipeline is byte-identical (Send stores the caller's reference, encode at
+    # handoff). Reliability-core + read ONCE at engine construction (a /config/reload does NOT re-read
+    # it — restart to change, exactly like claim_mode / fuse_thread_hops). Default-OFF: the default-flip
+    # is gated on an estate AST scan + throughput benchmark (out of the ADR 0104 build). Backend-agnostic
+    # (rides the run-context seam on every path). Env/harness override: MEFOR_PIPELINE_SNAPSHOT_ON_SEND.
+    snapshot_on_send: bool = Field(default=False)
 
 
 class SandboxSettings(_Section):
@@ -1409,6 +1443,13 @@ class AuthSettings(_Section):
     ad_group_search_base: str | None = None
     ad_bind_dn: str | None = None  # service-account DN used to look users up
     ad_bind_password: str | None = None  # secret — supply via env only
+    # Connector SecretProvider reference (ADR 0019 §5, BACKLOG #196). When set AND [secrets].provider is
+    # configured, the bind password is resolved from that provider (e.g. a Vault KV 'path#field') at
+    # LdapAuthenticator construction INSTEAD of ad_bind_password — so it need not sit in an env var. Unset
+    # (the default) → ad_bind_password is used exactly as before (byte-identical). Not a secret itself (a
+    # reference/label, not the value), so it may live in the config file. Fail-closed: a reference with no
+    # [secrets].provider, or an unresolvable one, raises at startup (never a blank bind).
+    ad_bind_password_secret: str | None = None
     ad_use_nested_groups: bool = True  # resolve nested groups via LDAP_MATCHING_RULE_IN_CHAIN
     ad_tls_verify: bool = True
     ad_tls_ca_cert_file: str | None = None  # trust an internal CA without disabling verification
@@ -1489,10 +1530,19 @@ class AuthSettings(_Section):
                 "ad_enabled requires an ldaps:// ad_server (credentials go over a SIMPLE bind); "
                 "set ad_allow_insecure_ldap=true only for a trusted-network dev override"
             )
-        if self.ad_enabled and (self.ad_bind_dn is None or self.ad_bind_password is None):
+        if self.ad_enabled and self.ad_bind_dn is None:
+            raise ValueError("ad_enabled requires a service account: ad_bind_dn")
+        if (
+            self.ad_enabled
+            and self.ad_bind_password is None
+            and self.ad_bind_password_secret is None
+        ):
+            # The service-account password may come from the env (ad_bind_password via
+            # MEFOR_AUTH_AD_BIND_PASSWORD) OR a [secrets].provider reference (ad_bind_password_secret,
+            # ADR 0019 §5) — but one of them must be present, or the SIMPLE bind has no credential.
             raise ValueError(
-                "ad_enabled requires a service account: ad_bind_dn and ad_bind_password "
-                "(supply the password via MEFOR_AUTH_AD_BIND_PASSWORD)"
+                "ad_enabled requires a service-account password: set ad_bind_password (via "
+                "MEFOR_AUTH_AD_BIND_PASSWORD) or ad_bind_password_secret (a [secrets].provider reference)"
             )
         if self.kerberos_enabled and not self.ad_enabled:
             raise ValueError("kerberos_enabled requires ad_enabled (SSO resolves roles via AD)")
@@ -1705,6 +1755,7 @@ _ALERT_EVENT_TYPES = frozenset(
         "secret_rotation",  # #195b (ADR 0019 §5): a tracked secret is overdue/near-due for rotation
         "connection_error",  # #46: an outbound lane went down (connection_lost), throttled per lane
         "message_stall",  # #50: an outbound lane's oldest undelivered message aged past the threshold
+        "saturation",  # #93 (ADR 0014 amendment): a lane's backlog is RISING SUSTAINED (ingest > drain)
         "integrity_drift",  # #54: startup attestation found in-place-tampered engine module(s)
         "update_available",  # #30: a newer MessageFoundry version is pinned than is running (ADR 0026)
         "backup_failed",  # #60 (ADR 0049): a scheduled/on-demand DR backup failed (snapshot/encrypt/verify)
@@ -1723,7 +1774,7 @@ class AlertRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # --- match (all conditions must hold) ---
-    event_type: str = "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry | secret_rotation | connection_error | message_stall | integrity_drift | update_available | backup_failed
+    event_type: str = "any"  # "any" | connection_stopped | queue_buildup | storage_threshold | cert_expiry | secret_rotation | connection_error | message_stall | saturation | integrity_drift | update_available | backup_failed
     connection: str = "*"  # fnmatch glob over the connection name; "*" = all
     min_depth: int | None = Field(None, ge=1)  # queue_buildup: match only at/over this lane depth
     min_oldest_seconds: float | None = Field(
@@ -1783,6 +1834,12 @@ class AlertsSettings(_Section):
     email_use_tls: bool = True  # STARTTLS
     email_username: str | None = None
     email_password: str | None = None  # secret — supply via MEFOR_ALERTS_EMAIL_PASSWORD
+    # Connector SecretProvider reference (ADR 0019 §5, BACKLOG #196). When set AND [secrets].provider is
+    # configured, the SMTP password is resolved from that provider (e.g. a Vault KV 'path#field') at
+    # notifier construction INSTEAD of email_password. Unset (the default) → email_password is used exactly
+    # as before (byte-identical). A reference/label, not the value, so it may live in the config file.
+    # Fail-closed: a reference with no [secrets].provider, or an unresolvable one, raises at startup.
+    email_password_secret: str | None = None
     email_timeout: float = 30.0  # seconds per send
     # Egress allowlist for the SMTP host (WP-11c, parity with webhook_allowed_hosts). Empty = any.
     smtp_allowed_hosts: list[str] = []
@@ -1815,6 +1872,25 @@ class AlertsSettings(_Section):
         if isinstance(v, str):
             return [addr.strip() for addr in v.split(",") if addr.strip()]
         return v
+
+
+class SecretsSettings(_Section):
+    """``[secrets]`` — the connector **SecretProvider** selection (ADR 0019 §5, BACKLOG #196 residual).
+
+    Selects HOW a named connector credential (an AD LDAP bind password, an SMTP password, a SQL Server
+    auth password) is *sourced* — from an external secrets backend **instead of** a ``MEFOR_*`` env var.
+    It is the connector-secret twin of ``[store].key_provider`` (which sources the store DEK).
+
+    ``provider`` is one of ``none`` | ``env`` | ``vault``. **``none`` (the default) means no provider is
+    consulted** — every credential point reads its env-sourced value exactly as before (BYTE-IDENTICAL). A
+    provider is used only for a credential whose per-credential ``*_secret`` reference is set (e.g.
+    ``[auth].ad_bind_password_secret``, ``[alerts].email_password_secret``); an unset reference always
+    falls through to the env value. ``vault`` reads Vault KV v2 behind the lazy ``[vault]`` extra (the SAME
+    ``hvac`` dependency the store's Vault KeyProvider uses — no new dependency). This names a *provider*,
+    not credential material, so it is NOT a secret. Unknown/unresolvable values fail closed at the
+    consuming credential point (config/secretprovider.py)."""
+
+    provider: str = "none"
 
 
 class ClusterSettings(_Section):
@@ -2430,6 +2506,7 @@ class ServiceSettings(BaseModel):
     egress: EgressSettings = Field(default_factory=EgressSettings)
     shadow: ShadowSettings = Field(default_factory=ShadowSettings)
     alerts: AlertsSettings = Field(default_factory=AlertsSettings)
+    secrets: SecretsSettings = Field(default_factory=SecretsSettings)
     cert_monitor: CertMonitorSettings = Field(default_factory=CertMonitorSettings)
     secret_rotation: SecretRotationSettings = Field(default_factory=SecretRotationSettings)
     update_check: UpdateCheckSettings = Field(default_factory=UpdateCheckSettings)

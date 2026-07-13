@@ -383,7 +383,8 @@ password is a **secret** supplied via env (`MEFOR_AUTH_AD_BIND_PASSWORD`), never
 | `ad_user_search_base` | str | — | required when `ad_enabled` |
 | `ad_group_search_base` | str | — | base for nested-group resolution |
 | `ad_bind_dn` | str | — | service-account DN used for lookups |
-| `ad_bind_password` | secret | — | **env only** (`MEFOR_AUTH_AD_BIND_PASSWORD`) |
+| `ad_bind_password` | secret | — | **env only** (`MEFOR_AUTH_AD_BIND_PASSWORD`), or use `ad_bind_password_secret` |
+| `ad_bind_password_secret` | str | — | connector `SecretProvider` reference (ADR 0019 §5) — when set and `[secrets].provider` is configured, the bind password is resolved from that backend (e.g. a Vault KV `path#field`) instead of `ad_bind_password`. A reference, not a secret. |
 | `ad_use_nested_groups` | bool | `true` | resolve nested groups (`LDAP_MATCHING_RULE_IN_CHAIN`) |
 | `ad_tls_verify` | bool | `true` | validate the LDAPS certificate |
 | `ad_tls_ca_cert_file` | str | — | trust an internal CA for LDAPS without disabling verification |
@@ -499,6 +500,7 @@ Because the local diff is cheap and PHI-safe it is **on by default** (zero phone
 | `buildup_max_depth` | int | _unset_ | raise a `queue_buildup` alert when an outbound lane's pending depth reaches this. Unset = depth dimension off (a healthy ceiling is throughput-specific, so there's no safe default). Per-outbound `buildup=BuildupThreshold(...)` overrides. |
 | `buildup_max_oldest_seconds` | num | 300 | raise `queue_buildup` when the lane's **oldest** pending message has waited this long (a stuck/retry-forever head is the classic cause). On by default — a head stuck >5 min is a problem in any environment. Set to unset/`0`-disable via a per-outbound override. |
 | `stall_max_oldest_seconds` | num | _unset_ | raise a `message_stall` alert (Corepoint "Max Message Stall", [ADR 0014](adr/0014-alert-routing-rules.md)) when an outbound lane's **oldest undelivered message** has waited this long. **Unset (the default) = the stall alert is OFF** — deny-by-default/opt-in, because it overlaps `buildup_max_oldest_seconds`'s age dimension and would double-page if both fired. Set a threshold to turn it on; a per-outbound `stall=StallThreshold(...)` overrides it. The stall event routes through `[[alerts.rules]]` like any other ([ADR 0014](adr/0014-alerting-rules-engine.md)). |
+| `saturation_sustain_samples` | int | _unset_ | raise a `saturation` alert (BACKLOG #93, [ADR 0014 amendment](adr/0014-alerting-rules-engine.md)) when an outbound lane's pending backlog is **rising sustained** over this many consecutive samples — the queue **derivative** (ingest > drain), distinct from the absolute depth/age ceilings above. A bursty-but-**draining** lane (spike then fall) never fires; only a lane whose depth climbs monotonically does. **Unset (the default) = OFF** — deny-by-default/opt-in (it overlaps `buildup_max_oldest_seconds`'s age dimension). Floor of 2 (fewer can't tell a burst from sustained growth). Global-only for now; a per-outbound override is a documented follow-up (a `[[alerts.rules]]` `connection` glob with `transports = []` can suppress it for a known-bursty feed in the interim). |
 | `outbox_workers` | int | per-outbound | delivery concurrency (planned) |
 | `dead_letter` | enum | `keep` | `keep`/`drop`-after-N (planned) |
 
@@ -614,7 +616,8 @@ best-effort and runs on a background task, so it never blocks or hangs a deliver
 | `email_to` | list | _unset_ | recipient(s) (required for email). Via env: comma-separated `MEFOR_ALERTS_EMAIL_TO` |
 | `email_use_tls` | bool | `true` | issue STARTTLS before sending |
 | `email_username` | str | _unset_ | SMTP login user (omit for unauthenticated relays) |
-| `email_password` | str | _unset_ | **secret** — supply via `MEFOR_ALERTS_EMAIL_PASSWORD`, never the file |
+| `email_password` | str | _unset_ | **secret** — supply via `MEFOR_ALERTS_EMAIL_PASSWORD`, never the file (or use `email_password_secret`) |
+| `email_password_secret` | str | _unset_ | connector `SecretProvider` reference (ADR 0019 §5) — when set and `[secrets].provider` is configured, the SMTP password is resolved from that backend (e.g. a Vault KV `path#field`) instead of `email_password`. A reference, not a secret. |
 | `email_timeout` | num | 30 | seconds per send |
 | `smtp_allowed_hosts` | list | `[]` | egress allowlist for the SMTP host (`[]` = any); parity with `webhook_allowed_hosts` (WP-11c) |
 | `security_notifications_required` | bool | `true` | **secure-by-default gate (BACKLOG #188, ASVS 6.3.5/6.3.7).** On a **PHI** instance, if no effective out-of-band security-notification channel is configured — `[auth].notify_security_events` on **and** `email_smtp_host` + `email_from` set — `serve` **refuses to start in production** and **warns** in a non-production PHI env. Set `false` to accept the pull-only `GET /me/security-events` feed instead (audited). |
@@ -698,6 +701,24 @@ event_type = "cert_expiry"
 severity = "critical"
 transports = ["webhook"]
 ```
+
+### `[secrets]` — connector `SecretProvider` selection
+Selects **how a named connector credential is sourced** ([ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md)
+§5) — from an external secrets backend **instead of** a `MEFOR_*` env var. The connector-secret twin of
+[`[store].key_provider`](#store) (which sources the store DEK).
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `provider` | str | `none` | `none` \| `env` \| `vault`. **`none` (default) consults no provider — every credential stays env-sourced (byte-identical).** `env` resolves a reference as an env-var name; `vault` reads **Vault KV v2** behind the lazy `[vault]` / `hvac` extra (the **same** dependency the store's Vault `key_provider` uses — no new dep). Names a *provider*, not a secret. |
+
+A provider is consulted **only** for a credential whose per-credential `*_secret` reference is set — today
+`[auth].ad_bind_password_secret` and `[alerts].email_password_secret` (the wired points); the SQL Server
+store password is seam-only (managed identity is preferred there). A reference is `"<kv-path>"` or
+`"<kv-path>#<field>"` for `vault` (field defaults to `value`; KV mount from `MEFOR_SECRETS_VAULT_KV_MOUNT`,
+default `secret`); Vault address/token come from `MEFOR_SECRETS_VAULT_ADDR` / `MEFOR_SECRETS_VAULT_TOKEN`
+(falling back to hvac's `VAULT_ADDR` / `VAULT_TOKEN`). **Fail-closed:** a reference with `provider = none`,
+an unknown provider, a missing `[vault]` extra, or an unresolvable/empty secret raises at load/connect —
+never a blank credential; the value is never logged.
 
 ### `[secret_rotation]`
 Periodic **secret-rotation reminder** ([ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) §5.1) —

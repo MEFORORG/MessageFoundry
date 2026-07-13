@@ -51,6 +51,7 @@ from messagefoundry.config.models import (
     OutboundSigning,
     Priority,
     RetryPolicy,
+    SaturationThreshold,
     Schedule,
     Source,
     StallThreshold,
@@ -87,9 +88,18 @@ from messagefoundry.parsing import (
     summarize,
     validate,
 )
+from messagefoundry.parsing.binary import (
+    DOC_REF_MARKER,
+    DocRefError,
+    chunk_b64,
+    iter_obx_documents,
+    make_doc_ref,
+    reattach_documents_in_hl7,
+)
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.sharding import owner_shard_of_destination
 from messagefoundry.redaction import safe_exc, safe_text
@@ -109,7 +119,13 @@ from messagefoundry.pipeline.stage_dispatcher import (
     LaneResultKind,
     StageDispatcher,
 )
-from messagefoundry.store import MessageStatus, OutboxItem, QueueStore, Stage
+from messagefoundry.store import (
+    MessageStatus,
+    OutboxItem,
+    QueueStore,
+    Stage,
+    StreamingAttachmentsUnsupported,
+)
 from messagefoundry.store.base import pool_over_provisioned_warning
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.transports import (
@@ -231,6 +247,14 @@ def _strict_validate_timeout(ic: InboundConnection) -> float | None:
 # a multi-GB body whole. Measured on the raw BYTES pre-base64-inflation (binary) / the decoded str (text,
 # matching enforce_size_limits' len(norm) convention).
 _INGRESS_MAX_BYTES = DEFAULT_MAX_MESSAGE_BYTES
+
+
+class _StreamBudgetExceeded(Exception):
+    """A very-large-document detach was refused because it would push the aggregate in-flight streaming
+    budget ([inbound].stream_inflight_budget_bytes) over its ceiling (#149, ADR 0105 Phase 1a) — the
+    backpressure DoS guard that replaces the frame cap. Caught in the ingress path and turned into an
+    ``ERROR`` disposition + NAK (never accepted-and-dropped), exactly like an over-cap message."""
+
 
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
 # PortConflictError naming the connection + binding, instead of a bare unattributed OSError aborting the
@@ -448,7 +472,9 @@ class RegistryRunner:
         internal_error_default: InternalErrorPolicy | None = None,
         buildup_default: BuildupThreshold | None = None,
         stall_default: StallThreshold | None = None,
+        saturation_default: SaturationThreshold | None = None,
         ack_after_default: AckAfter | None = None,
+        stream_inflight_budget_bytes: int = 0,  # #149 ADR 0105: streaming-detach concurrency DoS guard (0=off)
         priority_default: Priority | None = None,
         dr_threshold: Priority | None = None,
         alert_sink: AlertSink | None = None,
@@ -484,6 +510,7 @@ class RegistryRunner:
         fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
         pooled_fusing_workers: int = 8,
         batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
+        snapshot_on_send: bool = False,  # ADR 0104: copy-on-Send at Send construction (default-OFF)
         sandbox_policy: SandboxPolicy
         | None = None,  # ADR 0087 #197: opt-in subprocess isolation (default-OFF)
         sandbox_config_source: tuple[str | None, str | None] | None = None,
@@ -529,9 +556,21 @@ class RegistryRunner:
         # connection inherits "no stall alert" unless [delivery].stall_max_oldest_seconds or a per-
         # connection stall= sets one — deny-by-default.
         self._stall_default = stall_default or StallThreshold()
+        # saturation (rising-backlog derivative) threshold default (#93, ADR 0014 amendment).
+        # SaturationThreshold() is OFF (sustain_samples=None), so a lane inherits "no saturation alert"
+        # unless [delivery].saturation_sustain_samples sets one — deny-by-default (it overlaps the
+        # buildup age dimension). Global-only for now (see settings.py); applied to every stage lane.
+        self._saturation_default = saturation_default or SaturationThreshold()
         # Global inbound ACK-timing default (from [inbound]); a connection's own ack_after overrides
         # it. Step A only supports INGEST (ACK-on-receipt); a resolved DELIVERED fails loud at start.
         self._ack_after_default = ack_after_default or AckAfter.INGEST
+        # #149 (ADR 0105 Phase 1a) very-large-document streaming: the aggregate in-flight DoS budget
+        # (bytes of over-threshold bodies concurrently mid-detach across every inbound) and its running
+        # counter. 0 = unlimited (per-connection max_message_bytes still bounds a single body). Mutated
+        # only on the event loop inside _handle_inbound's detach (no lock needed — asyncio is single-
+        # threaded and the increment/refuse/decrement never awaits across the check).
+        self._stream_inflight_budget = max(0, stream_inflight_budget_bytes)
+        self._stream_inflight_bytes = 0
         # DR run-profile (#61, ADR 0048). _priority_default is the global [delivery].priority a
         # connection inherits when it declares no priority= (resolution: per-connection override >
         # global default > built-in NORMAL). _dr_threshold is the THIS-RUN run-profile gate: when set
@@ -643,6 +682,12 @@ class RegistryRunner:
         # Same per-connection re-alert throttle for the message_stall alert (#50), kept independent so a
         # buildup alert can't suppress a stall alert (and vice-versa) on the same lane.
         self._next_stall_alert: dict[str, float] = {}
+        # Saturation (rising-backlog derivative) alert state (#93, ADR 0014 amendment). One bounded
+        # depth-sample detector per "stage:lane" (the SMALL rate history), plus an independent per-key
+        # re-alert throttle so a saturation page can't suppress buildup/stall (and vice-versa). Both keyed
+        # by "stage:name" because the same connection saturates independently at ingress/routed/outbound.
+        self._saturation_detectors: dict[str, SaturationDetector] = {}
+        self._next_saturation_alert: dict[str, float] = {}
         # Live-lookup executor (db_lookup, ADR 0010): built from registry.lookups at start/reload, None
         # when the graph declares no DatabaseLookup — in which case the transform path stays byte-identical
         # (inline call, no thread hop, no runner). The engine loop is captured at start so a handler's
@@ -739,6 +784,10 @@ class RegistryRunner:
         # (the only backend that ships the batched handoff forms) — else the async path (fail-closed,
         # byte-identical). Independent of claim_mode: batching works on the plain async handoff too.
         self._batch_handoff_statements = batch_handoff_statements
+        # ADR 0104 copy-on-Send (default-OFF); every transform-phase RunContext this runner builds carries
+        # it, so Send.__post_init__ snapshots on the split, inline, and fused paths alike. Read ONCE here —
+        # a /config/reload never re-reads it (restart to change, exactly like fuse_thread_hops).
+        self._snapshot_on_send = snapshot_on_send
         # /stats-style gauge: True when the flag was set on a fusion-capable engine but the sync
         # handoff pool could not be opened at start (command_timeout==0 / session-cap / connect fault),
         # so fusion fell back to the async path. Distinct from "ignored on a non-SS backend".
@@ -1976,6 +2025,11 @@ class RegistryRunner:
         self._simulate.clear()
         self._lane_healthy.clear()
         self._next_buildup_alert.clear()
+        self._next_stall_alert.clear()
+        # #93: drop the per-lane saturation depth-sample history + re-alert throttle so a start()-after-
+        # stop() (or a full reload teardown) begins sampling a fresh backlog curve, not a stale one.
+        self._saturation_detectors.clear()
+        self._next_saturation_alert.clear()
         self._sources.clear()
         # B12 (ADR 0061): drop the per-lane wake Events now that every worker is cancelled+gathered. Safe
         # here (post-teardown) — NEVER clear/delete lane Events mid-run (a removed-but-draining worker and
@@ -2733,8 +2787,12 @@ class RegistryRunner:
         # HL7-over-HTTP: parse (+ optional strict validate) before committing, recording ERROR on a
         # malformed message exactly as MLLP does — but the synchronous response is the source's 202/4xx,
         # not an HL7 ACK frame (the HL7-ACK-over-HTTP / SOAP-reply path is the deferred ADR 0013 seam).
+        # #149 (ADR 0105 Phase 1a): mirror the MLLP path — a streaming inbound raises the peek ceiling to
+        # its max_message_bytes and downgrades whole-body strict validation to header-only over threshold.
+        peek_max_bytes = ic.max_message_bytes or DEFAULT_MAX_MESSAGE_BYTES
+        streaming_over = self._streaming_over_threshold(ic, text)
         try:
-            peek = Peek.parse(text)
+            peek = Peek.parse(text, max_bytes=peek_max_bytes)
         except HL7PeekError as exc:
             await self.store.record_received(
                 channel_id=ic.name,
@@ -2744,7 +2802,17 @@ class RegistryRunner:
                 source_type=src,
             )
             return None
-        if ic.validation.strict:
+        if ic.validation.strict and streaming_over:
+            # Whole-body strict validation is downgraded to header-only over the streaming threshold (the
+            # MSH structure Peek.parse validated) — see _handle_inbound for the rationale.
+            log.info(
+                "strict validation downgraded to header-only for streaming inbound %r (%d bytes >= "
+                "threshold %d)",
+                ic.name,
+                len(text),
+                ic.stream_threshold_bytes,
+            )
+        elif ic.validation.strict:
             timeout = _strict_validate_timeout(ic)
             try:
                 # wait_for frees THIS listener path but cannot kill the to_thread worker (no thread
@@ -2766,16 +2834,90 @@ class RegistryRunner:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
                 await self._record(ic, peek, text, MessageStatus.ERROR, error=persisted)
                 return None
+        # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
+        # failure records ERROR + returns None (HTTP maps None to a 202-without-id; the disposition is
+        # recorded) — never accepted-and-dropped.
+        skeleton = text
+        attachment_refs: list[str] = []
+        if streaming_over:
+            try:
+                skeleton, attachment_refs = await self._detach_documents(ic, text)
+            except (_StreamBudgetExceeded, StreamingAttachmentsUnsupported, DocRefError) as exc:
+                await self._record(
+                    ic,
+                    peek,
+                    text,
+                    MessageStatus.ERROR,
+                    error=f"streaming detach failed: {safe_exc(exc)}",
+                )
+                return None
         mid = await self.store.enqueue_ingress(
             channel_id=ic.name,
-            raw=text,
+            raw=skeleton,
             control_id=peek.control_id,
             message_type=peek.message_type,
             source_type=src,
             summary=summarize(peek) or None,
+            attachment_refs=attachment_refs or None,
         )
         self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
         return mid
+
+    def _streaming_over_threshold(self, ic: InboundConnection, text: str) -> bool:
+        """Whether ``ic`` is a streaming inbound (``stream_threshold_bytes`` set) and ``text`` is at/above
+        that threshold — the gate for the over-threshold detach path (#149, ADR 0105 Phase 1a). Below
+        threshold or unset ⇒ False ⇒ the byte-identical no-detach fast path (and no strict downgrade)."""
+        threshold = ic.stream_threshold_bytes
+        return threshold is not None and len(text) >= threshold
+
+    async def _detach_documents(self, ic: InboundConnection, text: str) -> tuple[str, list[str]]:
+        """Detach every oversized OBX-5 ED base64 document from an over-threshold HL7 body into the
+        store's content-addressed attachment substrate and return ``(skeleton_text, attachment_refs)``
+        (#149, ADR 0105 Phase 1a, Approach B — VERBATIM).
+
+        Reuses the strip-in-OBX mechanism through the parsed :class:`Message` model, but the value lifted
+        out is stored **byte-for-byte** (no decode/encode): ``put_attachment`` seals the exact base64
+        slices and content-addresses them, and the OBX-5.5 value is replaced by the small
+        ``mfdoc:v1:ref:<sha256>:<content_type>`` handle so the pipeline carries only the small skeleton.
+        The attachment chunks commit here (at refcount 0); the caller then commits the referencing
+        skeleton row and increfs each ref in the SAME transaction (``enqueue_ingress(attachment_refs=…)``)
+        — the two-object commit. A crash between the two leaves the attachment orphaned at refcount 0 for
+        the startup sweep to reclaim (no ACK was sent, so the sender resends and content-addressing dedups
+        the resend). If the message carries no qualifying document the original ``text`` is returned
+        unchanged with no refs (byte-identical, no attachment row).
+
+        Raises :class:`_StreamBudgetExceeded` when the aggregate in-flight budget would be exceeded, and
+        :class:`~messagefoundry.store.StreamingAttachmentsUnsupported` on a backend without streaming
+        support (SQL Server / Postgres in Phase 1a) — both are turned into an ``ERROR``/NAK by the
+        caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
+        Phase-C); the budget bounds how many such buffers can be concurrent."""
+        size = len(text)
+        budget = self._stream_inflight_budget
+        if budget and self._stream_inflight_bytes + size > budget:
+            raise _StreamBudgetExceeded(
+                f"streaming in-flight budget exceeded ({self._stream_inflight_bytes} + {size} > "
+                f"{budget} bytes); refusing the detach (backpressure)"
+            )
+        # Reserve the budget for the whole detach window (buffer + per-chunk seal); release in finally the
+        # instant the attachment(s) are durable and the skeleton is small — the peak this bounds is passed.
+        self._stream_inflight_bytes += size
+        try:
+            message = Message.parse(text)
+            refs: list[str] = []
+            detached = 0
+            for occ, verbatim_b64, content_type in iter_obx_documents(message):
+                ref = await self.store.put_attachment(chunk_b64(verbatim_b64), content_type)
+                message.set("OBX-5.5", make_doc_ref(ref, content_type), occurrence=occ)
+                if ref not in refs:
+                    refs.append(ref)
+                detached += 1
+            if detached == 0:
+                # An over-threshold body with no detachable document (e.g. a large non-ED message): keep
+                # it byte-identical — no attachment, no skeleton re-encode divergence, no ref to incref.
+                return text, []
+            return message.encode(), refs
+        finally:
+            self._stream_inflight_bytes -= size
 
     async def _handle_inbound(self, ic: InboundConnection, raw: bytes) -> str | None:
         ack_mode = ic.ack_mode
@@ -2884,8 +3026,14 @@ class RegistryRunner:
             self._wake_lane(Stage.INGRESS, ic.name)  # B12: wake only this inbound's router lane
             return None
 
+        # #149 (ADR 0105 Phase 1a): a streaming inbound raises the peek/total-body ceiling to its
+        # per-connection max_message_bytes so a large document is admitted (then detached under the cap);
+        # a non-streaming inbound keeps the engine 16 MiB default. A body over the resolved cap raises
+        # HL7PeekError here → recorded ERROR + NAK AR (the max_message_bytes rejection).
+        peek_max_bytes = ic.max_message_bytes or DEFAULT_MAX_MESSAGE_BYTES
+        streaming_over = self._streaming_over_threshold(ic, text)
         try:
-            peek = Peek.parse(text)
+            peek = Peek.parse(text, max_bytes=peek_max_bytes)
         except HL7PeekError as exc:
             parse_err = f"parse error: {safe_exc(exc)}"
             mid = await self.store.record_received(
@@ -2902,7 +3050,20 @@ class RegistryRunner:
                 )
             return ack
 
-        if ic.validation.strict:
+        if ic.validation.strict and streaming_over:
+            # #149 (ADR 0105 Phase 1a): whole-body hl7apy strict validation cannot complete over the
+            # streaming threshold (the detached document is opaque and the full parse would materialize
+            # it), so it is DOWNGRADED to header-only — the MSH structure Peek.parse already validated
+            # above. Not a regression: ED-document feeds aren't whole-body strict-validated today. Below
+            # threshold, full strict validation still runs (byte-identical) via the branch below.
+            log.info(
+                "strict validation downgraded to header-only for streaming inbound %r (%d bytes >= "
+                "threshold %d)",
+                ic.name,
+                len(text),
+                ic.stream_threshold_bytes,
+            )
+        elif ic.validation.strict:
             # hl7apy validation is CPU-bound (full structure/cardinality parse) — run it off the event
             # loop so a strict feed can't stall every other listener, worker, and API call (review M-11).
             timeout = _strict_validate_timeout(ic)
@@ -2963,20 +3124,57 @@ class RegistryRunner:
                     )
                 return ack
 
+        # #149 (ADR 0105 Phase 1a): an over-threshold streaming inbound detaches its oversized OBX-5 ED
+        # documents VERBATIM into the attachment substrate BEFORE the ingress commit, so the pipeline
+        # carries only the small skeleton + a `mfdoc:v1:ref:` handle. This runs AFTER the synchronous
+        # header parse/validate (a malformed header already NAK'd above) and BEFORE the commit/ACK, so a
+        # detach failure (budget/backpressure or an unsupported backend) is a synchronous ERROR + NAK AE
+        # — the message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store.
+        skeleton = text
+        attachment_refs: list[str] = []
+        if streaming_over:
+            try:
+                skeleton, attachment_refs = await self._detach_documents(ic, text)
+            except (
+                _StreamBudgetExceeded,
+                StreamingAttachmentsUnsupported,
+                DocRefError,
+            ) as exc:
+                detach_err = f"streaming detach failed: {safe_exc(exc)}"
+                mid = await self._record(ic, peek, text, MessageStatus.ERROR, error=detach_err)
+                ack = (
+                    build_ack(peek, code="AE", text="streaming detach failed", ack_mode=ack_mode)
+                    if reply
+                    else None
+                )
+                if ack is not None and self._capture_ack_enabled(ic):
+                    await self._capture_ack(
+                        mid,
+                        ic.name,
+                        ack_code="AE",
+                        ack_phase="ingest",
+                        ack_body=None,
+                        detail=detach_err,
+                    )
+                return ack
+
         # ACK-on-receipt (staged pipeline, ADR 0001 Step A): persist the raw message durably to the
         # ingress stage, then ACK. Routing/transform/delivery run AFTER the ACK in the ingress worker,
         # so a slow/hung router or outbound never stalls intake — and a router/handler failure no
         # longer NAKs the sender (it becomes a logged ERROR/dead-letter at the ingress stage). Decode,
         # parse, and strict validation above stay synchronous and still NAK, preserving the partner
         # contract for a malformed message. ack_after='delivered' (defer the ACK) is rejected at
-        # wiring in Step A, so this is always ACK-on-ingest.
+        # wiring in Step A, so this is always ACK-on-ingest. Under #149 the persisted body is the
+        # SKELETON and the attachment increfs commit in the SAME transaction (the two-object commit), so
+        # the AA ACK below still fires only after the whole document is durable.
         mid = await self.store.enqueue_ingress(
             channel_id=ic.name,
-            raw=text,
+            raw=skeleton,
             control_id=peek.control_id,
             message_type=peek.message_type,
             source_type=src,
             summary=summarize(peek) or None,
+            attachment_refs=attachment_refs or None,
         )
         self._wake_lane(
             Stage.INGRESS, ic.name
@@ -3137,6 +3335,39 @@ class RegistryRunner:
             return None
         return {str(k): v for k, v in loaded.items() if isinstance(v, str)}
 
+    async def _hydrate_payload(self, payload: str) -> str:
+        """Re-attach any detached very-large document into ``payload`` at the terminal egress, just
+        before it hits the wire (#149, ADR 0105 Phase 1b). A delivery/skeleton row carries a small
+        ``mfdoc:v1:ref:`` handle in ``OBX-5.5``; splice the stored VERBATIM base64 back in (Approach B —
+        no decode/encode) so the partner receives the full inline document (Epic's MLLP MDM receiver does
+        not cap the frame). A payload with **no** handle is returned byte-identical after a single
+        substring check — the below-threshold / no-detach / Handler-built (never-detached) delivery path
+        is untouched, and no store read happens.
+
+        Hydration is a **pure READ** off the immutable, content-addressed attachment; it does **not**
+        decref (the message may fan out to several outbounds and is replayable — the refcount is released
+        only on retention/purge, never on delivery), so every send and every retry re-derives the
+        IDENTICAL frame. **Fail-loud:** a missing / GC'd attachment (or a backend without streaming
+        support) is turned into a :class:`DeliveryError` so the row takes the normal ERROR/retry path and
+        the connector **never** receives an un-hydrated handle (which would deliver ``mfdoc:v1:ref:…``
+        into the partner's ``OBX-5.5`` = silent corruption)."""
+        if DOC_REF_MARKER not in payload:
+            return payload  # no detached document → byte-identical, no store read (the common path)
+
+        async def _reader(sha256: str) -> str:
+            # The store read runs off the event loop (aiosqlite), chunk-by-chunk, and the pieces
+            # concatenate to the exact verbatim OBX-5.5 base64 the sender sent (Approach B).
+            return "".join([chunk async for chunk in self.store.read_attachment(sha256)])
+
+        try:
+            return await reattach_documents_in_hl7(payload, _reader)
+        except (DocRefError, KeyError, StreamingAttachmentsUnsupported) as exc:
+            # A missing/GC'd attachment (KeyError), a malformed handle (DocRefError), or an unsupported
+            # backend — surface as a retryable DeliveryError (the message reached NEITHER wire nor peer),
+            # exactly like the encoding-override / raw-separators pre-send failures. The row re-pends with
+            # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
+            raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
+
     async def _process_delivery_item(
         self, name: str, item: OutboxItem
     ) -> tuple[_ItemOutcome, float | None]:
@@ -3201,17 +3432,22 @@ class RegistryRunner:
                 # the partner dial + write + wait-for-ACK — a prime suspect for the ~83 ms ceiling that
                 # loopback can't reproduce. Timed only when the bench lever is on (else `_send_t0 = 0`,
                 # no perf_counter). See the DeliveryPhaseTiming note.
+                # #149 (ADR 0105 Phase 1b): re-attach any detached very-large document VERBATIM just
+                # before the send (BEFORE the send timer — a store read, not the partner round-trip). A
+                # payload with no handle is returned byte-identical; a missing attachment raises a
+                # DeliveryError (caught below → retry), so a handle NEVER reaches the connector.
+                payload = await self._hydrate_payload(item.payload)
                 _send_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
                 if getattr(connector, "consumes_metadata", False):
                     # #68: an opted-in outbound (REST/FHIR with dynamic_headers) gets this message's
                     # user-metadata bag so it can project http.header.* entries onto the request. The
                     # read touches only the small metadata column (never the raw body).
                     metadata = await self._user_metadata_for(item.message_id)
-                    response = await connector.send(item.payload, metadata=metadata)
+                    response = await connector.send(payload, metadata=metadata)
                 else:
                     # Default: NO metadata read and the historical send(payload) call shape —
                     # byte-identical for every non-consuming connector.
-                    response = await connector.send(item.payload)
+                    response = await connector.send(payload)
                 if self._delivery_phase_timing:
                     self._delivery_phase_stats.record_send_ack(time.perf_counter_ns() - _send_t0)
         except NegativeAckError as exc:
@@ -3415,8 +3651,15 @@ class RegistryRunner:
         # the head is PARSED, for the BHS separators + the BHS-11 control id.
         try:
             control_id = Message.parse(head.payload).control_id or head.id  # FIFO-aligned, stable
+            # #149 (ADR 0105 Phase 1b): re-attach each member's detached document VERBATIM before framing
+            # the envelope, so a batched streaming feed delivers full inline documents (never a raw
+            # mfdoc:v1:ref: handle). Members with no handle are byte-identical; a missing attachment raises
+            # a DeliveryError (caught below → the whole batch re-pends), so the peer never sees a handle.
+            hydrated: list[Message | str] = [
+                await self._hydrate_payload(it.payload) for it in items
+            ]
             envelope = encode_batch(
-                [it.payload for it in items],
+                hydrated,
                 control_id=control_id,
                 timestamp=_hl7_batch_timestamp(head.created_at),
             )
@@ -3726,6 +3969,7 @@ class RegistryRunner:
                     active_environment=self._active_environment,
                     ingest_time=item.created_at,
                     message_id=item.message_id,  # #162: key the unmapped-capture drain per message
+                    snapshot_on_send=self._snapshot_on_send,  # ADR 0104 copy-on-Send (inline path)
                 )
                 with run_contexts(inline_rc, phase="transform"):
                     # ADR 0087 (#197): sandbox=subprocess marshals the Handler to the per-inbound
@@ -4009,6 +4253,7 @@ class RegistryRunner:
                 active_environment=self._active_environment,
                 ingest_time=item.created_at,
                 message_id=item.message_id,  # #162: key the unmapped-capture drain per message
+                snapshot_on_send=self._snapshot_on_send,  # ADR 0104 copy-on-Send (split path)
             )
             with run_contexts(transform_rc, phase="transform"):
                 # Run the Handler's transform OFF the event loop UNCONDITIONALLY (SEC-013,
@@ -4216,6 +4461,7 @@ class RegistryRunner:
             active_environment=self._active_environment,
             ingest_time=item.created_at,
             message_id=item.message_id,  # #162: key the unmapped-capture drain per message
+            snapshot_on_send=self._snapshot_on_send,  # ADR 0104 copy-on-Send (fused path)
         )
         content_type = ic.content_type.value
         return await loop.run_in_executor(
@@ -4330,6 +4576,12 @@ class RegistryRunner:
         # trips buildup. (INGRESS/ROUTED lanes never appear in _outbound_paused; the stage guard is belt.)
         if stage == Stage.OUTBOUND.value and name in self._outbound_paused:
             return
+        # #93 (ADR 0014 amendment): the saturation (rising-backlog derivative) check rides the SAME
+        # per-lane tick as buildup and shares the paused guard above, but is INDEPENDENT of the buildup
+        # ceiling — it fires on rising depth even when the absolute depth/age ceiling is not crossed
+        # (a lane becoming overloaded before it hits the ceiling). Off by default (zero cost — see the
+        # method's early return), so this adds nothing to the hot path unless an operator opts in.
+        await self._maybe_alert_saturation(name, stage=stage)
         threshold = threshold or self._buildup.get(name) or self._buildup_default
         if threshold.max_depth is None and threshold.max_oldest_seconds is None:
             return  # buildup alerting disabled for this lane
@@ -4353,6 +4605,55 @@ class RegistryRunner:
             self._alert_sink.queue_buildup(name, depth=depth, oldest_age_seconds=oldest_age or 0.0)
         except Exception:
             log.exception("alert sink raised on queue_buildup for %r", name)
+
+    async def _maybe_alert_saturation(
+        self, name: str, *, stage: str = Stage.OUTBOUND.value
+    ) -> None:
+        """Raise a ``saturation`` alert if a lane's backlog is **rising sustained** (#93, ADR 0014
+        amendment) — the DERIVATIVE signal, distinct from :meth:`_maybe_alert_buildup`'s absolute
+        depth/age ceiling. A bounded per-``(stage, lane)`` :class:`SaturationDetector` samples the
+        pending depth; a lane whose depth climbs monotonically over the window trips (sustained rising
+        depth ⇔ ingest > drain by queue conservation), while a bursty-but-DRAINING lane (spike then
+        fall) does not — the whole point.
+
+        **Deny-by-default and zero-cost when off:** ``sustain_samples is None`` (the default) returns
+        before any store read, so a deployment that does not opt in pays nothing on the buildup tick.
+        When on, it does its own cheap ``pending_depth`` COUNT+MIN (the buildup read is separate and
+        gated on the buildup threshold, which may itself be off). The re-alert is throttled per
+        ``(stage, connection)`` (``_BUILDUP_REALERT_SECONDS``) independently of buildup/stall; a sink
+        must never raise (contract), but we guard so an alerting bug can't kill the worker."""
+        # A deliberately-paused outbound's backlog grows by design — never false-page it (the shared
+        # buildup caller already guards this, but re-guard so a direct call is safe too).
+        if stage == Stage.OUTBOUND.value and name in self._outbound_paused:
+            return
+        sustain = self._saturation_default.sustain_samples
+        if sustain is None:
+            return  # saturation alerting disabled (deny-by-default) — no store read, no cost
+        key = f"{stage}:{name}"
+        now = time.time()
+        depth, _oldest = await self.store.pending_depth(name, stage=stage)
+        detector = self._saturation_detectors.get(key)
+        if detector is None:
+            detector = SaturationDetector(sustain)
+            self._saturation_detectors[key] = detector
+        # Sample EVERY tick (even when throttled) so the depth window stays continuous; the throttle
+        # only gates the notification, never the sampling.
+        signal = detector.observe(now, depth)
+        if signal is None:
+            return  # backlog not rising sustained (flat, falling, or window not yet primed)
+        if now < self._next_saturation_alert.get(key, 0.0):
+            return  # re-alert throttled — same lane paged too recently
+        self._next_saturation_alert[key] = now + _BUILDUP_REALERT_SECONDS
+        try:
+            self._alert_sink.saturation_rising(
+                name,
+                stage=stage,
+                depth=signal.depth,
+                depth_start=signal.depth_start,
+                growth_per_second=signal.growth_per_second,
+            )
+        except Exception:
+            log.exception("alert sink raised on saturation for %r", name)
 
     async def _non_owned_lane_watchdog(self) -> None:
         """Sharded-only (ADR 0073): periodically run the buildup/stall checks over the outbound
