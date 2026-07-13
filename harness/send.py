@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from messagefoundry.console.widgets import ConfigurableTable
+from harness._console_widgets import ConfigurableTable
 from messagefoundry.generators import _core
 from messagefoundry.generators import all_types  # noqa: F401  (registers the built-in message types)
 from harness.mllp import SendItem, SendResult, SendWorker

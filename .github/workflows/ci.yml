@@ -149,7 +149,7 @@ jobs:
           # + the browser ops console as a second editable wheel (Option B) so the moved /ui tests
           # (tests/test_webui.py etc. now import messagefoundry_webconsole) run on this full-suite leg.
           # It is NOT a published extra yet (would break uv lock), so install it by path.
-          uv pip install --system -e ".[dev,console,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+          uv pip install --system -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
 
       # ruff (lint + format) and mypy are PLATFORM-INDEPENDENT results — a ruff/format outcome is
       # identical on every OS, and mypy's platform-specific branches are covered by running it for

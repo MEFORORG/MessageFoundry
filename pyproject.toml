@@ -7,6 +7,17 @@ build-backend = "hatchling.build"
 [tool.hatch.version]
 path = "messagefoundry/__init__.py"
 
+# sdist file selection — an ALLOWLIST, not hatchling's default whole-repo VCS sweep. WITHOUT this,
+# `python -m build` packs every git-tracked file (docs/, tests/, scripts/, CLAUDE.md, .claude/ …) into the
+# sdist, and release.yml uploads that sdist to PUBLIC PyPI — which shipped the private security-posture
+# docs (docs/security/*, docs/reviews/*, Secure_Development_Standards.md — the publish-denylist set) on
+# every release 0.1.0..0.2.15. The mirror's leak gate (publish.ps1 + scan_forbidden.py) governs only the
+# git mirror, NOT the PyPI path, so the sdist is pinned here to the package + its metadata. (The wheel was
+# already package-only.) pyproject.toml + PKG-INFO are always added by hatchling; LICENSE/NOTICE also ship
+# via [project].license-files. release.yml has a belt-and-suspenders "sdist is package-only" gate.
+[tool.hatch.build.targets.sdist]
+only-include = ["messagefoundry", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"]
+
 [project]
 name = "messagefoundry"
 dynamic = ["version"]  # single-sourced from messagefoundry/__init__.py (see [tool.hatch.version])
@@ -57,11 +68,15 @@ Repository = "https://github.com/MEFORORG/MessageFoundry"
 Issues = "https://github.com/MEFORORG/MessageFoundry/issues"
 
 [project.optional-dependencies]
-console = [
-    "PySide6>=6.6",         # admin console (LGPL — OSS-distributable)
-    "keyring>=24.0",        # OS-keyring storage for the console's auth token
-    "httpx>=0.27",          # the console's runtime HTTP client to the engine API (console/client.py) — a [console]-only install needs it
-    "truststore>=0.10",     # verify the engine's TLS cert against the OS trust store (enterprise/AD-CS roots) so a remote console needs no per-PC CA wrangling (console/client.py)
+# The standalone PySide6 test HARNESS (harness/ — synthetic send/receive/load/failover GUI). The
+# desktop admin console was retired in favour of the web console (BACKLOG #103, ADR 0032 retired); the
+# harness kept the reusable Qt view widgets (rehomed to harness/_console_widgets.py + _login.py) and is
+# now the sole consumer of PySide6. keyring was dropped with the console (OS-token cache was
+# launcher-only). httpx/truststore back the shared apiclient the harness monitor uses.
+harness = [
+    "PySide6>=6.6",         # the harness GUI (LGPL — OSS-distributable)
+    "httpx>=0.27",          # the harness monitor's HTTP client to the engine API (via messagefoundry.apiclient)
+    "truststore>=0.10",     # verify the engine's TLS cert against the OS trust store (enterprise/AD-CS roots) so a remote harness monitor needs no per-PC CA wrangling
 ]
 # EXPERIMENTAL SQL Server store backend. Also needs the Microsoft ODBC Driver 18 for SQL Server
 # installed at the OS level (not pip-installable). Lazy-imported, so SQLite-only installs skip it.
@@ -147,18 +162,11 @@ dev = [
     "pytest-rerunfailures>=16.0",  # in-run auto-retry for the known harness-monitor timing flake: a single flake occurrence self-heals instead of reding the whole matrix + blocking auto-merge
     "ruff>=0.4",
     "mypy>=1.10",
-    "httpx>=0.27",          # ASGI test client for the API + harness/load polling (console ships its own copy via [console])
+    "httpx>=0.27",          # ASGI test client for the API + harness/load polling (the harness GUI ships its own copy via [harness])
 ]
 
 [project.scripts]
 messagefoundry = "messagefoundry.__main__:main"
-
-# Windowed launcher for the admin console (CONSOLE-UX). gui-scripts produces a pythonw-backed
-# messagefoundry-console.exe in <venv>\Scripts, so double-clicking it (or a shortcut) opens the GUI
-# with no flashing console window — unlike [project.scripts]. install-console-shortcut.ps1 drops a
-# Desktop/Start-Menu .lnk pointing at this exe so operators never touch a command line.
-[project.gui-scripts]
-messagefoundry-console = "messagefoundry.console.__main__:main"
 
 # The offline common-password screening corpus (messagefoundry/auth/data/, loaded via
 # importlib.resources) ships in the wheel automatically: hatchling packages every file under the

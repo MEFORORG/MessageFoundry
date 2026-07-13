@@ -18,7 +18,7 @@ import pytest
 
 from messagefoundry.config.settings import StoreSettings, _FILE_SECRET_KEYS
 from messagefoundry.store.base import resolve_active_key
-from messagefoundry.store.crypto import PREFIX, CipherError, make_cipher
+from messagefoundry.store.crypto import PREFIX, CipherError, cipher_info, make_cipher
 from messagefoundry.store.keyprovider import (
     KNOWN_PROVIDERS,
     AutoKeyProvider,
@@ -275,3 +275,68 @@ def test_wrong_provider_key_fails_loudly() -> None:
     other = SimpleNamespace(active_key=lambda: KEY_B, retired_keys=lambda: [])
     with pytest.raises(CipherError):
         make_cipher(other.active_key(), other.retired_keys()).decrypt(token)
+
+
+# --- CRYPTO-3: cross-provider active_key_id parity + same mfenc:v1 fixture ---
+
+
+class _FixedExternalProvider:
+    """Stands in for a future aws_kms/azure_kv/gcp_kms/vault/pkcs11 provider: envelope-decrypts a
+    wrapped DEK and surfaces the SAME base64 DEK bytes the built-ins do, with NO re-encoding (the Vault
+    'return plaintext with no re-encoding' contract, keyprovider_vault.py). A provider that silently
+    re-encoded/normalized/double-base64'd the DEK here is exactly what this parity test must catch."""
+
+    def __init__(self, active: str | None, retired: list[str] | None = None) -> None:
+        self._active, self._retired = active, list(retired or [])
+
+    def active_key(self) -> str | None:
+        return self._active
+
+    def retired_keys(self) -> list[str]:
+        return self._retired
+
+
+def test_cross_provider_active_key_id_parity_same_mfenc_v1_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CRIT-1 root-of-trust pin (ADR 0019 byte-identical): the built-in auto/env/dpapi providers AND a
+    faked external HSM/KMS provider, all provisioning the SAME base64 DEK, agree on a single
+    ``active_key_id`` fingerprint and each decrypts one shared ``mfenc:v1`` fixture with NO rotation.
+    Guards a future provider (or a change to ``_fingerprint``/``make_cipher``) that silently re-encodes,
+    normalizes, or double-base64s the DEK -- which would change which key is 'active' or orphan existing
+    rows."""
+
+    # `dpapi` is the only provider that reads a file -- monkeypatch the DPAPI branch to hand back KEY_A
+    # (Windows-only CryptUnprotectData avoided, matching this file's existing pattern at lines 82/112).
+    monkeypatch.setattr("messagefoundry.secrets_dpapi.load_protected_key", lambda path: KEY_A)
+
+    # Every provider is pointed at the SAME key (KEY_A); each sources it via a different mechanism.
+    providers: list[KeyProvider] = [
+        AutoKeyProvider(StoreSettings(encryption_key=KEY_A)),
+        EnvKeyProvider(StoreSettings(encryption_key=KEY_A)),
+        DpapiKeyProvider(StoreSettings(encryption_key_file="C:/x/key.dpapi")),
+        _FixedExternalProvider(active=KEY_A),
+    ]
+    for provider in providers:
+        assert isinstance(provider, KeyProvider)  # each structurally satisfies the seam
+
+    # One mfenc:v1 row written under KEY_A -- the fixture every provider must decrypt unchanged.
+    fixture = make_cipher(KEY_A).encrypt(ADT)
+    assert fixture.startswith(PREFIX)  # the FROZEN default v1 writer
+
+    fingerprints: list[str | None] = []
+    for provider in providers:
+        cipher = make_cipher(provider.active_key(), provider.retired_keys())
+        fingerprints.append(cipher_info(cipher).active_key_id)
+        assert cipher.decrypt(fixture) == ADT  # SAME fixture, NO rotation
+
+    # Identical, non-None fingerprint across all four providers -- the root-of-trust invariant.
+    assert len(set(fingerprints)) == 1
+    assert fingerprints[0] is not None
+
+    # Negative guard so the parity is not vacuous: a provider handing back a DIFFERENT key (KEY_B)
+    # yields a DIFFERENT fingerprint AND cannot decrypt the KEY_A fixture (the AEAD tag still guards).
+    other = make_cipher(_FixedExternalProvider(active=KEY_B).active_key())
+    assert cipher_info(other).active_key_id != fingerprints[0]
+    with pytest.raises(CipherError):
+        other.decrypt(fixture)

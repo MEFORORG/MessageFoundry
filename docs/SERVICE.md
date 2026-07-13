@@ -316,20 +316,20 @@ icacls "C:\ProgramData\MessageFoundry\logs" /inheritance:r `
   /grant "Administrators:(OI)(CI)F" "NT SERVICE\MessageFoundry:(OI)(CI)M"
 ```
 
-## Admin console (optional desktop shortcut)
+## Admin console (in a browser)
 
-This service is **headless**. Operators watch and run it from the **PySide6 admin console** — a
-separate desktop app (not part of the service) that connects over the localhost API. Give them a
-double-click icon instead of a command line:
+This service is **headless**. Operators watch and run it from the **browser web console** served
+same-origin at `/ui` (not part of the service runtime — a separate, version-matched wheel the engine
+mounts in-process):
 
 ```powershell
-pip install "messagefoundry[console]"            # into the engine venv
-.\scripts\console\install-console-shortcut.ps1   # Desktop + Start-Menu icon (per-user; -AllUsers for machine-wide)
+pip install "messagefoundry-webconsole"          # into the engine venv
+# set [api].serve_ui = true in the service settings, then (re)start the service
 ```
 
-It launches the windowed `messagefoundry-console.exe`, connects to this service on
-`http://127.0.0.1:8765`, and prompts for sign-in. See
-[INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console".
+Browse to this service's `/ui` (`http://127.0.0.1:8765/ui`) and sign in. See
+[INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
+console was retired — BACKLOG #103.)
 
 ## High-delivery-rate TCP tuning (engine host)
 

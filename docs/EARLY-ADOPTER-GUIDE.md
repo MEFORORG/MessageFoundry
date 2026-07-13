@@ -51,7 +51,7 @@ default, with payload-agnostic support for other formats — and its routing and
   connections.
 
 The engine is a **headless asyncio service** (FastAPI/uvicorn) that owns a durable message store and
-supervises one worker set per connection. A separate **PySide6 console** and a **VS Code extension**
+supervises one worker set per connection. A browser **web console** (`/ui`) and a **VS Code extension**
 operate it over a localhost HTTP API. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full model.
 
 **Who should pilot it now.** Teams who want a Python-native, open-source alternative to Mirth/Corepoint
@@ -154,7 +154,8 @@ pip install "messagefoundry==0.1.0"        # pin the exact engine version (core 
 ```
 
 `messagefoundry==0.1.0` pulls only the **core runtime** — what a headless engine needs. Add extras
-(§4.2) for the desktop console, a server-DB backend, or SFTP.
+(§4.2) for the PySide6 test harness, a server-DB backend, or SFTP; the browser web console installs
+as its own `messagefoundry-webconsole` wheel.
 
 > ⚠️ **Early access.** `0.1.0` is an **Early Access** release on public PyPI — feature-complete and
 > test-validated, but the external review + pen test that gate a security-certified **v1.0** land after
@@ -628,9 +629,8 @@ message, and confirm the **"wiring started"** banner in `service.out.log`.
   these to webhook/email — §7).
 - **`service.err.log`** — watch it.
 
-> Note: the desktop console polls the API on its main thread, so it can freeze on a slow/remote call,
-> and it has no Dead-Letters/Alerts GUI page yet. Use the **CLI/API** for dead-letter triage and alert
-> management.
+> Note: the browser web console (`/ui`) surfaces dispositions, dead-letters, and alerts; the **CLI/API**
+> remain available for scripted dead-letter triage and alert management.
 
 **Log management:** logs land under `<DataDir>\logs` via NSSM. Configure rotation, keep the level at
 `INFO` or above (DEBUG can leak PHI — §6), treat `service.out/err.log` as **potential-PHI artifacts**

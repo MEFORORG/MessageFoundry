@@ -43,10 +43,10 @@ maintainer.)
    ```powershell
    py -3.14 -m venv .venv
    .\.venv\Scripts\Activate.ps1
-   pip install -e ".[dev,console]"
+   pip install -e ".[dev,harness]"
    ```
 3. **Add a test for new behavior.**
-4. **Run the gates** — a change isn't ready until these pass (the console/Qt tests need the
+4. **Run the gates** — a change isn't ready until these pass (the PySide6 harness/Qt tests need the
    offscreen platform):
    ```powershell
    ruff check .

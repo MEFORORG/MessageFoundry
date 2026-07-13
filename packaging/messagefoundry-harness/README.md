@@ -14,7 +14,7 @@ for the clustered SQL Server / PostgreSQL store.
 ## Install
 
 ```bash
-pip install "messagefoundry-harness==<version>"   # pulls messagefoundry[console] (engine + API client + PySide6)
+pip install "messagefoundry-harness==<version>"   # pulls messagefoundry[harness] (engine + API client + PySide6)
 ```
 
 ## Use

@@ -6,6 +6,23 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-13 — Early Access
+
+Highlights since 0.2.15 — streaming attachments end-to-end, a copy-on-Send message model, richer
+connectivity, and a run of security hardening. (Concise highlights; the git history is the full change set.)
+
+### Added
+- **Streaming large attachments end-to-end** (#149, ADR 0105) — very-large OBX-5 documents are detached from
+  the message skeleton at ingress and streamed through routing → transform → delivery on all three stores
+  (SQLite / SQL Server / Postgres), with an operator read/download surface.
+- **Copy-on-Send message model** (ADR 0104) — `Send` snapshots the message at construction (opt-in
+  `[pipeline].snapshot_on_send`), plus `Message.copy()` and a recognition-first `message_type_of(accepts=)`
+  predicate; and in the IDE, a point-and-click HL7 field picker and the Steps-view authoring palette
+  (ADR 0103 / 0106).
+- **Connectivity** — generic HTTP auth (OAuth 2.0 client-credentials + Digest) and HTTP response-header
+  capture (#154, #65); a connector `SecretProvider` seam with a HashiCorp Vault backend (#196).
+- **Monitoring** — an engine-wide KPI roll-up with a saturation-derivative alert and DB-pool metrics (#93).
+
 ### Changed
 - **pipeline: `batch_handoff_statements` now defaults ON on SQL Server** ([ADR 0075](docs/adr/0075-per-hop-sql-statement-batching.md))
   — per-hop SQL statement batching (a **distance-insurance** lever: folds each message's per-hop store round-trips
@@ -16,6 +33,18 @@ All notable changes to MessageFoundry are documented here. The format follows
   −212 ms @ +50 ms) over a green SS correctness precondition (`tests/test_adr0075_batch_sqlserver.py`, 9 passed).
   **Fail-closed + SQL-Server-only** — Postgres (asyncpg) and SQLite are byte-identical no-ops; the flag is retained
   **only as an emergency off-switch**: set `[pipeline].batch_handoff_statements = false` to disable.
+
+### Security
+- **The published PyPI source distribution no longer ships the whole repo** (#1020) — the sdist is pinned to
+  the `messagefoundry` package + its metadata, with a fail-closed "sdist is package-only" gate in the release
+  workflow. No release ever exposed PHI or customer data.
+- **Transport hardening** — certificate-revocation refusal extended to outbound-connector TLS (#201); in-use
+  memory protection for the store (#198); the publish deny-list is read from the ref being published (#983).
+
+### Fixed
+- **CI reliability** — bound PHI-retention on the Windows service smoke (#1011); wrap pyodbc-heavy SQL Server
+  steps with a native-crash retry (#1010); multi-message finalizers take their per-message locks in canonical
+  order (#980).
 
 ## [0.2.15] — 2026-07-06 — Early Access
 

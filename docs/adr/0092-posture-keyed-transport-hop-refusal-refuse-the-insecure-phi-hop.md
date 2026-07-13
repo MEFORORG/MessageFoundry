@@ -108,3 +108,58 @@ dialect construction **logs it**: a `WARNING` when no ssl/tls/encrypt keyword is
 dropped to `DEBUG` when one is (`transports/database._warn_generic_tls_unenforced`). A future native-driver
 connector (asyncpg-as-connector, scoped out of #66) that *can* introspect TLS should re-enter this
 authority rather than delegate.
+
+## Amendment (2026-07-13) — the DEFERRED residuals closed (BACKLOG #200)
+
+The core shipment (serve/reload posture stamping + the production-PHI escape clamp) left four residual
+paths OPEN in decision 6 / the #200 banner. They are now built, each extending — never weakening — the
+authority above:
+
+1. **API PHI-read data-path guard (the decision-6 residual).** The posture-keyed refusal now applies to
+   the API's PHI-read **RESPONSE** path, not only to the transport egress cells. `create_app` derives the
+   **API serve-hop disposition** once from `(instance posture, is the serve hop loopback / in-process TLS /
+   proxy-terminated)` via the new pure `tls_policy.phi_read_hop_disposition` — which reuses the ONE
+   `insecure_hop_disposition` authority with the production-PHI clamp (`hop_insecure_escape_downgrades`)
+   supplied as `audited_opt_out` — and stashes it on `app.state`. `api/security.enforce_phi_read_hop`
+   (folded into `require_phi_read`; called explicitly by the step-up `search` route) then **refuses (403,
+   PHI-free)** a PHI read on a production-PHI instance whose serve hop is not proven secure, so PHI is
+   never emitted over an unstamped/weakened API hop. A secure serve hop is modelled as the authority's
+   on-box carve-out (`is_loopback_hop`); `posture is None` (no `[ai]`, an embedding/test) and every
+   synthetic / dev / loopback / TLS lane are **ALLOW** → **byte-identical**. `_serve` passes
+   `phi_read_hop_secure = api.is_loopback or api.exposure_protected`; `create_app` defaults it to secure so
+   an embedding is unaffected. Composes with the serve-start exposed-gate (that gate refuses the *bind*;
+   this refuses the *response* — defense-in-depth, never a double-refusal on a legitimate lane).
+2. **db_lookup / fhir_lookup live-read posture stamp.** The `db_lookup` (ADR 0010) / `fhir_lookup`
+   (ADR 0043) executors are built by `RegistryRunner` at `engine.start()` / reload **outside**
+   `build_check_registry`'s `active_hop_posture` scope, so their weakened-TLS / cleartext hop check keyed
+   on the **UNCLAMPED** escape (`insecure_tls_allowed()`, posture unstamped) — a production-PHI instance
+   could do a weakened-TLS live read, and a synthetic cleartext FHIR read was false-closed. The live
+   builders (`_build_lookup_executor` / `_build_fhir_lookup_executor`) now wrap construction in
+   `active_hop_posture(self._hop_posture)`, so the production-PHI clamp (`weakened_tls_escape_permitted` /
+   `hop_insecure_escape_downgrades`) actually applies — mirroring the connector-build stamping the core
+   shipment already added at `_start_outbound`/`_start_inbound_unsafe`.
+3. **`messagefoundry check` posture-stamped build_check.** `serve`/`reload` run the posture-stamped
+   `build_check_registry`; the commit/CI gate (`checks.run_checks`) ran only `validate_config` (which
+   never constructs connectors), so it could pass a config `serve` would REFUSE. A new **required**
+   `build-check` (`checks._check_build`) loads this instance's `messagefoundry.toml`, resolves `env()`
+   against the active environment, and runs the same posture-stamped `build_check_registry` — so a
+   prod-PHI cleartext hop FAILS at commit/CI. **Fail-safe SKIP** with no `messagefoundry.toml` /
+   unloadable settings/graph (a bare dir has no declared posture) → byte-identical for a dev checkout.
+4. **Posture-B tails.** (a) A **cert-authenticated intra-service auth** is now **audited**: the
+   `GET /service/identity` route (the only `require_service_cert` surface) writes a `service_cert_auth`
+   row into the tamper-evident chain naming the mapped principal (PHI/secret-free — auth plane + route
+   only). (b) **Runtime KEX enforcement** is verified: when the engine terminates TLS in-process,
+   `build_api_ssl_context` pins the approved forward-secret groups (`harden_kex_groups`), and a real
+   handshake test proves a client offering only a non-approved FFDHE group is refused — runtime
+   enforcement, not the operator attestation the proxy-terminated (Posture-B) case still relies on. (c) A
+   real **mutual-TLS handshake** test exercises the exact server context the serve path builds
+   (`CERT_REQUIRED`): a trusted client cert completes, a missing one is refused. **Genuinely deferred
+   (infra-bound):** a full uvicorn-on-a-real-socket mTLS handshake through the live serve bind is left to
+   the Windows TLS CI legs — the handshake tests here exercise the same `build_api_ssl_context` context,
+   so the only drift they don't catch is the uvicorn wiring, not the TLS policy.
+
+All four **compose with** the existing #200 serve-path enforcement, the #201 outbound revocation guard
+(fires only on a VERIFYING hop — disjoint from the cleartext/verify-off condition), the #199 cleartext-
+egress refusal, and the #129 expiry-relaxation (which stays a VERIFIED hop the posture gate never keys
+on). The production-PHI clamp (`weakened_tls_escape_permitted` / `hop_insecure_escape_downgrades`) remains
+the **single authority** for the global escape on every path; no path logs PHI or a secret.

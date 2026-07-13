@@ -102,7 +102,7 @@ if ($NoInstall) {
 # editable install would import whichever checkout it was installed from).
 $venv = Join-Path $WorktreePath ".venv"
 $venvPy = Join-Path $venv "Scripts\python.exe"
-$extras = if ($Sqlserver) { "dev,console,sqlserver" } else { "dev,console" }
+$extras = if ($Sqlserver) { "dev,harness,sqlserver" } else { "dev,harness" }
 
 Write-Host "Creating virtualenv + installing .[$extras] (this can take a minute)..."
 & $Python -m venv $venv

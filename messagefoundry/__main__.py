@@ -1805,6 +1805,11 @@ def _serve(args: argparse.Namespace) -> int:
         # scheme tripwire (proxy not sending X-Forwarded-Proto / untrusted peer).
         exposure_protected=settings.api.exposure_protected,
         tls_terminated_upstream=settings.api.tls_terminated_upstream,
+        # #200 residual (ADR 0092): the API PHI-read data-path guard keys on whether the serve hop is
+        # proven secure — a loopback bind (on-box), in-process TLS, or a declared TLS-terminating proxy
+        # (exposure_protected). A prod-PHI instance whose serve hop is none of these refuses to emit PHI
+        # over the response path, mirroring the transport-cell posture-keyed refusal.
+        phi_read_hop_secure=settings.api.is_loopback or settings.api.exposure_protected,
         # #200 (ADR 0002): mTLS client-cert → principal allow-list, consumed by
         # security.resolve_client_cert_identity (deny-by-default; empty = cert-identity off).
         tls_client_cert_identities=settings.api.tls_client_cert_identities,

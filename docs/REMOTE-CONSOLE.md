@@ -1,12 +1,19 @@
 # Running the admin console on a remote PC
 
-The PySide6 admin **console** is a separate process that reaches the engine **only** over its
-localhost-or-network HTTP/WebSocket API ([`api/app.py`](../messagefoundry/api/app.py)) — it never
-imports the engine or touches the store directly. So it can run on a different machine from the engine.
+> **Retired UI (BACKLOG #103, 2026-07-13).** The **PySide6 desktop console is retired** — the operator
+> UI is now the browser **web console** served same-origin by the engine at `/ui`
+> ([ADR 0065](adr/0065-web-ops-dashboard.md)). To operate the engine from a remote PC today, **do the
+> engine-side exposure below (bind off-loopback + TLS), then simply browse to `https://<engine-host>:8765/ui`**
+> from the remote machine — no desktop client to install. The desktop-console `messagefoundry-console --url …`
+> instructions further down are retained only as **historical reference**; that client no longer ships.
 
-This is **supported but off by default**: out of the box both ends are bound to `127.0.0.1` (loopback
-only), so nothing is exposed until an admin deliberately (1) binds the engine to a routable address,
-(2) puts TLS in front of it, and (3) points the console at the `https://` URL. Auth is already required.
+The engine reaches its clients **only** over its localhost-or-network HTTP/WebSocket API
+([`api/app.py`](../messagefoundry/api/app.py)) — a client never imports the engine or touches the store
+directly. So the operator UI can run on a different machine from the engine.
+
+Remote access is **supported but off by default**: out of the box the engine is bound to `127.0.0.1`
+(loopback only), so nothing is exposed until an admin deliberately (1) binds the engine to a routable
+address, (2) puts TLS in front of it, and (3) browses to the `https://…/ui` URL. Auth is already required.
 
 ---
 

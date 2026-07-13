@@ -24,6 +24,7 @@ from messagefoundry.secrets_dpapi import (
 )
 from messagefoundry.store.base import resolve_active_key
 from messagefoundry.store.crypto import generate_key
+import logging
 
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="DPAPI is Windows-only")
 
@@ -99,3 +100,27 @@ def test_encryption_key_file_loads_from_env() -> None:
     # MEFOR_STORE_ENCRYPTION_KEY_FILE routes to [store].encryption_key_file (it's a path, not a secret).
     settings = load_settings(environ={"MEFOR_STORE_ENCRYPTION_KEY_FILE": "C:/data/key.dpapi"})
     assert settings.store.encryption_key_file == "C:/data/key.dpapi"
+
+
+# --- CRYPTO-10: no key-material leak on the DPAPI CryptUnprotectData failure path ---
+
+
+@windows_only
+def test_dpapi_unprotect_failure_leaks_no_key_material(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A genuine CryptUnprotectData failure (a corrupted protected blob) must carry ONLY the Win32 error
+    # code — never the base64 store key it was protecting, nor the blob bytes — in str(exc) or a DEBUG
+    # log. Windows-only: the real Win32 failure path is unreachable off Windows (there it raises the
+    # platform guard DpapiUnavailable, which holds no decrypted key). CRYPTO-10 regression guard.
+    key = generate_key()
+    protected = bytearray(dpapi_protect(key.encode("ascii")))
+    protected[len(protected) // 2] ^= 0xFF  # tamper the DPAPI ciphertext → integrity check fails
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(DpapiError) as excinfo:
+            dpapi_unprotect(bytes(protected))
+
+    for hay in (str(excinfo.value), caplog.text):
+        assert key not in hay  # the base64 store key never surfaces on the failure path
+        assert bytes(protected).hex() not in hay  # nor the raw blob bytes

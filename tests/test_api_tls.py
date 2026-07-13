@@ -16,7 +16,7 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from pydantic import ValidationError
 
 from starlette.requests import Request
@@ -708,3 +708,230 @@ async def test_client_cert_cannot_bypass_phi_or_step_up_routes(tmp_path: Path) -
             assert (await c.get("/service/identity")).status_code == 200
     finally:
         await engine.stop()
+
+
+# --- #200 residual: cert-authenticated intra-service auth is AUDITED (ADR 0083/0092) ---------------
+
+
+async def test_service_cert_auth_emits_audit_event(tmp_path: Path) -> None:
+    # Residual (Posture-B tail): a successful mTLS cert authentication must not be a SILENT admission — it
+    # writes a `service_cert_auth` row into the tamper-evident audit chain naming the mapped principal.
+    engine, app = await _svc_app(tmp_path, "svc_audit.db", Role.VIEWER)
+    try:
+        transport = httpx.ASGITransport(app=_wrap_with_cert(app, _peercert("svc.internal")))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            assert (await c.get("/service/identity")).status_code == 200
+        rows = await engine.store.list_audit(action="service_cert_auth")
+        assert len(rows) == 1
+        assert rows[0]["actor"] == "svc"
+        # PHI/secret-safe: the audit detail carries only the auth plane + route, never a cert body.
+        assert "mtls-client-cert" in (rows[0]["detail"] or "")
+        # Negative: a denied (spoofed) cert never authenticates, so it writes NO audit row.
+        t_spoof = httpx.ASGITransport(app=_wrap_with_cert(app, _peercert("attacker.evil")))
+        async with httpx.AsyncClient(transport=t_spoof, base_url="http://t") as c:
+            assert (await c.get("/service/identity")).status_code == 401
+        assert len(await engine.store.list_audit(action="service_cert_auth")) == 1
+    finally:
+        await engine.stop()
+
+
+# --- #200 residual: runtime KEX enforcement + a real (mutual) TLS handshake on the built context ----
+
+
+def _handshake(
+    server_ctx: ssl.SSLContext, client_ctx: ssl.SSLContext, *, client_cert: tuple[Path, Path] | None
+) -> str | None:
+    """Drive a REAL TLS handshake over a loopback socket using ``server_ctx`` (the exact context the serve
+    path builds via :func:`build_api_ssl_context`). Returns the negotiated cipher name on success; raises
+    ``ssl.SSLError`` when the handshake is refused. ``client_cert`` presents a client cert (mTLS)."""
+    import socket
+    import threading
+
+    if client_cert is not None:
+        client_ctx.load_cert_chain(certfile=str(client_cert[0]), keyfile=str(client_cert[1]))
+    lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lsock.bind(("127.0.0.1", 0))
+    lsock.listen(1)
+    host, port = lsock.getsockname()
+    server_err: list[BaseException] = []
+
+    def _serve_once() -> None:
+        try:
+            raw, _ = lsock.accept()
+        except OSError:
+            return
+        try:
+            ss = server_ctx.wrap_socket(raw, server_side=True)  # the handshake
+        except (
+            OSError
+        ) as exc:  # a handshake refusal (e.g. missing/invalid client cert) — the real signal
+            server_err.append(exc)
+            raw.close()
+            return
+        # Handshake OK: a one-byte ping-pong so the client does not RST-close before the server finishes
+        # the handshake (a Windows race that would masquerade as a handshake failure). Post-handshake
+        # teardown aborts are ignored — only a handshake refusal is the signal.
+        try:
+            ss.sendall(b"1")
+            ss.recv(16)
+        except OSError:
+            pass
+        finally:
+            try:
+                ss.close()
+            except OSError:
+                pass
+
+    t = threading.Thread(target=_serve_once, daemon=True)
+    t.start()
+    client_cipher: str | None = None
+    client_err: BaseException | None = None
+    try:
+        with socket.create_connection((host, port), timeout=5) as raw:
+            with client_ctx.wrap_socket(raw, server_hostname="localhost") as cs:
+                cipher = cs.cipher()
+                client_cipher = cipher[0] if cipher else None
+                cs.recv(
+                    16
+                )  # wait for the server's ping so we don't close before it exits the handshake
+                cs.sendall(b"ok")
+    except (
+        OSError
+    ) as exc:  # ssl.SSLError subclasses OSError; a server-side abort surfaces as OSError too
+        client_err = exc
+    finally:
+        t.join(timeout=5)
+        lsock.close()
+    # A refusal may surface on EITHER side (TLS 1.3: the client can finish before the server validates the
+    # peer cert, so a missing-client-cert rejection appears server-side, and a rejected client sees a
+    # connection abort). Surface either as an OSError so the caller can assert on it uniformly.
+    if client_err is not None:
+        raise client_err
+    if server_err:
+        raise server_err[0]
+    return client_cipher
+
+
+def _strict_ca_and_leaf(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A RFC 5280-conformant CA + a localhost leaf (serverAuth+clientAuth EKU) that pass the
+    ``VERIFY_X509_STRICT`` flag ``build_api_ssl_context`` ORs on. Returns ``(ca_pem, leaf_cert, leaf_key)``;
+    the single leaf serves as BOTH the server cert and (for mTLS) the client cert, and the CA PEM is the
+    shared trust anchor for both directions."""
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "MEFOR Test CA")])
+    nb = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+    na = datetime.datetime(2040, 1, 1, tzinfo=datetime.timezone.utc)
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(nb)
+        .not_valid_after(na)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_cert_sign=True,
+                crl_sign=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf_cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
+        .issuer_name(ca_cert.subject)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(nb)
+        .not_valid_after(na)
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .add_extension(
+            x509.ExtendedKeyUsage(
+                [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH]
+            ),
+            critical=False,
+        )
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    ca_pem = tmp_path / "ca.pem"
+    leaf_c = tmp_path / "leaf-c.pem"
+    leaf_k = tmp_path / "leaf-k.pem"
+    ca_pem.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    leaf_c.write_bytes(leaf_cert.public_bytes(serialization.Encoding.PEM))
+    leaf_k.write_bytes(
+        leaf_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return ca_pem, leaf_c, leaf_k
+
+
+def _verifying_client_ctx(ca: Path) -> ssl.SSLContext:
+    return ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(ca))
+
+
+def test_kex_allow_list_enforced_at_runtime(tmp_path: Path) -> None:
+    # The engine terminates TLS in-process, so it ENFORCES the approved forward-secret KEX groups at
+    # runtime (harden_kex_groups on the built context), not merely as an operator attestation. Prove it:
+    # a client pinned to ONLY a non-approved FFDHE group cannot complete against the pinned server, while
+    # a default client negotiates a forward-secret TLS 1.3 suite.
+    ca, cert, key = _strict_ca_and_leaf(tmp_path)
+    server_ctx = build_api_ssl_context(
+        ApiSettings(tls_cert_file=str(cert), tls_key_file=str(key), tls_min_version="1.3")
+    )
+    # Positive control: a normal client (approved groups) handshakes and negotiates a TLS 1.3 suite.
+    cipher = _handshake(server_ctx, _verifying_client_ctx(ca), client_cert=None)
+    assert cipher and cipher.startswith("TLS_")  # a TLS 1.3 (ECDHE, forward-secret) suite
+
+    # Negative: a client offering ONLY ffdhe2048 (a valid TLS 1.3 group the server does NOT list) shares
+    # no key-exchange group with the pinned server, so the handshake is refused — runtime enforcement.
+    bad_client = _verifying_client_ctx(ca)
+    try:
+        bad_client.set_groups("ffdhe2048")
+    except (AttributeError, ssl.SSLError, ValueError):
+        pytest.skip("runtime does not support set_groups on the client side")
+    with pytest.raises(OSError):
+        _handshake(server_ctx, bad_client, client_cert=None)
+
+
+def test_real_mutual_tls_handshake_on_built_context(tmp_path: Path) -> None:
+    # A REAL mutual-TLS handshake against the exact server context the serve path builds (CERT_REQUIRED via
+    # tls_client_ca_file). A client presenting the trusted cert completes; a client presenting NO cert is
+    # refused by the server. This is the handshake-level integration the core shipment left as unit-only.
+    ca, cert, key = _strict_ca_and_leaf(tmp_path)
+    server_ctx = build_api_ssl_context(
+        ApiSettings(tls_cert_file=str(cert), tls_key_file=str(key), tls_client_ca_file=str(ca))
+    )
+    assert server_ctx.verify_mode == ssl.CERT_REQUIRED
+    # Positive: the client presents the trusted leaf cert → mutual handshake succeeds.
+    cipher = _handshake(server_ctx, _verifying_client_ctx(ca), client_cert=(cert, key))
+    assert cipher
+    # Negative: no client cert → the server (CERT_REQUIRED) refuses the handshake.
+    with pytest.raises(OSError):
+        _handshake(server_ctx, _verifying_client_ctx(ca), client_cert=None)
+
+
+# NOTE (residual, honest scope): a full uvicorn-on-a-real-socket mTLS handshake through the serve path
+# (build_api_ssl_context wired into a live uvicorn bind) is a CI/infra-bound integration left to the
+# windows-service-smoke / TLS CI legs — the handshake logic above exercises the SAME server context the
+# serve path builds, so the drift it would catch is the uvicorn wiring, not the TLS policy itself.

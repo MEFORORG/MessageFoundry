@@ -14,14 +14,20 @@ import messagefoundry.actions as actions_mod
 import messagefoundry.lens as lens_mod
 from messagefoundry import (
     append_to_field,
+    arith_field,
     code_lookup,
     convert_case,
     copy_field,
     copy_segment,
+    date_diff_field,
     delete_segment,
     format_date,
+    pad_field,
+    replace_literal,
     set_field,
     split_field,
+    substring_field,
+    trim_field,
 )
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.parsing.message import Message
@@ -194,6 +200,129 @@ def test_vocabulary_mutates_in_place_and_reencodes() -> None:
     set_field(m, "PID-3.1", "555")
     again = Message.parse(m.encode())
     assert again["PID-3.1"] == "555"  # the edit survives a round-trip
+
+
+# --- ADR 0106 palette additions --------------------------------------------
+
+
+def test_trim_field() -> None:
+    m = _msg()
+    set_field(m, "PID-4.1", "  X42  ")
+    trim_field(m, "PID-4.1")
+    assert m["PID-4.1"] == "X42"
+
+
+def test_trim_field_absent_is_noop() -> None:
+    m = _msg()
+    trim_field(m, "PID-99.1")  # absent
+    assert m["PID-99.1"] is None
+
+
+def test_substring_field() -> None:
+    m = _msg()
+    set_field(m, "PID-4.1", "ABCDEF")
+    substring_field(m, "PID-4.1", 0, 3)
+    assert m["PID-4.1"] == "ABC"
+
+
+def test_substring_field_open_end() -> None:
+    m = _msg()
+    set_field(m, "PID-4.1", "ABCDEF")
+    substring_field(m, "PID-4.1", 2)
+    assert m["PID-4.1"] == "CDEF"
+
+
+def test_pad_field_left_default() -> None:
+    m = _msg()
+    set_field(m, "PID-4.1", "42")
+    pad_field(m, "PID-4.1", 5)  # default fill "0", side "left"
+    assert m["PID-4.1"] == "00042"
+
+
+def test_pad_field_right() -> None:
+    m = _msg()
+    set_field(m, "PID-4.1", "42")
+    pad_field(m, "PID-4.1", 5, fill="x", side="right")
+    assert m["PID-4.1"] == "42xxx"
+
+
+def test_pad_field_unknown_side_raises() -> None:
+    m = _msg()
+    set_field(m, "PID-4.1", "42")
+    with pytest.raises(ValueError):
+        pad_field(m, "PID-4.1", 5, side="middle")
+
+
+def test_replace_literal() -> None:
+    m = _msg()
+    set_field(m, "PID-5.1", "MRS SMITH")
+    replace_literal(m, "PID-5.1", "MRS", "MS")
+    assert m["PID-5.1"] == "MS SMITH"
+
+
+def test_arith_field_multiply_rounds() -> None:
+    m = _msg()
+    set_field(m, "PID-4.1", "70")  # kg
+    arith_field(m, "PID-4.1", "*", 2.20462, ndigits=1)  # -> lb
+    assert m["PID-4.1"] == "154.3"
+
+
+def test_arith_field_integer_default() -> None:
+    m = _msg()
+    set_field(m, "PID-4.1", "70")
+    arith_field(m, "PID-4.1", "*", 2)
+    assert m["PID-4.1"] == "140"
+
+
+def test_arith_field_unknown_op_raises() -> None:
+    m = _msg()
+    set_field(m, "PID-4.1", "70")
+    with pytest.raises(ValueError):
+        arith_field(m, "PID-4.1", "**", 2)  # not an eval — a closed op set
+
+
+def test_arith_field_divide_by_zero_raises() -> None:
+    m = _msg()
+    set_field(m, "PID-4.1", "70")
+    with pytest.raises(ValueError):
+        arith_field(m, "PID-4.1", "/", 0)
+
+
+def test_arith_field_non_numeric_raises() -> None:
+    m = _msg()
+    with pytest.raises(ValueError):
+        arith_field(m, "PID-5.1", "+", 1)  # PID-5.1 = "doe"
+
+
+def test_date_diff_field_years() -> None:
+    m = _msg()  # PID-7 = 19800101 (DOB), MSH-7 = 20260101120000
+    date_diff_field(m, "PID-7", "MSH-7", "PID-4.1", unit="years")
+    assert m["PID-4.1"] == "46"
+
+
+def test_date_diff_field_hours() -> None:
+    m = _msg()  # EVN-2 = 20260101 (00:00), MSH-7 = 20260101120000 (12:00)
+    date_diff_field(m, "EVN-2", "MSH-7", "PID-4.1", unit="hours")
+    assert m["PID-4.1"] == "12"
+
+
+def test_date_diff_field_absent_is_noop() -> None:
+    m = _msg()
+    date_diff_field(m, "PID-99", "MSH-7", "PID-4.1", unit="days")
+    assert m["PID-4.1"] is None
+
+
+def test_date_diff_field_unparseable_raises() -> None:
+    m = _msg()
+    set_field(m, "PID-4.1", "notadate")
+    with pytest.raises(ValueError):
+        date_diff_field(m, "PID-4.1", "MSH-7", "PID-13.1", unit="days")
+
+
+def test_date_diff_field_unknown_unit_raises() -> None:
+    m = _msg()
+    with pytest.raises(ValueError):
+        date_diff_field(m, "PID-7", "MSH-7", "PID-4.1", unit="fortnights")
 
 
 # --- purity + no-new-dependency (ADR 0076 §6 gate 5) -------------------------

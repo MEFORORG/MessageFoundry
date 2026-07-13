@@ -70,15 +70,22 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.actions import (
     append_to_field,
+    arith_field,
     code_lookup,
     convert_case,
     copy_field,
     copy_segment,
+    date_diff_field,
     delete_segment,
     format_date,
+    pad_field,
+    replace_literal,
     set_field,
     split_field,
+    substring_field,
+    trim_field,
 )
+from messagefoundry.diagnostics import checkpoint, log_note
 from messagefoundry.parsing.groups import SegmentGroup
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.parsing.split import split_by_obr
@@ -91,7 +98,7 @@ from messagefoundry.timezone import (
     to_zone,
 )
 
-__version__ = "0.2.15"
+__version__ = "0.3.0"
 
 __all__ = [
     "Message",
@@ -156,12 +163,20 @@ __all__ = [
     "copy_field",
     "set_field",
     "append_to_field",
-    "format_date",
+    "trim_field",
+    "substring_field",
+    "pad_field",
+    "replace_literal",
     "convert_case",
+    "arith_field",
+    "format_date",
+    "date_diff_field",
     "split_field",
     "code_lookup",
     "copy_segment",
     "delete_segment",
+    "log_note",
+    "checkpoint",
     "convert_hl7_timestamp",
     "to_zone",
     "parse_hl7_timestamp",

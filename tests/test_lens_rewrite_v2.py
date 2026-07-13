@@ -1011,12 +1011,13 @@ def test_insert_non_ascii_value_is_raw() -> None:
     _assert_partition(out)
 
 
-def test_insert_refused_when_vocab_not_imported() -> None:
-    # gate 3: a module that imports only Send/handler — inserting a bare WRAPPER call (here format_date,
-    # NOT one of the three native-form actions) would emit an F821 undefined name (`ruff check` failure).
-    # The lens refuses rather than write code that won't lint (import lines are out of the row-scoped
-    # splice's scope by design, §5). (set_field/copy_field/delete_segment are exempt — they insert in
-    # their native msg.* form, which needs no import — see test_insert_native_form_needs_no_import.)
+def test_insert_injects_import_when_vocab_not_imported() -> None:
+    # ADR 0106 §6 (H): a module that imports only Send/handler — inserting a bare WRAPPER call (here
+    # format_date, NOT one of the three native-form actions) would be an F821 undefined name. Rather than
+    # refuse, the lens INJECTS ``from messagefoundry import format_date`` among the module's imports, so the
+    # result re-parses and lints clean (import lines are a §6-sanctioned exception to the row-scoped splice).
+    # (set_field/copy_field/delete_segment are exempt — native msg.* form, no import — see
+    # test_insert_native_form_needs_no_import.)
     src = (
         "from messagefoundry import handler, Send\n\n\n"
         '@handler("h")\n'
@@ -1031,25 +1032,20 @@ def test_insert_refused_when_vocab_not_imported() -> None:
         "action": "format_date",
         "params": {"path": "PID-7", "out_fmt": "%Y%m%d"},
     }
-    with pytest.raises(LensRewriteError, match="not imported"):
-        rewrite_source(src, edit)
-    # A module that DOES import the wrapper inserts fine — no over-refusal.
+    out = rewrite_source(src, edit)
+    assert "from messagefoundry import format_date" in out  # import injected
+    assert '    format_date(msg, "PID-7", "%Y%m%d")' in out
+    assert (
+        out.count("from messagefoundry import") == 2
+    )  # original + injected (rewrite_source re-parses)
+    # A module that ALREADY imports the wrapper inserts fine, with NO duplicate import (idempotent).
     imports_it = src.replace(
         "from messagefoundry import handler, Send",
         "from messagefoundry import handler, Send, format_date",
     )
-    out = rewrite_source(
-        imports_it,
-        {
-            "op": "insert_row",
-            "line_start": 6,
-            "line_end": 6,
-            "position": "before",
-            "action": "format_date",
-            "params": {"path": "PID-7", "out_fmt": "%Y%m%d"},
-        },
-    )
-    assert '    format_date(msg, "PID-7", "%Y%m%d")' in out
+    out2 = rewrite_source(imports_it, edit)
+    assert '    format_date(msg, "PID-7", "%Y%m%d")' in out2
+    assert out2.count("from messagefoundry import") == 1  # not injected again
 
 
 def test_insert_allowed_with_wildcard_import() -> None:

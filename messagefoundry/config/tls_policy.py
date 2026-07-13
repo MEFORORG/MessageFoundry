@@ -67,6 +67,7 @@ __all__ = [
     "in_process_tls_revocation_refused",
     "insecure_hop_disposition",
     "is_loopback_hop_host",
+    "phi_read_hop_disposition",
     "resolve_trust_anchor",
     "revocation_hop_disposition",
     "tls_revocation_attested",
@@ -469,6 +470,39 @@ def current_hop_posture() -> HopPosture | None:
     means the connector is being built outside the construction gate (an embedding/test) — the cell
     fail-closes (treats the hop as prod-PHI) rather than crossing on an unknown posture."""
     return _ACTIVE_HOP_POSTURE.get()
+
+
+def phi_read_hop_disposition(
+    posture: HopPosture | None,
+    *,
+    serve_hop_secure: bool,
+    audited_opt_out: bool,
+) -> HopDisposition:
+    """Decide whether the API may emit PHI over its own **serve hop** (#200 residual, ADR 0092 — PURE).
+
+    The data-path analogue of :func:`insecure_hop_disposition` for the API's PHI-read RESPONSE path
+    (raw view / attachment download / summary). A production-PHI instance whose API serve hop is NOT
+    proven secure — not loopback, not in-process TLS, not a declared TLS-terminating proxy — REFUSES to
+    put PHI on that hop rather than emitting it in the clear. Reuses the ONE authority so the API decides
+    identically to the transport cells, and the production-PHI clamp (``audited_opt_out``, supplied
+    already clamped by the caller) stays the single authority for the global escape.
+
+    ``posture is None`` (an embedding / test that declared no ``[ai]`` posture, so ``is_phi`` is unknown)
+    → :attr:`~HopDisposition.ALLOW` — byte-identical to the pre-residual behaviour, so the loopback/dev
+    default and every non-PHI embedding are untouched. A ``serve_hop_secure`` hop is modelled as the
+    authority's on-box carve-out (``is_loopback_hop``): a loopback / TLS / proxy-terminated serve hop is
+    not an insecure network exposure, so PHI may cross (the serve-start exposed-gate already vetted it).
+    There is no per-hop attestation for the API serve hop — the serve gate's proxy/TLS declarations are
+    what prove it secure — so ``hop_attested`` is always ``False`` here."""
+    if posture is None:
+        return HopDisposition.ALLOW
+    return insecure_hop_disposition(
+        is_phi=posture.is_phi,
+        production=posture.production,
+        is_loopback_hop=serve_hop_secure,
+        hop_attested=False,
+        audited_opt_out=audited_opt_out,
+    )
 
 
 # --- posture-keyed OUTBOUND revocation-hop refusal (#201, ADR 0078 amendment) ------------------

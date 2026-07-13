@@ -194,7 +194,7 @@ remaining engine-side work.
 ## Per-session method (the proven loop)
 1. **Ultracode design+verify Workflow** → ADR + plan + invariant-test matrix (map → designs → adversarial
    verifiers → synthesize → critic).
-2. **Worktree off `origin/main`** + venv (`[dev,console,sqlserver,postgres]`).
+2. **Worktree off `origin/main`** + venv (`[dev,harness,sqlserver,postgres]`).
 3. **Implement** default-OFF / byte-identical-when-OFF where it touches the reliability core.
 4. **Adversarial-invariant tests** across SQLite + SQL Server + Postgres; **append new backend tests to
    the `ci.yml` throughput-lever step on BOTH server-DB legs** (the #672 gate).

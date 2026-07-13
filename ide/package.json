@@ -2,7 +2,7 @@
   "name": "messagefoundry",
   "displayName": "MessageFoundry",
   "description": "Author, test, and monitor MessageFoundry HL7 v2 interfaces in VS Code.",
-  "version": "0.0.24",
+  "version": "0.0.25",
   "publisher": "messagefoundry",
   "icon": "media/icon.png",
   "license": "SEE LICENSE IN LICENSE",

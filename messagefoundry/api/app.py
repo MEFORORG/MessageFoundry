@@ -120,6 +120,7 @@ from messagefoundry.api.field_authz import count_exposed, redact_unauthorized
 from messagefoundry.api.metrics import METRICS_CONTENT_TYPE, render_metrics
 from messagefoundry.api.security import (
     authorize_ws,
+    enforce_phi_read_hop,
     optional_identity,
     require,
     require_phi_read,
@@ -168,8 +169,10 @@ from messagefoundry.config.settings import (
     StoreSettings,
     TlsSettings,
     UpdateCheckSettings,
+    hop_insecure_escape_downgrades,
     hop_posture_from_ai,
 )
+from messagefoundry.config.tls_policy import phi_read_hop_disposition
 from messagefoundry.config.fingerprint import config_fingerprint_detail
 from messagefoundry.config.secretprovider import resolve_secret_provider
 from messagefoundry.config.wiring import (
@@ -682,6 +685,7 @@ def create_app(
     exposure_protected: bool = False,
     tls_terminated_upstream: bool = False,
     tls_client_cert_identities: Mapping[str, str] | None = None,
+    phi_read_hop_secure: bool = True,
     log_dir: str | None = None,
 ) -> FastAPI:
     # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
@@ -742,6 +746,24 @@ def create_app(
     # identity to map a VERIFIED peer cert's subject/SAN to an Identity (deny-by-default). Empty (the
     # default) disables cert-identity — byte-identical to the pre-#200 mTLS-for-transport-only path.
     app.state.tls_client_cert_identities = dict(tls_client_cert_identities or {})
+    # #200 residual (ADR 0092): the API PHI-read DATA-PATH guard. The serve-start exposed-gate refuses a
+    # prod-PHI cleartext bind, but the posture-keyed refusal was never applied to the PHI-read RESPONSE
+    # path itself — so this derives the API serve-hop disposition ONCE (mirroring how the transport cells
+    # stamp active_hop_posture) and stashes it for require_phi_read + the search route to enforce before
+    # PHI leaves. A production-PHI instance whose serve hop is NOT proven secure (not loopback / TLS /
+    # proxy-terminated) REFUSES rather than silently emitting PHI; the production-PHI clamp
+    # (hop_insecure_escape_downgrades) stays the single authority for the global escape. posture=None (no
+    # [ai], embedding/test) or a secure serve hop → ALLOW, so the loopback/dev default is byte-identical.
+    _phi_read_posture = hop_posture_from_ai(ai_settings) if ai_settings is not None else None
+    app.state.phi_read_hop_disposition = phi_read_hop_disposition(
+        _phi_read_posture,
+        serve_hop_secure=phi_read_hop_secure,
+        audited_opt_out=(
+            hop_insecure_escape_downgrades(production=_phi_read_posture.production)
+            if _phi_read_posture is not None
+            else False
+        ),
+    )
     app.state.summary_auditor = _SummaryAuditCoalescer()  # coalesced PHI-summary access audit (M-5)
     # add_auth_routes registers the auth/user-admin JSON routes and RETURNS an AdminHandlers bundle of
     # its nested handlers; the /ui admin pages that reuse them now live in messagefoundry_webconsole and
@@ -1938,6 +1960,9 @@ def create_app(
         the event loop, bounded by ``scan_limit`` decrypts and ``limit`` matches (truncate-and-tell). It
         sits behind step-up (a bulk-PHI read), inherits the ``view_summary`` redaction, and writes a
         dedicated ``message_search`` audit row that never records an MRN-shaped needle."""
+        # #200 residual (ADR 0092): search is a bulk-PHI read behind require_step_up, NOT require_phi_read,
+        # so it doesn't inherit the folded data-path guard — apply it explicitly before any decrypt.
+        enforce_phi_read_hop(request)
         try:
             spec = make_spec(
                 content=content,
@@ -2676,11 +2701,22 @@ def create_app(
 
     @app.get("/service/identity")
     async def service_identity(
+        engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_service_cert(Permission.MONITORING_READ)),
     ) -> dict[str, object]:
         """Echo the MessageFoundry principal that this request's verified client certificate maps to
         (username + granted roles). Non-PHI, read-only; used by a peer service to confirm its cert-identity
-        wiring end-to-end. Returns 401 when no mapped/verified client cert is presented (deny-by-default)."""
+        wiring end-to-end. Returns 401 when no mapped/verified client cert is presented (deny-by-default).
+
+        #200 residual (ADR 0083/0092): a successful mTLS cert authentication is recorded in the tamper-
+        evident audit chain (``service_cert_auth``) so intra-service auth is not a silent admission — an
+        operator can see which principal a peer service's certificate authenticated as, and when. The
+        audit carries only the mapped username + the auth plane (never a cert body / PHI)."""
+        await engine.store.record_audit(
+            "service_cert_auth",
+            actor=identity.username,
+            detail=json.dumps({"auth": "mtls-client-cert", "route": "/service/identity"}),
+        )
         return {
             "username": identity.username,
             "roles": sorted(role.value for role in identity.roles),
@@ -3151,6 +3187,7 @@ def create_managed_app(
     exposure_protected: bool = False,
     tls_terminated_upstream: bool = False,
     tls_client_cert_identities: Mapping[str, str] | None = None,
+    phi_read_hop_secure: bool = True,
     registry_filter: Callable[[Registry], Registry] | None = None,
     log_dir: str | None = None,
 ) -> FastAPI:
@@ -3427,4 +3464,5 @@ def create_managed_app(
         exposure_protected=exposure_protected,
         tls_terminated_upstream=tls_terminated_upstream,
         tls_client_cert_identities=tls_client_cert_identities,
+        phi_read_hop_secure=phi_read_hop_secure,
     )

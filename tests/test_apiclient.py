@@ -2,10 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """The extracted Qt-free / FastAPI-free engine-client library (ADR 0088).
 
-The full end-to-end integration coverage (a real uvicorn server) lives in ``test_console_client.py``,
-which reaches the same code through the ``messagefoundry.console.client`` shim. Here we assert the
-new public entrypoint (:mod:`messagefoundry.apiclient`) works and — critically — that importing it
-drags in neither PySide6 nor FastAPI, so the harness / any future client can depend on it headlessly.
+This is the canonical engine-client entrypoint (:mod:`messagefoundry.apiclient`) — the desktop
+console and its ``messagefoundry.console.client`` shim were retired (BACKLOG #103). Here we assert the
+public entrypoint works and — critically — that importing it drags in neither PySide6 nor FastAPI, so
+the harness / any future client can depend on it headlessly.
 """
 
 from __future__ import annotations
@@ -21,14 +21,12 @@ from messagefoundry.apiclient import ApiError, EngineClient
 
 
 def test_public_surface_is_reexported() -> None:
-    # The package re-exports the two public names; and they are the *same* objects the shim exposes.
+    # The package re-exports the two public names from the client module (same objects).
     from messagefoundry.apiclient.client import ApiError as ClientApiError
     from messagefoundry.apiclient.client import EngineClient as ClientEngineClient
-    from messagefoundry.console.client import ApiError as ShimApiError
-    from messagefoundry.console.client import EngineClient as ShimEngineClient
 
-    assert EngineClient is ClientEngineClient is ShimEngineClient
-    assert ApiError is ClientApiError is ShimApiError
+    assert EngineClient is ClientEngineClient
+    assert ApiError is ClientApiError
 
 
 def test_import_pulls_in_no_pyside6_or_fastapi() -> None:

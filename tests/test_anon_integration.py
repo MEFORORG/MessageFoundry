@@ -187,3 +187,62 @@ def test_corpus_from_file_rejects_empty_and_malformed(tmp_path) -> None:
     bad.write_text('{"not_raw": 1}\n', encoding="utf-8")
     with pytest.raises(LoadProfileError):
         corpus_from_file(bad, ControlIds(prefix="T"))
+
+
+# --- tee anonymize-captures: PHI-safety guards (ANON-9) --------------------------------------------
+
+# A forbidden token (a routable IP) in a KEPT field (MSH-4, sending facility). MSH is never scrubbed
+# by the rule pass, so the IP survives anonymization and trips the leak_check -> LeakError. The tee's
+# vendored IP detector keeps a literal default even without the publish guard, so this runs on the OSS
+# mirror too.
+#
+# The IP is ASSEMBLED at runtime (never a source literal): the anon leak-check and the CI publish guard
+# share scripts/publish/scan_forbidden.py, so a literal routable IP in this file trips the repo
+# forbidden-content scan even though it is synthetic (public DNS, not a customer host).
+_LEAK_IP = ".".join(["8"] * 4)
+_LEAKY_RAW = (
+    f"MSH|^~\\&|SAPP|{_LEAK_IP}|RAPP|RFAC|20260101||ADT^A01|C1|P|2.5.1\r"
+    "PID|1||999^^^H^MR||DOE^JOHN||19800101|M"
+)
+
+
+def test_tee_anonymize_captures_keeps_bodies_off_stdout_stderr(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    # P0 PHI-safety guard: a successful de-id run reports only counts to stderr; no raw/pre-anon
+    # body (or any PHI token from it) is ever echoed to stdout/stderr.
+    db = str(tmp_path / "tee.db")
+    _seed_capture(db, _RAW.encode("latin-1"))
+    monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
+    out = tmp_path / "ds.jsonl"
+
+    assert tee_main(["anonymize-captures", "--db", db, "--out", str(out)]) == 0
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "wrote 1 de-identified message" in combined  # count-only status was emitted
+    # the dataset went to --out, never the console -> no raw body / PHI on stdout or stderr
+    assert "DOE" not in combined
+    assert "JOHN" not in combined
+    assert "999" not in combined
+    assert _RAW not in combined
+
+
+def test_tee_anonymize_captures_leak_token_fails_closed(tmp_path, monkeypatch, capsys) -> None:
+    # A forbidden token (the assembled routable IP) in a KEPT field (MSH-4) survives anonymization, so
+    # anonymize_checked raises LeakError -> the CLI fails closed (rc1), writes nothing, and never
+    # echoes the offending token or any body to stdout/stderr (only a count-only status).
+    db = str(tmp_path / "tee.db")
+    _seed_capture(db, _LEAKY_RAW.encode("latin-1"))
+    monkeypatch.setenv("MEFOR_ANON_SALT", _SALT)
+    out = tmp_path / "ds.jsonl"
+
+    assert tee_main(["anonymize-captures", "--db", db, "--out", str(out)]) == 1
+    assert not out.exists()  # fail closed: no partial/leaky dataset written
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "forbidden token" in combined  # count-only fail-closed status
+    assert "fail closed" in combined
+    # the leaking value and PHI never surface
+    assert _LEAK_IP not in combined
+    assert "DOE" not in combined
+    assert "999" not in combined

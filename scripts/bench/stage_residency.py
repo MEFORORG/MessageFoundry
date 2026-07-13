@@ -20,9 +20,18 @@ stage's measured claim/service time is **idle waiting**, and that is the interes
 ceiling the outbound lane episode was 250 ms against 23.8 ms of measured work — **226 ms (90.5%)
 unexplained.** This tells you which stage that residual lives in.
 
-⚠️ **RUN IT BEFORE THE NEXT SOAK.** ``shardcert._reset_store`` ``DELETE``s every table at the START of a
-run, so a soak's rows survive only until the next run begins. **The historical C5/C6/C7/P0 rows are already
-gone** — this is not a retroactive query. Capture it as part of the run, or immediately after.
+⚠️ **CLEAR ``message_events`` BEFORE THE SOAK — this table is NOT reset for you.**
+``shardcert._reset_store`` ``DELETE``s nine *named* tables (``queue``, ``outbox``, ``response``,
+``delivered_keys``, ``state``, ``leader_lease``, ``nodes``, ``cluster_config``, ``messages``) — and
+``message_events`` is **not one of them**. It has no foreign key to ``messages``, so nothing cascades into it
+either. **The rows therefore ACCUMULATE across every run, rung and arm.** The query below has no run filter
+and no time filter, so a stale table does not make this script fail loudly — it makes it **silently blend your
+soak with every soak that came before it.** A wrong number that looks entirely right.
+
+So: ``DELETE FROM message_events;`` **immediately before the soak you intend to decompose**, then run this
+**immediately after** it. (Corollary, if you inherited a rig: rows from earlier runs may still be sitting
+there — ``SELECT COUNT(*), MIN(ts), MAX(ts) FROM message_events`` before you clear it, and consider whether
+that history is worth banking first.)
 
 Usage (reads the same MEFOR_STORE_* env the engine uses):
 
@@ -37,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import statistics
 import sys
@@ -175,6 +185,13 @@ def _render(d: dict[str, Any]) -> str:
 
 
 def main() -> int:
+    # This report (and --help, which prints the module docstring) carries U+2014/U+2212. On Windows a
+    # REDIRECTED stdout defaults to the ANSI codepage, not UTF-8, so `... > out.txt` would die with
+    # UnicodeEncodeError — at exactly the moment the operator is banking the artifact.
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -186,15 +203,21 @@ def main() -> int:
     if d["messages_complete"] == 0:
         print(
             "\n  NO COMPLETE-PATH MESSAGES FOUND.\n"
-            "  Most likely the store was reset by a later run — shardcert._reset_store DELETEs every\n"
-            "  table at the START of a run, so a soak's message_events survive only until the next run\n"
-            "  begins. Run this immediately after a soak, before the next one.\n",
+            "  `message_events` is empty of full-path messages. Either no soak has run against this store,\n"
+            "  or it is not the store the soak wrote to — check MEFOR_STORE_* in THIS shell (with none set,\n"
+            "  the settings default to a local SQLite file and this script quietly measures an empty one).\n"
+            "  Note _reset_store does NOT clear message_events, so a soak's rows are not deleted by the next\n"
+            "  run — if you expected data here, you are probably pointed at the wrong store.\n",
             file=sys.stderr,
         )
         return 1
-    print(_render(d))
+    # The JSON artifact is written BEFORE the table is printed: rendering to a redirected stdout can still
+    # fail on a legacy-codepage console, and the artifact is the thing you cannot re-derive once the next
+    # soak starts.
     if args.json:
         args.json.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    print(_render(d))
+    if args.json:
         print(f"  wrote {args.json}")
     return 0
 

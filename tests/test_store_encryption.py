@@ -20,6 +20,7 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.store import MessageStore
+import logging
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 
@@ -682,3 +683,143 @@ def test_cipher_does_not_retain_raw_key_bytearray() -> None:
     cipher = make_cipher(generate_key())
     assert isinstance(cipher, AesGcmCipher)
     assert not any(isinstance(v, bytearray) for v in vars(cipher).values())
+
+
+# --- CRYPTO-6: require_encryption fail-CLOSED negative (configured-but-unusable key) ----------
+#
+# require_encryption is a *presence* guard (see tests/test_cli.py), not a key-usability validator, so a
+# CONFIGURED-but-unusable key (foreign / rotated-away DEK) makes serve START. These two tests lock the
+# runtime + cipher-level halves of the fail-closed net that catches such a key: it can NEVER silently
+# degrade to the plaintext IdentityCipher (cipher level), and an unusable key at delivery time REFUSES
+# the payload via per-row dead-lettering rather than handing the worker plaintext (runtime level). This
+# is the exact boundary a security audit mistook for a bug: usability is enforced at runtime, not startup.
+
+
+def test_configured_key_never_degrades_to_identity_cipher() -> None:
+    # Cipher-level fail-CLOSED invariant: a CONFIGURED key — even a fixed "foreign" one that matches
+    # nothing on a given store's disk — builds an *encrypting* AesGcmCipher, NEVER the passthrough
+    # IdentityCipher. make_cipher returns IdentityCipher ONLY for an absent key, so a configured-but-
+    # unusable key can never silently downgrade PHI to plaintext at rest. (Contrast the passthrough in
+    # test_identity_cipher_is_passthrough, which is reached ONLY with no key.)
+    for key in (generate_key(), _FROZEN_V1_KEY_B64):  # a fresh key and a fixed "foreign" key
+        cipher = make_cipher(key)
+        assert isinstance(cipher, AesGcmCipher) and cipher.encrypts
+        assert not isinstance(cipher, IdentityCipher)
+    # Only an ABSENT key (None or "") yields the plaintext passthrough — the sole path to identity.
+    assert isinstance(make_cipher(None), IdentityCipher) and not make_cipher(None).encrypts
+    assert isinstance(make_cipher(""), IdentityCipher)
+
+
+async def test_foreign_key_at_runtime_dead_letters_rather_than_degrading(tmp_path: Path) -> None:
+    # Runtime fail-CLOSED invariant: when the CONFIGURED store key is unusable against the rows on disk
+    # — the "rotated-away DEK / foreign key" case (open under key B, rows written under key A, with NO
+    # retired bridge key supplied) — the store REFUSES the payload (per-row dead-letter, "undecryptable"
+    # reason). It never returns plaintext to the delivery worker and never degrades to the identity
+    # cipher. This is the runtime safety net that backs require_encryption's presence-only startup guard.
+    from messagefoundry.store.store import OutboxStatus
+
+    db = tmp_path / "foreign.db"
+    key_a, key_b = generate_key(), generate_key()
+    seed = await MessageStore.open(db, cipher=make_cipher(key_a))
+    try:
+        mid = await seed.enqueue_message(channel_id="ch", raw=ADT, deliveries=[("d", "PAYLOAD-A")])
+    finally:
+        await seed.close()
+
+    # Reopen under key B ALONE: the on-open migration skips already-encrypted (mfenc:) rows, so open
+    # succeeds; the key mismatch surfaces only when a row is claimed for delivery.
+    store = await MessageStore.open(db, cipher=make_cipher(key_b))
+    try:
+        # The reopened store still ENCRYPTS (never silently degrades to identity) despite the mismatch.
+        assert isinstance(store._cipher, AesGcmCipher) and store._cipher.encrypts
+        [row] = await store.outbox_for(mid)  # metadata-only read (no payload decrypt) → succeeds
+        # Claiming the row REFUSES it: the undecryptable payload is dead-lettered, not returned/delivered.
+        items = await store.claim_ready(limit=10)
+        assert items == []  # nothing handed to the delivery worker (no plaintext leak)
+        cur = await store._db.execute(
+            "SELECT status, last_error FROM queue WHERE id=?", (row["id"],)
+        )
+        dead = await cur.fetchone()
+        assert dead["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
+        # last_error is ciphered (WP-5) under the ACTIVE key B, so the reopened store decrypts it.
+        assert "undecryptable" in store._cipher.decrypt(dead["last_error"] or "")
+    finally:
+        await store.close()
+
+
+# --- CRYPTO-10: no key-material / PHI leak on the cipher failure + tripwire paths ---
+#
+# Positive regression guards for the PHI/key-at-rest invariant. A wrong-key decrypt failure and the
+# 2**31 GCM invocation soft-warn must each carry ONLY the one-way key_id fingerprint — never the base64
+# DEK, the wrapped ciphertext blob, or the plaintext body — in str(exc) OR in any DEBUG-level log record.
+
+
+def test_cipher_decrypt_failure_leaks_no_key_material(caplog: pytest.LogCaptureFixture) -> None:
+    key_a, key_b = generate_key(), generate_key()
+    body = (
+        "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|LEAKCANARY|P|2.5.1\r"
+        "PID|1||100^^^H^MR||SECRETNAME^JANE\r"
+    )
+    token = make_cipher(key_a).encrypt(body)
+    blob = token.split(":")[
+        -1
+    ]  # the base64(nonce ‖ ciphertext ‖ tag) segment of mfenc:v1:<kid>:<blob>
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(CipherError) as excinfo:
+            make_cipher(key_b).decrypt(token)  # no configured key authenticates the GCM tag
+
+    for hay in (str(excinfo.value), caplog.text):
+        assert body not in hay  # the plaintext body never surfaces on the failure path
+        assert "SECRETNAME" not in hay  # nor a PHI fragment of it
+        assert key_a not in hay and key_b not in hay  # no base64 DEK (only the one-way fingerprint)
+        assert blob not in hay  # no wrapped ciphertext blob
+
+
+def test_gcm_invocation_warning_leaks_no_key_material(caplog: pytest.LogCaptureFixture) -> None:
+    import messagefoundry.store.crypto as crypto
+
+    key = generate_key()
+    cipher = make_cipher(key)
+    assert isinstance(cipher, AesGcmCipher)
+    body = "SECRETBODYCANARY residual free-text PHI"
+    # Jump the in-memory counter to just below the soft-warn threshold, then encrypt across it (idiom
+    # from test_audit_integrity.test_gcm_soft_warn_then_fail_closed) so the tripwire logs exactly once.
+    cipher._invocations = crypto._GCM_SOFT_WARN_INVOCATIONS - 1
+    with caplog.at_level(logging.DEBUG):
+        cipher.encrypt(body)  # crosses 2**31 → one soft warning naming only the key fingerprint
+
+    assert any(
+        "2**31" in r.getMessage() for r in caplog.records
+    )  # the tripwire fired (not vacuous)
+    assert key not in caplog.text  # the base64 DEK is never logged (only the one-way fingerprint)
+    assert body not in caplog.text and "SECRETBODYCANARY" not in caplog.text  # nor the plaintext
+
+
+def test_every_secret_buffer_is_actually_zeroized_across_the_full_cipher_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #198 — the DEK spy above only covers CONSTRUCTION. This pins the invariant across the whole
+    # code-owned mutable-buffer surface: the DEK (install), the encrypt plaintext buffer, AND the
+    # decrypt plaintext buffer are each not merely *offered* to the wiper but end genuinely all-zero.
+    import messagefoundry.store.crypto as crypto
+
+    real_zero = crypto._secure_zero
+    wiped_nonempty: list[bool] = []
+
+    def spy_zero(buf: bytearray) -> None:
+        had_secret = len(buf) > 0 and any(buf)  # a buffer that actually held bytes to scrub
+        real_zero(buf)  # perform the real wipe — behaviour must be unchanged
+        if had_secret:
+            wiped_nonempty.append(all(b == 0 for b in buf))  # …and confirm it is now scrubbed
+
+    monkeypatch.setattr(crypto, "_secure_zero", spy_zero)
+
+    cipher = make_cipher(generate_key())  # DEK buffer installed + wiped
+    token = cipher.encrypt(ADT)  # plaintext-encode buffer wiped after the AEAD consumed it
+    assert (
+        cipher.decrypt(token) == ADT
+    )  # decrypt plaintext buffer wiped after decode; round trip holds
+    # At least the DEK + the two plaintext buffers were non-empty secrets, and every one ended all-zero.
+    assert len(wiped_nonempty) >= 3
+    assert all(wiped_nonempty)

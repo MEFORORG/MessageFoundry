@@ -6,7 +6,7 @@ GitHub. The prose source of truth is [ARCHITECTURE.md](ARCHITECTURE.md); this fi
 
 Four views, each answering a different question:
 
-1. **Top-level components** — every shipped component (engine, console, IDE extension, Windows service, test harness, tee relay, CLI) and how they relate.
+1. **Top-level components** — every shipped component (engine, web console, IDE extension, Windows service, test harness, tee relay, CLI) and how they relate.
 2. **System topology** — the engine's internal packages, process boundaries, and the one-way dependency rule.
 3. **Runtime message flow** — how a received message moves through the staged queue and earns a disposition.
 4. **Config wiring graph** — how Connections, Routers, and Handlers wire together by name (no "channel" object).
@@ -36,7 +36,7 @@ flowchart TB
   classDef build fill:#f3e5f5,stroke:#6a1b9a,color:#2a0a3d;
 
   subgraph OPS["Operator tools — separate processes, API clients"]
-    CONSOLE["Monitoring / admin console<br/>messagefoundry.console · PySide6"]:::opstool
+    CONSOLE["Monitoring / admin console<br/>web console · /ui · messagefoundry-webconsole"]:::opstool
     IDEEXT["VS Code extension<br/>ide/ · setup · promote · test bench · AI"]:::opstool
   end
 
@@ -108,8 +108,8 @@ flowchart TB
 ```
 
 The engine ([`messagefoundry`](../messagefoundry/)) is the core; everything else is a separate
-component around it. **Operator tools** — the [console](../messagefoundry/console/) and the
-[VS Code extension](../ide/) — reach it **only** through the API. The **Windows service** (NSSM) runs
+component around it. **Operator tools** — the [web console](../packaging/messagefoundry-webconsole/)
+(served at `/ui`) and the [VS Code extension](../ide/) — reach it **only** through the API. The **Windows service** (NSSM) runs
 it in production; the **CLI**, **synthetic generators**, and **test harness** ([`harness/`](../harness/))
 exercise it in dev/test. The **tee relay** ([`tee/`](../tee/)) is fully standalone — it imports no
 engine code and keeps its own SQLite — used to run MEFOR in parallel with a legacy engine during a
@@ -122,8 +122,8 @@ version tag.
 
 The engine is a headless **asyncio** service; clients are **separate processes** that reach it
 **only** through the localhost HTTP/WebSocket API. The dependency rule is one-way: `pipeline` /
-`transports` / `parsing` / `store` / `config` never import `api` or `console` — the API depends on
-the engine, and the console depends on the API.
+`transports` / `parsing` / `store` / `config` never import `api` — the API depends on
+the engine, and the clients (web console, harness) depend on the API.
 
 ```mermaid
 flowchart TB
@@ -132,9 +132,9 @@ flowchart TB
   classDef engine fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
   classDef deploy fill:#eceff1,stroke:#546e7a,color:#1c2429;
 
-  CON["PySide6 Console<br/>(separate process)"]:::client
+  CON["Web console /ui<br/>(browser)"]:::client
   IDE["VS Code extension"]:::client
-  HARNESS["Test harness"]:::client
+  HARNESS["Test harness<br/>(PySide6)"]:::client
 
   subgraph API_BND["API — localhost 127.0.0.1 · auth + RBAC · the only external surface"]
     API["api/ — FastAPI + uvicorn<br/>HTTP + WebSocket"]:::api
@@ -154,7 +154,7 @@ flowchart TB
   CON -.->|"HTTP/WS API client"| API
   IDE -.->|"HTTP"| API
   HARNESS -.->|"MLLP send/receive"| TRANS
-  CON -.->|"may import (pure lib)"| PARSE
+  HARNESS -.->|"may import (pure lib)"| PARSE
 
   API --> AUTH
   API ==>|"depends on engine"| PIPE

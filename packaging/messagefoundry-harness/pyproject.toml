@@ -36,9 +36,9 @@ classifiers = [
     "Environment :: Console",
 ]
 dependencies = [
-    # The engine + its localhost API client (messagefoundry.console.client) + PySide6 (the harness GUI).
+    # The engine + its localhost API client (messagefoundry.apiclient) + PySide6 (the harness GUI).
     # Lockstep release: install messagefoundry-harness==X.Y.Z alongside messagefoundry==X.Y.Z.
-    "messagefoundry[console]",
+    "messagefoundry[harness]",
 ]
 
 [project.scripts]

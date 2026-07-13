@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Reusable PySide6 leaf widgets for the admin console.
+"""Reusable PySide6 leaf widgets for the harness monitor GUI.
 
 The HL7 parse-tree view, the message browser, the single-message detail pane, and the
-auto-refresh interval dialog. Pages (Connections / Log Search / …) compose these — see
-``shell.py``, ``connections.py``, ``search.py``. Every widget takes an
-:class:`~messagefoundry.console.client.EngineClient`-shaped object and exposes a
+auto-refresh interval dialog. The harness monitor composes these — see ``monitor.py``,
+``compose.py``, ``receive.py``, ``send.py``, ``file_panel.py``. Every widget takes an
+:class:`~messagefoundry.apiclient.EngineClient`-shaped object and exposes a
 ``refresh()`` so the UI can be driven (and smoke-tested headless) without user input.
 
 API calls run synchronously on the GUI thread — localhost latency is negligible — and any
 :class:`ApiError` is surfaced via the ``error`` signal rather than raising into Qt.
+
+Rehomed verbatim from the retired ``messagefoundry.console`` package (BACKLOG #103, ADR 0032 retired):
+the web console is now the sole operator UI, but the harness (itself a PySide6 app) keeps reusing these
+view widgets, so they now live beside it.
 """
 
 from __future__ import annotations
@@ -41,14 +45,15 @@ from PySide6.QtWidgets import (
 )
 
 from messagefoundry.api.models import MessageDetail, MessageSummary
-from messagefoundry.console._async import AsyncRunner
-from messagefoundry.console.client import ApiError, EngineClient
-from messagefoundry.console.theme import ERROR_TEXT
+from messagefoundry.apiclient import ApiError, EngineClient
 from messagefoundry.parsing import HL7PeekError, parse_tree
+
+from harness._async import AsyncRunner
 
 #: Shared "error red" for inline error text — the message-detail error, the auth dialogs'
 #: error labels, and the heart's stopped state — so the palette can't drift across modules.
-#: Sourced from the theme so there is a single source of truth for console colours.
+#: Carried over from the retired console theme so there is a single source of truth for this colour.
+ERROR_TEXT = "#c62828"
 ERROR_COLOR = ERROR_TEXT
 
 __all__ = [
@@ -567,7 +572,7 @@ class MessagesPanel(QWidget):
 
 
 class RefreshSettingsDialog(QDialog):
-    """Modal picker for the console auto-refresh interval. ``0`` means *off*."""
+    """Modal picker for the auto-refresh interval. ``0`` means *off*."""
 
     #: (label, seconds) presets shown in the dropdown.
     PRESETS: list[tuple[str, float]] = [

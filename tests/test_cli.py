@@ -1203,3 +1203,25 @@ def test_serve_notify_quiet_in_synthetic_dev(
     rc, _ = _run_secure_serve(tmp_path, monkeypatch, "", env="dev", key=False)
     assert rc == 0
     assert "security-notification" not in capsys.readouterr().err
+
+
+def test_serve_require_encryption_starts_with_configured_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # CRYPTO-6 (serve guard): [store].require_encryption is a PRESENCE guard, not a key-usability
+    # validator. With a configured MEFOR_STORE_ENCRYPTION_KEY — even a fresh/foreign key that matches
+    # nothing on disk — serve STARTS (exit 0); the guard neither runs a decrypt-probe nor refuses. This
+    # locks the boundary an audit mistook for a bug: a configured-but-unusable key is caught at RUNTIME
+    # by per-row dead-lettering (see tests/test_store_encryption.py), NOT at startup. Contrast
+    # test_serve_refuses_without_key_when_require_encryption (no key configured → refuse).
+    from messagefoundry.store.crypto import generate_key
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())  # a configured (foreign) key
+    (tmp_path / "messagefoundry.toml").write_text(
+        "[store]\nrequire_encryption = true\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    assert "require_encryption" not in capsys.readouterr().err  # presence satisfied → no refusal

@@ -23,6 +23,7 @@ from fastapi import HTTPException, Request, WebSocket, status
 from messagefoundry.api.tls_client_cert import MF_CLIENT_PEERCERT_STATE_KEY
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.tls_policy import HopDisposition
 
 log = logging.getLogger(__name__)
 
@@ -297,14 +298,42 @@ def require_service_cert(*permissions: Permission) -> Callable[[Request], Awaita
     return dependency
 
 
+def enforce_phi_read_hop(request: Request) -> None:
+    """Refuse to emit PHI over an insecure API serve hop (#200 residual, ADR 0092 data-path guard).
+
+    The serve-start exposed-gate already refuses a prod-PHI cleartext bind, but this is the RESPONSE-path
+    defense-in-depth: :func:`create_app` derived the API serve-hop :class:`HopDisposition` once (keyed on
+    the instance posture + whether the serve hop is loopback / in-process TLS / proxy-terminated) and
+    stashed it on ``app.state``. When it is :attr:`~HopDisposition.REFUSE` — a production-PHI instance
+    whose serve hop is NOT proven secure — a PHI-read is refused with a PHI-free 403 rather than putting a
+    body / summary on the clear. ALLOW / WARN (the loopback-dev / non-prod-PHI / synthetic / TLS cases)
+    return silently, so a legitimate lane is byte-identical. Unset (an app built before this seam) → ALLOW.
+
+    Call it from the PHI-read routes (folded into :func:`require_phi_read`; the step-up search route calls
+    it directly). It reads only ``app.state`` — no I/O, no PHI — so it is safe on every request."""
+    disposition = getattr(request.app.state, "phi_read_hop_disposition", HopDisposition.ALLOW)
+    if disposition is HopDisposition.REFUSE:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "PHI read refused: this production-PHI instance's API serve hop is not proven secure "
+            "(no loopback bind, in-process TLS, or declared TLS-terminating proxy), so PHI is not "
+            "emitted over it (posture-keyed refusal, #200/ADR 0092). Configure [api].tls_cert_file "
+            "or [api].tls_terminated_upstream (+ trusted_proxies).",
+        )
+
+
 def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require`, plus a **per-actor anti-automation throttle** for the PHI-read endpoints
     (`/messages`, `/messages/{id}`, `/dead-letters`) — bounds scripted PHI harvesting beyond the
     pagination + access-audit controls (ASVS 2.4.1). A throttled read is **logged** (not silent) and
-    returns 429. No throttle on the embedding/no-auth path (there's no per-actor identity to key on)."""
+    returns 429. No throttle on the embedding/no-auth path (there's no per-actor identity to key on).
+
+    It also enforces the #200 API PHI-read DATA-PATH guard (:func:`enforce_phi_read_hop`) before any
+    identity work, so a production-PHI instance serving over an insecure hop refuses to emit PHI."""
     base = require(*permissions)
 
     async def dependency(request: Request) -> Identity:
+        enforce_phi_read_hop(request)
         identity = await base(request)
         auth = get_auth(request)
         if auth is not None and not auth.allow_phi_read(identity.user_id):

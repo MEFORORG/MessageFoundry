@@ -14,6 +14,8 @@ import pytest
 
 from messagefoundry.store import backup_codec as bc
 from messagefoundry.store.crypto import AesGcmCipher
+import base64
+import logging
 
 
 def _roundtrip(payload: bytes, *, chunk_size: int, key: bytes | None = None) -> bytes:
@@ -142,3 +144,48 @@ def test_unsupported_version_rejected() -> None:
 def test_short_key_rejected() -> None:
     with pytest.raises(bc.BackupCodecError):
         bc.encrypt_stream(io.BytesIO(b"x"), io.BytesIO(), os.urandom(16))
+
+
+# --- CRYPTO-10: no key-material / PHI leak on the .mfbak failure paths ---
+#
+# BackupKeyMismatch (wrong-key precheck) and BackupCodecError (a failed AEAD tag) must each carry ONLY
+# the one-way key_id fingerprint / frame index — never the raw DEK (hex or base64) or the archived
+# plaintext — in str(exc) OR in any DEBUG-level log record. The codec module logs nothing, so caplog
+# stays empty; the guard catches a future regression that starts leaking on these paths.
+
+
+def test_key_mismatch_leaks_no_key_material(caplog: pytest.LogCaptureFixture) -> None:
+    seal_key = os.urandom(32)
+    wrong_key = os.urandom(32)
+    plaintext = b"PHI-BODY-CANARY archived bytes " * 200
+    enc = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(plaintext), enc, seal_key)
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(bc.BackupKeyMismatch) as excinfo:
+            bc.decrypt_stream(io.BytesIO(enc.getvalue()), io.BytesIO(), wrong_key)
+
+    seal_b64 = base64.b64encode(seal_key).decode()
+    wrong_b64 = base64.b64encode(wrong_key).decode()
+    for hay in (str(excinfo.value), caplog.text):
+        assert seal_key.hex() not in hay and wrong_key.hex() not in hay  # no raw DEK hex
+        assert seal_b64 not in hay and wrong_b64 not in hay  # no base64 DEK
+        assert "PHI-BODY-CANARY" not in hay  # nor the archived plaintext
+
+
+def test_auth_failure_leaks_no_key_material(caplog: pytest.LogCaptureFixture) -> None:
+    key = os.urandom(32)
+    plaintext = b"PHI-BODY-CANARY tamper payload " * 200
+    enc = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(plaintext), enc, key, chunk_size=4096)
+    blob = bytearray(enc.getvalue())
+    blob[-50] ^= 0x01  # flip a byte inside the final ciphertext frame → GCM tag fails (correct key)
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(bc.BackupCodecError) as excinfo:
+            bc.decrypt_stream(io.BytesIO(bytes(blob)), io.BytesIO(), key)
+
+    key_b64 = base64.b64encode(key).decode()
+    for hay in (str(excinfo.value), caplog.text):
+        assert key.hex() not in hay and key_b64 not in hay  # no raw DEK (hex or base64)
+        assert "PHI-BODY-CANARY" not in hay  # nor the archived plaintext

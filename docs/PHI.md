@@ -241,23 +241,33 @@ PHI is exposed for the **minimum window and surface** needed to route and transf
   routed through the store cipher on write/read — there is no SQL search or index on `summary`, so
   encrypting it costs nothing — and decrypt only at the audited, RBAC-gated read paths.
 
-**Honest limitation (heap lifetime — decrypted PHI *and* the DEK):** decrypted PHI is ordinary Python
-heap for the processing window and is **not zeroized after use** — CPython `str`/`bytes` are immutable
-and not reliably wipeable (no `memset`-on-free guarantee; the GC may copy or retain the object, and an
-in-memory secret can surface in a heap dump or be paged to a swap file). The **same applies to the
-unwrapped DEK**: once the KeyProvider hands back the base64-decoded 32-byte key, it lives in an
-immutable `bytes` for the cipher's lifetime — MessageFoundry **cannot** scrub it, and any "zeroize"
-call would be best-effort theater on CPython. We are deliberately honest about this rather than
-claiming a wipe we can't deliver. What we *do* enforce: the DEK is never logged, never put into an
-exception message, and never serialized — only its SHA-256 **fingerprint** (`key_id`) is ever surfaced
-(§3, §6), so the in-heap key bytes are the *only* place the secret exists in the process. This is the
-standing **ASVS 11.7.1 / CWE-316 / WP-BL3-28** residual: full in-use memory encryption is a host/OS
-capability (Intel TME / AMD SEV / confidential VMs), not something an application library can provide,
-and it survives even when the KeyProvider seam is pointed at an external HSM/KMS/Vault — envelope
-decryption protects the **root KEK**, not the unwrapped DEK the bulk AES-256-GCM path holds in process.
-The compensating controls are the documented restricted-service-account + volume-encryption posture
-(§10) on a single-tenant host: keep the decrypted-secret window inside an OS-isolated process whose
-memory and swap an attacker cannot reach without already owning the host.
+**Best-effort in-use hygiene `[BUILT — #198]` (ASVS 13.3.3 partial).** Every secret buffer this module
+*owns as a mutable `bytearray`* — the unwrapped DEK, each retired decrypt-only key, and the transient
+plaintext buffers of `encrypt`/`decrypt` — is best-effort **memory-locked** (`VirtualLock`/`mlock`, so it
+is not paged to swap) and **zeroized** (`ctypes.memset`) the instant the AEAD has copied the key/data
+into its own buffer ([store/crypto.py](../messagefoundry/store/crypto.py) — `_lock_memory`/`_secure_zero`,
+`_install_key`). Both are *best-effort*: they swallow every failure (no privilege, `rlimit` exhaustion,
+an exported buffer) and never raise, log, or corrupt — hardening, not correctness. `mfenc:v1` ciphertext
+stays byte-identical and the public cipher seam is unchanged. This shortens the window a decrypted secret
+sits scrubbable in heap; it is a **documented partial of 13.3.3, not a full close.**
+
+**Honest residual (heap lifetime — the copies we cannot reach):** the wipe reaches only the *mutable*
+buffers above. The unavoidable residual is CPython's **immutable** `str`/`bytes`, which have no wipe hook:
+the caller's plaintext `str`, the base64 marker `str` we return (ciphertext only — no plaintext PHI), the
+`bytes` `cryptography` hands back from `decrypt`, and the transient `bytes(dek)`/`bytes(key)` copies the
+`AESGCM`/HKDF constructors consume — plus **`cryptography`'s internal OpenSSL `EVP` key copy**, which we
+cannot address. These linger in the interpreter heap until GC/reuse (they may surface in a heap dump or be
+paged to swap), so the residual survives even when the KeyProvider seam is pointed at an external
+HSM/KMS/Vault — envelope decryption protects the **root KEK**, not the unwrapped DEK the bulk AES-256-GCM
+path holds. What we *do* enforce regardless: the DEK is never logged, never put into an exception message,
+and never serialized — only its SHA-256 **fingerprint** (`key_id`) is ever surfaced (§3, §6). This is the
+standing **ASVS 11.7.1 / CWE-316 / WP-BL3-28** residual: full in-use memory *encryption* is a host/OS
+capability (Intel TME / AMD SEV / confidential VMs), not something an application library can provide, so
+it is carried as a **stated deployment requirement** (§10) accepted via a signed risk-acceptance
+([ASVS-L3-RISK-ACCEPTANCE-REGISTER.md](security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) theme 5), not code.
+The compensating controls are the documented restricted-service-account + volume-encryption posture (§10)
+on a single-tenant host: keep the decrypted-secret window inside an OS-isolated process whose memory and
+swap an attacker cannot reach without already owning the host.
 
 ---
 
@@ -550,6 +560,13 @@ For operators standing up the engine (see also [SERVICE.md](SERVICE.md)):
       account (the file ACL is best-effort, and the spill dirs aren't covered).
 - [ ] **Enable volume encryption** (BitLocker / LUKS) on the data volume — the required at-rest layer
       under §3.
+- [ ] **In-use memory protection is a host requirement (ASVS 11.7.1).** The engine best-effort
+      locks + zeroizes the mutable key/plaintext buffers it owns (#198, §3), but full in-use memory
+      *encryption* is host/hypervisor territory. **Disable or encrypt swap** on the engine host, and
+      **restrict local administrator / debugger access** so no other principal can scrape process memory.
+      Where a memory-forensics threat is in scope, deploy on a **confidential-compute / memory-encrypted
+      host** (Intel TME/SGX/TDX, AMD SEV) — the stated deployment requirement accepted via
+      [ASVS-L3-RISK-ACCEPTANCE-REGISTER.md](security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) theme 5.
 - [ ] **Keep the API on `127.0.0.1`.** Never `0.0.0.0` without TLS + auth in front.
 - [ ] **FastAPI docs are off by default** — `/docs`, `/redoc`, `/openapi.json` are disabled unless
       `[api] expose_docs = true` (they leak the schema, not data); leave them off for any non-localhost

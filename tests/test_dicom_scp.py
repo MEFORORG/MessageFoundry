@@ -246,3 +246,33 @@ def test_scp_tls_ca_file_requires_client_cert(tmp_path: Path) -> None:
     assert ctx is not None
     assert ctx.verify_mode == ssl.CERT_REQUIRED  # fail-closed mTLS — an unverified peer is rejected
     assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2
+
+
+async def test_scp_commit_timeout_returns_out_of_resources_not_success() -> None:
+    # A commit that does not land within the per-commit timeout must surface as a DIMSE failure
+    # (Out of Resources, 0xA700 — the SCU re-sends), never a false Success and never the
+    # decode-failure status (0xC000). This pins the FutureTimeoutError branch of _commit, which is
+    # distinct from the commit-*exception* branch covered by
+    # test_scp_commit_failure_returns_dimse_failure_not_success above.
+    #
+    # Build with the default timeout so the AE's acse/dimse/network timeouts stay long (they are set
+    # once at _start_server and would otherwise abort the association before the C-STORE reply),
+    # then tighten ONLY the per-commit future.result() timeout right before the C-STORE. The handler
+    # sleeps well past that tightened timeout so future.result() raises FutureTimeoutError.
+    async def slow_handler(data: bytes) -> None:
+        await asyncio.sleep(2)  # outlasts the monkeypatched 0.05s commit timeout
+
+    scp = _build_scp([])
+    await scp.start(slow_handler)
+    try:
+        scp._timeout = 0.05  # only future.result(); AE transport timeouts already bound at start
+        established, status = await asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10())
+        assert established is True
+        assert (
+            status == 0xA700
+        )  # Out of Resources — the commit-timeout branch (re-send), not Success
+        assert status not in (0x0000, 0xC000), (
+            "a commit timeout must be Out of Resources, not Success or Cannot Understand"
+        )
+    finally:
+        await scp.stop()

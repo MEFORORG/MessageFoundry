@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Off-thread API calls for the console.
+"""Off-thread API calls for the harness GUI.
 
-The :class:`~messagefoundry.console.client.EngineClient` is synchronous, and calling it on the Qt main
+The :class:`~messagefoundry.apiclient.EngineClient` is synchronous, and calling it on the Qt main
 thread freezes the GUI for the duration of the call. That's fine for sub-millisecond loopback reads, but
 a **DB-backed read during a failover** (``/cluster/nodes``, ``/status``) can stall for seconds while the
 new primary recovers — long enough to lock up the window. :class:`AsyncRunner` runs a blocking callable on
 a worker thread and delivers its result (or exception) back to a **main-thread** slot via a queued signal,
 so the handler can safely touch widgets. Background work off the main thread + ``Signal``/``Slot`` back is
 the PySide6 rule (CLAUDE.md §10).
+
+Rehomed verbatim from the retired ``messagefoundry.console`` package (BACKLOG #103, ADR 0032 retired):
+the harness reuses these Qt view widgets, so they now live beside it.
 """
 
 from __future__ import annotations

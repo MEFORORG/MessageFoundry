@@ -24,6 +24,7 @@ from messagefoundry.parsing import RawMessage
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.dicomweb import DicomWebDestination
+import logging
 
 BASE = "https://pacs.example.org/dicom-web"
 # An opaque "DICOM object" — the destination never parses it, so any bytes exercise the carriage + framing.
@@ -334,3 +335,59 @@ async def test_dicomweb_probe_unreachable_raises() -> None:
     dest._opener = _FakeOpener(exc=urllib.error.URLError("no route"))  # type: ignore[assignment]
     with pytest.raises(DeliveryError, match="unreachable"):
         await dest.test_connection()
+
+
+# --- PHI no-log regression guard (DICOM-23; parity with test_dicom_scu/scp) --
+
+# A STOW-RS dicom+json body can name patient/study identifiers. This canary stands in for that PHI:
+# it must never surface in a log record or a raised exception message (only status + redacted URL may).
+_PHI_CANARY = "Secretpatient^Phicanary^DoNotLog"
+
+
+async def test_dicomweb_failed_sop_response_body_not_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A 2xx FailedSOPSequence body carrying PHI -> permanent dead-letter, but the dicom+json body must
+    # not reach any log record or the raised exception's message.
+    failed_body = json.dumps(
+        {
+            "00081198": {
+                "vr": "SQ",
+                "Value": [
+                    {
+                        "00081197": {"vr": "US", "Value": [272]},
+                        "00081155": {"vr": "UI", "Value": [_PHI_CANARY]},
+                    }
+                ],
+            },
+            "00100010": {"vr": "PN", "Value": [{"Alphabetic": _PHI_CANARY}]},
+        }
+    )
+    dest = _dest()
+    dest._opener = _FakeOpener(body=failed_body.encode(), status=200)  # type: ignore[assignment]
+    # Root DEBUG: also covers any delivery-worker exception logging of the raised error.
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(NegativeAckError) as exc:
+            await dest.send(PAYLOAD)
+    assert exc.value.permanent is True
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert _PHI_CANARY not in blob and "Secretpatient" not in blob
+    assert _PHI_CANARY not in str(exc.value) and "Secretpatient" not in str(exc.value)
+
+
+async def test_dicomweb_http_error_response_body_not_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A non-2xx STOW-RS reply whose error body carries PHI -> classified permanent, but the body must
+    # not reach any log record or the raised exception's message (only status + redacted URL).
+    error_body = json.dumps(
+        {"00100010": {"vr": "PN", "Value": [{"Alphabetic": _PHI_CANARY}]}}
+    ).encode()
+    dest = _dest()
+    dest._opener = _FakeOpener(exc=_http_error(409, error_body))  # type: ignore[assignment]
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(DeliveryError) as exc:
+            await dest.send(PAYLOAD)
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert _PHI_CANARY not in blob and "Secretpatient" not in blob
+    assert _PHI_CANARY not in str(exc.value) and "Secretpatient" not in str(exc.value)

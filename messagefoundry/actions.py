@@ -34,8 +34,14 @@ __all__ = [
     "copy_field",
     "set_field",
     "append_to_field",
-    "format_date",
+    "trim_field",
+    "substring_field",
+    "pad_field",
+    "replace_literal",
     "convert_case",
+    "arith_field",
+    "format_date",
+    "date_diff_field",
     "split_field",
     "code_lookup",
     "copy_segment",
@@ -138,6 +144,134 @@ def code_lookup(
     else:
         return
     msg.set(path, str(translated))
+
+
+def trim_field(msg: Message, path: str) -> None:
+    """Strip leading/trailing whitespace from the value at ``path`` (Corepoint ``ItemConvert`` trim).
+
+    A no-op on an absent field; the trimmed value re-encodes structurally."""
+    value = msg.field(path)
+    if value is None:
+        return
+    msg.set(path, value.strip())
+
+
+def substring_field(msg: Message, path: str, start: int, end: int | None = None) -> None:
+    """Replace the value at ``path`` with its ``[start:end]`` slice (Corepoint ``ItemConvert`` substring).
+
+    ``start``/``end`` index the **decoded** field value with ordinary Python slice semantics (negatives
+    count from the end; ``end=None`` runs to the end). A no-op on an absent field."""
+    value = msg.field(path)
+    if value is None:
+        return
+    msg.set(path, value[start:end])
+
+
+def pad_field(msg: Message, path: str, width: int, *, fill: str = "0", side: str = "left") -> None:
+    """Pad the value at ``path`` to ``width`` with ``fill`` on ``side`` (Corepoint ``ItemConvert`` pad).
+
+    ``side="left"`` right-justifies (e.g. zero-pad an MRN); ``side="right"`` left-justifies. A value
+    already ``>= width`` is left unchanged. A no-op on an absent field; raises :class:`ValueError` on an
+    unknown ``side`` (fail loud rather than silently leaving the value)."""
+    value = msg.field(path)
+    if value is None:
+        return
+    if side == "left":
+        result = value.rjust(width, fill)
+    elif side == "right":
+        result = value.ljust(width, fill)
+    else:
+        raise ValueError(f"pad_field side must be 'left' or 'right', got {side!r}")
+    msg.set(path, result)
+
+
+def replace_literal(msg: Message, path: str, old: str, new: str) -> None:
+    """Replace every literal occurrence of ``old`` with ``new`` at ``path`` (Corepoint ``ItemReplace``
+    find/replace).
+
+    Literal substring replacement via :meth:`str.replace` — **not** a regex, so the result is
+    deterministic and carries no pattern mini-language (which would drift toward the declined declarative
+    layer, ADR 0106 §7). A no-op on an absent field."""
+    value = msg.field(path)
+    if value is None:
+        return
+    msg.set(path, value.replace(old, new))
+
+
+def arith_field(
+    msg: Message, path: str, op: str, operand: float, *, ndigits: int | None = None
+) -> None:
+    """Apply a bounded arithmetic operation to the numeric value at ``path`` (Corepoint ``ItemExpr``).
+
+    Reads the field as a number, applies ``op`` — one of ``"+"`` / ``"-"`` / ``"*"`` / ``"/"`` — with the
+    scalar ``operand``, rounds via :func:`round` (banker's rounding: to an integer when ``ndigits`` is
+    ``None``, else to ``ndigits`` decimal places), and writes the result back. The common use is unit
+    conversion (``op="*"``, e.g. kg→lb with ``operand=2.20462``, ``ndigits=1``).
+
+    ``op`` is validated against the closed set above with an explicit ``if``/``elif`` chain and raises
+    :class:`ValueError` on anything else — it is deliberately **not** an expression string / ``eval`` /
+    operator-table lookup, so there is no mini-language and no non-deterministic drift; the arithmetic is
+    IEEE-754-deterministic, so the reliability invariant holds. A no-op on an absent/empty field. A
+    non-numeric value raises :class:`ValueError`, and division by zero raises :class:`ValueError` — route
+    either to the error/dead-letter path (Corepoint's *Abort* error action)."""
+    value = msg.field(path)
+    if not value:
+        return
+    number = float(value)
+    if op == "+":
+        result = number + operand
+    elif op == "-":
+        result = number - operand
+    elif op == "*":
+        result = number * operand
+    elif op == "/":
+        if operand == 0:
+            raise ValueError("arith_field division by zero")
+        result = number / operand
+    else:
+        raise ValueError(f"arith_field op must be '+', '-', '*', or '/', got {op!r}")
+    msg.set(path, str(round(result) if ndigits is None else round(result, ndigits)))
+
+
+def date_diff_field(
+    msg: Message, start_path: str, end_path: str, dst: str, *, unit: str = "days"
+) -> None:
+    """Write the whole-number interval between two message timestamps to ``dst`` (Corepoint ``ItemDiffDate``).
+
+    Parses the tolerant HL7 v2 timestamps at ``start_path`` and ``end_path`` (via
+    :func:`~messagefoundry.timezone.parse_hl7_timestamp`) and writes ``end - start`` — length-of-stay
+    (``PV1-45`` − ``PV1-44``) or age-at-event (event − ``PID-7``). ``unit`` is ``"days"`` (default),
+    ``"years"`` (whole calendar years), ``"hours"``, or ``"minutes"``.
+
+    **Field-to-field only** — it never reads the wall clock, so a re-run re-derives an identical value
+    (the at-least-once invariant holds; now-relative age stays native Python by design). A no-op if
+    either field is absent/empty; a value that does not parse as an HL7 timestamp raises
+    :class:`ValueError` (route it to the error/dead-letter path); an unknown ``unit`` raises
+    :class:`ValueError`."""
+    start_raw = msg.field(start_path)
+    end_raw = msg.field(end_path)
+    if not start_raw or not end_raw:
+        return
+    start_dt, _sp, _so = parse_hl7_timestamp(start_raw)
+    end_dt, _ep, _eo = parse_hl7_timestamp(end_raw)
+    delta = end_dt - start_dt
+    if unit == "days":
+        interval = delta.days
+    elif unit == "hours":
+        interval = int(delta.total_seconds() // 3600)
+    elif unit == "minutes":
+        interval = int(delta.total_seconds() // 60)
+    elif unit == "years":
+        interval = (
+            end_dt.year
+            - start_dt.year
+            - ((end_dt.month, end_dt.day) < (start_dt.month, start_dt.day))
+        )
+    else:
+        raise ValueError(
+            f"date_diff_field unit must be 'days', 'years', 'hours', or 'minutes', got {unit!r}"
+        )
+    msg.set(dst, str(interval))
 
 
 def copy_segment(

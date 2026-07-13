@@ -63,7 +63,7 @@ pip install "messagefoundry==0.1.0"          # pin the exact version (core runti
 
 Add extras only for what a host actually runs — `messagefoundry[postgres]` (PostgreSQL store),
 `messagefoundry[sqlserver]` (SQL Server store + the DATABASE connectors, needs OS-level ODBC Driver 18),
-`messagefoundry[console]` (desktop admin console), `messagefoundry[sftp]` (SFTP connectors),
+`messagefoundry[harness]` (the PySide6 test harness GUI), `messagefoundry[sftp]` (SFTP connectors),
 `messagefoundry[fhir]` (FHIR codec + FHIR outbound), `messagefoundry[dicom]` (DICOM C-STORE SCP + codec).
 
 Key properties this install model gives you:
@@ -242,24 +242,22 @@ messagefoundry serve --config config --env test --project-root C:\srv\mefor\my-c
   a failover. MEFOR ships the clustering + the `/cluster/*` health-check endpoints, but **not** the load
   balancer itself; single-node deployments need none of this.
 
-### Launching the admin console (no command line)
+### Launching the admin console (in a browser)
 
-Operators monitor and run an instance from the **PySide6 admin console** — a separate desktop app that
-talks to the engine over its localhost API. Install the console extra, then drop a Desktop / Start-Menu
-shortcut so it opens with a double-click, no terminal:
+Operators monitor and run an instance from the **browser web console** served same-origin at `/ui`.
+It ships as a separate, version-matched wheel (`messagefoundry-webconsole`) that the engine mounts
+in-process; install it alongside the engine and turn on `[api].serve_ui`:
 
 ```powershell
-pip install "messagefoundry[console]==0.1.0"     # PySide6 + keyring, into the same venv
-.\scripts\console\install-console-shortcut.ps1   # per-user icon (add -AllUsers, elevated, for machine-wide)
+pip install "messagefoundry-webconsole==0.1.0"   # the /ui web console, into the same venv
+# then set [api].serve_ui = true in your service settings and (re)start the engine
 ```
 
-The shortcut launches `messagefoundry-console.exe` — a **windowed** launcher (no flashing console
-window) carrying the MessageFoundry badge. Double-click it: the console connects to the engine
-(`http://127.0.0.1:8765` by default — typically the boot-start [service](SERVICE.md)) and prompts for
-sign-in, so nothing else is needed for the local case. Point it at a different engine with
-`-Url https://engine.internal:8765` (off-loopback requires TLS), and remove the icons with
-`uninstall-console-shortcut.ps1`. (A shell still works too: `messagefoundry-console` or
-`python -m messagefoundry.console`.)
+Browse to the engine's `/ui` (`http://127.0.0.1:8765/ui` by default — typically the boot-start
+[service](SERVICE.md)) and sign in; nothing else is needed for the local case. Off-loopback exposure
+requires TLS (see [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md)). The former PySide6 desktop console was
+retired in favour of this browser console (BACKLOG #103); PySide6 now backs only the standalone test
+harness (`pip install "messagefoundry[harness]"`).
 
 ---
 

@@ -9,8 +9,9 @@ below are all instances of it.
 
 **Modular design (component-based architecture).** The system is decomposed into independent
 components: the headless **engine**, the **code-first config** authored against it
-(Connections/Routers/Handlers + per-environment values), the **console**, the **IDE extension**, the
-**test harness**, and the **CLI tools** (`generate` / `check` / `dryrun`, beyond `serve`) — with the
+(Connections/Routers/Handlers + per-environment values), the **web console** (`/ui`), the **IDE
+extension**, the **PySide6 test harness**, and the **CLI tools** (`generate` / `check` / `dryrun`,
+beyond `serve`) — with the
 NSSM **Windows service** and **CI** as the operational wrapping. Within the engine itself: `config` /
 `parsing` / `store` / `transports` / `pipeline` / `auth` / `api`. Modularity bounds how much of the
 system any one change — or any one AI context window — has to hold, and deconflicts concurrent builds.
@@ -24,7 +25,7 @@ don't conflict."
 
 **Separation of concerns — high cohesion + loose coupling.**
 - **High cohesion** — everything related to one concern lives inside one component (the engine's
-  message processing; the console's UI). A change stays local.
+  message processing; the web console's UI). A change stays local.
 - **Loose coupling** — components depend on each other as little as possible, and only through
   stable seams. Low coupling means a change in component A has a small **blast radius**, so two
   people (or agents) editing A and B rarely touch the same code.
@@ -35,11 +36,11 @@ don't conflict."
 We agree on the interface *first*, then each side builds behind it independently — the contract is
 the synchronization point; everything behind it is private and parallelizable. In this repo:
 - the **HTTP/WebSocket API** ([`api/app.py`](../messagefoundry/api/app.py)) is the contract between
-  the engine and its clients (console, IDE);
+  the engine and its clients (web console, IDE, harness);
 - the **connector registry** ([`transports/base.py`](../messagefoundry/transports/base.py)) is the
   contract for pluggable transports;
 - the **one-way dependency rule** (`pipeline` / `transports` / `parsing` / `store` / `config` never
-  import `api` / `console`) keeps the seams from leaking.
+  import `api`) keeps the seams from leaking.
 
 **Organizational dimension.**
 - **Conway's Law** — systems tend to mirror the communication structure of the teams that build
@@ -52,21 +53,21 @@ the synchronization point; everything behind it is private and parallelizable. I
 ## Topology: engine-as-library + localhost API
 
 The engine is an importable Python package (`messagefoundry`). Clients — primarily the
-PySide6 console — drive it over a localhost HTTP + WebSocket API (FastAPI/uvicorn).
-The same API serves three deployments without code changes:
+**browser web console** (`/ui`, `messagefoundry_webconsole`) — drive it over a localhost HTTP +
+WebSocket API (FastAPI/uvicorn). The same API serves three deployments without code changes:
 
 - **Embedded** — another Python program owns the engine in-process via `create_app(engine)`
-  (the async test client; embedding). The **console is never this** — it's always a separate
-  process that reaches the engine only over the HTTP API, never by importing it.
-- **Local daemon** — engine runs as a Windows service / Linux daemon; the console attaches over
+  (the async test client; embedding). A **UI client is never this** — it's always a separate
+  process (or a browser) that reaches the engine only over the HTTP API, never by importing it.
+- **Local daemon** — engine runs as a Windows service / Linux daemon; the web console attaches over
   the API. See [SERVICE.md](SERVICE.md) for the Windows service setup (NSSM).
 - **Remote** — same API over the network (Phase 2+, with auth/TLS).
 
 We deliberately did **not** start with two separate processes + hand-rolled IPC. The
 logical boundary (library API) comes first; physical split is a deployment choice.
 
-The same topology as a rendered diagram — clients are separate processes that reach the
-engine only through the API, and the engine packages never import `api`/`console`:
+The same topology as a rendered diagram — clients are separate processes (or a browser) that reach
+the engine only through the API, and the engine packages never import `api`:
 
 ```mermaid
 flowchart TB
@@ -75,9 +76,9 @@ flowchart TB
   classDef engine fill:#e8f5e9,stroke:#2e7d32,color:#10240f;
   classDef deploy fill:#eceff1,stroke:#546e7a,color:#1c2429;
 
-  CON["PySide6 Console<br/>(separate process)"]:::client
+  CON["Web console /ui<br/>(browser)"]:::client
   IDE["VS Code extension"]:::client
-  HARNESS["Test harness"]:::client
+  HARNESS["Test harness<br/>(PySide6)"]:::client
 
   subgraph API_BND["API — localhost 127.0.0.1 · auth + RBAC · the only external surface"]
     API["api/ — FastAPI + uvicorn<br/>HTTP + WebSocket"]:::api
@@ -298,14 +299,17 @@ for transport, and **retention/purge** enforcement.
 | `messagefoundry.transports` | Inbound & outbound connections (MLLP, file, X12 raw-TCP, DICOM C-STORE SCP inbound over pynetdicom — ADR 0025, …), resolved through a registry (`base.py`) — never special-cased in `pipeline/` |
 | `messagefoundry.anon` | Deterministic, secret-per-dataset pseudonymization / de-identification (fail-closed; ADR 0030) — exposed to the tee (`anonymize-captures`) and the test harness |
 | `messagefoundry.pipeline` | Per-message routing/handling (`RegistryRunner` in `wiring_runner.py`) + per-inbound-connection supervision (`engine.py`); offline `dryrun.py` |
-| `messagefoundry.api` | Localhost FastAPI surface for the console (`app.py` + response `models.py`) — the engine's only external interface. The optional `/ui` browser ops console is no longer in-tree: it mounts onto this app from a separate wheel (see below) via `mount_ui`, pinned against the `api/_ui_seam.py` contract ([WEBCONSOLE-PACKAGE.md](WEBCONSOLE-PACKAGE.md)) |
+| `messagefoundry.api` | Localhost FastAPI surface (`app.py` + response `models.py`) — the engine's only external interface. The `/ui` browser web console mounts onto this app from a separate wheel (see below) via `mount_ui`, pinned against the `api/_ui_seam.py` contract ([WEBCONSOLE-PACKAGE.md](WEBCONSOLE-PACKAGE.md)) |
+| `messagefoundry.apiclient` | Qt-free / FastAPI-free engine-client library (ADR 0088) — a small typed httpx wrapper over the API, shared by the test harness and any future client |
 | `messagefoundry.auth` | Authn + RBAC core (no FastAPI): permissions/roles, `Identity`, password hashing, opaque session tokens, LDAP/Kerberos (`service.py`) — enforced by `api` |
 | `messagefoundry.generators` | Conformant synthetic HL7 generators (ADT, ORM, ORU, …) behind `messagefoundry generate` |
-| `messagefoundry.console` | PySide6 admin app — a separate process, HTTP client to the API only |
-| `__main__.py`, `checks.py` | CLI entrypoint (`serve` / `generate` / `check`) + the `check` commit/CI gate |
+| `messagefoundry.service` | Local Windows service control (`messagefoundry service {install,start,stop,status}`; ADR 0088), wrapping the NSSM scripts |
+| `__main__.py`, `checks.py` | CLI entrypoint (`serve` / `generate` / `check` / `service`) + the `check` commit/CI gate |
 
 Dependency direction is one-way: `pipeline` / `transports` / `parsing` / `store` / `config`
-never import `api` or `console`. The API depends on the engine; the console depends on the API.
+never import `api`. The API depends on the engine; the clients (web console, harness) depend on the API
+(via `apiclient`). The former PySide6 desktop console (`messagefoundry.console`) was retired — its
+reusable Qt widgets moved to the harness (BACKLOG #103, ADR 0032 retired).
 
 **Beyond the engine packages** (separate components, not `messagefoundry.*`): the **code-first config**
 an operator authors (their `--config` modules + [`environments/`](../environments/) value overrides),
@@ -336,7 +340,7 @@ hashed resolution lives in the committed **`uv.lock`** / **`requirements.lock`**
 
 **Optional extras**
 
-- `console` → `PySide6` (LGPL — chosen so the OSS console is distributable; not PyQt)
+- `harness` → `PySide6` (LGPL — chosen so the OSS test harness GUI is distributable; not PyQt) + `httpx` + `truststore` (was `[console]` before the desktop console was retired — BACKLOG #103)
 - `sqlserver` → `aioodbc` (production SQL Server store; also needs the OS-level Microsoft ODBC
   Driver 18 for SQL Server, which is not pip-installable; lazy-imported so SQLite-only installs skip it)
 - `dicom` → `pydicom` + `pynetdicom` (DICOM codec — headers/SR only, no numpy — and the C-STORE SCP

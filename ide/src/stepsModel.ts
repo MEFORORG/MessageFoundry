@@ -17,7 +17,7 @@ import type { TraceInvocation, TraceValue } from "./liveDebug";
 
 // ---- the `lens parse --json` contract (ADR 0076 §3; mirror of messagefoundry/lens.py output) --------
 
-export type RowKind = "action" | "lookup" | "control" | "send" | "code";
+export type RowKind = "action" | "lookup" | "control" | "send" | "code" | "diagnostic";
 
 /** One row of a handler's Steps, exactly as `lens parse` emits it (§3). Fields are per-kind. */
 export interface LensRow {
@@ -32,10 +32,10 @@ export interface LensRow {
   suite?: string;
   // action rows
   action?: string;
-  // lookup rows
+  // lookup | diagnostic rows (diagnostic = log_note / checkpoint, ADR 0106 §5 K)
   call?: string;
   assign_to?: string;
-  // action | lookup rows
+  // action | lookup | diagnostic rows
   params?: Record<string, unknown>;
   // The subset of `params` whose argument is a Python literal (`ast.Constant`) — the only params the
   // lens can edit in place from a scalar (§5). Emitted by `lens parse` on action/lookup rows; the
@@ -43,7 +43,7 @@ export interface LensRow {
   // F6). Absent on an older contract / a hand-built test row → treated as "all params editable".
   literal_params?: string[];
   // control rows
-  control?: "if" | "elif" | "else" | "for";
+  control?: "if" | "elif" | "else" | "for" | "raise";
   test_src?: string | null;
   recognized?: boolean;
   // A recognized native control idiom's descriptive header + captured display operand (ADR 0089 Phase C):
@@ -54,6 +54,9 @@ export interface LensRow {
   operand?: unknown;
   // send rows
   outbounds?: string[];
+  // A `return []` explicit filter (the store maps it to FILTERED) — an additive flag on a send row so it
+  // renders as "Filter" without overloading empty `outbounds` (a dynamic-destination Send also has none).
+  filtered?: boolean;
 }
 
 /** One `@handler`'s contract: its registered name, def line, and ordered rows. */
@@ -93,11 +96,11 @@ export interface RowViewModel {
   nesting: number;
   lineStart: number;
   lineEnd: number;
-  // The control keyword for a `control` row (`if`/`elif`/`else`/`for`), carried through so the DOM can tell
-  // an `elif`/`else` CONTINUATION of a block apart from a genuine following sibling at the same nesting —
+  // The control keyword for a `control` row (`if`/`elif`/`else`/`for`/`raise`), carried through so the DOM can
+  // tell an `elif`/`else` CONTINUATION of a block apart from a genuine following sibling at the same nesting —
   // needed to find a dropped-after block's VISUAL bottom (the insertion-bar anchor, {@link insertionBarAnchor}).
   // Undefined for non-control rows.
-  control?: "if" | "elif" | "else" | "for";
+  control?: "if" | "elif" | "else" | "for" | "raise";
   // The row's suite id (see {@link LensRow.suite}) + whether it can be REORDERED (drag/↑/↓). `movable` is
   // computed once at fold time (it needs the contract's `control` field, absent from this view-model) so
   // the webview stays a pure consumer. Optional only so a hand-built test row may omit it (→ not movable);
@@ -162,11 +165,18 @@ const LOOKUP_LABELS: Record<string, string> = {
   code_lookup: "Code Lookup",
 };
 
+// Diagnostics (ADR 0106 §5 K / Group 4) — the one output-independent side effect (DEBUG-only logging).
+const DIAGNOSTIC_LABELS: Record<string, string> = {
+  log_note: "Log Note",
+  checkpoint: "Checkpoint",
+};
+
 const CONTROL_LABELS: Record<string, string> = {
   if: "If",
   elif: "Else If",
   else: "Else",
   for: "For each",
+  raise: "Raise",
 };
 
 /** Title-case a snake_case identifier for a fallback label (e.g. `new_helper` → "New Helper"). */
@@ -253,7 +263,10 @@ function rowTitle(row: LensRow): string {
       }
       return row.control ? (CONTROL_LABELS[row.control] ?? humanizeIdentifier(row.control)) : "Control";
     case "send":
-      return "Send";
+      // An explicit `return []` filter reads as "Filter"; a real Send stays "Send".
+      return row.filtered ? "Filter" : "Send";
+    case "diagnostic":
+      return row.call ? (DIAGNOSTIC_LABELS[row.call] ?? humanizeIdentifier(row.call)) : "Diagnostic";
     case "code":
       return "Code";
   }
@@ -268,8 +281,17 @@ function rowSubtitle(row: LensRow): string | undefined {
     return `→ ${row.assign_to}`;
   }
   if (row.kind === "send") {
+    if (row.filtered) {
+      return "(drop the message)";
+    }
     const outs = row.outbounds ?? [];
     return outs.length > 0 ? outs.join(", ") : "(dynamic destination)";
+  }
+  if (row.kind === "diagnostic") {
+    // The template (log_note) / label (checkpoint) literal — the one meaningful, editable field.
+    const p = row.params ?? {};
+    const text = p.template ?? p.label;
+    return text !== undefined ? renderParamValue(text) : undefined;
   }
   return undefined;
 }
@@ -283,9 +305,13 @@ function rowParams(row: LensRow): ParamField[] {
   return paramsToFields(row.params);
 }
 
-/** Whether a row kind is a recognized, template-regenerable row the lens can edit (ADR 0076 §5). */
+/**
+ * Whether a row kind is a recognized, lens-editable row (ADR 0076 §5 + ADR 0106 §5 K). `diagnostic`
+ * (log_note/checkpoint) is editable too — only its template/label LITERAL, enforced by the engine's
+ * `_editable_slots` (operands render verbatim / read-only).
+ */
 export function isRowEditable(kind: RowKind): boolean {
-  return kind === "action" || kind === "lookup" || kind === "send";
+  return kind === "action" || kind === "lookup" || kind === "send" || kind === "diagnostic";
 }
 
 /**
@@ -298,6 +324,19 @@ export function isRowEditable(kind: RowKind): boolean {
  * draggable + shows ↑/↓ on.
  */
 export function isRowMovable(row: LensRow): boolean {
+  return (
+    isRowEditable(row.kind) ||
+    (row.kind === "control" && (row.control === "if" || row.control === "for" || row.control === "raise"))
+  );
+}
+
+/**
+ * Whether a row can be DELETED. Mirrors the engine's delete gate (messagefoundry/lens rewrite_source):
+ * any lens-editable leaf (action/lookup/send/diagnostic), plus a whole `if`/`for` control BLOCK (its
+ * header removes the block). A `raise`/`elif`/`else`/`code` row is NOT deletable — the engine refuses it
+ * (so the webview greys the trash to avoid an error toast, F6).
+ */
+export function isRowDeletable(row: LensRow): boolean {
   return isRowEditable(row.kind) || (row.kind === "control" && (row.control === "if" || row.control === "for"));
 }
 
@@ -312,7 +351,9 @@ export function isRowMovable(row: LensRow): boolean {
  * "all params editable".
  */
 export function editableParamNames(row: LensRow): string[] {
-  if (row.kind === "action" || row.kind === "lookup") {
+  // action / lookup / diagnostic expose only their literal-valued params (diagnostics: the template/label
+  // literal — operands are excluded by the engine, so `literal_params` already omits them, ADR 0106 §5 K).
+  if (row.kind === "action" || row.kind === "lookup" || row.kind === "diagnostic") {
     const names = Object.keys(row.params ?? {});
     if (row.literal_params === undefined) {
       return names;
@@ -740,6 +781,256 @@ export function buildToolbarInsertRequest(
   return buildInsertRequest(anchor, action, params, pos);
 }
 
+// ---- ADR 0106 grouped Add menu (the full palette) ----------------------------------------------------
+//
+// ADD_MENU_CATALOG is the SINGLE source of truth for the grouped <optgroup> select, the right-click
+// submenu, and the tests. Each item names the lens op it requests and the inputs the provider gathers
+// (a picker / input / fixed choice) before building the edit; a no-prompt item seeds default params and
+// is filled inline. #26 holds: every item requests a NATIVE-code insert the lens recognizes — no
+// declarative logic is executed.
+
+export type AddMenuGroup = "Transform" | "Translate & lookup" | "Structure & flow" | "Diagnostics";
+
+/** One input the Add flow gathers before building the edit. `field` is the edit-dict key it fills. */
+export interface PromptSpec {
+  field: string;
+  label: string;
+  kind: "text" | "codeset" | "destination" | "choice";
+  choices?: readonly string[]; // kind === "choice"
+  optional?: boolean;
+  expr?: boolean; // wrap the gathered value as `{expr: <value>}` (a Name / numeric / expression arg)
+  placeholder?: string;
+}
+
+/** One grouped Add-menu item. Exactly one op-discriminator field (`action`/`template`/`clause`) is set. */
+export interface AddMenuItem {
+  id: string;
+  label: string;
+  group: AddMenuGroup;
+  op: "insert_row" | "template" | "insert_clause" | "insert_comment" | "insert_code_lookup";
+  action?: string; // op === "insert_row"
+  template?: string; // op === "template"
+  clause?: "elif" | "else"; // op === "insert_clause"
+  assignVar?: boolean; // op === "insert_row" lookups that bind a var (the "var" prompt → assign_to)
+  seed?: Record<string, ParamValue>; // op === "insert_row": default params for a no-prompt inline-fill
+  prompts: PromptSpec[];
+  anchorConstraint?: "if_chain"; // Else / Else If: only valid on an if-chain anchor
+}
+
+const IF_OPERATORS = ["exists", "equals", "not_equals", "contains"] as const;
+
+export const ADD_MENU_CATALOG: readonly AddMenuItem[] = [
+  // --- Transform: scalar/string params filled inline (no prompt) ---
+  { id: "set_field", label: "Set Field", group: "Transform", op: "insert_row", action: "set_field", seed: { path: "", value: "" }, prompts: [] },
+  { id: "copy_field", label: "Copy Field", group: "Transform", op: "insert_row", action: "copy_field", seed: { src: "", dst: "" }, prompts: [] },
+  { id: "trim_field", label: "Trim Field", group: "Transform", op: "insert_row", action: "trim_field", seed: { path: "" }, prompts: [] },
+  { id: "replace_literal", label: "Replace", group: "Transform", op: "insert_row", action: "replace_literal", seed: { path: "", old: "", new: "" }, prompts: [] },
+  { id: "date_diff_field", label: "Date Diff", group: "Transform", op: "insert_row", action: "date_diff_field", seed: { start_path: "", end_path: "", dst: "" }, prompts: [] },
+  { id: "format_date", label: "Format Date", group: "Transform", op: "insert_row", action: "format_date", seed: { path: "", out_fmt: "" }, prompts: [] },
+  { id: "copy_segment", label: "Copy Segment", group: "Transform", op: "insert_row", action: "copy_segment", seed: { segment_id: "" }, prompts: [] },
+  { id: "delete_segment", label: "Delete Segment", group: "Transform", op: "insert_row", action: "delete_segment", seed: { segment_id: "" }, prompts: [] },
+  { id: "add_segment", label: "Insert Segment", group: "Transform", op: "insert_row", action: "add_segment", seed: { line: "" }, prompts: [] },
+  { id: "add_repetition", label: "Add Repetition", group: "Transform", op: "insert_row", action: "add_repetition", seed: { path: "", value: "" }, prompts: [] },
+  // --- Transform: numeric / list params gathered at insert (rendered as raw exprs, not string literals) ---
+  {
+    id: "substring_field", label: "Substring Field", group: "Transform", op: "insert_row", action: "substring_field",
+    prompts: [
+      { field: "path", label: "Field path", kind: "text", placeholder: "PID-3.1" },
+      { field: "start", label: "Start index", kind: "text", expr: true, placeholder: "0" },
+      { field: "end", label: "End index", kind: "text", expr: true, placeholder: "6" },
+    ],
+  },
+  {
+    id: "pad_field", label: "Pad Field", group: "Transform", op: "insert_row", action: "pad_field",
+    prompts: [
+      { field: "path", label: "Field path", kind: "text", placeholder: "PID-3.1" },
+      { field: "width", label: "Width", kind: "text", expr: true, placeholder: "10" },
+    ],
+  },
+  {
+    id: "arith_field", label: "Arith", group: "Transform", op: "insert_row", action: "arith_field",
+    prompts: [
+      { field: "path", label: "Field path", kind: "text", placeholder: "OBX-5" },
+      { field: "op", label: "Operator", kind: "choice", choices: ["+", "-", "*", "/"] },
+      { field: "operand", label: "Operand", kind: "text", expr: true, placeholder: "2.20462" },
+    ],
+  },
+  {
+    id: "split_field", label: "Split Field", group: "Transform", op: "insert_row", action: "split_field",
+    prompts: [
+      { field: "src", label: "Source field", kind: "text", placeholder: "PID-5" },
+      { field: "sep", label: "Separator", kind: "text", placeholder: "^" },
+      { field: "dests", label: "Destination fields (Python list)", kind: "text", expr: true, placeholder: '["PID-5.1", "PID-5.2"]' },
+    ],
+  },
+  // --- Translate & lookup ---
+  {
+    id: "code_lookup", label: "Code Lookup", group: "Translate & lookup", op: "insert_code_lookup",
+    prompts: [
+      { field: "code_set", label: "Code set", kind: "codeset" },
+      { field: "path", label: "Field path", kind: "text", placeholder: "PID-8" },
+      { field: "default", label: "Default (on a miss, optional)", kind: "text", optional: true },
+    ],
+  },
+  {
+    id: "db_lookup", label: "DB Lookup", group: "Translate & lookup", op: "insert_row", action: "db_lookup",
+    assignVar: true, seed: { params: { expr: "{}" } },
+    prompts: [
+      { field: "var", label: "Assign result to", kind: "text", placeholder: "row" },
+      // db_lookup / fhir_lookup connections live in [egress].allowed_db / allowed_http, NOT the outbound
+      // graph — so this is free text (an outbound picker would offer the wrong, message-sending set).
+      { field: "connection", label: "DB connection ([egress].allowed_db)", kind: "text", placeholder: "MPI" },
+      { field: "statement", label: "SQL statement", kind: "text", placeholder: "select 1" },
+    ],
+  },
+  {
+    id: "fhir_lookup", label: "FHIR Lookup", group: "Translate & lookup", op: "insert_row", action: "fhir_lookup",
+    assignVar: true,
+    prompts: [
+      { field: "var", label: "Assign result to", kind: "text", placeholder: "pat" },
+      { field: "connection", label: "FHIR connection ([egress].allowed_http)", kind: "text", placeholder: "epic" },
+      { field: "query", label: "FHIR query", kind: "text", placeholder: "Patient?identifier=X" },
+    ],
+  },
+  // --- Structure & flow ---
+  {
+    id: "if", label: "If", group: "Structure & flow", op: "template", template: "if",
+    prompts: [
+      { field: "field", label: "Field path", kind: "text", placeholder: "PID-3.1" },
+      { field: "operator", label: "Condition", kind: "choice", choices: IF_OPERATORS },
+      { field: "value", label: "Value", kind: "text", optional: true },
+    ],
+  },
+  {
+    id: "elif", label: "Else If", group: "Structure & flow", op: "insert_clause", clause: "elif", anchorConstraint: "if_chain",
+    prompts: [
+      { field: "field", label: "Field path", kind: "text", placeholder: "PID-3.1" },
+      { field: "operator", label: "Condition", kind: "choice", choices: IF_OPERATORS },
+      { field: "value", label: "Value", kind: "text", optional: true },
+    ],
+  },
+  { id: "else", label: "Else", group: "Structure & flow", op: "insert_clause", clause: "else", anchorConstraint: "if_chain", prompts: [] },
+  {
+    id: "for_each", label: "For Each", group: "Structure & flow", op: "template", template: "for_each",
+    prompts: [{ field: "segment_id", label: "Segment id", kind: "text", placeholder: "OBX" }],
+  },
+  { id: "filter", label: "Filter", group: "Structure & flow", op: "template", template: "filter", prompts: [] },
+  {
+    id: "raise", label: "Raise", group: "Structure & flow", op: "template", template: "raise",
+    prompts: [
+      { field: "exc_type", label: "Exception", kind: "choice", choices: ["ValueError", "RuntimeError"] },
+      { field: "message", label: "Message", kind: "text", placeholder: "bad MRN" },
+    ],
+  },
+  {
+    id: "send", label: "Send", group: "Structure & flow", op: "template", template: "send",
+    prompts: [{ field: "destination", label: "Destination", kind: "destination" }],
+  },
+  {
+    id: "comment", label: "Comment", group: "Structure & flow", op: "insert_comment",
+    prompts: [{ field: "text", label: "Comment", kind: "text" }],
+  },
+  // --- Diagnostics (editable after insert, ADR 0106 §5 K — filled inline) ---
+  { id: "log_note", label: "Log Note", group: "Diagnostics", op: "insert_row", action: "log_note", seed: { template: "" }, prompts: [] },
+  { id: "checkpoint", label: "Checkpoint", group: "Diagnostics", op: "insert_row", action: "checkpoint", seed: { label: "" }, prompts: [] },
+];
+
+/** The catalog keyed by id — the provider's untrusted-input allowlist (the `insertItem` message's itemId). */
+export const ADD_MENU_BY_ID: Readonly<Record<string, AddMenuItem>> = Object.fromEntries(
+  ADD_MENU_CATALOG.map((item) => [item.id, item]),
+);
+
+/** The catalog grouped in stable order — for the grouped <optgroup> select + the right-click submenu. */
+export function addMenuGroups(): { group: AddMenuGroup; items: AddMenuItem[] }[] {
+  const order: AddMenuGroup[] = ["Transform", "Translate & lookup", "Structure & flow", "Diagnostics"];
+  return order.map((group) => ({ group, items: ADD_MENU_CATALOG.filter((i) => i.group === group) }));
+}
+
+/**
+ * Build the `lens rewrite` edit for a chosen Add-menu item + the values the provider gathered (pure;
+ * unit-testable). `values` maps each prompt's `field` to its gathered string; a no-prompt item leaves it
+ * empty and uses `item.seed`. The POSITION follows the toolbar-Add rule (a `send` anchor → `before`).
+ * The anchor's projection-time source rides as `expect_src` (F7). Never runs a picker — that is the
+ * provider's job before it calls this.
+ */
+export function buildAddMenuRequest(
+  item: AddMenuItem,
+  anchor: { handler: string; lineStart: number; lineEnd: number; expectSrc?: string; kind: RowKind },
+  values: Record<string, string>,
+  position?: "before" | "after",
+): StructuralRequest {
+  const pos: "before" | "after" = position ?? (anchor.kind === "send" ? "before" : "after");
+  const base = { handler: anchor.handler, line_start: anchor.lineStart, line_end: anchor.lineEnd };
+  const withExpect = <T extends { expect_src?: string }>(req: T): T => {
+    if (anchor.expectSrc !== undefined) {
+      req.expect_src = anchor.expectSrc;
+    }
+    return req;
+  };
+  const promptByField = new Map(item.prompts.map((p) => [p.field, p]));
+  const paramValue = (field: string): ParamValue => {
+    const v = values[field] ?? "";
+    return promptByField.get(field)?.expr ? { expr: v } : v;
+  };
+
+  switch (item.op) {
+    case "insert_row": {
+      const params: Record<string, ParamValue> = { ...(item.seed ?? {}) };
+      let assignTo: string | undefined;
+      for (const p of item.prompts) {
+        if (item.assignVar && p.field === "var") {
+          assignTo = values[p.field];
+          continue;
+        }
+        if (!(p.optional && !values[p.field])) {
+          params[p.field] = paramValue(p.field);
+        }
+      }
+      const req: InsertRequest = { ...base, op: "insert_row", position: pos, action: item.action ?? "", params };
+      if (assignTo) {
+        req.assign_to = assignTo;
+      }
+      return withExpect(req);
+    }
+    case "template": {
+      const req: TemplateRequest = { ...base, op: "template", position: pos, template: item.template ?? "" };
+      if (values.field) req.field = values.field;
+      if (values.operator) req.operator = values.operator;
+      if (values.value !== undefined && values.value !== "") req.value = values.value;
+      if (values.test) req.test = values.test;
+      if (values.segment_id) req.segment_id = values.segment_id;
+      if (values.exc_type) req.exc_type = values.exc_type;
+      if (values.message !== undefined && values.message !== "") req.message = values.message;
+      if (values.destination) req.destination = values.destination;
+      return withExpect(req);
+    }
+    case "insert_clause": {
+      const req: InsertClauseRequest = { ...base, op: "insert_clause", clause: item.clause ?? "else" };
+      if (values.field) req.field = values.field;
+      if (values.operator) req.operator = values.operator;
+      if (values.value !== undefined && values.value !== "") req.value = values.value;
+      if (values.test) req.test = values.test;
+      return withExpect(req);
+    }
+    case "insert_comment": {
+      const req: InsertCommentRequest = { ...base, op: "insert_comment", position: pos, text: values.text ?? "" };
+      return withExpect(req);
+    }
+    case "insert_code_lookup": {
+      const req: InsertCodeLookupRequest = {
+        ...base,
+        op: "insert_code_lookup",
+        position: pos,
+        code_set: values.code_set ?? "",
+        path: values.path ?? "",
+      };
+      if (values.var) req.var = values.var;
+      if (values.default) req.default = values.default;
+      return withExpect(req);
+    }
+  }
+}
+
 // ---- row context menu (right-click, BACKLOG #222 follow-up to ADR 0100) ------------------------------
 //
 // The right-click menu is a NEW SURFACE onto the EXISTING row operations — it posts the same
@@ -830,6 +1121,10 @@ export interface MoveRequest {
   expect_src?: string;
 }
 
+/** A value in an inserted call's params: a scalar literal, or a raw `{expr: <source>}` for a Name /
+ * expression argument (a code-set table Name, a db params dict, a numeric literal, a split_field list). */
+export type ParamValue = string | { expr: string };
+
 /** The `lens rewrite` spec for an insert_row op. */
 export interface InsertRequest {
   handler: string;
@@ -838,7 +1133,67 @@ export interface InsertRequest {
   op: "insert_row";
   position: "before" | "after";
   action: string;
-  params: Record<string, string>;
+  params: Record<string, ParamValue>;
+  // db_lookup / fhir_lookup bind their result: `<var> = <call>` (ADR 0106 §5 J). Absent for actions.
+  assign_to?: string;
+  expect_src?: string;
+}
+
+/** The `lens rewrite` spec for a `template` op (ADR 0106 §5 A — If / For Each / Filter / Raise / Send). */
+export interface TemplateRequest {
+  handler: string;
+  line_start: number;
+  line_end: number;
+  op: "template";
+  position: "before" | "after";
+  template: string;
+  field?: string; // if / elif: structured test
+  operator?: string;
+  value?: string;
+  test?: string; // if / elif: raw test escape
+  segment_id?: string; // for_each
+  exc_type?: string; // raise
+  message?: string;
+  destination?: string; // send
+  expect_src?: string;
+}
+
+/** The `lens rewrite` spec for an `insert_clause` op (ADR 0106 §5 D — Else If / Else clause-append). */
+export interface InsertClauseRequest {
+  handler: string;
+  line_start: number;
+  line_end: number;
+  op: "insert_clause";
+  clause: "elif" | "else";
+  field?: string;
+  operator?: string;
+  value?: string;
+  test?: string;
+  expect_src?: string;
+}
+
+/** The `lens rewrite` spec for an `insert_comment` op (ADR 0106 §5 L). */
+export interface InsertCommentRequest {
+  handler: string;
+  line_start: number;
+  line_end: number;
+  op: "insert_comment";
+  position: "before" | "after";
+  text: string;
+  expect_src?: string;
+}
+
+/** The `lens rewrite` spec for an `insert_code_lookup` op (ADR 0106 §5 I — Code Lookup + code-set binding). */
+export interface InsertCodeLookupRequest {
+  handler: string;
+  line_start: number;
+  line_end: number;
+  op: "insert_code_lookup";
+  position: "before" | "after";
+  code_set: string;
+  path: string;
+  var?: string;
+  default?: string;
   expect_src?: string;
 }
 
@@ -854,7 +1209,15 @@ export interface PasteRequest {
   expect_src?: string;
 }
 
-export type StructuralRequest = DeleteRequest | MoveRequest | InsertRequest | PasteRequest;
+export type StructuralRequest =
+  | DeleteRequest
+  | MoveRequest
+  | InsertRequest
+  | PasteRequest
+  | TemplateRequest
+  | InsertClauseRequest
+  | InsertCommentRequest
+  | InsertCodeLookupRequest;
 
 /**
  * The lens ops that change LINE COUNTS — after any of them every row coordinate the webview held is
@@ -866,6 +1229,11 @@ export const STRUCTURAL_OPS: ReadonlySet<string> = new Set([
   "insert_row",
   "move_row",
   "paste_block",
+  // ADR 0106 inserts — all change line counts, so each forces a full re-projection.
+  "template",
+  "insert_clause",
+  "insert_comment",
+  "insert_code_lookup",
 ]);
 
 /** Whether an op invalidates every row coordinate (structural) and so forces a re-projection. */
@@ -1728,13 +2096,25 @@ export function renderHandlersHtml(handlers: HandlerViewModel[]): string {
  * webview greys items per {@link contextMenuEnablement}. Pure — every label/value is HTML-escaped.
  */
 export function renderStepsContextMenuHtml(): string {
+  // The full ADR 0106 palette, grouped. Each item carries data-item-id (the ADD_MENU_BY_ID allowlist key
+  // the provider validates) and, for a clause insert, data-anchor="if_chain" so the webview greys it off a
+  // non-if row. Delete/Move enablement still comes from contextMenuEnablement.
   const actionItems = (position: "before" | "after"): string =>
-    INSERT_ACTION_LABELS.map(
-      (o) =>
-        `<button type="button" class="ctx-item" role="menuitem" ` +
-        `data-cmd="insert" data-position="${position}" data-action="${escapeHtml(o.value)}">` +
-        `${escapeHtml(o.label)}</button>`,
-    ).join("");
+    addMenuGroups()
+      .map(
+        ({ group, items }) =>
+          `<div class="ctx-group-label" role="presentation">${escapeHtml(group)}</div>` +
+          items
+            .map(
+              (item) =>
+                `<button type="button" class="ctx-item" role="menuitem" ` +
+                `data-cmd="insert" data-position="${position}" data-item-id="${escapeHtml(item.id)}"` +
+                (item.anchorConstraint ? ` data-anchor="${escapeHtml(item.anchorConstraint)}"` : "") +
+                `>${escapeHtml(item.label)}</button>`,
+            )
+            .join(""),
+      )
+      .join("");
   const insertParent = (position: "before" | "after", label: string): string =>
     `<div class="ctx-sub">` +
     `<button type="button" class="ctx-item ctx-parent" role="menuitem" aria-haspopup="true" ` +

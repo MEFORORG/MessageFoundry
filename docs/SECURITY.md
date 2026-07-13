@@ -202,8 +202,8 @@ a request older than `[approvals].expiry_hours` can no longer be approved. Appro
 at `GET /approvals`.
 
 The gated set is configurable (`[approvals].operations`); the first cut covers the two highest-PHI-impact
-flows — **bulk dead-letter replay** and **connection purge**. (The console's `QMessageBox` "are you
-sure?" prompts are **client-side only** and bypassable via the raw API — they are *not* a second approver
+flows — **bulk dead-letter replay** and **connection purge**. (The web console's "are you
+sure?" confirm prompts are **client-side only** and bypassable via the raw API — they are *not* a second approver
 and do not satisfy this control.)
 
 ### Step-up re-verification on sensitive operations (WP-L3-16, ASVS 7.5.3)
@@ -248,14 +248,15 @@ clock-skew window** (`[auth].totp_skew_steps`, **default `0` = the current 30 s 
 replay window, ASVS 6.5.5; set `1`/`2` to restore RFC-6238 ±1 network-delay tolerance, the forward step
 clamped to the current step so single-use holds). TOTP is a shared-secret factor — L3 *prefers*
 phishing-resistant factors: **WebAuthn passkeys are the built WP-14b sibling** (next section), and TOTP
-stays fully supported alongside them (it remains the desktop console's second factor).
+stays fully supported alongside them (a non-browser client — e.g. the test harness, or CLI/API
+automation — has no `navigator.credentials`, so TOTP remains its usable second factor).
 
 ### WebAuthn passkeys (WP-14b, ADR 0068)
 
 Local accounts can also enroll **WebAuthn/FIDO2 passkeys** as a phishing-resistant second factor at the
-**same step-up boundary** — browser-only ceremonies on the `/ui` console (requires the optional
-**`[webauthn]` extra**; the PySide6 console has no `navigator.credentials`, so keep TOTP enrolled for
-desktop step-up). The browser step-up stays **two-credential**: the passkey assertion satisfies the
+**same step-up boundary** — browser ceremonies on the `/ui` web console (requires the optional
+**`[webauthn]` extra**; a non-browser client has no `navigator.credentials`, so keep TOTP enrolled for
+step-up outside the browser). The browser step-up stays **two-credential**: the passkey assertion satisfies the
 session's **MFA leg only**, and the mandatory password leg of `POST /ui/reauth` still stamps step-up
 freshness and re-anchors the session's client IP (WP-L3-13) — so a passkey never silently relaxes the
 password re-proof. Enrollment (`POST /ui/account/webauthn/enroll`) sits behind the **password-only
@@ -354,7 +355,7 @@ revoked privilege or disabled account takes effect immediately (ASVS 8.3.2).
 
 **Device security-posture assessment is deployment-delegated**, not built in-process: an attested/managed
 admin host and an **mTLS client certificate terminated at the reverse proxy** (WP-15) are the posture
-control, consistent with the on-prem desktop-console model — Python's stdlib `ssl` performs no in-process
+control, consistent with the on-prem, loopback-first deployment model — Python's stdlib `ssl` performs no in-process
 device attestation. This is the documented residual for 8.4.2's device-posture clause.
 
 ### Field-level (property) authorization (WP-9)
@@ -414,7 +415,7 @@ alongside the read map.
 Both kinds of user share one identity model (`users.auth_provider` is `local` or `ad`).
 
 - **Local users** authenticate with an argon2id-hashed password and are assigned roles explicitly
-  (`PUT /users/{id}/roles` or the console Users page).
+  (`PUT /users/{id}/roles` or the web console Users page).
 - **AD users** authenticate by LDAP simple-bind over **LDAPS**. The engine binds with a service
   account to find the user, binds as the user to verify the password, then resolves group membership
   (including **nested** groups via `LDAP_MATCHING_RULE_IN_CHAIN`). Their roles are **re-synced from
@@ -444,7 +445,7 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
 
 ### AD-group → role mapping
 
-An admin sets which AD groups govern which role via `GET/PUT /ad-group-map` (or the console). Group
+An admin sets which AD groups govern which role via `GET/PUT /ad-group-map` (or the web console). Group
 identifiers are matched case-insensitively and may be either the group **DN** or its
 **sAMAccountName**. A user in multiple mapped groups gets the union of those roles.
 
@@ -465,12 +466,15 @@ validation **fails closed on a backward wall-clock step** (NTP step-back / VM sn
 than reviving an expired token, and the idle clock is only refreshed by **user-driven** requests — a
 background keepalive (the stats WebSocket re-checks itself, and is capped/short-lived) does not keep a
 session alive. `[auth].max_sessions_per_user` caps concurrent sessions (default **5**; a login beyond
-the cap revokes the user's oldest — ASVS 7.1.2; `0` = unlimited). The console stores the token in the OS keyring (Windows Credential Manager) and sends it as
+the cap revokes the user's oldest — ASVS 7.1.2; `0` = unlimited). Clients send the token as
 `Authorization: Bearer <token>` (the WebSocket prefers the header; the legacy `?token=` query param is
-deprecated because it leaks into proxy/access logs). The keyring item is a **PHI-scoped** credential
-(the user's full RBAC for the session lifetime); the console re-validates it against `/auth/me` on
-startup (discarding a stale/revoked one) and **refuses to send credentials over plaintext `http` to a
-non-loopback host** (no TLS yet) unless explicitly run with `--insecure` for trusted-network dev.
+deprecated because it leaks into proxy/access logs). The token is a **PHI-scoped** credential (the
+user's full RBAC for the session lifetime): the web console holds it in the browser session and the
+`apiclient` (test harness / automation) keeps it in memory, each re-validating it against `/auth/me`
+before use (discarding a stale/revoked one); `apiclient` also **refuses to send credentials over
+plaintext `http` to a non-loopback host** (no TLS yet) unless explicitly run with `--insecure` for
+trusted-network dev. (The retired PySide6 desktop console's OS-keyring token cache is an accepted
+retirement loss — BACKLOG #103.)
 
 ### Session inventory & targeted revocation (WP-10)
 
@@ -485,8 +489,8 @@ Users and admins can see and revoke individual sessions (ASVS 7.5.2 / 7.4.5):
 - **`DELETE /users/{id}/sessions`** (`users:manage`) — admin force-sign-out of a user (offboarding /
   suspected compromise).
 
-Every targeted revoke is audited (`auth.session_revoked`, with scope + actor). The **console** surfaces
-this: an **Active sessions…** dialog in the account menu lists your sessions and offers per-session
+Every targeted revoke is audited (`auth.session_revoked`, with scope + actor). The **web console** surfaces
+this: an **Active sessions…** view in the account menu lists your sessions and offers per-session
 revoke + "sign out everywhere else" (the current session is shown but only revocable via *Sign out*),
 and the **Users** page has a **Revoke sessions** action for admin force-sign-out.
 
@@ -508,7 +512,7 @@ Users are notified of security-relevant changes to their account through **two**
   changes (whose audit `actor` is the admin) are delivered by the email channel, not shown in this self
   view.
 
-MFA step-up is now built (WP-14 native TOTP); a console banner for the feed remains future work (WS-G).
+MFA step-up is now built (WP-14 native TOTP); a web console banner for the feed remains future work (WS-G).
 
 ## Password policy
 
@@ -661,6 +665,32 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
   protects the payload. Re-open when the stdlib gains a first-class ECH API (no new dep) and an
   SVCB/HTTPS resolver is in scope.
 
+### In-use memory protection — best-effort partial + deployment requirement (13.3.3 / 11.7.1 / 11.7.2, #198)
+
+The store cipher holds an unwrapped 32-byte DEK and transient plaintext PHI in process heap while it
+runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and accepts the rest:
+
+- **Built (best-effort partial).** Every key/plaintext buffer the cipher owns as a *mutable* `bytearray`
+  — the unwrapped DEK, retired decrypt-only keys, and the `encrypt`/`decrypt` plaintext buffers — is
+  best-effort `mlock`/`VirtualLock`-pinned (not paged to swap) and `memset`-zeroized the moment the AEAD
+  has copied it ([store/crypto.py](../messagefoundry/store/crypto.py): `_lock_memory`/`_secure_zero`/
+  `_install_key`). Both are fail-safe — a lock or wipe failure is swallowed, never raising, logging, or
+  corrupting — and `mfenc:v1` ciphertext stays byte-identical. This is a **documented partial of ASVS
+  13.3.3, not a full close.**
+- **Accepted residual (application layer).** CPython **immutable** `str`/`bytes` have no wipe hook, so
+  the caller plaintext, the returned marker (ciphertext-only), `cryptography`'s `decrypt()` output, the
+  transient `bytes(dek)` copies its constructors consume, and **OpenSSL's internal `EVP` key copy** are
+  **unreachable** to scrub. This residual is signed off in
+  [ASVS-L3-RISK-ACCEPTANCE-REGISTER.md](security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) theme 5 (owner as
+  system + security owner), not hidden.
+- **Deployment requirement (11.7.1).** Full in-use memory *encryption* (Intel TME/SGX/TDX, AMD SEV,
+  confidential VMs) is a **host/hypervisor capability no pure-Python application library can provide**.
+  It is carried as a **stated deployment requirement** — disabled/encrypted swap, restricted local
+  admin, and a confidential-compute host where memory forensics is in scope (see
+  [PHI.md §10](PHI.md#10-secure-deployment--operations-checklist)) — accepted via the same register
+  entry rather than enforced by the engine. 11.7.2's encrypt-after-use guarantee is active only on a
+  keyed instance (a key must be configured), which is already the case for any PHI-bearing deployment.
+
 ### HIPAA §164.312 alignment
 
 - **Unique user identification** (required) — every user is a distinct account; no shared logins.
@@ -672,11 +702,12 @@ BACKLOG #190 bundled three integrity residuals; #190 closes with **one built** a
 
 ---
 
-## Console sign-in
+## Web console sign-in
 
-`python -m messagefoundry.console` shows a sign-in dialog (Local / Active Directory) when the engine
-requires auth, caches the token in the OS keyring, gates UI actions by permission, exposes a **Users**
-admin page to `users:manage` holders, and offers **Sign out** (clears the token).
+The browser web console (`/ui`) shows a sign-in form (Local / Active Directory) when the engine
+requires auth, holds the token in the browser session, gates UI actions by permission, exposes a
+**Users** admin page to `users:manage` holders, and offers **Sign out** (clears the session). The
+former PySide6 desktop console was retired (BACKLOG #103).
 
 ---
 
@@ -730,6 +761,6 @@ SLSA + the Sigstore identity check) per [INSTALL-GUIDE.md](INSTALL-GUIDE.md#veri
 
 Entra ID / OIDC federation, custom roles, and the remaining `code:edit` / `config:validate` /
 `service:configure` endpoints those permissions will gate. **Transport TLS is built** — API/WS (WP-13a), the reverse-proxy / forwarded-header path (WP-15), and MLLP-over-TLS (WP-13b, per-connection `tls`/`tls_*`), per [ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md) (*Accepted*). The §0 **exposed-gate is enforced** — a non-loopback *plaintext* API or MLLP bind is refused at startup unless `serve --allow-insecure-bind`. ADR-0002 **MFA (WP-14) is now built** — native TOTP for local accounts (see "Multi-factor authentication" above); AD/Kerberos MFA is delegated to the directory. The **DICOM C-STORE SCP inbound** (ADR 0025 Phase 1) carries the same posture: it accepts only allowlisted calling AE titles + peer IPs, supports **DICOM-over-TLS**, and a non-loopback bind is refused unless explicitly overridden. **Outbound egress auth** for the FHIR/REST connector is built as a **SMART Backend Services token provider** (ADR 0024) — OAuth2 `client_credentials` with a signed-JWT (RS384/ES384) client assertion (extending the ADR 0018 signing core, no new dependency), opted in per connection via `with_smart_backend()`; it mints a per-request bearer and re-mints on `401`, and the token endpoint is gated by `[egress].allowed_http`. It is **client-only** — no App Launch flow and no authorization-server facade. **SMART trust boundary (BACKLOG #204, ASVS 10.4.16):** the engine *presents* a `private_key_jwt` client assertion (RFC 7523) to the token endpoint, but *enforcing* that method — validating the assertion signature/audience/expiry, refusing a weaker `client_secret_post`/`client_secret_basic` for this client, and replay-protecting the `jti` — is the **authorization server's responsibility**, a boundary the client engine does not and cannot police. MessageFoundry assumes an AS that mandates private_key_jwt for Backend Services clients; an AS that *also* accepts a weaker authentication method is an AS-side misconfiguration, not a client-engine defect. (Encryption at rest, audit hash-chaining,
-**per-channel RBAC** — including the console scope editor and AD-group→scope mapping — and the
+**per-channel RBAC** — including the web console scope editor and AD-group→scope mapping — and the
 **committed dependency lockfile** are now built; see [PHI.md §3](PHI.md#3-encryption-at-rest),
 *Audit*, the per-channel-scoping note, and *Dependency lockfile (DEP-1)* above.)

@@ -259,7 +259,20 @@
         lineEnd: Number(el.dataset.lineEnd),
         expectSrc: el.dataset.expectSrc,
         kind: el.dataset.kind,
+        control: el.dataset.control,
       };
+      updateAddState();
+    }
+
+    // Enable the toolbar Add only for a valid (item, selected row) pair: a chosen item, AND — for an
+    // if-chain-only item (Else / Else If, data-anchor="if_chain") — an if/elif anchor. Mirrors the
+    // right-click menu's greying so the two Add surfaces agree on what is legal (avoids an F6 toast).
+    function updateAddState() {
+      if (sel.value === '' || !selected) { addBtn.disabled = true; return; }
+      const opt = sel.selectedOptions && sel.selectedOptions[0];
+      const needsIfChain = !!(opt && opt.dataset.anchor === 'if_chain');
+      const isIfChain = selected.kind === 'control' && (selected.control === 'if' || selected.control === 'elif');
+      addBtn.disabled = needsIfChain && !isIfChain;
     }
 
     // ---- Steps block clipboard (webview-owned via vscode.setState — survives re-projection) ------------
@@ -513,7 +526,7 @@
     })();
 
     // The dropdown: "[select item]" (value "") disables Add; a real action enables it (R3).
-    sel.addEventListener('change', () => { addBtn.disabled = sel.value === ''; });
+    sel.addEventListener('change', updateAddState);
     addBtn.addEventListener('click', () => {
       if (sel.value === '' || !selected) { return; }
       const position = selected.kind === 'send' ? 'before' : 'after';
@@ -522,8 +535,8 @@
         selectAfterInsert: { handler: selected.handler, anchorExpectSrc: selected.expectSrc, position },
       }));
       vscode.postMessage({
-        command: 'insertToolbar',
-        action: sel.value,
+        command: 'insertItem',
+        itemId: sel.value,
         handler: selected.handler,
         lineStart: selected.lineStart,
         lineEnd: selected.lineEnd,
@@ -553,15 +566,15 @@
     // pure stepsModel.contextMenuEnablement (unit-tested there). Copy/Cut/Paste stay keyboard-served (they
     // are deliberately NOT in this menu). Dispatch helpers use the currently `selected` row. These post to
     // the SAME provider handlers, so the byte-stable lens-rewrite path + F7 stale guard are unchanged.
-    function menuInsert(action, position) {
-      if (!selected || !action || (position !== 'before' && position !== 'after')) { return; }
+    function menuInsert(itemId, position) {
+      if (!selected || !itemId || (position !== 'before' && position !== 'after')) { return; }
       // Remember which row to re-select after the insert re-projects (the new neighbour of the anchor),
       // exactly as the toolbar Add does — the position drives before/after neighbour selection.
       vscode.setState(Object.assign({}, vscode.getState() || {}, {
         selectAfterInsert: { handler: selected.handler, anchorExpectSrc: selected.expectSrc, position: position },
       }));
       vscode.postMessage({
-        command: 'insertToolbar', action: action, position: position,
+        command: 'insertItem', itemId: itemId, position: position,
         handler: selected.handler, lineStart: selected.lineStart, lineEnd: selected.lineEnd,
         expectSrc: selected.expectSrc, kind: selected.kind,
       });
@@ -633,9 +646,21 @@
           for (const p of insertParents) {
             setDisabled(p, p.dataset.sub === 'after' && kind === 'send');
           }
-          setDisabled(delItem, !(kind === 'action' || kind === 'lookup' || kind === 'send'));
-          setDisabled(upItem, !walkMove(ctxRows, ls, 'up'));
-          setDisabled(downItem, !walkMove(ctxRows, ls, 'down'));
+          const control = el.dataset.control;
+          setDisabled(delItem, !(kind === 'action' || kind === 'lookup' || kind === 'send' || kind === 'diagnostic'));
+          // ADR 0106: Else / Else If (data-anchor="if_chain") only apply to an if-chain anchor (an if/elif row).
+          const isIfChain = kind === 'control' && (control === 'if' || control === 'elif');
+          for (const c of menu.querySelectorAll('.ctx-item[data-anchor="if_chain"]')) {
+            setDisabled(c, !isIfChain);
+          }
+          // Mirror isRowMovable: a code row (and an elif/else header) is NOT movable, even though walkMove
+          // finds an adjacent slot for it (it is draggable only as a drag-interception marker). Gate the
+          // ↑/↓ on the row's own movability so the menu agrees with the per-row buttons + the read-only contract.
+          const rowMovable =
+            kind === 'action' || kind === 'lookup' || kind === 'send' || kind === 'diagnostic' ||
+            (kind === 'control' && (control === 'if' || control === 'for' || control === 'raise'));
+          setDisabled(upItem, !rowMovable || !walkMove(ctxRows, ls, 'up'));
+          setDisabled(downItem, !rowMovable || !walkMove(ctxRows, ls, 'down'));
           // Reveal (hidden=false) so it can be measured, then clamp into the viewport (flip up/left at edges).
           menu.hidden = false;
           menu.classList.remove('ctx-flip-sub');
@@ -689,7 +714,7 @@
           const item = ev.target.closest('.ctx-item');
           if (!item || item.disabled) { return; }
           const cmd = item.dataset.cmd;
-          if (cmd === 'insert') { menuInsert(item.dataset.action, item.dataset.position); }
+          if (cmd === 'insert') { menuInsert(item.dataset.itemId, item.dataset.position); }
           else if (cmd === 'deleteRow') { menuDelete(); }
           else if (cmd === 'moveUp') { menuMove('up'); }
           else if (cmd === 'moveDown') { menuMove('down'); }

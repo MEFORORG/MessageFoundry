@@ -16,7 +16,8 @@ guided tooling or extend it in Python; it runs on SQLite, PostgreSQL, or SQL Ser
 authentication, RBAC, audit logging, and encryption-at-rest built in.
 
 > Python import package: `messagefoundry`. Built with **hl7apy** + **python-hl7** (HL7 parsing/
-> validation), **FastAPI** (engine API), and **PySide6** (admin console).
+> validation), **FastAPI** (engine API + the same-origin `/ui` web console), and **PySide6** (the
+> standalone test harness).
 
 ## What it is
 
@@ -29,8 +30,8 @@ control; either way the configuration is version-controlled and yours.
 ## Architecture
 
 **Engine-as-library + localhost API.** The engine is an importable Python package.
-The PySide6 console talks to it over a localhost HTTP + WebSocket API — the same way
-whether the engine runs in-process, as a local daemon, or (later) on a remote host.
+A browser **web console** (served same-origin at `/ui`) talks to it over a localhost HTTP + WebSocket
+API — the same way whether the engine runs in-process, as a local daemon, or (later) on a remote host.
 No hand-rolled IPC; the deployment split is a config choice, not an architectural fork.
 
 See **[docs/architecture-diagram.md](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/architecture-diagram.md)** for the rendered diagrams —
@@ -71,7 +72,7 @@ Full documentation lives on **[messagefoundry.org](https://messagefoundry.org/)*
 
 - **[Mental map](https://messagefoundry.org/assets/docs/MessageFoundry-Mental-Model.pdf)** — an
   orientation guide to how the pieces fit: Connections → Router → Handlers → Connections, with the
-  headless engine and the console/IDE that drive it.
+  headless engine and the web console/IDE that drive it.
 - **[Install Guide](https://messagefoundry.org/assets/docs/MessageFoundry-Install-Guide.pdf)** — install,
   configure, secure, and roll out to production.
 - **[User Guide](https://messagefoundry.org/assets/docs/MessageFoundry-User-Guide.pdf)** — author and
@@ -101,19 +102,21 @@ deliberate — replace `<version>` with the current release shown at the top of 
 needs (each is opt-in and lazy-imported):
 
 ```bash
-pip install "messagefoundry[console]==<version>"     # admin console (PySide6 GUI) — the operator UI; most operators want this
+pip install "messagefoundry-webconsole==<version>"   # the browser web console (/ui) — the operator UI; most operators want this
 pip install "messagefoundry[postgres]==<version>"    # PostgreSQL store backend (production server DB)
 pip install "messagefoundry[sqlserver]==<version>"   # SQL Server store backend (+ OS-level ODBC Driver 18)
 pip install "messagefoundry[sftp]==<version>"        # SFTP transport for the REMOTEFILE connector
 pip install "messagefoundry[dicom]==<version>"       # DICOM codec + C-STORE SCP (pydicom + pynetdicom)
+pip install "messagefoundry[harness]==<version>"     # the standalone PySide6 test harness GUI
 ```
 
-**What's in the `messagefoundry` package — and what isn't.** It is the **engine plus the admin
-console**: the console ships in the same wheel, with its PySide6/GUI dependencies as the opt-in
-`[console]` extra, so a headless server, container, or adopter install stays lean — the console is one
-flag away (`messagefoundry[console]`) when you want the operator UI. The **VS Code extension is a
-separate product, not on PyPI** (a VS Code extension is a different ecosystem); see *VS Code extension &
-test harness* below for where to get it.
+**What's in the `messagefoundry` package — and what isn't.** It is the **engine**; the operator UI is
+the browser **web console** served same-origin at `/ui`, which ships as a separate, version-matched
+wheel (`messagefoundry-webconsole`) the engine mounts in-process (turn it on with `[api].serve_ui`), so
+a headless server, container, or adopter install stays lean. (The former PySide6 desktop console was
+retired in favour of the web console — BACKLOG #103; PySide6 now backs only the opt-in `[harness]` test
+tooling.) The **VS Code extension is a separate product, not on PyPI** (a VS Code extension is a
+different ecosystem); see *VS Code extension & test harness* below for where to get it.
 
 > **Verify before you install (supply chain).** Every release is built by a GitHub Actions workflow,
 > Sigstore-signed, and carries SLSA build-provenance + PEP 740 attestations. Verify a downloaded
@@ -148,10 +151,11 @@ python -m messagefoundry serve --config samples/config --db messagefoundry.db --
 # API on http://127.0.0.1:8765 — GET /connections, /messages, /stats, WS /ws/stats
 ```
 
-Then open the admin console (needs the `console` extra: `pip install -e ".[console]"`):
+Then open the admin console in a browser (install the web console alongside the engine —
+`pip install -e packaging/messagefoundry-webconsole` — and set `[api].serve_ui = true`):
 
 ```bash
-python -m messagefoundry.console --url http://127.0.0.1:8765
+# browse to http://127.0.0.1:8765/ui and sign in
 ```
 
 ### VS Code extension & test harness

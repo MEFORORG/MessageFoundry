@@ -19,6 +19,9 @@ from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.content_search import make_spec
 from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
+from messagefoundry.config.wiring import ConnectionSpec, ConnectorType, InboundConnection, Registry
+from messagefoundry.parsing.peek import Peek
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
 _ADT_SEARCH = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN9001^^^H^MR||DOE^JANE\r"
@@ -2028,3 +2031,56 @@ async def test_attachment_chunks_sealed_at_rest_and_reseal_on_rotation(store) ->
         assert ref == _A_REF  # the content address is over plaintext — rotation-stable
     finally:
         await s3.close()
+
+
+# --- STORE-4: runner-level ACK-on-receipt + post-ingress no-NAK on the real backend ----------
+# Drives the runner's real AA-emitting path (_handle_inbound) + _process_ingress_item against THIS
+# file's real backend `store` fixture — no `.start()`, no socket (port=0 never binds). The SQLite
+# suites cover the AA-after-commit tie and the FILE-source post-ingress path; these pin them on the
+# reply-capable (MLLP) path against SS. Gated like every test here; a green leg confirms the design.
+
+
+def _mllp_inbound_registry(name: str, route) -> Registry:
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            name,
+            ConnectionSpec(ConnectorType.MLLP, {"host": "127.0.0.1", "port": 0}),
+            router="r",
+        )
+    )
+    reg.add_router("r", route)
+    return reg
+
+
+async def test_mllp_inbound_commits_ingress_before_aa(store) -> None:
+    # ACK-on-receipt tie: _handle_inbound builds the AA only AFTER enqueue_ingress durably commits the
+    # raw to the ingress stage. Assert the AA reply AND that the committed ingress row is visible +
+    # claimable — the AA was not returned ahead of a durable commit (count-and-log intact).
+    reg = _mllp_inbound_registry("IB_MLLP", lambda m: [])
+    runner = RegistryRunner(reg, store)
+    ack = await runner._handle_inbound(reg.inbound["IB_MLLP"], RAW.encode("utf-8"))
+    assert ack is not None and Peek.parse(ack).field("MSA-1") == "AA"  # positive ACK to the sender
+    ing = await store.claim_next_fifo("IB_MLLP", stage=Stage.INGRESS.value)
+    assert ing is not None and ing.stage == Stage.INGRESS.value
+    msg = await store.get_message(ing.message_id)
+    assert msg is not None and msg["status"] == MessageStatus.RECEIVED.value
+    assert msg["raw"] == RAW and msg["control_id"] == "MSG1"  # raw preserved, durably persisted
+
+
+async def test_mllp_post_ingress_failure_errors_without_nak(store) -> None:
+    # Reply-capable post-ingress no-NAK path: AA'd on receipt, then a router-phase failure (an unknown
+    # handler name — fail-closed in route_only) dead-letters the message to ERROR AFTER the ACK. No
+    # second reply/NAK: _handle_inbound wrote the one AA; _process_ingress_item holds no sender socket
+    # and returns a control-flow outcome, never an ACK string.
+    reg = _mllp_inbound_registry("IB_MLLP", lambda m: ["ghost"])  # names an unregistered handler
+    runner = RegistryRunner(reg, store)
+    ack = await runner._handle_inbound(reg.inbound["IB_MLLP"], RAW.encode("utf-8"))
+    assert (
+        ack is not None and Peek.parse(ack).field("MSA-1") == "AA"
+    )  # the sole sender-facing reply
+    item = await store.claim_next_fifo("IB_MLLP", stage=Stage.INGRESS.value)
+    assert item is not None
+    outcome = await runner._process_ingress_item("IB_MLLP", item)
+    assert (await store.get_message(item.message_id))["status"] == MessageStatus.ERROR.value
+    assert outcome[0] is _ItemOutcome.PROCESSED  # lane advanced; no NAK back to the sender

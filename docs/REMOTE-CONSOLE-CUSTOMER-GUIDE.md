@@ -1,9 +1,17 @@
 # Enabling the MessageFoundry Console on a Remote PC
 
-**A customer setup guide.** This guide is for the IT administrator who wants staff to run the
-MessageFoundry **admin console** from their own PCs instead of only on the server that hosts the
-engine. It walks through the three things you need to do — prepare a certificate, open the engine to
-the network securely, and point each console at it.
+> **Retired UI (BACKLOG #103, 2026-07-13).** The **PySide6 desktop console is retired**; the operator UI
+> is now the browser **web console** the engine serves same-origin at `/ui`
+> ([ADR 0065](adr/0065-web-ops-dashboard.md)). The certificate + open-the-engine-securely steps below are
+> still exactly what you do — but once the engine is exposed over TLS, staff simply **browse to
+> `https://<engine-host>:8765/ui`** on their own PCs; there is no desktop client to install. The
+> `messagefoundry-console --url …` steps are retained only as **historical reference** for the retired
+> desktop client.
+
+**A customer setup guide.** This guide is for the IT administrator who wants staff to operate
+MessageFoundry from their own PCs (in a browser) instead of only on the server that hosts the
+engine. It walks through the things you need to do — prepare a certificate, open the engine to
+the network securely, and browse to the engine's `/ui`.
 
 No code changes are required; everything here is configuration.
 

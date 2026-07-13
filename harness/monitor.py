@@ -10,9 +10,9 @@ the dead-letter queue (with replay). It also drives a `config/reload`.
 Threading split (CLAUDE.md §10): the **background** stats/connections/dead-letter poll runs off the
 GUI thread in :class:`MonitorPoller` (a slow/unreachable engine must never freeze the UI), and
 emits a snapshot via signal. **User-initiated** calls (login, message browsing/detail, replay,
-reload, connection control) run briefly on the GUI thread — the same pattern the console uses, and
-they reuse the console's :class:`~messagefoundry.console.widgets.MessagesPanel` /
-:class:`~messagefoundry.console.widgets.MessageDetailPanel` widgets verbatim.
+reload, connection control) run briefly on the GUI thread. It reuses the
+:class:`~harness._console_widgets.MessagesPanel` / :class:`~harness._console_widgets.MessageDetailPanel`
+view widgets, rehomed here from the retired desktop console (BACKLOG #103).
 """
 
 from __future__ import annotations
@@ -37,13 +37,13 @@ from PySide6.QtWidgets import (
 
 from messagefoundry.api.models import ConnectionRow, DeadLetterRow
 from messagefoundry.apiclient import ApiError, EngineClient
-from messagefoundry.console.login import LoginDialog
-from messagefoundry.console.widgets import (
+from harness._console_widgets import (
     ConfigurableTable,
     MessageDetailPanel,
     MessagesPanel,
     fmt_ts,
 )
+from harness._login import LoginDialog
 
 _DEFAULT_URL = "http://127.0.0.1:8765"
 _POLL_INTERVAL_MS = 1500
@@ -245,7 +245,7 @@ class MonitorPanel(QWidget):
 
     def _ensure_auth(self, client: EngineClient) -> bool:
         """Return True if usable: a no-auth engine answers ``/auth/me`` directly; an authed one
-        401/403s, so prompt sign-in via the console's :class:`LoginDialog`."""
+        401/403s, so prompt sign-in via the :class:`LoginDialog`."""
         try:
             client.me()
             return True
@@ -259,9 +259,9 @@ class MonitorPanel(QWidget):
             return False
         if dialog.must_change_password:
             # The token works but is restricted to the password-change routes, so every poll/action
-            # would 403. Don't connect with it — the console is where you rotate the password.
+            # would 403. Don't connect with it — the web console is where you rotate the password.
             self._set_status(
-                "Account must change its password before use — do that in the console first.",
+                "Account must change its password before use — do that in the web console first.",
                 error=True,
             )
             return False

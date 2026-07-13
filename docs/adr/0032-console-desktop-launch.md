@@ -1,7 +1,18 @@
 # ADR 0032 — Console desktop launch: a windowed gui-script + shortcut, not a command line
 
-- **Status:** **Accepted (2026-06-20) — built (Phase A).** Phase A (the windowed `gui-script` entry
-  point + the shortcut scripts) is built and remains the console's distribution path (`pip install
+- **Status:** **RETIRED (2026-07-13) — the PySide6 desktop console is removed.** Superseded by the
+  browser web console (`/ui`, `messagefoundry_webconsole`; [ADR 0065](0065-web-ops-dashboard.md),
+  [BACKLOG #75](../BACKLOG.md)) as the sole operator UI, and by [ADR 0088](0088-apiclient-service-cli-extraction.md)
+  (which extracted the Qt-free `apiclient/` + the `messagefoundry service` CLI). [BACKLOG #103](../BACKLOG.md)
+  completed the deferred remainder — `messagefoundry/console/` deleted, the reusable Qt view widgets
+  rehomed to `harness/`, the `[console]` extra renamed to `[harness]` (keyring dropped), and the
+  `[project.gui-scripts]` windowed launcher + `scripts/console/` shortcut tooling removed. Everything
+  below (Phase A's gui-script/icon/shortcut launch, and the retired Phase B frozen installer) is kept as
+  the **historical record** — it no longer describes shipped code. See the *Amendment (2026-07-13) —
+  desktop console retired* section at the end.
+
+- **Superseded status (historical):** *Accepted (2026-06-20) — built (Phase A).* Phase A (the windowed
+  `gui-script` entry point + the shortcut scripts) was the console's distribution path (`pip install
   messagefoundry[console]` + a clickable icon). Phase B (a frozen, zero-Python installer) was ratified
   Accepted (2026-06-28) and built, then **retired (2026-07-01) — superseded**, and its packaging assets
   + CI leg were removed — see the *Amendment (2026-07-01) — Phase B retired* section below (rationale:
@@ -400,3 +411,50 @@ and found the channel is a maintained liability with no evidenced user:
 
 The freeze recipe survives in git history (this ADR + the removed files) and can be restored as a
 one-off if a genuine no-Python/no-IT site appears before [#75](../BACKLOG.md) covers its needs.
+
+---
+
+## Amendment (2026-07-13) — desktop console retired (this ADR is RETIRED)
+
+- **Status (this amendment):** **RETIRED (2026-07-13).** The whole PySide6 desktop console is removed;
+  everything this ADR describes (Phase A's windowed gui-script launch + icon + shortcut installer) no
+  longer describes shipped code. This ADR is kept as the historical record of the desktop console's
+  launch model.
+- **Date:** 2026-07-13
+- **Related:** [BACKLOG #103](../BACKLOG.md) (the retirement) · [ADR 0065](0065-web-ops-dashboard.md)
+  (the browser web console — the successor operator UI) · [ADR 0088](0088-apiclient-service-cli-extraction.md)
+  (the reusable-core extraction: Qt-free `apiclient/` + `messagefoundry service` CLI) ·
+  [BACKLOG #75](../BACKLOG.md) · [CLAUDE.md §2/§10](../../CLAUDE.md)
+
+### Why retire it
+
+Two operator clients (a PySide6 desktop app + the `/ui` browser console) doubled the maintenance,
+parity, and security surface. The web console ([ADR 0065](0065-web-ops-dashboard.md), BACKLOG #75)
+reached operator parity and is zero-install; the one genuinely browser-impossible capability — local
+Windows service control — is CLI-shaped and already moved to `messagefoundry service {install,start,
+stop,status}` (ADR 0088). Retiring the desktop app leaves **one** operator UI to build, test, and secure.
+
+### What was removed vs. what stays
+
+- **Removed:** the `messagefoundry/console/` package in full (all pages/widgets/icons/resources), the
+  desktop-console tests (`tests/test_console_*.py`), the `[project.gui-scripts]` `messagefoundry-console`
+  windowed launcher, `scripts/console/` (the shortcut installer + `pack_ico.py`), and the `[console]`
+  optional-dependency group (renamed to `[harness]`, with `keyring` — the launcher-only OS-token cache —
+  dropped).
+- **Stays:** the browser **web console** as the sole operator UI; the Qt-free **`apiclient/`** client and
+  the **`messagefoundry service`** CLI (ADR 0088); and **PySide6**, now scoped to the standalone **test
+  harness** (`harness/`), into which the reusable Qt view widgets (`ConfigurableTable` / `MessagesPanel` /
+  `MessageDetailPanel` / `LoginDialog`) were rehomed verbatim (`harness/_console_widgets.py`,
+  `harness/_login.py`, `harness/_async.py`).
+
+### Accepted parity losses
+
+The desktop-only affordances that do **not** carry to the web console are accepted as retired: the
+OS-keyring session-token custody, the interactive self-signed/mTLS trust prompt, the multi-shard
+fan-out desktop view, and per-machine `QSettings` UI preferences. Local Windows service control is not
+a loss — it moved to the CLI (ADR 0088).
+
+### Reversibility
+
+The desktop console survives in git history and can be restored if a concrete need reappears, but the
+strategic direction is a single browser UI; no revival is planned.

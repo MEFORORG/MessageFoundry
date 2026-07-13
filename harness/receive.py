@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from messagefoundry.console.widgets import ConfigurableTable
+from harness._console_widgets import ConfigurableTable
 from harness.mllp import REPLY_MODES, MllpReceiver, Received
 
 _COLUMNS = ["Time", "Peer", "Type", "Trigger", "Control ID", "Seen #"]

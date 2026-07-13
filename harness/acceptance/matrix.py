@@ -381,7 +381,7 @@ MATRIX: tuple[MatrixRow, ...] = (
         "Native TOTP MFA for local accounts (WP-14)",
         ONCE,
         Coverage.PYTEST,
-        ("tests/test_step_up.py", "tests/test_console_step_up.py"),
+        ("tests/test_step_up.py", "tests/test_mfa.py"),
     ),
     _row(
         "F3",
@@ -406,10 +406,10 @@ MATRIX: tuple[MatrixRow, ...] = (
     ),
     _row(
         "F6",
-        "Console reaches engine over HTTP API only",
+        "Console reaches engine over HTTP API only (web console + apiclient; PySide6 desktop console retired #103)",
         ONCE,
         Coverage.PYTEST,
-        ("tests/test_console_client.py",),
+        ("tests/test_apiclient.py", "tests/test_dependency_boundaries.py"),
     ),
     _row(
         "F7",
@@ -459,7 +459,6 @@ MATRIX: tuple[MatrixRow, ...] = (
         (
             "tests/test_cluster.py",
             "tests/test_alert_rules.py",
-            "tests/test_console_dead_letters.py",
         ),
     ),
     _row(

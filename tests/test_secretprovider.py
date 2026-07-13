@@ -312,3 +312,47 @@ def test_secret_provider_is_runtime_checkable() -> None:
     # The protocol is @runtime_checkable, mirroring KeyProvider — the fakes satisfy it structurally.
     assert isinstance(_FakeProvider({}), SecretProvider)
     assert isinstance(EnvSecretProvider(), SecretProvider)
+
+
+# --- SMTP fail-closed symmetry: both notifier entrypoints (ADR 0019 §5) --------
+# The AD LDAP consumer has a fail-closed-through-the-real-consumer test
+# (test_ldap_authenticator_unresolvable_reference_fails_closed); these give the two SMTP consumers
+# the same coverage. Both notifier_from_settings and security_notifier_from_settings call
+# resolve_connector_secret first, so a bad [alerts].email_password_secret reference must propagate
+# SecretProviderError BEFORE any transport is built (no blank-credential sink). No production change.
+
+
+def test_notifier_unresolvable_reference_fails_closed() -> None:
+    from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+
+    # Provider present but missing the key → the resolve raises before any EmailTransport is built.
+    provider = _FakeProvider({})
+    with pytest.raises(SecretProviderError):
+        notifier_from_settings(
+            _smtp_settings(email_password_secret="mefor/smtp#password"), secret_provider=provider
+        )
+    assert provider.calls == ["mefor/smtp#password"]
+
+
+def test_security_notifier_unresolvable_reference_fails_closed() -> None:
+    from messagefoundry.pipeline.security_notify import security_notifier_from_settings
+
+    provider = _FakeProvider({})
+    with pytest.raises(SecretProviderError):
+        security_notifier_from_settings(
+            _smtp_settings(email_password_secret="mefor/smtp#password"), secret_provider=provider
+        )
+    assert provider.calls == ["mefor/smtp#password"]
+
+
+def test_notifiers_reference_without_provider_fail_closed() -> None:
+    # A [alerts].email_password_secret reference with no [secrets].provider is a misconfiguration —
+    # both notifier entrypoints must fail closed rather than silently fall back to the (blank) literal.
+    from messagefoundry.pipeline.alert_sinks import notifier_from_settings
+    from messagefoundry.pipeline.security_notify import security_notifier_from_settings
+
+    settings = _smtp_settings(email_password_secret="mefor/smtp#password")
+    with pytest.raises(SecretProviderError, match="email_password"):
+        notifier_from_settings(settings)  # secret_provider defaults to None
+    with pytest.raises(SecretProviderError, match="email_password"):
+        security_notifier_from_settings(settings)

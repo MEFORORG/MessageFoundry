@@ -53,6 +53,8 @@ from messagefoundry.pipeline.sandbox import (
 from messagefoundry.pipeline.sharding import filter_registry_for_shard
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxItem, OutboxStatus, Stage
+from messagefoundry.config.response import response_get
+from messagefoundry.config.state import state_get
 
 # A conformant synthetic ADT^A01 (fabricated MRN/name).
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||900001||DOE^JANE\r"
@@ -697,3 +699,52 @@ def test_route_only_is_thread_safe_under_concurrent_messages(tmp_path: Path) -> 
 
     results = asyncio.run(_run())
     assert results == [["adt"], ["oru"]] * 10
+
+
+# --- PIPE-9: accepts= static fail-closed guards, NEGATIVE branches (ADR 0084) ---
+#
+# test_orphan_accepts_fails_validate (above) hits the `hname not in handlers` branch, which returns
+# BEFORE _check_accepts_predicate runs. These key the bad predicate to the REAL default handler "h"
+# so validate() clears the orphan check and reaches the two static guards.
+
+
+def _reads_run_scoped_state(msg: Any) -> bool:
+    # Names ``state_get`` so the literal lands in ``__code__.co_names`` for the static scan. The body is
+    # never executed (validate() only inspects the code object), so the call args are immaterial.
+    return state_get("ns", "k", default=None) is not None
+
+
+def _reads_run_scoped_response(msg: Any) -> bool:
+    # Same idea for ``response_get`` (the other fail-OPEN run-scoped accessor).
+    return response_get("OB", default=None) is not None
+
+
+def test_non_callable_accepts_fails_validate(tmp_path: Path) -> None:
+    # ``accepts=True`` — the intended default handed in by mistake, a plausible typo — clears the orphan
+    # check yet ``pred(msg)`` would raise ``'bool' object is not callable`` on the FIRST message,
+    # dead-lettering every message on that inbound. Fail closed at load/check time instead.
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = True  # type: ignore[assignment]  # keyed to the REAL handler
+    with pytest.raises(WiringError, match="not callable"):
+        reg.validate()
+
+
+def test_state_get_accepts_fails_validate(tmp_path: Path) -> None:
+    # A predicate whose code names ``state_get`` would read an EMPTY view in the router phase (it fails
+    # OPEN, returning its default) and could silently invert a suppression/dedup filter migrated from a
+    # Handler. Refused statically, naming the offending accessor.
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = _reads_run_scoped_state
+    with pytest.raises(WiringError) as exc:
+        reg.validate()
+    assert "run-scoped state" in str(exc.value)
+    assert "state_get" in str(exc.value)  # the message names the accessor it rejected
+
+
+def test_response_get_accepts_fails_validate(tmp_path: Path) -> None:
+    reg = _reg(tmp_path)
+    reg.handler_accepts["h"] = _reads_run_scoped_response
+    with pytest.raises(WiringError) as exc:
+        reg.validate()
+    assert "run-scoped state" in str(exc.value)
+    assert "response_get" in str(exc.value)

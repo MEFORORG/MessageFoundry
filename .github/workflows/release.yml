@@ -75,6 +75,25 @@ jobs:
           python -m build
           ls -l dist/
 
+      - name: Leak gate — sdist MUST be package-only (private-doc/PHI publish guard)
+        run: |
+          # WITHOUT [tool.hatch.build.targets.sdist].only-include, hatchling sweeps the whole repo into
+          # the sdist and this workflow uploads it to PUBLIC PyPI — which leaked docs/security/* and other
+          # deny-listed private docs on releases 0.1.0..0.2.15. This gate fails the release BEFORE the
+          # (last-step) PyPI publish if any sdist member is outside the package + its standard metadata,
+          # so a regression in the allowlist can never re-leak. Belt-and-suspenders to the pyproject pin.
+          sd=$(ls dist/*.tar.gz)
+          # allowlist = the package tree + the metadata files hatchling force-includes in every sdist
+          # (PKG-INFO, pyproject.toml, .gitignore) + README/CHANGELOG + license files (root or licenses/).
+          leak=$(tar tzf "$sd" | sed -E 's#^[^/]+/##' \
+            | grep -vE '^(messagefoundry/|licenses/|README\.md$|CHANGELOG\.md$|LICENSE$|NOTICE$|PKG-INFO$|pyproject\.toml$|\.gitignore$|$)' || true)
+          if [ -n "$leak" ]; then
+            echo "::error::sdist contains non-package files — private-doc leak guard tripped:"
+            printf '%s\n' "$leak"
+            exit 1
+          fi
+          echo "sdist is package-only ✓"
+
       - name: Smoke-check the built wheel (clean venv → import + version)
         run: |
           python -m venv /tmp/relsmoke

@@ -72,8 +72,14 @@ _ACTION_PARAMS: dict[str, list[str]] = {
     "copy_field": ["msg", "src", "dst"],
     "set_field": ["msg", "path", "value"],
     "append_to_field": ["msg", "path", "suffix"],
-    "format_date": ["msg", "path", "out_fmt"],  # in_fmt is keyword-only
+    "trim_field": ["msg", "path"],  # ADR 0106
+    "substring_field": ["msg", "path", "start", "end"],  # ADR 0106
+    "pad_field": ["msg", "path", "width"],  # ADR 0106 — fill / side are keyword-only
+    "replace_literal": ["msg", "path", "old", "new"],  # ADR 0106
     "convert_case": ["msg", "path", "mode"],
+    "arith_field": ["msg", "path", "op", "operand"],  # ADR 0106 — ndigits is keyword-only
+    "format_date": ["msg", "path", "out_fmt"],  # in_fmt is keyword-only
+    "date_diff_field": ["msg", "start_path", "end_path", "dst"],  # ADR 0106 — unit is keyword-only
     "split_field": ["msg", "src", "sep", "dests"],
     "copy_segment": ["msg", "segment_id"],  # occurrence / index are keyword-only
     "delete_segment": ["msg", "segment_id"],
@@ -88,6 +94,21 @@ _LOOKUP_PARAMS: dict[str, list[str]] = {
 
 _ACTIONS = frozenset(_ACTION_PARAMS)
 _LOOKUPS = frozenset(_LOOKUP_PARAMS)
+# The lookups whose call RETURNS a value to bind (``row = db_lookup(...)``). ``code_lookup`` is a lookup
+# ROW too, but it mutates the message in place and returns ``None`` (actions.py) — so an inserted
+# ``x = code_lookup(...)`` would bind ``None`` and re-classify as a read-only ``code`` row. An insert may
+# assign ONLY these; ``code_lookup`` is inserted bare (ADR 0106 §5 J).
+_ASSIGNABLE_LOOKUPS = frozenset({"db_lookup", "fhir_lookup"})
+
+# Diagnostic helpers (ADR 0106, ``messagefoundry.diagnostics``) — the one output-independent side effect
+# (DEBUG-only, redact-by-default logging). Recognized as read-only ``diagnostic`` rows for now; only the
+# ``template`` / ``label`` literal is meaningful, the ``log_note`` operands are recognized-only extra
+# positionals. Making them insertable/editable is the ADR 0106 insert-side work.
+_DIAGNOSTIC_PARAMS: dict[str, list[str]] = {
+    "log_note": ["template"],
+    "checkpoint": ["msg", "label"],
+}
+_DIAGNOSTICS = frozenset(_DIAGNOSTIC_PARAMS)
 
 
 # --- native Message-API idiom recognition (ADR 0089 Phase A) ------------------
@@ -200,6 +221,19 @@ def _recognize_native_method(call: ast.Call) -> _NativeAction | None:
         if len(call.args) != 1:
             return None
         return _NativeAction("delete_segment", [("segment_id", call.args[0])], display)
+    if func.attr == "add_segment":
+        # ``msg.add_segment(<line>)`` — the arg is a WHOLE segment line ("ODS|R|^ODS123"), the one
+        # editable slot; ``index=`` is a read-only display kwarg (never editable in Phase A).
+        if len(call.args) != 1:
+            return None
+        return _NativeAction("add_segment", [("line", call.args[0])], display)
+    if func.attr == "add_repetition":
+        # ``msg.add_repetition(<path>, <value>)`` — two editable slots; ``occurrence=`` is display-only.
+        if len(call.args) != 2:
+            return None
+        return _NativeAction(
+            "add_repetition", [("path", call.args[0]), ("value", call.args[1])], display
+        )
     return None
 
 
@@ -497,6 +531,19 @@ def _emit_stmt(s: ast.stmt, nesting: int, source: str, lines: list[str]) -> list
         return _emit_if(s, nesting, "if", source, lines)
     if isinstance(s, ast.For | ast.AsyncFor):
         return _emit_for(s, nesting, source, lines)
+    if isinstance(s, ast.Raise):
+        # ``raise ...`` — a recognized single-line control row (ADR 0106); no nested body. It maps to the
+        # post-ACK ERROR/dead-letter + AlertSink path and does NOT NAK the already-ACKed sender.
+        return [
+            _control_row(
+                "raise",
+                _src(s.exc, source) if s.exc is not None else None,
+                True,
+                s.lineno,
+                s.end_lineno or s.lineno,
+                nesting,
+            )
+        ]
     recognized = _classify_simple(s, nesting, source)
     if recognized is not None:
         return [recognized]
@@ -615,6 +662,19 @@ def _classify_simple(s: ast.stmt, nesting: int, source: str) -> dict[str, Any] |
 
     # ``return Send(...)`` / ``return [Send(...), ...]`` — a send row.
     if isinstance(s, ast.Return) and s.value is not None:
+        # ``return []`` / ``return ()`` — an explicit filter (drop the message → FILTERED). It also yields
+        # empty outbounds, so it is distinguished from a dynamic-destination ``Send`` (which likewise has
+        # empty outbounds) by an additive ``filtered`` flag; the store-finalizer keys on ``filtered``,
+        # never on emptiness of ``outbounds`` (ADR 0106). Older consumers ignore the extra field.
+        if isinstance(s.value, ast.List | ast.Tuple) and not s.value.elts:
+            return {
+                "kind": "send",
+                "outbounds": [],
+                "filtered": True,
+                "line_start": line_start,
+                "line_end": line_end,
+                "nesting": nesting,
+            }
         outbounds = _send_outbounds(s.value)
         if outbounds is not None:
             return {
@@ -656,6 +716,16 @@ def _classify_simple(s: ast.stmt, nesting: int, source: str) -> dict[str, Any] |
             "action": name,
             "params": _render_params(call, _ACTION_PARAMS[name], source),
             "literal_params": _literal_param_names(call, _ACTION_PARAMS[name]),
+            "line_start": line_start,
+            "line_end": line_end,
+            "nesting": nesting,
+        }
+    if name in _DIAGNOSTICS and isinstance(s, ast.Expr):
+        return {
+            "kind": "diagnostic",
+            "call": name,
+            "params": _render_params(call, _DIAGNOSTIC_PARAMS[name], source),
+            "literal_params": _literal_param_names(call, _DIAGNOSTIC_PARAMS[name]),
             "line_start": line_start,
             "line_end": line_end,
             "nesting": nesting,
@@ -749,7 +819,12 @@ def _literal_param_names(call: ast.Call, param_names: list[str]) -> list[str]:
     for i, arg in enumerate(call.args):
         if isinstance(arg, ast.Starred):
             continue
-        name = param_names[i] if i < len(param_names) else f"arg{i}"
+        if i >= len(param_names):
+            # An extra positional beyond the signature (e.g. log_note's *values operands) is
+            # recognized-only, never inline-editable — don't advertise it to the IDE (ADR 0106 §5 K),
+            # which would offer an operand as editable then hit the rewrite-layer refusal (F6).
+            continue
+        name = param_names[i]
         if name == "msg":
             continue
         if isinstance(arg, ast.Constant):
@@ -803,12 +878,24 @@ def _is_bounded(node: ast.expr) -> bool:
 
 
 def _is_message_iteration(node: ast.expr) -> bool:
-    """Whether a ``for`` iterates a Message structure (``msg.groups(...)`` / ``.segments()`` / ``.repetitions(...)``)."""
+    """Whether a ``for`` iterates a Message structure with the CORRECT arity — ``msg.segments()`` (no
+    arg), ``msg.groups(boundary)`` / ``msg.repetitions(path)`` (one arg).
+
+    A wrong-arity call such as ``msg.segments("OBX")`` (which would ``TypeError`` at runtime) is NOT a
+    recognized iteration and degrades to a read-only ``code`` row instead of a false-green control row
+    (ADR 0106 — the arity check the review caught was missing)."""
     if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
         return False
-    if node.func.attr not in ("groups", "segments", "repetitions"):
+    if not (isinstance(node.func.value, ast.Name) and node.func.value.id == "msg"):
         return False
-    return isinstance(node.func.value, ast.Name) and node.func.value.id == "msg"
+    if node.keywords:
+        return False
+    attr = node.func.attr
+    if attr == "segments":
+        return not node.args
+    if attr in ("groups", "repetitions"):
+        return len(node.args) == 1
+    return False
 
 
 # --- native control-flow idiom recognition (ADR 0089 Phase C) -----------------
@@ -1073,12 +1160,26 @@ def _merge_code_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # "to" field. It maps to the first positional argument of ``Send(destination, message)``.
 _SEND_TO = "to"
 
-_EDITABLE_KINDS = frozenset({"action", "lookup", "send"})
+# ``diagnostic`` rows (log_note/checkpoint) are editable too (ADR 0106 §5 K) — but only their template/
+# label LITERAL: their operands fall past the signature and are skipped by _editable_slots/literal_params.
+_EDITABLE_KINDS = frozenset({"action", "lookup", "send", "diagnostic"})
 
 # v2 adds three STRUCTURAL ops (delete/insert/move) + multi-line param edits to v1's ``set_params``
 # (ADR 0076 §2 phase 3 v2); ``paste_block`` adds the Steps block-paste (re-indenting a captured block into
 # the anchor's suite, reusing the cross-suite move helpers). Anything else is refused (zero change).
-_SUPPORTED_OPS = frozenset({"set_params", "delete_row", "insert_row", "move_row", "paste_block"})
+_SUPPORTED_OPS = frozenset(
+    {
+        "set_params",
+        "delete_row",
+        "insert_row",
+        "move_row",
+        "paste_block",
+        "template",
+        "insert_clause",
+        "insert_comment",
+        "insert_code_lookup",
+    }
+)
 
 # ruff's configured line length (pyproject ``[tool.ruff] line-length``). Two paths refuse rather than emit a
 # line ruff would re-wrap, so the structural output stays ``ruff format --check``-clean (gate 3): an INSERTED
@@ -1164,8 +1265,8 @@ def rewrite_source(source: str, edit: dict[str, Any], *, module: str = "<source>
     if op in ("set_params", "delete_row") and kind not in _EDITABLE_KINDS:
         if not (op == "delete_row" and kind == "control" and row.get("control") in ("if", "for")):
             raise LensRewriteError(
-                f"row at lines {line_start}-{line_end} is a {kind!r} row — only action/lookup/send rows are "
-                "editable (code and control rows are read-only, ADR 0076 §5)"
+                f"row at lines {line_start}-{line_end} is a {kind!r} row — only action/lookup/send/"
+                "diagnostic rows are editable (code and control rows are read-only, ADR 0076 §5)"
             )
 
     handler_node = _handler_def(tree, row["_handler"])
@@ -1182,6 +1283,22 @@ def rewrite_source(source: str, edit: dict[str, Any], *, module: str = "<source>
         result = _apply_insert_row(src, tree, handler_node, edit, line_start, line_end)
     elif op == "paste_block":
         result = _apply_paste_block(src, line_start, line_end, edit)
+    elif op == "template":
+        # ADR 0106 structure/flow insert (If / For Each / Filter / Raise / Send) — render native Python and
+        # route through the paste path; uses the target only as a position, like insert_row/paste_block.
+        result = _apply_insert_template(src, tree, line_start, line_end, edit)
+    elif op == "insert_clause":
+        # ADR 0106 Else If / Else — append an ``elif``/``else`` clause to the ``if`` chain anchored at the
+        # target row. A pure line-insert (no existing byte is touched), so only re-parse validity is at risk.
+        result = _apply_insert_clause(src, handler_node, line_start, edit)
+    elif op == "insert_comment":
+        # ADR 0106 Comment — splice a ``# <text>`` line at the anchor indent; a raw-line insert (a comment
+        # is not an ast statement), position-only like insert_row, so it can anchor on any row kind.
+        result = _apply_insert_comment(src, line_start, line_end, edit)
+    elif op == "insert_code_lookup":
+        # ADR 0106 Code Lookup — insert code_lookup(msg, path, VAR) AND inject the module-level
+        # ``VAR = code_set("<name>")`` capture (ADR 0033 tables); position-only, anchors any row kind.
+        result = _apply_insert_code_lookup(src, tree, handler_node, line_start, line_end, edit)
     else:  # move_row
         _check_to_suite(edit, contracts, row["_handler"])
         result = _apply_move_row(src, handler_node, edit, line_start, line_end)
@@ -1370,7 +1487,13 @@ def _editable_slots(stmt: ast.stmt, kind: str) -> dict[str, ast.expr] | None:
         if native is not None:
             return dict(native.slots)
     name = _callee_name(call.func)
-    param_names = _ACTION_PARAMS.get(name or "") or _LOOKUP_PARAMS.get(name or "")
+    param_names = (
+        _ACTION_PARAMS.get(name or "")
+        or _LOOKUP_PARAMS.get(name or "")
+        or _DIAGNOSTIC_PARAMS.get(
+            name or ""
+        )  # log_note→[template], checkpoint→[msg,label] (ADR 0106 §5 K)
+    )
     if param_names is None:
         return None
     slots: dict[str, ast.expr] = {}
@@ -1700,6 +1823,63 @@ def _name_in_scope(tree: ast.Module, name: str) -> bool:
     return star or name in names
 
 
+def _last_import_line(tree: ast.Module) -> int:
+    """1-based line number of the last top-level ``import``/``from`` (0 if the module has none).
+
+    Used as the 0-based ``lines`` index at which to inject a new import AFTER the existing block (ADR
+    0106 §6 import injection). A ``@handler`` module always imports at least ``handler``, so 0
+    (top-of-file) is a rare fallback."""
+    last = 0
+    for node in tree.body:
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            last = node.end_lineno or node.lineno
+    return last
+
+
+def _leading_import_end(tree: ast.Module) -> int:
+    """1-based end line of the LEADING contiguous import block (after an optional module docstring), or
+    the docstring's end, or 0.
+
+    Unlike :func:`_last_import_line` (the last import ANYWHERE), this is always ABOVE every handler body,
+    so it is the index-stable, canonical point to inject a module-level code-set binding — even when a
+    stray top-level import trails the handlers (where ``_last_import_line`` would point below the anchor
+    and, after the row splice, land the binding mid-file or inside a later import's parentheses)."""
+    last = 0
+    body = tree.body
+    start = 0
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        last = (
+            body[0].end_lineno or body[0].lineno
+        )  # inject after a leading module docstring at least
+        start = 1
+    for node in body[start:]:
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            last = node.end_lineno or node.lineno
+        else:
+            break  # first non-import ends the leading block
+    return last
+
+
+def _function_binds(func: ast.FunctionDef | ast.AsyncFunctionDef, name: str) -> bool:
+    """Whether ``name`` is a parameter or an assignment target anywhere in ``func``.
+
+    Such a name is a function LOCAL for the whole body (Python scoping), so a module-level binding of the
+    same name would be shadowed — the reason :func:`_apply_insert_code_lookup` refuses it."""
+    a = func.args
+    for arg in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg):
+        if arg is not None and arg.arg == name:
+            return True
+    return any(
+        isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id == name
+        for n in ast.walk(func)
+    )
+
+
 def _apply_insert_row(
     src: str,
     module_tree: ast.Module,
@@ -1730,6 +1910,7 @@ def _apply_insert_row(
     params = edit.get("params", {})
     if not isinstance(params, dict):
         raise LensRewriteError("insert_row 'params' must be an object of {name: value}")
+    needs_import = False
     if action in _NATIVE_INSERT_ACTIONS:
         # ADR 0089: the three actions the Phase A recognizer reads back are inserted in their NATIVE
         # Message-API form (``msg.set`` / ``msg.delete_segments``). That references only ``msg`` — no
@@ -1741,17 +1922,13 @@ def _apply_insert_row(
         # Render first — an unknown vocabulary name / missing param is refused with that (more specific)
         # message before the import-scope check below.
         rendered = _render_insert_call(action, params, edit.get("assign_to"))
-        # gate 3: refuse inserting a vocabulary call the module does not import — a BARE ``set_field(...)``
-        # in a module that never imported ``set_field`` is an F821 undefined name (``ruff check`` failure)
-        # reachable through the IDE's "add step" affordance. Import lines are out of the row-scoped
-        # splice's scope by design (§5), so the honest move is to refuse rather than emit code that won't
-        # lint.
-        if not _name_in_scope(module_tree, action):
-            raise LensRewriteError(
-                f"insert_row: {action!r} is not imported in this module — inserting it would raise an "
-                f"F821 undefined name (`ruff check` failure). Add `from messagefoundry import {action}` "
-                "first, then add the step."
-            )
+        # ADR 0106 §6 (H): a wrapper call the module does not import would be a BARE ``trim_field(...)``
+        # F821 undefined name. Rather than refuse, INJECT ``from messagefoundry import <action>`` among the
+        # module's imports (below). Idempotent — only reached when the name is not already in scope — and a
+        # §6-sanctioned exception to the row-scoped byte-splice (imports sit outside the target row's range);
+        # the caller's re-parse + ruff gates still bracket the whole result. (``_render_insert_call`` above
+        # already refused an unknown name / missing param with a more specific message.)
+        needs_import = not _name_in_scope(module_tree, action)
 
     lines = _physical_lines_keepends(src)
     # Indent the inserted line to match the anchor's CODE, not a leading/trailing BLANK line within the row
@@ -1777,6 +1954,11 @@ def _apply_insert_row(
         lines.append(new_line)
     else:
         lines.insert(insert_idx, new_line)
+    if needs_import:
+        # Inject the vocabulary import after the module's existing import block. Placed above the body, so
+        # the just-inserted row stays between its intended neighbors; the whole result is re-parse + ruff
+        # gated by the caller (§6-sanctioned exception to the row-scoped byte-splice).
+        lines.insert(_last_import_line(module_tree), f"from messagefoundry import {action}" + term)
     return "".join(lines)
 
 
@@ -2090,10 +2272,398 @@ def _apply_paste_block(src: str, line_start: int, line_end: int, edit: dict[str,
     return "".join(lines)
 
 
+def _str_lit(value: object) -> str:
+    """A double-quoted Python string literal (ruff's preferred quote style) for template rendering."""
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _render_if_test(edit: dict[str, Any]) -> str:
+    """The bounded test for an ``if`` template — a structured field/operator/value, or a raw ``test`` escape.
+
+    Operators are the closed set {exists, equals, not_equals, contains}; a regex condition belongs in the
+    raw ``test`` escape hatch (reads back ``recognized:false``), never a first-class GUI operator — the
+    same no-mini-language line ``replace_literal`` holds (ADR 0106 §7)."""
+    test = edit.get("test")
+    if isinstance(test, str) and test:
+        return test
+    field = edit.get("field")
+    if not isinstance(field, str) or not field:
+        raise LensRewriteError("template 'if' requires a 'field' or a raw 'test'")
+    read = f"msg.field({_str_lit(field)})"
+    op = edit.get("operator", "exists")
+    if op == "exists":
+        return read
+    value = _str_lit(edit.get("value", ""))
+    if op == "equals":
+        return f"{read} == {value}"
+    if op == "not_equals":
+        return f"{read} != {value}"
+    if op == "contains":
+        return f"{value} in ({read} or {_str_lit('')})"
+    raise LensRewriteError(
+        f"template 'if' operator {op!r} must be exists / equals / not_equals / contains"
+    )
+
+
+def _render_template(edit: dict[str, Any]) -> str:
+    """Render an ADR 0106 structure/flow template to native Python source (LF-joined) for the paste path.
+
+    Control templates seed a ``pass`` body (an empty suite is invalid Python); on readback the recognizer
+    splits the header into a control row + a ``pass`` code row, and further steps drop into that body."""
+    # Rendered at a 4-space "capture indent" (control bodies at 8): the paste path wraps the block in
+    # ``def _f():`` and needs an indented body, then re-indents from this base to the anchor's suite.
+    template = edit.get("template")
+    if template == "filter":
+        return "    return []"
+    if template == "send":
+        dest = edit.get("destination")
+        if not isinstance(dest, str) or not dest:
+            raise LensRewriteError("template 'send' requires a 'destination'")
+        return f"    return Send({_str_lit(dest)}, msg)"
+    if template == "raise":
+        exc = edit.get("exc_type", "ValueError")
+        if exc not in ("ValueError", "RuntimeError"):
+            raise LensRewriteError(
+                "template 'raise' exc_type must be 'ValueError' or 'RuntimeError'"
+            )
+        return f"    raise {exc}({_str_lit(edit.get('message', ''))})"
+    if template == "for_each":
+        seg = edit.get("segment_id")
+        if not isinstance(seg, str) or not seg:
+            raise LensRewriteError("template 'for_each' requires a 'segment_id'")
+        return f"    for i in range(1, msg.count_segments({_str_lit(seg)}) + 1):\n        pass"
+    if template == "if":
+        return f"    if {_render_if_test(edit)}:\n        pass"
+    raise LensRewriteError(
+        f"unknown template {template!r} (expected if / for_each / filter / raise)"
+    )
+
+
+def _apply_insert_template(
+    src: str, module_tree: ast.Module, line_start: int, line_end: int, edit: dict[str, Any]
+) -> str:
+    """Insert an ADR 0106 structure/flow template (If / For Each / Filter / Raise / Send) at the anchor.
+
+    Renders native Python (§5 A) and routes it through the AUDITED paste path
+    (:func:`_apply_paste_block` → :func:`_parse_pasted_block` + reindent + splice), so the same
+    byte-stability + validity guarantees apply. ``send`` is the one template that references a
+    vocabulary name (``Send``); if the module does not already have it in scope its import is injected
+    (idempotent), the same §6 H exception the wrapper insert uses. (Else If / Else are a clause-append —
+    a separate ADR 0106 insert path.)"""
+    block = _render_template(edit)
+    result = _apply_paste_block(
+        src, line_start, line_end, {"block": block, "position": edit.get("position", "after")}
+    )
+    # The paste path does not inject imports; ``Send`` is the only template symbol that needs one. The
+    # imports are unchanged by the body splice, so the original module's last-import line still points
+    # at the right insertion point in ``result``.
+    if edit.get("template") == "send" and not _name_in_scope(module_tree, "Send"):
+        lines = _physical_lines_keepends(result)
+        lines.insert(
+            _last_import_line(module_tree),
+            f"from messagefoundry import Send{_dominant_terminator(src)}",
+        )
+        result = "".join(lines)
+    return result
+
+
+def _clause_chain_headers(top: ast.If) -> list[int]:
+    """Header linenos of an ``if`` chain — the ``if`` plus each same-column ``elif`` (excludes ``else``).
+
+    Python models ``if / elif / else`` as nested :class:`ast.If` (each ``elif`` is a single same-column
+    ``ast.If`` in the parent's ``orelse``); this walks that chain and returns the header line of every
+    ``if``/``elif`` clause, so an Else-If/Else insert anchored on *any* clause resolves to the whole chain."""
+    headers = [top.lineno]
+    node = top
+    while (
+        len(node.orelse) == 1
+        and isinstance(node.orelse[0], ast.If)
+        and node.orelse[0].col_offset == top.col_offset
+    ):
+        node = node.orelse[0]
+        headers.append(node.lineno)
+    return headers
+
+
+def _find_if_chain(root: ast.AST, line_start: int) -> ast.If | None:
+    """The TOP-of-chain :class:`ast.If` whose ``if``/``elif`` header is on ``line_start`` (or ``None``).
+
+    Anchoring on a nested ``elif`` returns the outermost ``if`` (so the new clause appends to the same
+    chain, not the elif's own). Elif nodes — a parent's single same-column ``orelse`` child — are skipped as
+    chain heads, leaving exactly the outermost ``if`` of each chain as a candidate."""
+    ifs = [n for n in ast.walk(root) if isinstance(n, ast.If)]
+    elifs = {
+        id(p.orelse[0])
+        for p in ifs
+        if len(p.orelse) == 1
+        and isinstance(p.orelse[0], ast.If)
+        and p.orelse[0].col_offset == p.col_offset
+    }
+    for node in ifs:
+        if id(node) not in elifs and line_start in _clause_chain_headers(node):
+            return node
+    return None
+
+
+def _apply_insert_clause(
+    src: str,
+    handler_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    line_start: int,
+    edit: dict[str, Any],
+) -> str:
+    """Append an ADR 0106 ``elif``/``else`` clause to the ``if`` chain anchored at ``line_start``.
+
+    A **pure line-insert**: the new clause (header + a seeded ``pass`` body, at the ``if``'s own indent)
+    is spliced in — an ``elif`` before an existing ``else:`` (or at the chain's end when there is none),
+    an ``else`` only at the end. No existing byte is touched, so every other row round-trips unchanged;
+    the caller's re-parse gate (:func:`_assert_reparses`) is the validity backstop. Refuses (zero change)
+    when there is no ``if`` at the anchor, or an ``else`` is requested but the chain already has one."""
+    clause = edit.get("clause")
+    if clause not in ("elif", "else"):
+        raise LensRewriteError("insert_clause: 'clause' must be 'elif' or 'else'")
+    top = _find_if_chain(handler_node, line_start)
+    if top is None:
+        raise LensRewriteError(
+            f"insert_clause: no `if` clause anchored at line {line_start} "
+            "(anchor Else / Else If on the if or an elif row)"
+        )
+    # Walk to the deepest clause; a non-``If`` ``orelse`` there is the existing ``else`` block.
+    deep = top
+    while (
+        len(deep.orelse) == 1
+        and isinstance(deep.orelse[0], ast.If)
+        and deep.orelse[0].col_offset == top.col_offset
+    ):
+        deep = deep.orelse[0]
+    has_else = bool(deep.orelse)
+    if clause == "else" and has_else:
+        raise LensRewriteError(
+            "insert_clause: this `if` already has an `else` clause (refused, no change)"
+        )
+
+    lines = _physical_lines_keepends(src)
+    term = _dominant_terminator(src)
+    indent = " " * top.col_offset
+    if clause == "elif":
+        header = f"{indent}elif {_render_if_test(edit)}:{term}"
+    else:
+        header = f"{indent}else:{term}"
+    new_lines = [header, f"{indent}    pass{term}"]
+
+    if has_else:
+        # An ``elif`` slots in BEFORE the ``else:`` header (elif cannot follow else).
+        deep_body_end = deep.body[-1].end_lineno or deep.lineno
+        else_body_first = deep.orelse[0].lineno
+        else_header = _find_keyword(lines, deep_body_end + 1, else_body_first - 1, "else")
+        if else_header is None:  # inline ``else: y`` — no header line to insert before
+            raise LensRewriteError("insert_clause: could not locate the `else:` header (refused)")
+        insert_idx = else_header - 1
+    else:
+        # No ``else`` — append after the chain's last body line (0-based index == the 1-based end line).
+        insert_idx = top.end_lineno or deep.end_lineno or deep.lineno
+    # If we append right after a final line that lacks an EOL (no trailing newline), terminate it first so
+    # the new clause starts on its own line.
+    if 0 < insert_idx == len(lines) and not lines[insert_idx - 1].endswith(("\n", "\r")):
+        lines[insert_idx - 1] += term
+    lines[insert_idx:insert_idx] = new_lines
+    return "".join(lines)
+
+
+def _apply_insert_comment(src: str, line_start: int, line_end: int, edit: dict[str, Any]) -> str:
+    """Insert a ``# <text>`` comment line before/after the target row, at the target's indentation.
+
+    ADR 0106 Comment (§5 L). A comment is NOT an ``ast`` statement, so it cannot ride the wrapper
+    (:func:`_render_insert_call`) or paste (:func:`_parse_pasted_block`) paths — this is a raw-line
+    insert, the same keepends splice as :func:`_apply_insert_row`'s tail. Read-back: a standalone
+    comment tiles into a read-only ``code`` row via :func:`_partition_suite` gap-tiling (no recognizer
+    change needed). The target is a POSITION only, so it may be any row kind. Refuses a non-string
+    ``text``, a text with an embedded newline/CR (it would add lines or inject code), or a rendered
+    line over the column limit — so the output stays ``ruff format --check``-clean and re-parses."""
+    position = edit.get("position", "after")
+    if position not in ("before", "after"):
+        raise LensRewriteError("insert_comment 'position' must be 'before' or 'after'")
+    text = edit.get("text")
+    if not isinstance(text, str):
+        raise LensRewriteError("insert_comment requires a string 'text' (the comment body)")
+    if "\n" in text or "\r" in text:
+        raise LensRewriteError(
+            "insert_comment 'text' must be a single line (a newline would add lines / could inject code)"
+        )
+    # Normalize to a single ``# body`` (strip a caller-supplied leading ``#`` and surrounding space) — the
+    # canonical form ``ruff format`` produces; an empty body renders as a bare ``#``.
+    body = text.strip().lstrip("#").strip()
+    rendered = f"# {body}" if body else "#"
+
+    lines = _physical_lines_keepends(src)
+    indent = _paste_anchor_indent(lines, line_start, line_end, position)
+    term = _dominant_terminator(src)
+    physical = indent + rendered
+    if len(physical) > _MAX_LINE_LENGTH:
+        raise LensRewriteError(
+            f"the inserted comment would be {len(physical)} columns — over the {_MAX_LINE_LENGTH}-column "
+            "limit (ruff would wrap it); shorten it"
+        )
+    new_line = physical + term
+    insert_idx = (line_start - 1) if position == "before" else line_end
+    if insert_idx >= len(lines):
+        if lines and _line_terminator(lines[-1]) == "":
+            lines[-1] = lines[-1] + term
+        lines.append(new_line)
+    else:
+        lines.insert(insert_idx, new_line)
+    return "".join(lines)
+
+
+def _codeset_var(name: str) -> str:
+    """Derive a module-binding variable for a code-set name (``"epic_diets"`` → ``EPIC_DIETS``)."""
+    var = "".join(c if (c.isalnum() or c == "_") else "_" for c in name).upper()
+    if not var or var[0].isdigit():
+        var = "_" + var
+    return var
+
+
+def _codeset_binding(tree: ast.Module, var: str) -> str | None:
+    """The code-set name if a module-level ``<var> = code_set("<name>")`` capture exists, else ``None``.
+
+    Matches both a plain ``VAR = code_set(...)`` and an annotated ``VAR: CodeSet = code_set(...)`` so an
+    annotated existing binding is reused, not mistaken for a non-code-set collision."""
+    for node in tree.body:
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == var for t in node.targets
+        ):
+            value = node.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == var
+        ):
+            value = (
+                node.value
+            )  # may be None (``VAR: T`` with no assignment) — the guard below rejects it
+        if (
+            isinstance(value, ast.Call)
+            and _callee_name(value.func) == "code_set"
+            and value.args
+            and isinstance(value.args[0], ast.Constant)
+            and isinstance(value.args[0].value, str)
+        ):
+            return value.args[0].value
+    return None
+
+
+def _apply_insert_code_lookup(
+    src: str,
+    tree: ast.Module,
+    handler_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    line_start: int,
+    line_end: int,
+    edit: dict[str, Any],
+) -> str:
+    """Insert a ``code_lookup`` step bound to a managed code set (ADR 0106 §5 I; ADR 0033 tables).
+
+    The "full" Code-Lookup insert: renders ``code_lookup(msg, <path>, <VAR>)`` at the anchor AND, when
+    ``<VAR>`` is not already captured, injects a module-level ``<VAR> = code_set("<name>")`` binding among
+    the imports (plus the ``code_set`` / ``code_lookup`` imports as needed). That module-level binding is
+    the THIRD sanctioned out-of-row injection (ADR 0106 §6, alongside import injection and the Else-If/Else
+    clause-append): it sits outside the anchor row's byte range, and the caller's re-parse + ruff gates
+    still bracket the whole result. On readback the binding is invisible module setup (never a step row)
+    and the inserted call is a ``lookup`` row. Refuses a missing ``code_set``/``path``, a non-identifier
+    ``var``, or a ``<VAR>`` already bound to a DIFFERENT code set (or a non-code-set value) — a collision
+    the analyst resolves by naming a different variable."""
+    position = edit.get("position", "after")
+    if position not in ("before", "after"):
+        raise LensRewriteError("insert_code_lookup 'position' must be 'before' or 'after'")
+    setname = edit.get("code_set")
+    if not isinstance(setname, str) or not setname:
+        raise LensRewriteError("insert_code_lookup requires a non-empty 'code_set' name")
+    path = edit.get("path")
+    if not isinstance(path, str) or not path:
+        raise LensRewriteError("insert_code_lookup requires a 'path' (the field to translate)")
+    var = edit.get("var")
+    if var is None:
+        var = _codeset_var(setname)
+    if not (isinstance(var, str) and var.isidentifier()):
+        raise LensRewriteError("insert_code_lookup 'var' must be a valid Python identifier")
+
+    # A handler-LOCAL of the same name (a param or an assignment target anywhere in this handler) makes
+    # ``var`` local for the whole body, so a module-level ``var = code_set(...)`` would be SHADOWED and the
+    # inserted ``code_lookup(msg, path, var)`` would reference the local instead — refuse (module-scope
+    # collisions are caught below).
+    if _function_binds(handler_node, var):
+        raise LensRewriteError(
+            f"insert_code_lookup: {var!r} is a local variable of this handler — a module-level "
+            "code_set(...) binding would be shadowed; choose a different variable name"
+        )
+
+    # Decide whether to inject the module-level binding — idempotent (reuse a same-set capture) and
+    # collision-guarded (refuse a var already meaning something else, which a blind inject would shadow).
+    existing = _codeset_binding(tree, var)
+    if existing is not None:
+        if existing != setname:
+            raise LensRewriteError(
+                f"insert_code_lookup: {var!r} is already bound to code_set({existing!r}) — "
+                "choose a different variable name"
+            )
+        need_binding = False  # same code set already captured — reuse it
+    elif _name_in_scope(tree, var):
+        raise LensRewriteError(
+            f"insert_code_lookup: {var!r} is already defined in this module (not as a code set) — "
+            "choose a different variable name"
+        )
+    else:
+        need_binding = True
+
+    row_params: dict[str, Any] = {"path": path, "table": {"expr": var}}
+    default = edit.get("default")
+    if default is not None:
+        row_params["default"] = default
+    rendered = _render_insert_call("code_lookup", row_params, None)
+
+    lines = _physical_lines_keepends(src)
+    indent = _paste_anchor_indent(lines, line_start, line_end, position)
+    term = _dominant_terminator(src)
+    physical = indent + rendered
+    if len(physical) > _MAX_LINE_LENGTH:
+        raise LensRewriteError(
+            f"the inserted code_lookup would be {len(physical)} columns — over the {_MAX_LINE_LENGTH}-"
+            "column limit (ruff would wrap it); shorten the path or variable"
+        )
+    # Splice the row FIRST (deepest index), then the prelude at the LEADING import block: that block is
+    # always above every handler body, so the row's index is below the prelude's — inserting the prelude
+    # simply shifts the already-placed row down, preserving its position relative to its anchor. (Using
+    # the leading block, not the last import anywhere, keeps this invariant even when a stray top-level
+    # import trails the handlers, and lands the binding canonically at the top.)
+    new_line = physical + term
+    insert_idx = (line_start - 1) if position == "before" else line_end
+    if insert_idx >= len(lines):
+        if lines and _line_terminator(lines[-1]) == "":
+            lines[-1] = lines[-1] + term
+        lines.append(new_line)
+    else:
+        lines.insert(insert_idx, new_line)
+
+    prelude: list[str] = []
+    if not _name_in_scope(tree, "code_lookup"):
+        prelude.append(f"from messagefoundry import code_lookup{term}")
+    if need_binding and not _name_in_scope(tree, "code_set"):
+        prelude.append(f"from messagefoundry import code_set{term}")
+    if need_binding:
+        # A module-level statement must be blank-line-separated from the import block (ruff format);
+        # the ``code_set`` capture sits just below the imports, mirroring the canonical config layout.
+        prelude.append(term)
+        prelude.append(f"{var} = code_set({_str_lit(setname)}){term}")
+    import_idx = _leading_import_end(tree)
+    lines[import_idx:import_idx] = prelude
+    return "".join(lines)
+
+
 # The three ADR 0076 actions the ADR 0089 Phase A recognizer reads back from their NATIVE Message-API
 # idiom. An insert of one of these emits that native form (no vocabulary import needed) so a new step
 # matches an estate authored in the native API and round-trips through :func:`_recognize_native_method`.
-_NATIVE_INSERT_ACTIONS = frozenset({"set_field", "copy_field", "delete_segment"})
+_NATIVE_INSERT_ACTIONS = frozenset(
+    {"set_field", "copy_field", "delete_segment", "add_segment", "add_repetition"}
+)
 
 
 def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any) -> str:
@@ -2105,6 +2675,8 @@ def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any
     * ``set_field {path, value}``     → ``msg.set(<path>, <value>)``
     * ``copy_field {src, dst}``       → ``msg.set(<dst>, msg.field(<src>) or "")``
     * ``delete_segment {segment_id}`` → ``msg.delete_segments(<segment_id>)``
+    * ``add_segment {line}``          → ``msg.add_segment(<line>)`` (ADR 0106 §3 Group 1)
+    * ``add_repetition {path, value}``→ ``msg.add_repetition(<path>, <value>)`` (ADR 0106 §3 Group 1)
 
     Values are rendered via :func:`_render_insert_value` (literal-vs-``{"expr"}`` handling + the single-
     line invariant are identical to the wrapper path). A missing/empty param renders as an empty string
@@ -2118,23 +2690,66 @@ def _render_native_insert_call(name: str, params: dict[str, Any], assign_to: Any
             "insert_row: 'msg' is supplied automatically and cannot be passed as a parameter"
         )
     if assign_to is not None:
-        # set_field/copy_field/delete_segment mutate the message in place and return ``None``; assigning
-        # that both binds ``None`` and reclassifies the row as ``code`` (only a bare call is recognized).
+        # every native form mutates the message in place and returns ``None``; assigning that both binds
+        # ``None`` and reclassifies the row as ``code`` (only a bare call is recognized).
         raise LensRewriteError(
             f"insert_row: {name!r} returns no value, so it cannot be assigned "
-            "(only db_lookup/fhir_lookup/code_lookup return a value to assign)"
+            "(only db_lookup/fhir_lookup return a value to assign)"
         )
+    # ADR 0106 §5 C — an ``occurrence=``/``repetition=`` passthrough makes a For-Each loop var inhabitable
+    # (``occurrence={"expr":"i"}``). Computed once here so an unsupported kwarg is refused for EVERY name
+    # (add_segment/delete_segment take neither), never silently dropped.
+    suffix = _native_occurrence_suffix(name, params)
     if name == "set_field":
         path = _render_insert_value(params.get("path", ""), "path")
         value = _render_insert_value(params.get("value", ""), "value")
-        return f"msg.set({path}, {value})"
+        return f"msg.set({path}, {value}{suffix})"
     if name == "copy_field":
         src = _render_insert_value(params.get("src", ""), "src")
         dst = _render_insert_value(params.get("dst", ""), "dst")
-        return f'msg.set({dst}, msg.field({src}) or "")'
+        # The occurrence applies to BOTH the inner read and the outer write, so the copy operates on the
+        # loop's occurrence (not occurrence 1); the recognizer surfaces only the outer set's occurrence.
+        return f'msg.set({dst}, msg.field({src}{suffix}) or ""{suffix})'
+    if name == "add_segment":
+        line = _render_insert_value(params.get("line", ""), "line")
+        return f"msg.add_segment({line})"
+    if name == "add_repetition":
+        path = _render_insert_value(params.get("path", ""), "path")
+        value = _render_insert_value(params.get("value", ""), "value")
+        return f"msg.add_repetition({path}, {value}{suffix})"
     # delete_segment — the recognizer reads back both ``delete_segments`` and ``delete_segment``.
     segment_id = _render_insert_value(params.get("segment_id", ""), "segment_id")
     return f"msg.delete_segments({segment_id})"
+
+
+# The occurrence/repetition kwargs each native insert accepts (mirrors the Message API signatures:
+# set/field take occurrence+repetition; add_repetition takes occurrence only; add_segment/delete_segment
+# take neither). An inserted call may carry these so a For-Each loop index is usable (ADR 0106 §5 C).
+_NATIVE_OCCURRENCE_KW: dict[str, tuple[str, ...]] = {
+    "set_field": ("occurrence", "repetition"),
+    "copy_field": ("occurrence", "repetition"),
+    "add_repetition": ("occurrence",),
+    "add_segment": (),
+    "delete_segment": (),
+}
+
+
+def _native_occurrence_suffix(name: str, params: dict[str, Any]) -> str:
+    """Render the ``, occurrence=<v>[, repetition=<v>]`` kwarg suffix for a native insert (ADR 0106 §5 C).
+
+    Only the kwargs the underlying Message method accepts are allowed; an unsupported one (e.g. a
+    ``repetition`` on ``add_repetition``, or any on ``add_segment``/``delete_segment``) is REFUSED rather
+    than silently dropped. Values render via :func:`_render_insert_value`, so a loop index passes as
+    ``occurrence={"expr":"i"}`` → ``occurrence=i`` and a literal as ``occurrence=2``."""
+    allowed = _NATIVE_OCCURRENCE_KW.get(name, ())
+    parts: list[str] = []
+    for kw in ("occurrence", "repetition"):
+        if kw not in params:
+            continue
+        if kw not in allowed:
+            raise LensRewriteError(f"insert_row: {name!r} does not accept a {kw!r} argument")
+        parts.append(f", {kw}={_render_insert_value(params[kw], kw)}")
+    return "".join(parts)
 
 
 def _move_to_target(
@@ -2216,14 +2831,17 @@ def _render_insert_call(name: str, params: dict[str, Any], assign_to: Any) -> st
     (e.g. a keyword-only ``default=`` / ``in_fmt=``). A scalar value renders as a Python literal, an
     ``{"expr": <source>}`` object verbatim. Refuses an unknown vocabulary name, a missing required
     positional parameter, a ``msg`` parameter (it is supplied automatically — passing it would emit a
-    duplicate ``msg=`` kwarg), ``assign_to`` on a mutating action (only db/fhir/code_lookup return a
-    value — assigning an action's ``None`` reclassifies the row as ``code``), or a non-identifier
-    ``assign_to`` / keyword name."""
-    param_names = _ACTION_PARAMS.get(name) or _LOOKUP_PARAMS.get(name)
+    duplicate ``msg=`` kwarg), ``assign_to`` on a mutating action/lookup (only db_lookup/fhir_lookup
+    return a value — assigning an action's ``None`` reclassifies the row as ``code``), or a non-identifier
+    ``assign_to`` / keyword name. Also renders the ``diagnostics`` helpers (``log_note`` / ``checkpoint``,
+    ADR 0106 §5) so they are insertable — they round-trip to ``diagnostic`` rows and return ``None``."""
+    param_names = (
+        _ACTION_PARAMS.get(name) or _LOOKUP_PARAMS.get(name) or _DIAGNOSTIC_PARAMS.get(name)
+    )
     if param_names is None:
         raise LensRewriteError(
             f"insert_row: {name!r} is not a recognized vocabulary action/lookup "
-            f"(known: {sorted(_ACTIONS | _LOOKUPS)})"
+            f"(known: {sorted(_ACTIONS | _LOOKUPS | _DIAGNOSTICS)})"
         )
     if "msg" in params:
         # ``msg`` is the injected message, emitted automatically as the first positional arg; passing it
@@ -2250,13 +2868,13 @@ def _render_insert_call(name: str, params: dict[str, Any], assign_to: Any) -> st
         args.append(f"{pn}={_render_insert_value(val, pn)}")
     call = f"{name}({', '.join(args)})"
     if assign_to is not None:
-        if name not in _LOOKUPS:
-            # copy_field/set_field/… mutate the message in place and return ``None``; ``x = set_field(…)``
+        if name not in _ASSIGNABLE_LOOKUPS:
+            # copy_field/set_field/code_lookup/log_note/… mutate (or log) and return ``None``; ``x = set_field(…)``
             # both binds ``None`` (nonsensical) and RE-CLASSIFIES the row as ``code`` (only a bare-call
             # action is recognized, not an assignment) — an uneditable row the analyst can't recover.
             raise LensRewriteError(
                 f"insert_row: {name!r} returns no value, so it cannot be assigned "
-                "(only db_lookup/fhir_lookup/code_lookup return a value to assign)"
+                "(only db_lookup/fhir_lookup return a value to assign)"
             )
         if not (isinstance(assign_to, str) and assign_to.isidentifier()):
             raise LensRewriteError("insert_row 'assign_to' must be a simple identifier")

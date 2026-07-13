@@ -19,7 +19,7 @@ import pytest
 import uvicorn
 
 from messagefoundry.api import create_managed_app
-from messagefoundry.console.client import EngineClient
+from messagefoundry.apiclient import EngineClient
 from harness.__main__ import main
 from harness.scenarios import Scenario, _verify_dead_letter, _verify_disposition, run_scenario
 

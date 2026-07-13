@@ -33,7 +33,7 @@ second-wheel release job — mirror it (with the console's **own** version, sinc
 ## 1. Re-add the engine `[webconsole]` extra
 
 - [ ] In the **engine** [`pyproject.toml`](../../pyproject.toml) `[project.optional-dependencies]`, add
-      (mirroring `[console]`/`[webauthn]`):
+      (mirroring `[harness]`/`[webauthn]`):
 
       ```toml
       webconsole = ["messagefoundry-webconsole>=A,<B"]

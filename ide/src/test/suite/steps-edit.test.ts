@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 
 import {
+  ADD_MENU_CATALOG,
   EditLoopGuard,
   INSERTABLE_ACTIONS,
   INSERT_ACTION_LABELS,
@@ -1032,19 +1033,22 @@ suite("Steps context menu — the server-rendered menu template (ADR 0103)", () 
     assert.ok(html.includes('role="menu"'));
   });
 
-  test("Insert before/after parents each carry a submenu of the INSERT_ACTION_LABELS catalog", () => {
+  test("Insert before/after parents each carry the grouped ADD_MENU_CATALOG submenu (ADR 0106)", () => {
     assert.ok(html.includes('data-sub="before"') && html.includes('data-sub="after"'));
     for (const position of ["before", "after"] as const) {
-      for (const { value } of INSERT_ACTION_LABELS) {
+      for (const item of ADD_MENU_CATALOG) {
         assert.ok(
-          html.includes(`data-cmd="insert" data-position="${position}" data-action="${value}"`),
-          `${value} @ ${position}`,
+          html.includes(`data-cmd="insert" data-position="${position}" data-item-id="${item.id}"`),
+          `${item.id} @ ${position}`,
         );
       }
     }
-    for (const { label } of INSERT_ACTION_LABELS) {
-      assert.ok(html.includes(`>${label}</button>`), label);
+    for (const item of ADD_MENU_CATALOG) {
+      assert.ok(html.includes(`>${item.label}</button>`), item.label);
     }
+    // the four group headers + the clause anchor constraint are rendered
+    assert.ok(html.includes("ctx-group-label"), "grouped menu");
+    assert.ok(html.includes('data-item-id="elif" data-anchor="if_chain"'), "Else If gated to an if chain");
   });
 
   test("the leaf verbs are Delete / Move up / Move down (Copy/Cut/Paste stay keyboard-served, out of the menu)", () => {
@@ -1084,9 +1088,21 @@ suite("Steps v2 — structural ops force a re-projection (never a queued param c
     assert.strictEqual(opForcesReprojection("move_row"), true);
     assert.strictEqual(opForcesReprojection("paste_block"), true);
     assert.strictEqual(opForcesReprojection("set_params"), false);
+    // ADR 0106 added the template / insert_clause / insert_comment / insert_code_lookup inserts.
+    assert.strictEqual(opForcesReprojection("template"), true);
+    assert.strictEqual(opForcesReprojection("insert_code_lookup"), true);
     assert.deepStrictEqual(
       [...STRUCTURAL_OPS].sort(),
-      ["delete_row", "insert_row", "move_row", "paste_block"],
+      [
+        "delete_row",
+        "insert_clause",
+        "insert_code_lookup",
+        "insert_comment",
+        "insert_row",
+        "move_row",
+        "paste_block",
+        "template",
+      ],
     );
   });
 

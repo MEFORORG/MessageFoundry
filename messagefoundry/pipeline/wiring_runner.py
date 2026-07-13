@@ -1109,7 +1109,13 @@ class RegistryRunner:
             settings = resolve_env_settings(spec.settings, self._env_values)
             check_lookup_allowed(name, settings, self._egress)
             resolved[name] = settings
-        return DatabaseLookupExecutor(resolved)
+        # #200 (ADR 0092): stamp the derived posture around the live executor build so the DSN's
+        # weakened-TLS refusal (_build_dsn → _weakened_tls_permitted) keys on THIS instance's posture,
+        # applying the production-PHI clamp. engine.start()/reload build the executor here WITHOUT going
+        # through build_check_registry's active_hop_posture scope, so an unstamped build would fall back
+        # to the UNCLAMPED escape at query time and let a prod-PHI weakened-TLS live read cross.
+        with active_hop_posture(self._hop_posture):
+            return DatabaseLookupExecutor(resolved)
 
     def _run_lookup(
         self, connection: str, statement: str, params: Mapping[str, Any] | None
@@ -1139,7 +1145,13 @@ class RegistryRunner:
             settings = resolve_env_settings(spec.settings, self._env_values)
             check_fhir_lookup_allowed(name, settings, self._egress)
             resolved[name] = settings
-        return FhirLookupExecutor(resolved)
+        # #200 (ADR 0092): stamp the derived posture around the live executor build so each connection's
+        # cleartext/verify-off hop guard (refuse_cleartext_egress / refuse_verify_off) captures THIS
+        # instance's posture rather than the unstamped fail-closed default. engine.start()/reload build
+        # the executor here outside build_check_registry's active_hop_posture scope, so an unstamped build
+        # would either fail-closed a legit dev read or (via the send-time re-assertion) mis-key the hop.
+        with active_hop_posture(self._hop_posture):
+            return FhirLookupExecutor(resolved)
 
     def _run_fhir_lookup(
         self,

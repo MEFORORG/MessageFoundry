@@ -31,6 +31,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
+  codesetList,
   configDir,
   isExecGated,
   messageSetsDir,
@@ -39,12 +40,15 @@ import {
   runWithStdin,
   workspaceDir,
 } from "./cli";
+import type { Graph } from "./graphModel";
 import { invocationsForFile, type LiveTraceEntry } from "./liveDebug";
 import {
+  ADD_MENU_BY_ID,
   EditLoopGuard,
-  INSERT_ACTION_LABELS,
   REDACTED_LIVE_VALUE,
   TOOLBAR_INSERT_DEFAULTS,
+  addMenuGroups,
+  buildAddMenuRequest,
   buildDeleteRequest,
   buildEditRequest,
   buildHandlerViewModels,
@@ -62,6 +66,7 @@ import {
   shouldAttachLiveValues,
   shouldFallBackToText,
   traceRowValues,
+  type AddMenuItem,
   type EditMessage,
   type HandlerViewModel,
   type LensParseResult,
@@ -81,6 +86,50 @@ import { pickHl7Path, type PickScope } from "./hl7Picker";
 
 /** Debounce (ms) before re-parsing after the underlying document changes in a split text view. */
 const RERENDER_DEBOUNCE_MS = 250;
+
+/**
+ * Gather the inputs an ADR 0106 Add-menu item needs before its edit is built (a QuickPick / InputBox per
+ * prompt: a code-set list, a graph outbound destination, a fixed choice, or free text). Returns the
+ * gathered `{field: value}` map, or `undefined` if the user cancelled any step (so nothing is inserted).
+ * A code-set / destination lookup that fails degrades to a free-text input rather than blocking the flow.
+ */
+async function runInsertPrompts(item: AddMenuItem): Promise<Record<string, string> | undefined> {
+  const values: Record<string, string> = {};
+  for (const p of item.prompts) {
+    let value: string | undefined;
+    if (p.kind === "choice") {
+      value = await vscode.window.showQuickPick([...(p.choices ?? [])], {
+        title: item.label,
+        placeHolder: p.label,
+      });
+    } else if (p.kind === "codeset") {
+      const sets = await codesetList(workspaceDir()).catch(() => []);
+      const names = sets.map((s) => s.name);
+      value = names.length
+        ? await vscode.window.showQuickPick(names, { title: item.label, placeHolder: p.label })
+        : await vscode.window.showInputBox({ title: item.label, prompt: `${p.label} (no code sets found)` });
+    } else if (p.kind === "destination") {
+      const graph = await runJson<Graph>(["graph", "--config", configDir()], workspaceDir()).catch(
+        () => undefined,
+      );
+      const names = (graph?.outbound ?? []).map((o) => o.name);
+      value = names.length
+        ? await vscode.window.showQuickPick(names, { title: item.label, placeHolder: p.label })
+        : await vscode.window.showInputBox({ title: item.label, prompt: p.label });
+    } else {
+      value = await vscode.window.showInputBox({
+        title: item.label,
+        prompt: p.label,
+        placeHolder: p.placeholder,
+      });
+    }
+    if (value === undefined) {
+      return undefined; // the user pressed Esc — cancel the whole insert (nothing is written)
+    }
+    values[p.field] = value;
+  }
+  return values;
+}
 
 function nonce(): string {
   let s = "";
@@ -479,6 +528,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         toSuite?: string;
         expectSrc?: string;
         action?: string;
+        itemId?: string; // ADR 0106 grouped Add menu — the ADD_MENU_BY_ID catalog id
         kind?: string;
         block?: string;
         text?: string;
@@ -666,6 +716,37 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
             ),
           );
         } else if (
+          m?.command === "insertItem" &&
+          typeof m.itemId === "string" &&
+          // Gate the item id against the ADD_MENU_BY_ID allowlist — inbound webview data is untrusted.
+          Object.prototype.hasOwnProperty.call(ADD_MENU_BY_ID, m.itemId) &&
+          typeof m.handler === "string" &&
+          typeof m.lineStart === "number" &&
+          typeof m.lineEnd === "number" &&
+          typeof m.kind === "string" &&
+          (m.position === undefined || m.position === "before" || m.position === "after")
+        ) {
+          // The ADR 0106 grouped Add menu: look up the catalog item, gather any picker inputs, then build
+          // + apply the matching lens op via the SAME byte-stable applyStructural path as every other insert.
+          const item = ADD_MENU_BY_ID[m.itemId];
+          const anchor = {
+            handler: m.handler,
+            lineStart: m.lineStart,
+            lineEnd: m.lineEnd,
+            expectSrc: typeof m.expectSrc === "string" ? m.expectSrc : undefined,
+            kind: m.kind as RowKind,
+          };
+          const position = m.position as "before" | "after" | undefined;
+          if (item.prompts.length === 0) {
+            void applyStructural(buildAddMenuRequest(item, anchor, {}, position));
+          } else {
+            void runInsertPrompts(item).then((gathered) => {
+              if (gathered !== undefined && !disposed) {
+                void applyStructural(buildAddMenuRequest(item, anchor, gathered, position));
+              }
+            });
+          }
+        } else if (
           (m?.command === "copyBlock" || m?.command === "cutInfo") &&
           typeof m.text === "string"
         ) {
@@ -775,12 +856,23 @@ function pageHtml(
   const n = nonce();
   const body = renderHandlersHtml(handlers);
   // The insert-toolbar dropdown: a leading "[select item]" placeholder (value ""), then one option per
-  // insertable action, built from the single-source-of-truth INSERT_ACTION_LABELS (same friendly labels
-  // the rows show). Labels are static, but escape defensively per the CSP/injection rule.
+  // insertable item, built from the single-source-of-truth ADD_MENU_CATALOG (ADR 0106), grouped into
+  // <optgroup>s. Each <option> value is the catalog item id (the ADD_MENU_BY_ID allowlist key the provider
+  // validates). Labels are static, but escape defensively per the CSP/injection rule.
   const insertOptions = [`<option value="">[select item]</option>`]
     .concat(
-      INSERT_ACTION_LABELS.map(
-        (o) => `<option value="${escapeHtml(o.value)}">${escapeHtml(o.label)}</option>`,
+      addMenuGroups().map(
+        ({ group, items }) =>
+          `<optgroup label="${escapeHtml(group)}">` +
+          items
+            .map(
+              (item) =>
+                `<option value="${escapeHtml(item.id)}"` +
+                (item.anchorConstraint ? ` data-anchor="${escapeHtml(item.anchorConstraint)}"` : "") +
+                `>${escapeHtml(item.label)}</option>`,
+            )
+            .join("") +
+          `</optgroup>`,
       ),
     )
     .join("");
@@ -952,6 +1044,8 @@ function pageHtml(
     .ctx-item:disabled { opacity: 0.4; cursor: default; }
     .ctx-arrow { opacity: 0.75; font-size: 11px; margin-left: auto; }
     .ctx-sep { height: 1px; margin: 4px 2px; background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border)); }
+    .ctx-group-label { padding: 4px 8px 2px; font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+                       opacity: .6; pointer-events: none; }
     /* Submenu: hidden until the SCRIPT opens it (JS-controlled + mutually exclusive — see openSubmenu in
        stepsWebview.js). NOT CSS :hover/:focus-within, which let a FOCUSED parent and a HOVERED sibling both
        open and overlap (two submenus stacked). Opens to the right, flipping left when the root menu sits

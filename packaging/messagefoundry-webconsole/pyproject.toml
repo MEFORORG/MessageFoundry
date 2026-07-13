@@ -44,7 +44,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # The ASGI end-to-end tests drive create_app(serve_ui=True) via the async test client — they need the
-# engine's dev/test stack (httpx, pytest-asyncio, ...), mirroring how the harness pulls [console].
+# engine's dev/test stack (httpx, pytest-asyncio, ...), mirroring how the harness pulls [harness].
 dev = ["messagefoundry[dev]"]
 
 [project.urls]

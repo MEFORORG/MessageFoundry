@@ -17,7 +17,7 @@ MessageFoundry is an open-source, Python integration engine for healthcare — a
 
 ## What MessageFoundry is, and how to use this guide
 
-MessageFoundry receives, routes, transforms, and validates messages between systems: **HL7 v2.x by default**, and payload-agnostic for other formats (JSON, XML/SOAP, X12 EDI, database records). Unlike a legacy engine's embedded scripting language or a locked-in low/no-code GUI, the routing and handling logic is **ordinary Python you own and version-control** — and connection setup in particular can be pure data (a TOML file, edited by hand or in a VS Code GUI). The engine runs headless as an asyncio service; you operate it from a separate PySide6 console and a VS Code extension, both talking to it over a localhost HTTP/WebSocket API.
+MessageFoundry receives, routes, transforms, and validates messages between systems: **HL7 v2.x by default**, and payload-agnostic for other formats (JSON, XML/SOAP, X12 EDI, database records). Unlike a legacy engine's embedded scripting language or a locked-in low/no-code GUI, the routing and handling logic is **ordinary Python you own and version-control** — and connection setup in particular can be pure data (a TOML file, edited by hand or in a VS Code GUI). The engine runs headless as an asyncio service; you operate it from a browser **web console** (served same-origin at `/ui`) and a VS Code extension, both talking to it over a localhost HTTP/WebSocket API.
 
 ### The mental model in one read
 
@@ -60,7 +60,7 @@ The remaining sections are a **path**, in the order you'll actually work through
 2. Send your **first message** end to end (e.g. [samples/messages/adt_a01.hl7](../samples/messages/adt_a01.hl7) via [samples/send_mllp.py](../samples/send_mllp.py)) against the bundled sample config.
 3. **Author Connections** (in Python or `connections.toml`).
 4. **Author Routers and Handlers** to route and transform.
-5. **Operate** via the PySide6 console and the VS Code extension ([messagefoundry/console/](../messagefoundry/console/), [ide/](../ide/)).
+5. **Operate** via the browser web console (`/ui`, [messagefoundry-webconsole](../packaging/messagefoundry-webconsole/)) and the VS Code extension ([ide/](../ide/)).
 6. **Monitor and troubleshoot** with dispositions, alerts, dead-letter triage, and replay.
 
 Work through them in order the first time; afterward, jump to the task you need.
@@ -100,7 +100,8 @@ pip install "messagefoundry==0.1.0"
 Add only the extras a host actually needs (each is opt-in and lazy-imported):
 
 ```powershell
-pip install -e ".[console]"      # PySide6 admin console (step 5)
+pip install -e packaging/messagefoundry-webconsole   # the browser web console (/ui) — the operator UI (step 5)
+pip install -e ".[harness]"      # the standalone PySide6 test harness GUI
 pip install -e ".[postgres]"     # PostgreSQL store backend
 pip install -e ".[sqlserver]"    # SQL Server store backend — also needs the OS-level Microsoft ODBC Driver 18
 pip install -e ".[sftp]"         # SFTP transport for the REMOTEFILE connector
@@ -109,7 +110,7 @@ pip install -e ".[dicom]"        # DICOM C-STORE SCP + codec — headers/SR only
 pip install -e ".[otel]"         # OpenTelemetry/OTLP export seam (the /metrics endpoint itself needs no extra)
 ```
 
-(For a deployment wheel, the same extras apply: `pip install "messagefoundry[console]==0.1.0"`, etc.) SQLite is the zero-dependency default — you need no extra to run the sample config.
+(For a deployment wheel, the same extras apply: `pip install "messagefoundry[harness]==0.1.0"`, and the web console installs as its own wheel `pip install "messagefoundry-webconsole==0.1.0"`.) SQLite is the zero-dependency default — you need no extra to run the sample config.
 
 ### 3. Run the engine headless (dev)
 
@@ -154,15 +155,15 @@ messagefoundry serve --config config --env dev
 
 Put it under version control with **Set Up Version Control & Checks** in the IDE (or a plain `git init`). During setup you choose **where the repo is stored** — *on this machine only* (fine for a single-box, non-HA engine or local dev) or on a *shared remote* (recommended for HA, a team, or off-machine backup); change it any time with **Config Repo Storage Location**. Choosing local vs. remote storage, and why secrets/PHI never land in the repo, are covered in [VERSION-CONTROL.md](VERSION-CONTROL.md) (with the full deployment model in [INSTALL-GUIDE.md](INSTALL-GUIDE.md)).
 
-### 5. Launch the admin console
+### 5. Open the admin console (in a browser)
 
-The console is a **separate PySide6 process** that talks to the engine over the localhost API (it needs the `console` extra). With the engine running:
+The console is the **browser web console** served same-origin by the engine at `/ui` (install the `messagefoundry-webconsole` wheel alongside the engine and set `[api].serve_ui = true`). With the engine running, browse to:
 
-```powershell
-python -m messagefoundry.console --url http://127.0.0.1:8765
+```
+http://127.0.0.1:8765/ui
 ```
 
-`--url` defaults to `http://127.0.0.1:8765`, so you can omit it when the engine is local on the default port. The console prompts for sign-in (authentication is on by default). Source: [messagefoundry/console/](../messagefoundry/console/).
+The web console prompts for sign-in (authentication is on by default). Source: [packaging/messagefoundry-webconsole/](../packaging/messagefoundry-webconsole/). (The former PySide6 desktop console was retired — BACKLOG #103; PySide6 now backs only the standalone test harness.)
 
 ### 6. Run as a Windows service (NSSM)
 
@@ -252,7 +253,7 @@ ls ./out/adt/
 
 Two complementary ways to inspect what happened:
 
-- **The console Log Search page.** Launch the PySide6 admin console in a third terminal (`python -m messagefoundry.console`), then open the **Log Search** page to find the message, its disposition, the original raw body, and the per-destination delivery. The console talks only to the engine's API — see [messagefoundry/console/](../messagefoundry/console/).
+- **The web console Log Search page.** Open the web console at `/ui` in a browser, then use the **Log Search** page to find the message, its disposition, the original raw body, and the per-destination delivery. The web console talks only to the engine's API — see [packaging/messagefoundry-webconsole/](../packaging/messagefoundry-webconsole/).
 - **A dryrun preview (no engine needed).** To see exactly how the config *would* route and transform a message without sending it anywhere, run:
 
   ```
@@ -486,14 +487,13 @@ The console is a separate process that attaches to a running engine. Start the e
 python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev
 ```
 
-Then launch the console (defaults to `http://127.0.0.1:8765`):
+Then open the web console in a browser (the engine serves it at `/ui` when `[api].serve_ui` is on):
 
-```bash
-python -m messagefoundry.console
-# point at a different engine: python -m messagefoundry.console --url http://127.0.0.1:8765
+```
+http://127.0.0.1:8765/ui
 ```
 
-When the engine requires authentication (the default), a **Sign in** dialog appears first:
+When the engine requires authentication (the default), a **Sign in** form appears first:
 
 1. Enter your **username** and **password**, and pick a **Provider** — *Local* always; *Active Directory* appears only if the engine advertises AD.
 2. If your account uses **two-factor (TOTP)**, you are prompted for the 6-digit code from your authenticator app (or a single-use recovery code) before the window opens.
@@ -555,8 +555,8 @@ The key operator shift under the staged pipeline: **an `AA` ACK means "received 
 
 ### Where to watch dispositions
 
-- **Console -> Log Search.** The message browser ([console/search.py](../messagefoundry/console/search.py)) has a **status** filter — type a disposition (e.g. `unrouted`, `error`) to narrow the list, then open a message to see its raw body, parse tree, deliveries, and audit trail. The Connections page has a per-connection **Logs** link that opens Log Search pre-filtered to that channel.
-- **Console -> Connections.** The dashboard ([console/connections.py](../messagefoundry/console/connections.py)) shows each connection's live status plus per-connection counts, including an **errored** column, so a climbing error count on one feed is visible at a glance.
+- **Web console -> Log Search.** The message browser has a **status** filter — type a disposition (e.g. `unrouted`, `error`) to narrow the list, then open a message to see its raw body, parse tree, deliveries, and audit trail. The Connections page has a per-connection **Logs** link that opens Log Search pre-filtered to that channel.
+- **Web console -> Connections.** The dashboard shows each connection's live status plus per-connection counts, including an **errored** column, so a climbing error count on one feed is visible at a glance.
 - **API.** `GET /messages?status=error` (and `&channel_id=`, `&message_type=`) is the filter the console uses; `GET /stats` returns outbox-by-status + in-pipeline depth; `GET /status` returns engine uptime, running/stopped channel counts, and DB size/free-disk; `GET /metrics` exposes a Prometheus exposition (aggregate counts/latency keyed by connection + status, no PHI) for an external scraper — it works on a base install, and the `[otel]` extra adds only the optional OpenTelemetry/OTLP export seam. All require the `monitoring:read` (stats/status/metrics) or `messages:read` (Log Search) permission — see [SECURITY.md](SECURITY.md).
 
 ### The ERROR / dead-letter path: inspect and replay

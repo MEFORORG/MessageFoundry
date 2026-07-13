@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Sign-in dialog shown before the main window when the engine requires authentication."""
+"""Sign-in dialog shown before the harness monitor window when the engine requires authentication.
+
+Rehomed verbatim from the retired ``messagefoundry.console`` package (BACKLOG #103, ADR 0032 retired):
+the harness reuses this dialog to authenticate its localhost API client.
+"""
 
 from __future__ import annotations
 
@@ -16,8 +20,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from messagefoundry.console.client import ApiError, EngineClient
-from messagefoundry.console.widgets import ERROR_COLOR
+from messagefoundry.apiclient import ApiError, EngineClient
+
+from harness._console_widgets import ERROR_COLOR
 
 
 class LoginDialog(QDialog):
@@ -28,7 +33,7 @@ class LoginDialog(QDialog):
 
     When the engine reports ``must_change_password`` the dialog still ``accept()``s so the
     entrypoint regains control, but exposes :attr:`must_change_password` and
-    :attr:`entered_password` so it can chain a :class:`ChangePasswordDialog` and re-prompt sign-in.
+    :attr:`entered_password` so it can chain a password change and re-prompt sign-in.
     """
 
     def __init__(self, client: EngineClient, parent: QWidget | None = None) -> None:
@@ -86,7 +91,7 @@ class LoginDialog(QDialog):
             self._error.setText("Sign-in failed." if exc.status == 401 else str(exc))
             return
         if result.must_change_password and result.user.auth_provider == "ad":
-            # The console can't rotate AD passwords (the server rejects /me/password for AD
+            # The harness can't rotate AD passwords (the server rejects /me/password for AD
             # accounts) — advise and admit; the user changes it in Active Directory. (AD logins
             # don't set must_change_password today, so this branch is a forward-guard.)
             QMessageBox.information(
@@ -96,8 +101,7 @@ class LoginDialog(QDialog):
                 "Directory (or ask an administrator) before your access is restricted.",
             )
         else:
-            # Hand the must-change flag and the just-entered plaintext back to _authenticate, which
-            # chains a ChangePasswordDialog (prefilling the current password) and re-prompts sign-in.
+            # Hand the must-change flag and the just-entered plaintext back to _authenticate.
             self.must_change_password = result.must_change_password
             self.entered_password = password
         # The engine accepted the password but wants a second factor (local MFA-enrolled / required

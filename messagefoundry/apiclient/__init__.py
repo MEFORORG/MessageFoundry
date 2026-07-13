@@ -6,11 +6,9 @@
 depends only on ``httpx`` (+ the optional ``truststore`` for OS-trust-store TLS, imported lazily)
 and the pure pydantic response models in :mod:`messagefoundry.api.models` /
 :mod:`messagefoundry.api.auth_models` — it imports neither PySide6 nor FastAPI, so it is reusable
-by the PySide6 console, the headless load/acceptance harness, and any future client without
-dragging a GUI or the server into the process.
-
-The console re-exports these names from :mod:`messagefoundry.console.client` (a thin shim) so its
-existing imports keep working.
+by the headless load/acceptance harness and any future client without dragging a GUI or the server
+into the process. It is the sole engine-client entrypoint since the PySide6 desktop console (and its
+``messagefoundry.console.client`` shim) were retired in favour of the web console (BACKLOG #103).
 """
 
 from __future__ import annotations

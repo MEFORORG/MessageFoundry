@@ -222,7 +222,7 @@ def test_cli_engine_setup_failure_exits_2(
 ) -> None:
     # A bad token / unreachable engine surfaces as ApiError (the client validates via /auth/me before
     # preflight). That's a setup failure → exit 2 with a message, not exit 1 + a traceback.
-    from messagefoundry.console.client import ApiError
+    from messagefoundry.apiclient import ApiError
     from harness.load import runner
 
     async def _boom(*_args: object, **_kwargs: object) -> object:

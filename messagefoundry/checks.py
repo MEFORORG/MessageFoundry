@@ -21,6 +21,13 @@ environment is set whose security posture is unresolved (a *custom* name with no
 / ``[ai].production``) — it FAILS, mirroring ``serve``'s fail-closed ``require_posture()`` so the
 foot-gun is caught at commit/CI time instead of at runtime. No ``messagefoundry.toml`` → SKIP.
 
+A fourth required check, ``build-check``, runs the **posture-stamped** ``build_check_registry`` that
+``serve``/``reload`` run (which ``validate`` does not): it constructs every connector with this
+instance's derived security posture stamped, so a config ``serve`` would REFUSE — most importantly a
+production-PHI cleartext / weakened-TLS transport hop (#200, ADR 0092) — FAILS at commit/CI time
+instead of only at runtime. Fail-safe SKIP when it can't resolve a real posture (no
+``messagefoundry.toml``, or settings/graph that won't load), so a bare config dir is byte-identical.
+
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
 config-dir Router/Handler modules that flags ``raise <Exc>(f"...{var}...")``, the exact pattern that can
@@ -106,6 +113,11 @@ def run_checks(
         _check_validate(config_dir),
         _check_dryrun(config_dir, messages_dir),
         _check_posture(
+            config_dir,
+            service_config=service_config,
+            suppress_search=suppress_service_toml_search,
+        ),
+        _check_build(
             config_dir,
             service_config=service_config,
             suppress_search=suppress_service_toml_search,
@@ -575,6 +587,109 @@ def _check_posture(
             f"environment {settings.ai.environment!r}: "
             f"data_class={data_class.value}, production={production}"
         ),
+    )
+
+
+def _check_build(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Run the **posture-stamped** ``build_check_registry`` that ``serve``/``reload`` run, so a config
+    ``serve`` would REFUSE — most importantly a production-PHI cleartext / weakened-TLS transport hop
+    (#200, ADR 0092) — fails at commit/CI time instead of only at runtime.
+
+    ``validate`` loads the graph and resolves references but never constructs the connectors, so it does
+    NOT run the posture-keyed insecure-hop refusal (nor the ``[egress]`` allowlists). This check closes
+    that gap: it loads this instance's ``messagefoundry.toml`` (same resolution as :func:`_check_posture`),
+    resolves ``env()`` values against the active environment exactly as ``serve`` does, and calls
+    :func:`~messagefoundry.pipeline.wiring_runner.build_check_registry` with the instance's **derived
+    posture** stamped — so a prod-PHI cleartext egress hop raises a ``WiringError`` and FAILS the gate.
+
+    Required, but **fail-safe SKIP** when it can't resolve a real posture, so it never blocks a bare
+    config dir or a dev checkout: no ``messagefoundry.toml`` → SKIP (a bare dir has no declared posture,
+    byte-identical to before this check); settings/graph that won't load → SKIP (``validate`` already
+    reports that). Only a genuine build/posture refusal on a fully-resolved config blocks."""
+    import os
+
+    from pydantic import ValidationError
+
+    from messagefoundry.config.environments import (
+        load_environment_values,
+        resolve_values_base_dir,
+    )
+    from messagefoundry.config.settings import hop_posture_from_ai, load_settings
+    from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
+    from messagefoundry.pipeline.wiring_runner import build_check_registry
+
+    if service_config is not None:
+        toml: Path | None = Path(service_config) if Path(service_config).is_file() else None
+    elif suppress_search:
+        candidate = Path(config_dir) / "messagefoundry.toml"
+        toml = candidate if candidate.is_file() else None
+    else:
+        toml = _find_service_toml(config_dir)
+    if toml is None:
+        # No declared instance posture — a bare config dir. The posture-keyed refusal has nothing to key
+        # on, so skip (byte-identical to before this check); a prod-PHI instance always has a toml.
+        return CheckResult(
+            "build-check", ok=True, required=True, skipped=True, detail="no messagefoundry.toml"
+        )
+    try:
+        settings = load_settings(config_path=toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        return CheckResult(
+            "build-check",
+            ok=True,
+            required=True,
+            skipped=True,
+            detail=f"settings did not load: {exc}",
+        )
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        # A broken graph is reported (blocking) by validate; don't double-fail here.
+        return CheckResult(
+            "build-check",
+            ok=True,
+            required=True,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    env_name = settings.ai.environment
+    # Resolve env() against the active environment the same way serve does, so a hop's host/scheme (an
+    # env()-supplied value) is built exactly as at runtime rather than left as an unresolved reference.
+    env_values = (
+        load_environment_values(
+            base_dir=resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd()),
+            dir_name=settings.environments.dir,
+            environment=env_name,
+            environ=os.environ,
+        )
+        if env_name is not None
+        else {}
+    )
+    try:
+        build_check_registry(
+            registry,
+            inbound_bind_host=settings.inbound.bind_host,
+            env_values=env_values,
+            egress=settings.egress,
+            reserved_bindings=((API_LISTENER_LABEL, settings.api.host, settings.api.port),),
+            # The residual: stamp THIS instance's derived posture so the posture-keyed insecure-hop
+            # refusal (ADR 0092) decides at commit/CI exactly as serve/reload do — a prod-PHI cleartext
+            # hop raises here rather than shipping and only refusing at serve.
+            posture=hop_posture_from_ai(settings.ai),
+            trust_anchor_policy=settings.tls.policy(),
+        )
+    except WiringError as exc:
+        return CheckResult("build-check", ok=False, required=True, detail=str(exc))
+    return CheckResult(
+        "build-check",
+        ok=True,
+        required=True,
+        detail=f"connectors build against the {env_name or 'default'} posture",
     )
 
 
