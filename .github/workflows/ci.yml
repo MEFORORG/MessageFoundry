@@ -1079,9 +1079,18 @@ jobs:
           # fhir-prod.example.org is allowlisted HOST-ONLY: its prod URL (https://fhir-prod.example.org/fhir)
           # has no explicit port, so urlsplit().port is None and a ":443" suffix would NOT match (see
           # _http_egress_allowed). A bare host matches any port, which is what we want for a default-port URL.
+          # `prod` FAIL-CLOSES on unbounded PHI RETENTION too (#186a, ASVS 14.2.4): both PHI-body windows —
+          # [retention].messages_days (inbound bodies) and [retention].dead_letter_days (dead-lettered
+          # outbound bodies, replayable until purged) — default to 0 = keep-forever, and a PRODUCTION PHI
+          # instance with EITHER unbounded refuses to start ("no data-retention window is configured ...
+          # refusing to start"), so NSSM crash-loops to SERVICE_PAUSED and /health never comes up. BOUND both
+          # (30d) rather than setting [retention].allow_unbounded_phi=true: a real prod deployment configures
+          # a window, so the smoke exercises the path it is meant to validate instead of opting out of it.
           nssm set MessageFoundry AppEnvironmentExtra `
             "MEFOR_AUTH_ENABLED=false" `
             "MEFOR_STORE_ENCRYPTION_KEY=$storeKey" `
+            "MEFOR_RETENTION_MESSAGES_DAYS=30" `
+            "MEFOR_RETENTION_DEAD_LETTER_DAYS=30" `
             "MEFOR_EGRESS_DENY_BY_DEFAULT=true" `
             "MEFOR_EGRESS_ALLOWED_MLLP=receiver-prod.example.org:6661,powerscribe-prod.example.org:6665" `
             "MEFOR_EGRESS_ALLOWED_TCP=payer-prod.example.org:6662,rte-prod.example.org:6663,rte-result-prod.example.org:6664" `
