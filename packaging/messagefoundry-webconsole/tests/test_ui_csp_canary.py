@@ -499,11 +499,20 @@ _PACKAGE_DIR = Path(messagefoundry_webconsole.__file__).parent
 
 
 def _runbook_contract() -> str:
-    """The runbook's degrade-contract section (prose + table)."""
-    runbook = (
-        Path(__file__).resolve().parents[3] / "docs/security/OFF-LOOPBACK-DEPLOYMENT.md"
-    ).read_text(encoding="utf-8")
-    contract = runbook.split("Browser security-feature support and degrade contract", 1)[1]
+    """The runbook's degrade-contract section (prose + table), or a per-test skip where it is absent.
+
+    ``docs/security/**`` is deny-listed from the OSS mirror (and vaulted after the cutover), so this
+    runbook is not there and an assertion about its CONTENT has nothing to say. The skip sits at this
+    single accessor — ``_runbook_contract_table`` funnels through it too — so the ~36 tests in this
+    module that assert about the console's own CODE keep running publicly; only the three that compare
+    code against the runbook table stand down.
+    """
+    doc = Path(__file__).resolve().parents[3] / "docs/security/OFF-LOOPBACK-DEPLOYMENT.md"
+    if not doc.exists():
+        pytest.skip("docs/security/OFF-LOOPBACK-DEPLOYMENT.md is private-only (deny-list / vault)")
+    contract = doc.read_text(encoding="utf-8").split(
+        "Browser security-feature support and degrade contract", 1
+    )[1]
     return contract.split("## Per-message signing", 1)[0]
 
 
