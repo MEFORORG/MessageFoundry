@@ -509,6 +509,14 @@ _UNSCANNABLE_RE_PATTERNS = {
         r"""'(?i)\\b(' + '|'.join(_CREDENTIAL_QUERY_KEYS) + ')=[^&\\s\\"\']+'""",
     ),
     "messagefoundry/parsing/_builtin_hl7.py": ("f'{e}\\\\.({prefixes})(?!{e})'",),  # ASVS 1.3.3
+    # ADR 0030 §4h: the site-code prefix is no longer a literal in the anonymizer — it is EXTERNALIZED
+    # and loaded at runtime, so the detector is composed from the loaded value rather than written out.
+    # That is the POINT of §4h (the prefix is customer data and must not sit in tracked source), and it
+    # necessarily makes the expression unresolvable to this static scanner. The shape is bounded and
+    # non-catastrophic by inspection: an alternation of digit literals followed by a fixed ``\d{4}`` —
+    # no nested quantifier, no overlapping alternation.
+    "messagefoundry/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
+    "tee/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py

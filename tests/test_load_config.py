@@ -156,24 +156,25 @@ def test_invalid_transform_mode_fails_loud(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 # Real estate tokens that must never appear in the shipped load graph or profiles. The site-code
-# pattern catches 6-digit 54xxxx codes; the rest are partner/product/customer substrings drawn from
-# the (git-ignored) real migration estate. NOTE: the generic product name "Corepoint" is deliberately
-# NOT here — it's the competitor named all over the repo's own docs; the guard targets real customer/
-# partner/site identifiers, not the product name.
+# pattern catches externalized 6-digit site codes; the rest are partner/product/customer substrings
+# drawn from the (git-ignored) real migration estate. NOTE: the generic product name "Corepoint" is
+# deliberately NOT here — it's the competitor named all over the repo's own docs; the guard targets
+# real customer/partner/site identifiers, not the product name.
 #
-# These estate tokens + the site-code pattern now live in the publish guard
-# (scripts/publish/scan_forbidden.py) as the SINGLE source of truth (ADR 0030 §5), shared with the
+# These estate tokens + the site-code pattern now live in the guard
+# (scripts/security/scan_forbidden.py) as the SINGLE source of truth (ADR 0030 §5), shared with the
 # anonymizer's leak-check; this test imports them instead of keeping a divergent copy (the drift
 # BACKLOG #36 recorded). The scanner lives under scripts/ (not an installed package), so it is loaded
 # by path — mirroring tests/test_scan_forbidden.py.
 def _load_scan_forbidden() -> object:
-    path = Path(__file__).resolve().parents[1] / "scripts" / "publish" / "scan_forbidden.py"
+    path = Path(__file__).resolve().parents[1] / "scripts" / "security" / "scan_forbidden.py"
     if not path.exists():
-        # Private-only: scripts/publish/ is deny-listed in the OSS mirror, so the estate-token
-        # assertions this module feeds don't apply there. Skip the whole module rather than error at
-        # collection (the scanner is the single source of truth only where it exists).
+        # The scanner lives under scripts/ (not an installed package); on an installed wheel it is
+        # absent, so the estate-token assertions this module feeds don't apply. Skip the whole module
+        # rather than error at collection.
         pytest.skip(
-            "scan_forbidden.py is private-only (OSS-mirror deny-list)", allow_module_level=True
+            "scan_forbidden.py needs the source checkout (absent on an installed wheel)",
+            allow_module_level=True,
         )
     spec = importlib.util.spec_from_file_location("scan_forbidden", path)
     assert spec is not None and spec.loader is not None
@@ -204,7 +205,7 @@ def test_no_forbidden_tokens_in_shipped_load_artifacts() -> None:
             if token in text:
                 offenders.append(f"{path}: {token!r}")
         if _SITE_CODE.search(text):
-            offenders.append(f"{path}: site-code pattern 54xxxx")
+            offenders.append(f"{path}: site-code pattern")
     assert not offenders, "real estate tokens leaked into shipped load artifacts: " + "; ".join(
         offenders
     )

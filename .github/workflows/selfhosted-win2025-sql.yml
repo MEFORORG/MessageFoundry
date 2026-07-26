@@ -4,9 +4,11 @@
 # (they exercise SQL Server only on a Linux service container). It is the companion to ci.yml's
 # `sql server (store + connector)` legs — the SAME suites, run on the real OS + driver stack.
 #
-# SECURITY (a self-hosted runner executes repository code):
-#   * Gated to `workflow_dispatch` ONLY — never `pull_request`, never a fork, no schedule. The repo is
-#     private, so untrusted fork code never reaches this runner. Run it ON DEMAND when the VM is up.
+# SECURITY (a self-hosted runner executes repository code — critical on a PUBLIC repo, where a fork PR
+# could otherwise run attacker code on the runner host):
+#   * Gated to `workflow_dispatch` ONLY — never `pull_request`, never a fork, no schedule. Dispatch is
+#     restricted to users with write access, so untrusted fork code never reaches this runner. That
+#     dispatch-only posture (NOT repo privacy) is the control. Run it ON DEMAND when the VM is up.
 #   * NOT a required check, and there is NO scheduled trigger — so the VM never has to be on. Nothing
 #     queues or fails while it is off; a manual run just waits for the runner (and expires after ~24h if
 #     the VM never comes up). It never blocks a PR or a merge.

@@ -19,19 +19,103 @@ Pure stdlib + the ``_pools`` seam — byte-identical with ``tee/anon/surrogates.
 
 from __future__ import annotations
 
+import os
 import random
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from . import _pools
 from .keying import Keyer
 from .rules import SurrogateKind
 
-#: A field/component value that *is exactly* a ``54xxxx`` site code (ADR 0030 §5, owner decision
-#: 2026-06-20: **field-anchored** — ``fullmatch`` on a whole component, so a coincidental ``54xxxx``
-#: inside a longer timestamp/order number is left alone, unlike the publish gate's broad catch-all).
-SITE_CODE_RE = re.compile(r"54\d{4}")
+#: A never-matching pattern — the site-code detector when no prefix is configured (a token-less
+#: public build). ``re`` has no built-in "match nothing", so encode one explicitly.
+_NEVER: re.Pattern[str] = re.compile(r"(?!x)x")
+
+
+def _resolve_token_text() -> str | None:
+    """The active token content, or ``None`` if no source is configured — the SAME source
+    ``scripts/security/scan_forbidden.py`` reads, so the site-code authority is externalized in one
+    place (never committed). ``MEFOR_FORBIDDEN_TOKENS`` wins: an existing file path is read; any other
+    non-empty value is inline content; an explicitly-empty value means "no source". Otherwise the
+    git-ignored ``scripts/security/scan-tokens.local.txt`` is located by walking up from this file
+    (a dev checkout); an installed wheel without it degrades to no-op.
+    """
+    env = os.environ.get("MEFOR_FORBIDDEN_TOKENS")
+    if env is not None:
+        env = env.strip()
+        if not env:
+            return None
+        try:
+            p = Path(env)
+            if p.is_file():
+                return p.read_text(encoding="utf-8")
+        except OSError:
+            pass
+        return env
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "scripts" / "security" / "scan-tokens.local.txt"
+        try:
+            if candidate.is_file():
+                return candidate.read_text(encoding="utf-8")
+        except OSError:
+            pass
+    return None
+
+
+def _load_site_prefixes() -> tuple[str, ...]:
+    """The estate's site-code numeric prefixes, EXTERNALIZED out of source (they identify a real
+    customer estate; ADR 0030 §5, owner decision 2026-06-20). Only the ``[site_prefix]`` section of
+    the shared token file is read here, two-digit prefixes only (the site-code model is a two-digit
+    prefix + four digits). An absent source yields ``()`` — the site-code safety pass then no-ops,
+    correct for a token-less public build where the rule map is the primary control.
+    """
+    text = _resolve_token_text()
+    if text is None:
+        return ()
+    prefixes: list[str] = []
+    section: str | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        if section == "site_prefix" and line.isdigit() and len(line) == 2:
+            prefixes.append(line)
+    return tuple(dict.fromkeys(prefixes))
+
+
+#: Field-anchored site-code detector (``fullmatch`` on a whole component, so a coincidental site-code
+#: run inside a longer timestamp/order number is left alone, unlike the publish gate's broad catch-all).
+#: Built from the externalized prefixes; ``_NEVER`` when none are configured. Recomputed by
+#: :func:`reload_site_prefixes`; read as a stable public contract by the leak-check bridge.
+_SITE_PREFIXES: tuple[str, ...] = ()
+SITE_CODE_RE: re.Pattern[str] = _NEVER
+#: Two-digit prefixes that are NOT site-code prefixes — a fabricated replacement code draws its lead
+#: from here so it can never itself be a site code.
+_NON_SITE_PREFIXES: tuple[str, ...] = ()
+
+
+def reload_site_prefixes() -> None:
+    """Recompute the externalized site-code globals from the current environment / local token file.
+    Called once at import and by tests after adjusting the source. Never raises."""
+    global _SITE_PREFIXES, SITE_CODE_RE, _NON_SITE_PREFIXES
+    _SITE_PREFIXES = _load_site_prefixes()
+    if _SITE_PREFIXES:
+        alt = "|".join(re.escape(p) for p in _SITE_PREFIXES)
+        SITE_CODE_RE = re.compile(rf"(?:{alt})\d{{4}}")
+    else:
+        SITE_CODE_RE = _NEVER
+    _NON_SITE_PREFIXES = tuple(
+        f"{n:02d}" for n in range(10, 100) if f"{n:02d}" not in _SITE_PREFIXES
+    )
+
+
+reload_site_prefixes()
 
 #: What :class:`SurrogateKind.FREETEXT` collapses a narrative field to. Free text routinely embeds
 #: identifiers (a name/MRN/DOB in prose) that field-level surrogation cannot reach and the leak-check
@@ -194,19 +278,23 @@ def surrogate_field(kind: SurrogateKind, value: str, keyer: Keyer, seps: Seps) -
 
 
 def scrub_site_codes(value: str, keyer: Keyer, seps: Seps) -> str:
-    """Field-anchored ``54xxxx`` safety pass (ADR 0030 §5): replace any **whole component** that is
-    exactly a site code with a fabricated 6-digit non-``54`` code, leaving coincidental ``54xxxx``
-    inside a longer value (timestamps, order numbers) untouched. Applied to every field as a net
-    under the rule map, since a site code can lurk in an unexpected field.
+    """Field-anchored site-code safety pass (ADR 0030 §5): replace any **whole component** that is
+    exactly a site code with a fabricated non-site code of the same width, leaving a coincidental
+    site-code run inside a longer value (timestamps, order numbers) untouched. Applied to every field
+    as a net under the rule map, since a site code can lurk in an unexpected field. A no-op when no
+    site-code prefix is configured (a token-less build; the rule map remains the primary control).
     """
-    if not value or "54" not in value:
+    if not value or not _SITE_PREFIXES:
+        return value
+    if not any(p in value for p in _SITE_PREFIXES):
         return value
 
     def _one(component: str) -> str:
         if not SITE_CODE_RE.fullmatch(component):
             return component
         rng = keyer.rng("sitecode", component)
-        return f"{rng.randrange(10, 54)}{_fake_digits(rng, 4)}"
+        prefix = rng.choice(_NON_SITE_PREFIXES)
+        return f"{prefix}{_fake_digits(rng, len(component) - len(prefix))}"
 
     reps = value.split(seps.repetition)
     out_reps = []
@@ -245,11 +333,12 @@ def read_message_seps(text: str) -> tuple[Seps, str] | None:
 
 
 def message_has_site_code(text: str) -> bool:
-    """True if any whole field/component/subcomponent **is exactly** a ``54xxxx`` site code — the
-    field-anchored leak-check that matches the scrub (ADR 0030 §5). Using ``fullmatch`` per component
-    (not a broad substring search) means a value that merely *contains* a ``54xxxx`` run — a timestamp,
-    a fabricated 1954/2054 date, a long order number — is not falsely flagged, while a genuine scrub
-    *miss* still is. Falls back to a broad search only for unstructured (no-MSH) text."""
+    """True if any whole field/component/subcomponent **is exactly** a site code — the field-anchored
+    leak-check that matches the scrub (ADR 0030 §5). Using ``fullmatch`` per component (not a broad
+    substring search) means a value that merely *contains* a site-code run — a timestamp, a fabricated
+    date, a long order number — is not falsely flagged, while a genuine scrub *miss* still is. Falls
+    back to a broad search only for unstructured (no-MSH) text. Always False when no site-code prefix
+    is configured."""
     parsed = read_message_seps(text)
     if parsed is None:
         return SITE_CODE_RE.search(text) is not None
@@ -264,13 +353,13 @@ def message_has_site_code(text: str) -> bool:
 
 
 def scrub_message_site_codes(text: str, keyer: Keyer) -> str:
-    """Field-anchored ``54xxxx`` safety pass over a whole ``\\r``-delimited message (ADR 0030 §5).
+    """Field-anchored site-code safety pass over a whole ``\\r``-delimited message (ADR 0030 §5).
 
     Splits on the message's own separators and replaces any whole **component** that is exactly a
     site code, anywhere in the message — the net under the rule map for a site code lurking in an
     unexpected field. MSH-1 (field separator) and MSH-2 (encoding characters) are left untouched so
     the header stays parseable. The broad, unanchored catch-all stays in the publish leak-gate as
-    defense-in-depth; here we never over-redact a coincidental ``54xxxx`` inside a longer value.
+    defense-in-depth; here we never over-redact a coincidental site-code run inside a longer value.
     """
     parsed = read_message_seps(text)
     if parsed is None:

@@ -16,6 +16,11 @@ name: Security
 # against an unchanged main. On-demand full scans: workflow_dispatch.
 on:
   pull_request:
+  # Post-merge re-scan (main only). A fork PR is scanned STRUCTURAL-ONLY by design -- the secret is
+  # unavailable to it -- so without this arm no fully-loaded scan ever sees fork-contributed content.
+  # Scoped to main so branch pushes do not double-run alongside their own PR.
+  push:
+    branches: [main]
   schedule:
     # Daily, so a CVE freshly disclosed against an UNCHANGED pinned dep (no push/PR to trigger a scan)
     # is caught within ~24h instead of up to 7 days — a weekly cadence can't meet a 72h-class remediation
@@ -344,24 +349,48 @@ jobs:
   forbidden-content:
     name: forbidden-content (customer/PHI leak guard)
     runs-on: ubuntu-latest
-    # BLOCKING: scan the PUBLISHABLE subset — every tracked file MINUS scripts/publish/publish-denylist.txt
-    # (the same deny-list publish.ps1 removes) — for customer/PHI-adjacent strings: partner/site names, the
-    # real production estate, routable host IPs. These are not *secrets* (gitleaks won't flag them) but must
-    # never reach the open-source mirror. This is the same scanner publish.ps1 runs as its fail-closed gate,
-    # brought forward to PR/push-to-main time so a token can't ride a squash-merge onto main and sit there
-    # until the next publish catches it. See docs/security/PUBLISHING.md.
+    # BLOCKING (required context): scan the WHOLE tracked tree for customer/PHI-adjacent strings --
+    # partner/site names, the real production estate, routable host IPs, internal worktree slugs and
+    # absolute home paths. These are not *secrets* (gitleaks will not flag them) but must never land on
+    # this public repo. The committed scanner ships only STRUCTURAL detectors plus a synthetic
+    # .example; the real token list is NEVER committed -- it arrives from the MEFOR_FORBIDDEN_TOKENS
+    # secret here, and locally from a git-ignored scripts/security/scan-tokens.local.txt.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
-      - name: Scan the publishable subset for forbidden content
-        # Stdlib-only scanner (no install). Exits non-zero — failing the build — on any hit. The scanner
-        # lives under the deny-listed scripts/publish/, so it is ABSENT on the OSS mirror — there's
-        # nothing to gate there (everything is already the published subset); skip rather than error.
+      - name: Scan the tracked tree for forbidden content
+        # Stdlib-only scanner (no install).
+        #
+        # MEFOR_MIN_DETECTORS is what makes "fail-closed" mean anything. Requiring a token SOURCE only
+        # proves one arrived: a partially-mangled secret still loaded as few as 1 of 21 detectors and
+        # passed with a green tick, and losing just the final line silently disabled every site-code
+        # detector. The floor is PER-SECTION, not a bare total -- a total is a SUM, so growth in a cheap
+        # section masks collapse in an expensive one (names 7->1 alongside estate 13->19 still totals 21).
+        # It is a FLOOR: adding tokens needs no CI change, losing them fails the build.
+        #
+        # zizmor: the secret is never interpolated into this run: body. It arrives as the step-level env
+        # var (an opaque value, not an Actions-expression sink).
+        env:
+          MEFOR_FORBIDDEN_TOKENS: ${{ secrets.MEFOR_FORBIDDEN_TOKENS }}
+          # Whether this run CANNOT legitimately see the secret. Empty on pushes and same-repo PRs.
+          IS_FORK_PR: ${{ github.event.pull_request.head.repo.fork }}
         run: |
-          if [ -f scripts/publish/scan_forbidden.py ]; then
-            python scripts/publish/scan_forbidden.py --published
+          if [ -n "$MEFOR_FORBIDDEN_TOKENS" ]; then
+            # Deliberately NOT written to scripts/security/scan-tokens.local.txt: the scanner resolves
+            # the env var first, so that file would never be read -- it would only drop the full real
+            # token list into the job workspace for every later step to see.
+            export MEFOR_REQUIRE_TOKENS=1
+            export MEFOR_MIN_DETECTORS=names=7,estate=13,site_prefixes=1
+            echo "token list loaded from the MEFOR_FORBIDDEN_TOKENS secret (fail-closed, per-section floor)."
+          elif [ "$IS_FORK_PR" = "true" ]; then
+            echo "fork PR -- the secret is unavailable BY DESIGN; structural-only scan."
           else
-            echo "scripts/publish/scan_forbidden.py absent (OSS mirror) — skipping the publish leak-gate."
+            # Degrading here would be SILENT and PERMANENT: a renamed, deleted, environment-scoped or
+            # rotated secret takes the fork branch forever, scanning nothing while the REQUIRED context
+            # stays green. Absent-on-a-non-fork is a broken gate, not a mode.
+            echo "::error::MEFOR_FORBIDDEN_TOKENS is absent on a non-fork run. The customer-leak gate cannot run. Check the repository secret (repo-scoped, not environment-scoped)." >&2
+            exit 2
           fi
+          python scripts/security/scan_forbidden.py --path .

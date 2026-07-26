@@ -1,0 +1,91 @@
+# Dependabot: surface vulnerable / outdated dependencies and CI actions as PRs (CI-1 / DEP-1).
+# Until a committed lockfile lands, this is the primary signal for a known-CVE dependency.
+version: 2
+updates:
+  # Python deps via the native "uv" ecosystem (was "pip"). The uv ecosystem resolves against
+  # pyproject.toml + uv.lock and REGENERATES uv.lock IN its PRs (version updates GA 2025-03,
+  # security updates GA 2025-12) — the old "pip" ecosystem updated requirements/pyproject but NOT
+  # uv.lock. It still does not re-derive the EXPORTED locks (requirements.lock + docker/locks/* +
+  # constraints.lock), which the DEP-1 gate in security.yml byte-diffs;
+  # .github/workflows/dependabot-lock-resync.yml re-exports those on the Dependabot branch so the
+  # gate stays green.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    # Supply-chain cooldown: age a fresh release before opening a ROUTINE update PR, to dodge a
+    # package compromised shortly after publish. Security updates ignore cooldown (Dependabot
+    # behavior), so a real advisory fix still arrives immediately. Pairs with the auto-merge
+    # workflow: routine patches auto-merge AFTER aging; security patches auto-merge now.
+    cooldown:
+      # ~5-day aging window (DEPENDENCY-POSTURE-REVIEW.md) lengthens the malicious-fresh-publish
+      # dodge on the routine VERSION track; the SECURITY track still bypasses cooldown (Dependabot
+      # design), now backstopped by the published-GHSA gate in dependabot-auto-merge.yml (SEC-007 #2).
+      default-days: 5
+      semver-major-days: 7
+    groups:
+      # Version-update grouping (applies-to defaults to version-updates).
+      python-deps:
+        patterns: ["*"]
+      # Security-update grouping: collapse multiple vulnerable-dep fixes into ONE PR so a single
+      # review/merge clears them — faster remediation when several CVEs land together.
+      python-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      # One weekly PR for all action bumps instead of one PR per action (CI cost: every extra PR
+      # buys a full required-check pass + a push-to-main run when it auto-merges). Mirrors the
+      # python-deps/ide-deps grouping above. A patch batched with a major rides the same PR —
+      # latency-only, auto-merge still gates on the full CI pass. Security updates keep their own
+      # group so an advisory fix is never held behind a routine batch.
+      actions-deps:
+        patterns: ["*"]
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  # The VS Code extension's npm tree (build-time toolchain — the shipped artifact is the esbuild
+  # bundle). Surfaces a vulnerable/outdated npm dep as a PR, the same DEP-1 surveillance the uv
+  # ecosystem gets; the blocking npm-audit job in security.yml is the fail-closed companion.
+  - package-ecosystem: "npm"
+    directory: "/ide"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 3
+      semver-major-days: 7
+    # Three dev-deps are pinned to the extension's runtime contract and must NOT float to the newest
+    # published version (grouping them into a routine bump broke `ide build` in PR #649 and PR #877):
+    #   * @types/node tracks the Node runtime inside VS Code's Electron, not the latest stubs. The
+    #     20 -> 26 jump made the Node globals/builtins unresolvable at typecheck (TS2591/TS2304). A
+    #     major is a deliberate moduleResolution (node16/nodenext) migration on its own PR, not an
+    #     auto-bump — so hold the 20.x line (patches still flow).
+    #   * @types/vscode must never exceed the engines.vscode floor (^1.95). Typing against a newer
+    #     API surface lets the extension compile against methods absent from the editors it claims to
+    #     support, failing at runtime on an older VS Code rather than in CI. Raise engines.vscode and
+    #     this pin together, as one deliberate change, when dropping support for older VS Code.
+    #   * typescript majors are a compiler migration, not a routine bump. The 5 -> 6 jump broke the
+    #     typecheck outright (TS2591/TS2304/TS2694 — @types/node globals and the NodeJS namespace no
+    #     longer resolve under the new lib/moduleResolution defaults). #875 deliberately left it
+    #     un-ignored so CI could adjudicate the major on its own PR; CI failed it (#877), so hold the
+    #     5.x line and adopt TS 6 as its own deliberate migration (tsconfig lib/module review).
+    ignore:
+      - dependency-name: "@types/node"
+        versions: [">=21.0.0"]
+      - dependency-name: "@types/vscode"
+        versions: [">=1.96.0"]
+      - dependency-name: "typescript"
+        versions: [">=6.0.0"]
+    groups:
+      ide-deps:
+        patterns: ["*"]
+      ide-security:
+        applies-to: security-updates
+        patterns: ["*"]
