@@ -8,7 +8,7 @@ the AST and diff them against the maintained inventory below. The build **fails*
 crypto primitive it isn't documented to use — so a new (or moved) crypto usage can't slip in
 unreviewed, and the inventory below stays an accurate "where is crypto used" map (it is the
 machine-readable companion to the human-readable inventory in
-``docs/security/ASVS-L2-PHASE0-CHANGES.md`` §4).
+``docs/ASVS-L2-PHASE0-CHANGES.md`` §4).
 
 A module counts as a crypto call site when it imports any of three trigger classes (BACKLOG #282
 widened the original six-stdlib-module list so *delegated* crypto stops being invisible):
@@ -78,7 +78,7 @@ CRYPTO_SEAM_MODULES = frozenset(
 _TOPLEVEL_TRIGGERS = CRYPTO_MODULES | CRYPTO_LIBRARY_MODULES
 
 # The maintained inventory: repo-relative module path -> the crypto modules it is documented to use.
-# Keep this in sync with docs/security/ASVS-L2-PHASE0-CHANGES.md §4. To add an entry, document *why*
+# Keep this in sync with docs/ASVS-L2-PHASE0-CHANGES.md §4. To add an entry, document *why*
 # the new crypto usage is needed there, then list it here.
 INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0030: keyed BLAKE2b derives the deterministic, salt-keyed seed that picks a surrogate, so

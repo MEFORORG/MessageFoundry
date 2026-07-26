@@ -236,6 +236,25 @@ _ALLOWED_SHELL_SITES: dict[str, str] = {
 
 
 def _doc_text() -> str:
+    """The threat-model text, or a per-test skip where the document is not published.
+
+    ``docs/security/**`` is deny-listed from the OSS mirror (and vaulted after the cutover), so this
+    document is absent there and every assertion about its CONTENT has nothing to say. The skip is
+    deliberately here, at the single accessor, rather than at module level — that distinction is the
+    whole point:
+
+    * A module-level skip would take the FIVE code-only tests down with the 88 doc-anchored ones,
+      including the only inventory of process-spawn sites and the only exact-value lock on ~60 shipped
+      security defaults. Those assert about CODE and are just as valid on the public repo.
+    * Skipping at the accessor also keeps the code half of a MIXED test enforced. ``test_subprocess_
+      sites_are_exactly_the_documented_set`` asserts ``live == known`` over the package and only THEN
+      reads the doc: if that assertion fails you never reach the skip, so the test still fails. Before
+      this, that test failed outright on the mirror and the process-spawn inventory guarded nothing
+      there — a list-form ``subprocess.Popen`` could ship unnoticed, which is the exact defect its
+      docstring records having already happened once.
+    """
+    if not _DOC.exists():
+        pytest.skip("docs/security/THREAT-MODEL.md is private-only (OSS-mirror deny-list / vault)")
     return _DOC.read_text(encoding="utf-8")
 
 

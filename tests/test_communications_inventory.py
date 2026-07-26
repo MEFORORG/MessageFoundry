@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """ASVS 13.1.1 / 13.1.2 / 13.1.3 drift guard: the communications inventory in
-``docs/security/ASVS-L2-PHASE0-CHANGES.md`` §5 and the resource-management tables in
+``docs/ASVS-L2-PHASE0-CHANGES.md`` §5 and the resource-management tables in
 ``docs/CONNECTIONS.md`` must stay complete and true at HEAD.
 
 For these three requirements the **shipped documentation IS the control** — an assessor scores the
@@ -52,7 +52,7 @@ import pytest
 from messagefoundry.config.models import ConnectorType
 
 _ROOT = Path(__file__).resolve().parent.parent
-_PHASE0 = _ROOT / "docs" / "security" / "ASVS-L2-PHASE0-CHANGES.md"
+_PHASE0 = _ROOT / "docs" / "ASVS-L2-PHASE0-CHANGES.md"
 _CONNECTIONS = _ROOT / "docs" / "CONNECTIONS.md"
 
 # --- doc slice markers (exact headings; a rename fails loudly) ---------------------------------
@@ -559,7 +559,7 @@ def test_every_registered_connector_has_an_inventory_row() -> None:
     )
     assert not missing, (
         "registered connector type(s) with no row in the §5.1 communications inventory of "
-        f"docs/security/ASVS-L2-PHASE0-CHANGES.md (add a row whose FIRST cell names `<type>`): "
+        f"docs/ASVS-L2-PHASE0-CHANGES.md (add a row whose FIRST cell names `<type>`): "
         f"{missing}"
     )
 
@@ -590,7 +590,7 @@ def test_curated_infra_hops_appear_in_their_inventory_subsection() -> None:
     missing = missing_tokens(INFRA_HOPS, _phase0_slices())
     assert not missing, (
         "infrastructure hop(s) missing from their §5 sub-section in "
-        f"docs/security/ASVS-L2-PHASE0-CHANGES.md: {missing}"
+        f"docs/ASVS-L2-PHASE0-CHANGES.md: {missing}"
     )
 
 
@@ -606,7 +606,7 @@ def test_s5_only_hops_appear_in_their_inventory_subsection() -> None:
     missing = missing_tokens(S5_ONLY_HOPS, _phase0_slices())
     assert not missing, (
         "§5-only hop(s) missing from their sub-section in "
-        f"docs/security/ASVS-L2-PHASE0-CHANGES.md: {missing}"
+        f"docs/ASVS-L2-PHASE0-CHANGES.md: {missing}"
     )
     section = _phase0_slices()["§5"]
     assert "such as a URL for a callback" in section, (
@@ -635,7 +635,7 @@ def test_every_message_plane_row_is_pinned_by_its_own_label() -> None:
     """
     missing = missing_row_labels(S51_ROW_MARKERS, _phase0_slices())
     assert not missing, (
-        "§5.1 message-plane row(s) missing from docs/security/ASVS-L2-PHASE0-CHANGES.md (matched on "
+        "§5.1 message-plane row(s) missing from docs/ASVS-L2-PHASE0-CHANGES.md (matched on "
         "the row's FIRST cell, so a deleted row is detected even when its ConnectorType value "
         f"survives in a sibling row): {missing}"
     )
@@ -652,7 +652,7 @@ def test_every_control_plane_and_infra_row_is_pinned_by_its_own_label() -> None:
     slices = _phase0_slices()
     missing = missing_row_labels(S5_ROW_MARKERS, slices)
     assert not missing, (
-        "§5.2/§5.3 row(s) missing from docs/security/ASVS-L2-PHASE0-CHANGES.md (matched on the "
+        "§5.2/§5.3 row(s) missing from docs/ASVS-L2-PHASE0-CHANGES.md (matched on the "
         f"row's FIRST cell, so a deleted row is detected even when a sibling repeats its tokens): "
         f"{missing}"
     )

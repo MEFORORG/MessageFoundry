@@ -347,5 +347,5 @@ the build.
 no new workload field, no new dependency (`truststore` has been a **base** dependency since the wheel-packaging
 amendment above, precisely so "the tray/monitor need no per-PC CA wrangling"). `messagefoundry/tray/probe.py`
 gains an `ssl` import and is registered in the ASVS 11.1.3 crypto inventory
-(`scripts/security/crypto_inventory_check.py` + [`docs/security/ASVS-L2-PHASE0-CHANGES.md`](../security/ASVS-L2-PHASE0-CHANGES.md) §4).
+(`scripts/security/crypto_inventory_check.py` + [`docs/ASVS-L2-PHASE0-CHANGES.md`](../ASVS-L2-PHASE0-CHANGES.md) §4).
 **AC-7 is amended** (above) to state locality, not scheme.

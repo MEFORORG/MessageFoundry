@@ -616,39 +616,6 @@ async def test_gate_is_not_a_basehttpmiddleware(engine: Engine) -> None:
     assert app.user_middleware[0].cls is ClientNetworkMiddleware
 
 
-def test_runbook_example_block_actually_loads(tmp_path: Path) -> None:
-    """The runbook's engine-config block is the one an operator copies. A doc example that no longer
-    loads is worse than none — and this feature's own first draft shipped an invalid CIDR in it
-    ("2001:db8:ops::"), which is exactly what this catches. Scoped to the block that carries the
-    setting; the runbook's OTHER stale blocks are pre-existing and out of scope here."""
-    import re
-
-    doc = (
-        Path(__file__).resolve().parents[1] / "docs" / "security" / "OFF-LOOPBACK-DEPLOYMENT.md"
-    ).read_text(encoding="utf-8")
-    blocks = [
-        b for b in re.findall(r"```toml\n(.*?)```", doc, re.S) if "allowed_client_networks" in b
-    ]
-    assert len(blocks) == 1, "the runbook should carry exactly one allowed_client_networks example"
-    cfg = tmp_path / "messagefoundry.toml"
-    cfg.write_text(blocks[0], encoding="utf-8")
-    settings = load_settings(config_path=cfg, environ={})
-    assert settings.security.allowed_client_networks
-    # ...and it models R2 correctly: a DECLARED, single-host proxy, without which it would be inert.
-    assert settings.api.trusted_proxies == ["127.0.0.1"]
-
-
-def test_runbook_proxy_replaces_rather_than_appends_the_forwarded_chain() -> None:
-    doc = (
-        Path(__file__).resolve().parents[1] / "docs" / "security" / "OFF-LOOPBACK-DEPLOYMENT.md"
-    ).read_text(encoding="utf-8")
-    assert "proxy_set_header X-Forwarded-For   $remote_addr;" in doc
-    # The APPENDING form must not survive as a directive (it may still be named in prose explaining
-    # why it was replaced): a chain built from the client's own header carries an attacker-authored
-    # prefix, and only the single-host trusted_proxies rule keeps uvicorn's reverse walk landing right.
-    assert "proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for" not in doc
-
-
 def test_web_console_keys_on_the_same_denial_marker() -> None:
     """Drift guard across the Python/JS seam. The console distinguishes a network denial from an RBAC
     403 by the marker header — if the engine renames either constant, the console silently stops
@@ -739,3 +706,9 @@ def test_default_loopback_serve_emits_nothing_new(
     captured = capsys.readouterr()
     assert "allowed_client_networks" not in captured.out
     assert "allowed_client_networks" not in captured.err
+
+
+# NOTE: test_runbook_example_block_actually_loads, test_runbook_proxy_replaces_rather_than_appends_the_forwarded_chain moved to tests/test_off_loopback_runbook.py (2026-07-26). They asserted against
+# the deny-listed off-loopback runbook, so on the public mirror they failed at runtime and took
+# this whole module's required test leg red — while the rest of this file guards shipped
+# behaviour that must keep running publicly. The new home already carries the doc-absent guard.

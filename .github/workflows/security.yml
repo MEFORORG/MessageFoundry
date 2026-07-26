@@ -330,7 +330,7 @@ jobs:
     runs-on: ubuntu-latest
     # BLOCKING: enumerate every crypto call site (hashlib/secrets/hmac/ssl/argon2/cryptography) and diff
     # against the maintained inventory in scripts/security/crypto_inventory_check.py (machine-readable
-    # companion to docs/security/ASVS-L2-PHASE0-CHANGES.md §4). A new/moved/undocumented crypto usage —
+    # companion to docs/ASVS-L2-PHASE0-CHANGES.md §4). A new/moved/undocumented crypto usage —
     # or a stale inventory entry — fails the build, so the inventory can't silently drift (WP-L3-02).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

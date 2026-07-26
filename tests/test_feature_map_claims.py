@@ -25,9 +25,6 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 _FEATURE_MAP = _REPO / "docs" / "FEATURE-MAP.md"
 _DENYLIST = _REPO / "scripts" / "publish" / "publish-denylist.txt"
-_GITIGNORE = _REPO / ".gitignore"
-# Marker opening the .gitignore vault block that replaces the deny-list after the cutover.
-_VAULT_MARKER = "Private-content vault"
 
 # "214 / 0 / 0 / 131", "195/89/0/61" — an ASVS Pass/Partial/Fail/N-A tuple.
 _SCORE_TUPLE = re.compile(r"\d{1,3}\s*/\s*\d{1,3}\s*/\s*\d{1,3}\s*/\s*\d{1,3}")
@@ -40,93 +37,73 @@ def _text() -> str:
     return _FEATURE_MAP.read_text(encoding="utf-8")
 
 
-def _private_prefixes() -> list[str]:
-    """Paths the public catalog must never link into.
+def _denylist_prefixes() -> list[str] | None:
+    """Deny-listed path prefixes, or ``None`` in a checkout that has no deny-list.
 
-    The SOURCE of that list changes across the repo's lifetime, but the question does not. While the
-    private+mirror model is live it is the publish deny-list. Once development moves into the public
-    repo the deny-list is deleted and the same role is played by the ``.gitignore`` private-content
-    vault block — which is *broader*, so the guard gets stronger, not weaker. Read whichever exists.
+    A "link into a private path" MANIFESTS DIFFERENTLY depending on which checkout you are in, and that
+    is why there are two modes rather than one list from two sources:
 
-    If NEITHER exists this RAISES rather than returning an empty list. Empty would make every guard in
-    this module vacuously pass: no prefixes, so nothing can link into one, so green. A leak guard that
-    silently stops guarding when its input disappears is worse than no guard, because it still reports
-    a green tick — the precise failure mode this cutover's pre-flight found in the CI leak gate itself.
+    * **Private repo** — the target file is present locally but is stripped from the published snapshot,
+      so only the deny-list can tell you the link will 404 for a reader. Existence proves nothing.
+    * **Public repo / mirror** — the private path is simply ABSENT, so a link into one is just a broken
+      relative link. No list is needed, and the existence check is strictly STRONGER: it also catches
+      links to files that were deleted or renamed, which a deny-list never could.
+
+    An earlier version of this tried to keep one list by parsing a marker block out of ``.gitignore``
+    after the cutover. That marker did not exist in any ``.gitignore`` — the string appeared only in
+    this test — and its unit test built a synthetic file in ``tmp_path``, so it exercised the parser
+    and could never notice the real marker was missing. It was a check that could not fail.
     """
-    if _DENYLIST.exists():
-        return [
-            entry
-            for line in _DENYLIST.read_text(encoding="utf-8").splitlines()
-            if (entry := line.strip()) and not entry.startswith("#")
-        ]
-    if _GITIGNORE.exists():
-        out: list[str] = []
-        in_vault = False
-        for line in _GITIGNORE.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if _VAULT_MARKER in stripped:
-                in_vault = True
-                continue
-            if in_vault:
-                if not stripped:
-                    break
-                if not stripped.startswith("#"):
-                    # "docs/security/**" and "/docs/security/" both mean the prefix docs/security.
-                    out.append(stripped.lstrip("/").replace("**", "").rstrip("/"))
-        if out:
-            return out
-    raise AssertionError(
-        "neither the publish deny-list nor the .gitignore private-content vault block was found, so "
-        "these guards cannot tell which paths are private. Failing closed rather than passing green "
-        "on no data — if the vault block moved, point _VAULT_MARKER at it."
-    )
+    if not _DENYLIST.exists():
+        return None
+    return [
+        entry
+        for line in _DENYLIST.read_text(encoding="utf-8").splitlines()
+        if (entry := line.strip()) and not entry.startswith("#")
+    ]
 
 
-def test_private_prefixes_falls_back_to_the_gitignore_vault_block(
+def test_link_check_catches_a_missing_target_without_a_denylist(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After the cutover the publish deny-list is deleted; the vault block must take over seamlessly.
+    """The public-repo mode must actually FAIL on a bad link, not just run.
 
-    Without this fallback two guards in this module raise FileNotFoundError on the public repo — which
-    is at least loud. The subtler risk is "fixing" that by deleting them, which quietly removes the only
-    automated check that the public catalog never links into a vaulted path.
+    This is the branch that is live on the mirror and will be the ONLY branch after the cutover, so it
+    is asserted directly rather than via a synthetic parser fixture. Both halves matter: a link whose
+    target exists passes, and one whose target does not FAILS.
     """
-    gitignore = tmp_path / ".gitignore"
-    gitignore.write_text(
-        "*.pyc\n\n"
-        f"# --- {_VAULT_MARKER} (never commit) ---\n"
-        "docs/security/**\n"
-        "/docs/reviews/\n"
-        "docs/BACKLOG.md\n"
-        "\n"
-        "# Tooling — must NOT be picked up: the block ends at the blank line\n"
-        ".ruff_cache/\n",
-        encoding="utf-8",
-    )
     monkeypatch.setattr(sys.modules[__name__], "_DENYLIST", tmp_path / "absent.txt")
-    monkeypatch.setattr(sys.modules[__name__], "_GITIGNORE", gitignore)
-    assert _private_prefixes() == ["docs/security", "docs/reviews", "docs/BACKLOG.md"]
+    assert _denylist_prefixes() is None, "precondition: this must exercise the no-denylist mode"
 
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "present.md").write_text("hi\n", encoding="utf-8")
+    fm = docs / "FEATURE-MAP.md"
+    monkeypatch.setattr(sys.modules[__name__], "_FEATURE_MAP", fm)
 
-def test_private_prefixes_fails_closed_when_no_source_exists(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Returning [] would make every guard here pass VACUOUSLY and still report green."""
-    monkeypatch.setattr(sys.modules[__name__], "_DENYLIST", tmp_path / "absent.txt")
-    monkeypatch.setattr(sys.modules[__name__], "_GITIGNORE", tmp_path / "also-absent")
-    with pytest.raises(AssertionError, match="Failing closed"):
-        _private_prefixes()
+    fm.write_text("see [ok](present.md)\n", encoding="utf-8")
+    test_no_links_into_private_paths()  # must not raise
+
+    fm.write_text("see [gone](security/THREAT-MODEL.md)\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="do not exist"):
+        test_no_links_into_private_paths()
 
 
 def test_feature_map_is_actually_published() -> None:
-    """The premise of every other guard here: FEATURE-MAP reaches the public mirror.
+    """The premise of every other guard here: FEATURE-MAP reaches the reader.
 
-    If it is ever added to the denylist these guards become pointless rather than wrong —
-    this test makes that transition loud instead of silent.
+    With a deny-list, prove it is not on it. Without one, the file's own presence in this checkout IS
+    the proof — a deny-listed/vaulted file would not be here to read.
     """
+    prefixes = _denylist_prefixes()
+    if prefixes is None:
+        assert _FEATURE_MAP.is_file(), (
+            "FEATURE-MAP.md is missing — the guards below have no subject"
+        )
+        return
     assert not any(
         p == "docs/FEATURE-MAP.md" or "docs/FEATURE-MAP.md".startswith(p.rstrip("/") + "/")
-        for p in _private_prefixes()
+        for p in prefixes
     ), "FEATURE-MAP.md is now deny-listed — revisit the guards in this module"
 
 
@@ -150,21 +127,39 @@ def test_no_hardcoded_asvs_score_tuple() -> None:
 
 
 def test_no_links_into_private_paths() -> None:
-    """A link into a deny-listed path is a dead link on the public mirror."""
-    prefixes = _private_prefixes()
+    """A link into a private path is a dead link for the reader.
+
+    Two modes, because the defect looks different depending on the checkout — see
+    :func:`_denylist_prefixes`. With a deny-list, match the link against it (the target is present
+    locally, so only the list knows it will 404). Without one, the private path is simply absent, so
+    a missing target IS the defect — and that also catches deleted or renamed files.
+    """
+    prefixes = _denylist_prefixes()
     bad: list[tuple[int, str]] = []
     for i, line in enumerate(_text().splitlines(), start=1):
         for m in _REL_LINK.finditer(line):
             target = m.group(1).split("#", 1)[0].strip()
             if not target:
                 continue
+            if prefixes is None:
+                if not (_FEATURE_MAP.parent / target).exists():
+                    bad.append((i, target))
+                continue
             repo_rel = f"docs/{target}".replace("\\", "/")
             if any(repo_rel == p or repo_rel.startswith(p.rstrip("/") + "/") for p in prefixes):
                 bad.append((i, target))
-    assert not bad, (
-        "docs/FEATURE-MAP.md links into private, deny-listed paths (these 404 on the public "
-        "mirror): " + ", ".join(f"{t!r} at line {ln}" for ln, t in bad)
-    )
+    detail = ", ".join(f"{t!r} at line {ln}" for ln, t in bad)
+    if prefixes is None:
+        assert not bad, (
+            f"docs/FEATURE-MAP.md links to targets that do not exist in this checkout: {detail}. "
+            "In a public checkout that means either a link into a private/vaulted path, or a stale "
+            "link to something deleted or renamed. Either way it is a 404 for the reader."
+        )
+    else:
+        assert not bad, (
+            f"docs/FEATURE-MAP.md links into private, deny-listed paths (these 404 on the public "
+            f"mirror): {detail}"
+        )
 
 
 def test_no_links_to_superseded_documents() -> None:

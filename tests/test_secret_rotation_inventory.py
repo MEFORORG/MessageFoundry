@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """ASVS 13.1.4 re-drift guard: the critical-secret enumeration + rotation schedule in
-``docs/security/ASVS-L2-PHASE0-CHANGES.md`` must stay complete.
+``docs/ASVS-L2-PHASE0-CHANGES.md`` must stay complete.
 
 The 2026-07-16 / 07-20 failure mode was silent: a new secret-bearing ``MEFOR_*`` env var landed in the
 engine (most recently the ADR 0138 ``vault_transit`` Transit keys) without a matching row in the
@@ -39,7 +39,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PKG = _ROOT / "messagefoundry"
-_DOC = _ROOT / "docs" / "security" / "ASVS-L2-PHASE0-CHANGES.md"
+_DOC = _ROOT / "docs" / "ASVS-L2-PHASE0-CHANGES.md"
 
 # The section the enumeration + schedule live in; sliced by these exact headings so the check is anchored
 # to the schedule (and fails loudly if the section is ever restructured away).
@@ -137,7 +137,7 @@ def test_discovered_secret_env_vars_are_registered() -> None:
     assert not missing, (
         "secret-bearing MEFOR_* env var(s) found in messagefoundry/ but not registered in "
         "CRITICAL_SECRETS (add each here AND a rotation row in "
-        f"docs/security/ASVS-L2-PHASE0-CHANGES.md §4): {missing}"
+        f"docs/ASVS-L2-PHASE0-CHANGES.md §4): {missing}"
     )
 
 
@@ -161,7 +161,7 @@ def test_registry_secrets_appear_in_rotation_schedule() -> None:
     )
     assert not undocumented, (
         "critical secret(s) with no entry in the rotation-schedule section of "
-        f"docs/security/ASVS-L2-PHASE0-CHANGES.md: {undocumented}"
+        f"docs/ASVS-L2-PHASE0-CHANGES.md: {undocumented}"
     )
 
 
@@ -203,7 +203,7 @@ def test_secret_setting_keys_are_registered() -> None:
     missing = sorted(name for name in rotatable if name not in CRITICAL_SECRETS)
     assert not missing, (
         "connector-credential setting(s) in wiring._SECRET_SETTING_KEYS absent from CRITICAL_SECRETS — "
-        "register each here AND add a rotation row in docs/security/ASVS-L2-PHASE0-CHANGES.md §4 (or add "
+        "register each here AND add a rotation row in docs/ASVS-L2-PHASE0-CHANGES.md §4 (or add "
         f"it to _NON_ROTATABLE_SETTING_KEYS if it is a non-secret identifier): {missing}"
     )
 

@@ -100,10 +100,21 @@ def test_pyproject_and_release_leak_gate_allowlists_cannot_drift() -> None:
 
     # And a known-private path MUST be rejected by the gate (does not match -> counted as a leak). This is
     # the exact class of file that shipped to PyPI on 0.1.0..0.2.15.
-    assert (_REPO / PRIVATE_CANARY).is_file(), (
-        f"the private-doc canary {PRIVATE_CANARY!r} is missing from the tree — pick another real "
-        f"security-posture doc so this rejection check stays grounded"
-    )
+    # The GROUNDEDNESS half — that the canary still names a REAL private doc rather than a path that
+    # quietly stopped existing — can only be checked where private docs are present at all. On a public
+    # checkout they are deny-listed/vaulted BY DEFINITION, so requiring the file there fails the whole
+    # test and takes the actual guard below down with it (which is what it did on the mirror).
+    #
+    # The discriminator is the private DIRECTORY, not the canary file: keying on the file would be a
+    # tautology — "if the canary exists, assert the canary exists" — and would silently stop grounding
+    # the check the moment the path went stale, which is the one thing it is for.
+    if (_REPO / "docs" / "security").is_dir():
+        assert (_REPO / PRIVATE_CANARY).is_file(), (
+            f"the private-doc canary {PRIVATE_CANARY!r} is missing from the tree — pick another real "
+            f"security-posture doc so this rejection check stays grounded"
+        )
+    # The REJECTION half is a pure regex check over the path string, so it is valid in every checkout
+    # and always runs. It is the assertion that actually guards the 0.1.0..0.2.15 leak class.
     assert not re.match(gate, PRIVATE_CANARY), (
         f"release.yml's leak gate WRONGLY allows the private doc {PRIVATE_CANARY!r} into the sdist — the "
         f"private-doc PyPI leak guard is broken.\n  gate: {gate}"

@@ -1,0 +1,391 @@
+# ASVS L2 — Phase 0 Hardening (operator notes)
+
+Phase 0 of the internal ASVS-L2 remediation plan closes the low-risk "quick win" findings from the
+internal ASVS-L3 assessment. (Those two are maintainer-internal working documents and are not
+published; they are named here only for provenance — this page stands alone.) This page is the
+operator-facing summary: **behavior changes that may need action**, the **new configuration knobs**,
+and the **key-management / communications inventories** the assessment asked for.
+
+---
+
+## 1. Behavior changes (read before upgrading)
+
+| Change | Effect | Action |
+|---|---|---|
+| **Insecure TLS overrides now refuse** | `ad_tls_verify = false` (LDAPS) and `trust_server_certificate = true` / `encrypt = false` (SQL Server) now **raise at startup** instead of warning (ASVS 12.3.2). | Use a trusted CA cert, **or** set `MEFOR_ALLOW_INSECURE_TLS=1` for a trusted-network dev/test bind. |
+| **WebSocket `?token=` removed** | The `/ws/stats` token is read **only** from the `Authorization: Bearer` header; the deprecated `?token=` query param is ignored (it leaked into proxy/access logs). | None for the desktop console (already header-based). Any custom WS client must send the header. |
+| **Browser WebSocket Origins rejected** | A `/ws/stats` handshake carrying an `Origin` header (i.e. a browser) is rejected unless the Origin is allow-listed (ASVS 4.4.2). The desktop console sends no Origin and is unaffected. | If you ever add a browser client, list its Origin in `[api].ws_allowed_origins`. |
+| **Non-HL7 files quarantined earlier** | A file in a FileSource drop dir whose content doesn't start with an HL7 header (`MSH`/`FHS`/`BHS`) is moved to `.error` **before** parsing, instead of becoming an `ERROR`-status message (ASVS 5.2.2). | None. Quarantined files are logged and preserved in `.error`. |
+
+The rest of Phase 0 is purely additive (response headers, log hygiene, a new audit event, pinned
+crypto params, length caps) and needs no operator action.
+
+---
+
+## 2. New configuration knobs
+
+| Setting / env | Default | Purpose (ASVS) |
+|---|---|---|
+| `[api].ws_allowed_origins` | empty | Browser Origins permitted to open `/ws/stats`. Empty ⇒ only no-Origin (native) clients. Env: `MEFOR_API_WS_ALLOWED_ORIGINS` (path-sep list). (4.4.2) |
+| `[alerts].webhook_allowed_hosts` | empty | Optional egress allow-list for the alert webhook host. Empty ⇒ any host (the URL is operator-set). Env: `MEFOR_ALERTS_WEBHOOK_ALLOWED_HOSTS` (comma list). (1.3.6) |
+| `MEFOR_ALLOW_INSECURE_TLS` (env only) | unset | Truthy (`1`/`true`/`yes`/`on`) explicitly permits the MITM-able TLS overrides above for a trusted-network dev/test bind. **Never set in production.** (12.3.2) |
+
+These join the existing `[auth]`, `[api]`, `[store]`, `[alerts]` settings in
+[CONFIGURATION.md](../CONFIGURATION.md).
+
+---
+
+## 3. Additive security controls landed in Phase 0
+
+- **HTTP response headers** on every API response: `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` (+ `Strict-Transport-Security` once the
+  request is served over HTTPS — wired when API TLS lands). (3.4.4 / 3.4.5 / 3.2.1)
+- **Generic-error guarantee**: a catch-all exception handler returns a plain `500 {"detail":
+  "internal error"}` to clients; the real cause (exception *type* + route, never the body) is logged
+  server-side only. (16.5.1)
+- **Log-injection defense**: a logging filter escapes CR/LF and other control characters so untrusted
+  MLLP/HL7-derived text can't forge log lines in the NSSM-captured stdout. (16.4.1)
+- **UTC log timestamps** with a trailing `Z` for unambiguous cross-host correlation. (16.2.2)
+- **`auth.logout` is now emitted** (it was documented but never written) and rate-limit (429) /
+  body-cap (411/413) rejections are logged rather than dropped silently. (16.3.3)
+- **Pinned argon2id parameters** (`t=3`, `m=64 MiB`, `p=4`) asserted by a test, so a library upgrade
+  can't silently change the password work factor. (11.4.2)
+- **Request length caps** (`Field(max_length=…)`) on engine-route models and message-list filters.
+  (1.3.3)
+- **Webhook egress hardening**: the alert webhook no longer follows HTTP redirects and honors the
+  optional host allow-list above. (15.3.2 / 1.3.6)
+
+### Anti-CSRF posture (3.5.1)
+
+The API has **no browser frontend and sets no cookies** — the only client is the PySide6 desktop
+console, which authenticates with a non-ambient `Authorization: Bearer` token. Because the credential
+is never sent automatically by a browser, a cross-site page cannot forge an authenticated request:
+CSRF is structurally prevented rather than mitigated with a token. If a browser frontend is ever
+added, pair it with explicit `Origin` / `Sec-Fetch-Site` validation (the WS handshake already checks
+`Origin`, §1).
+
+---
+
+## 4. Key-management & cryptographic inventory (ASVS 11.1.1 / 11.1.2)
+
+A single, change-controlled inventory of every key, algorithm, and certificate the engine relies on.
+Update it whenever a crypto dependency, algorithm, or key source changes.
+
+> **Enforced by CI (ASVS 11.1.3, WP-L3-02).** `scripts/security/crypto_inventory_check.py` is the
+> machine-readable companion to this section. It walks the five first-party roots (`messagefoundry/`,
+> `messagefoundry_webconsole/`, `harness/`, `tee/`, `scripts/` — pinned identical to
+> `tests/test_security_static.py`'s `_CRYPTO_ROOTS`; `ide/` is TypeScript with zero `.py` files, an
+> *enforced* exclusion) and treats three trigger classes as a crypto call site (BACKLOG #282 widened
+> the original six-module list so *delegated* crypto stops being invisible): the six stdlib modules
+> (`hashlib`, `secrets`, `hmac`, `ssl`, `argon2`, `cryptography`); the third-party crypto libraries
+> `hvac` / `truststore` / `webauthn` / `signxml`; and the **first-party delegated-crypto seams**
+> (`store/crypto.py`, `store/keyprovider.py`, `store/keyprovider_vault.py`, `store/crypto_transit.py`,
+> `store/backup_codec.py`) — so `store/crypto_transit.py` (all Vault-Transit AEAD + the audit MAC ride
+> the HTTP seam; it imports none of the six) is now discovered and inventoried. It **fails the build**
+> on any undocumented or stale usage. When a module starts (or stops) using a crypto primitive or a
+> seam, update both this section and that script's `INVENTORY`.
+
+| Asset | Algorithm / detail | Source / storage | Lifecycle |
+|---|---|---|---|
+| Local password hashes | argon2id (`t=3`, `m=64 MiB`, `p=4`, 32-byte hash, 16-byte salt) — pinned in `auth/passwords.py` | `users.password_hash` (self-contained) | Rehash-on-login when params change; no expiry by policy |
+| Session tokens | 256-bit CSPRNG (`secrets.token_urlsafe(32)`); stored only as SHA-256 | `sessions.token_hash` | Idle 30 min / absolute 12 h; revoked on logout/password-change/disable |
+| WebAuthn ceremony challenges ([ADR 0068](../adr/0068-browser-webauthn-passkeys-offloopback.md)) | First-party 64-byte CSPRNG (`secrets.token_bytes(64)` in `auth/webauthn.py`), passed as the explicit `challenge=` to the `webauthn` library (ASVS 6.7.2 evidence) | Process-local bounded TTL'd `ChallengeCache` keyed by `(session token-hash, kind)` — never persisted, never logged | Single-use (pop-on-verify); 120 s monotonic TTL; new ceremony overwrites the session's pending one; per-user cap 16 (self-evicting), global safety bound 4096 (refuse, cause-named) |
+| WebAuthn credentials ([ADR 0068](../adr/0068-browser-webauthn-passkeys-offloopback.md)) | COSE public keys verified by the `webauthn` library (`cryptography` transitively — ECDSA P-256 et al.); sign-count updated via strict compare-and-set (a CAS miss = clone signal → reject + `auth.webauthn_clone_suspected` audit; 0 is legitimate for synced passkeys) | `webauthn_credentials` table, keyed `credential_id_hash` (SHA-256 hex of the raw id — the `sessions.token_hash` precedent). Public keys stored **plaintext by design** (verification material, not a secret) — deliberately excluded from the store cipher and the id-keyed rekey loops | Enrolled behind the password-only re-proof (WP-14); self-removable behind the full step-up (last-required-factor delete refused); `admin_reset_mfa` clears all; rp_id pinned at mint (origin migration → visibly "unusable") |
+| Store-at-rest cipher — in-process (`[store].cipher_provider = aesgcm`, default) | AES-256-GCM (`mfenc:v1:<key_id>:…`, additive AAD-bound `mfenc:v2`) in-process keyring cipher. **The shipped default is key-required, NOT keyless:** every built-in environment (`dev`/`staging`/`prod`) derives `data_class=phi` ([ADR 0148](../adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 1), and a PHI instance **refuses to start keyless** in *any* environment (the `serve` gate in [`__main__.py`](../../messagefoundry/__main__.py); `[store].require_encryption` forces the refusal even for a synthetic instance). The identity/plaintext cipher runs only on a **synthetic / non-PHI** instance (`data_class ≠ phi`, e.g. CI) or via the loud, audited `[store].allow_unencrypted_phi` opt-out (a second `[security].allow_unencrypted_phi_under_strict_enforcement` ack under strict enforcement). Covers the `_CIPHER_COLUMNS` set — `messages.raw`/`.summary`/`.metadata`/`.error`, `queue.payload`/`.last_error`, `message_events.detail`, `users.totp_secret`, `connection_event.reason`, `alert_instance.reason` (`summary`/`metadata` carry ingest-derived MRN/patient-name PHI); WebAuthn COSE public keys are deliberately excluded (verification material, not a secret). **Usage scope:** this DEK is the confidentiality key for the at-rest store columns above **only** — message bodies + ingest-derived MRN/patient-name PHI; it is **not** a transport, signing, or token key, is never used to verify a signature, and never leaves the engine host. | **Keyring:** active key `MEFOR_STORE_ENCRYPTION_KEY` (or DPAPI-protected `MEFOR_STORE_ENCRYPTION_KEY_FILE`) + decrypt-only `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`; `key_id` = SHA-256 fingerprint | **See key-management policy below** |
+| Vault Transit KeyProvider (opt-in, [ADR 0019](../adr/0019-pluggable-keyprovider-hsm-kms-vault.md)) | Envelope-unwraps the store DEK: Vault Transit `decrypt_data` returns the base64 32-byte DEK, decrypting the wrapped DEK (`vault:v1:…`) against a **non-extractable KEK held inside Vault**; only the wrapped DEK sits at rest. **Fail-closed** — any missing config or Transit/transport failure raises `KeyProviderError` and `serve` refuses to start (never degrades to the identity/plaintext cipher); key material is never logged (only the exception type). `hvac` in [`store/keyprovider_vault.py`](../../messagefoundry/store/keyprovider_vault.py). **Usage scope:** the Vault KEK **only** unwraps the store DEK inside Vault — it never encrypts store data directly and never leaves Vault; the DEK it yields protects exactly the at-rest store columns above, and no transport / signing / token material. | Env-sourced: `MEFOR_STORE_VAULT_ADDR` / `MEFOR_STORE_VAULT_TOKEN` / `MEFOR_STORE_VAULT_TRANSIT_KEY` / `MEFOR_STORE_VAULT_WRAPPED_DEK`; `hvac` behind the optional `[vault]` extra | **OFF by default** — `[store].key_provider` defaults to `auto` (env-then-DPAPI key sourcing for the in-process `aesgcm` cipher), not `vault` |
+| Store-at-rest cipher — Transit mode (`[store].cipher_provider = vault_transit`, opt-in, [ADR 0138](../adr/0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md)) | Bulk at-rest AEAD encrypt/decrypt runs **inside** Vault/OpenBao Transit — each value is stored as the `mfenc:v3:` marker + Transit's own `vault:v1:…` ciphertext, and the audit-chain MAC is computed **inside** Transit via `generate_hmac` (forgery-**resistant**, not keyless SHA-256). `TransitCipher` in [`store/crypto_transit.py`](../../messagefoundry/store/crypto_transit.py) imports **none** of the six stdlib crypto modules — every primitive is delegated over the Vault HTTP seam, so the plaintext DEK **never enters engine heap** (ASVS 13.3.3 isolated security module; 13.3.1's L3 hardware clause still wants the vault HSM-sealed). ASVS 11.3.3 cell-binding rides for free — `cell_aad(table, column, *pk)` is forwarded as Transit `associated_data`. **Fail-closed** — missing config or an unreachable/unknown Transit key raises `KeyProviderError` and `serve` refuses to start (never degrades to plaintext); a per-op Transit failure raises `CipherError`, surfacing only the exception **type**, never key material or PHI. **Usage scope:** the named Transit keys encrypt/decrypt **only** the at-rest store columns above (data key) and compute **only** the audit-chain MAC (audit key); they are Vault-resident, non-exportable, and protect no transport / signing / token material. | Env-named Transit keys `MEFOR_STORE_TRANSIT_KEY` (data) + optional `MEFOR_STORE_TRANSIT_AUDIT_KEY` (audit MAC; unset ⇒ reuses the data key), reached via `MEFOR_STORE_VAULT_ADDR` / `MEFOR_STORE_VAULT_TOKEN`; `hvac` behind the optional `[vault]` extra | **OFF by default** — `[store].cipher_provider` defaults to `aesgcm`; the key material stays inside Vault, so **roll the Transit key version in Vault** (prior versions still decrypt existing `mfenc:v3` rows) |
+| Audit chain | Row-hash chain (tamper-evident): **keyless SHA-256** in the default keyless posture, upgraded to **HMAC-SHA256** — keyed on an HKDF-SHA256-derived (`mefor/audit-chain/v1`) subkey of the store DEK — only when a store key is configured (#190), or on an isolated-module Transit MAC under `cipher_provider=vault_transit` (ADR 0138); both modes hash identical canonical bytes, so keyless deployments and legacy rows still verify. The digest primitive is `audit_row_hash` in `store/store.py` (`hashlib` + `hmac`), shared verbatim by all three backends. **Verification is constant-time and full-walk (ASVS 11.2.4):** `hmac.compare_digest` over `audit_mac_bytes` on every row MAC *and* on the external-anchor head, in `store/store.py`, `store/postgres.py` and `store/sqlserver.py` — the walk never returns early, so verify duration is a function of chain length, not of where a forgery sits (the first divergent row id is still named in the operator-facing result) | `audit_log.row_hash` | Append-only; verified by `messagefoundry audit-verify` |
+| Config fingerprint ([ADR 0041](../adr/0041-load-path-attestation-and-change-attribution.md)) | SHA-256 content digest of a loaded config bundle — path-relative Merkle fold over every loaded file (`*.py` incl `_*.py`, `connections.toml`, `codesets/*`, `environments/*.toml`); `hashlib` in `config/fingerprint.py` | Recorded in the `config_reload` audit detail (not stored as a secret) | Recomputed per reload/startup; binds reviewed-commit → loaded-bytes (integrity/attribution, not confidentiality) |
+| Engine wheel attestation ([ADR 0041](../adr/0041-load-path-attestation-and-change-attribution.md) D3) | SHA-256 over each **loaded** first-party `messagefoundry` module file, compared to the installed wheel's `*.dist-info/RECORD` baseline (a base64 `sha256=` manifest already in the wheel); `hashlib` in `integrity.py` | Drift recorded in the hash-chained `startup_integrity` audit row (not a secret); RECORD baseline read from site-packages metadata | Recomputed at startup + on demand; in-place-tamper tripwire (integrity, not confidentiality). Alert-only by default; `[integrity].fail_closed_on_drift` refuses to start on drift; no-op on an editable install |
+| Outbound message signing (opt-in) | Detached JWS (RFC 7515) — RS256/PS256 (RSA) or ES256 (ECDSA P-256), SHA-256; `cryptography` in `transports/signing.py` (ASVS 4.1.5, [ADR 0018](../adr/0018-per-message-signatures-accepted-risk.md)) | Operator-supplied PEM **private** signing key per connection (inline via `env()` or a PEM file path; encrypted-key passphrase via `env()`); the **public** key is shared with the partner out-of-band. **Usage scope:** this private key **only** signs this connection's outbound per-message JWS — a message-**authenticity/integrity** key in transit; it is never used for at-rest encryption or session/token material, and the partner holds only the matching **public** verification half | **OFF by default**; per-connection opt-in. `kid` carried in the JWS header so key rotation / a managed provider ([ADR 0019](../adr/0019-pluggable-keyprovider-hsm-kms-vault.md)) slots in without a wire change |
+| DIRECT S/MIME (opt-in, [ADR 0085](../adr/0085-direct-hisp-smime-connector.md)) | CMS **sign-then-encrypt** in `transports/direct.py` (core `cryptography` `serialization.pkcs7`): PKCS#7 signature over the body with a **SHA-256** digest, the public-key signature algorithm (RSA / ECDSA) following the loaded signing key type (not pinned to RSA), then a PKCS#7 **envelope** to the partner's recipient cert. The envelope content-encryption cipher is the **`cryptography` pkcs7 library default** — no algorithm is pinned in code | Sender **signing cert** + PEM **private key** (optional `signing_key_password`) and the per-partner **`recipient_cert`**, all operator-supplied files; the recipient cert is trust-verified at construction against an operator `trust_anchor` (one-level direct-issuance check); key/cert mismatch refused. **Usage scope:** the sender signing key signs the CMS body and the partner's `recipient_cert` encrypts the CMS envelope — this material protects the **confidentiality + authenticity of a DIRECT message to one partner in transit**; it is not an at-rest store key and encrypts nothing in the store | **OFF by default** — only when a DIRECT Connection is configured, and its HISP relay host is gated by the **opt-in** `[egress].allowed_direct` allow-list (empty by default = unrestricted; an unlisted host is refused only once the list is populated, or outright when `[egress].deny_by_default` is set). Signing key + recipient certs rotate on the schedule below |
+| OIDC IdP JWKS verification keys (opt-in, [ADR 0142](../adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)) | **Public** verifying keys fetched from the IdP JWKS: **RS256/PS256** (RSA, ≥ 2048-bit floor) and **ES256/ES384** (EC P-256/P-384) — rebuilt from each JWK by `cryptography` in [`auth/oidc/jwks.py`](../../messagefoundry/auth/oidc/jwks.py); the closed `SignatureAlgorithm` enum forecloses `alg:none` and RS256→HS256 confusion. Bounded, TTL-cached (`DEFAULT_JWKS_TTL_SECONDS`), a 512 KiB body cap, a global min-refetch floor (fetch-amplification bound), and a hard refusal of a duplicate `kid`; a key below the floor is skipped/refused, never merely warned. **Usage scope:** these are **public**, non-secret keys used **only** to verify the IdP's id-token signature at console login — they encrypt nothing and can protect no data; the engine holds no private half. | Fetched from the IdP JWKS URI over the CA-pinned no-redirect opener (row below); held process-local in `JwksCache`, never persisted, never logged | Refetched per TTL / on an unknown `kid` within the amplification bound; rolls when the IdP rotates its signing keys |
+| OIDC IdP TLS trust anchor (`[auth].oidc_tls_ca_cert_file`, opt-in, [ADR 0142](../adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)) | Pins the CA that must anchor the IdP's TLS server cert on **both** federated-SSO legs (JWKS fetch + token endpoint) — the hardened, no-redirect `ssl` opener in [`auth/oidc_http.py`](../../messagefoundry/auth/oidc_http.py) (mirrors `ad_tls_ca_cert_file`); unset ⇒ the OS trust store via `truststore`. No insecure/`verify=False` escape exists — the IdP hop carries an authentication assertion. **Usage scope:** a **trust anchor**, not a key the engine holds — it authenticates the IdP endpoint's TLS identity only; it signs and encrypts nothing and protects no at-rest data. | Operator-supplied CA PEM path (`[auth].oidc_tls_ca_cert_file`) or the OS trust store | Managed by the operator / OS trust store; rotate on IdP CA change |
+| AD transport | LDAPS (TLS) with `CERT_REQUIRED` by default; optional internal CA via `ad_tls_ca_cert_file` | OS / configured CA trust | Managed by the directory / OS trust store |
+| SQL Server transport | TLS via ODBC Driver 18 (`Encrypt=yes`, `TrustServerCertificate=no` by default) | Server certificate | Managed by SQL Server / OS trust store |
+| Console → engine TLS (remote console) | Verifies the engine API server cert: **OS trust store** by default (`truststore.SSLContext`) or a pinned PEM via `--cacert` (`ssl.create_default_context`); opt-in client cert (mTLS) via `load_cert_chain`; `ssl` in `apiclient/client.py` (CONSOLE-3; extracted from `console/client.py` per ADR 0088) | OS trust store / operator-supplied CA PEM (`--cacert`) | Managed by the OS trust store; `--cacert` for a self-signed / internal-CA engine |
+| Tray → engine TLS (local status probe, [ADR 0113](../adr/0113-windows-tray-service-manager-stdlib-ctypes-tokenless.md) 2026-07-22 amendment) | Verifies the engine API server cert on the tray's **tokenless** `/health` + `/ui` probes when `[api].tls_cert_file` makes the loopback bind serve https: **OS trust store only** (`truststore.SSLContext`); `ssl` in `tray/probe.py`. **No pinned-PEM option and no `verify=False` escape** — an AST test in `tests/test_tray_probe.py` freezes that | Windows machine trust store (an internal-CA/AD-CS cert verifies as-is; a self-signed engine cert is installed under Trusted Root) | Managed by the OS trust store; a verification failure renders the engine `DOWN`, never an unverified connection |
+| Cert tooling — `.pfx` import / read-only inventory / self-signed dev cert (BACKLOG #71/#72) | `cryptography` in [`pki.py`](../../messagefoundry/pki.py) — the single PKI call site for the `cert` CLI group: PKCS#12/.pfx import (`pkcs12.load_key_and_certificates`) writes the leaf cert + private key + CA chain to the PEM files the TLS loaders already read; a **read-only** inventory reads only **public** cert facts (subject/issuer/notAfter/SAN/days) via `x509`; `make_self_signed` mints an **EC P-256 / SHA-256** self-signed cert for **non-prod** bring-up. `pipeline/cert_expiry.py` shares this module's `read_cert_facts` (so it no longer imports `cryptography` itself). **Usage scope:** an operator CLI utility — it imports/serializes/inspects operator-supplied cert material and mints throwaway dev certs; it holds no long-lived engine key, signs no message, and encrypts nothing at rest. The imported/minted **private-key** PEM is written `O_EXCL` + `0o600` + the `_secure_file` DACL; the `.pfx` passphrase is env-only (`MEFOR_PFX_PASSWORD`), never a CLI arg, never logged/echoed/put in an exception | Operator-supplied `.pfx` bundle → cert/key/CA PEM files on disk (`--out-dir`) | Managed by the operator / PKI; self-signed dev certs are disposable (default 365-day validity) |
+| Engine-shard lane ownership ([ADR 0073](../adr/0073-ownership-scoped-recovery-single-consumer-lanes.md)) | Rendezvous (HRW) hash — SHA-256 (`hashlib` in `pipeline/sharding.py`) over `destination + shard id`, picking each outbound lane's single delivering shard. A stable, process-independent hash is required (the salted builtin `hash()` would let two shards disagree on an owner); deterministic placement, **not** a security control | No key material — pure function of config names | Recomputed per process from the loaded config; changes only with the shard universe (coordinated fleet restart) |
+
+### Store-key management policy (NIST SP 800-57 alignment)
+
+- **Generation** — mint with `messagefoundry gen-key` (32 bytes from `os.urandom`); supply via
+  `MEFOR_STORE_ENCRYPTION_KEY`, **never** the TOML file.
+- **Storage / access** — environment only; the process account is the trust boundary. Restrict the
+  data-volume and service account (see [SERVICE.md](../SERVICE.md)); volume encryption
+  (BitLocker/LUKS) is the required at-rest layer for the columns outside the cipher.
+- **Rotation / retirement** — **built (WP-5, ASVS 11.2.2).** Each ciphertext is self-identifying via
+  its `key_id` (SHA-256 fingerprint), so multiple keys coexist: set the new key as
+  `MEFOR_STORE_ENCRYPTION_KEY`, move the prior one to `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`
+  (decrypt-only), then run **`messagefoundry rotate-key`** to re-encrypt every ciphered value under the
+  active key (`reencrypt_to_active`); legacy `key_id='0'` rows are covered by a try-all fallback. Still
+  **escrow** every active + retired key (losing a key strands the rows last written under it). Rotation
+  *cadence* is in the schedule below (13.1.4).
+- **Destruction** — destroying the key cryptographically erases the ciphered columns, now **including**
+  `summary` / `metadata` (MRN / patient-name), which EF-3 routes through the cipher **when keyed** like
+  `raw`. The residual outside the seam is the routing/dedup/index metadata (message IDs, timestamps,
+  connection labels) — never a body — which relies on volume encryption (accepted residual — see
+  [PHI.md §3](../PHI.md#3-encryption-at-rest)).
+
+### Rotation schedule (ASVS 13.1.4 / 13.3.4)
+
+A rotation cadence per critical secret, justified against the threat model + HIPAA. These are
+**operator-policy defaults** — the engine does **not** force-rotate or hard-expire a secret (rotation
+*execution* stays operator- / secret-manager-driven, by design). It **does** now **monitor** the cadence
+(ASVS 13.3.4, BACKLOG #282): the store DEK is tracked live-by-default and every configured secret class
+the engine holds is fingerprinted with a **DEK-derived keyed MAC** in store meta, so a **rotation is
+auto-detected** (the fingerprint changes → the clock resets) and a `secret_rotation_due` alert fires
+against the cadence below — never operator-attested, and carrying only dates + a one-way MAC, never a
+value. Under `[security].enforcement=ENFORCE` a DEK past its max-age + grace **escalates** at restart.
+
+| Secret (env var / connector setting) | Suggested cadence | Trigger / notes |
+|---|---|---|
+| Store encryption key — `MEFOR_STORE_ENCRYPTION_KEY` (or DPAPI `MEFOR_STORE_ENCRYPTION_KEY_FILE`); decrypt-only retired window `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` | At **2^31 cumulative encrypts (alerted)** or **annually**, whichever comes first — **or** on suspected compromise / operator departure | `rotate-key`; keep the prior key in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` until re-encrypt completes. A flat annual cadence is **not** sufficient on its own: at the assessed ~600 ev/s with ~6 ciphered writes per message a single key crosses the 2^32 AES-GCM birthday ceiling in ~14 days, ~26x faster than yearly. The engine now enforces this rather than assuming it — a **persisted per-`key_id` invocation count** (`cipher_meta`, aggregated across every process on the one unified store) raises a routable `gcm_invocations` alert at 2^31 and **fails closed** at 2^32 (ASVS 11.3.4). Rotating mints a new `key_id`, whose count starts at zero |
+| Store-DB / AD-bind / SMTP-alert passwords — `MEFOR_STORE_PASSWORD` / `MEFOR_AUTH_AD_BIND_PASSWORD` / `MEFOR_ALERTS_EMAIL_PASSWORD` | Per org policy (≤ 1 yr); prefer **gMSA / managed identity** to retire the static secret entirely | Rotate at the directory / DB / SMTP, then update the env var (all three are `settings._FILE_SECRET_KEYS` — env-only, never the config file) |
+| AI engine-broker credential — `MEFOR_AI_API_KEY` (ADR 0135) | Per provider / org policy; on compromise | The LLM API key; env-only + `/metadata`-redacted. Rotate at the provider, then update the env var |
+| Federated OIDC client secret — `MEFOR_AUTH_OIDC_CLIENT_SECRET` (or a `[secrets].provider` reference `oidc_client_secret_ref`) (ADR 0142) | Per IdP / org policy; on compromise | The confidential-client secret for the console's OIDC relying party; env-only (`_FILE_SECRET_KEYS`), never logged, never the config file. Rotate the client credential at the IdP, then update the env var / provider secret |
+| TLS server key/cert + encrypted-key passphrase — PEM key/cert files + `MEFOR_API_TLS_KEY_PASSWORD` (off-loopback API/MLLP/DICOM) | Before certificate expiry; passphrase on compromise; on CA change | Managed by the chosen terminator / PKI; the encrypted-key passphrase is env-sourced |
+| PKCS#12 import passphrase — `MEFOR_PFX_PASSWORD` (`cert import`, BACKLOG #71) | N/A — supplied per invocation, never stored | A **transient** operator passphrase read once to decrypt a `.pfx` the operator is importing; the engine never persists, fingerprints, or rotates it (it is **not** in `settings._FILE_SECRET_KEYS` and the rotation watcher does not track it), so there is no cadence. It is never placed on argv or echoed; rotate the `.pfx` / its passphrase at the source PKI |
+| Vault access token — `MEFOR_STORE_VAULT_TOKEN` (store-DEK provider) + `MEFOR_SECRETS_VAULT_TOKEN` (connector-secret KV provider) | Per Vault policy / lease; on compromise | **Two** distinct env names; rotate at Vault, then update the env var |
+| Vault Transit key names — `MEFOR_STORE_VAULT_TRANSIT_KEY` (KEK, ADR 0019) and `MEFOR_STORE_TRANSIT_KEY` + `MEFOR_STORE_TRANSIT_AUDIT_KEY` (`vault_transit` data + audit keys, ADR 0138) | Per crypto-key policy; roll **inside Vault** as Transit key versions | These env vars **name** the Transit keys; the key material never leaves Vault — roll the Transit key version in Vault (prior versions still decrypt existing rows) |
+| Connector credentials (per-Connection, `env()`-sourced + `/metadata`-redacted) — `password` / `basic_password` / `bearer_token` / `proxy_password` (REST/FHIR/SOAP/DICOMweb/DB/SMTP/relay/FTP); `oauth2_client_secret` / `http_auth_password` (OAuth2 / Digest); `tls_key_password` / `client_key_password` / `key_password` (MLLP/DICOM/FTPS/SFTP key passphrases); `signing_key_password` (DIRECT S/MIME) + per-partner `recipient_cert`; `private_key_password` (per-message JWS, ADR 0018); `smart_private_key_password` (SMART, ADR 0024); `ws_password` (SOAP WS-Security); `body_secret_value` / `body_secret_value_<i>` (SOAP) | Per partner / org policy; on compromise; certs before expiry / on partner CA change | Rotate at the IdP / endpoint / partner, then update the `env()` value for this environment. File-based key/cert material (`signing_key` / `recipient_cert` / `trust_anchor`, JWS PEM) is replaced on disk; the `body_secret_tokens` placeholders stay public |
+| Per-message JWS signing key — `private_key` (PEM key material; paired passphrase `private_key_password`, ADR 0018) | Annually, **or** on suspected compromise; before the published JWK / cert expires | Signs outbound message payloads for authenticity — a leaked key lets an attacker forge signed messages. Replace the PEM in the secret store, publish the new public JWK, then update `private_key_password` |
+| SMART Backend Services signing key — `smart_private_key` (PEM key material; paired passphrase `smart_private_key_password`, ADR 0024) | Per FHIR-server registration / org policy; on compromise | Signs the SMART client-assertion JWT — a leaked key lets an attacker mint access tokens as this client. Re-register the new key at the FHIR server, replace the PEM, then update `smart_private_key_password` |
+| Generic connector API key — `api_key` (`env()`-sourced + `/metadata`-redacted) | Per provider / partner policy; on compromise | Static API credential presented to a partner endpoint; rotate at the endpoint, then update the `env()` value for this environment |
+| Generic connector token — `token` (`env()`-sourced + `/metadata`-redacted; distinct from `bearer_token`) | Per provider / partner policy; on compromise | Static token credential presented to a partner endpoint; rotate at the endpoint, then update the `env()` value for this environment |
+| File-endpoint UNC-share / Windows alternate credential — `credential_password` (`env()`-sourced + `/metadata`-redacted, ADR 0132) | Per org / directory policy (≤ 1 yr); on compromise / operator departure | Alternate Windows/AD account used to reach a SMB/UNC share; rotate the account password at the directory, then update the `env()` value. The paired `credential_username` is a non-rotatable identifier, not a secret |
+| Off-box log-forward mTLS client cert — `[logging].forward_tls_client_cert` (single combined PEM cert+key chain, ADR 0080) | Before certificate expiry; on compromise / collector-CA change | Optional mutual-TLS client credential to the syslog/SIEM collector; **one** PEM file carries the cert **and** its private key — there is **no** separate key or passphrase setting. Replace the PEM on disk |
+| Session tokens | Automatic — idle 30 min / absolute 12 h | Not operator-rotated; revoked on logout / password-change / disable |
+
+> **Critical secrets (13.1.4).** The engine's critical secrets — every value whose disclosure would break
+> at-rest confidentiality, transport authentication, or message authenticity — are enumerated in full in the
+> table above: the **store encryption key** (`MEFOR_STORE_ENCRYPTION_KEY`, its DPAPI
+> `MEFOR_STORE_ENCRYPTION_KEY_FILE`, and decrypt-only `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`); the
+> **store-DB / AD-bind / SMTP-alert passwords** (`MEFOR_STORE_PASSWORD` / `MEFOR_AUTH_AD_BIND_PASSWORD` /
+> `MEFOR_ALERTS_EMAIL_PASSWORD`); the **AI engine-broker credential** (`MEFOR_AI_API_KEY`); the **off-loopback
+> TLS key passphrase** (`MEFOR_API_TLS_KEY_PASSWORD`); the **two Vault access tokens**
+> (`MEFOR_STORE_VAULT_TOKEN` / `MEFOR_SECRETS_VAULT_TOKEN`) and the **Vault Transit key names**
+> (`MEFOR_STORE_VAULT_TRANSIT_KEY`, `MEFOR_STORE_TRANSIT_KEY`, `MEFOR_STORE_TRANSIT_AUDIT_KEY` — the key
+> material stays inside Vault); and the per-Connection **connector credentials** (`password` /
+> `basic_password` / `bearer_token` / `api_key` / `token` / `proxy_password` / `oauth2_client_secret` /
+> `http_auth_password` / `tls_key_password` / `client_key_password` / `key_password` / `signing_key_password` /
+> `private_key` + `private_key_password` / `smart_private_key` + `smart_private_key_password` /
+> `credential_password` / `ws_password` / `body_secret_value_<i>`), plus the off-box log-forward mTLS client
+> cert (`[logging].forward_tls_client_cert`, a single combined PEM). Each secret **value** is
+> **`env()`-sourced — never the config file (the fixed `MEFOR_*` set is enforced by
+> `settings._FILE_SECRET_KEYS`) — and `/metadata` viewer-redacted**. Rotation *execution* stays operator-
+> / secret-manager-driven — the engine never force-rotates or hard-expires a secret (session tokens are the
+> one engine-expired credential) — but it now **monitors** the cadence and **auto-detects** a rotation
+> (ASVS 13.3.4 — see the rotation-watcher note below). **This enumeration is drift-guarded by
+> `tests/test_secret_rotation_inventory.py`**, which fails the build when a new `MEFOR_*` secret name (`…_TOKEN` / `…_SECRET` / `…_PASSWORD` /
+> `…_KEY`) appears in `messagefoundry/` without a row here — the exact 2026-07-16 regression that put this cell
+> back to Partial.
+
+> **Rotation watcher (13.3.4 — built).** `pipeline/secret_rotation.py`'s `SecretRotationRunner`, armed at
+> engine start by `reconcile_rotation_meta`, closes the *detect-and-remind* side of 13.3.4 (force-rotation
+> stays operator-driven by design):
+> - **Live-by-default DEK.** At first keyed start a **non-secret** stamp — the DEK's one-way key-id + an
+>   ISO *tracked-since* date — is persisted in store meta (`secret_rotation_meta`), so the DEK is watched
+>   without an operator setting `[secret_rotation].store_key_last_rotated` (which stays an override).
+>   `messagefoundry rotate-key` re-stamps it, and a changed key-id is auto-detected on the next start.
+> - **Widened enumeration.** Every configured secret class the engine holds (store-DB / AD / SMTP
+>   passwords, both Vault tokens, the OIDC client secret, the TLS key passphrase, connector `env()` creds)
+>   is fingerprinted with a **DEK-derived keyed MAC** (`store/crypto.py rotation_fingerprint_key`, HKDF) —
+>   a keyed MAC, **never a salted hash**, so a low-entropy AD/SMTP password's fingerprint is not offline-
+>   guessable. A changed fingerprint resets the clock (rotation auto-detected, never operator-attested);
+>   a value is read only to MAC it, never persisted or logged (dates + one-way MAC only — no PHI). The
+>   per-Connection `env()` credentials are not engine-global env vars, so they are resolved from the **live
+>   graph** at start (`wiring.connector_secret_env_values` over every wired Connection's rotatable
+>   credential settings — the `_SECRET_SETTING_KEYS` set minus the non-rotatable username identifiers) and
+>   passed to `reconcile_rotation_meta` as `extra_values`, riding the identical keyed-MAC mechanism; each is
+>   keyed by its operator-chosen env-value name (shared names collapse to one rotation clock).
+> - **Tracked-since is an age FLOOR.** On upgrade, a pre-existing (possibly year-old) key gets a **fresh**
+>   clock — it does **not** retroactively alert. The stamp records when tracking began, not the key's age.
+> - **ENFORCE escalation (committed).** Under `[security].enforcement=ENFORCE`, a DEK older than
+>   `store_key_max_age_days + enforce_grace_days` escalates its `secret_rotation_due` alert (`enforced`,
+>   logged at ERROR) at restart.
+> - **Review cadence.** This section + the keyed-secret enumeration are reviewed **quarterly** and on any
+>   new `[store].cipher_provider` / `CRITICAL_SECRETS` change, tied to the drift guard above +
+>   `scripts/security/crypto_inventory_check.py` so the definition cannot silently rot.
+>
+> *Backend note:* the store-meta persistence rides the narrow `SecretRotationMetaStore` slice, implemented
+> by all three shipped backends (SQLite, SQL Server, Postgres) since #1186 — so the reconcile persists and
+> runs on each; a backend that did not implement it would degrade to the operator-configured dates without
+> persistence — never an error.
+
+### TLS key-exchange & cipher posture (ASVS 11.6.2)
+
+For the off-loopback transports the TLS floor is **1.2+** (`tls_min_version`), which constrains key
+exchange to forward-secret **(EC)DHE** suites. The **code-half is now built** (WP-L3-10 free lift):
+[config/tls_policy.py](../../messagefoundry/config/tls_policy.py) pins the approved key-exchange groups
+(`X25519:secp384r1:secp256r1` via `SSLContext.set_groups` on Python ≥3.13; OpenSSL already defaults to
+these on 3.11/3.12) on every built API + MLLP TLS context (`harden_kex_groups`), and a `[api].tls_ciphers`
+settings validator (`validate_tls_ciphers`) rejects any non-forward-secret (static-RSA/DH) operator
+cipher string at config load. On the default `127.0.0.1` bind no TLS is presented, so this is immaterial
+today; the controls take effect once the engine terminates TLS off-loopback.
+
+### Cryptographic migration & agility (ASVS 11.1.4 — incl. post-quantum)
+
+The crypto surface is **versioned and seam'd** so an algorithm change is a localized, low-risk
+operation rather than a rewrite. Each row below is a migration item with an **agility mechanism** (how
+the swap happens without a wire/format break), a **dated milestone**, and a **named owner** — so no
+item is milestone-less or owner-less (the ASVS 11.1.4 residual). Owners are role DRIs (a solo
+maintainer wears every hat today; the label fixes accountability, not headcount).
+
+| Crypto surface | Agility mechanism (swap without a rewrite) | Milestone (trigger · review) | Owner |
+|---|---|---|---|
+| At-rest cipher envelope (`aesgcm`) | `mfenc:v1`/`v2` is explicitly versioned behind the `Cipher` `Protocol` (`store/crypto.py`); an additive `mfenc:v4` PQC-hybrid wrap would be new-writes-only while the keyring/try-all path keeps decrypting v1/v2 and `rotate-key` migrates rows forward | Trigger: ML-KEM (FIPS 203) exposed in `cryptography` + a harvest-now-decrypt-later risk decision · **review 2027-01** (annual) | store-crypto maintainer |
+| Vault Transit at-rest (`vault_transit`) | Bulk crypto runs inside Vault, so a PQC data key is a **Transit key-type change in Vault** with no engine code change; existing `mfenc:v3` blobs re-key via `rotate-key` | Trigger: OpenBao/Vault Transit ships a PQC key type · **review 2027-01** | store-crypto maintainer |
+| Password hashing | argon2id `needs_rehash`-on-login upgrades params or the primitive transparently on next sign-in | Trigger: OWASP/NIST password-hash guidance change · **review 2027-01** | auth maintainer |
+| Hashing / signing chokepoints | SHA-256 (session-token storage, audit chain, integrity digests) → a longer digest / SHA-3 is a one-line primitive swap per chokepoint; the audit chain re-anchors from the swap point | Trigger: a SHA-2 deprecation signal · **review 2027-01** | store-crypto maintainer |
+| Transport TLS → hybrid-KEM | Adopt X25519 + ML-KEM once stdlib `ssl` / platform OpenSSL ship it and add it to the pinned group/cipher policy (WP-L3-10); immaterial on the default loopback bind | Trigger: platform OpenSSL hybrid-KEM support · **track 2026-H2, review 2027-01** | transport/TLS maintainer |
+| WebAuthn COSE public keys (at rest) | Verification material via the `webauthn` library + a registered algorithm allow-list; a PQC COSE alg is an allow-list addition once authenticators + the library ship it | Trigger: FIDO2/WebAuthn PQC alg support in the `[webauthn]` extra · **review 2027-01** | auth/WebAuthn maintainer |
+| OIDC RP id-token verification | Cached IdP verifying keys behind the closed `SignatureAlgorithm` enum + the JWKS floor (`auth/oidc/jwks.py`); a PQC JOSE alg is an enum addition once IdPs issue it | Trigger: JOSE PQC signature standardization + IdP issuance · **review 2027-01** | auth/federation maintainer |
+| Per-message JWS (RS256/PS256/ES256) | `kid`-carried key rotation + the KeyProvider seam (`transports/signing.py`); a PQC JOSE signature alg is added additively per connection | Trigger: a JOSE PQC signature RFC + partner support · **review 2027-01** | transport/signing maintainer |
+| DIRECT S/MIME (CMS) | CMS sign-then-encrypt (`transports/direct.py`); migrate the envelope to CMS `KEMRecipientInfo` (RFC 9629) with ML-KEM + a PQC signature — cross-ref **11.3.1** | Trigger: `cryptography` CMS `KEMRecipientInfo`/ML-KEM support + partner readiness · **review 2027-01** | DIRECT/S-MIME maintainer |
+
+**PQC posture.** Monitor NIST PQC (FIPS 203/204/205). The engine **does** hold classical-public-key
+material at rest — WebAuthn COSE public keys, and (when OIDC federation is enabled) cached IdP id-token
+verifying keys — but these are **public verification** keys: a quantum break of them discloses no stored
+PHI (a forger would still need the authenticator's / IdP's private key), and sessions remain opaque
+server-side tokens, **not** signed JWTs. The confidentiality-relevant PQC surfaces are therefore
+(1) **at-rest data encryption** (harvest-now-decrypt-later) — the additive `mfenc:v4` PQC-hybrid wrap
+path above — and (2) **hybrid-KEM TLS** once the engine terminates TLS off-loopback; both are gated on
+platform/library support and tracked in the table.
+
+**Review cadence.** This migration plan and the whole §4 inventory are reviewed **at least annually**
+(next: **2027-01**) and on any crypto-dependency, algorithm, or key-source change. Drift is caught by
+[`tests/test_crypto_inventory_doc.py`](../../tests/test_crypto_inventory_doc.py) — the §4 truth-guard:
+every `[store].cipher_provider` value stays documented, the retired plaintext-by-default cipher claim
+cannot reappear, and every migration row keeps a dated milestone + a named owner — and by
+`scripts/security/crypto_inventory_check.py` (the ASVS 11.1.3 crypto-call-site gate). So this section
+cannot silently rot.
+
+---
+
+## 5. Communications inventory (ASVS 13.1.1)
+
+**Every** interface over which this engine communicates, with its direction, transport (and default
+port), TLS posture, authentication, and whether the peer/target address is supplied by the operator
+("the end user provides an external location **such as a URL for a callback**" — the OIDC
+authorization endpoint and its authorization-code callback are the literal instance of that clause,
+and have their own §5.3 row). The inventory is split into three sub-sections so it
+can be read — and drift-checked — per plane:
+
+* **§5.1 Message-plane connectors** — the registered `ConnectorType`s a Connection is built from.
+* **§5.2 Control-plane listeners** — the engine's own API / console sockets and the segment in front of them.
+* **§5.3 Infrastructure hops** — everything the engine itself dials that is not a Connection.
+
+`tests/test_communications_inventory.py` is the CI drift guard: §5.1 is enumerated from the live
+connector registry (a new `transports/` module with no row here fails the build) and §5.2/§5.3 are
+checked against a curated hop registry, because infrastructure clients live in no registry. Per-hop
+**concurrency limits, behaviour at the limit, timeouts, release and retry posture** are the sibling
+tables in [`../CONNECTIONS.md`](../CONNECTIONS.md) §"Resource management & limits" (ASVS 13.1.2/13.1.3).
+
+### 5.1 Message-plane connectors
+
+| Interface (`ConnectorType`) | Direction | Transport + default port | TLS posture | Auth | Target operator-supplied? | Settings keys |
+|---|---|---|---|---|---|---|
+| MLLP listener (`mllp`) | inbound | TCP; port authored per connection (no default), bound to `[inbound].bind_host` (default `127.0.0.1`), overridable per connection by `bind_address` | opt-in per-connection TLS (`tls`, TLS 1.2+ floor) with opt-in mTLS via `tls_ca_file`; default loopback plaintext; a **non-loopback cleartext listener is refused at start** unless `serve --allow-insecure-bind` — and that flag is **CLAMPED** on a production-PHI instance, where the per-connection `tls_hop_attested` is the only per-hop opt-in | network trust + optional per-connection `source_ip_allowlist` (CIDR peer gate, refused at accept) + HL7 ACK/NAK | bind host is `[inbound].bind_host`; the peer dials in | `MLLP(port, max_connections, receive_timeout, max_frame_bytes, tls*)`, `[inbound].bind_host`, `bind_address`, `tls_hop_attested`, `[inbound].source_ip_allowlist` |
+| MLLP destination (`mllp`) | outbound | TCP to `host:port` (no default port) | opt-in TLS (`tls`); `tls_verify` and `tls_check_hostname` default true; `tls_cert_file`/`tls_key_file` are the CLIENT cert (mTLS) | network trust plus the optional client cert; the partner's HL7 ACK is read back | **yes** — `host`/`port` per Connection | `MLLP(host, port, connect_timeout, timeout_seconds, persistent, idle_timeout_seconds)`, `[egress].allowed_mllp` |
+| Raw TCP endpoint (`tcp`) | inbound + outbound | TCP with configurable delimiter framing; port per connection (no default); the inbound bind is `[inbound].bind_host`, overridable per connection by `bind_address` | none on this connector — wrap it in a TLS terminator or use MLLP/HTTP if the hop needs TLS. A **non-loopback cleartext listener is refused at start** unless `serve --allow-insecure-bind` (CLAMPED on production-PHI; `tls_hop_attested` is the per-hop opt-in) | network trust + `source_ip_allowlist` (inbound) | **yes** — `host`/`port` per Connection (outbound); bind is `[inbound].bind_host` | `Tcp(host, port, framing, max_connections, receive_timeout, connect_timeout, timeout_seconds)`, `[inbound].bind_host`, `bind_address`, `tls_hop_attested`, `[egress].allowed_tcp` |
+| X12 EDI endpoint (`x12`) | inbound + outbound | raw TCP, ISA/IEA-framed (ADR 0012); port per connection (no default); the inbound bind is `[inbound].bind_host`, overridable per connection by `bind_address` | none on this connector; the same **non-loopback cleartext start refusal** applies (`serve --allow-insecure-bind`, CLAMPED on production-PHI; `tls_hop_attested` per hop) | network trust + `source_ip_allowlist` (inbound) | **yes** — `host`/`port` per Connection (outbound); bind is `[inbound].bind_host` | `X12(host, port, max_connections, receive_timeout, max_interchange_bytes, connect_timeout, timeout_seconds)`, `[inbound].bind_host`, `bind_address`, `tls_hop_attested`, `[egress].allowed_tcp` |
+| Web-service listener (`http`) | inbound | HTTP/1.1 (ADR 0023); port per connection, bound to `[inbound].bind_host`, overridable per connection by `bind_address` | opt-in per-connection TLS with opt-in mTLS via `tls_ca_file`; a **non-loopback cleartext listener is refused at start** unless `serve --allow-insecure-bind` | network trust + optional `source_ip_allowlist` | bind host is `[inbound].bind_host`; the partner dials in | `Http(port, max_connections, receive_timeout, max_body_bytes, max_header_bytes, tls*)`, `[inbound].bind_host`, `bind_address`, `tls_hop_attested` |
+| File endpoint — local filesystem (`file`) | inbound + outbound | **no network socket** — a local directory | n/a | filesystem ACLs under the engine's own service account | **yes** — `directory` per Connection | `File(directory, pattern, poll_seconds, min_age_seconds, max_file_bytes, after_read)`, `[egress].allowed_file_dirs` |
+| File endpoint — UNC / SMB share (`file`) | inbound + outbound | **SMB/CIFS over TCP**, addressed by the UNC path (the OS redirector owns the port) | session security is the SMB dialect's, negotiated by the OS; the engine sets none | alternate Windows identity: `credential_username` / `credential_domain` / `credential_password` (an `env()`-only secret) driving `LogonUserW` + impersonation on a dedicated thread — Win32-only (ADR 0132) | **yes** — the UNC `directory` per Connection | `File(directory, credential_username, credential_domain, credential_password)`, `[egress].allowed_file_dirs` |
+| SFTP source + destination (`remotefile`) | inbound + outbound | SSH over TCP, **default port 22** | SSH host-key verification with paramiko `RejectPolicy` by default (`AutoAddPolicy` only under `MEFOR_ALLOW_INSECURE_TLS`, logged) | `username` + `password` and/or `private_key` (+ `key_password`); agent and default-key lookup are both disabled | **yes** — `host`/`port` per Connection | `Sftp(host, port, username, password, private_key, known_hosts)`, `[egress].allowed_remote`. **No timeout argument is exposed** — the 30 s hard-coded module fallback in `transports/remotefile.py` is passed to `paramiko.SSHClient.connect(timeout=…)`, which bounds the **TCP connect only**; the SSH banner and auth legs ride paramiko's own defaults (the engine sets neither `banner_timeout` nor `auth_timeout`) and the SFTP channel read/write has **no timeout at all**. Not operator-configurable |
+| FTP / FTPS source + destination (`remotefile`) | inbound + outbound | TCP, **default port 21** | `tls=true` selects FTPS (explicit TLS with a verifying context, plus `PROT P` so the DATA channel is encrypted too); plain FTP carrying credentials is refused unless `MEFOR_ALLOW_INSECURE_TLS` | `username` + `password` | **yes** — `host`/`port` per Connection | `Ftp(host, port, tls, tls_allow_expired, username, password)`, `[egress].allowed_remote`. **No timeout argument is exposed** — the same hard-coded 30 s module fallback, here a genuine **whole-socket** timeout: it is handed to `ftplib.FTP_TLS(timeout=…)` / `ftplib.FTP(timeout=…)`, which sets it on the control **and** data connections |
+| REST destination (`rest`) | outbound | HTTP/HTTPS; port from the URL | TLS verified by default (`verify_tls`); redirects are **never** followed | OAuth2 client-credentials bearer, static bearer, HTTP Basic, or HTTP Digest (RFC 7616); a cleartext-`http` credential hop is posture-keyed and refused on prod-PHI off-box | **yes** — `url` per Connection | `Rest(url, method, timeout_seconds, verify_tls, bearer_token, basic_user, proxy*)`, `[egress].allowed_http` |
+| SOAP destination (`soap`) | outbound | HTTP/HTTPS; port from the URL | same verifying no-redirect opener as REST | bearer / HTTP Basic / WS-Security UsernameToken / client-cert mTLS; `body_secrets` inject an `env()` secret into the SOAP Body at send time | **yes** — `url` per Connection | `Soap(url, soap_action, soap_version, timeout_seconds, verify_tls)`, `[egress].allowed_http` |
+| FHIR destination and `fhir_lookup` read client (`fhir`) | outbound | HTTPS; port from the base URL | same verifying no-redirect opener | static bearer / HTTP Basic / SMART Backend Services bearer; `fhir_lookup` is structurally GET-only (ADR 0043) | **yes** — `url` per Connection / per lookup | `FHIR(url, fhir_version, interaction, timeout_seconds)`, `FhirLookup(name, url, timeout_seconds)`, `[egress].allowed_http` |
+| DICOMweb STOW-RS destination (`dicomweb`) | outbound | HTTPS; port from the base URL (ADR 0025 Phase 2) | `verify_tls` default true (false needs `MEFOR_ALLOW_INSECURE_TLS`) | static bearer or HTTP Basic | **yes** — `url` per Connection | `DICOMweb(url, study_uid, timeout_seconds, verify_tls)`, `[egress].allowed_http` |
+| DICOM C-STORE SCP (`dimse`) | inbound | DICOM upper layer over TCP, **default port 104**, bound to `[inbound].bind_host` | opt-in TLS with opt-in mTLS via `tls_ca_file`; a **non-loopback cleartext SCP is refused at start** unless `serve --allow-insecure-bind` | `calling_ae_allowlist` (AE-Title gate) + `require_called_ae_title` (default true) + the `[inbound].source_ip_allowlist` IP gate | bind host is `[inbound].bind_host`; the modality dials in | `DICOM(ae_title, port, calling_ae_allowlist, require_called_ae_title, max_associations, max_pdu_size, max_object_bytes, timeout_seconds)` |
+| DICOM C-STORE SCU + C-ECHO destination (`dimse`) | outbound | DICOM upper layer over TCP, **default port 104** | opt-in TLS (`tls`, `tls_allow_expired`) | the association's calling / `called_ae_title` AE Titles | **yes** — `host`/`port`/`called_ae_title` per Connection | `DICOM(host, port, called_ae_title, timeout_seconds, connect_timeout)`, `[egress].allowed_tcp` |
+| SMTP email destination (`email`) | outbound | SMTP, **default port 587** (STARTTLS submission); port 465 selects implicit TLS (ADR 0029) | `use_tls` default true (STARTTLS); false needs `MEFOR_ALLOW_INSECURE_TLS` | optional SMTP AUTH `username` / `password` (`env()`) | **yes** — `host`/`port` per Connection | `Email(host, port, sender, recipients, use_tls, username, password, timeout_seconds)`, `[egress].allowed_smtp` |
+| Direct-Project S/MIME destination (`direct`) | outbound | SMTP to a HISP relay, **default port 587** (465 = implicit TLS), ADR 0085 | STARTTLS on by default; the sign-then-encrypt S/MIME body protects PHI **independently of** session TLS | the sender's S/MIME `signing_key` + `signing_cert` (+ optional `signing_key_password`), the partner `recipient_cert` chaining to `trust_anchor`, plus optional SMTP AUTH | **yes** — `host` / `recipient_cert` / `trust_anchor` per Connection | `Direct(host, port, signing_key, signing_cert, recipient_cert, trust_anchor, use_tls, timeout_seconds)`, `[egress].allowed_direct` |
+| DATABASE destination, poll source, and `db_lookup` read connection (`database`) | outbound (the poll source also dials out, for inbound data) | ODBC — TDS for the `sqlserver` dialect, **default port 1433** | the `sqlserver` dialect enforces Driver-18 TLS (`encrypt` default true, `trust_server_certificate` default false); the `generic` dialect delegates TLS to the operator's `odbc_params` | SQL / Integrated / Entra; statements are parameterized | **yes** — `server` / `database` / statement per Connection | `Database(...)`, `DatabasePoll(...)`, `DatabaseLookup(...)` with `connect_timeout`, `pool_max`, `acquire_timeout`; `[egress].allowed_db` |
+| Reference-set sync dial-out — `DatabaseRef` (`database`) | outbound (periodic) | ODBC, **default port 1433** (ADR 0006) | as above | as above | **yes** — `server` / `statement` per reference set | `DatabaseRef(...)` + `Reference(name, refresh_seconds)`; `[egress].allowed_db` |
+| Internal sources that **open no socket**: `timer`, `loopback`, `passthrough` | inbound (internal only) | none — clock-driven (ADR 0011), re-ingress-only (ADR 0013), and Handler-fed pass-through respectively | n/a | n/a — they reach no external system | no | `Timer(...)`, `Loopback()`, `PassThrough()` |
+
+### 5.2 Control-plane listeners
+
+| Interface | Direction | Transport + default port | TLS posture | Auth | Target operator-supplied? | Settings keys |
+|---|---|---|---|---|---|---|
+| Engine JSON API + `/ui` web console + `/ws/stats` (`[api].port`) | inbound | HTTP/WS, **default `127.0.0.1:8765`** | opt-in in-process TLS, engaged when `[api].tls_cert_file` is set; `tls_min_version` default `"1.2"`, optional `tls_ciphers`, optional client-CA mTLS via `tls_client_ca_file` with a deny-by-default `tls_client_cert_identities` map | opaque Bearer session token + RBAC on the JSON API; an HttpOnly, `SameSite=Strict` session cookie scoped **`Path=/`** for the console (a `__Host-`-prefixed name over https with browser hardening on, which *mandates* `Path=/`) that is **read** only by the `/ui` dependency — the JSON API deps stay header-only; 429 throttles — login **per source IP (10) and globally (60) per 60 s** (never per-actor), PHI reads **per actor (120 / 60 s)**, admin writes **per actor (12 / s)** — each behind its own `*_rate_limit_enabled` switch, and one `login_rate_limit_enabled` gates BOTH login limiters (never two independent controls) | bind is `[api].host` / `[api].port` (loopback by default) | `[api].host`, `[api].port`, `[api].tls_*`, `[security].local_access_only`, `[security].listen_address` |
+| Reverse proxy → engine segment (Posture B) | inbound | HTTP over the internal network — the proxy terminates browser TLS in front of the engine | the segment itself carries **no engine-terminated TLS**; `[api].proxy_tls_min_version` is the operator-DECLARED floor for the *browser→proxy* leg, not this one | **none enforced by the engine.** `[api].proxy_intra_service_auth` (`none` \| `mtls` \| `network` \| `shared_secret`, default `none`) is an operator **ATTESTATION**. A PHI instance that is **enforcing** (`[security].enforcement = enforce`) and bound **off-loopback** REFUSES to start unless BOTH `proxy_intra_service_auth` and `proxy_tls_min_version` are declared; a loopback-behind-proxy bind (the recommended topology) and any non-enforcing PHI instance **WARN only**; a synthetic / non-PHI instance is silent | **yes** — the proxy's address(es) | `[api].trusted_proxies` (feeds uvicorn `forwarded_allow_ips`; empty = trust nothing), `[api].tls_terminated_upstream`, `[api].proxy_intra_service_auth`, `[api].proxy_tls_min_version` |
+
+> **Listener multiplicity under engine sharding.** With `serve --shard`, the supervisor forks one
+> engine subprocess per shard and each binds its **own** API port, derived as `base_port + i` in
+> sorted shard order. On a sharded deployment the API/UI/WS listener above is therefore **N sockets,
+> not one** — size firewall rules and the proxy upstream list accordingly.
+
+### 5.3 Infrastructure hops
+
+| Interface | Direction | Transport + default port | TLS posture | Auth | Target operator-supplied? | Settings keys |
+|---|---|---|---|---|---|---|
+| Store — SQLite (the default backend) | local | **no network socket** — a local database file (WAL) | n/a; `[store].ssl_root_cert` is **rejected** for SQLite | filesystem ACLs; at-rest encryption is the store DEK, not a transport credential | no — a local path | `[store].backend = sqlite`, `[store].path` |
+| Store — SQL Server | outbound | TDS over ODBC Driver 18, **default port 1433** | `encrypt` default true, `trust_server_certificate` default false; optional `ssl_root_cert` pins the server certificate via the Driver-18.1 `ServerCertificate` keyword; optional `multi_subnet_failover` for an AOAG listener | SQL / Integrated / Entra, with an opt-in `require_managed_identity` precondition (default off) | **yes** — `[store].server` | `[store].backend = sqlserver`, `[store].server`, `[store].port`, `[store].auth`, `[store].pool_size`, `[store].connect_timeout`, `[store].command_timeout`, `[store].warm_pool` |
+| Store — Postgres (asyncpg) | outbound | TCP; the model's `port` default is 1433 and a **left-at-default value is remapped to Postgres's conventional 5432** | TLS built from `encrypt` / `trust_server_certificate`; `ssl_root_cert` loads `ssl.create_default_context(cafile=…)`, so chain **and** hostname are still verified | username + password only — Postgres has **no managed-identity mode**, so it cannot satisfy `require_managed_identity` | **yes** — `[store].server` | `[store].backend = postgres`, plus the same `[store]` connection keys as SQL Server |
+| Active Directory — login binds | outbound | LDAPS (TLS) by default; a plain `ldap://` bind requires the explicit `ad_allow_insecure_ldap` opt-in | `ad_tls_verify` default true (`CERT_REQUIRED`); `ad_tls_verify=false` now **refuses at construction** without `MEFOR_ALLOW_INSECURE_TLS`; `ad_tls_ca_cert_file` anchors an internal CA without disabling verification | a service-account simple bind (`ad_bind_dn` + `ad_bind_password` / `ad_bind_password_secret`), then a **second bind as the user**, then 1–2 SUBTREE searches | **yes** — `[auth].ad_server` | `[auth].ad_server`, `ad_domain`, `ad_bind_dn`, `ad_user_search_base`, `ad_group_search_base`, `ad_use_nested_groups`, `ad_connect_timeout`, `ad_receive_timeout` |
+| Active Directory — directory session reconciler (ADR 0079) | outbound (periodic) | the same LDAPS hop, off the login path | as above | the service-account bind only — one `resolve_principal` bind per signed-in directory user per pass | same server | `[auth].ad_session_recheck_seconds` (0 = OFF, floored at 60 s), `ad_session_recheck_max_users`, `ad_session_recheck_strikes`, `ad_session_revoke_max`, `ad_session_revoke_max_fraction` |
+| Kerberos / SPNEGO browser SSO | n/a — **the engine opens no socket** | one SPNEGO *server* step against the host's SSPI (Windows) or GSSAPI/krb5 (Linux) provider using the local keytab / machine credential; any KDC traffic belongs to the OS provider | n/a — the engine terminates nothing here | the browser's SPNEGO ticket, validated by the OS provider | no — the host's realm / keytab | `[auth].kerberos_enabled` (experimental, off by default), `[auth].kerberos_spn` |
+| OIDC IdP — token endpoint (ADR 0142) | outbound | HTTPS POST to the operator-**pinned** endpoint; port from the URL. There is **no `.well-known` discovery** — every endpoint is pinned, so no attacker-influenced URL exists | `ssl.create_default_context(cafile=oidc_tls_ca_cert_file)` or the OS store, **always** `check_hostname=True` + `CERT_REQUIRED` (no verify-off escape by design); redirects are never followed | the confidential-client secret plus the authorization code and the PKCE verifier | **yes** — `[auth].oidc_token_endpoint` | `[auth].oidc_token_endpoint`, `oidc_client_id`, `oidc_client_secret` (env `MEFOR_AUTH_OIDC_CLIENT_SECRET`) or `oidc_client_secret_ref`, `oidc_allowed_endpoints`, `oidc_tls_ca_cert_file` |
+| OIDC IdP — authorization endpoint + authorization-code **callback** (ADR 0142) | **n/a — the engine opens no socket on this leg**: the BROWSER is redirected to the operator-pinned authorization endpoint, and the IdP returns the code to the engine's own `[api]` listener | HTTPS redirect to `[auth].oidc_authorization_endpoint` (port from the URL); the code arrives back on `[auth].oidc_redirect_path` (default `/ui/oidc/callback`, fixed in this release), whose absolute `redirect_uri` is derived from `[security].web_console_public_address` | the browser↔IdP leg carries the browser's own TLS, not the engine's; the callback leg rides the §5.2 API listener's posture. The endpoint is host-gated by `oidc_allowed_endpoints` | server-side PKCE `code_verifier` + `state` (constant-time compare) + `nonce` held in the bounded pending-flow cache — only the opaque `flow_id` ever reaches the browser, in a `__Host-`-prefixed cookie the callback requires | **yes** — `[auth].oidc_authorization_endpoint` is the operator-supplied external location, and `oidc_redirect_path` is the **callback URL** the requirement names by example | `[auth].oidc_authorization_endpoint`, `oidc_redirect_path`, `oidc_allowed_endpoints`, `oidc_flow_ttl_seconds`, `oidc_flow_cache_max`, `[security].web_console_public_address` |
+| OIDC IdP — JWKS fetch | outbound | HTTPS GET through the **same** opener as the token leg, so the two legs cannot drift onto different anchors | as above | none — a public key document; the response is size-capped **on the socket read** | **yes** — `[auth].oidc_jwks_uri` | `[auth].oidc_jwks_uri`, `oidc_jwks_ttl_seconds`, `oidc_jwks_min_refetch_seconds` |
+| SMART Backend Services token endpoint (ADR 0024) | outbound | HTTPS POST to the operator-pinned token URL (no discovery); routed through the connection's forward proxy when one resolves for the **token** host | the REST verifying no-redirect opener; a cleartext-`http` token URL is **refused** unless `MEFOR_ALLOW_INSECURE_TLS` (the client assertion is a credential) | a signed `client_assertion` JWT (`smart_private_key`, optionally passphrase-protected) | **yes** — `smart_token_url` per Connection | `smart_token_url`, `smart_client_id`, `smart_private_key`, `smart_scope`, `smart_timeout_seconds`, `smart_expiry_skew_seconds` |
+| Generic OAuth2 client-credentials token endpoint | outbound | HTTPS POST for the non-SMART REST/SOAP/FHIR/DICOMweb bearer path; also proxy-routed per token host | the same verifying no-redirect opener; a cleartext-`http` credential hop is posture-keyed and refused | `oauth2_client_id` + `oauth2_client_secret`, sent `basic` or `post` per `oauth2_auth_style` | **yes** — `oauth2_token_url` per Connection | `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret`, `oauth2_scope`, `oauth2_auth_style`, `oauth2_timeout_seconds` |
+| Engine-brokered AI assistance (ADR 0135) | outbound | HTTPS POST of a `code_only` assist prompt to a **customer-managed / self-hosted** LLM endpoint; runs off the event loop | the REST verifying no-redirect opener; a cleartext-`http` endpoint carrying the key is refused unless `MEFOR_ALLOW_INSECURE_TLS` | `MEFOR_AI_API_KEY`, sent as the `x-api-key` header | **yes** — verbatim the requirement's "the end user provides an external location" | `[ai].endpoint`, `[ai].api_key`, `[ai].allowed_endpoints` (a **dedicated fail-closed** SSRF allowlist — an EMPTY list refuses everything; deliberately **not** `[egress].allowed_http`), `[ai].provider`, `[ai].model` |
+| HashiCorp Vault Transit — store DEK envelope-decrypt (ADR 0019) | outbound | HTTPS via `hvac` (the `[vault]` extra); port from the address | TLS verification is `hvac`/`requests`' own default — the engine sets no explicit client TLS options here | a Vault token — `MEFOR_STORE_VAULT_TOKEN` (`hvac` falls back to `VAULT_TOKEN` when unset) | **yes** — `MEFOR_STORE_VAULT_ADDR` (opt-in; fail-closed) | `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN`, `MEFOR_STORE_VAULT_TRANSIT_KEY` |
+| HashiCorp Vault Transit — **bulk at-rest cipher** (`[store].cipher_provider = vault_transit`, ADR 0138) | outbound (**per store operation**) | HTTPS via the same shared `hvac` client build; port from the address. **One `encrypt_data` / `decrypt_data` round trip per encrypted CELL** on every store write and read, plus one `generate_hmac` per audit row — not a startup-only hop | as the DEK hop: `hvac`/`requests` defaults, no engine-set client TLS options | the same Vault token (`MEFOR_STORE_VAULT_TOKEN`) | **yes** — `MEFOR_STORE_VAULT_ADDR` (shared with the DEK hop) | `[store].cipher_provider`, `MEFOR_STORE_TRANSIT_KEY`, `MEFOR_STORE_TRANSIT_AUDIT_KEY` |
+| DR backup destination (ADR 0049) | outbound (scheduled + on-demand) | local filesystem, or **SMB/CIFS over TCP when `[backup].destination` is a UNC path** (the OS redirector owns the port); a cloud URL is **rejected at load** | n/a — no engine-terminated TLS on this hop; SMB dialect security is the OS's | the engine service account's **own** identity — `[backup]` exposes no `credential_*` impersonation knob, unlike the FILE connector | **yes** — `[backup].destination` | `[backup].enabled`, `[backup].destination`, `schedule_at`, `retention_keep`, `snapshot_method`, `allow_unencrypted` |
+| Security-event notification email, per user | outbound | SMTP through the **same** `[alerts]` transport and default port 587, but a **second, independent** background dispatcher — its own 1000-item queue and its own drain task — mailing each affected USER's own address, not the operator `email_to` list | STARTTLS, as the operator sink | as the operator sink | **yes** — the same `[alerts].email_smtp_host` | `[auth].notify_security_events`, `[alerts].email_*` |
+| HashiCorp Vault KV v2 — connector-credential secrets provider (ADR 0019) | outbound | HTTPS via `hvac`, a **separate client** from the Transit one behind the same extra | as above | a Vault token — `MEFOR_SECRETS_VAULT_TOKEN` (falls back to `VAULT_TOKEN`) | **yes** — `MEFOR_SECRETS_VAULT_ADDR` (opt-in; fail-closed) | `MEFOR_SECRETS_VAULT_ADDR`, `MEFOR_SECRETS_VAULT_TOKEN`, `[secrets].provider` |
+| Alerts — SMTP notification sink | outbound | SMTP, **default port 587**, STARTTLS by default. Distinct from the `email` message connector | STARTTLS (`email_use_tls`) | optional `email_username` / `email_password` (env `MEFOR_ALERTS_EMAIL_PASSWORD`, never the file) | **yes** — `[alerts].email_smtp_host`, gated by `[alerts].smtp_allowed_hosts` (empty = any) | `[alerts].email_smtp_host`, `email_smtp_port`, `email_from`, `email_to`, `email_timeout`, `smtp_allowed_hosts` |
+| Alerts — webhook sink | outbound | HTTP(S) POST of the event as JSON through a **no-redirect** opener (a 3xx cannot divert the POST) | a plaintext `http://` target is **refused** unless `MEFOR_ALLOW_INSECURE_TLS` | none — the URL is the credential | **yes** — `[alerts].webhook_url`, gated by `[alerts].webhook_allowed_hosts` | `[alerts].webhook_url`, `webhook_timeout`, `webhook_allowed_hosts` |
+| Off-box syslog log forwarder (ADR 0080) | outbound | `udp` (**the default**, plaintext RFC 5426), `tcp` (RFC 6587) or `tls` (RFC 5425); **default port 514** | on `tls`, only `forward_tls_ca_file` is trusted (system roots are **not** loaded) with hostname checking (`forward_tls_verify` default true) and optional mutual TLS via `forward_tls_client_cert`. A plaintext / unverified collector hop is REFUSED on an enforcing production-PHI instance unless `forward_hop_attested` | none on `udp`/`tcp` (network trust); the client certificate under mutual TLS | **yes** — `[logging].forward_host` | `[logging].forward_enabled`, `forward_host`, `forward_port`, `forward_protocol`, `forward_format`, `forward_tls_ca_file`, `forward_tls_verify`, `forward_tls_client_cert`, `forward_hop_attested` |
+| SNTP / NTP startup clock-sync probe (ADR 0080, ASVS 16.2.2) | outbound | UDP, **port 123** — one 48-byte stdlib SNTP request at startup, never on the message path | none — SNTP, not NTS | **unauthenticated by design**: a coarse drift check for a trusted management network | **yes** — `[logging].ntp_peer` | `[logging].ntp_peer`, `require_time_sync` (both are needed to enable it; default = a no-op), `time_sync_max_skew_seconds`, `time_sync_fail_closed` |
+| Forward / egress web proxy (ADR 0126) | outbound | the proxy hop in front of the **whole stdlib HTTP family** — REST, SOAP, FHIR, `fhir_lookup`, DICOMweb, **and** the OAuth2 + SMART token endpoints. Built into a per-connection `ProxyHandler`; the shared no-redirect opener is never mutated | the destination's own TLS is end-to-end through the proxy. A proxy **credential** over a cleartext `http` proxy hop is refused regardless of the destination's scheme; digest-over-https is refused; ntlm/windows is refused as deferred | optional `proxy_user` / `proxy_password` (`env()`), `basic` by default | **yes** — site-wide `[egress].proxy_url` or per-connection `proxy` (which also accepts `"default"`, the OS `getproxies()` proxy) | `[egress].proxy_url`, `[egress].proxy_no_proxy`; per connection `proxy`, `proxy_no_proxy`, `proxy_user`, `proxy_password`, `proxy_auth_type` |
+| Loopback ECH sidecar (ADR 0139, ASVS 12.1.5) | outbound (loopback) | cleartext HTTP to a **mandatory-loopback** sidecar base URL; the sidecar re-originates the `https` + ECH connection and owns destination TLS verification | the sidecar hop is loopback cleartext **by construction**; fails closed — `ech_egress` without `ech_sidecar` raises, a **non-loopback** sidecar is refused, and `ech_egress` is mutually exclusive with `proxy` | none — a co-located loopback process | **yes** — the `ech_sidecar` base URL per Connection | `ech_egress`, `ech_sidecar` (REST connections) |
+
+> **Local / UNC path sources.** `FileRef(path=…)` reference-set sources read over the same local-or-UNC path class as the DR backup destination above: a UNC path is SMB/CIFS over TCP to an operator-supplied host, with no engine-terminated TLS and the service account's own identity.
+
+> **Egress note.** The fail-closed `[egress]` outbound allow-list is **built** (WP-11c / #186): eight
+> per-transport lists — `allowed_mllp`, `allowed_tcp`, `allowed_file_dirs`, `allowed_http`,
+> `allowed_db`, `allowed_remote`, `allowed_smtp`, `allowed_direct` — plus the posture switch
+> **`[security].block_unlisted_outbound`** (relocated there by ADR 0118; setting the retired
+> `[egress].deny_by_default` in its old section is now **rejected at load**). In the bare default
+> (Posture A) every list is empty and the switch is off, so egress is **allow-any**; it
+> **auto-flips on for ANY PHI instance** (`data_class = phi` — broadened from production-only by
+> WP243/#243, so a staging or declared-PHI loopback instance flips too; only a synthetic/dev instance
+> is exempt), refusing every destination of a transport whose list is empty. The `[alerts]` webhook
+> and SMTP host allow-lists (§2) are siblings of this control.
+>
+> **Transport → allow-list arm** (not one-to-one, and easy to get wrong): the DIMSE
+> **destination** (C-STORE SCU / C-ECHO) rides `allowed_tcp` because it is a raw socket, like
+> the raw-TCP and X12 destinations — but the inbound C-STORE SCP (and the raw-TCP / X12 / MLLP /
+> HTTP listeners) are **listeners**: no egress arm applies to them at any setting, because
+> `check_egress_allowed` gates destinations and `check_source_allowed` gates only the DATABASE
+> poll source and the REMOTEFILE source — the two source kinds that dial out. A listener is
+> gated by `calling_ae_allowlist` / `[inbound].source_ip_allowlist` instead. DICOMWEB rides
+> `allowed_http` like REST/SOAP/FHIR; DIRECT has its **own** `allowed_direct` list, deliberately
+> separate from `allowed_smtp`; and the **AI broker rides neither** — it is gated only by the
+> dedicated fail-closed `[ai].allowed_endpoints`.
+---
+
+## 6. Dependency-remediation policy (ASVS 15.1.1 / 15.2.1)
+
+CI blocks on `pip-audit` against the hashed lockfile (DEP-1). The **remediation timeframe** for a
+finding it reports, measured from disclosure:
+
+| Severity | Patch window |
+|---|---|
+| Critical | ≤ 7 days |
+| High | ≤ 30 days |
+| Medium | ≤ 90 days |
+| Low | next routine dependency bump |
+
+Remediate by bumping the lockfile (`uv lock` → `uv export`); a triaged, non-applicable advisory may be
+accepted with `pip-audit --ignore-vuln <ID>` **and** a tracking note. A machine-readable CycloneDX
+**SBOM** is generated from the lockfile in CI (`.github/workflows/security.yml`, advisory) and
+retained as a build artifact (15.1.2).

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """ASVS 11.1.2 / 11.1.4 §4 truth-guard: the key-management & cryptographic inventory in
-``docs/security/ASVS-L2-PHASE0-CHANGES.md`` §4 must stay TRUE and complete.
+``docs/ASVS-L2-PHASE0-CHANGES.md`` §4 must stay TRUE and complete.
 
 Sibling of ``tests/test_secret_rotation_inventory.py`` (13.1.4) and
 ``scripts/security/crypto_inventory_check.py`` (11.1.3). Those two guard the *rotation schedule* and the
@@ -34,7 +34,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PKG = _ROOT / "messagefoundry"
-_DOC = _ROOT / "docs" / "security" / "ASVS-L2-PHASE0-CHANGES.md"
+_DOC = _ROOT / "docs" / "ASVS-L2-PHASE0-CHANGES.md"
 _CRYPTO_GATE = _ROOT / "scripts" / "security" / "crypto_inventory_check.py"
 
 
@@ -108,7 +108,7 @@ def test_every_cipher_provider_value_is_documented() -> None:
     missing = _missing_from_section(providers, section)
     assert not missing, (
         "[store].cipher_provider value(s) accepted by store/base.py but not documented in "
-        f"docs/security/ASVS-L2-PHASE0-CHANGES.md §4: {missing}"
+        f"docs/ASVS-L2-PHASE0-CHANGES.md §4: {missing}"
     )
 
 
@@ -169,7 +169,7 @@ def test_retired_false_claims_are_absent() -> None:
     present = [claim for claim in _RETIRED_CLAIMS if claim in section]
     assert not present, (
         "a retired FALSE cryptographic-inventory claim reappeared in §4 of "
-        f"docs/security/ASVS-L2-PHASE0-CHANGES.md: {present}"
+        f"docs/ASVS-L2-PHASE0-CHANGES.md: {present}"
     )
 
 

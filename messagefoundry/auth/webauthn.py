@@ -10,7 +10,7 @@ the persistence in ``store/``, both driven by ``auth/service.py``).
 Ceremony **challenges are minted first-party** (``secrets.token_bytes(64)``) and passed as the
 explicit ``challenge=`` kwarg — a real crypto call site, registered in
 ``scripts/security/crypto_inventory_check.py`` (ASVS 11.1.3) and documented in
-``docs/security/ASVS-L2-PHASE0-CHANGES.md`` §4 (first-party evidence for ASVS 6.7.2). They live in
+``docs/ASVS-L2-PHASE0-CHANGES.md`` §4 (first-party evidence for ASVS 6.7.2). They live in
 a bounded, TTL'd, process-local :class:`ChallengeCache` (the rate-limiter precedent — single API
 process is structural; ADR 0068 records the store-backed table as the multi-node upgrade path).
 

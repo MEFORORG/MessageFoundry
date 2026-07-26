@@ -358,3 +358,86 @@ def test_the_two_owner_gated_steps_stay_visibly_unprescribed() -> None:
     assert "#steps-not-yet-prescribed" in section[:start], (
         "the operator-steps preamble no longer links to the not-yet-prescribed section"
     )
+
+
+# --------------------------------------------------------------------------------------------------
+# Relocated doc-drift guards (2026-07-26).
+#
+# These four asserted against THIS runbook while living in modules whose OTHER ~100 tests guard shipped
+# behaviour and pass fine on the public mirror. Because docs/security/** is deny-listed there (and
+# vaulted after the cutover), each one failed at RUNTIME on the mirror and took its whole required test
+# leg red with it. Guarding them where they were would have meant a module-level skip, silencing ~101
+# green tests to fix 4 red ones.
+#
+# They belong here on the merits, not just for convenience: every one asserts "this runbook and the code
+# agree", which is precisely what this module is for, and this module already carries the correct
+# skip-when-the-doc-is-absent guard at the top.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_runbook_example_block_actually_loads(tmp_path: Path) -> None:
+    """The runbook's engine-config block is the one an operator copies. A doc example that no longer
+    loads is worse than none — and this feature's own first draft shipped an invalid CIDR in it, which
+    is exactly what this catches. Scoped to the block carrying the setting; the runbook's OTHER stale
+    blocks are pre-existing and out of scope. (Relocated from test_client_network_allowlist.py.)"""
+    from messagefoundry.config.settings import load_settings
+
+    doc = _DOC.read_text(encoding="utf-8")
+    blocks = [
+        b for b in re.findall(r"```toml\n(.*?)```", doc, re.S) if "allowed_client_networks" in b
+    ]
+    assert len(blocks) == 1, "the runbook should carry exactly one allowed_client_networks example"
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text(blocks[0], encoding="utf-8")
+    settings = load_settings(config_path=cfg, environ={})
+    assert settings.security.allowed_client_networks
+    # ...and it models R2 correctly: a DECLARED, single-host proxy, without which it would be inert.
+    assert settings.api.trusted_proxies == ["127.0.0.1"]
+
+
+def test_runbook_proxy_replaces_rather_than_appends_the_forwarded_chain() -> None:
+    """Relocated from test_client_network_allowlist.py."""
+    doc = _DOC.read_text(encoding="utf-8")
+    assert "proxy_set_header X-Forwarded-For   $remote_addr;" in doc
+    # The APPENDING form must not survive as a directive (it may still be named in prose explaining
+    # why it was replaced): a chain built from the client's own header carries an attacker-authored
+    # prefix, and only the single-host trusted_proxies rule keeps uvicorn's reverse walk landing right.
+    assert "proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for" not in doc
+
+
+def test_the_mtls_runbook_and_the_table_cannot_diverge() -> None:
+    """Relocated from test_docs_security_pathways.py, whose remaining 17 tests guard the PUBLIC
+    docs/SECURITY.md auth-strength table against introspected code and must keep running publicly."""
+    body = _DOC.read_text(encoding="utf-8")
+    assert "require_service_cert" in body
+    assert re.search(r"mTLS client certificate as an Identity", body), (
+        "the off-loopback runbook's mTLS-identity section is the sibling description of the fifth "
+        "pathway; keep them in step."
+    )
+
+
+def test_runbook_documents_the_shipped_download_safety_mechanism() -> None:
+    """Doc-drift guard for the runbook's attachment-safety block (the 5.1.1 <-> 1.3.4 rider): it
+    describes HOW downloads are made safe, so it must name every shipped layer. The tokens below ARE
+    the pinned mechanism — a lane rewriting that block keeps them or this fails.
+
+    Relocated from test_attachment_download_api.py, whose other 38 tests cover live MIME-downgrade,
+    sandbox-CSP and RBAC behaviour. Was declared ``async`` there but awaits nothing, so it is a plain
+    function here."""
+    from messagefoundry.api.app import _ATTACHMENT_CSP
+
+    heading = "## Served-attachment filename + Content-Type safety on the streaming-detach path"
+    text = _DOC.read_text(encoding="utf-8")
+    start = text.find(heading)
+    assert start != -1, f"runbook section {heading!r} missing from {_DOC.name}"
+    nxt = text.find("\n## ", start + len(heading))
+    section = text[start:] if nxt == -1 else text[start:nxt]
+    for token in (
+        "_safe_attachment_content_type",  # the octet-stream forcing helper
+        "browser-active",  # the downgrade rule this lane shipped
+        "application/octet-stream",
+        "Content-Disposition: attachment",
+        "nosniff",
+        _ATTACHMENT_CSP,  # default-src 'none'; sandbox
+    ):
+        assert token in section, f"runbook attachment section no longer documents {token!r}"

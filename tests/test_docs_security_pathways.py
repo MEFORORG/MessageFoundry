@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import ast
 import inspect
-import re
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
@@ -492,11 +491,7 @@ def test_non_interactive_authentication_planes_are_enumerated_too() -> None:
     )
 
 
-def test_the_mtls_runbook_and_the_table_cannot_diverge() -> None:
-    runbook = _ROOT / "docs" / "security" / "OFF-LOOPBACK-DEPLOYMENT.md"
-    body = runbook.read_text(encoding="utf-8")
-    assert "require_service_cert" in body
-    assert re.search(r"mTLS client certificate as an Identity", body), (
-        "the off-loopback runbook's mTLS-identity section is the sibling description of the fifth "
-        "pathway; keep them in step."
-    )
+# NOTE: test_the_mtls_runbook_and_the_table_cannot_diverge moved to tests/test_off_loopback_runbook.py (2026-07-26). They asserted against
+# the deny-listed off-loopback runbook, so on the public mirror they failed at runtime and took
+# this whole module's required test leg red — while the rest of this file guards shipped
+# behaviour that must keep running publicly. The new home already carries the doc-absent guard.

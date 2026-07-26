@@ -371,30 +371,6 @@ async def test_ui_delegate_serves_the_sandbox_csp_not_the_console_csp(
         assert ("nonce-" in page.headers["content-security-policy"]) is loopback
 
 
-async def test_runbook_documents_the_shipped_download_safety_mechanism() -> None:
-    """Doc-drift guard for the off-loopback runbook's attachment-safety block (the 5.1.1 ↔ 1.3.4
-    rider): it describes HOW downloads are made safe, so it must name every shipped layer. The tokens
-    below ARE the pinned mechanism — a lane rewriting that block keeps them or this fails."""
-    doc = (
-        Path(__file__).resolve().parent.parent / "docs" / "security" / "OFF-LOOPBACK-DEPLOYMENT.md"
-    )
-    heading = "## Served-attachment filename + Content-Type safety on the streaming-detach path"
-    text = doc.read_text(encoding="utf-8")
-    start = text.find(heading)
-    assert start != -1, f"runbook section {heading!r} missing from {doc.name}"
-    nxt = text.find("\n## ", start + len(heading))
-    section = text[start:] if nxt == -1 else text[start:nxt]
-    for token in (
-        "_safe_attachment_content_type",  # the octet-stream forcing helper
-        "browser-active",  # the downgrade rule this lane shipped
-        "application/octet-stream",
-        "Content-Disposition: attachment",
-        "nosniff",
-        _ATTACHMENT_CSP,  # default-src 'none'; sandbox
-    ):
-        assert token in section, f"runbook attachment section no longer documents {token!r}"
-
-
 async def test_download_unknown_message_is_404(client: httpx.AsyncClient) -> None:
     assert (await client.get("/messages/missing/attachments/" + "a" * 64)).status_code == 404
 
@@ -473,3 +449,9 @@ async def test_download_out_of_scope_message_is_404_not_403(engine: Engine) -> N
         assert (await c.get(f"/messages/{mid_a}/attachments/{ref_a}", headers=h)).status_code == 200
         assert (await c.get(f"/messages/{mid_b}/attachments/{ref_b}", headers=h)).status_code == 404
     assert any(a["action"] == "auth.channel_denied" for a in await engine.store.list_audit())
+
+
+# NOTE: test_runbook_documents_the_shipped_download_safety_mechanism moved to tests/test_off_loopback_runbook.py (2026-07-26). They asserted against
+# the deny-listed off-loopback runbook, so on the public mirror they failed at runtime and took
+# this whole module's required test leg red — while the rest of this file guards shipped
+# behaviour that must keep running publicly. The new home already carries the doc-absent guard.

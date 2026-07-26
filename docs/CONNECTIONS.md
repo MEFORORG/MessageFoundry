@@ -1571,7 +1571,7 @@ running at the scale pooled unlocks:
 How the engine bounds connections, threads, and retries **per external service**, what happens **when
 a limit is reached**, and how each service's resources are released — the resource-management
 contract a reviewer needs. The two tables below cover **every** hop in the communications inventory
-([security/ASVS-L2-PHASE0-CHANGES.md](security/ASVS-L2-PHASE0-CHANGES.md) §5): Table A is the
+([security/ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) §5): Table A is the
 13.1.2/13.2.6 concurrency axis, Table B the 13.1.3 resource-strategy axis. They carry the **same row
 set**, and `tests/test_communications_inventory.py` fails the build if they diverge or if a stated
 default drifts from the constant in the code.
