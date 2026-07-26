@@ -100,3 +100,11 @@ Thumbs.db
 /*.html
 /*.txt
 /*.yml
+
+# The real customer/vendor token list consumed by scripts/security/scan_forbidden.py at
+# commit time. Only the SYNTHETIC scan-tokens.local.txt.example is ever committed.
+#
+# Deliberately unconditional, and listed ahead of the scanner it serves: an operator creates
+# this file before the tooling that references it exists, so ignoring the path up front
+# removes any window in which a real token list sits un-ignored in a working tree.
+scripts/security/scan-tokens.local.txt
